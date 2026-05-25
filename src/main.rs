@@ -18,6 +18,7 @@ use tracing::Level;
 use recursive::config::load_project_context;
 use recursive::mcp::{load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::skills::{discover_skills, skill_index, Skill};
+use recursive::SessionFile;
 use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
@@ -72,6 +73,10 @@ struct Cli {
     /// Enable token-by-token streaming. Deltas are printed live on stderr.
     #[arg(long, env = "RECURSIVE_STREAM")]
     stream: bool,
+    /// Path to write a session file for non-success finishes (budget exceeded,
+    /// stuck, transcript limit). The session can be resumed later with `resume`.
+    #[arg(long, env = "RECURSIVE_SESSION_OUT")]
+    session_out: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -110,6 +115,23 @@ enum Cmd {
         #[arg(long)]
         head: Option<usize>,
     },
+    /// Resume a run from a saved session file.
+    Resume {
+        /// Path to the session JSON file (as written by --session-out).
+        #[arg(required = true)]
+        session: PathBuf,
+    },
+    /// List or inspect saved sessions.
+    Sessions {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionCmd {
+    /// List all session files in the workspace's session directory.
+    List,
 }
 
 #[tokio::main]
@@ -142,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 goal.join(" "),
                 cli.max_transcript_chars,
                 cli.transcript_out,
+                cli.session_out,
                 cli.json,
                 cli.stream,
                 cli.mcp_config,
@@ -191,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
                         goal.join(" "),
                         cli.max_transcript_chars,
                         cli.transcript_out,
+                        cli.session_out,
                         cli.json,
                         cli.mcp_config,
                     )
@@ -198,6 +222,49 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Resume { session } => {
+            let session_file = SessionFile::read_from(&session)
+                .with_context(|| format!("reading session file: {}", session.display()))?;
+            let tools = build_tools(&config).await;
+            let specs = tools.specs();
+            session_file
+                .validate_tool_registry(&specs)
+                .map_err(|msg| anyhow::anyhow!("{}", msg))?;
+            let goal = session_file.goal.clone();
+            let seed = session_file.into_transcript();
+            run_resumed(
+                config,
+                seed,
+                goal,
+                cli.max_transcript_chars,
+                cli.transcript_out,
+                cli.session_out,
+                cli.json,
+                cli.mcp_config,
+            )
+            .await
+        }
+        Cmd::Sessions { cmd } => match cmd {
+            SessionCmd::List => {
+                let sessions = recursive::session::list_sessions(&config.workspace)?;
+                if sessions.is_empty() {
+                    println!(
+                        "No sessions found in {}",
+                        config
+                            .workspace
+                            .join(".recursive")
+                            .join("sessions")
+                            .display()
+                    );
+                } else {
+                    println!("Session files ({}):", sessions.len());
+                    for s in &sessions {
+                        println!("  {}", s.display());
+                    }
+                }
+                Ok(())
+            }
+        },
     }
 }
 
@@ -498,6 +565,32 @@ fn save_transcript(
     Ok(())
 }
 
+/// Save a session file for non-success finishes.
+fn save_session(
+    outcome: &recursive::AgentOutcome,
+    goal: String,
+    model: &str,
+    provider: &str,
+    tool_specs: &[recursive::ToolSpec],
+    path: &Path,
+) -> anyhow::Result<()> {
+    let session = SessionFile::new(
+        goal,
+        model.to_string(),
+        provider.to_string(),
+        tool_specs,
+        outcome.steps,
+        outcome.transcript.clone(),
+    );
+    session.write_to(path)?;
+    eprintln!(
+        "session: wrote {} messages to {}",
+        outcome.transcript.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 /// Return Err iff the finish reason should propagate as a non-zero binary
 /// exit code so that self-improve.sh's auto-resume gate fires. The
 /// transcript has already been saved by the caller before this is called.
@@ -510,18 +603,22 @@ fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_resumed(
     config: Config,
     seed: Vec<recursive::message::Message>,
     goal: String,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
+    session_out: Option<PathBuf>,
     json_mode: bool,
     mcp_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
     let (mut agent, rx) =
         build_agent(&config, max_transcript_chars, seed, false, mcp_config).await?;
+    let tools = build_tools(&config).await;
+    let tool_specs = tools.specs();
     if !json_mode {
         eprintln!("resuming from {seed_len} seeded message(s)");
     }
@@ -530,11 +627,11 @@ async fn run_resumed(
     } else {
         tokio::spawn(stream_events(rx))
     };
-    let outcome = agent.run(goal).await?;
+    let outcome = agent.run(goal.clone()).await?;
     drop(agent);
     printer.await.ok();
     if !json_mode {
-        if let Some(msg) = outcome.final_message {
+        if let Some(ref msg) = outcome.final_message {
             println!("\n=== final ===\n{msg}");
         }
         print_usage(
@@ -548,14 +645,23 @@ async fn run_resumed(
     if let Some(path) = transcript_out {
         save_transcript(&outcome.transcript, outcome.steps, &config.model, &path)?;
     }
+    // Save session file for non-success finishes
+    if let Some(path) = session_out {
+        let is_success = matches!(outcome.finish, FinishReason::NoMoreToolCalls);
+        if !is_success {
+            save_session(&outcome, goal, &config.model, "openai", &tool_specs, &path)?;
+        }
+    }
     exit_for_finish(&outcome.finish, outcome.steps)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     config: Config,
     goal: String,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
+    session_out: Option<PathBuf>,
     json_mode: bool,
     stream: bool,
     mcp_config: Option<PathBuf>,
@@ -568,16 +674,18 @@ async fn run_once(
         mcp_config,
     )
     .await?;
+    let tools = build_tools(&config).await;
+    let tool_specs = tools.specs();
     let printer = if json_mode {
         tokio::spawn(stream_events_json(rx))
     } else {
         tokio::spawn(stream_events(rx))
     };
-    let outcome = agent.run(goal).await?;
+    let outcome = agent.run(goal.clone()).await?;
     drop(agent);
     printer.await.ok();
     if !json_mode {
-        if let Some(msg) = outcome.final_message {
+        if let Some(ref msg) = outcome.final_message {
             println!("\n=== final ===\n{msg}");
         }
         print_usage(
@@ -591,6 +699,13 @@ async fn run_once(
 
     if let Some(path) = transcript_out {
         save_transcript(&outcome.transcript, outcome.steps, &config.model, &path)?;
+    }
+    // Save session file for non-success finishes
+    if let Some(path) = session_out {
+        let is_success = matches!(outcome.finish, FinishReason::NoMoreToolCalls);
+        if !is_success {
+            save_session(&outcome, goal, &config.model, "openai", &tool_specs, &path)?;
+        }
     }
     exit_for_finish(&outcome.finish, outcome.steps)
 }
