@@ -271,6 +271,8 @@ impl Tool for Remember {
         }
     }
 
+    fn is_readonly(&self) -> bool { true }
+
     async fn execute(&self, arguments: Value) -> Result<String> {
         let text = arguments["text"]
             .as_str()

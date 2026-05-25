@@ -48,6 +48,11 @@ impl Default for ToolRegistry {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, arguments: Value) -> Result<String>;
+    /// Whether this tool only reads data without side effects.
+    /// Default: false (conservative). Override to true for read-only tools.
+    fn is_readonly(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -99,6 +104,14 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Check if a tool is read-only (no side effects).
+    pub fn is_readonly(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|t| t.is_readonly())
+            .unwrap_or(false)
     }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {

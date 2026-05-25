@@ -146,6 +146,8 @@ impl Tool for LoadSkill {
         }
     }
 
+    fn is_readonly(&self) -> bool { true }
+
     async fn execute(&self, arguments: Value) -> Result<String> {
         let name = arguments["name"]
             .as_str()
