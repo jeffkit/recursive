@@ -111,7 +111,7 @@ impl OpenAiProvider {
     fn make_err(&self, ctx: impl Into<String>) -> Error {
         Error::Llm {
             provider: self.model.clone(),
-            message: ctx.into().to_string(),
+            message: ctx.into(),
         }
     }
 
