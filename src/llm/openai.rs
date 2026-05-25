@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+use super::StructuredRequest;
 use super::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
@@ -200,6 +201,109 @@ impl LlmProvider for OpenAiProvider {
                             backoff_ms = backoff.as_millis(),
                             error = %e,
                             "network error, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(self.make_err(format!("request failed: {e}")));
+                }
+            }
+        }
+    }
+
+    async fn complete_structured(&self, req: StructuredRequest) -> Result<Value> {
+        let mut body = build_request(
+            &self.model,
+            self.temperature,
+            self.max_tokens,
+            &req.messages,
+            &[],
+        );
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": req.schema_name,
+                "strict": true,
+                "schema": req.schema,
+            }
+        });
+
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let mut attempt = 0;
+        loop {
+            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (structured)", url);
+            let result = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let is_network_error = false;
+
+                    if status.is_success() {
+                        let text = resp.text().await?;
+                        let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+                            self.make_err(format!("failed to parse response: {e}; body: {text}"))
+                        })?;
+                        let choice = parsed
+                            .choices
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| self.make_err("response had no choices"))?;
+                        let completion = parse_completion(choice, parsed.usage);
+                        // Parse the content as JSON
+                        if completion.content.trim().is_empty() {
+                            return Err(
+                                self.make_err("structured response had empty content".to_string())
+                            );
+                        }
+                        let parsed_json: Value = serde_json::from_str(&completion.content)
+                            .map_err(|e| {
+                                self.make_err(format!(
+                                    "failed to parse structured response as JSON: {e}; content: {}",
+                                    completion.content
+                                ))
+                            })?;
+                        return Ok(parsed_json);
+                    }
+
+                    let text = resp.text().await?;
+                    tracing::debug!(target: "recursive::llm", body = %text, "error response (structured)");
+
+                    if let Some(backoff) =
+                        self.retry
+                            .backoff_for(attempt, Some(status.as_u16()), is_network_error)
+                    {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            status = status.as_u16(),
+                            "transient HTTP error, retrying (structured)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
+                }
+                Err(e) => {
+                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            error = %e,
+                            "network error, retrying (structured)"
                         );
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
@@ -872,5 +976,122 @@ data: [DONE]\n\n";
             policy.backoff_for(5, Some(500), false),
             Some(Duration::from_secs(3))
         );
+    }
+
+    #[tokio::test]
+    async fn openai_structured_includes_schema_in_request_body() {
+        // Spawn a mock server that captures the request body and returns
+        // a valid JSON response. Assert the request body contains the
+        // response_format block with the schema.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Extract the JSON body (after the blank line)
+            if let Some(body_start) = request.find("\r\n\r\n") {
+                let body = request[body_start + 4..].trim().to_string();
+                *captured_clone.lock().unwrap() = body.clone();
+            }
+            let response_body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":42}"},"finish_reason":"stop"}],"usage":null}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-structured-model");
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": {"type": "integer"}
+            },
+            "required": ["answer"]
+        });
+
+        let req = StructuredRequest {
+            messages: vec![Message::user("what is 6 times 7?".to_string())],
+            schema: schema.clone(),
+            schema_name: "math_answer".to_string(),
+        };
+
+        let _ = provider.complete_structured(req).await;
+
+        // Check the captured request body
+        let body_str = captured.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        // Assert response_format is present with the right shape
+        let rf = body.get("response_format").unwrap();
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["name"], "math_answer");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        assert_eq!(rf["json_schema"]["schema"], schema);
+    }
+
+    #[tokio::test]
+    async fn openai_structured_parses_response_json() {
+        // Spawn a mock server that returns a known JSON response.
+        // Assert the parsed value matches.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            // Return a JSON object with summary and kept_facts
+            let response_body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"summary\":\"test\",\"kept_facts\":[\"a\",\"b\"]}"},"finish_reason":"stop"}],"usage":null}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-structured-model");
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "kept_facts": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["summary", "kept_facts"]
+        });
+
+        let req = StructuredRequest {
+            messages: vec![Message::user("summarize".to_string())],
+            schema,
+            schema_name: "summary".to_string(),
+        };
+
+        let result = provider.complete_structured(req).await;
+        assert!(result.is_ok(), "got error: {:?}", result.err());
+        let value = result.unwrap();
+        assert_eq!(value["summary"], "test");
+        assert_eq!(value["kept_facts"][0], "a");
+        assert_eq!(value["kept_facts"][1], "b");
     }
 }
