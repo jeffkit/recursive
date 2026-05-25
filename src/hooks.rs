@@ -169,17 +169,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct CountingHook {
-        count: Arc<AtomicUsize>,
-    }
-
-    impl Hook for CountingHook {
-        fn on_event(&self, _event: HookEvent) -> HookAction {
-            self.count.fetch_add(1, Ordering::SeqCst);
-            HookAction::Continue
-        }
-    }
-
     struct SkipHook;
 
     impl Hook for SkipHook {
