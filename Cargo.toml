@@ -51,3 +51,27 @@ debug = 1
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+required-features = []
+
+[[example]]
+name = "with_tools"
+path = "examples/with_tools.rs"
+required-features = []
+
+[[example]]
+name = "with_hooks"
+path = "examples/with_hooks.rs"
+required-features = []
+
+[[example]]
+name = "with_mcp"
+path = "examples/with_mcp.rs"
+required-features = []
+
+[[example]]
+name = "with_skills"
+path = "examples/with_skills.rs"
+required-features = []

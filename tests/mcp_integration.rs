@@ -118,10 +118,7 @@ async fn test_read_file() {
     let mut client = McpClient::spawn(server()).await.unwrap();
 
     let content = client
-        .call_tool(
-            "read_file",
-            json!({"path": file_path.to_string_lossy()}),
-        )
+        .call_tool("read_file", json!({"path": file_path.to_string_lossy()}))
         .await
         .unwrap();
 
@@ -183,10 +180,7 @@ async fn test_read_nonexistent_file() {
     let mut client = McpClient::spawn(server()).await.unwrap();
 
     let err = client
-        .call_tool(
-            "read_file",
-            json!({"path": nonexistent.to_string_lossy()}),
-        )
+        .call_tool("read_file", json!({"path": nonexistent.to_string_lossy()}))
         .await
         .unwrap_err();
 
