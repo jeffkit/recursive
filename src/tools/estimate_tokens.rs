@@ -59,6 +59,8 @@ impl Tool for EstimateTokens {
         }
     }
 
+    fn is_readonly(&self) -> bool { true }
+
     async fn execute(&self, arguments: Value) -> Result<String> {
         let text_arg = arguments.get("text");
         let path_arg = arguments.get("path");

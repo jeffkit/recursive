@@ -50,6 +50,8 @@ impl Tool for SearchFiles {
         }
     }
 
+    fn is_readonly(&self) -> bool { true }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let pattern = args["pattern"].as_str().ok_or_else(|| Error::BadToolArgs {
             name: "search_files".into(),

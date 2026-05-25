@@ -331,26 +331,35 @@ impl Agent {
                 completion.tool_calls.clone(),
             ));
 
-            for call in completion.tool_calls.iter() {
+            // Phase 1: emit ToolCall events for all calls
+            for call in &completion.tool_calls {
                 self.emit(StepEvent::ToolCall {
                     call: call.clone(),
                     step,
                 });
+            }
 
-                // Apply permission hook before executing the tool
+            // Phase 2: separate read-only and write calls, then execute.
+            // Read-only calls run in parallel; write calls run sequentially
+            // to preserve ordering guarantees.
+            let mut results: Vec<(String, String, String, serde_json::Value)> = Vec::new(); // (id, name, output, args)
+
+            // First pass: handle denied/skipped calls immediately, collect
+            // the rest for execution.
+            struct PendingCall {
+                id: String,
+                name: String,
+                args: serde_json::Value,
+            }
+            let mut pending: Vec<PendingCall> = Vec::new();
+
+            for call in &completion.tool_calls {
                 let effective_args = if let Some(ref hook) = self.permission_hook {
                     match hook(&call.name, &call.arguments) {
                         PermissionDecision::Allow => call.arguments.clone(),
                         PermissionDecision::Deny(reason) => {
                             let result = format!("ERROR: {reason}");
-                            self.emit(StepEvent::ToolResult {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                output: result.clone(),
-                                step,
-                            });
-                            self.transcript
-                                .push(Message::tool_result(call.id.clone(), result));
+                            results.push((call.id.clone(), call.name.clone(), result, call.arguments.clone()));
                             continue;
                         }
                         PermissionDecision::Transform(new_args) => new_args,
@@ -364,52 +373,112 @@ impl Agent {
                     name: &call.name,
                     args: &effective_args,
                 });
-                let result = match hook_action {
+                match hook_action {
                     HookAction::Skip => {
                         let result = "ERROR: tool call skipped by hook".to_string();
-                        self.emit(StepEvent::ToolResult {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            output: result.clone(),
-                            step,
-                        });
-                        self.transcript
-                            .push(Message::tool_result(call.id.clone(), result));
+                            results.push((call.id.clone(), call.name.clone(), result, call.arguments.clone()));
                         continue;
                     }
                     HookAction::Error(msg) => {
                         let result = format!("ERROR: {msg}");
-                        self.emit(StepEvent::ToolResult {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            output: result.clone(),
-                            step,
-                        });
-                        self.transcript
-                            .push(Message::tool_result(call.id.clone(), result));
+                            results.push((call.id.clone(), call.name.clone(), result, call.arguments.clone()));
                         continue;
                     }
-                    HookAction::Continue => {
-                        let tool_start = std::time::Instant::now();
-                        let result = match self.tools.invoke(&call.name, effective_args).await {
-                            Ok(output) => output,
-                            Err(err) => format!("ERROR: {err}"),
-                        };
-                        let duration_ms = tool_start.elapsed().as_millis() as u64;
-                        self.hooks.dispatch(HookEvent::PostToolCall {
-                            name: &call.name,
-                            args: &call.arguments,
-                            result: &result,
-                            duration_ms,
-                        });
-                        result
+                    HookAction::Continue => {}
+                }
+
+                pending.push(PendingCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: effective_args,
+                });
+            }
+
+            // Second pass: execute read-only calls in parallel, write calls sequentially.
+            // We process calls in order, but batch consecutive read-only calls together.
+            let mut i = 0;
+            while i < pending.len() {
+                if self.tools.is_readonly(&pending[i].name) {
+                    // Batch consecutive read-only calls
+                    let batch_start = i;
+                    while i < pending.len() && self.tools.is_readonly(&pending[i].name) {
+                        i += 1;
                     }
-                };
+                    let batch: Vec<PendingCall> = pending.drain(batch_start..i).collect();
+                    i = batch_start; // reset i since we drained
+
+                    // Execute read-only batch in parallel
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for pc in &batch {
+                        let name = pc.name.clone();
+                        let args = pc.args.clone();
+                        let tools = self.tools.clone();
+                        join_set.spawn(async move {
+                            let tool_start = std::time::Instant::now();
+                            let result = match tools.invoke(&name, args).await {
+                                Ok(output) => output,
+                                Err(err) => format!("ERROR: {err}"),
+                            };
+                            let duration_ms = tool_start.elapsed().as_millis() as u64;
+                            (name, result, duration_ms)
+                        });
+                    }
+
+                    // Collect results in order (JoinSet yields as they complete,
+                    // but we need to map back to original order)
+                    let mut batch_results: Vec<(String, String, u64)> = Vec::new();
+                    while let Some(res) = join_set.join_next().await {
+                        let (name, result, duration_ms) = res.unwrap();
+                        batch_results.push((name, result, duration_ms));
+                    }
+
+                    // Map results back to original order
+                    for pc in &batch {
+                        let (_, result, duration_ms) = batch_results
+                            .iter()
+                            .find(|(n, _, _)| n == &pc.name)
+                            .unwrap();
+                        results.push((pc.id.clone(), pc.name.clone(), result.clone(), pc.args.clone()));
+                        self.hooks.dispatch(HookEvent::PostToolCall {
+                            name: &pc.name,
+                            args: &pc.args,
+                            result,
+                            duration_ms: *duration_ms,
+                        });
+                    }
+                } else {
+                    // Execute write call sequentially
+                    let pc = pending.remove(i);
+                    let tool_start = std::time::Instant::now();
+                    let result = match self.tools.invoke(&pc.name, pc.args.clone()).await {
+                        Ok(output) => output,
+                        Err(err) => format!("ERROR: {err}"),
+                    };
+                    let duration_ms = tool_start.elapsed().as_millis() as u64;
+                    results.push((pc.id.clone(), pc.name.clone(), result.clone(), pc.args.clone()));
+                    self.hooks.dispatch(HookEvent::PostToolCall {
+                        name: &pc.name,
+                        args: &pc.args,
+                        result: &result,
+                        duration_ms,
+                    });
+                    // i intentionally NOT incremented: remove(i) shifts remaining elements down
+                }
+            }
+
+            // Phase 3: emit results and push to transcript (preserving original order)
+            for (id, name, result, args) in &results {
+                self.emit(StepEvent::ToolResult {
+                    id: id.clone(),
+                    name: name.clone(),
+                    output: result.clone(),
+                    step,
+                });
 
                 // Anti-stuck heuristic: track identical failing calls
                 let call_key = (
-                    call.name.clone(),
-                    serde_json::to_string(&call.arguments).unwrap_or_default(),
+                    name.clone(),
+                    serde_json::to_string(args).unwrap_or_default(),
                 );
                 let is_error = result.starts_with("ERROR:");
 
@@ -427,7 +496,7 @@ impl Agent {
 
                 // Check if stuck threshold reached
                 if consecutive_errors >= STUCK_THRESHOLD {
-                    let repeated_call = call.name.clone();
+                    let repeated_call = name.clone();
                     let repeats = consecutive_errors;
                     let finish = FinishReason::Stuck {
                         repeated_call,
@@ -447,14 +516,8 @@ impl Agent {
                     });
                 }
 
-                self.emit(StepEvent::ToolResult {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: result.clone(),
-                    step,
-                });
                 self.transcript
-                    .push(Message::tool_result(call.id.clone(), result));
+                    .push(Message::tool_result(id.clone(), result.clone()));
             }
         }
 
@@ -864,7 +927,7 @@ mod tests {
             .build()
             .unwrap();
         let out = agent.run("loop").await.unwrap();
-        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert_eq!(out.steps, 3);
         // Transcript MUST be populated even on budget-exceeded — this is
         // what unlocks auto-resume in self-improve.sh.
@@ -1027,7 +1090,7 @@ mod tests {
         let out = agent.run("add with different args").await.unwrap();
 
         // Should hit budget, not stuck (args differ each time)
-        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert_eq!(out.steps, 3);
     }
 
@@ -1074,7 +1137,7 @@ mod tests {
             .unwrap();
         let out = agent.run("loop").await.unwrap();
 
-        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert!(
             !out.transcript.is_empty(),
             "transcript must survive BudgetExceeded for auto-resume"
@@ -1943,5 +2006,322 @@ mod tracing_tests {
         // Should have both run and step spans
         assert!(logs_contain("run:"));
         assert!(logs_contain("step="));
+    }
+}
+
+// ============================================================================
+// Parallel execution tests
+// ============================================================================
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::llm::{Completion, MockProvider, ToolCall};
+    use crate::ToolSpec;
+    use crate::tools::Tool;
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A read-only tool that records its execution order and simulates latency.
+    struct SlowReadOnly {
+        counter: Arc<AtomicUsize>,
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl Tool for SlowReadOnly {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "slow_read".into(),
+                description: "a slow read-only tool".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        fn is_readonly(&self) -> bool { true }
+        async fn execute(&self, _args: Value) -> Result<String> {
+            let order = self.counter.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            Ok(format!("read-{}", order))
+        }
+    }
+
+    /// A write tool that records its execution order.
+    struct TrackingWrite {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for TrackingWrite {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "track_write".into(),
+                description: "a tracked write tool".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: Value) -> Result<String> {
+            let order = self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("write-{}", order))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_execute_in_parallel() {
+        // Two read-only tools with delays. If executed in parallel, total
+        // time should be ~100ms (not ~200ms).
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tool1 = Arc::new(SlowReadOnly {
+            counter: counter.clone(),
+            delay_ms: 100,
+        });
+        let tool2 = Arc::new(SlowReadOnly {
+            counter: counter.clone(),
+            delay_ms: 100,
+        });
+
+        let tools = ToolRegistry::local()
+            .register(tool1)
+            .register(tool2);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "reading...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let start = std::time::Instant::now();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("read in parallel").await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Should complete in ~100ms (parallel), not ~200ms (sequential)
+        assert!(
+            elapsed.as_millis() < 150,
+            "parallel execution took {}ms, expected <150ms",
+            elapsed.as_millis()
+        );
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+
+        // Both results should be present in the transcript
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn write_tools_execute_sequentially() {
+        // Two write tools. If executed sequentially, the order counter
+        // should increment predictably.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tool1 = Arc::new(TrackingWrite {
+            counter: counter.clone(),
+        });
+        let tool2 = Arc::new(TrackingWrite {
+            counter: counter.clone(),
+        });
+
+        let tools = ToolRegistry::local()
+            .register(tool1)
+            .register(tool2);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "writing...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("write sequentially").await.unwrap();
+
+        // Both results should be present
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[tokio::test]
+    async fn mixed_read_write_preserves_order() {
+        // Mix of read-only and write tools. Read-only tools should run in
+        // parallel, write tools sequentially, but results should appear in
+        // the original call order in the transcript.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let read_tool = Arc::new(SlowReadOnly {
+            counter: counter.clone(),
+            delay_ms: 10,
+        });
+        let write_tool = Arc::new(TrackingWrite {
+            counter: counter.clone(),
+        });
+
+        let tools = ToolRegistry::local()
+            // Adder not needed for this test
+            .register(read_tool)
+            .register(write_tool);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "mixed...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("mixed").await.unwrap();
+
+        // Results should be in original order: read, write, read
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 3);
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[tokio::test]
+    async fn parallel_read_only_with_unknown_tool() {
+        // Mix of read-only and unknown tools. Unknown tools should error
+        // but not prevent parallel execution of read-only tools.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let read_tool = Arc::new(SlowReadOnly {
+            counter: counter.clone(),
+            delay_ms: 10,
+        });
+
+        let tools = ToolRegistry::local()
+            .register(read_tool);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "mixed...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "unknown_tool".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("mixed with unknown").await.unwrap();
+
+        // Should complete with both results (one error)
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+        // The unknown tool should have an error message
+        assert!(tool_msgs[1].content.contains("ERROR"));
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
     }
 }
