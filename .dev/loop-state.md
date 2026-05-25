@@ -7,11 +7,41 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T08:22Z.** Empty between batches 8 and 9.
-> Batch 9 will be the **first 3-wide run** (GLM-4-flash joins
-> DeepSeek + MiniMax).
+> **As of 2026-05-25T08:32Z.** Batch 10, 3-wide with 2x DeepSeek + 1x
+> MiniMax (GLM dropped — `余额不足` on the only available 5.1 model).
+> User confirmed DeepSeek can be safely double-booked.
+> - **goal-24 per-step-latency** (deepseek, PID 28325).
+>   Surface: `src/agent.rs` + `src/main.rs::print_usage`.
+> - **goal-25 apply-patch-dry-run** (deepseek, PID 28704).
+>   Surface: `src/tools/apply_patch.rs` only.
+> - **goal-23 shell-timeout-env** (minimax, PID 28964).
+>   Surface: `src/config.rs` + `src/main.rs::build_tools`.
+> - Watcher: PID 40149, heartbeat PID 40241 (30-min fallback).
 
 ## Last batch landed
+
+> **Goals 21 + 22**, ninth concurrent batch (first attempted 3-wide,
+> de-facto 2-wide because GLM rolled back). Both intended slots green.
+> - goal-21 deepseek-cache-hits (deepseek): merged. 55 messages,
+>   $0.2136, +3 new tests. `TokenUsage` now tracks
+>   `cache_hit_tokens` / `cache_miss_tokens` from DeepSeek's
+>   `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` fields,
+>   surfaced in `print_usage`. Observability-only — no cost-calc
+>   change since DeepSeek's published price already reflects cache.
+> - goal-22 apply-patch-nicer-error (minimax): merged. 71 messages,
+>   **$0.4186 — new most-expensive single run**. `apply_patch` now
+>   surfaces up to 3 unique-context examples as `@@ anchor`
+>   suggestions when a hunk's context matches multiple locations.
+>   The cost spike is from `apply_patch.rs` being a large file
+>   (transcript accumulation) and 18 agent loops worth of LLM
+>   completions. Worth it given how many runs go Stuck on V4A
+>   ambiguity.
+> - goal-23 shell-timeout-env (glm-5.1, first 3-wide slot):
+>   **rolled back** — HTTP 429 / Zhipu error 1113 *余额不足或无可用
+>   资源包,请充值* on the very first request. GLM-4-flash had no
+>   product changes either (weak tool-use). GLM dropped from
+>   rotation for now; user will top up if/when desired.
+> - 123 tests green on main (119 + 3 from g21 + 1 from g22 net new).
 
 > **Goals 19 + 20**, eighth concurrent batch — both green, no
 > rollbacks, no manual landings. First batch since #5 that's
