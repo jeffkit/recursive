@@ -15,3 +15,7 @@ Cargo.lock.bak
 # Auto-saved transcripts from self-improve.sh (kept on disk for diagnosis,
 # but never committed — they're huge JSON dumps that bloat the repo).
 .dev/transcripts/
+
+# Personal IDE / AI assistant config (per-user, not project policy).
+.claude/
+.cursor/local/
