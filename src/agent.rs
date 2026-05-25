@@ -821,7 +821,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder().llm(llm).tools(tools).build().unwrap();
         let out = agent.run("what is 2+3?").await.unwrap();
         assert_eq!(out.final_message.as_deref(), Some("5"));
@@ -846,7 +846,7 @@ mod tests {
             });
         }
         let llm = Arc::new(MockProvider::new(script));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder()
             .llm(llm)
             .tools(tools)
@@ -913,7 +913,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut agent = Agent::builder()
             .llm(llm)
@@ -1006,7 +1006,7 @@ mod tests {
             });
         }
         let llm = Arc::new(MockProvider::new(script));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         // Set max_steps low so test terminates with budget
         let mut agent = Agent::builder()
             .llm(llm)
@@ -1055,7 +1055,7 @@ mod tests {
             });
         }
         let llm = Arc::new(MockProvider::new(script));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder()
             .llm(llm)
             .tools(tools)
@@ -1117,7 +1117,7 @@ mod tests {
                 usage: Some(u2),
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder().llm(llm).tools(tools).build().unwrap();
         let out = agent.run("add twice").await.unwrap();
 
@@ -1188,7 +1188,7 @@ mod tests {
             });
         }
         let llm = Arc::new(MockProvider::new(script));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder()
             .llm(llm)
             .tools(tools)
@@ -1224,7 +1224,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder().llm(llm).tools(tools).build().unwrap();
         let out = agent.run("what is 2+3?").await.unwrap();
         assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
@@ -1296,7 +1296,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let compactor = crate::compact::Compactor::new(10).keep_recent_n(2);
         let mut agent = Agent::builder()
@@ -1358,7 +1358,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut agent = Agent::builder()
             .llm(llm)
@@ -1429,7 +1429,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         // keep_recent_n=1 forces the naive split onto the Tool message.
         // min_messages check is keep_recent_n + 2 = 3, satisfied at step 2.
         let compactor = crate::compact::Compactor::new(10).keep_recent_n(1);
@@ -1624,7 +1624,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut agent = Agent::builder()
             .llm(llm)
@@ -1688,7 +1688,7 @@ mod tests {
                 Ok("x".repeat(500))
             }
         }
-        let tools = ToolRegistry::new().register(Arc::new(BigResultTool));
+        let tools = ToolRegistry::local().register(Arc::new(BigResultTool));
         // Set limit so the big result (500 chars) plus user goal (2 chars)
         // plus assistant text (~17 chars) would exceed, but trimming the
         // tool result to the placeholder (~50 chars) brings it under.
@@ -1740,7 +1740,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         // Set a very tight limit that even the user goal alone exceeds.
         let mut agent = Agent::builder()
             .llm(llm)
@@ -1778,7 +1778,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder()
             .llm(llm)
             .tools(tools)
@@ -1812,7 +1812,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         let mut agent = Agent::builder()
             .llm(llm)
             .tools(tools)
@@ -1854,7 +1854,7 @@ mod tests {
                 usage: None,
             },
         ]));
-        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
         // Transform args to add 1+2 instead of 100+200
         let mut agent = Agent::builder()
             .llm(llm)

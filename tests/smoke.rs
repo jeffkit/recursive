@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use recursive::{
     llm::{Completion, MockProvider, ToolCall},
-    tools::{ListDir, ReadFile, WriteFile},
+    tools::{ListDir, LocalTransport, ReadFile, ToolTransport, WriteFile},
     Agent, ToolRegistry,
 };
 use serde_json::json;
@@ -58,7 +58,8 @@ async fn agent_writes_reads_and_summarises() {
     ];
 
     let llm = Arc::new(MockProvider::new(script));
-    let tools = ToolRegistry::new()
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    let tools = ToolRegistry::new(transport)
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(ListDir::new(root)));

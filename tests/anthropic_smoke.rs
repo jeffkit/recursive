@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use recursive::{
     llm::AnthropicProvider,
-    tools::{ReadFile, WriteFile},
+    tools::{LocalTransport, ReadFile, ToolTransport, WriteFile},
     Agent, ToolRegistry,
 };
 use tempfile::TempDir;
@@ -89,7 +89,8 @@ async fn anthropic_full_agent_loop_with_mock_provider() {
         "claude-3-sonnet-20240229",
     ));
 
-    let tools = ToolRegistry::new()
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    let tools = ToolRegistry::new(transport)
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ReadFile::new(root)));
 
