@@ -50,6 +50,42 @@ files in this folder; this index is the side-by-side comparison.
 | 36 project-context-file | minimax | MiniMax-M2 | 35 | 34 | 3 | 9:0 | $0.3544 | NoMoreToolCalls (perfect patch discipline — 0 write_file invocations) |
 | 37 web-fetch-tool | minimax | MiniMax-M2 | 110 | ~ | ? | 16:4 | (varied) | NoMoreToolCalls (highest-step batch-13 goal — HTML extraction is non-trivial) |
 | 38 persistent-memory | deepseek | deepseek-chat | 28 | ~ | ? | 9:1 | $0.3065 | NoMoreToolCalls (97.9% cache hit; 9 new tests across remember/recall/forget) |
+| 39 estimate-tokens-tool | minimax | MiniMax-M2 | 32 | ~ | ? | 9:1 | $0.2824 | NoMoreToolCalls (Phase 1 closer; 6 new tests) |
+| 40 sub-agent | deepseek | deepseek-chat | 38 | ~ | ? | 16:1 | $0.6251 | NoMoreToolCalls (recursive agent primitive; 7 new tests; default-off via env flag) |
+| 41 structured-output | deepseek | deepseek-chat | 29 | ~ | ? | 10:0 | $0.3146 | NoMoreToolCalls (LlmProvider extension; perfect patch discipline; 3 new tests) |
+| 42 otel-tracing | minimax | MiniMax-M2 | 103 | ~ | ? | 45:4 | **$2.1722** | NoMoreToolCalls (NEW cost record; instrumenting agent.rs + llm/* + tools/* needed 45 surgical patches; 3 new tests) |
+
+### Batch 14 (g39-g42) — Phase 1 done, Phase 4 starts
+
+All four green again, no auto-resume. **Total cost ≈ $3.43** dominated
+by g42 otel-tracing at $2.17 (highest single-goal cost ever, beating
+g24 latency at $0.74). Cause: instrumentation work touches many spots
+across many files — every `#[tracing::instrument]` requires reading
+the function context first, then applying a small patch. 45 apply_patch
+invocations is the highest count observed.
+
+Highlights:
+
+- **g40 sub-agent**: the recursive agent primitive. 38 steps, $0.63.
+  Default-off via `RECURSIVE_SUBAGENT_ENABLED=1` so baseline behavior
+  is unchanged. Depth-limit + tool-subset isolation both implemented.
+- **g41 structured-output**: plumbing only (no callers wired). Sets up
+  `LlmProvider::complete_structured()` for future plan-then-act,
+  compactor structured summaries, etc.
+- **g39 estimate-tokens-tool**: closes Phase 1 with the char/4
+  heuristic. No tokenizer crate dependency (deliberate — heavy native
+  dep for marginal gain).
+- **g42 otel-tracing**: spans only, no exporter. Operators bring their
+  own subscriber. Worth noting for future: even though g42 was "S"
+  effort in the roadmap, the actual work was high — 7 files touched,
+  103 steps. Future "instrumentation" goals should probably be sized
+  M, not S.
+
+**Merge conflict**: 1 of 4 (g40 in `src/main.rs` — combined use
+imports). All others auto-merged including the heaviest g42.
+
+Tests: 211 lib → 230 lib (+19 net new from batch). Total tests
+214 → 233.
 
 ### Batch 13 (g35-g38) — Phase 1 closes, Phase 2 majority
 

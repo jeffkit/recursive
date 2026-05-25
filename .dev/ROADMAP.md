@@ -266,19 +266,19 @@ Status legend: **✅ landed** | **🟡 in-batch-N** | **🔴 not started** | **�
 | 1.1   | Context Compaction   | M      | Critical | ✅ agent.rs only     | ✅ landed `e63eb63` (g31 deepseek, batch-12) |
 | 1.2   | Project Context File | S      | High     | ✅ config/context    | ✅ landed `2dbe297` (g36 minimax, batch-13) |
 | 1.3   | Streaming            | M      | High     | ✅ LlmProvider trait | ✅ landed `92d257e` (g32 deepseek, batch-12; startup-panic regression fixed in `c5b2b8d`) |
-| 1.4   | estimate_tokens Tool | S      | Medium   | ✅ new Tool          | 🔴 not started (renamed from "Count Lines" — was removed in goal-16; new tool is token estimator, not just line count) |
+| 1.4   | estimate_tokens Tool | S      | Medium   | ✅ new Tool          | ✅ landed `0357e1f` (g39 minimax, batch-14; **Phase 1 complete**) |
 | 2.1   | MCP Client           | L      | Critical | ✅ new Tool source   | ✅ landed `8792131` (g35 deepseek, batch-13; the headline) |
 | 2.2   | Web Fetch            | S      | High     | ✅ new Tool          | ✅ landed `13df912` (g37 minimax, batch-13) |
 | 2.3   | Anthropic Provider   | M      | High     | ✅ new LlmProvider   | ✅ landed `44cec95` (g34 minimax, batch-12; MiniMax + DeepSeek both expose Anthropic-compatible endpoints — free testing surface) |
-| 3.1   | Sub-Agent            | M      | High     | ✅ new Tool          | 🔴 not started |
+| 3.1   | Sub-Agent            | M      | High     | ✅ new Tool          | ✅ landed `bd01835` (g40 deepseek, batch-14; recursive primitive, default-off via `RECURSIVE_SUBAGENT_ENABLED`) |
 | 3.2   | Persistent Memory    | S      | Medium   | ✅ new Tool+startup  | ✅ landed `15249ef` (g38 deepseek, batch-13) |
 | 3.3   | Skill System         | M      | Medium   | ✅ new Tool+index    | ✅ landed `efef2cc` (g33 minimax→manual, batch-12; auto-resume infra bug surfaced — see Phase 0 follow-ups) |
 | 3.4   | Permission Hooks     | S      | High     | ✅ builder callback  | 🔴 not started |
 | 4.1   | Docker Sandbox       | L      | Medium   | ✅ wrapper           | 🔴 not started |
 | 4.2   | Session Management   | M      | Medium   | ✅ persistence layer | 🔴 not started |
-| 4.3   | Structured Output    | S      | Medium   | ✅ LlmProvider       | 🔴 not started |
+| 4.3   | Structured Output    | S      | Medium   | ✅ LlmProvider       | ✅ landed `477e689` (g41 deepseek, batch-14; plumbing only — no callers yet) |
 | 4.4   | Hooks                | M      | Medium   | ✅ observer pattern  | 🔴 not started |
-| 4.5   | OpenTelemetry        | S      | Low      | ✅ observer pattern  | 🔴 not started |
+| 4.5   | OpenTelemetry        | S      | Low      | ✅ observer pattern  | ✅ landed `2df8fc4` (g42 minimax, batch-14; spans only, no exporter) |
 
 S = small (~1 day), M = medium (~2-3 days), L = large (~1 week)
 

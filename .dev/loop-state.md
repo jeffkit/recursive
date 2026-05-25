@@ -7,40 +7,44 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T10:46Z.** Batch 14 launched (hybrid plan,
-> per user "you-decide" signal). Baseline `5962c05`. Effective
-> step ceiling per goal: 400 (single-pass 200 + auto-resume).
+> **As of 2026-05-25T10:55Z.** Idle. Batch 14 fully landed — 4/4 green
+> on first attempt, all NoMoreToolCalls, no auto-resume.
+> Tests 214 → 233 (+19 net). Cost ≈ **$3.43** (dominated by g42
+> at $2.17 — instrumentation is more expensive than the "S" effort
+> estimate suggested).
 >
-> - **goal-40 sub-agent** (deepseek, pid 82616) — 3.1, M.
->   Worktree `sub-agent-deepseek-20260525T104547Z-82584`.
->   Biggest goal — recursive agent invocation primitive. Watch for
->   depth-counter design and tool-subset isolation.
-> - **goal-41 structured-output** (deepseek, pid 85299) — 4.3, S.
->   Worktree `structured-output-deepseek-20260525T104556Z-85261`.
->   Adds `complete_structured` to LlmProvider; plumbing only.
-> - **goal-39 estimate-tokens-tool** (minimax, pid 88451) — 1.4, S.
->   Worktree `estimate-tokens-tool-minimax-20260525T104606Z-88435`.
->   Closes Phase 1. char/4 heuristic, no tokenizer dep.
-> - **goal-42 otel-tracing** (minimax, pid 92154) — 4.5, S.
->   Worktree `otel-tracing-minimax-20260525T104616Z-92110`.
->   `#[tracing::instrument]` on hot paths; no exporter dep.
+> Tree clean at `2df8fc4`.
 >
-> Conflict surface in main.rs again: tool registration (g39 + g40)
-> + CLI flags (g41, g42 unlikely). Likely 1-2 small auto-merge
-> conflicts.
+> **Roadmap status after batch 14**:
+> - Phase 1 Foundation: **4/4 done — COMPLETE**
+> - Phase 2 Ecosystem: **3/3 done — COMPLETE**
+> - Phase 3 Agent Intelligence: **3/4 done** (3.4 Permission Hooks left)
+> - Phase 4 Production Readiness: **2/5 done** (4.3, 4.5 landed;
+>   4.1 Docker Sandbox, 4.2 Session Management, 4.4 Hooks remain)
+>
+> Six roadmap items left: 3.4, 4.1, 4.2, 4.4 + miscellaneous follow-ups
+> (no-callers-yet for 4.3/4.5, exporter for 4.5, callers for 4.3,
+> Anthropic structured output, sub-agent streaming, etc.).
+>
+> **Strategic note for batch 15**: 4.1 (Docker Sandbox, L) is the
+> remaining "big" item. Worth saving for a dedicated batch with
+> careful prep. Batch 15 should probably consolidate: 3.4 Permission
+> Hooks + 4.4 Hooks + 4.2 Session Management + a "real consumer"
+> goal that wires 4.3 structured-output into Compactor. Defer 4.1
+> to batch 16 or later.
 
 ## Roadmap delta (live)
 
 > Updated each time a batch lands. See `.dev/ROADMAP.md` Priority
 > Matrix for the canonical status column.
 >
-> **Just landed (batch 13)**: 1.2 ✅, 2.1 ✅, 2.2 ✅, 3.2 ✅
+> **Just landed (batch 14)**: 1.4 ✅, 3.1 ✅, 4.3 ✅, 4.5 ✅
 > **In progress**: none
-> **Phase 1 (Foundation)**: 3/4 done. Only 1.4 (estimate_tokens) left.
-> **Phase 2 (Connectors)**: 3/3 done — phase complete.
-> **Phase 3 (Agent Intelligence)**: 2/4 done. 3.1 (Sub-Agent), 3.4
->   (Permission Hooks) remain.
-> **Phase 4 (Production Readiness)**: 0/5, not started.
+> **Phase 1 (Foundation)**: 4/4 done — **complete**.
+> **Phase 2 (Connectors)**: 3/3 done — **complete**.
+> **Phase 3 (Agent Intelligence)**: 3/4 done. 3.4 (Permission Hooks) remains.
+> **Phase 4 (Production Readiness)**: 2/5 done. 4.1 Docker Sandbox,
+>   4.2 Session Management, 4.4 Hooks remain.
 >
 > **Phase 0 (kernel polish, pre-roadmap)**: all 27 goals (04-30)
 > landed. ~140 tests baseline. Now 175 tests after batch 12.
@@ -72,10 +76,46 @@
 
 ## Last batch landed
 
-> **Goals 35 + 36 + 37 + 38**, batch 13 — **Phase 1 closes, Phase 2
-> majority lands**. **4/4 green on first attempt**, no auto-resume,
-> all NoMoreToolCalls. Wall-clock from launch to all-verdicts ≈ 9 min
-> (10:28Z → 10:36Z); add ~3 min for merging + housekeeping.
+> **Goals 39 + 40 + 41 + 42**, batch 14 — **Phase 1 done, Phase 4
+> starts**. **4/4 green on first attempt, third batch in a row**,
+> no auto-resume, all NoMoreToolCalls. Wall-clock from launch to
+> all-verdicts ≈ 7 min (10:46Z → 10:53Z); add ~5 min for merging
+> (1 conflict, 4 builds, 4 test cycles).
+>
+> Goal-by-goal:
+>
+> - **goal-39 estimate-tokens-tool** (minimax): merged `0357e1f`.
+>   32 steps, $0.28. char/4 heuristic, supports `text` OR `path`,
+>   sandboxed via `resolve_within`. **Closes Phase 1.**
+>
+> - **goal-40 sub-agent** (deepseek, batch-14 headline): merged
+>   `bd01835`. 38 steps, $0.63. Default-off via
+>   `RECURSIVE_SUBAGENT_ENABLED=1`. Recursive primitive with
+>   depth limit + tool-subset isolation. 7 new tests.
+>
+> - **goal-41 structured-output** (deepseek): merged `477e689`.
+>   29 steps, $0.31. **Perfect patch discipline (10:0)**. Pure
+>   plumbing — adds `LlmProvider::complete_structured()` with a
+>   default `Err`, OpenAiProvider override. No callers yet —
+>   future goals will use it.
+>
+> - **goal-42 otel-tracing** (minimax): merged `2df8fc4`.
+>   **103 steps, $2.17 — NEW cost record.** 45 apply_patch
+>   invocations across agent.rs, compact.rs, llm/openai.rs,
+>   llm/mock.rs, tools/mod.rs. `#[tracing::instrument]` spans on
+>   hot paths; default behavior unchanged (no subscriber attached).
+>   Lesson: "S" effort estimate was wrong — instrumentation across
+>   N files is N small patches, costs add up.
+>
+> Total: 178 → 214 → 233 tests across last two batches.
+> Total cost batch 14 ≈ $3.43 (vs $1.40 batch 13). g42 is the cost
+> outlier; otherwise batch 14 would have cost ≈ $1.26 — under batch 13.
+>
+> **Merge conflicts**: 1 of 4 (g40 — `src/main.rs` use imports).
+> All others auto-merged including the heaviest g42.
+>
+> **Batch 13 (previous)**: goals 35-38, Phase 1 closes, Phase 2
+> majority. 4/4 first attempt. 178 → 214 tests, $1.40.
 >
 > Pre-batch infrastructure work paid off:
 > - Bumped `RECURSIVE_MAX_STEPS` 100 → 200 (matches Cursor).
