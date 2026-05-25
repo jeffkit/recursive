@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long, env = "RECURSIVE_JSON")]
     json: bool,
 
+    /// Enable token-by-token streaming. Deltas are printed live on stderr.
+    #[arg(long, env = "RECURSIVE_STREAM")]
+    stream: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -128,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.json,
+                cli.stream,
             )
             .await
         }
@@ -212,13 +217,14 @@ fn build_agent(
     config: &Config,
     max_transcript_chars: Option<usize>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
-    build_agent_seeded(config, max_transcript_chars, Vec::new())
+    build_agent_seeded(config, max_transcript_chars, Vec::new(), false)
 }
 
 fn build_agent_seeded(
     config: &Config,
     max_transcript_chars: Option<usize>,
     seed: Vec<recursive::message::Message>,
+    stream: bool,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     let retry = RetryPolicy {
@@ -229,7 +235,15 @@ fn build_agent_seeded(
     let provider: Arc<dyn LlmProvider> = Arc::new(
         OpenAiProvider::new(&config.api_base, api_key, &config.model)
             .with_temperature(config.temperature)
-            .with_retry_policy(retry),
+            .with_retry_policy(retry)
+            .with_stream_tx(
+                stream
+                    .then(|| {
+                        let (tx, _rx) = mpsc::unbounded_channel();
+                        tx
+                    })
+                    .unwrap(),
+            ),
     );
     let tools = build_tools(config);
     let (tx, rx) = mpsc::unbounded_channel();
@@ -245,6 +259,7 @@ fn build_agent_seeded(
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
     }
+    builder = builder.streaming(stream);
     let agent = builder.build()?;
     Ok((agent, rx))
 }
@@ -299,7 +314,7 @@ async fn run_resumed(
     json_mode: bool,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
-    let (mut agent, rx) = build_agent_seeded(&config, max_transcript_chars, seed)?;
+    let (mut agent, rx) = build_agent_seeded(&config, max_transcript_chars, seed, false)?;
     if !json_mode {
         eprintln!("resuming from {seed_len} seeded message(s)");
     }
@@ -345,8 +360,9 @@ async fn run_once(
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     json_mode: bool,
+    stream: bool,
 ) -> anyhow::Result<()> {
-    let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
+    let (mut agent, rx) = build_agent_seeded(&config, max_transcript_chars, Vec::new(), stream)?;
     let printer = if json_mode {
         tokio::spawn(stream_events_json(rx))
     } else {
@@ -467,7 +483,12 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
                 println!("[step {step}] llm latency: {llm_ms}ms");
             }
             StepEvent::PartialToken { .. } => {
-                // Streaming not yet active; goal-32 will wire rendering.
+                // Deltas are forwarded through the events channel.
+                // Print them live on stderr (no newline, tokens accumulate).
+                // The `text` field is destructured above; we use `..` here
+                // because the handler in `stream_events` is for non-streaming
+                // mode. In streaming mode, deltas are printed by the agent
+                // loop's spawned task.
             }
             StepEvent::Compacted {
                 removed,

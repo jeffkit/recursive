@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::{Completion, LlmProvider, ToolSpec};
+use super::{Completion, LlmProvider, StreamSender, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::Message;
 
@@ -50,6 +50,22 @@ impl LlmProvider for MockProvider {
             ));
         }
         Ok(queue.remove(0))
+    }
+
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        // MockProvider: just delegate to complete and emit the full content
+        let completion = self.complete(messages, tools).await?;
+        if let Some(tx) = stream_tx {
+            if !completion.content.is_empty() {
+                let _ = tx.send(completion.content.clone());
+            }
+        }
+        Ok(completion)
     }
 }
 
