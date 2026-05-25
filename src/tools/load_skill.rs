@@ -216,7 +216,8 @@ impl Tool for LoadSkill {
                 .iter()
                 .find(|s| s.name.to_lowercase() == section_name.to_lowercase())
                 .ok_or_else(|| {
-                    let available: Vec<&str> = skill.sections.iter().map(|s| s.name.as_str()).collect();
+                    let available: Vec<&str> =
+                        skill.sections.iter().map(|s| s.name.as_str()).collect();
                     let available_list = if available.is_empty() {
                         "no sections available for this skill".to_string()
                     } else {
@@ -816,9 +817,11 @@ mod tests {
         let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
         let tool = LoadSkill::new(skills);
 
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(
-            tool.execute(json!({"name": "template-skill", "section": "Overview", "params": {"lang": "python"}})),
-        );
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(
+            json!({"name": "template-skill", "section": "Overview", "params": {"lang": "python"}}),
+        ));
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Review python code.");

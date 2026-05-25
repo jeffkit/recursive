@@ -31,6 +31,11 @@ pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
 pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
+pub use mcp::{
+    discover_mcp_servers, load_mcp_config, McpClient, McpPrompt, McpPromptArgument,
+    McpPromptMessage, McpResource, McpResourceContent, McpServer, McpServerConfig, McpTool,
+    McpToolSpec, ServerCapabilities,
+};
 pub use message::{Message, Role};
 pub use session::SessionFile;
 pub use skills::{

@@ -1068,7 +1068,8 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\nmode: always\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, _depends_on, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, _depends_on, params) =
+            parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Always);
@@ -1084,7 +1085,8 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust, trait\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, _depends_on, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, _depends_on, params) =
+            parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Trigger);
@@ -1101,7 +1103,8 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust\nhint: Rust-related helper\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, _depends_on, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, _depends_on, params) =
+            parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Trigger);

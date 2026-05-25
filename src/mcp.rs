@@ -5,7 +5,9 @@
 //! - `tools/list` to discover tools
 //! - `tools/call` to invoke them
 //!
-//! No prompts, resources, sampling, or notifications.
+//! Also supports:
+//! - `resources/list` and `resources/read`
+//! - `prompts/list` and `prompts/get`
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -68,6 +70,58 @@ pub struct McpToolSpec {
     pub input_schema: Value,
 }
 
+/// A resource exposed by an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+/// Content returned from reading an MCP resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// A prompt template exposed by an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<McpPromptArgument>>,
+}
+
+/// An argument to an MCP prompt template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// A message in an MCP prompt response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: String,
+}
+
 // ---------------------------------------------------------------------------
 // Transport abstraction
 // ---------------------------------------------------------------------------
@@ -96,7 +150,9 @@ impl fmt::Debug for McpTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stdio { .. } => f.debug_struct("Stdio").finish(),
-            Self::HttpSse { sse_url, post_url, .. } => f
+            Self::HttpSse {
+                sse_url, post_url, ..
+            } => f
                 .debug_struct("HttpSse")
                 .field("sse_url", sse_url)
                 .field("post_url", post_url)
@@ -109,6 +165,16 @@ impl fmt::Debug for McpTransport {
 pub struct McpClient {
     transport: McpTransport,
     next_id: u64,
+    /// Capabilities advertised by the server during initialization.
+    capabilities: ServerCapabilities,
+}
+
+/// Capabilities advertised by an MCP server during the initialize handshake.
+#[derive(Debug, Clone, Default)]
+pub struct ServerCapabilities {
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
 }
 
 impl fmt::Debug for McpClient {
@@ -116,6 +182,7 @@ impl fmt::Debug for McpClient {
         f.debug_struct("McpClient")
             .field("transport", &self.transport)
             .field("next_id", &self.next_id)
+            .field("capabilities", &self.capabilities)
             .finish()
     }
 }
@@ -176,6 +243,7 @@ impl McpClient {
                 child: Some(child),
             },
             next_id: 1,
+            capabilities: ServerCapabilities::default(),
         };
 
         client.do_initialize(&server.name).await?;
@@ -264,6 +332,7 @@ impl McpClient {
                 buffer: sse_buffer,
             },
             next_id: 1,
+            capabilities: ServerCapabilities::default(),
         };
 
         client.do_initialize(&server.name).await?;
@@ -297,6 +366,19 @@ impl McpClient {
                     "MCP server protocol version mismatch"
                 );
             }
+        }
+
+        // Parse capabilities from the server response
+        if let Some(caps) = init_result.get("capabilities") {
+            self.capabilities.tools = caps.get("tools").and_then(|v| v.as_bool()).unwrap_or(false);
+            self.capabilities.resources = caps
+                .get("resources")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            self.capabilities.prompts = caps
+                .get("prompts")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
         }
 
         // Send initialized notification (no response expected)
@@ -395,6 +477,142 @@ impl McpClient {
             .unwrap_or_default();
 
         Ok(content)
+    }
+
+    /// Call `resources/list` and return the discovered resources.
+    pub async fn list_resources(&mut self) -> Result<Vec<McpResource>> {
+        if !self.capabilities.resources {
+            return Err(Error::Other(
+                "MCP server does not advertise `resources` capability".into(),
+            ));
+        }
+
+        let result: Value = self
+            .send_request("resources/list", serde_json::json!({}))
+            .await?;
+
+        let resources_arr = result
+            .get("resources")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::Other("MCP `resources/list` response missing `resources` array".into())
+            })?;
+
+        let mut resources = Vec::with_capacity(resources_arr.len());
+        for item in resources_arr {
+            let resource: McpResource = serde_json::from_value(item.clone())
+                .map_err(|e| Error::Other(format!("failed to parse MCP resource: {e}")))?;
+            resources.push(resource);
+        }
+
+        Ok(resources)
+    }
+
+    /// Call `resources/read` for a specific resource URI.
+    /// Returns the list of content items.
+    pub async fn read_resource(&mut self, uri: &str) -> Result<Vec<McpResourceContent>> {
+        if !self.capabilities.resources {
+            return Err(Error::Other(
+                "MCP server does not advertise `resources` capability".into(),
+            ));
+        }
+
+        let result: Value = self
+            .send_request("resources/read", serde_json::json!({ "uri": uri }))
+            .await?;
+
+        let contents_arr = result
+            .get("contents")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::Other("MCP `resources/read` response missing `contents` array".into())
+            })?;
+
+        let mut contents = Vec::with_capacity(contents_arr.len());
+        for item in contents_arr {
+            let content: McpResourceContent = serde_json::from_value(item.clone())
+                .map_err(|e| Error::Other(format!("failed to parse MCP resource content: {e}")))?;
+            contents.push(content);
+        }
+
+        Ok(contents)
+    }
+
+    /// Call `prompts/list` and return the discovered prompts.
+    pub async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>> {
+        if !self.capabilities.prompts {
+            return Err(Error::Other(
+                "MCP server does not advertise `prompts` capability".into(),
+            ));
+        }
+
+        let result: Value = self
+            .send_request("prompts/list", serde_json::json!({}))
+            .await?;
+
+        let prompts_arr = result
+            .get("prompts")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::Other("MCP `prompts/list` response missing `prompts` array".into())
+            })?;
+
+        let mut prompts = Vec::with_capacity(prompts_arr.len());
+        for item in prompts_arr {
+            let prompt: McpPrompt = serde_json::from_value(item.clone())
+                .map_err(|e| Error::Other(format!("failed to parse MCP prompt: {e}")))?;
+            prompts.push(prompt);
+        }
+
+        Ok(prompts)
+    }
+
+    /// Call `prompts/get` for a specific prompt name with optional arguments.
+    /// Returns the list of messages.
+    pub async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: Option<HashMap<String, String>>,
+    ) -> Result<Vec<McpPromptMessage>> {
+        if !self.capabilities.prompts {
+            return Err(Error::Other(
+                "MCP server does not advertise `prompts` capability".into(),
+            ));
+        }
+
+        let mut params = serde_json::json!({ "name": name });
+        if let Some(args) = arguments {
+            params["arguments"] = serde_json::to_value(args)
+                .map_err(|e| Error::Other(format!("failed to serialize prompt arguments: {e}")))?;
+        }
+
+        let result: Value = self.send_request("prompts/get", params).await?;
+
+        let messages_arr = result
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::Other("MCP `prompts/get` response missing `messages` array".into())
+            })?;
+
+        let mut messages = Vec::with_capacity(messages_arr.len());
+        for item in messages_arr {
+            let role = item
+                .get("role")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Other("MCP prompt message missing `role`".into()))?;
+            let content = item
+                .get("content")
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Other("MCP prompt message missing `content.text`".into()))?;
+            messages.push(McpPromptMessage {
+                role: role.to_string(),
+                content: content.to_string(),
+            });
+        }
+
+        Ok(messages)
     }
 
     // -----------------------------------------------------------------------
@@ -498,9 +716,7 @@ impl McpClient {
             let read_future = reader.read_line(&mut line_buf);
             match timeout(Duration::from_secs(10), read_future).await {
                 Ok(Ok(0)) => {
-                    return Err(Error::Other(
-                        "MCP server closed stdout unexpectedly".into(),
-                    ));
+                    return Err(Error::Other("MCP server closed stdout unexpectedly".into()));
                 }
                 Ok(Ok(_)) => {
                     let trimmed = line_buf.trim();
@@ -703,9 +919,7 @@ fn parse_sse_response(buffer: &str, expected_id: u64) -> Option<Result<Value>> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown error");
                         let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        return Some(Err(Error::Other(format!(
-                            "MCP error (code {code}): {msg}"
-                        ))));
+                        return Some(Err(Error::Other(format!("MCP error (code {code}): {msg}"))));
                     }
                     if let Some(result) = parsed.get("result") {
                         return Some(Ok(result.clone()));
@@ -934,7 +1148,7 @@ except:
 
     case "$method" in
         initialize)
-            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":true,"resources":true,"prompts":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
             ;;
         notifications/initialized)
             # No response expected
@@ -944,6 +1158,18 @@ except:
             ;;
         tools/call)
             echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"Echo: hello"}]}}'
+            ;;
+        resources/list)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"file:///tmp/test.txt","name":"Test File","description":"A test file","mimeType":"text/plain"}]}}'
+            ;;
+        resources/read)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"file:///tmp/test.txt","mimeType":"text/plain","text":"Hello, world!"}]}}'
+            ;;
+        prompts/list)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"prompts":[{"name":"greet","description":"Greet someone","arguments":[{"name":"name","description":"The name to greet","required":true}]}]}}'
+            ;;
+        prompts/get)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"messages":[{"role":"user","content":{"type":"text","text":"Hello, world!"}}]}}'
             ;;
         *)
             echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
@@ -1398,9 +1624,278 @@ done
         assert!(servers[0].url.is_none());
         assert_eq!(servers[1].name, "remote");
         assert_eq!(servers[1].command, "");
-        assert_eq!(
-            servers[1].url.as_deref(),
-            Some("http://localhost:3000/sse")
+        assert_eq!(servers[1].url.as_deref(), Some("http://localhost:3000/sse"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Resources tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_resources_list_resources() {
+        let script = mock_script_echo();
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let resources = client.list_resources().await.expect("list_resources");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].uri, "file:///tmp/test.txt");
+        assert_eq!(resources[0].name, "Test File");
+        assert_eq!(resources[0].description.as_deref(), Some("A test file"));
+        assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_resources_read_resource() {
+        let script = mock_script_echo();
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let contents = client
+            .read_resource("file:///tmp/test.txt")
+            .await
+            .expect("read_resource");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].uri, "file:///tmp/test.txt");
+        assert_eq!(contents[0].text.as_deref(), Some("Hello, world!"));
+        assert_eq!(contents[0].mime_type.as_deref(), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_resources_read_resource_with_blob() {
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        resources/read)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"file:///tmp/image.png","mimeType":"image/png","blob":"iVBORw0KGgoAAAANSUhEUgAAAAE="}]}}'
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let contents = client
+            .read_resource("file:///tmp/image.png")
+            .await
+            .expect("read_resource");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].uri, "file:///tmp/image.png");
+        assert_eq!(contents[0].mime_type.as_deref(), Some("image/png"));
+        assert!(contents[0].blob.is_some());
+        assert!(contents[0].text.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompts tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_prompts_list_prompts() {
+        let script = mock_script_echo();
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let prompts = client.list_prompts().await.expect("list_prompts");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "greet");
+        assert_eq!(prompts[0].description.as_deref(), Some("Greet someone"));
+        let args = prompts[0]
+            .arguments
+            .as_ref()
+            .expect("arguments should be present");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "name");
+        assert!(args[0].required);
+    }
+
+    #[tokio::test]
+    async fn test_prompts_get_prompt() {
+        let script = mock_script_echo();
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let messages = client.get_prompt("greet", None).await.expect("get_prompt");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn test_prompts_get_prompt_with_arguments() {
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"prompts":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        prompts/get)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"messages":[{"role":"user","content":{"type":"text","text":"Hello, Alice!"}}]}}'
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "Alice".to_string());
+        let messages = client
+            .get_prompt("greet", Some(args))
+            .await
+            .expect("get_prompt");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Hello, Alice!");
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability check tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_capability_not_advertised_returns_error() {
+        // Server that only advertises tools, not resources
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let err = client.list_resources().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not advertise"),
+            "error should mention capability: {msg}"
+        );
+
+        let err = client
+            .read_resource("file:///tmp/test.txt")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not advertise"),
+            "error should mention capability: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_not_advertised_returns_error_for_prompts() {
+        // Server that only advertises tools, not prompts
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let err = client.list_prompts().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not advertise"),
+            "error should mention capability: {msg}"
+        );
+
+        let err = client.get_prompt("greet", None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not advertise"),
+            "error should mention capability: {msg}"
         );
     }
 }
