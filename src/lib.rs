@@ -10,6 +10,7 @@
 //! `Tool` or `LlmProvider`, never by editing the loop.
 
 pub mod agent;
+pub mod compact;
 pub mod config;
 pub mod error;
 pub mod llm;
@@ -18,6 +19,7 @@ pub mod tools;
 pub mod transcript;
 
 pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
+pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use llm::openai::RetryPolicy;
