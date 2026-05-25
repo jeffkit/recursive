@@ -55,6 +55,33 @@ impl TranscriptFile {
         serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    /// Render the transcript as a human-readable string suitable for
+    /// piping to a pager.
+    pub fn pretty(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "=== transcript ({} messages) ===\n",
+            self.messages.len()
+        ));
+        out.push_str(&format!(
+            "saved_at: {}\nsteps: {}\nmodel: {}\n\n",
+            self.meta.saved_at,
+            self.meta.steps,
+            self.meta.model.as_deref().unwrap_or("(unknown)"),
+        ));
+        for (i, msg) in self.messages.iter().enumerate() {
+            out.push_str(&format!("--- [{}] {:?} ---\n", i, msg.role));
+            if !msg.content.is_empty() {
+                out.push_str(&msg.content);
+                if !msg.content.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
 }
 
 // Tiny RFC3339-ish timestamp without pulling in `chrono`. Format:
@@ -178,5 +205,41 @@ mod tests {
 
         assert!(restored1.meta.model.is_some());
         assert!(restored2.meta.model.is_none());
+    }
+
+    #[test]
+    fn pretty_includes_header_and_meta() {
+        let file = TranscriptFile::new(
+            vec![Message::user("hello".to_string())],
+            5,
+            Some("gpt-4".to_string()),
+        );
+        let output = file.pretty();
+        assert!(output.contains("=== transcript (1 messages) ==="));
+        assert!(output.contains("saved_at:"));
+        assert!(output.contains("steps: 5"));
+        assert!(output.contains("model: gpt-4"));
+    }
+
+    #[test]
+    fn pretty_renders_each_message_with_index_and_role() {
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("usr".to_string()),
+            Message::assistant("asst".to_string()),
+        ];
+        let file = TranscriptFile::new(messages, 3, None);
+        let output = file.pretty();
+        assert!(output.contains("--- [0] System ---"));
+        assert!(output.contains("--- [1] User ---"));
+        assert!(output.contains("--- [2] Assistant ---"));
+    }
+
+    #[test]
+    fn pretty_handles_empty_content_gracefully() {
+        let file = TranscriptFile::new(vec![Message::user(String::new())], 1, None);
+        let output = file.pretty();
+        assert!(output.contains("--- [0] User ---"));
+        // No crash; section header still present
     }
 }
