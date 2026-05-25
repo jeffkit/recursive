@@ -17,6 +17,8 @@ pub struct Skill {
     pub path: PathBuf,
     /// Reference documents found in <skill_dir>/refs/
     pub refs: Vec<SkillRef>,
+    /// Parameters declared in frontmatter.
+    pub params: Vec<SkillParam>,
 }
 
 /// A reference document within a skill's `refs/` directory.
@@ -26,6 +28,17 @@ pub struct SkillRef {
     pub name: String,
     /// Absolute path to the ref file
     pub path: PathBuf,
+}
+
+/// A parameter declared in a skill's frontmatter.
+#[derive(Debug, Clone)]
+pub struct SkillParam {
+    /// Parameter name, e.g. "language"
+    pub name: String,
+    /// Brief description
+    pub description: String,
+    /// Default value (None if required)
+    pub default: Option<String>,
 }
 
 /// Discover skills in the given search paths.
@@ -57,13 +70,14 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                 }
 
                 if let Ok(content) = fs::read_to_string(&skill_file) {
-                    let (name, description) = parse_skill_meta(&content, &dir_path);
+                    let (name, description, params) = parse_skill_meta(&content, &dir_path);
                     let refs = discover_refs(&dir_path);
                     skills.push(Skill {
                         name,
                         description,
                         path: skill_file,
                         refs,
+                        params,
                     });
                 }
             }
@@ -104,9 +118,9 @@ fn discover_refs(skill_dir: &Path) -> Vec<SkillRef> {
 
 /// Parse YAML frontmatter (if present) from skill content.
 ///
-/// Returns (name, description). If frontmatter is absent, falls back to
-/// using the parent directory name and first non-empty line.
-fn parse_skill_meta(content: &str, dir_path: &Path) -> (String, String) {
+/// Returns (name, description, params). If frontmatter is absent, falls back
+/// to using the parent directory name and first non-empty line.
+fn parse_skill_meta(content: &str, dir_path: &Path) -> (String, String, Vec<SkillParam>) {
     // Try to extract YAML frontmatter: --- ... ---
     if let Some(frontmatter) = content.strip_prefix("---") {
         if let Some(end) = frontmatter.find("---") {
@@ -116,14 +130,64 @@ fn parse_skill_meta(content: &str, dir_path: &Path) -> (String, String) {
             // Parse naive key: value pairs
             let mut name = None;
             let mut description = None;
+            let mut params = Vec::new();
 
-            for line in yaml.lines() {
-                let line = line.trim();
+            let lines: Vec<&str> = yaml.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                let line = lines[i].trim();
                 if let Some(stripped) = line.strip_prefix("name:") {
                     name = Some(stripped.trim().to_string());
                 } else if let Some(stripped) = line.strip_prefix("description:") {
                     description = Some(stripped.trim().to_string());
+                } else if line == "params:" {
+                    // Parse params list: each entry starts with "  - name: xxx"
+                    i += 1;
+                    while i < lines.len() {
+                        let entry_line = lines[i];
+                        // Check if this line starts a new param entry: "  - name: xxx"
+                        if let Some(after_dash) = entry_line.trim().strip_prefix("- name:") {
+                            let param_name = after_dash.trim().to_string();
+                            let mut param_description = String::new();
+                            let mut param_default = None;
+
+                            // Look at subsequent lines for description and default
+                            i += 1;
+                            while i < lines.len() {
+                                let sub_line = lines[i];
+                                let trimmed = sub_line.trim();
+                                // Stop if we hit a new top-level key (no indent) or a new list entry
+                                if !sub_line.starts_with(' ') && !sub_line.starts_with('\t') {
+                                    break;
+                                }
+                                if let Some(val) = trimmed.strip_prefix("description:") {
+                                    param_description = val.trim().to_string();
+                                } else if let Some(val) = trimmed.strip_prefix("default:") {
+                                    param_default = Some(val.trim().to_string());
+                                } else if trimmed.starts_with("- name:") {
+                                    // Next param entry — back up so outer loop re-processes
+                                    i -= 1;
+                                    break;
+                                } else if !trimmed.is_empty() && !trimmed.starts_with('-') {
+                                    // Unknown indented line — skip
+                                }
+                                i += 1;
+                            }
+
+                            params.push(SkillParam {
+                                name: param_name,
+                                description: param_description,
+                                default: param_default,
+                            });
+                        } else {
+                            // Not a param entry — skip to next line
+                            i += 1;
+                        }
+                    }
+                    // After params block, break out of top-level loop
+                    break;
                 }
+                i += 1;
             }
 
             // Use frontmatter values if present, otherwise fall back to defaults
@@ -142,7 +206,7 @@ fn parse_skill_meta(content: &str, dir_path: &Path) -> (String, String) {
                     .unwrap_or_default()
             });
 
-            return (final_name, final_description);
+            return (final_name, final_description, params);
         }
     }
 
@@ -159,7 +223,7 @@ fn parse_skill_meta(content: &str, dir_path: &Path) -> (String, String) {
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
 
-    (name, description)
+    (name, description, Vec::new())
 }
 
 /// Render a compact "available skills" block for the system prompt.
@@ -176,14 +240,39 @@ pub fn skill_index(skills: &[Skill]) -> String {
     ];
 
     for skill in skills {
+        let mut suffix_parts = Vec::new();
+
+        // Ref count
         let ref_count = skill.refs.len();
         if ref_count > 0 {
-            lines.push(format!(
-                "- {}: {} ({} refs)",
-                skill.name, skill.description, ref_count
-            ));
-        } else {
+            suffix_parts.push(format!("{ref_count} refs"));
+        }
+
+        // Params
+        if !skill.params.is_empty() {
+            let param_strs: Vec<String> = skill
+                .params
+                .iter()
+                .map(|p| {
+                    if let Some(ref default) = p.default {
+                        format!("{}={}", p.name, default)
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect();
+            suffix_parts.push(format!("params: {}", param_strs.join(", ")));
+        }
+
+        if suffix_parts.is_empty() {
             lines.push(format!("- {}: {}", skill.name, skill.description));
+        } else {
+            lines.push(format!(
+                "- {}: {} ({})",
+                skill.name,
+                skill.description,
+                suffix_parts.join(", ")
+            ));
         }
     }
 
@@ -245,12 +334,14 @@ mod tests {
                 description: "Explain Rust trait design".to_string(),
                 path: PathBuf::from("/tmp/skills/rust-traits/SKILL.md"),
                 refs: vec![],
+                params: vec![],
             },
             Skill {
                 name: "python-api".to_string(),
                 description: "Python API patterns".to_string(),
                 path: PathBuf::from("/tmp/skills/python-api/SKILL.md"),
                 refs: vec![],
+                params: vec![],
             },
         ];
 
@@ -339,12 +430,14 @@ mod tests {
                         path: PathBuf::from("/tmp/skills/with-refs/refs/examples.txt"),
                     },
                 ],
+                params: vec![],
             },
             Skill {
                 name: "no-refs".to_string(),
                 description: "No references".to_string(),
                 path: PathBuf::from("/tmp/skills/no-refs/SKILL.md"),
                 refs: vec![],
+                params: vec![],
             },
         ];
 
@@ -354,6 +447,108 @@ mod tests {
         assert!(
             !result.contains("(0 refs)"),
             "should not show count for 0 refs"
+        );
+    }
+
+    #[test]
+    fn discover_skills_parses_params() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("code-review");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: code-review\n\
+             description: Review code for quality issues\n\
+             params:\n\
+             \x20\x20- name: language\n\
+             \x20\x20  description: Target language\n\
+             \x20\x20  default: rust\n\
+             \x20\x20- name: strict\n\
+             \x20\x20  description: Enable strict mode\n\
+             ---\n\
+             \n\
+             Review {{language}} code {{#if strict}}strictly{{/if}}.",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+
+        let skill = &skills[0];
+        assert_eq!(skill.name, "code-review");
+        assert_eq!(skill.params.len(), 2);
+
+        let lang = skill.params.iter().find(|p| p.name == "language").unwrap();
+        assert_eq!(lang.description, "Target language");
+        assert_eq!(lang.default.as_deref(), Some("rust"));
+
+        let strict = skill.params.iter().find(|p| p.name == "strict").unwrap();
+        assert_eq!(strict.description, "Enable strict mode");
+        assert_eq!(strict.default, None);
+    }
+
+    #[test]
+    fn discover_skills_handles_no_params() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("simple");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: simple\ndescription: No params\n---\n\nBody",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+        assert!(
+            skills[0].params.is_empty(),
+            "skill without params should have empty params"
+        );
+    }
+
+    #[test]
+    fn skill_index_shows_params() {
+        let skills = vec![
+            Skill {
+                name: "code-review".to_string(),
+                description: "Review code".to_string(),
+                path: PathBuf::from("/tmp/skills/code-review/SKILL.md"),
+                refs: vec![],
+                params: vec![
+                    SkillParam {
+                        name: "language".to_string(),
+                        description: "Target language".to_string(),
+                        default: Some("rust".to_string()),
+                    },
+                    SkillParam {
+                        name: "strict".to_string(),
+                        description: "Enable strict mode".to_string(),
+                        default: None,
+                    },
+                ],
+            },
+            Skill {
+                name: "simple".to_string(),
+                description: "No params".to_string(),
+                path: PathBuf::from("/tmp/skills/simple/SKILL.md"),
+                refs: vec![],
+                params: vec![],
+            },
+        ];
+
+        let result = skill_index(&skills);
+        assert!(
+            result.contains("params: language=rust, strict"),
+            "should show params with defaults: {result}"
+        );
+        assert!(
+            result.contains("- simple: No params"),
+            "should show skill without params normally"
         );
     }
 }
