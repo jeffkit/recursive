@@ -22,6 +22,7 @@ pub mod search;
 pub mod shell;
 pub mod sub_agent;
 pub mod transport;
+pub mod run_background;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
@@ -33,6 +34,7 @@ pub use memory::{Forget, Recall, Remember};
 pub use run_skill_script::RunSkillScript;
 pub use search::SearchFiles;
 pub use shell::RunShell;
+pub use run_background::{BackgroundJobManager, CheckBackground, RunBackground};
 pub use sub_agent::SubAgent;
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
