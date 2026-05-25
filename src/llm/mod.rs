@@ -201,11 +201,7 @@ pub fn load_pricing_from_yaml(path: &Path) -> Result<HashMap<String, ModelPricin
                         // Strip inline comments: "0.027  # 10% of input" → "0.027"
                         let value = value.split('#').next().unwrap_or(value).trim();
                         if let Err(e) = builder.parse_field(key, value) {
-                            return Err(Error::Config(format!(
-                                "error parsing {}: {}",
-                                path.display(),
-                                e
-                            )));
+                            return Err(Error::Config { message: format!("error parsing {}: {}", path.display(), e) });
                         }
                     }
                 }
@@ -300,9 +296,7 @@ pub trait LlmProvider: Send + Sync {
     /// Default impl returns an error. Providers that support structured
     /// output (e.g. OpenAI-compatible) override this.
     async fn complete_structured(&self, _req: StructuredRequest) -> Result<Value> {
-        Err(Error::Config(
-            "provider does not support structured output".into(),
-        ))
+        Err(Error::Config { message: "provider does not support structured output".into() })
     }
 
     /// Stream a completion token-by-token.

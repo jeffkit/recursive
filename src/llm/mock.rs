@@ -62,9 +62,7 @@ impl LlmProvider for MockProvider {
             self.calls.lock().unwrap().push(messages.to_vec());
             let mut queue = self.scripted.lock().unwrap();
             if queue.is_empty() {
-                return Err(Error::Llm(
-                    "MockProvider: no scripted completions left".into(),
-                ));
+                return Err(Error::Llm { provider: "mock".into(), message: "MockProvider: no scripted completions left".into() });
             }
             Ok(queue.remove(0))
         }
@@ -76,9 +74,7 @@ impl LlmProvider for MockProvider {
         let mut queue = self.structured_responses.lock().unwrap();
         if queue.is_empty() {
             // Default: return error to trigger fallback
-            return Err(Error::Config(
-                "MockProvider: no structured responses configured".into(),
-            ));
+            return Err(Error::Config { message: "MockProvider: no structured responses configured".into() });
         }
         queue.remove(0)
     }
@@ -137,7 +133,7 @@ mod tests {
     async fn errors_when_queue_drained() {
         let provider = MockProvider::new(vec![]);
         let err = provider.complete(&[], &[]).await.unwrap_err();
-        assert!(matches!(err, Error::Llm(_)));
+        assert!(matches!(err, Error::Llm { .. }));
     }
 }
 
