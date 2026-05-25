@@ -7,22 +7,27 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T10:42Z.** Idle. Batch 13 fully landed — 4/4 green
-> on first attempt, all `NoMoreToolCalls`, no auto-resume. Total tests
-> 178 → 214 (+36 new). Total cost ≈ **$1.40 across batch 13**.
+> **As of 2026-05-25T10:46Z.** Batch 14 launched (hybrid plan,
+> per user "you-decide" signal). Baseline `5962c05`. Effective
+> step ceiling per goal: 400 (single-pass 200 + auto-resume).
 >
-> All worktrees torn down. Tree clean at `8792131`.
+> - **goal-40 sub-agent** (deepseek, pid 82616) — 3.1, M.
+>   Worktree `sub-agent-deepseek-20260525T104547Z-82584`.
+>   Biggest goal — recursive agent invocation primitive. Watch for
+>   depth-counter design and tool-subset isolation.
+> - **goal-41 structured-output** (deepseek, pid 85299) — 4.3, S.
+>   Worktree `structured-output-deepseek-20260525T104556Z-85261`.
+>   Adds `complete_structured` to LlmProvider; plumbing only.
+> - **goal-39 estimate-tokens-tool** (minimax, pid 88451) — 1.4, S.
+>   Worktree `estimate-tokens-tool-minimax-20260525T104606Z-88435`.
+>   Closes Phase 1. char/4 heuristic, no tokenizer dep.
+> - **goal-42 otel-tracing** (minimax, pid 92154) — 4.5, S.
+>   Worktree `otel-tracing-minimax-20260525T104616Z-92110`.
+>   `#[tracing::instrument]` on hot paths; no exporter dep.
 >
-> Next: draft batch 14. Phase 1 (Foundation) now **3/4 done** —
-> only 1.4 (estimate_tokens) remains. Phase 2 (Connectors) **3/3
-> done**. Phase 3 (Agent Intelligence) **2/4 done** — 3.1 Sub-Agent,
-> 3.4 Permission Hooks remain. Phase 4 still untouched.
->
-> Strategic question for batch 14: **start Phase 4** (Docker Sandbox,
-> Session Management, Structured Output, Hooks, OpenTelemetry —
-> production-readiness theme) OR **finish Phases 1-3** (4 small goals
-> remaining)? Suggest a hybrid: finish Phase 1+3 small ones in batch
-> 14 alongside one Phase 4 starter. Await HITL signal on prioritization.
+> Conflict surface in main.rs again: tool registration (g39 + g40)
+> + CLI flags (g41, g42 unlikely). Likely 1-2 small auto-merge
+> conflicts.
 
 ## Roadmap delta (live)
 
