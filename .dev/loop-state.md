@@ -7,40 +7,34 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T12:00Z.** Idle. **Batch 15 fully landed** — 4/4
-> green eventually but it took three waves + a hotfix. Tree clean
-> at `effa8ca`.
+> **As of 2026-05-25T12:25Z.** Idle. **Batch 16 fully landed** — 2/2
+> green on first attempt, no auto-resume, no rollbacks. Tree clean
+> at `d7f8812`.
 >
-> Tests: 234 → 245 (+11 net new; 242 lib + 2 anthropic_smoke + 1
-> existing smoke). Total cost ≈ **$2.74** product + ~$0.6 wasted on
-> MiniMax retries.
+> Tests: 245 → 263 (+18 net new). Total cost TBD (deepseek g48 ~$1
+> estimate based on 73 steps; minimax g49 cheap at 20 steps).
 >
-> **The dogfooding payoff**: turning on Compactor + Skill +
-> AGENTS.md project context in self-improve.sh inflated the prompt
-> enough that the new 200KB compaction threshold actually fired
-> during runs — and that surfaced a latent orphan-Tool bug in
-> `Agent::maybe_compact` (caused HTTP 400 on DeepSeek, empty body
-> on MiniMax). Now fixed + tested + codified as Invariant #8.
+> Merge order: g49 first (smaller diff), g48 second — both auto-merged
+> cleanly, no conflicts. One post-merge clippy fix (dead_code in
+> hooks test helper struct — removed unused `CountingHook`).
 >
-> **Roadmap status after batch 15**:
+> **Roadmap status after batch 16**:
 > - Phase 1 Foundation: **4/4 done — COMPLETE**
 > - Phase 2 Ecosystem: **3/3 done — COMPLETE**
 > - Phase 3 Agent Intelligence: **4/4 done — COMPLETE**
-> - Phase 4 Production Readiness: **4/5 done** (only 4.1 Docker
->   Sandbox + 4.4 Hooks left)
+> - Phase 4 Production Readiness: **5/5 done — COMPLETE**
+> - Dev Loop: D.2 ✅ landed; D.1, D.3 remain
 >
-> Two roadmap items left:
->   - **4.1 Docker Sandbox (L)** — needs its own batch with prep.
->   - **4.4 Hooks (M)** — general lifecycle observer pattern.
+> **Only 4.1 Docker Sandbox (L) remains as the sole unfinished
+> "shipping product" roadmap item.** D-series are dev-infra/meta
+> improvements.
 >
-> Plus follow-ups: an OTel exporter for 4.5, permission-hook
-> inheritance for sub_agent, structured-output for AnthropicProvider,
-> streaming for Anthropic.
->
-> **Strategic note**: the roadmap is now ~90% complete. Next phase
-> of work is either (a) the two remaining items, (b) follow-up
-> polish from previous batches, or (c) something new based on
-> usage signals once the project is open-sourced.
+> Next candidates:
+>   - **4.1 Docker Sandbox (L)** — the last Phase 4 item
+>   - **D.1 External Pricing Table (S)** — dev-infra, pairs with D.2
+>   - **D.3 DeepSeek V4 ID Cleanup (S)** — chore before July cutoff
+>   - **Follow-up polish**: OTel exporter, Anthropic streaming,
+>     sub_agent permission inheritance, structured-output consumers
 >
 > **Roadmap status after batch 14**:
 > - Phase 1 Foundation: **4/4 done — COMPLETE**
@@ -103,11 +97,29 @@
 
 ## Last batch landed
 
-> **Goals 39 + 40 + 41 + 42**, batch 14 — **Phase 1 done, Phase 4
-> starts**. **4/4 green on first attempt, third batch in a row**,
-> no auto-resume, all NoMoreToolCalls. Wall-clock from launch to
-> all-verdicts ≈ 7 min (10:46Z → 10:53Z); add ~5 min for merging
-> (1 conflict, 4 builds, 4 test cycles).
+> **Goals 48 + 49**, batch 16 — **2/2 green first attempt, no conflicts**.
+> Orchestrator handover from Cursor to Claude Code. First batch under
+> new orchestrator.
+>
+> - **goal-48 lifecycle-hooks (deepseek)**: merged `52c0433`. 73 steps,
+>   patch discipline 11:1 (1 write_file for new `src/hooks.rs`). New
+>   `HookEvent` enum (6 variants, `#[non_exhaustive]`), `Hook` trait,
+>   `HookRegistry`, `HookAction` enum. Agent.rs gains 5 hook invocation
+>   points (SessionStart, PreToolCall, PostToolCall, PreCompact,
+>   PostCompact, SessionEnd). +11 tests. One post-merge clippy fix
+>   (dead unused `CountingHook` test helper removed).
+>
+> - **goal-49 cache-aware-cost (minimax)**: merged `2dac43d`. 20 steps,
+>   patch discipline 4:0 (perfect). Extended `ModelPricing` with
+>   `cache_hit_input_per_million` field; `cost_usd()` now bills cache
+>   hits at discounted rate (10% for DeepSeek, 90% for others as
+>   conservative default). +7 tests. Zero errors during run.
+>
+> Total: 245 → 263 tests on main. Both goals auto-merged cleanly.
+>
+> **Roadmap milestone**: Phase 4 is now **5/5 done** (pending 4.1
+> Docker Sandbox which was always scoped separately). Phases 1-3
+> complete. Only 4.1 + D-series remain.
 >
 > Goal-by-goal:
 >

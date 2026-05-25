@@ -338,10 +338,10 @@ Status legend: **✅ landed** | **🟡 in-batch-N** | **🔴 not started** | **�
 | 4.1   | Docker Sandbox       | L      | Medium   | ✅ wrapper           | 🔴 not started |
 | 4.2   | Session Management   | M      | Medium   | ✅ persistence layer | ✅ landed `eb5bffe` (g45 deepseek, batch-15) |
 | 4.3   | Structured Output    | S      | Medium   | ✅ LlmProvider       | ✅ landed `477e689` (g41 deepseek, batch-14); first consumer wired `20b0164` (g46 deepseek, batch-15 — Compactor uses structured JSON) |
-| 4.4   | Hooks                | M      | Medium   | ✅ observer pattern  | 🔴 not started |
+| 4.4   | Hooks                | M      | Medium   | ✅ observer pattern  | ✅ landed `52c0433` (g48 deepseek, batch-16) |
 | 4.5   | OpenTelemetry        | S      | Low      | ✅ observer pattern  | ✅ landed `2df8fc4` (g42 minimax, batch-14; spans only, no exporter) |
 | D.1   | External Pricing Table | S    | Medium   | ✅ dev-infra / CLI   | 🔴 not started — move rates out of `mod.rs` → `.dev/pricing.yaml` |
-| D.2   | Cache-Aware Cost     | S      | High     | ✅ cost helper only  | 🔴 not started — uses g21 cache fields; pairs with D.1 |
+| D.2   | Cache-Aware Cost     | S      | High     | ✅ cost helper only  | ✅ landed `2dac43d` (g49 minimax, batch-16) |
 | D.3   | DeepSeek V4 ID Cleanup | S    | Low      | ✅ dev-infra chore   | 🔴 not started — post Flash/Pro fallback; before 2026-07-24 alias retirement |
 
 S = small (~1 day), M = medium (~2-3 days), L = large (~1 week)
