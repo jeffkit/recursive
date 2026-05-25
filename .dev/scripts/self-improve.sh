@@ -19,14 +19,15 @@
 #   RECURSIVE_API_KEY (required; falls back to GLM_API_KEY / MINIMAX_API_KEY)
 #   RECURSIVE_API_BASE (default: MiniMax)
 #   RECURSIVE_MODEL    (default: MiniMax-M2)
-#   RECURSIVE_MAX_STEPS (default: 100)
+#   RECURSIVE_MAX_STEPS (default: 200, matches Cursor's per-turn ceiling)
 #   RECURSIVE_NO_COMMIT (set to 1 to skip the auto-commit step)
 #   RECURSIVE_AUTO_RESUME (default: 1; set to 0 to disable). When the
 #                         first agent attempt exits with BudgetExceeded,
 #                         the wrapper auto-replays from the saved
 #                         transcript with the same goal exactly once.
-#                         Effective budget = MAX_STEPS × 2 on hard
-#                         goals; simple goals pay no extra cost.
+#                         Effective ceiling = MAX_STEPS × 2 on hard
+#                         goals (400 with the default); simple goals
+#                         pay no extra cost.
 #
 #   RECURSIVE_PROVIDER       — force a named profile for this run: minimax | deepseek
 #   RECURSIVE_PROVIDERS=a,b  — auto-rotate across a comma-separated list, persisting
@@ -177,7 +178,7 @@ fi
 
 echo "[self-improve] provider=$SELECTED_PROVIDER  model=${RECURSIVE_MODEL}" >&2
 
-export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-100}"
+export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-200}"
 RECURSIVE_AUTO_RESUME="${RECURSIVE_AUTO_RESUME:-1}"
 
 # Use release build if available, else dev.

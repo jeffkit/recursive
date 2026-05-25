@@ -307,8 +307,9 @@ once when the first run exits with `reason: BudgetExceeded`. The
 resumed run is seeded with the full saved transcript via
 `recursive replay --resume-from N <goal>` (goal-17 plumbing).
 
-- Default `RECURSIVE_MAX_STEPS=100` (was 50 before goal-30 batch).
-- Effective ceiling on a hard goal = 200 steps across two attempts.
+- Default `RECURSIVE_MAX_STEPS=200` (matches Cursor's per-turn ceiling;
+  was 100 before batch-13, was 50 before goal-30 batch).
+- Effective ceiling on a hard goal = 400 steps across two attempts.
 - Resume is **once only**. If both attempts BudgetExceed, the run
   rolls back exactly as before.
 - `observe.sh` reports `auto-resumed: yes/no` in the metrics table
