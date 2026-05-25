@@ -27,6 +27,7 @@ pub use agent::{PermissionDecision, PermissionHook};
 pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
+pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
 pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};

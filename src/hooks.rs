@@ -40,6 +40,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::agent::AgentOutcome;
+use std::collections::HashMap;
+use std::time::Instant;
 
 /// Action a hook can request in response to an event.
 #[derive(Debug, Clone)]
@@ -161,6 +163,47 @@ impl HookRegistry {
     /// Returns the number of registered hooks.
     pub fn len(&self) -> usize {
         self.hooks.len()
+    }
+}
+
+/// A hook that prints tool call timing information to stderr.
+///
+/// On `PostToolCall` events, prints `[hook] {name} took {duration_ms}ms`.
+/// All other events return `HookAction::Continue`.
+pub struct ToolTimingHook {
+    start_times: std::sync::Mutex<HashMap<String, Instant>>,
+}
+
+impl ToolTimingHook {
+    pub fn new() -> Self {
+        Self {
+            start_times: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for ToolTimingHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hook for ToolTimingHook {
+    fn on_event(&self, event: HookEvent) -> HookAction {
+        match event {
+            HookEvent::PreToolCall { name, .. } => {
+                let mut map = self.start_times.lock().unwrap();
+                map.insert(name.to_string(), Instant::now());
+                HookAction::Continue
+            }
+            HookEvent::PostToolCall {
+                name, duration_ms, ..
+            } => {
+                eprintln!("[hook] {name} took {duration_ms}ms");
+                HookAction::Continue
+            }
+            _ => HookAction::Continue,
+        }
     }
 }
 
@@ -432,5 +475,57 @@ mod tests {
     fn hook_event_is_non_exhaustive() {
         // Compile-time check: HookEvent is #[non_exhaustive]
         let _ = HookEvent::SessionStart { goal: "test" };
+    }
+
+    #[test]
+    fn tool_timing_hook_prints_to_stderr_on_post_tool_call() {
+        // Capture stderr by redirecting
+        let hook = ToolTimingHook::new();
+        let action = hook.on_event(HookEvent::PostToolCall {
+            name: "read_file",
+            args: &serde_json::json!({"path": "foo.txt"}),
+            result: "ok",
+            duration_ms: 42,
+        });
+        assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[test]
+    fn tool_timing_hook_returns_continue_for_non_tool_events() {
+        let hook = ToolTimingHook::new();
+        let action = hook.on_event(HookEvent::SessionStart { goal: "test" });
+        assert!(matches!(action, HookAction::Continue));
+
+        let action = hook.on_event(HookEvent::PreCompact {
+            transcript_len: 100,
+        });
+        assert!(matches!(action, HookAction::Continue));
+
+        let action = hook.on_event(HookEvent::PostCompact {
+            removed: 5,
+            summary_chars: 50,
+        });
+        assert!(matches!(action, HookAction::Continue));
+
+        let outcome = AgentOutcome {
+            final_message: Some("done".into()),
+            transcript: vec![],
+            steps: 1,
+            finish: crate::agent::FinishReason::NoMoreToolCalls,
+            total_usage: crate::llm::TokenUsage::default(),
+            total_llm_latency_ms: 0,
+        };
+        let action = hook.on_event(HookEvent::SessionEnd { outcome: &outcome });
+        assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[test]
+    fn tool_timing_hook_pre_tool_call_returns_continue() {
+        let hook = ToolTimingHook::new();
+        let action = hook.on_event(HookEvent::PreToolCall {
+            name: "write_file",
+            args: &serde_json::json!({"path": "foo.txt"}),
+        });
+        assert!(matches!(action, HookAction::Continue));
     }
 }
