@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Tools => {
-            let tools = build_tools(&config.workspace);
+            let tools = build_tools(&config);
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
@@ -182,13 +182,16 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_tools(root: &std::path::Path) -> ToolRegistry {
+fn build_tools(config: &Config) -> ToolRegistry {
+    let root = &config.workspace;
     ToolRegistry::new()
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ApplyPatch::new(root)))
         .register(Arc::new(ListDir::new(root)))
-        .register(Arc::new(RunShell::new(root)))
+        .register(Arc::new(
+            RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
+        ))
         .register(Arc::new(SearchFiles::new(root)))
 }
 
@@ -215,7 +218,7 @@ fn build_agent_seeded(
             .with_temperature(config.temperature)
             .with_retry_policy(retry),
     );
-    let tools = build_tools(&config.workspace);
+    let tools = build_tools(config);
     let (tx, rx) = mpsc::unbounded_channel();
     let mut builder = Agent::builder()
         .llm(provider)

@@ -20,6 +20,7 @@ pub struct Config {
     pub retry_max: usize,
     pub retry_initial_backoff_secs: u64,
     pub retry_max_backoff_secs: u64,
+    pub shell_timeout_secs: u64,
 }
 
 impl Config {
@@ -70,6 +71,10 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
+        let shell_timeout_secs = std::env::var("RECURSIVE_SHELL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
 
         Ok(Self {
             workspace,
@@ -82,6 +87,7 @@ impl Config {
             retry_max,
             retry_initial_backoff_secs,
             retry_max_backoff_secs,
+            shell_timeout_secs,
         })
     }
 
@@ -178,10 +184,12 @@ mod tests {
             retry_max: 2,
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
         assert_eq!(config.retry_max_backoff_secs, 8);
+        assert_eq!(config.shell_timeout_secs, 300);
     }
 
     #[test]
@@ -221,6 +229,33 @@ mod tests {
         }
         if let Ok(v) = original_max_backoff {
             std::env::set_var("RECURSIVE_RETRY_MAX_BACKOFF_SECS", v);
+        }
+    }
+
+    // NOTE: both shell_timeout_* checks live in ONE test on purpose.
+    // `cargo test` runs tests in parallel threads and `set_var` /
+    // `remove_var` are process-global, so splitting them creates a
+    // race (one test sees the other's value). MiniMax's goal-23 run
+    // burned 50 steps discovering this exact race; lesson recorded in
+    // AGENTS.md section 5.
+    #[test]
+    fn shell_timeout_default_and_env_override() {
+        let original = std::env::var("RECURSIVE_SHELL_TIMEOUT_SECS").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        std::env::remove_var("RECURSIVE_SHELL_TIMEOUT_SECS");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.shell_timeout_secs, 300);
+
+        std::env::set_var("RECURSIVE_SHELL_TIMEOUT_SECS", "42");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.shell_timeout_secs, 42);
+
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_SHELL_TIMEOUT_SECS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_SHELL_TIMEOUT_SECS");
         }
     }
 }

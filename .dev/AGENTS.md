@@ -81,6 +81,17 @@ tests/
        goal-17 burned its anti-stuck budget on exactly this — three
        identical patch retries because the unique-context rule of V4A
        can't disambiguate three near-identical lines.
+     - **Env-var tests must be ONE test, not many.** `cargo test` runs
+       tests in parallel threads by default. `std::env::set_var` and
+       `remove_var` are process-global, so two tests touching the same
+       `RECURSIVE_*` variable will race — one sees the other's value
+       intermittently, no amount of "save/restore" inside each test
+       fixes it. Collapse defaults + override checks into a single
+       sequential test. Goal-23's MiniMax run burned all 50 steps
+       trying to debug this race; the consolidated test pattern in
+       `src/config.rs::shell_timeout_default_and_env_override` is the
+       reference. See also `retry_env_overrides_apply` (one test that
+       toggles all retry vars at once).
      - Worked example, editing `src/llm/mod.rs` to add a struct after the
        `pub use openai::OpenAiProvider;` line:
        ```
