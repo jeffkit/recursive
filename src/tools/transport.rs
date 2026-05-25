@@ -249,10 +249,7 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::TimedOut
-        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]

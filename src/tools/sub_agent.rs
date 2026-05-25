@@ -190,7 +190,9 @@ impl Tool for SubAgent {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider, ToolCall};
-    use crate::tools::{ApplyPatch, ListDir, LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile};
+    use crate::tools::{
+        ApplyPatch, ListDir, LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile,
+    };
 
     /// Helper: create a MockProvider with the given scripted completions.
     fn mock_provider(script: Vec<Completion>) -> Arc<dyn LlmProvider> {

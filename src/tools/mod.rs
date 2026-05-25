@@ -19,8 +19,8 @@ pub mod load_skill;
 pub mod memory;
 pub mod search;
 pub mod shell;
-pub mod transport;
 pub mod sub_agent;
+pub mod transport;
 pub mod web_fetch;
 
 pub use apply_patch::ApplyPatch;
@@ -30,8 +30,8 @@ pub use load_skill::LoadSkill;
 pub use memory::{Forget, Recall, Remember};
 pub use search::SearchFiles;
 pub use shell::RunShell;
-pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 pub use sub_agent::SubAgent;
+pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 pub use web_fetch::WebFetch;
 
 impl Default for ToolRegistry {

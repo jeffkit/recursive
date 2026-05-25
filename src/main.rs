@@ -28,8 +28,8 @@ use recursive::{
     },
     tools::memory::memory_summary,
     tools::{
-        ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, ReadFile, Recall, Remember,
-        LocalTransport, RunShell, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
+        ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, LocalTransport, ReadFile, Recall,
+        Remember, RunShell, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
     },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
