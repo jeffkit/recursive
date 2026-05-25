@@ -7,34 +7,27 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T12:25Z.** Idle. **Batch 16 fully landed** — 2/2
-> green on first attempt, no auto-resume, no rollbacks. Tree clean
-> at `d7f8812`.
+> **As of 2026-05-25T12:40Z.** Idle. **Batch 17 fully landed** — 2/2
+> green on first attempt, no conflicts, no auto-resume. Tree clean.
 >
-> Tests: 245 → 263 (+18 net new). Total cost TBD (deepseek g48 ~$1
-> estimate based on 73 steps; minimax g49 cheap at 20 steps).
+> Tests: 263 → 272 (+9 net new).
 >
-> Merge order: g49 first (smaller diff), g48 second — both auto-merged
-> cleanly, no conflicts. One post-merge clippy fix (dead_code in
-> hooks test helper struct — removed unused `CountingHook`).
+> - g52 anthropic-streaming (deepseek): 601 LOC added to `anthropic.rs`,
+>   real SSE streaming with tool-call assembly. Clean first-attempt.
+> - g51 external-pricing-table (minimax): 46 steps (higher than S
+>   estimate — MiniMax used write_file on main.rs, typical behavior).
+>   New `.dev/pricing.yaml` + `load_pricing_from_yaml()` in `mod.rs` +
+>   `--pricing-file` CLI flag.
 >
-> **Roadmap status after batch 16**:
-> - Phase 1 Foundation: **4/4 done — COMPLETE**
-> - Phase 2 Ecosystem: **3/3 done — COMPLETE**
-> - Phase 3 Agent Intelligence: **4/4 done — COMPLETE**
-> - Phase 4 Production Readiness: **5/5 done — COMPLETE**
-> - Dev Loop: D.2 ✅ landed; D.1, D.3 remain
+> **Roadmap status after batch 17**:
+> - Phase 1-4: all core items done (4.1 deferred as Tool Transport)
+> - D-series: D.1 ✅, D.2 ✅, D.3 remaining
+> - Follow-ups landed: Anthropic streaming ✅
 >
-> **Only 4.1 Docker Sandbox (L) remains as the sole unfinished
-> "shipping product" roadmap item.** D-series are dev-infra/meta
-> improvements.
->
-> Next candidates:
->   - **4.1 Docker Sandbox (L)** — the last Phase 4 item
->   - **D.1 External Pricing Table (S)** — dev-infra, pairs with D.2
->   - **D.3 DeepSeek V4 ID Cleanup (S)** — chore before July cutoff
->   - **Follow-up polish**: OTel exporter, Anthropic streaming,
->     sub_agent permission inheritance, structured-output consumers
+> **Batch 18 prepared** (4-wide): g53 tool-transport (deepseek),
+> g54 subagent-permission-inherit (deepseek), g55 mcp-workspace-discovery
+> (minimax), g56 deepseek-v4-id-cleanup (minimax). Goal files committed.
+> Ready to launch after this doc update.
 >
 > **Roadmap status after batch 14**:
 > - Phase 1 Foundation: **4/4 done — COMPLETE**
