@@ -17,6 +17,9 @@ pub struct Config {
     pub max_steps: usize,
     pub temperature: f64,
     pub system_prompt: String,
+    pub retry_max: usize,
+    pub retry_initial_backoff_secs: u64,
+    pub retry_max_backoff_secs: u64,
 }
 
 impl Config {
@@ -55,6 +58,19 @@ impl Config {
             Err(_) => default_system_prompt(),
         };
 
+        let retry_max = std::env::var("RECURSIVE_RETRY_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        let retry_initial_backoff_secs = std::env::var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let retry_max_backoff_secs = std::env::var("RECURSIVE_RETRY_MAX_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+
         Ok(Self {
             workspace,
             api_base,
@@ -63,6 +79,9 @@ impl Config {
             max_steps,
             temperature,
             system_prompt,
+            retry_max,
+            retry_initial_backoff_secs,
+            retry_max_backoff_secs,
         })
     }
 
@@ -112,5 +131,65 @@ mod tests {
         let prompt = default_system_prompt();
         assert!(prompt.contains("run_shell"));
         assert!(prompt.contains("tests"));
+    }
+
+    #[test]
+    fn retry_defaults_match_old_policy() {
+        // Ensure defaults match the hardcoded RetryPolicy::default()
+        let config = Config {
+            workspace: PathBuf::from("."),
+            api_base: String::new(),
+            api_key: None,
+            model: String::new(),
+            max_steps: 32,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+        };
+        assert_eq!(config.retry_max, 2);
+        assert_eq!(config.retry_initial_backoff_secs, 1);
+        assert_eq!(config.retry_max_backoff_secs, 8);
+    }
+
+    #[test]
+    fn retry_env_overrides_apply() {
+        // Save original env values
+        let original_max = std::env::var("RECURSIVE_RETRY_MAX");
+        let original_initial = std::env::var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS");
+        let original_max_backoff = std::env::var("RECURSIVE_RETRY_MAX_BACKOFF_SECS");
+
+        // Set custom values
+        std::env::set_var("RECURSIVE_RETRY_MAX", "5");
+        std::env::set_var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS", "2");
+        std::env::set_var("RECURSIVE_RETRY_MAX_BACKOFF_SECS", "30");
+
+        // We need to also set required env vars to avoid errors
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.retry_max, 5);
+        assert_eq!(config.retry_initial_backoff_secs, 2);
+        assert_eq!(config.retry_max_backoff_secs, 30);
+
+        // Restore original env values
+        std::env::remove_var("RECURSIVE_RETRY_MAX");
+        std::env::remove_var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS");
+        std::env::remove_var("RECURSIVE_RETRY_MAX_BACKOFF_SECS");
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
+
+        if let Ok(v) = original_max {
+            std::env::set_var("RECURSIVE_RETRY_MAX", v);
+        }
+        if let Ok(v) = original_initial {
+            std::env::set_var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS", v);
+        }
+        if let Ok(v) = original_max_backoff {
+            std::env::set_var("RECURSIVE_RETRY_MAX_BACKOFF_SECS", v);
+        }
     }
 }

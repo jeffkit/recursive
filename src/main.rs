@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -18,7 +19,7 @@ use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
     tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, SearchFiles, WriteFile},
-    Agent, FinishReason, StepEvent, ToolRegistry, TranscriptFile,
+    Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -144,9 +145,15 @@ fn build_agent(
     max_transcript_chars: Option<usize>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
+    let retry = RetryPolicy {
+        max_retries: config.retry_max,
+        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+    };
     let provider: Arc<dyn LlmProvider> = Arc::new(
         OpenAiProvider::new(&config.api_base, api_key, &config.model)
-            .with_temperature(config.temperature),
+            .with_temperature(config.temperature)
+            .with_retry_policy(retry),
     );
     let tools = build_tools(&config.workspace);
     let (tx, rx) = mpsc::unbounded_channel();

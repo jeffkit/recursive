@@ -20,6 +20,7 @@ pub mod transcript;
 pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
 pub use config::Config;
 pub use error::{Error, Result};
+pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
 pub use message::{Message, Role};
 pub use tools::{Tool, ToolRegistry};
