@@ -20,7 +20,10 @@ pub struct ReadFile {
 
 impl ReadFile {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), max_bytes: 256 * 1024 }
+        Self {
+            root: root.into(),
+            max_bytes: 256 * 1024,
+        }
     }
 }
 
@@ -29,7 +32,8 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file under the workspace. Returns the file contents.".into(),
+            description: "Read a UTF-8 text file under the workspace. Returns the file contents."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -53,7 +57,11 @@ impl Tool for ReadFile {
         if bytes.len() > self.max_bytes {
             return Err(Error::Tool {
                 name: "read_file".into(),
-                message: format!("file too large: {} bytes (max {})", bytes.len(), self.max_bytes),
+                message: format!(
+                    "file too large: {} bytes (max {})",
+                    bytes.len(),
+                    self.max_bytes
+                ),
             });
         }
         String::from_utf8(bytes).map_err(|e| Error::Tool {
@@ -96,21 +104,27 @@ impl Tool for WriteFile {
             name: "write_file".into(),
             message: "missing `path`".into(),
         })?;
-        let contents = args["contents"].as_str().ok_or_else(|| Error::BadToolArgs {
-            name: "write_file".into(),
-            message: "missing `contents`".into(),
-        })?;
+        let contents = args["contents"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "write_file".into(),
+                message: "missing `contents`".into(),
+            })?;
         let abs = resolve_within(&self.root, path)?;
         if let Some(parent) = abs.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| Error::Tool {
-                name: "write_file".into(),
-                message: format!("mkdir {}: {e}", parent.display()),
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::Tool {
+                    name: "write_file".into(),
+                    message: format!("mkdir {}: {e}", parent.display()),
+                })?;
         }
-        tokio::fs::write(&abs, contents).await.map_err(|e| Error::Tool {
-            name: "write_file".into(),
-            message: format!("{}: {e}", abs.display()),
-        })?;
+        tokio::fs::write(&abs, contents)
+            .await
+            .map_err(|e| Error::Tool {
+                name: "write_file".into(),
+                message: format!("{}: {e}", abs.display()),
+            })?;
         Ok(format!("wrote {} bytes to {}", contents.len(), path))
     }
 }
@@ -155,7 +169,11 @@ impl Tool for ListDir {
         })? {
             let name = entry.file_name().to_string_lossy().to_string();
             let kind = entry.file_type().await.ok();
-            let suffix = if kind.is_some_and(|k| k.is_dir()) { "/" } else { "" };
+            let suffix = if kind.is_some_and(|k| k.is_dir()) {
+                "/"
+            } else {
+                ""
+            };
             lines.push(format!("{name}{suffix}"));
         }
         lines.sort();
@@ -173,7 +191,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let w = WriteFile::new(tmp.path());
         let r = ReadFile::new(tmp.path());
-        w.execute(json!({"path":"hello.txt","contents":"world"})).await.unwrap();
+        w.execute(json!({"path":"hello.txt","contents":"world"}))
+            .await
+            .unwrap();
         let got = r.execute(json!({"path":"hello.txt"})).await.unwrap();
         assert_eq!(got, "world");
     }
@@ -193,7 +213,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
-        let out = ListDir::new(tmp.path()).execute(json!({"path":"."})).await.unwrap();
+        let out = ListDir::new(tmp.path())
+            .execute(json!({"path":"."}))
+            .await
+            .unwrap();
         assert_eq!(out, "a.txt\nsub/");
     }
 
@@ -201,7 +224,10 @@ mod tests {
     async fn rejects_escape() {
         let tmp = TempDir::new().unwrap();
         let r = ReadFile::new(tmp.path());
-        let err = r.execute(json!({"path":"../etc/passwd"})).await.unwrap_err();
+        let err = r
+            .execute(json!({"path":"../etc/passwd"}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::BadToolArgs { .. }));
     }
 }

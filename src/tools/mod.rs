@@ -56,13 +56,16 @@ impl ToolRegistry {
     }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
-        let tool = self.get(name).ok_or_else(|| Error::UnknownTool(name.into()))?;
-        tool.execute(arguments)
-            .await
-            .map_err(|e| match e {
-                Error::Tool { .. } | Error::BadToolArgs { .. } | Error::UnknownTool(_) => e,
-                other => Error::Tool { name: name.into(), message: other.to_string() },
-            })
+        let tool = self
+            .get(name)
+            .ok_or_else(|| Error::UnknownTool(name.into()))?;
+        tool.execute(arguments).await.map_err(|e| match e {
+            Error::Tool { .. } | Error::BadToolArgs { .. } | Error::UnknownTool(_) => e,
+            other => Error::Tool {
+                name: name.into(),
+                message: other.to_string(),
+            },
+        })
     }
 }
 
@@ -73,13 +76,21 @@ impl ToolRegistry {
 /// `--workspace /abs/path`.
 pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf> {
     let candidate = std::path::Path::new(path);
-    let joined = if candidate.is_absolute() { candidate.to_path_buf() } else { root.join(candidate) };
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
     let abs_root = absolutise(root);
     let abs_joined = absolutise(&joined);
     if !abs_joined.starts_with(&abs_root) {
         return Err(Error::BadToolArgs {
             name: "<fs>".into(),
-            message: format!("path `{}` escapes workspace root `{}`", path, abs_root.display()),
+            message: format!(
+                "path `{}` escapes workspace root `{}`",
+                path,
+                abs_root.display()
+            ),
         });
     }
     Ok(abs_joined)
@@ -91,7 +102,9 @@ fn absolutise(p: &std::path::Path) -> std::path::PathBuf {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(p)
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(p)
     };
     normalise(&abs)
 }
@@ -135,7 +148,10 @@ mod tests {
     #[tokio::test]
     async fn registry_dispatches_and_errors_on_unknown() {
         let reg = ToolRegistry::new().register(Arc::new(Echo));
-        let out = reg.invoke("echo", serde_json::json!({"msg":"hi"})).await.unwrap();
+        let out = reg
+            .invoke("echo", serde_json::json!({"msg":"hi"}))
+            .await
+            .unwrap();
         assert_eq!(out, "hi");
         let err = reg.invoke("nope", serde_json::json!({})).await.unwrap_err();
         assert!(matches!(err, Error::UnknownTool(_)));

@@ -70,7 +70,11 @@ async fn agent_writes_reads_and_summarises() {
     let outcome = agent.run("create greet.txt and confirm").await.unwrap();
 
     assert_eq!(outcome.steps, 4);
-    assert!(outcome.final_message.as_deref().unwrap().contains("greet.txt"));
+    assert!(outcome
+        .final_message
+        .as_deref()
+        .unwrap()
+        .contains("greet.txt"));
 
     // The agent actually wrote the file via the real fs tool.
     let on_disk = std::fs::read_to_string(root.join("greet.txt")).unwrap();

@@ -20,7 +20,10 @@ pub struct MockProvider {
 
 impl MockProvider {
     pub fn new(scripted: Vec<Completion>) -> Self {
-        Self { scripted: Mutex::new(scripted), calls: Mutex::new(Vec::new()) }
+        Self {
+            scripted: Mutex::new(scripted),
+            calls: Mutex::new(Vec::new()),
+        }
     }
 
     /// Snapshot of the transcripts the agent has sent to this provider.
@@ -35,7 +38,9 @@ impl LlmProvider for MockProvider {
         self.calls.lock().unwrap().push(messages.to_vec());
         let mut queue = self.scripted.lock().unwrap();
         if queue.is_empty() {
-            return Err(Error::Llm("MockProvider: no scripted completions left".into()));
+            return Err(Error::Llm(
+                "MockProvider: no scripted completions left".into(),
+            ));
         }
         Ok(queue.remove(0))
     }
@@ -48,8 +53,16 @@ mod tests {
     #[tokio::test]
     async fn returns_scripted_in_order_and_records_calls() {
         let provider = MockProvider::new(vec![
-            Completion { content: "one".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
-            Completion { content: "two".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
+            Completion {
+                content: "one".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+            },
+            Completion {
+                content: "two".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+            },
         ]);
 
         let m1 = vec![Message::user("hi")];

@@ -25,7 +25,11 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_retries: 2, initial_backoff: Duration::from_secs(1), max_backoff: Duration::from_secs(8) }
+        Self {
+            max_retries: 2,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        }
     }
 }
 
@@ -66,7 +70,11 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
@@ -100,7 +108,13 @@ impl LlmProvider for OpenAiProvider {
         let mut attempt = 0;
         loop {
             tracing::debug!(target: "recursive::llm", request = %body, "POST {}", url);
-            let result = self.client.post(&url).bearer_auth(&self.api_key).json(&body).send().await;
+            let result = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await;
 
             match result {
                 Ok(resp) => {
@@ -109,8 +123,9 @@ impl LlmProvider for OpenAiProvider {
 
                     if status.is_success() {
                         let text = resp.text().await?;
-                        let parsed: ChatResponse = serde_json::from_str(&text)
-                            .map_err(|e| Error::Llm(format!("failed to parse response: {e}; body: {text}")))?;
+                        let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+                            Error::Llm(format!("failed to parse response: {e}; body: {text}"))
+                        })?;
                         let choice = parsed
                             .choices
                             .into_iter()
@@ -123,7 +138,10 @@ impl LlmProvider for OpenAiProvider {
                     let text = resp.text().await?;
                     tracing::debug!(target: "recursive::llm", body = %text, "error response");
 
-                    if let Some(backoff) = self.retry.backoff_for(attempt, Some(status.as_u16()), is_network_error) {
+                    if let Some(backoff) =
+                        self.retry
+                            .backoff_for(attempt, Some(status.as_u16()), is_network_error)
+                    {
                         tracing::warn!(
                             target: "recursive::llm",
                             attempt,
@@ -268,10 +286,18 @@ fn parse_completion(choice: ChatChoice) -> Completion {
                 serde_json::from_str(&c.function.arguments)
                     .unwrap_or_else(|_| Value::String(c.function.arguments.clone()))
             };
-            ToolCall { id: c.id, name: c.function.name, arguments: args }
+            ToolCall {
+                id: c.id,
+                name: c.function.name,
+                arguments: args,
+            }
         })
         .collect();
-    Completion { content, tool_calls, finish_reason: choice.finish_reason }
+    Completion {
+        content,
+        tool_calls,
+        finish_reason: choice.finish_reason,
+    }
 }
 
 #[cfg(test)]
@@ -323,7 +349,9 @@ mod tests {
         );
         let v = serialize_message(&msg);
         assert_eq!(v["tool_calls"][0]["function"]["name"], "write_file");
-        let args = v["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = v["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         let decoded: Value = serde_json::from_str(args).unwrap();
         assert_eq!(decoded["contents"], "b");
     }
@@ -338,10 +366,16 @@ mod tests {
     #[test]
     fn policy_retries_5xx_with_exponential_backoff() {
         let policy = RetryPolicy::default(); // max_retries = 2
-        // Attempt 0: should return initial_backoff (1s)
-        assert_eq!(policy.backoff_for(0, Some(503), false), Some(Duration::from_secs(1)));
+                                             // Attempt 0: should return initial_backoff (1s)
+        assert_eq!(
+            policy.backoff_for(0, Some(503), false),
+            Some(Duration::from_secs(1))
+        );
         // Attempt 1: should return 2s (1s * 2^1)
-        assert_eq!(policy.backoff_for(1, Some(500), false), Some(Duration::from_secs(2)));
+        assert_eq!(
+            policy.backoff_for(1, Some(500), false),
+            Some(Duration::from_secs(2))
+        );
         // Attempt 2: should return None (exceeds max_retries=2)
         assert_eq!(policy.backoff_for(2, Some(500), false), None);
     }
@@ -350,7 +384,10 @@ mod tests {
     fn policy_retries_network_errors() {
         let policy = RetryPolicy::default();
         // Network error at attempt 0 should return initial_backoff
-        assert_eq!(policy.backoff_for(0, None, true), Some(Duration::from_secs(1)));
+        assert_eq!(
+            policy.backoff_for(0, None, true),
+            Some(Duration::from_secs(1))
+        );
     }
 
     #[test]
@@ -365,8 +402,15 @@ mod tests {
 
     #[test]
     fn policy_caps_backoff_at_max() {
-        let policy = RetryPolicy { max_retries: 10, initial_backoff: Duration::from_secs(1), max_backoff: Duration::from_secs(3) };
+        let policy = RetryPolicy {
+            max_retries: 10,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(3),
+        };
         // At attempt 5, exponential backoff would be 32s but capped to 3s
-        assert_eq!(policy.backoff_for(5, Some(500), false), Some(Duration::from_secs(3)));
+        assert_eq!(
+            policy.backoff_for(5, Some(500), false),
+            Some(Duration::from_secs(3))
+        );
     }
 }

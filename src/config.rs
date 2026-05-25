@@ -55,7 +55,15 @@ impl Config {
             Err(_) => default_system_prompt(),
         };
 
-        Ok(Self { workspace, api_base, api_key, model, max_steps, temperature, system_prompt })
+        Ok(Self {
+            workspace,
+            api_base,
+            api_key,
+            model,
+            max_steps,
+            temperature,
+            system_prompt,
+        })
     }
 
     /// Return the API key or a descriptive error if none was configured.
