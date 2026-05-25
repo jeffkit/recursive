@@ -7,17 +7,19 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T07:38Z.** Empty — batch 3 fully landed; next
-> batch not yet picked.
-
-(none)
+> **As of 2026-05-25T07:48Z.** Empty between batches 4 and 5.
 
 ## Last batch landed
 
-> **Goals 11 + 12**, third concurrent batch. Merge commits on `main`:
-> goal-11 search-files-tool (deepseek), goal-12 default-system-prompt
-> (minimax). Zero merge conflicts. 103 tests green. Pair cost $0.32.
-> Notable: goal-11 hit apply:write=13:1, best discipline yet.
+> **Goals 13 + 14 (partial)**, fourth concurrent batch.
+> - goal-13 search_files regex (deepseek): merged. 12 steps, $0.0681,
+>   cheapest single run yet, 4 tests added. apply:write impressive.
+> - goal-14 --json events (minimax): **rolled back at step 50**
+>   (BudgetExceeded). The rolled-back journal is cherry-picked to
+>   main for the record (commit 25b9031 → on main as `dev: journal
+>   — rolled-back run …`). The product surface was too wide for one
+>   MiniMax run; rerunning on DeepSeek next batch.
+> - 107 tests green on main.
 
 ## Background processes
 
