@@ -98,6 +98,11 @@ impl OpenAiProvider {
         }
     }
 
+    /// Build an `Error::Llm` with the model name prefixed.
+    fn make_err(&self, ctx: impl Into<String>) -> Error {
+        Error::Llm(format!("model={}: {}", self.model, ctx.into()))
+    }
+
     pub fn with_temperature(mut self, t: f64) -> Self {
         self.temperature = t;
         self
@@ -145,13 +150,13 @@ impl LlmProvider for OpenAiProvider {
                     if status.is_success() {
                         let text = resp.text().await?;
                         let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-                            Error::Llm(format!("failed to parse response: {e}; body: {text}"))
+                            self.make_err(format!("failed to parse response: {e}; body: {text}"))
                         })?;
                         let choice = parsed
                             .choices
                             .into_iter()
                             .next()
-                            .ok_or_else(|| Error::Llm("response had no choices".into()))?;
+                            .ok_or_else(|| self.make_err("response had no choices"))?;
                         return Ok(parse_completion(choice, parsed.usage));
                     }
 
@@ -176,7 +181,7 @@ impl LlmProvider for OpenAiProvider {
                     }
 
                     // Non-transient (4xx or other)
-                    return Err(Error::Llm(format!("HTTP {}: {}", status, text)));
+                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
                 }
                 Err(e) => {
                     // Network error
@@ -193,7 +198,7 @@ impl LlmProvider for OpenAiProvider {
                         continue;
                     }
 
-                    return Err(Error::Llm(format!("request failed: {e}")));
+                    return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
         }
@@ -503,6 +508,68 @@ mod tests {
     fn builds_request_includes_max_tokens() {
         let req = build_request("m", 0.2, 1024, &[Message::user("hi")], &[]);
         assert_eq!(req["max_tokens"], 1024);
+    }
+
+    #[tokio::test]
+    async fn error_includes_model_name_on_network_failure() {
+        // Bind a listener on an ephemeral port, then drop it so the port is freed.
+        // The next connect attempt gets ECONNREFUSED (a network error).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        // Small sleep so the OS releases the port.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model");
+        let err = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model=test-model"),
+            "error should contain model name: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_includes_model_name_and_status_on_http_error() {
+        // Spawn a one-shot TCP listener that sends a 400 response.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Use a dedicated thread with a blocking server to avoid tokio issues.
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model-http");
+        let err = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model=test-model-http"),
+            "error should contain model name: {msg}"
+        );
+        assert!(
+            msg.contains("400"),
+            "error should contain HTTP status: {msg}"
+        );
     }
 
     #[test]
