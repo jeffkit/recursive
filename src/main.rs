@@ -18,7 +18,7 @@ use tracing::Level;
 
 use recursive::config::load_project_context;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
-use recursive::skills::{discover_skills, skill_index, Skill};
+use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
 use recursive::SessionFile;
 use recursive::{
     config::Config,
@@ -477,6 +477,7 @@ async fn build_agent(
     stream: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
+    goal: Option<&str>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     // Provider selector: `openai` (default) uses the OpenAI-compatible adapter,
@@ -538,7 +539,7 @@ async fn build_agent(
 
     // Load project context from AGENTS.md if present
     let project_context = load_project_context(&config.workspace);
-    let system_prompt = match (&project_context, skills.is_empty()) {
+    let mut system_prompt = match (&project_context, skills.is_empty()) {
         (Some(ctx), true) => {
             format!(
                 "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}",
@@ -556,7 +557,38 @@ async fn build_agent(
         (None, true) => config.system_prompt.clone(),
         (None, false) => format!("{}\n{}", config.system_prompt, skill_index(&skills)),
     };
-    // Inject memory summary (top 5 most recent notes) into the system prompt
+    // Inject auto-loaded skill bodies (Always + Trigger matching goal)
+    let injected = skills_for_injection(&skills, goal.unwrap_or(""));
+    if !injected.is_empty() {
+        let mut injection_block = String::new();
+        let mut total_chars = 0usize;
+        let max_injection_chars = 8192usize;
+        for (name, body) in &injected {
+            let snippet = format!("=== Skill: {name} (auto-loaded) ===
+{body}
+
+");
+            if total_chars + snippet.len() > max_injection_chars {
+                let remaining = max_injection_chars.saturating_sub(total_chars);
+                let truncated = if remaining > 20 {
+                    format!("{}...
+[truncated]
+", &snippet[..remaining.saturating_sub(20)])
+                } else {
+                    "[truncated]
+".to_string()
+                };
+                injection_block.push_str(&truncated);
+                break;
+            }
+            injection_block.push_str(&snippet);
+            total_chars += snippet.len();
+        }
+        system_prompt = format!("{}
+
+{}", system_prompt, injection_block);
+    }
+    // Inject memory summary (top 5 most recent notes) into the system prompt (top 5 most recent notes) into the system prompt
     let memory_block = memory_summary(&config.workspace, 5);
     let system_prompt = if memory_block.is_empty() {
         system_prompt
@@ -750,6 +782,7 @@ async fn run_resumed(
         false,
         mcp_config,
         hook_timing,
+        Some(&goal),
     )
     .await?;
     let tools = build_tools(&config).await;
@@ -811,6 +844,7 @@ async fn run_once(
         stream,
         mcp_config,
         hook_timing,
+        None,
     )
     .await?;
     let tools = build_tools(&config).await;
@@ -880,6 +914,7 @@ async fn repl(
             false,
             mcp_config.clone(),
             false,
+            None,
         )
         .await?;
         let printer = if json_mode {
@@ -1013,15 +1048,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
 
-        let r1 = build_agent(&cfg, None, Vec::new(), /* stream */ false, None, false).await;
+        let r1 = build_agent(&cfg, None, Vec::new(), /* stream */ false, None, false, None).await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
 
-        let r2 = build_agent(&cfg, None, Vec::new(), /* stream */ true, None, false).await;
+        let r2 = build_agent(&cfg, None, Vec::new(), /* stream */ true, None, false, None).await;
         assert!(r2.is_ok(), "openai/stream=true: must not panic or fail");
 
         let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
-        let r3 = build_agent(&cfg, None, Vec::new(), false, None, false).await;
+        let r3 = build_agent(&cfg, None, Vec::new(), false, None, false, None).await;
         match original {
             Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),

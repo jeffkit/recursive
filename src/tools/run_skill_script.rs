@@ -206,7 +206,7 @@ async fn read_capped<R: AsyncReadExt + Unpin>(reader: &mut R, max: usize) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::SkillScript;
+    use crate::skills::{SkillMode, SkillScript};
     use tempfile::TempDir;
 
     fn make_skill_with_scripts(tmp: &TempDir, scripts: &[(&str, &str, &str)]) -> Vec<Skill> {
@@ -248,6 +248,8 @@ mod tests {
             refs: vec![],
             params: vec![],
             scripts: skill_scripts,
+            mode: SkillMode::Manual,
+            triggers: vec![],
         }]
     }
 
