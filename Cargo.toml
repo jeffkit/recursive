@@ -1,0 +1,47 @@
+[package]
+name = "recursive"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal, orthogonal, embeddable coding-agent kernel."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kongjie/recursive"
+homepage = "https://github.com/kongjie/recursive"
+documentation = "https://docs.rs/recursive"
+keywords = ["agent", "llm", "coding-agent", "ai", "tool-use"]
+categories = ["command-line-utilities", "api-bindings"]
+rust-version = "1.75"
+exclude = [".dev/", "journal/", "goals/"]
+
+[lib]
+name = "recursive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "recursive"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "io-std", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

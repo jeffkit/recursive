@@ -1,0 +1,73 @@
+//! Deterministic LLM for tests and offline development.
+//!
+//! `MockProvider` is fed a queue of pre-baked completions. The agent treats
+//! it identically to a real provider, so the agent loop is fully testable
+//! without network access.
+
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+
+use super::{Completion, LlmProvider, ToolSpec};
+use crate::error::{Error, Result};
+use crate::message::Message;
+
+#[derive(Default)]
+pub struct MockProvider {
+    scripted: Mutex<Vec<Completion>>,
+    calls: Mutex<Vec<Vec<Message>>>,
+}
+
+impl MockProvider {
+    pub fn new(scripted: Vec<Completion>) -> Self {
+        Self { scripted: Mutex::new(scripted), calls: Mutex::new(Vec::new()) }
+    }
+
+    /// Snapshot of the transcripts the agent has sent to this provider.
+    pub fn calls(&self) -> Vec<Vec<Message>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MockProvider {
+    async fn complete(&self, messages: &[Message], _tools: &[ToolSpec]) -> Result<Completion> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let mut queue = self.scripted.lock().unwrap();
+        if queue.is_empty() {
+            return Err(Error::Llm("MockProvider: no scripted completions left".into()));
+        }
+        Ok(queue.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn returns_scripted_in_order_and_records_calls() {
+        let provider = MockProvider::new(vec![
+            Completion { content: "one".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
+            Completion { content: "two".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
+        ]);
+
+        let m1 = vec![Message::user("hi")];
+        let r1 = provider.complete(&m1, &[]).await.unwrap();
+        assert_eq!(r1.content, "one");
+
+        let m2 = vec![Message::user("bye")];
+        let r2 = provider.complete(&m2, &[]).await.unwrap();
+        assert_eq!(r2.content, "two");
+
+        assert_eq!(provider.calls().len(), 2);
+        assert_eq!(provider.calls()[0][0].content, "hi");
+    }
+
+    #[tokio::test]
+    async fn errors_when_queue_drained() {
+        let provider = MockProvider::new(vec![]);
+        let err = provider.complete(&[], &[]).await.unwrap_err();
+        assert!(matches!(err, Error::Llm(_)));
+    }
+}
