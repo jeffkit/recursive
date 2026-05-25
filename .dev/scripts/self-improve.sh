@@ -246,10 +246,16 @@ mkdir -p "$TRANSCRIPT_DIR"
 
 # ---- Run the agent ----------------------------------------------------------
 
+# Pricing file for accurate cost reporting (dogfoods g51 external-pricing).
+PRICING_FILE="$DEV_DIR/pricing.yaml"
+PRICING_FLAG=""
+[[ -f "$PRICING_FILE" ]] && PRICING_FLAG="--pricing-file $PRICING_FILE"
+
 set +e
 "$BIN" --workspace . \
   --system-prompt-file "$SYSPROMPT_FILE" \
   --transcript-out "$TRANSCRIPT_OUT" \
+  $PRICING_FLAG \
   --log warn \
   run "$GOAL_BODY" 2>&1 | tee -a "$LOG"
 AGENT_STATUS=${PIPESTATUS[0]}
@@ -278,6 +284,7 @@ if [[ "$AGENT_STATUS" -ne 0 ]] \
     "$BIN" --workspace . \
       --system-prompt-file "$SYSPROMPT_FILE" \
       --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+      $PRICING_FLAG \
       --log warn \
       replay "$TRANSCRIPT_OUT" \
       --resume-from "$RESUME_FROM" "$GOAL_BODY" 2>&1 | tee -a "$LOG"
