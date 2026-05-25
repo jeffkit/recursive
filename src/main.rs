@@ -30,7 +30,7 @@ use recursive::{
     tools::{
         ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, LocalTransport, ReadFile, Recall,
         Remember, RunShell, RunSkillScript, SearchFiles, SubAgent, ToolTransport, WebFetch,
-        WriteFile, WebSearch,
+        WriteFile,
     },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
@@ -358,10 +358,6 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         ))
         .register(Arc::new(SearchFiles::new(root)))
         .register(Arc::new(WebFetch::new()));
-    // Register web_search if configured via env vars
-    if let Some(ws) = WebSearch::from_env() {
-        registry = registry.register(Arc::new(ws));
-    }
     registry = registry.register(Arc::new(EstimateTokens::new(root)));
     registry = registry
         .register(Arc::new(Remember::new(root)))
