@@ -196,7 +196,8 @@ pub fn load_pricing_from_yaml(path: &Path) -> Result<HashMap<String, ModelPricin
                 if let Some(ref mut builder) = current_pricing {
                     if let Some((key, value)) = trimmed.split_once(':') {
                         let key = key.trim();
-                        let value = value.trim();
+                        // Strip inline comments: "0.027  # 10% of input" → "0.027"
+                        let value = value.split('#').next().unwrap_or(value).trim();
                         if let Err(e) = builder.parse_field(key, value) {
                             return Err(Error::Config(format!(
                                 "error parsing {}: {}",
