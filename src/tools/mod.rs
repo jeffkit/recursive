@@ -14,11 +14,13 @@ use crate::llm::ToolSpec;
 pub mod apply_patch;
 pub mod count_lines;
 pub mod fs;
+pub mod search;
 pub mod shell;
 
 pub use apply_patch::ApplyPatch;
 pub use count_lines::CountLines;
 pub use fs::{ListDir, ReadFile, WriteFile};
+pub use search::SearchFiles;
 pub use shell::RunShell;
 
 #[async_trait]
