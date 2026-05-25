@@ -5,7 +5,7 @@
 //!   - `repl`:          interactive loop, one goal per line.
 //!   - `tools`:         print the registered tool specs as JSON.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -333,6 +333,42 @@ fn print_finish_note(finish: &FinishReason) {
     }
 }
 
+/// Save the transcript to disk if a path was requested. Always called
+/// before any exit-code decision so auto-resume (which keys off the
+/// transcript file's existence) works even when the agent terminated
+/// abnormally (e.g. BudgetExceeded).
+fn save_transcript(
+    outcome_transcript: &[recursive::message::Message],
+    outcome_steps: usize,
+    model: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let file = TranscriptFile::new(
+        outcome_transcript.to_vec(),
+        outcome_steps,
+        Some(model.into()),
+    );
+    file.write_to(path)?;
+    eprintln!(
+        "transcript: wrote {} messages to {}",
+        outcome_transcript.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Return Err iff the finish reason should propagate as a non-zero binary
+/// exit code so that self-improve.sh's auto-resume gate fires. The
+/// transcript has already been saved by the caller before this is called.
+fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
+    match finish {
+        FinishReason::BudgetExceeded => {
+            anyhow::bail!("agent exceeded step budget ({steps})")
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn run_resumed(
     config: Config,
     seed: Vec<recursive::message::Message>,
@@ -367,19 +403,9 @@ async fn run_resumed(
         print_finish_note(&outcome.finish);
     }
     if let Some(path) = transcript_out {
-        let file = TranscriptFile::new(
-            outcome.transcript.clone(),
-            outcome.steps,
-            Some(config.model.clone()),
-        );
-        file.write_to(&path)?;
-        eprintln!(
-            "transcript: wrote {} messages to {}",
-            outcome.transcript.len(),
-            path.display()
-        );
+        save_transcript(&outcome.transcript, outcome.steps, &config.model, &path)?;
     }
-    Ok(())
+    exit_for_finish(&outcome.finish, outcome.steps)
 }
 
 async fn run_once(
@@ -413,19 +439,9 @@ async fn run_once(
     }
 
     if let Some(path) = transcript_out {
-        let file = TranscriptFile::new(
-            outcome.transcript.clone(),
-            outcome.steps,
-            Some(config.model.clone()),
-        );
-        file.write_to(&path)?;
-        eprintln!(
-            "transcript: wrote {} messages to {}",
-            outcome.transcript.len(),
-            path.display()
-        );
+        save_transcript(&outcome.transcript, outcome.steps, &config.model, &path)?;
     }
-    Ok(())
+    exit_for_finish(&outcome.finish, outcome.steps)
 }
 
 async fn repl(

@@ -22,9 +22,6 @@ pub enum Error {
     #[error("invalid tool arguments for `{name}`: {message}")]
     BadToolArgs { name: String, message: String },
 
-    #[error("agent exceeded step budget ({0})")]
-    StepBudgetExceeded(usize),
-
     #[error("llm response truncated by provider (finish_reason = {0:?})")]
     ProviderTruncated(String),
 

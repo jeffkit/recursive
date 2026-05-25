@@ -46,6 +46,16 @@ tests/
    exception is `client build` in `openai.rs` (infallible by construction).
 6. **No new dependencies without justification.** State the reason in the
    journal entry. Prefer std + what's already in `Cargo.toml`.
+7. **Finish reasons are data, not errors.** `Agent::run` returns
+   `Ok(AgentOutcome { finish: ... })` for every termination mode
+   (`NoMoreToolCalls`, `BudgetExceeded`, `Stuck`, `TranscriptLimit`,
+   `ProviderStop`). Only honest-to-god failures (network, JSON,
+   provider transport, IO) become `Err`. The CLI decides binary
+   exit code by inspecting `outcome.finish` AFTER persisting the
+   transcript — see `main.rs::exit_for_finish`. **NEVER** introduce
+   a new `Error::XxxBudget` or `Error::XxxLimit` variant that
+   short-circuits the transcript save. self-improve.sh's auto-resume
+   gate depends on the saved transcript existing on disk.
 
 ## How to do work
 

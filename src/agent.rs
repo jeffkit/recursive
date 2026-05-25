@@ -29,58 +29,98 @@ const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepEvent {
-    AssistantText {
-        text: String,
-        step: usize,
-    },
-    ToolCall {
-        call: ToolCall,
-        step: usize,
-    },
-    Latency {
-        step: usize,
-        llm_ms: u64,
-    },
+    /// Model generated text without tool calls.
+    ///
+    /// Emitted when the LLM produces a response. This is typically the final
+    /// answer or intermediate reasoning. The `text` field contains the complete
+    /// model response, and `step` indicates which iteration this occurred on.
+    AssistantText { text: String, step: usize },
+    /// Model requested to execute a tool.
+    ///
+    /// Emitted when the LLM calls a tool. Contains the tool name, ID, and arguments
+    /// that will be executed. The `call` is dispatched to the registry after this event.
+    /// Tool errors are reported via `ToolResult` events, not `ToolCall` failures.
+    ToolCall { call: ToolCall, step: usize },
+    /// Time taken for the LLM request (excluding tool execution).
+    ///
+    /// Emitted after the model responds. Useful for measuring provider latency
+    /// and diagnosing slow responses. `llm_ms` is in milliseconds.
+    Latency { step: usize, llm_ms: u64 },
+    /// Result of executing a tool call.
+    ///
+    /// Emitted after a tool finishes executing. Contains the tool name, call ID,
+    /// the output string (or error message), and the step number. This result
+    /// is added to the transcript and sent back to the model for the next iteration.
+    /// In case of tool error, the output will be the error message prefixed with "ERROR: ".
     ToolResult {
         id: String,
         name: String,
         output: String,
         step: usize,
     },
-    Usage {
-        usage: TokenUsage,
-        step: usize,
-    },
-    PartialToken {
-        text: String,
-        step: usize,
-    },
+    /// Token usage statistics from the LLM provider.
+    ///
+    /// Emitted if the provider returns usage information (input tokens, output tokens).
+    /// Accumulated across all steps for total usage. Useful for cost tracking and
+    /// monitoring resource consumption.
+    Usage { usage: TokenUsage, step: usize },
+    /// Partial token from streaming response (if streaming enabled).
+    ///
+    /// Only emitted if streaming is enabled. Contains a single token or partial chunk
+    /// of the model's response text. Allows UI layers to display real-time incremental
+    /// updates to the model's output without waiting for the entire response.
+    PartialToken { text: String, step: usize },
+    /// Transcript was compacted to fit size constraints.
+    ///
+    /// Emitted when the transcript exceeds the max size and is automatically compacted.
+    /// The `removed` field shows how many messages were summarized, `kept` shows how many
+    /// remain, and `summary_chars` shows the size of the compaction summary added.
+    /// This allows UI layers to notify users that older context has been summarized.
+    /// Compaction only occurs if a `Compactor` is configured on the Agent.
     Compacted {
         removed: usize,
         kept: usize,
         summary_chars: usize,
         step: usize,
     },
-    Finished {
-        reason: FinishReason,
-        steps: usize,
-    },
+    /// Agent run completed.
+    ///
+    /// Emitted as the final event. Indicates the run is done and why it stopped.
+    /// `reason` explains the termination (no more tool calls, budget exceeded, stuck
+    /// detection, etc.). `steps` shows how many iterations were executed.
+    /// After this event, no more events will be emitted for this run.
+    Finished { reason: FinishReason, steps: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Why the agent's run terminated.
+///
+/// # Variants
+///
+/// - `NoMoreToolCalls`: Model produced a response without tool calls (natural completion).
+/// - `BudgetExceeded`: Ran out of steps (hit `max_steps`). Agent likely unfinished.
+/// - `ProviderStop(reason)`: LLM provider stopped unexpectedly. `reason` may be "length"
+///   (truncated by token limit), "stop"/"end_turn", or a provider-specific code.
+/// - `Stuck`: Agent got stuck calling the same tool repeatedly with the same arguments.
+///   `repeated_call` is the tool name, `repeats` is how many times before stopping.
+/// - `TranscriptLimit`: Transcript size hit `max_transcript_chars` hard limit before
+///   compaction could reduce it further. Agent cannot continue. `chars` is final size,
+///   `limit` is the configured maximum.
 pub enum FinishReason {
+    /// Model generated final response without requesting more tools.
     NoMoreToolCalls,
+    /// Agent exceeded the maximum number of steps allowed.
     BudgetExceeded,
+    /// LLM provider stopped with a specific reason or status code.
     ProviderStop(String),
+    /// Agent detected repeated identical tool calls (stuck loop).
     Stuck {
         repeated_call: String,
         repeats: usize,
     },
-    TranscriptLimit {
-        chars: usize,
-        limit: usize,
-    },
+    /// Transcript size exceeded hard limit and cannot be reduced further.
+    TranscriptLimit { chars: usize, limit: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +133,35 @@ pub struct AgentOutcome {
     pub total_llm_latency_ms: u64,
 }
 
+/// The ReAct loop: ask LLM, execute tools, repeat.
+///
+/// `Agent` orchestrates the interaction between an LLM provider, a tool registry,
+/// and a transcript. It drives a loop until the model stops calling tools or the
+/// budget (steps or transcript size) is exceeded.
+///
+/// # Usage
+///
+/// ```ignore
+/// let agent = Agent::builder()
+///     .llm(Arc::new(provider))
+///     .tools(registry)
+///     .system_prompt("You are a helpful assistant")
+///     .max_steps(32)
+///     .build()?;
+///
+/// let outcome = agent.run("Help me debug this file").await?;
+/// ```
+///
+/// # Events
+///
+/// The agent emits `StepEvent`s through an optional channel, allowing UI layers
+/// to observe progress without coupling to internals. See `StepEvent` for variants.
+///
+/// # Isolation
+///
+/// Each `Agent::run()` call is independent. The transcript is maintained across
+/// steps within a single run but cleared between runs. Use `seed_transcript()` to
+/// carry state between runs if needed.
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
@@ -293,11 +362,19 @@ impl Agent {
         }
 
         warn!(target: "recursive::agent", "step budget exceeded");
+        let finish = FinishReason::BudgetExceeded;
         self.emit(StepEvent::Finished {
-            reason: FinishReason::BudgetExceeded,
+            reason: finish.clone(),
             steps: self.max_steps,
         });
-        Err(Error::StepBudgetExceeded(self.max_steps))
+        Ok(AgentOutcome {
+            final_message,
+            transcript: std::mem::take(&mut self.transcript),
+            steps: self.max_steps,
+            finish,
+            total_usage,
+            total_llm_latency_ms: self.total_llm_latency_ms,
+        })
     }
 
     /// Try to trim old tool results to bring the transcript under the character limit.
@@ -397,6 +474,20 @@ impl Agent {
     }
 }
 
+/// Builder for configuring and creating an agent.
+///
+/// Use `Agent::builder()` to start building. All methods are optional except `llm()`.
+///
+/// # Example
+///
+/// ```ignore
+/// let agent = Agent::builder()
+///     .llm(Arc::new(provider))
+///     .tools(registry)
+///     .system_prompt("You are a helpful assistant")
+///     .max_steps(50)
+///     .build()?;
+/// ```
 #[derive(Default)]
 pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
@@ -411,26 +502,62 @@ pub struct AgentBuilder {
 }
 
 impl AgentBuilder {
+    /// Set the LLM provider (required).
+    ///
+    /// The provider handles all requests to the model. Must be provided before
+    /// calling `build()`, otherwise `build()` will return an error.
     pub fn llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
         self
     }
+    /// Set the tool registry (optional, defaults to empty registry).
+    ///
+    /// Tools are available to the model for execution during the run. If not set,
+    /// the agent will only generate text. The registry is shared via Arc, so tool
+    /// implementations must be thread-safe.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
         self
     }
+    /// Set the system prompt (optional).
+    ///
+    /// Prepended to the transcript before the first goal. Typically describes
+    /// the agent's role (e.g., "You are a code assistant"). If not set, no
+    /// system message is added.
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system = Some(prompt.into());
         self
     }
+    /// Set the maximum number of agent iterations (optional, defaults to 32).
+    ///
+    /// Each iteration is one LLM call + tool execution round. Higher values
+    /// allow more complex reasoning but increase cost and latency. If exceeded,
+    /// the run finishes with `FinishReason::BudgetExceeded`.
     pub fn max_steps(mut self, n: usize) -> Self {
         self.max_steps = Some(n);
         self
     }
+    /// Set the maximum transcript character size (optional).
+    ///
+    /// Prevents the transcript from growing unbounded. When this limit is approached,
+    /// `Compactor` (if configured) will summarize and trim old messages. If the
+    /// transcript cannot fit within the limit, the run stops with
+    /// `FinishReason::TranscriptLimit`.
+    ///
+    /// # Note
+    ///
+    /// This is a hard limit; if compaction cannot reduce the size enough, the
+    /// run will terminate rather than add the next message.
     pub fn max_transcript_chars(mut self, n: usize) -> Self {
         self.max_transcript_chars = Some(n);
         self
     }
+    /// Attach an event channel to observe agent progress (optional).
+    ///
+    /// Events are sent through this channel as the agent runs. Non-blocking:
+    /// if the receiver is dropped or the channel is full, sends are silently
+    /// ignored. Allows UI layers to display real-time progress without coupling
+    /// to the agent's internals.
     pub fn events(mut self, tx: mpsc::UnboundedSender<StepEvent>) -> Self {
         self.events = Some(tx);
         self
@@ -443,10 +570,20 @@ impl AgentBuilder {
         self.seed = messages;
         self
     }
+    /// Enable token-by-token streaming from the provider (optional, defaults to false).
+    ///
+    /// If enabled, the agent creates a channel and asks the provider to emit
+    /// `PartialToken` events as they arrive. Requires provider support; some
+    /// providers ignore this and emit the complete response at once.
     pub fn streaming(mut self, enabled: bool) -> Self {
         self.streaming = enabled;
         self
     }
+    /// Attach a compactor to automatically trim old transcript content (optional).
+    ///
+    /// When the transcript reaches `max_transcript_chars`, the compactor
+    /// summarizes and removes old messages. Only active if both `max_transcript_chars`
+    /// and `compactor` are set. Without a compactor, `TranscriptLimit` errors occur.
     pub fn compactor(mut self, compactor: Compactor) -> Self {
         self.compactor = Some(compactor);
         self
@@ -577,8 +714,12 @@ mod tests {
             .max_steps(3)
             .build()
             .unwrap();
-        let err = agent.run("loop").await.unwrap_err();
-        assert!(matches!(err, Error::StepBudgetExceeded(3)));
+        let out = agent.run("loop").await.unwrap();
+        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+        assert_eq!(out.steps, 3);
+        // Transcript MUST be populated even on budget-exceeded — this is
+        // what unlocks auto-resume in self-improve.sh.
+        assert!(!out.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -734,10 +875,73 @@ mod tests {
             .max_steps(3)
             .build()
             .unwrap();
-        let err = agent.run("add with different args").await.unwrap_err();
+        let out = agent.run("add with different args").await.unwrap();
 
         // Should hit budget, not stuck (args differ each time)
-        assert!(matches!(err, Error::StepBudgetExceeded(3)));
+        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+        assert_eq!(out.steps, 3);
+    }
+
+    /// Regression test for self-improve.sh auto-resume.
+    ///
+    /// Before the fix, `Agent::run` returned `Err(StepBudgetExceeded)` on
+    /// budget overrun, and `run_once` propagated the `?` before the
+    /// transcript-save block. Result: `--transcript-out` produced no file,
+    /// and self-improve.sh's auto-resume gate `[[ -f $TRANSCRIPT_OUT ]]`
+    /// always failed → no resume ever ran.
+    ///
+    /// Now `Agent::run` returns `Ok(outcome)` with `finish: BudgetExceeded`
+    /// and the full transcript populated. The CLI (`main.rs`) is then
+    /// expected to save the transcript first and only then bail with a
+    /// non-zero exit code via `exit_for_finish`.
+    ///
+    /// This test pins the agent half of that contract: on budget overrun,
+    /// `outcome.transcript` is non-empty AND round-trips through
+    /// `TranscriptFile::{write_to,read_from}` cleanly.
+    #[tokio::test]
+    async fn budget_exceeded_yields_writable_transcript() {
+        use crate::TranscriptFile;
+
+        let mut script = Vec::new();
+        for i in 0..10 {
+            script.push(Completion {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("t{i}"),
+                    name: "adder".into(),
+                    arguments: json!({"a": i, "b": i + 1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            });
+        }
+        let llm = Arc::new(MockProvider::new(script));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(3)
+            .build()
+            .unwrap();
+        let out = agent.run("loop").await.unwrap();
+
+        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+        assert!(
+            !out.transcript.is_empty(),
+            "transcript must survive BudgetExceeded for auto-resume"
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let file =
+            TranscriptFile::new(out.transcript.clone(), out.steps, Some("mock-model".into()));
+        file.write_to(tmp.path()).unwrap();
+
+        let restored = TranscriptFile::read_from(tmp.path()).unwrap();
+        assert_eq!(
+            restored.messages().len(),
+            out.transcript.len(),
+            "round-trip transcript length must match"
+        );
     }
 
     #[tokio::test]
