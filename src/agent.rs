@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::compact::Compactor;
 use crate::error::{Error, Result};
 use crate::llm::{Completion, LlmProvider, TokenUsage, ToolCall};
 use crate::message::Message;
@@ -100,6 +101,7 @@ pub struct Agent {
     max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
     total_llm_latency_ms: u64,
+    compactor: Option<Compactor>,
 }
 
 impl Agent {
@@ -147,6 +149,9 @@ impl Agent {
                     });
                 }
             }
+
+            // Optionally compact the transcript if it exceeds the threshold.
+            self.maybe_compact(step).await?;
 
             debug!(target: "recursive::agent", step, "calling llm");
             let start = std::time::Instant::now();
@@ -285,6 +290,49 @@ impl Agent {
     /// replaces the content with [`TRIM_PLACEHOLDER`]. Stops as soon as the total
     /// character count is below `limit`. Emits an `AssistantText` event (reusing the
     /// existing variant) to surface that trimming happened.
+    async fn maybe_compact(&mut self, step: usize) -> Result<()> {
+        let compactor = match &self.compactor {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let chars = Compactor::estimate_chars(&self.transcript);
+        if chars < compactor.threshold_chars {
+            return Ok(());
+        }
+
+        // Need at least keep_recent_n + 2 messages to have something to compact.
+        let min_messages = compactor.keep_recent_n + 2;
+        if self.transcript.len() < min_messages {
+            return Ok(());
+        }
+
+        let summary_msg = compactor
+            .compact(self.llm.as_ref(), &self.transcript)
+            .await?;
+        let summary_chars = summary_msg.content.len();
+
+        // Replace the older portion with the summary message.
+        // Keep the last keep_recent_n messages verbatim.
+        let keep = compactor.keep_recent_n;
+        let split = self.transcript.len().saturating_sub(keep);
+        let removed = split;
+        let kept = self.transcript.len() - split;
+
+        // Drain the older messages and insert the summary at the front.
+        self.transcript.drain(..split);
+        self.transcript.insert(0, summary_msg);
+
+        self.emit(StepEvent::Compacted {
+            removed,
+            kept,
+            summary_chars,
+            step,
+        });
+
+        Ok(())
+    }
+
     fn maybe_trim_transcript(&mut self, limit: usize, step: usize) {
         let mut chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
         if chars < limit {
@@ -341,6 +389,7 @@ pub struct AgentBuilder {
     max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
     seed: Vec<Message>,
+    compactor: Option<Compactor>,
 }
 
 impl AgentBuilder {
@@ -376,6 +425,10 @@ impl AgentBuilder {
         self.seed = messages;
         self
     }
+    pub fn compactor(mut self, compactor: Compactor) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self
             .llm
@@ -393,6 +446,7 @@ impl AgentBuilder {
             max_transcript_chars: self.max_transcript_chars,
             events: self.events,
             total_llm_latency_ms: 0,
+            compactor: self.compactor,
         })
     }
 }
@@ -831,6 +885,136 @@ mod tests {
         }
         // Should have stopped at step 1 without making any LLM call.
         assert_eq!(out.steps, 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_triggers_with_low_threshold() {
+        // Set up an agent with a very low compaction threshold (10 chars)
+        // and a script that produces enough messages to exceed it.
+        // The MockProvider's first two calls return tool calls to build up
+        // the transcript, the third call is consumed by the compactor,
+        // and the fourth call returns "done" to finish.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first call".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "second call".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            // This completion is consumed by the compactor
+            Completion {
+                content: "Summary: added numbers, tests pass.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+            // This completion is the agent's next step after compaction
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let compactor = crate::compact::Compactor::new(10).keep_recent_n(2);
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .events(tx)
+            .compactor(compactor)
+            .max_steps(10)
+            .build()
+            .unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+
+        // Check that a Compacted event was emitted
+        let mut compacted_count = 0;
+        while let Ok(e) = rx.try_recv() {
+            if matches!(e, StepEvent::Compacted { .. }) {
+                compacted_count += 1;
+            }
+        }
+        assert_eq!(compacted_count, 1, "expected exactly one Compacted event");
+
+        // The transcript should contain the summary message (system role)
+        let summary_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::System)
+            .collect();
+        assert!(
+            !summary_msgs.is_empty(),
+            "expected at least one system message (the summary)"
+        );
+        assert!(
+            summary_msgs
+                .iter()
+                .any(|m| m.content.contains("[compacted:")),
+            "expected a system message with compacted header"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_disabled_by_default() {
+        // Without setting a compactor, no compaction should happen.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "let me add".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .events(tx)
+            .max_steps(10)
+            .build()
+            .unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+
+        // No Compacted events should be emitted
+        let mut compacted_count = 0;
+        while let Ok(e) = rx.try_recv() {
+            if matches!(e, StepEvent::Compacted { .. }) {
+                compacted_count += 1;
+            }
+        }
+        assert_eq!(
+            compacted_count, 0,
+            "expected no Compacted events by default"
+        );
     }
 
     #[test]
