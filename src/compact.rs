@@ -59,6 +59,7 @@ impl Compactor {
     ///
     /// Returns the summary `Message` that should replace the older portion.
     /// The caller is responsible for splicing it into the transcript.
+    #[tracing::instrument(skip(self, provider, transcript))]
     pub async fn compact(
         &self,
         provider: &dyn LlmProvider,
