@@ -95,9 +95,14 @@ impl Tool for RunShell {
 
         let out = stdout_task.await.unwrap_or_default();
         let err = stderr_task.await.unwrap_or_default();
-        let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
 
-        Ok(format!("exit: {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"))
+        Ok(format!(
+            "exit: {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        ))
     }
 }
 
@@ -153,7 +158,10 @@ mod tests {
     async fn enforces_timeout() {
         let tmp = TempDir::new().unwrap();
         let tool = RunShell::new(tmp.path()).with_timeout(Duration::from_millis(150));
-        let err = tool.execute(json!({"command": "sleep 5"})).await.unwrap_err();
+        let err = tool
+            .execute(json!({"command": "sleep 5"}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
     }
 }

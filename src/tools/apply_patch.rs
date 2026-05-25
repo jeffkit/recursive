@@ -85,7 +85,8 @@ impl Tool for ApplyPatch {
                 "Context lines must match the file exactly. If a hunk's pattern ",
                 "appears multiple times in the file, add an @@ anchor (some unique ",
                 "line that appears earlier in the file) before the hunk."
-            ).into(),
+            )
+            .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -101,12 +102,18 @@ impl Tool for ApplyPatch {
             name: "apply_patch".into(),
             message: "missing `patch`".into(),
         })?;
-        let patch = parse_patch(input)
-            .map_err(|e| Error::Tool { name: "apply_patch".into(), message: e })?;
-        let writes = stage(&patch, &self.root).await
-            .map_err(|e| Error::Tool { name: "apply_patch".into(), message: e })?;
-        commit(writes).await
-            .map_err(|e| Error::Tool { name: "apply_patch".into(), message: e })
+        let patch = parse_patch(input).map_err(|e| Error::Tool {
+            name: "apply_patch".into(),
+            message: e,
+        })?;
+        let writes = stage(&patch, &self.root).await.map_err(|e| Error::Tool {
+            name: "apply_patch".into(),
+            message: e,
+        })?;
+        commit(writes).await.map_err(|e| Error::Tool {
+            name: "apply_patch".into(),
+            message: e,
+        })
     }
 }
 
@@ -176,7 +183,13 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
             if path.is_empty() {
                 return Err(format!("`{UPDATE}` with empty path"));
             }
-            current_file = Some(FileOp::Update { path, hunks: vec![Hunk { anchor: None, lines: vec![] }] });
+            current_file = Some(FileOp::Update {
+                path,
+                hunks: vec![Hunk {
+                    anchor: None,
+                    lines: vec![],
+                }],
+            });
             continue;
         }
         if let Some(path) = line.strip_prefix(ADD) {
@@ -187,7 +200,10 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
             if path.is_empty() {
                 return Err(format!("`{ADD}` with empty path"));
             }
-            current_file = Some(FileOp::Add { path, content: String::new() });
+            current_file = Some(FileOp::Add {
+                path,
+                content: String::new(),
+            });
             continue;
         }
         if let Some(path) = line.strip_prefix(DELETE) {
@@ -212,12 +228,19 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
                 if let Some(rest) = line.strip_prefix(HUNK_SEP) {
                     // New hunk; first hunk is pre-allocated above, so we only push if the current is non-empty.
                     let anchor_str = rest.trim();
-                    let anchor = if anchor_str.is_empty() { None } else { Some(anchor_str.to_string()) };
+                    let anchor = if anchor_str.is_empty() {
+                        None
+                    } else {
+                        Some(anchor_str.to_string())
+                    };
                     let last = hunks.last_mut().unwrap();
                     if last.lines.is_empty() {
                         last.anchor = anchor;
                     } else {
-                        hunks.push(Hunk { anchor, lines: vec![] });
+                        hunks.push(Hunk {
+                            anchor,
+                            lines: vec![],
+                        });
                     }
                     continue;
                 }
@@ -243,7 +266,9 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
                 } else if line.is_empty() {
                     ""
                 } else {
-                    return Err(format!("Add File body lines must start with `+`, got `{line}`"));
+                    return Err(format!(
+                        "Add File body lines must start with `+`, got `{line}`"
+                    ));
                 };
                 if !content.is_empty() {
                     content.push('\n');
@@ -263,7 +288,9 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
     let mut seen: HashSet<&String> = HashSet::new();
     for op in &patch.ops {
         let path = match op {
-            FileOp::Update { path, .. } | FileOp::Add { path, .. } | FileOp::Delete { path } => path,
+            FileOp::Update { path, .. } | FileOp::Add { path, .. } | FileOp::Delete { path } => {
+                path
+            }
         };
         if !seen.insert(path) {
             return Err(format!("path `{path}` appears in patch more than once"));
@@ -276,8 +303,15 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
                 if h.lines.is_empty() {
                     return Err(format!("Update File `{path}` hunk {} is empty", i + 1));
                 }
-                if !h.lines.iter().any(|l| matches!(l, HunkLine::Add(_) | HunkLine::Remove(_))) {
-                    return Err(format!("Update File `{path}` hunk {} has no +/- lines", i + 1));
+                if !h
+                    .lines
+                    .iter()
+                    .any(|l| matches!(l, HunkLine::Add(_) | HunkLine::Remove(_)))
+                {
+                    return Err(format!(
+                        "Update File `{path}` hunk {} has no +/- lines",
+                        i + 1
+                    ));
                 }
             }
         }
@@ -299,11 +333,16 @@ enum StagedKind {
     Delete,
 }
 
-async fn stage(patch: &Patch, root: &std::path::Path) -> std::result::Result<Vec<StagedWrite>, String> {
+async fn stage(
+    patch: &Patch,
+    root: &std::path::Path,
+) -> std::result::Result<Vec<StagedWrite>, String> {
     let mut staged = Vec::new();
     for op in &patch.ops {
         let path = match op {
-            FileOp::Update { path, .. } | FileOp::Add { path, .. } | FileOp::Delete { path } => path,
+            FileOp::Update { path, .. } | FileOp::Add { path, .. } | FileOp::Delete { path } => {
+                path
+            }
         };
         let abs = resolve_within(root, path).map_err(|e| e.to_string())?;
 
@@ -312,8 +351,8 @@ async fn stage(patch: &Patch, root: &std::path::Path) -> std::result::Result<Vec
                 let current = tokio::fs::read_to_string(&abs)
                     .await
                     .map_err(|e| format!("update `{path}`: {e}"))?;
-                let updated = apply_hunks(&current, hunks)
-                    .map_err(|e| format!("update `{path}`: {e}"))?;
+                let updated =
+                    apply_hunks(&current, hunks).map_err(|e| format!("update `{path}`: {e}"))?;
                 staged.push(StagedWrite {
                     abs_path: abs,
                     rel_path: path.clone(),
@@ -334,7 +373,11 @@ async fn stage(patch: &Patch, root: &std::path::Path) -> std::result::Result<Vec
                 if !abs.exists() {
                     return Err(format!("delete `{path}`: file does not exist"));
                 }
-                staged.push(StagedWrite { abs_path: abs, rel_path: path.clone(), kind: StagedKind::Delete });
+                staged.push(StagedWrite {
+                    abs_path: abs,
+                    rel_path: path.clone(),
+                    kind: StagedKind::Delete,
+                });
             }
         }
     }
@@ -364,7 +407,11 @@ async fn commit(staged: Vec<StagedWrite>) -> std::result::Result<String, String>
             }
         }
     }
-    Ok(format!("applied {} change(s):\n{}", staged.len(), summary.join("\n")))
+    Ok(format!(
+        "applied {} change(s):\n{}",
+        staged.len(),
+        summary.join("\n")
+    ))
 }
 
 fn apply_hunks(content: &str, hunks: &[Hunk]) -> std::result::Result<String, String> {
@@ -373,15 +420,23 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> std::result::Result<String, Str
 
     for (idx, hunk) in hunks.iter().enumerate() {
         // Pattern: context + remove lines in order. Replacement: context + add.
-        let pattern: Vec<&str> = hunk.lines.iter().filter_map(|l| match l {
-            HunkLine::Context(s) | HunkLine::Remove(s) => Some(s.as_str()),
-            HunkLine::Add(_) => None,
-        }).collect();
+        let pattern: Vec<&str> = hunk
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                HunkLine::Context(s) | HunkLine::Remove(s) => Some(s.as_str()),
+                HunkLine::Add(_) => None,
+            })
+            .collect();
 
-        let replacement: Vec<String> = hunk.lines.iter().filter_map(|l| match l {
-            HunkLine::Context(s) | HunkLine::Add(s) => Some(s.clone()),
-            HunkLine::Remove(_) => None,
-        }).collect();
+        let replacement: Vec<String> = hunk
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                HunkLine::Context(s) | HunkLine::Add(s) => Some(s.clone()),
+                HunkLine::Remove(_) => None,
+            })
+            .collect();
 
         if pattern.is_empty() {
             // Pure-add hunk with no anchor: prepend to file. Discouraged but allowed.
@@ -426,8 +481,16 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> std::result::Result<String, Str
                 return Err(format!(
                     "hunk {} pattern not found{}.\nFirst 3 pattern lines:\n{}",
                     idx + 1,
-                    hunk.anchor.as_deref().map(|a| format!(" (anchor `{a}`)")).unwrap_or_default(),
-                    pattern.iter().take(3).map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
+                    hunk.anchor
+                        .as_deref()
+                        .map(|a| format!(" (anchor `{a}`)"))
+                        .unwrap_or_default(),
+                    pattern
+                        .iter()
+                        .take(3)
+                        .map(|l| format!("    {l}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ));
             }
             1 => matches[0],
@@ -479,11 +542,14 @@ mod tests {
                 assert_eq!(path, "a.txt");
                 assert_eq!(hunks.len(), 1);
                 assert_eq!(hunks[0].anchor, None);
-                assert_eq!(hunks[0].lines, vec![
-                    HunkLine::Context("keep".into()),
-                    HunkLine::Remove("old".into()),
-                    HunkLine::Add("new".into()),
-                ]);
+                assert_eq!(
+                    hunks[0].lines,
+                    vec![
+                        HunkLine::Context("keep".into()),
+                        HunkLine::Remove("old".into()),
+                        HunkLine::Add("new".into()),
+                    ]
+                );
             }
             _ => panic!("wrong op"),
         }
@@ -556,13 +622,16 @@ mod tests {
 
     #[test]
     fn parse_rejects_duplicate_path() {
-        let e = parse_patch("\
+        let e = parse_patch(
+            "\
 *** Begin Patch
 *** Add File: a.txt
 +x
 *** Delete File: a.txt
 *** End Patch
-").unwrap_err();
+",
+        )
+        .unwrap_err();
         assert!(e.contains("more than once"));
     }
 
@@ -574,13 +643,16 @@ mod tests {
 
     #[test]
     fn parse_rejects_hunk_without_changes() {
-        let e = parse_patch("\
+        let e = parse_patch(
+            "\
 *** Begin Patch
 *** Update File: a
  just
  context
 *** End Patch
-").unwrap_err();
+",
+        )
+        .unwrap_err();
         assert!(e.contains("no +/- lines"));
     }
 
@@ -598,7 +670,9 @@ mod tests {
  line3
 *** End Patch
 ");
-        let FileOp::Update { hunks, .. } = &patch.ops[0] else { panic!() };
+        let FileOp::Update { hunks, .. } = &patch.ops[0] else {
+            panic!()
+        };
         let updated = apply_hunks(original, hunks).unwrap();
         assert_eq!(updated, "line1\nnew\nline3\n");
     }
@@ -607,38 +681,61 @@ mod tests {
     fn applies_multi_hunk() {
         let original = "alpha\nbeta\ngamma\ndelta\n";
         let hunks = vec![
-            Hunk { anchor: None, lines: vec![
-                HunkLine::Context("alpha".into()),
-                HunkLine::Remove("beta".into()),
-                HunkLine::Add("BETA".into()),
-            ]},
-            Hunk { anchor: None, lines: vec![
-                HunkLine::Context("gamma".into()),
-                HunkLine::Remove("delta".into()),
-                HunkLine::Add("DELTA".into()),
-            ]},
+            Hunk {
+                anchor: None,
+                lines: vec![
+                    HunkLine::Context("alpha".into()),
+                    HunkLine::Remove("beta".into()),
+                    HunkLine::Add("BETA".into()),
+                ],
+            },
+            Hunk {
+                anchor: None,
+                lines: vec![
+                    HunkLine::Context("gamma".into()),
+                    HunkLine::Remove("delta".into()),
+                    HunkLine::Add("DELTA".into()),
+                ],
+            },
         ];
-        assert_eq!(apply_hunks(original, &hunks).unwrap(), "alpha\nBETA\ngamma\nDELTA\n");
+        assert_eq!(
+            apply_hunks(original, &hunks).unwrap(),
+            "alpha\nBETA\ngamma\nDELTA\n"
+        );
     }
 
     #[test]
     fn errors_when_pattern_not_found() {
-        let e = apply_hunks("hello\nworld\n", &[Hunk { anchor: None, lines: vec![
-            HunkLine::Context("foo".into()),
-            HunkLine::Remove("bar".into()),
-            HunkLine::Add("baz".into()),
-        ]}]).unwrap_err();
+        let e = apply_hunks(
+            "hello\nworld\n",
+            &[Hunk {
+                anchor: None,
+                lines: vec![
+                    HunkLine::Context("foo".into()),
+                    HunkLine::Remove("bar".into()),
+                    HunkLine::Add("baz".into()),
+                ],
+            }],
+        )
+        .unwrap_err();
         assert!(e.contains("not found"));
     }
 
     #[test]
     fn errors_when_pattern_ambiguous() {
         let original = "x\ny\nx\ny\n";
-        let e = apply_hunks(original, &[Hunk { anchor: None, lines: vec![
-            HunkLine::Context("x".into()),
-            HunkLine::Remove("y".into()),
-            HunkLine::Add("Y".into()),
-        ]}]).unwrap_err();
+        let e = apply_hunks(
+            original,
+            &[Hunk {
+                anchor: None,
+                lines: vec![
+                    HunkLine::Context("x".into()),
+                    HunkLine::Remove("y".into()),
+                    HunkLine::Add("Y".into()),
+                ],
+            }],
+        )
+        .unwrap_err();
         assert!(e.contains("matches"));
     }
 
@@ -661,11 +758,14 @@ mod tests {
     #[test]
     fn preserves_no_trailing_newline() {
         let original = "a\nb";
-        let hunks = vec![Hunk { anchor: None, lines: vec![
-            HunkLine::Remove("a".into()),
-            HunkLine::Add("A".into()),
-            HunkLine::Context("b".into()),
-        ]}];
+        let hunks = vec![Hunk {
+            anchor: None,
+            lines: vec![
+                HunkLine::Remove("a".into()),
+                HunkLine::Add("A".into()),
+                HunkLine::Context("b".into()),
+            ],
+        }];
         assert_eq!(apply_hunks(original, &hunks).unwrap(), "A\nb");
     }
 
@@ -676,15 +776,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("hello.txt"), "before\n").unwrap();
         let tool = ApplyPatch::new(tmp.path());
-        let result = tool.execute(json!({"patch": "\
+        let result = tool
+            .execute(json!({"patch": "\
 *** Begin Patch
 *** Update File: hello.txt
 -before
 +after
 *** End Patch
-"})).await.unwrap();
+"}))
+            .await
+            .unwrap();
         assert!(result.contains("wrote hello.txt"));
-        assert_eq!(std::fs::read_to_string(tmp.path().join("hello.txt")).unwrap(), "after\n");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("hello.txt")).unwrap(),
+            "after\n"
+        );
     }
 
     #[tokio::test]
@@ -697,19 +803,27 @@ mod tests {
 +hi
 +there
 *** End Patch
-"})).await.unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.path().join("sub/new.txt")).unwrap(), "hi\nthere");
+"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("sub/new.txt")).unwrap(),
+            "hi\nthere"
+        );
     }
 
     #[tokio::test]
     async fn tool_deletes_existing_file() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("doomed.txt"), "x").unwrap();
-        ApplyPatch::new(tmp.path()).execute(json!({"patch": "\
+        ApplyPatch::new(tmp.path())
+            .execute(json!({"patch": "\
 *** Begin Patch
 *** Delete File: doomed.txt
 *** End Patch
-"})).await.unwrap();
+"}))
+            .await
+            .unwrap();
         assert!(!tmp.path().join("doomed.txt").exists());
     }
 
@@ -720,7 +834,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "original-a\n").unwrap();
         std::fs::write(tmp.path().join("b.txt"), "original-b\n").unwrap();
-        let err = ApplyPatch::new(tmp.path()).execute(json!({"patch": "\
+        let err = ApplyPatch::new(tmp.path())
+            .execute(json!({"patch": "\
 *** Begin Patch
 *** Update File: a.txt
 -original-a
@@ -729,45 +844,62 @@ mod tests {
 -nonexistent-line
 +changed-b
 *** End Patch
-"})).await.unwrap_err();
+"}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
-        assert_eq!(std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(), "original-a\n");
-        assert_eq!(std::fs::read_to_string(tmp.path().join("b.txt")).unwrap(), "original-b\n");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "original-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("b.txt")).unwrap(),
+            "original-b\n"
+        );
     }
 
     #[tokio::test]
     async fn tool_rejects_add_when_file_exists() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("exists.txt"), "x").unwrap();
-        let err = ApplyPatch::new(tmp.path()).execute(json!({"patch": "\
+        let err = ApplyPatch::new(tmp.path())
+            .execute(json!({"patch": "\
 *** Begin Patch
 *** Add File: exists.txt
 +content
 *** End Patch
-"})).await.unwrap_err();
+"}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
     }
 
     #[tokio::test]
     async fn tool_rejects_delete_when_file_missing() {
         let tmp = TempDir::new().unwrap();
-        let err = ApplyPatch::new(tmp.path()).execute(json!({"patch": "\
+        let err = ApplyPatch::new(tmp.path())
+            .execute(json!({"patch": "\
 *** Begin Patch
 *** Delete File: ghost.txt
 *** End Patch
-"})).await.unwrap_err();
+"}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
     }
 
     #[tokio::test]
     async fn tool_rejects_sandbox_escape() {
         let tmp = TempDir::new().unwrap();
-        let err = ApplyPatch::new(tmp.path()).execute(json!({"patch": "\
+        let err = ApplyPatch::new(tmp.path())
+            .execute(json!({"patch": "\
 *** Begin Patch
 *** Add File: ../escape.txt
 +evil
 *** End Patch
-"})).await.unwrap_err();
+"}))
+            .await
+            .unwrap_err();
         // Wrapped as a Tool error (resolve_within returned BadToolArgs internally,
         // but we re-wrapped it). Just check it failed.
         assert!(matches!(err, Error::Tool { .. }));
@@ -777,7 +909,9 @@ mod tests {
     #[tokio::test]
     async fn tool_round_trips_a_real_change() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("lib.rs"), "\
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "\
 fn add(a: i32, b: i32) -> i32 {
     a + b
 }
@@ -785,7 +919,9 @@ fn add(a: i32, b: i32) -> i32 {
 fn sub(a: i32, b: i32) -> i32 {
     a - b
 }
-").unwrap();
+",
+        )
+        .unwrap();
         let tool = ApplyPatch::new(tmp.path());
         tool.execute(json!({"patch": "\
 *** Begin Patch
@@ -796,7 +932,9 @@ fn sub(a: i32, b: i32) -> i32 {
 +    a.saturating_sub(b)
  }
 *** End Patch
-"})).await.unwrap();
+"}))
+            .await
+            .unwrap();
         let got = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
         assert!(got.contains("a.saturating_sub(b)"));
         assert!(got.contains("a + b"), "add() unchanged");

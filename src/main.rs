@@ -22,7 +22,11 @@ use recursive::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "recursive", version, about = "A minimal self-improving coding agent")]
+#[command(
+    name = "recursive",
+    version,
+    about = "A minimal self-improving coding agent"
+)]
 struct Cli {
     /// Workspace root the agent can read/write within.
     #[arg(long, env = "RECURSIVE_WORKSPACE")]
@@ -90,7 +94,11 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
     let lvl: Level = level.parse().context("invalid log level")?;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(lvl.to_string()));
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).compact().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
     Ok(())
 }
 
@@ -141,7 +149,9 @@ async fn repl(config: Config) -> anyhow::Result<()> {
         eprint!("recursive> ");
         use std::io::Write;
         let _ = std::io::stderr().flush();
-        let Some(line) = lines.next_line().await? else { break };
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
         let goal = line.trim();
         if goal.is_empty() {
             continue;
@@ -178,8 +188,14 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             StepEvent::ToolCall { call, step } => {
                 println!("[step {step}] -> {} {}", call.name, call.arguments);
             }
-            StepEvent::ToolResult { name, output, step, .. } => {
-                let preview = if output.len() > 800 { format!("{}\n...[truncated]", &output[..800]) } else { output };
+            StepEvent::ToolResult {
+                name, output, step, ..
+            } => {
+                let preview = if output.len() > 800 {
+                    format!("{}\n...[truncated]", &output[..800])
+                } else {
+                    output
+                };
                 println!("[step {step}] <- {name}\n{preview}");
             }
             StepEvent::Finished { reason, steps } => {

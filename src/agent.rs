@@ -22,10 +22,24 @@ const STUCK_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone)]
 pub enum StepEvent {
-    AssistantText { text: String, step: usize },
-    ToolCall { call: ToolCall, step: usize },
-    ToolResult { id: String, name: String, output: String, step: usize },
-    Finished { reason: FinishReason, steps: usize },
+    AssistantText {
+        text: String,
+        step: usize,
+    },
+    ToolCall {
+        call: ToolCall,
+        step: usize,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        step: usize,
+    },
+    Finished {
+        reason: FinishReason,
+        steps: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +47,10 @@ pub enum FinishReason {
     NoMoreToolCalls,
     BudgetExceeded,
     ProviderStop(String),
-    Stuck { repeated_call: String, repeats: usize },
+    Stuck {
+        repeated_call: String,
+        repeats: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -83,12 +100,16 @@ impl Agent {
             }
 
             if completion.tool_calls.is_empty() {
-                self.transcript.push(Message::assistant(completion.content.clone()));
+                self.transcript
+                    .push(Message::assistant(completion.content.clone()));
                 let finish = match completion.finish_reason {
                     Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
                     _ => FinishReason::NoMoreToolCalls,
                 };
-                self.emit(StepEvent::Finished { reason: finish.clone(), steps: step });
+                self.emit(StepEvent::Finished {
+                    reason: finish.clone(),
+                    steps: step,
+                });
                 return Ok(AgentOutcome {
                     final_message,
                     transcript: std::mem::take(&mut self.transcript),
@@ -103,14 +124,20 @@ impl Agent {
             ));
 
             for call in completion.tool_calls.iter() {
-                self.emit(StepEvent::ToolCall { call: call.clone(), step });
+                self.emit(StepEvent::ToolCall {
+                    call: call.clone(),
+                    step,
+                });
                 let result = match self.tools.invoke(&call.name, call.arguments.clone()).await {
                     Ok(output) => output,
                     Err(err) => format!("ERROR: {err}"),
                 };
 
                 // Anti-stuck heuristic: track identical failing calls
-                let call_key = (call.name.clone(), serde_json::to_string(&call.arguments).unwrap_or_default());
+                let call_key = (
+                    call.name.clone(),
+                    serde_json::to_string(&call.arguments).unwrap_or_default(),
+                );
                 let is_error = result.starts_with("ERROR:");
 
                 if is_error {
@@ -133,7 +160,10 @@ impl Agent {
                         repeated_call,
                         repeats,
                     };
-                    self.emit(StepEvent::Finished { reason: finish.clone(), steps: step });
+                    self.emit(StepEvent::Finished {
+                        reason: finish.clone(),
+                        steps: step,
+                    });
                     return Ok(AgentOutcome {
                         final_message,
                         transcript: std::mem::take(&mut self.transcript),
@@ -148,12 +178,16 @@ impl Agent {
                     output: result.clone(),
                     step,
                 });
-                self.transcript.push(Message::tool_result(call.id.clone(), result));
+                self.transcript
+                    .push(Message::tool_result(call.id.clone(), result));
             }
         }
 
         warn!(target: "recursive::agent", "step budget exceeded");
-        self.emit(StepEvent::Finished { reason: FinishReason::BudgetExceeded, steps: self.max_steps });
+        self.emit(StepEvent::Finished {
+            reason: FinishReason::BudgetExceeded,
+            steps: self.max_steps,
+        });
         Err(Error::StepBudgetExceeded(self.max_steps))
     }
 
@@ -199,7 +233,9 @@ impl AgentBuilder {
         self
     }
     pub fn build(self) -> Result<Agent> {
-        let llm = self.llm.ok_or_else(|| Error::Config("agent: missing llm provider".into()))?;
+        let llm = self
+            .llm
+            .ok_or_else(|| Error::Config("agent: missing llm provider".into()))?;
         let mut transcript = Vec::new();
         if let Some(sys) = self.system {
             transcript.push(Message::system(sys));
@@ -269,10 +305,18 @@ mod tests {
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
                 content: "let me add".into(),
-                tool_calls: vec![ToolCall { id: "c1".into(), name: "add".into(), arguments: json!({"a":2,"b":3}) }],
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":2,"b":3}),
+                }],
                 finish_reason: Some("tool_calls".into()),
             },
-            Completion { content: "5".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
+            Completion {
+                content: "5".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+            },
         ]));
         let tools = ToolRegistry::new().register(Arc::new(Adder));
         let mut agent = Agent::builder().llm(llm).tools(tools).build().unwrap();
@@ -289,13 +333,22 @@ mod tests {
         for _ in 0..10 {
             script.push(Completion {
                 content: "".into(),
-                tool_calls: vec![ToolCall { id: "x".into(), name: "add".into(), arguments: json!({"a":1,"b":1}) }],
+                tool_calls: vec![ToolCall {
+                    id: "x".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
                 finish_reason: Some("tool_calls".into()),
             });
         }
         let llm = Arc::new(MockProvider::new(script));
         let tools = ToolRegistry::new().register(Arc::new(Adder));
-        let mut agent = Agent::builder().llm(llm).tools(tools).max_steps(3).build().unwrap();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(3)
+            .build()
+            .unwrap();
         let err = agent.run("loop").await.unwrap_err();
         assert!(matches!(err, Error::StepBudgetExceeded(3)));
     }
@@ -305,15 +358,27 @@ mod tests {
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
                 content: "".into(),
-                tool_calls: vec![ToolCall { id: "c1".into(), name: "nope".into(), arguments: json!({}) }],
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "nope".into(),
+                    arguments: json!({}),
+                }],
                 finish_reason: Some("tool_calls".into()),
             },
-            Completion { content: "ok i give up".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
+            Completion {
+                content: "ok i give up".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+            },
         ]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let out = agent.run("call a missing tool").await.unwrap();
         // tool message must contain the error so the model can recover
-        let tool_msg = out.transcript.iter().find(|m| m.role == crate::message::Role::Tool).unwrap();
+        let tool_msg = out
+            .transcript
+            .iter()
+            .find(|m| m.role == crate::message::Role::Tool)
+            .unwrap();
         assert!(tool_msg.content.contains("ERROR"));
         assert_eq!(out.final_message.as_deref(), Some("ok i give up"));
     }
@@ -323,14 +388,27 @@ mod tests {
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
                 content: "thinking".into(),
-                tool_calls: vec![ToolCall { id: "c1".into(), name: "add".into(), arguments: json!({"a":1,"b":1}) }],
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
                 finish_reason: Some("tool_calls".into()),
             },
-            Completion { content: "two".into(), tool_calls: vec![], finish_reason: Some("stop".into()) },
+            Completion {
+                content: "two".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+            },
         ]));
         let tools = ToolRegistry::new().register(Arc::new(Adder));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut agent = Agent::builder().llm(llm).tools(tools).events(tx).build().unwrap();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .events(tx)
+            .build()
+            .unwrap();
         agent.run("add").await.unwrap();
         let mut kinds = Vec::new();
         while let Ok(e) = rx.try_recv() {
@@ -362,10 +440,14 @@ mod tests {
         let llm = Arc::new(MockProvider::new(script));
         let mut agent = Agent::builder().llm(llm).max_steps(10).build().unwrap();
         let out = agent.run("call unknown tool").await.unwrap();
-        
+
         // Should be stuck after 3 consecutive errors
         assert!(matches!(out.finish, FinishReason::Stuck { .. }));
-        if let FinishReason::Stuck { repeated_call, repeats } = &out.finish {
+        if let FinishReason::Stuck {
+            repeated_call,
+            repeats,
+        } = &out.finish
+        {
             assert_eq!(repeated_call, "UnknownTool");
             assert_eq!(*repeats, 3);
         }
@@ -389,9 +471,14 @@ mod tests {
         let llm = Arc::new(MockProvider::new(script));
         let tools = ToolRegistry::new().register(Arc::new(Adder));
         // Set max_steps low so test terminates with budget
-        let mut agent = Agent::builder().llm(llm).tools(tools).max_steps(3).build().unwrap();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(3)
+            .build()
+            .unwrap();
         let err = agent.run("add with different args").await.unwrap_err();
-        
+
         // Should hit budget, not stuck (args differ each time)
         assert!(matches!(err, Error::StepBudgetExceeded(3)));
     }
