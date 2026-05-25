@@ -4,7 +4,13 @@
 //! document from the skill's `refs/` directory via the optional `ref`
 //! parameter. Also supports parameter substitution via the `params`
 //! object.
+//!
+//! When loading a skill (without `ref`), any skills listed in its
+//! `depends_on` frontmatter field are resolved recursively (up to 3
+//! levels deep) and prepended to the output. Circular dependencies are
+//! detected and skipped with a warning.
 
+use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 
@@ -16,6 +22,9 @@ use crate::llm::ToolSpec;
 use crate::skills::Skill;
 use crate::tools::Tool;
 
+/// Maximum depth for dependency resolution.
+const MAX_DEPTH: usize = 3;
+
 /// Tool to load a skill's SKILL.md body content, or a specific ref document.
 pub struct LoadSkill {
     skills: Arc<Vec<Skill>>,
@@ -26,6 +35,78 @@ impl LoadSkill {
         Self {
             skills: Arc::new(skills),
         }
+    }
+
+    /// Resolve dependencies for a skill, returning a list of (name, body) pairs
+    /// in dependency-first order (breadth-first from leaves).
+    ///
+    /// `visited` tracks names already seen in the current resolution chain
+    /// (for circular detection). `depth` tracks how deep we are.
+    fn resolve_deps(
+        &self,
+        skill: &Skill,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<Vec<(String, String)>> {
+        if depth > MAX_DEPTH {
+            return Err(Error::Tool {
+                name: "load_skill".into(),
+                message: "dependency tree too deep (max 3 levels)".to_string(),
+            });
+        }
+
+        let mut deps = Vec::new();
+
+        for dep_name in &skill.depends_on {
+            // Circular detection
+            if !visited.insert(dep_name.to_lowercase()) {
+                // Already in the chain — circular dependency
+                deps.push((
+                    dep_name.clone(),
+                    format!(
+                        "[WARNING: circular dependency detected, skipping {}]",
+                        dep_name
+                    ),
+                ));
+                continue;
+            }
+
+            // Find the dependency skill (case-insensitive)
+            let dep_skill = self
+                .skills
+                .iter()
+                .find(|s| s.name.to_lowercase() == dep_name.to_lowercase())
+                .ok_or_else(|| Error::Tool {
+                    name: "load_skill".into(),
+                    message: format!(
+                        "dependency '{}' not found (required by '{}')",
+                        dep_name, skill.name
+                    ),
+                })?;
+
+            // Recursively resolve the dependency's own dependencies first
+            let sub_deps = self.resolve_deps(dep_skill, visited, depth + 1)?;
+            deps.extend(sub_deps);
+
+            // Read the dependency's body
+            let content = fs::read_to_string(&dep_skill.path).map_err(|e| Error::Tool {
+                name: "load_skill".into(),
+                message: format!("failed to read dependency '{}': {e}", dep_skill.name),
+            })?;
+
+            let body = content
+                .strip_prefix("---")
+                .and_then(|rest| rest.find("---").map(|end| rest[end + 3..].trim()))
+                .unwrap_or(content.trim())
+                .to_string();
+
+            deps.push((dep_skill.name.clone(), body));
+
+            // Remove from visited so sibling branches can reference the same skill
+            visited.remove(&dep_name.to_lowercase());
+        }
+
+        Ok(deps)
     }
 }
 
@@ -183,14 +264,32 @@ impl Tool for LoadSkill {
             result
         };
 
-        Ok(rendered)
+        // Resolve dependencies (if any)
+        let mut visited = HashSet::new();
+        visited.insert(skill.name.to_lowercase());
+        let deps = self.resolve_deps(skill, &mut visited, 1)?;
+
+        if deps.is_empty() {
+            return Ok(rendered);
+        }
+
+        // Build output: dependencies first, then the requested skill
+        let mut output = String::new();
+        for (dep_name, dep_body) in &deps {
+            output.push_str(&format!("=== Dependency: {dep_name} ===\n{dep_body}\n\n"));
+        }
+        output.push_str(&format!("=== Skill: {} ===\n{}", skill.name, rendered));
+
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::SkillMode;
     use std::io::Write;
+    use std::path::PathBuf;
 
     #[test]
     fn load_skill_returns_body_for_known_skill() {
@@ -519,5 +618,197 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Lang=python Mode=lax");
+    }
+
+    // --- Dependency resolution tests ---
+
+    /// Helper to create a skill directory with frontmatter and body.
+    fn create_skill(base: &std::path::Path, name: &str, depends_on: &[&str], body: &str) {
+        let dir = base.join(name);
+        fs::create_dir(&dir).unwrap();
+        let mut frontmatter = format!("---\nname: {name}\ndescription: {name} skill\n");
+        if !depends_on.is_empty() {
+            frontmatter.push_str(&format!("depends_on: {}\n", depends_on.join(", ")));
+        }
+        frontmatter.push_str("---\n\n");
+        fs::write(dir.join("SKILL.md"), format!("{frontmatter}{body}")).unwrap();
+    }
+
+    #[test]
+    fn load_skill_resolves_single_dependency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Skill B (no deps)
+        create_skill(base, "skill-b", &[], "Body of B");
+        // Skill A depends on B
+        create_skill(base, "skill-a", &["skill-b"], "Body of A");
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "skill-a"})));
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            "=== Dependency: skill-b ===\nBody of B\n\n=== Skill: skill-a ===\nBody of A"
+        );
+    }
+
+    #[test]
+    fn load_skill_resolves_multi_level_dependencies() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Skill C (no deps)
+        create_skill(base, "skill-c", &[], "Body of C");
+        // Skill B depends on C
+        create_skill(base, "skill-b", &["skill-c"], "Body of B");
+        // Skill A depends on B
+        create_skill(base, "skill-a", &["skill-b"], "Body of A");
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "skill-a"})));
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            "=== Dependency: skill-c ===\nBody of C\n\n=== Dependency: skill-b ===\nBody of B\n\n=== Skill: skill-a ===\nBody of A"
+        );
+    }
+
+    #[test]
+    fn load_skill_detects_circular_dependency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Skill A depends on B
+        create_skill(base, "skill-a", &["skill-b"], "Body of A");
+        // Skill B depends on A (circular!)
+        create_skill(base, "skill-b", &["skill-a"], "Body of B");
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "skill-a"})));
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        // Should contain the warning for the circular dependency
+        assert!(
+            output.contains("circular dependency detected"),
+            "output should mention circular dependency: {output}"
+        );
+        // Should still contain the skill body
+        assert!(output.contains("=== Skill: skill-a ==="));
+        assert!(output.contains("Body of A"));
+    }
+
+    #[test]
+    fn load_skill_respects_depth_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a chain A -> B -> C -> D -> E (4 levels deep, exceeds max 3)
+        create_skill(base, "skill-e", &[], "Body of E");
+        create_skill(base, "skill-d", &["skill-e"], "Body of D");
+        create_skill(base, "skill-c", &["skill-d"], "Body of C");
+        create_skill(base, "skill-b", &["skill-c"], "Body of B");
+        create_skill(base, "skill-a", &["skill-b"], "Body of A");
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "skill-a"})));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("dependency tree too deep"),
+            "error should mention depth limit: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_skill_meta_single_depends_on() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("test-skill");
+        fs::create_dir(&dir).unwrap();
+        let content =
+            "---\nname: test-skill\ndescription: A test\ndepends_on: base-skill\n---\n\nBody text";
+        let (_, _, _, _, depends_on, _) = crate::skills::parse_skill_meta(content, &dir);
+        assert_eq!(depends_on, vec!["base-skill"]);
+    }
+
+    #[test]
+    fn parse_skill_meta_multiple_depends_on() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("test-skill");
+        fs::create_dir(&dir).unwrap();
+        let content =
+            "---\nname: test-skill\ndescription: A test\ndepends_on: base-skill, utils, logging\n---\n\nBody text";
+        let (_, _, _, _, depends_on, _) = crate::skills::parse_skill_meta(content, &dir);
+        assert_eq!(depends_on, vec!["base-skill", "utils", "logging"]);
+    }
+
+    #[test]
+    fn parse_skill_meta_no_depends_on() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("test-skill");
+        fs::create_dir(&dir).unwrap();
+        let content = "---\nname: test-skill\ndescription: A test\n---\n\nBody text";
+        let (_, _, _, _, depends_on, _) = crate::skills::parse_skill_meta(content, &dir);
+        assert!(depends_on.is_empty());
+    }
+
+    #[test]
+    fn skill_index_shows_depends_on() {
+        let skills = vec![
+            Skill {
+                name: "with-deps".to_string(),
+                description: "Has dependencies".to_string(),
+                path: PathBuf::from("/tmp/skills/with-deps/SKILL.md"),
+                mode: SkillMode::Manual,
+                triggers: vec![],
+                depends_on: vec!["base".to_string(), "utils".to_string()],
+                refs: vec![],
+                params: vec![],
+                scripts: vec![],
+            },
+            Skill {
+                name: "no-deps".to_string(),
+                description: "No dependencies".to_string(),
+                path: PathBuf::from("/tmp/skills/no-deps/SKILL.md"),
+                mode: SkillMode::Manual,
+                triggers: vec![],
+                depends_on: vec![],
+                refs: vec![],
+                params: vec![],
+                scripts: vec![],
+            },
+        ];
+
+        let result = crate::skills::skill_index(&skills);
+        assert!(
+            result.contains("depends_on: base, utils"),
+            "should show depends_on: {result}"
+        );
+        assert!(
+            result.contains("- no-deps: No dependencies"),
+            "should show skill without deps normally"
+        );
     }
 }

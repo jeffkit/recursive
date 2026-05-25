@@ -250,6 +250,7 @@ mod tests {
             scripts: skill_scripts,
             mode: SkillMode::Manual,
             triggers: vec![],
+            depends_on: vec![],
         }]
     }
 
