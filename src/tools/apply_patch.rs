@@ -508,6 +508,41 @@ async fn commit(staged: Vec<StagedWrite>) -> std::result::Result<String, String>
     ))
 }
 
+/// Find up to 3 unique lines near the match location that could serve as anchors.
+/// We look 5 lines before and 5 lines after the first matched location,
+/// and keep only lines that appear exactly once in the whole file.
+fn find_unique_anchor_suggestions(
+    lines: &[String],
+    match_start: usize,
+    pattern: &[&str],
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let window = 5;
+
+    // Collect candidate lines: 5 before through 5 after the match location
+    let start = match_start.saturating_sub(window);
+    let end = (match_start + pattern.len() + window).min(lines.len());
+
+    for i in start..end {
+        let line = &lines[i];
+        if line.is_empty() {
+            continue;
+        }
+
+        // Count occurrences of this exact line in the whole file
+        let count = lines.iter().filter(|l| l.as_str() == line.as_str()).count();
+        if count == 1 {
+            suggestions.push(line.clone());
+        }
+
+        if suggestions.len() >= 3 {
+            break;
+        }
+    }
+
+    suggestions
+}
+
 fn apply_hunks(content: &str, hunks: &[Hunk]) -> std::result::Result<String, String> {
     let trailing_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
@@ -589,9 +624,25 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> std::result::Result<String, Str
             }
             1 => matches[0],
             n => {
+                // Find unique anchor suggestions around the first match location
+                let suggestions = find_unique_anchor_suggestions(&lines, matches[0], &pattern);
+
+                let suggestion_text = if suggestions.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nAdd an `@@ <anchor>` line above the hunk with one of these unique nearby lines:\n{}",
+                        suggestions
+                            .iter()
+                            .map(|s| format!("  @@ {}", s))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
+
                 return Err(format!(
-                    "hunk {} pattern matches {} locations; add an `@@ anchor` line above the hunk to disambiguate",
-                    idx + 1, n
+                    "hunk {} pattern matches {} locations; add an `@@ anchor` line above the hunk to disambiguate{}",
+                    idx + 1, n, suggestion_text
                 ));
             }
         };
@@ -922,6 +973,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("matches"));
+    }
+
+    #[test]
+    fn ambiguous_error_shows_unique_anchor_suggestions() {
+        // File with duplicated context and unique function definitions nearby
+        let original = "UNIQUE_FUNC_A()\n    x\n    y\n}\nUNIQUE_FUNC_B()\n    x\n    y\n}\nUNIQUE_FUNC_C() {}\n";
+        let hunks = vec![Hunk {
+            anchor: None,
+            lines: vec![
+                HunkLine::Context("    x".into()),
+                HunkLine::Remove("    y".into()),
+                HunkLine::Add("    Y".into()),
+            ],
+        }];
+        let e = apply_hunks(original, &hunks).unwrap_err();
+
+        // Should mention multiple matches
+        assert!(e.contains("matches"));
+        // Should contain anchor suggestion section
+        assert!(e.contains("@@ <anchor>"));
+        // Should contain at least one unique suggestion that exists in the original
+        assert!(
+            e.contains("UNIQUE_FUNC_A")
+                || e.contains("UNIQUE_FUNC_B")
+                || e.contains("UNIQUE_FUNC_C")
+        );
     }
 
     #[test]
