@@ -66,6 +66,7 @@ pub struct OpenAiProvider {
     model: String,
     client: Client,
     temperature: f64,
+    max_tokens: u32,
     retry: RetryPolicy,
 }
 
@@ -84,12 +85,26 @@ impl OpenAiProvider {
                 .build()
                 .expect("reqwest client build"),
             temperature: 0.2,
+            // DeepSeek defaults to a per-response cap of 4096 tokens; any
+            // tool call whose `arguments` string holds more than that — e.g.
+            // a `write_file` with a multi-kilobyte `contents` field — gets
+            // truncated server-side and arrives as malformed JSON. 16384 is
+            // both within DeepSeek's hard ceiling (8192 for v3, 32K-64K for
+            // newer models) and big enough for whole-file writes. Callers
+            // can override with `with_max_tokens` if their provider supports
+            // more or needs less.
+            max_tokens: 16384,
             retry: RetryPolicy::default(),
         }
     }
 
     pub fn with_temperature(mut self, t: f64) -> Self {
         self.temperature = t;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = n;
         self
     }
 
@@ -102,7 +117,13 @@ impl OpenAiProvider {
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
-        let body = build_request(&self.model, self.temperature, messages, tools);
+        let body = build_request(
+            &self.model,
+            self.temperature,
+            self.max_tokens,
+            messages,
+            tools,
+        );
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut attempt = 0;
@@ -179,10 +200,17 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
-fn build_request(model: &str, temperature: f64, messages: &[Message], tools: &[ToolSpec]) -> Value {
+fn build_request(
+    model: &str,
+    temperature: f64,
+    max_tokens: u32,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Value {
     let mut req = serde_json::json!({
         "model": model,
         "temperature": temperature,
+        "max_tokens": max_tokens,
         "messages": messages.iter().map(serialize_message).collect::<Vec<_>>(),
     });
     if !tools.is_empty() {
@@ -420,9 +448,16 @@ mod tests {
 
     #[test]
     fn builds_request_without_tools_omits_field() {
-        let req = build_request("m", 0.2, &[Message::user("hi")], &[]);
+        let req = build_request("m", 0.2, 16384, &[Message::user("hi")], &[]);
         assert!(req.get("tools").is_none());
         assert_eq!(req["messages"][0]["role"], "user");
+        assert_eq!(req["max_tokens"], 16384);
+    }
+
+    #[test]
+    fn builds_request_includes_max_tokens() {
+        let req = build_request("m", 0.2, 1024, &[Message::user("hi")], &[]);
+        assert_eq!(req["max_tokens"], 1024);
     }
 
     #[test]
