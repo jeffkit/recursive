@@ -1,0 +1,652 @@
+//! MCP (Model Context Protocol) client — stdio transport, JSON-RPC 2.0.
+//!
+//! Supports the bounded subset needed for tool proxy:
+//! - `initialize` / `initialized` handshake
+//! - `tools/list` to discover tools
+//! - `tools/call` to invoke them
+//!
+//! No prompts, resources, sampling, or notifications. No HTTP/SSE transport.
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use tokio::time::timeout;
+
+use std::fmt;
+
+use crate::error::{Error, Result};
+use crate::llm::ToolSpec;
+use crate::tools::Tool;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Configuration for a single MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// A tool spec as returned by the MCP server's `tools/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Value,
+}
+
+/// An MCP client owns a spawned subprocess and its stdio handles.
+pub struct McpClient {
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    next_id: u64,
+    child: Option<Child>,
+}
+
+impl fmt::Debug for McpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpClient")
+            .field("next_id", &self.next_id)
+            .finish()
+    }
+}
+
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl McpClient {
+    /// Spawn an MCP server subprocess, perform the initialize handshake,
+    /// and return a ready-to-use client.
+    pub async fn spawn(server: &McpServer) -> Result<Self> {
+        let mut child = Command::new(&server.command)
+            .args(&server.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                Error::Other(format!("failed to spawn MCP server `{}`: {e}", server.name))
+            })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            Error::Other(format!(
+                "failed to open stdin for MCP server `{}`",
+                server.name
+            ))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            Error::Other(format!(
+                "failed to open stdout for MCP server `{}`",
+                server.name
+            ))
+        })?;
+        let reader = BufReader::new(stdout);
+
+        let mut client = Self {
+            stdin,
+            reader,
+            next_id: 1,
+            child: Some(child),
+        };
+
+        // Send initialize request
+        let init_result: Value = client
+            .send_request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "recursive-agent",
+                        "version": "0.1.0"
+                    }
+                }),
+            )
+            .await?;
+
+        // Check protocol version in response
+        if let Some(server_proto) = init_result.get("protocolVersion").and_then(|v| v.as_str()) {
+            if server_proto != "2024-11-05" {
+                // Non-fatal: log but continue
+                tracing::warn!(
+                    target: "recursive::mcp",
+                    server = %server.name,
+                    server_protocol = %server_proto,
+                    "MCP server protocol version mismatch"
+                );
+            }
+        }
+
+        // Send initialized notification (no response expected)
+        client
+            .send_notification("notifications/initialized", serde_json::json!({}))
+            .await?;
+
+        Ok(client)
+    }
+
+    /// Call `tools/list` and return the discovered tool specs.
+    pub async fn list_tools(&mut self) -> Result<Vec<McpToolSpec>> {
+        let result: Value = self
+            .send_request("tools/list", serde_json::json!({}))
+            .await?;
+
+        let tools_arr = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::Other("MCP `tools/list` response missing `tools` array".into())
+            })?;
+
+        let mut specs = Vec::with_capacity(tools_arr.len());
+        for item in tools_arr {
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Other("MCP tool entry missing `name`".into()))?;
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let input_schema = item
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or(serde_json::json!({"type": "object"}));
+            specs.push(McpToolSpec {
+                name: name.to_string(),
+                description: description.to_string(),
+                input_schema,
+            });
+        }
+
+        Ok(specs)
+    }
+
+    /// Call a tool by name with the given arguments.
+    /// Returns the textual content of the first `content[].text` block.
+    /// Errors if `isError` is true in the response.
+    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<String> {
+        let result: Value = self
+            .send_request(
+                "tools/call",
+                serde_json::json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
+
+        // Check for error
+        if result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let error_msg = result
+                .get("content")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(Error::Tool {
+                name: name.to_string(),
+                message: error_msg.to_string(),
+            });
+        }
+
+        // Extract text content
+        let content = result
+            .get("content")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        if c.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            c.get("text").and_then(|v| v.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        Ok(content)
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON-RPC 2.0 internals
+    // -----------------------------------------------------------------------
+
+    /// Send a JSON-RPC request and await the matching response.
+    async fn send_request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        self.write_line(&request).await?;
+        self.read_response(id).await
+    }
+
+    /// Send a JSON-RPC notification (no response expected).
+    async fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+
+        self.write_line(&notification).await
+    }
+
+    /// Write a JSON-RPC message as a newline-delimited line.
+    async fn write_line(&mut self, value: &Value) -> Result<()> {
+        let line = serde_json::to_string(value)?;
+        let mut full = line.into_bytes();
+        full.push(b'\n');
+        self.stdin
+            .write_all(&full)
+            .await
+            .map_err(|e| Error::Other(format!("MCP write error: {e}")))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| Error::Other(format!("MCP flush error: {e}")))?;
+        Ok(())
+    }
+
+    /// Read lines from stdout until we find a response matching the given id.
+    /// Timeout after 10 seconds to prevent hanging on a stuck server.
+    async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
+        let mut line_buf = String::new();
+
+        loop {
+            line_buf.clear();
+
+            let read_future = self.reader.read_line(&mut line_buf);
+            match timeout(Duration::from_secs(10), read_future).await {
+                Ok(Ok(0)) => {
+                    return Err(Error::Other("MCP server closed stdout unexpectedly".into()));
+                }
+                Ok(Ok(_)) => {
+                    // Parse the line
+                    let trimmed = line_buf.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let parsed: Value = serde_json::from_str(trimmed).map_err(|e| {
+                        Error::Other(format!(
+                            "MCP server returned non-JSON line: {e}; line: {trimmed}"
+                        ))
+                    })?;
+
+                    // Check if this is a response to our request
+                    if let Some(resp_id) = parsed.get("id") {
+                        if resp_id.as_u64() == Some(expected_id) {
+                            // Check for error response
+                            if let Some(err) = parsed.get("error") {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown error");
+                                let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                                return Err(Error::Other(format!(
+                                    "MCP error (code {code}): {msg}"
+                                )));
+                            }
+                            // Extract result
+                            if let Some(result) = parsed.get("result") {
+                                return Ok(result.clone());
+                            }
+                            return Err(Error::Other(
+                                "MCP response missing both `result` and `error`".into(),
+                            ));
+                        }
+                    }
+                    // Non-matching id or notification — ignore and continue
+                }
+                Ok(Err(e)) => {
+                    return Err(Error::Other(format!("MCP read error: {e}")));
+                }
+                Err(_) => {
+                    return Err(Error::Other(
+                        "MCP server timed out (no response within 10s)".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// McpTool — implements the Tool trait by delegating to an McpClient
+// ---------------------------------------------------------------------------
+
+/// A tool that wraps an MCP server tool. Registered with a namespaced name
+/// `mcp__<server_name>__<tool_name>`.
+pub struct McpTool {
+    client: Arc<Mutex<McpClient>>,
+    spec: McpToolSpec,
+    server_name: String,
+}
+
+impl McpTool {
+    pub fn new(
+        client: Arc<Mutex<McpClient>>,
+        spec: McpToolSpec,
+        server_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            spec,
+            server_name: server_name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: format!("mcp__{}__{}", self.server_name, self.spec.name),
+            description: format!("[mcp:{}] {}", self.server_name, self.spec.description),
+            parameters: self.spec.input_schema.clone(),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let mut client = self.client.lock().await;
+        client.call_tool(&self.spec.name, arguments).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config loading
+// ---------------------------------------------------------------------------
+
+/// Load MCP server configurations from a JSON file.
+/// Expected format:
+/// ```json
+/// { "servers": [ { "name": "...", "command": "...", "args": [...] } ] }
+/// ```
+pub fn load_mcp_config(path: &std::path::Path) -> Result<Vec<McpServer>> {
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        Error::Other(format!(
+            "failed to read MCP config `{}`: {e}",
+            path.display()
+        ))
+    })?;
+    let parsed: McpConfigFile = serde_json::from_str(&contents).map_err(|e| {
+        Error::Other(format!(
+            "failed to parse MCP config `{}`: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(parsed.servers)
+}
+
+#[derive(Debug, Deserialize)]
+struct McpConfigFile {
+    servers: Vec<McpServer>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Helper: spawn a mock MCP server using a shell script that reads
+    /// JSON-RPC lines from stdin and writes canned responses to stdout.
+    async fn spawn_mock_server(script: impl AsRef<str>) -> Result<McpClient> {
+        let server = McpServer {
+            name: "mock".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.as_ref().to_string()],
+        };
+        McpClient::spawn(&server).await
+    }
+
+    /// Build a mock script that handles initialize + tools/list + tools/call.
+    fn mock_script_echo() -> String {
+        r#"
+while IFS= read -r line; do
+    # Parse the method from the request
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            # No response expected
+            ;;
+        tools/list)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo","description":"Echo back the input","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}}]}}'
+            ;;
+        tools/call)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"Echo: hello"}]}}'
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#.to_string()
+    }
+
+    #[tokio::test]
+    async fn test_a_initialize_handshake_and_list_tools() {
+        let script = mock_script_echo();
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let tools = client.list_tools().await.expect("list_tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        assert!(tools[0].description.contains("Echo"));
+    }
+
+    #[tokio::test]
+    async fn test_a_call_tool_returns_text() {
+        let script = mock_script_echo();
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        let result = client
+            .call_tool("echo", serde_json::json!({"message": "hello"}))
+            .await
+            .expect("call_tool");
+        assert!(result.contains("Echo: hello"));
+    }
+
+    #[tokio::test]
+    async fn test_b_malformed_server_errors_cleanly() {
+        // Server that outputs non-JSON
+        let script = r#"
+echo "not json"
+sleep 10
+"#;
+        let result = spawn_mock_server(script).await;
+        assert!(result.is_err(), "should fail on non-JSON response");
+    }
+
+    #[tokio::test]
+    async fn test_c_mcp_tool_roundtrip() {
+        let script = mock_script_echo();
+        let client = spawn_mock_server(script).await.expect("spawn mock server");
+        let client = Arc::new(Mutex::new(client));
+
+        let spec = McpToolSpec {
+            name: "echo".to_string(),
+            description: "Echo back input".to_string(),
+            input_schema: serde_json::json!({"type":"object","properties":{"message":{"type":"string"}}}),
+        };
+
+        let tool = McpTool::new(client, spec, "mock");
+        let tool_spec = tool.spec();
+        assert_eq!(tool_spec.name, "mcp__mock__echo");
+        assert!(tool_spec.description.contains("[mcp:mock]"));
+
+        let result = tool
+            .execute(serde_json::json!({"message": "hello"}))
+            .await
+            .expect("tool execute");
+        assert!(result.contains("Echo: hello"));
+    }
+
+    #[tokio::test]
+    async fn test_b_server_timeout_errors_cleanly() {
+        // Server that never responds
+        let script = r#"
+while true; do
+    read line
+    # Never write anything
+done
+"#;
+        let result = spawn_mock_server(script).await;
+        // The initialize handshake should time out
+        assert!(result.is_err(), "should fail on timeout");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("timed out") || err.contains("timeout"),
+            "error should mention timeout: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_call_tool_with_error_response() {
+        // Server that returns isError: true
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        tools/list)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"failing","description":"Always fails","inputSchema":{"type":"object"}}]}}'
+            ;;
+        tools/call)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"isError":true,"content":[{"type":"text","text":"Something went wrong"}]}}'
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+        let err = client
+            .call_tool("failing", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Tool { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("Something went wrong"), "error: {msg}");
+    }
+
+    #[test]
+    fn load_mcp_config_parses_correctly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "servers": [
+                    {"name": "fs", "command": "mcp-fs", "args": ["--root", "."]},
+                    {"name": "github", "command": "mcp-gh", "args": []}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let servers = load_mcp_config(&path).unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "fs");
+        assert_eq!(servers[0].command, "mcp-fs");
+        assert_eq!(servers[0].args, vec!["--root", "."]);
+        assert_eq!(servers[1].name, "github");
+        assert_eq!(servers[1].command, "mcp-gh");
+        assert!(servers[1].args.is_empty());
+    }
+
+    #[test]
+    fn load_mcp_config_empty_servers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, r#"{"servers": []}"#).unwrap();
+
+        let servers = load_mcp_config(&path).unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn load_mcp_config_missing_file_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let err = load_mcp_config(&path).unwrap_err();
+        assert!(err.to_string().contains("failed to read MCP config"));
+    }
+}

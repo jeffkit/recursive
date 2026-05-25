@@ -14,6 +14,7 @@ pub mod compact;
 pub mod config;
 pub mod error;
 pub mod llm;
+pub mod mcp;
 pub mod message;
 pub mod skills;
 pub mod tools;
