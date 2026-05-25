@@ -5,6 +5,7 @@
 //!   - `repl`:          interactive loop, one goal per line.
 //!   - `tools`:         print the registered tool specs as JSON.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,10 @@ use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::SessionFile;
 use recursive::{
     config::Config,
-    llm::{pricing_for, AnthropicProvider, LlmProvider, OpenAiProvider, TokenUsage},
+    llm::{
+        load_pricing_from_yaml, pricing_for, AnthropicProvider, LlmProvider, ModelPricing,
+        OpenAiProvider, TokenUsage,
+    },
     tools::memory::memory_summary,
     tools::{
         ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, ReadFile, Recall, Remember,
@@ -77,6 +81,12 @@ struct Cli {
     /// stuck, transcript limit). The session can be resumed later with `resume`.
     #[arg(long, env = "RECURSIVE_SESSION_OUT")]
     session_out: Option<PathBuf>,
+
+    /// Path to external pricing YAML file. If provided, pricing from this file
+    /// takes precedence over hardcoded values. Models not in the file fall back
+    /// to hardcoded rates.
+    #[arg(long, env = "RECURSIVE_PRICING_FILE")]
+    pricing_file: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -151,6 +161,26 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("reading system prompt: {}", p.display()))?;
     }
 
+    // Load external pricing if provided
+    let external_pricing: Option<HashMap<String, ModelPricing>> =
+        if let Some(path) = &cli.pricing_file {
+            match load_pricing_from_yaml(path) {
+                Ok(pricing) => {
+                    eprintln!(
+                        "pricing: loaded {} model(s) from {}",
+                        pricing.len(),
+                        path.display()
+                    );
+                    Some(pricing)
+                }
+                Err(e) => {
+                    anyhow::bail!("failed to load pricing file {}: {}", path.display(), e);
+                }
+            }
+        } else {
+            None
+        };
+
     match cli.cmd {
         Cmd::Tools => {
             let tools = build_tools(&config).await;
@@ -168,10 +198,20 @@ async fn main() -> anyhow::Result<()> {
                 cli.json,
                 cli.stream,
                 cli.mcp_config,
+                external_pricing,
             )
             .await
         }
-        Cmd::Repl => repl(config, cli.max_transcript_chars, cli.json, cli.mcp_config).await,
+        Cmd::Repl => {
+            repl(
+                config,
+                cli.max_transcript_chars,
+                cli.json,
+                cli.mcp_config,
+                external_pricing,
+            )
+            .await
+        }
         Cmd::Replay {
             path,
             resume_from,
@@ -204,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(n) => {
                     let seed = file.take_first_n(n).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "--resume-from {n} exceeds saved transcript length ({})",
+                            "--resume_from {n} exceeds saved transcript length ({})",
                             file.messages().len()
                         )
                     })?;
@@ -217,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.session_out,
                         cli.json,
                         cli.mcp_config,
+                        external_pricing,
                     )
                     .await
                 }
@@ -241,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.session_out,
                 cli.json,
                 cli.mcp_config,
+                external_pricing,
             )
             .await
         }
@@ -521,7 +563,27 @@ async fn build_agent(
     Ok((agent, rx))
 }
 
-fn print_usage(usage: TokenUsage, model: &str, total_llm_latency_ms: u64, steps: usize) {
+/// Get pricing for a model: external pricing takes precedence, then falls back
+/// to hardcoded pricing_for().
+fn get_pricing(
+    model: &str,
+    external: &Option<HashMap<String, ModelPricing>>,
+) -> Option<ModelPricing> {
+    if let Some(ext) = external {
+        if let Some(pricing) = ext.get(model) {
+            return Some(*pricing);
+        }
+    }
+    pricing_for(model)
+}
+
+fn print_usage(
+    usage: TokenUsage,
+    model: &str,
+    total_llm_latency_ms: u64,
+    steps: usize,
+    external_pricing: &Option<HashMap<String, ModelPricing>>,
+) {
     if usage.total_tokens > 0 {
         eprintln!(
             "tokens: prompt={} completion={} total={}",
@@ -539,7 +601,7 @@ fn print_usage(usage: TokenUsage, model: &str, total_llm_latency_ms: u64, steps:
                 usage.cache_hit_tokens, usage.cache_miss_tokens, hit_rate
             );
         }
-        if let Some(pricing) = pricing_for(model) {
+        if let Some(pricing) = get_pricing(model, external_pricing) {
             let cost = pricing.cost_usd(usage);
             eprintln!("cost: ${:.4} ({})", cost, model);
         }
@@ -634,6 +696,7 @@ async fn run_resumed(
     session_out: Option<PathBuf>,
     json_mode: bool,
     mcp_config: Option<PathBuf>,
+    external_pricing: Option<HashMap<String, ModelPricing>>,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
     let (mut agent, rx) =
@@ -660,6 +723,7 @@ async fn run_resumed(
             &config.model,
             outcome.total_llm_latency_ms,
             outcome.steps,
+            &external_pricing,
         );
         print_finish_note(&outcome.finish);
     }
@@ -686,6 +750,7 @@ async fn run_once(
     json_mode: bool,
     stream: bool,
     mcp_config: Option<PathBuf>,
+    external_pricing: Option<HashMap<String, ModelPricing>>,
 ) -> anyhow::Result<()> {
     let (mut agent, rx) = build_agent(
         &config,
@@ -714,6 +779,7 @@ async fn run_once(
             &config.model,
             outcome.total_llm_latency_ms,
             outcome.steps,
+            &external_pricing,
         );
         print_finish_note(&outcome.finish);
     }
@@ -736,6 +802,7 @@ async fn repl(
     max_transcript_chars: Option<usize>,
     json_mode: bool,
     mcp_config: Option<PathBuf>,
+    external_pricing: Option<HashMap<String, ModelPricing>>,
 ) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -779,6 +846,7 @@ async fn repl(
                         &config.model,
                         outcome.total_llm_latency_ms,
                         outcome.steps,
+                        &external_pricing,
                     );
                     print_finish_note(&outcome.finish);
                 }

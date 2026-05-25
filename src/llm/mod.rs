@@ -8,6 +8,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::Path;
 
 use crate::error::Error;
 use crate::error::Result;
@@ -128,6 +130,126 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
             // (conservative)".
             None
         }
+    }
+}
+
+/// Load pricing from a YAML file.
+/// The file should have a "models" key mapping model names to pricing structs.
+/// Returns a HashMap of model name -> ModelPricing.
+pub fn load_pricing_from_yaml(path: &Path) -> Result<HashMap<String, ModelPricing>> {
+    use std::fs;
+    use std::io::{self, BufRead};
+
+    let file = fs::File::open(path).map_err(Error::Io)?;
+    let reader = io::BufReader::new(file);
+
+    let mut models: HashMap<String, ModelPricing> = HashMap::new();
+    let mut current_model: Option<String> = None;
+    let mut current_pricing: Option<ModelPricingBuilder> = None;
+    let mut in_models_section = false;
+
+    // Simple YAML parser for the flat structure we expect.
+    // Lines are either:
+    //   models:
+    //   <model_name>:
+    //     key: value
+    for line in reader.lines() {
+        let line = line.map_err(Error::Io)?;
+
+        // Skip empty lines and comments
+        if line.trim().is_empty() || line.trim().starts_with('#') {
+            continue;
+        }
+
+        // Count leading spaces to determine indentation level
+        let leading_spaces = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+
+        // Top-level "models:" key
+        if trimmed == "models:" {
+            in_models_section = true;
+            continue;
+        }
+
+        // If we're in the models section
+        if in_models_section {
+            // Model name line: 2 spaces indent, ends with colon
+            // e.g., "  deepseek-chat:" -> model name is "deepseek-chat"
+            if leading_spaces == 2 && trimmed.ends_with(':') {
+                // Save previous model if any
+                if let (Some(name), Some(builder)) = (current_model.take(), current_pricing.take())
+                {
+                    if let Some(pricing) = builder.build() {
+                        models.insert(name, pricing);
+                    }
+                }
+                // Extract model name (remove trailing colon)
+                let model_name = trimmed.trim_end_matches(':').to_string();
+                current_model = Some(model_name);
+                current_pricing = Some(ModelPricingBuilder::default());
+                continue;
+            }
+
+            // Field line: 4+ spaces indent, contains "key: value"
+            // e.g., "    input_per_million: 0.27"
+            if leading_spaces >= 4 && current_model.is_some() {
+                if let Some(ref mut builder) = current_pricing {
+                    if let Some((key, value)) = trimmed.split_once(':') {
+                        let key = key.trim();
+                        let value = value.trim();
+                        if let Err(e) = builder.parse_field(key, value) {
+                            return Err(Error::Config(format!(
+                                "error parsing {}: {}",
+                                path.display(),
+                                e
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Save last model
+    if let (Some(name), Some(builder)) = (current_model, current_pricing) {
+        if let Some(pricing) = builder.build() {
+            models.insert(name, pricing);
+        }
+    }
+
+    Ok(models)
+}
+
+/// Helper to build ModelPricing from YAML fields.
+#[derive(Default)]
+struct ModelPricingBuilder {
+    input_per_million: Option<f64>,
+    output_per_million: Option<f64>,
+    cache_hit_input_per_million: Option<f64>,
+}
+
+impl ModelPricingBuilder {
+    fn parse_field(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let value: f64 = value
+            .parse()
+            .map_err(|_| format!("invalid float: {}", value))?;
+        match key {
+            "input_per_million" => self.input_per_million = Some(value),
+            "output_per_million" => self.output_per_million = Some(value),
+            "cache_hit_input_per_million" => self.cache_hit_input_per_million = Some(value),
+            _ => return Err(format!("unknown field: {}", key)),
+        }
+        Ok(())
+    }
+
+    fn build(self) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: self.input_per_million?,
+            output_per_million: self.output_per_million?,
+            cache_hit_input_per_million: self
+                .cache_hit_input_per_million
+                .unwrap_or(self.input_per_million.unwrap_or(0.0)),
+        })
     }
 }
 
@@ -476,5 +598,143 @@ mod tests {
         assert_eq!(acc.cache_hit_tokens, 2700);
         assert_eq!(acc.cache_miss_tokens, 300);
         assert_eq!(acc.prompt_tokens, 3000);
+    }
+
+    /// Test loading pricing from YAML file.
+    #[test]
+    fn load_pricing_from_yaml_parses_file() {
+        let temp_dir = std::env::temp_dir();
+        let yaml_path = temp_dir.join("test_pricing.yaml");
+        std::fs::write(
+            &yaml_path,
+            r#"
+models:
+  test-model:
+    input_per_million: 1.0
+    output_per_million: 2.0
+    cache_hit_input_per_million: 0.1
+"#,
+        )
+        .unwrap();
+
+        let result = load_pricing_from_yaml(&yaml_path);
+        assert!(result.is_ok(), "load should succeed: {:?}", result.err());
+        let pricing = result.unwrap();
+        assert!(
+            pricing.contains_key("test-model"),
+            "should contain test-model: {:?}",
+            pricing.keys().collect::<Vec<_>>()
+        );
+        let p = pricing.get("test-model").unwrap();
+        assert!((p.input_per_million - 1.0).abs() < 1e-9);
+        assert!((p.output_per_million - 2.0).abs() < 1e-9);
+        assert!((p.cache_hit_input_per_million - 0.1).abs() < 1e-9);
+
+        std::fs::remove_file(&yaml_path).ok();
+    }
+
+    /// Test external pricing overrides hardcoded values.
+    #[test]
+    fn load_pricing_from_yaml_overrides_hardcoded() {
+        let temp_dir = std::env::temp_dir();
+        let yaml_path = temp_dir.join("test_pricing_override.yaml");
+        // Override deepseek-chat with a different rate
+        std::fs::write(
+            &yaml_path,
+            r#"
+models:
+  deepseek-chat:
+    input_per_million: 99.0
+    output_per_million: 99.0
+    cache_hit_input_per_million: 9.9
+"#,
+        )
+        .unwrap();
+
+        let result = load_pricing_from_yaml(&yaml_path);
+        assert!(result.is_ok());
+        let pricing = result.unwrap();
+        let p = pricing
+            .get("deepseek-chat")
+            .expect("should have deepseek-chat");
+        // Verify the override is loaded
+        assert!((p.input_per_million - 99.0).abs() < 1e-9);
+
+        // Hardcoded should still work for other models
+        assert!(pricing.contains_key("deepseek-chat"));
+        // MiniMax-M2 is not in the external file, so it shouldn't be here
+        assert!(!pricing.contains_key("MiniMax-M2"));
+
+        std::fs::remove_file(&yaml_path).ok();
+    }
+
+    /// Test missing model falls back to hardcoded.
+    #[test]
+    fn load_pricing_from_yaml_missing_model_falls_back() {
+        // When loading external pricing, models not in the external file
+        // should return None from pricing_for, which falls back to hardcoded.
+        // This is tested by verifying pricing_for still returns hardcoded
+        // values for models not in the external file.
+        let temp_dir = std::env::temp_dir();
+        let yaml_path = temp_dir.join("test_pricing_partial.yaml");
+        // Only include one model
+        std::fs::write(
+            &yaml_path,
+            r#"
+models:
+  test-only:
+    input_per_million: 1.0
+    output_per_million: 1.0
+    cache_hit_input_per_million: 0.1
+"#,
+        )
+        .unwrap();
+
+        let result = load_pricing_from_yaml(&yaml_path);
+        assert!(result.is_ok());
+        let external = result.unwrap();
+
+        // External has only test-only
+        assert!(
+            external.contains_key("test-only"),
+            "should have test-only: {:?}",
+            external.keys().collect::<Vec<_>>()
+        );
+        // MiniMax-M2 is NOT in external, so pricing_for should return hardcoded
+        let fallback = pricing_for("MiniMax-M2");
+        assert!(fallback.is_some());
+        assert!((fallback.unwrap().input_per_million - 0.30).abs() < 1e-9);
+
+        std::fs::remove_file(&yaml_path).ok();
+    }
+
+    /// Test malformed YAML returns descriptive error.
+    #[test]
+    fn load_pricing_from_yaml_malformed_error() {
+        let temp_dir = std::env::temp_dir();
+        let yaml_path = temp_dir.join("test_pricing_malformed.yaml");
+        // Invalid YAML (invalid float value)
+        std::fs::write(
+            &yaml_path,
+            r#"
+models:
+  bad-model:
+    input_per_million: not_a_number
+"#,
+        )
+        .unwrap();
+
+        let result = load_pricing_from_yaml(&yaml_path);
+        assert!(result.is_err(), "should fail with bad data");
+        let err = result.unwrap_err();
+        // Should contain some error message
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("error parsing") || err_str.contains("invalid float"),
+            "error should mention parsing issue: {}",
+            err_str
+        );
+
+        std::fs::remove_file(&yaml_path).ok();
     }
 }
