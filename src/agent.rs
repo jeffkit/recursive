@@ -736,9 +736,9 @@ impl AgentBuilder {
         self
     }
     pub fn build(self) -> Result<Agent> {
-        let llm = self
-            .llm
-            .ok_or_else(|| Error::Config { message: "agent: missing llm provider".into() })?;
+        let llm = self.llm.ok_or_else(|| Error::Config {
+            message: "agent: missing llm provider".into(),
+        })?;
         let mut transcript = Vec::new();
         if let Some(sys) = self.system {
             transcript.push(Message::system(sys));

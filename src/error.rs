@@ -15,7 +15,10 @@ pub enum Error {
 
     /// LLM rate limited — caller should retry after `retry_after_ms`
     #[error("LLM rate limited ({provider}): retry after {retry_after_ms}ms")]
-    RateLimited { provider: String, retry_after_ms: u64 },
+    RateLimited {
+        provider: String,
+        retry_after_ms: u64,
+    },
 
     /// Tool execution failure (spawn, timeout, I/O)
     #[error("tool error ({name}): {message}")]
@@ -69,10 +72,7 @@ pub enum Error {
 impl Error {
     /// Returns `true` if the error is safe to retry (rate limits, timeouts).
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Error::RateLimited { .. } | Error::Timeout { .. }
-        )
+        matches!(self, Error::RateLimited { .. } | Error::Timeout { .. })
     }
 
     /// Returns `true` if the error is transient (network issues, timeouts).
@@ -80,10 +80,7 @@ impl Error {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Error::RateLimited { .. }
-                | Error::Timeout { .. }
-                | Error::Http(_)
-                | Error::Io(_)
+            Error::RateLimited { .. } | Error::Timeout { .. } | Error::Http(_) | Error::Io(_)
         )
     }
 }
