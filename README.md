@@ -2,7 +2,9 @@
 
 A minimal, orthogonal, embeddable coding agent kernel in Rust.
 
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](#testing)
+[![CI](https://github.com/jeffkit/recursive/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffkit/recursive/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/recursive-agent.svg)](https://crates.io/crates/recursive-agent)
+[![Docs.rs](https://docs.rs/recursive-agent/badge.svg)](https://docs.rs/recursive-agent)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Recursive is a tiny ReAct-style agent loop that wires together:
