@@ -15,6 +15,46 @@ use super::{Completion, LlmProvider, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
+/// Retry policy for transient failures (network timeouts, 5xx errors).
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_retries: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self { max_retries: 2, initial_backoff: Duration::from_secs(1), max_backoff: Duration::from_secs(8) }
+    }
+}
+
+impl RetryPolicy {
+    /// Decide whether the caller should wait and try again.
+    /// `attempt` is 0-indexed (0 = the first retry decision after the
+    /// initial try has failed). Returns `Some(backoff)` to retry,
+    /// `None` to give up and propagate the error.
+    pub fn backoff_for(
+        &self,
+        attempt: usize,
+        status: Option<u16>,
+        is_network_error: bool,
+    ) -> Option<Duration> {
+        if attempt >= self.max_retries {
+            return None;
+        }
+
+        let is_transient = is_network_error || status.is_some_and(|s| (500..600).contains(&s));
+
+        if !is_transient {
+            return None;
+        }
+
+        let backoff = self.initial_backoff * 2u32.pow(attempt as u32);
+        Some(backoff.min(self.max_backoff))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     base_url: String,
@@ -22,6 +62,7 @@ pub struct OpenAiProvider {
     model: String,
     client: Client,
     temperature: f64,
+    retry: RetryPolicy,
 }
 
 impl OpenAiProvider {
@@ -35,11 +76,17 @@ impl OpenAiProvider {
                 .build()
                 .expect("reqwest client build"),
             temperature: 0.2,
+            retry: RetryPolicy::default(),
         }
     }
 
     pub fn with_temperature(mut self, t: f64) -> Self {
         self.temperature = t;
+        self
+    }
+
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
         self
     }
 }
@@ -49,30 +96,68 @@ impl LlmProvider for OpenAiProvider {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let body = build_request(&self.model, self.temperature, messages, tools);
         let url = format!("{}/chat/completions", self.base_url);
-        tracing::debug!(target: "recursive::llm", request = %body, "POST {}", url);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
 
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            tracing::debug!(target: "recursive::llm", body = %text, "error response");
-            return Err(Error::Llm(format!("HTTP {}: {}", status, text)));
+        let mut attempt = 0;
+        loop {
+            tracing::debug!(target: "recursive::llm", request = %body, "POST {}", url);
+            let result = self.client.post(&url).bearer_auth(&self.api_key).json(&body).send().await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let is_network_error = false;
+
+                    if status.is_success() {
+                        let text = resp.text().await?;
+                        let parsed: ChatResponse = serde_json::from_str(&text)
+                            .map_err(|e| Error::Llm(format!("failed to parse response: {e}; body: {text}")))?;
+                        let choice = parsed
+                            .choices
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| Error::Llm("response had no choices".into()))?;
+                        return Ok(parse_completion(choice));
+                    }
+
+                    // Non-2xx response: check if it's transient (5xx)
+                    let text = resp.text().await?;
+                    tracing::debug!(target: "recursive::llm", body = %text, "error response");
+
+                    if let Some(backoff) = self.retry.backoff_for(attempt, Some(status.as_u16()), is_network_error) {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            status = status.as_u16(),
+                            "transient HTTP error, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    // Non-transient (4xx or other)
+                    return Err(Error::Llm(format!("HTTP {}: {}", status, text)));
+                }
+                Err(e) => {
+                    // Network error
+                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            error = %e,
+                            "network error, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(Error::Llm(format!("request failed: {e}")));
+                }
+            }
         }
-
-        let parsed: ChatResponse = serde_json::from_str(&text)
-            .map_err(|e| Error::Llm(format!("failed to parse response: {e}; body: {text}")))?;
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Llm("response had no choices".into()))?;
-        Ok(parse_completion(choice))
     }
 }
 
@@ -248,5 +333,40 @@ mod tests {
         let req = build_request("m", 0.2, &[Message::user("hi")], &[]);
         assert!(req.get("tools").is_none());
         assert_eq!(req["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn policy_retries_5xx_with_exponential_backoff() {
+        let policy = RetryPolicy::default(); // max_retries = 2
+        // Attempt 0: should return initial_backoff (1s)
+        assert_eq!(policy.backoff_for(0, Some(503), false), Some(Duration::from_secs(1)));
+        // Attempt 1: should return 2s (1s * 2^1)
+        assert_eq!(policy.backoff_for(1, Some(500), false), Some(Duration::from_secs(2)));
+        // Attempt 2: should return None (exceeds max_retries=2)
+        assert_eq!(policy.backoff_for(2, Some(500), false), None);
+    }
+
+    #[test]
+    fn policy_retries_network_errors() {
+        let policy = RetryPolicy::default();
+        // Network error at attempt 0 should return initial_backoff
+        assert_eq!(policy.backoff_for(0, None, true), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn policy_does_not_retry_4xx() {
+        let policy = RetryPolicy::default();
+        // 4xx errors should not be retried
+        assert_eq!(policy.backoff_for(0, Some(400), false), None);
+        assert_eq!(policy.backoff_for(0, Some(401), false), None);
+        assert_eq!(policy.backoff_for(0, Some(404), false), None);
+        assert_eq!(policy.backoff_for(0, Some(429), false), None);
+    }
+
+    #[test]
+    fn policy_caps_backoff_at_max() {
+        let policy = RetryPolicy { max_retries: 10, initial_backoff: Duration::from_secs(1), max_backoff: Duration::from_secs(3) };
+        // At attempt 5, exponential backoff would be 32s but capped to 3s
+        assert_eq!(policy.backoff_for(5, Some(500), false), Some(Duration::from_secs(3)));
     }
 }
