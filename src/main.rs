@@ -67,6 +67,11 @@ enum Cmd {
     Repl,
     /// Print registered tool specs as JSON (sanity check).
     Tools,
+    /// Pretty-print a previously saved transcript JSON file.
+    Replay {
+        /// Path to the transcript JSON file (as written by --transcript-out).
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +108,11 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Repl => repl(config, cli.max_transcript_chars).await,
+        Cmd::Replay { path } => {
+            let file = recursive::TranscriptFile::read_from(&path)?;
+            print!("{}", file.pretty());
+            Ok(())
+        }
     }
 }
 
