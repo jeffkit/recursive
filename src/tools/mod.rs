@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
 pub mod apply_patch;
+pub mod estimate_tokens;
 pub mod fs;
 pub mod load_skill;
 pub mod memory;
@@ -20,6 +21,7 @@ pub mod shell;
 pub mod web_fetch;
 
 pub use apply_patch::ApplyPatch;
+pub use estimate_tokens::EstimateTokens;
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use load_skill::LoadSkill;
 pub use memory::{Forget, Recall, Remember};
