@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tracing::Level;
 
 use recursive::config::load_project_context;
+use recursive::mcp::{load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::{
     config::Config,
@@ -50,6 +51,10 @@ struct Cli {
     /// Path to a system prompt file (overrides default).
     #[arg(long, env = "RECURSIVE_SYSTEM_PROMPT_FILE")]
     system_prompt_file: Option<PathBuf>,
+
+    /// Path to MCP server config JSON file.
+    #[arg(long, env = "RECURSIVE_MCP_CONFIG")]
+    mcp_config: Option<PathBuf>,
 
     /// Log level: error|warn|info|debug|trace.
     #[arg(long, default_value = "info")]
@@ -126,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Tools => {
-            let tools = build_tools(&config);
+            let tools = build_tools(&config).await;
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
@@ -139,10 +144,11 @@ async fn main() -> anyhow::Result<()> {
                 cli.transcript_out,
                 cli.json,
                 cli.stream,
+                cli.mcp_config,
             )
             .await
         }
-        Cmd::Repl => repl(config, cli.max_transcript_chars, cli.json).await,
+        Cmd::Repl => repl(config, cli.max_transcript_chars, cli.json, cli.mcp_config).await,
         Cmd::Replay {
             path,
             resume_from,
@@ -186,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.max_transcript_chars,
                         cli.transcript_out,
                         cli.json,
+                        cli.mcp_config,
                     )
                     .await
                 }
@@ -206,7 +213,8 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_tools(config: &Config) -> ToolRegistry {
+/// Build the tool registry, optionally registering MCP tools from a config file.
+async fn build_tools(config: &Config) -> ToolRegistry {
     let root = &config.workspace;
     let mut registry = ToolRegistry::new()
         .register(Arc::new(ReadFile::new(root)))
@@ -229,6 +237,59 @@ fn build_tools(config: &Config) -> ToolRegistry {
     registry
 }
 
+/// Register MCP tools from a config file into the registry.
+async fn register_mcp_tools(registry: &mut ToolRegistry, mcp_config_path: Option<PathBuf>) {
+    let Some(path) = mcp_config_path else {
+        return;
+    };
+    if !path.exists() {
+        eprintln!("warning: MCP config file not found: {}", path.display());
+        return;
+    }
+    let servers = match load_mcp_config(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: failed to load MCP config: {e}");
+            return;
+        }
+    };
+    if servers.is_empty() {
+        return;
+    }
+    for server in &servers {
+        match register_mcp_server_tools(registry, server).await {
+            Ok(count) => {
+                eprintln!(
+                    "mcp: registered {} tool(s) from server `{}`",
+                    count, server.name
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to register MCP server `{}`: {e}",
+                    server.name
+                );
+            }
+        }
+    }
+}
+
+/// Spawn an MCP server, list its tools, and register them in the registry.
+async fn register_mcp_server_tools(
+    registry: &mut ToolRegistry,
+    server: &McpServer,
+) -> anyhow::Result<usize> {
+    let mut client = McpClient::spawn(server).await?;
+    let tool_specs = client.list_tools().await?;
+    let count = tool_specs.len();
+    let client = Arc::new(tokio::sync::Mutex::new(client));
+    for spec in tool_specs {
+        let tool = McpTool::new(client.clone(), spec, &server.name);
+        registry.register_mut(Arc::new(tool));
+    }
+    Ok(count)
+}
+
 /// Discover skills from configured search paths.
 /// Defaults: <workspace>/.recursive/skills/, ~/.recursive/skills/.
 /// Override with RECURSIVE_SKILL_PATHS=path1:path2 (colon-separated).
@@ -245,18 +306,13 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
-fn build_agent(
-    config: &Config,
-    max_transcript_chars: Option<usize>,
-) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
-    build_agent_seeded(config, max_transcript_chars, Vec::new(), false)
-}
-
-fn build_agent_seeded(
+/// Build an agent, optionally registering MCP tools from a config file.
+async fn build_agent(
     config: &Config,
     max_transcript_chars: Option<usize>,
     seed: Vec<recursive::message::Message>,
     stream: bool,
+    mcp_config: Option<PathBuf>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     let retry = RetryPolicy {
@@ -272,7 +328,8 @@ fn build_agent_seeded(
         openai = openai.with_stream_tx(tx);
     }
     let provider: Arc<dyn LlmProvider> = Arc::new(openai);
-    let tools = build_tools(config);
+    let mut tools = build_tools(config).await;
+    register_mcp_tools(&mut tools, mcp_config).await;
     let skills = discover_loaded_skills(config);
 
     // Load project context from AGENTS.md if present
@@ -404,9 +461,11 @@ async fn run_resumed(
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     json_mode: bool,
+    mcp_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
-    let (mut agent, rx) = build_agent_seeded(&config, max_transcript_chars, seed, false)?;
+    let (mut agent, rx) =
+        build_agent(&config, max_transcript_chars, seed, false, mcp_config).await?;
     if !json_mode {
         eprintln!("resuming from {seed_len} seeded message(s)");
     }
@@ -443,8 +502,16 @@ async fn run_once(
     transcript_out: Option<PathBuf>,
     json_mode: bool,
     stream: bool,
+    mcp_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let (mut agent, rx) = build_agent_seeded(&config, max_transcript_chars, Vec::new(), stream)?;
+    let (mut agent, rx) = build_agent(
+        &config,
+        max_transcript_chars,
+        Vec::new(),
+        stream,
+        mcp_config,
+    )
+    .await?;
     let printer = if json_mode {
         tokio::spawn(stream_events_json(rx))
     } else {
@@ -476,6 +543,7 @@ async fn repl(
     config: Config,
     max_transcript_chars: Option<usize>,
     json_mode: bool,
+    mcp_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -493,7 +561,14 @@ async fn repl(
         if matches!(goal, ":q" | ":quit" | "exit") {
             break;
         }
-        let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
+        let (mut agent, rx) = build_agent(
+            &config,
+            max_transcript_chars,
+            Vec::new(),
+            false,
+            mcp_config.clone(),
+        )
+        .await?;
         let printer = if json_mode {
             tokio::spawn(stream_events_json(rx))
         } else {
@@ -609,19 +684,19 @@ mod tests {
     // panicked because `then(false)` returns None. This made every
     // `recursive run` (default: stream=false) panic at startup, which
     // in turn broke all parallel-self-improve.sh launches in batch 13.
-    #[test]
-    fn build_agent_does_not_panic_without_stream() {
+    #[tokio::test]
+    async fn build_agent_does_not_panic_without_stream() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
-        let built = build_agent_seeded(&cfg, None, Vec::new(), /* stream */ false);
+        let built = build_agent(&cfg, None, Vec::new(), /* stream */ false, None).await;
         assert!(built.is_ok(), "construction must not panic or fail");
     }
 
-    #[test]
-    fn build_agent_does_not_panic_with_stream() {
+    #[tokio::test]
+    async fn build_agent_does_not_panic_with_stream() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
-        let built = build_agent_seeded(&cfg, None, Vec::new(), /* stream */ true);
+        let built = build_agent(&cfg, None, Vec::new(), /* stream */ true, None).await;
         assert!(built.is_ok(), "construction must not panic or fail");
     }
 }

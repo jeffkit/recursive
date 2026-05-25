@@ -49,6 +49,12 @@ impl ToolRegistry {
         self
     }
 
+    /// Register a tool via mutable reference (for use with shared registries).
+    pub fn register_mut(&mut self, tool: Arc<dyn Tool>) {
+        let name = tool.spec().name;
+        self.tools.insert(name, tool);
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
     }
