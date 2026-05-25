@@ -37,10 +37,10 @@ MCP is the ecosystem connector. Currently stdio-only with mock tests.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 6.1 | MCP HTTP+SSE transport (Streamable HTTP) | M | 🔴 |
-| 6.2 | MCP real server integration test (filesystem server) | S | 🔴 |
-| 6.3 | MCP Server mode (expose Recursive as an MCP server) | L | 🔴 |
-| 6.4 | MCP resource/prompt support (beyond tools) | M | 🔴 |
+| 6.1 | MCP HTTP+SSE transport (Streamable HTTP) | M | ✅ g65 |
+| 6.2 | MCP real server integration test (filesystem server) | S | ✅ g66 |
+| 6.3 | MCP Server mode (expose Recursive as an MCP server) | L | ⏸️ deferred (agent failed 2x) |
+| 6.4 | MCP resource/prompt support (beyond tools) | M | ✅ g67 |
 
 **Total**: ~2 batches
 
@@ -94,11 +94,11 @@ Make the agent handle harder tasks.
 ```
 Batch 19 (done): Validation — dogfood hooks, integration tests
 Batch 20 (done): Phase 5 partial — g59 refs, g60 scripts, g61 params, g62 injection modes
-Batch 21 (next): Phase 5 finish + Phase 6 start — g63 progressive disclosure, g64 composition, g65 MCP HTTP+SSE
-Batch 22-23: Phase 6 (MCP) — 4 goals, 2-wide (complex)
-Batch 24-25: Phase 7 (Ship) — 6 goals, 4-wide
-Batch 26-27: Phase 8 (Capability) — 4 goals
-Batch 28+: Phase 9 (Ecosystem) — as needed
+Batch 21 (done): Phase 5 finish + Phase 6.1 MCP HTTP+SSE
+Batch 22 (done): Phase 6.2 integration test, 6.4 resources/prompts (6.3 server mode deferred)
+Batch 23 (next): Phase 7 (Ship It) — API stabilization, docs, examples, feature flags
+Batch 24-25: Phase 7 continued + Phase 8 (Capability)
+Batch 26+: Phase 9 (Ecosystem) — as needed
 ```
 
 **Estimated total: 8-10 more batches to v0.2 release.**
