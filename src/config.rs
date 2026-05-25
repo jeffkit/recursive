@@ -107,6 +107,28 @@ pub fn default_system_prompt() -> String {
         "- If a tool call fails the same way twice, change approach instead of retrying.",
         "- Stop calling tools and write a short final summary once the task is done.",
         "",
+        "Patching with apply_patch:",
+        "- Use the V4A format (see AGENTS.md section 5 for the canonical reference).",
+        "- Each `*** Update File:` block must appear at most once per patch.",
+        "- The `@@ <anchor>` line cites an existing line; lines with leading space are unchanged context.",
+        "- Example (editing src/example.rs to add a new function):",
+        "```",
+        "*** Begin Patch",
+        "*** Update File: src/example.rs",
+        "@@ fn existing_function() {",
+        " fn existing_function();",
+        "",
+        "+fn new_function();",
+        "+",
+        " fn another_function();",
+        "*** End Patch",
+        "```",
+        "",
+        "Don't:",
+        "- Do not run `git checkout`, `git reset`, `git restore`, or any command that mutates the working tree. The orchestrator owns rollback.",
+        "- Do not edit source files via `sed -i`, `tail > file`, or `cat <<EOF`. Use apply_patch or write_file (whole file).",
+        "- Verify behavior via `cargo test`, never via `cargo run | jq`. Cargo build noise on a fresh tree breaks jq parsing and burns your step budget.",
+        "",
         "Output should be terse and concrete. Avoid filler.",
     ]
     .join("\n")
@@ -118,7 +140,7 @@ mod tests {
 
     #[test]
     fn default_prompt_is_well_under_a_kilobyte() {
-        assert!(default_system_prompt().len() < 1024);
+        assert!(default_system_prompt().len() < 2048);
     }
 
     #[test]
@@ -131,6 +153,15 @@ mod tests {
         let prompt = default_system_prompt();
         assert!(prompt.contains("run_shell"));
         assert!(prompt.contains("tests"));
+    }
+
+    #[test]
+    fn default_prompt_includes_new_sections() {
+        let prompt = default_system_prompt();
+        assert!(prompt.contains("apply_patch"));
+        assert!(prompt.contains("git checkout"));
+        assert!(prompt.contains("cargo test"));
+        assert!(prompt.contains("*** Begin Patch"));
     }
 
     #[test]
