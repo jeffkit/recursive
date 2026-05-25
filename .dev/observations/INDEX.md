@@ -13,6 +13,8 @@ files in this folder; this index is the side-by-side comparison.
 | 06 cost-estimation | minimax | MiniMax-M2 | 29 | 29 | 9 | 9:4 | $0.3831 | NoMoreToolCalls |
 | 07 transcript-limit | deepseek | deepseek-chat | 39 | 41 | 9 | 9:4 | $0.4885 | NoMoreToolCalls |
 | 08 persistent-transcripts | minimax | MiniMax-M2 | 19 | 19 | 2 | 2:5 | $0.1871 | NoMoreToolCalls |
+| 09 transcript-replay | deepseek | deepseek-chat | 18 | 18 | 4 | 4:2 | $0.1437 | NoMoreToolCalls |
+| 10 shell-cwd | minimax | MiniMax-M2 | 15 | 14 | 0 | 0:2 | $0.1187 | NoMoreToolCalls |
 
 ## Key insight: prompt-token amplification
 
@@ -116,6 +118,23 @@ Worth re-running the same goal on both providers later to control for it.
 - Outcome: `TranscriptFile`/`TranscriptMeta` types + `--transcript-out`
   flag. Includes a vendored civil-from-days algorithm to avoid pulling
   in `chrono`. 4 new tests including round-trip via a real tempfile.
+
+### Second concurrent batch (09 + 10)
+
+- **goal-09 transcript-replay (deepseek)**: 18 steps, 4 errors,
+  apply:write=4:2, $0.1437. Dogfood goal-08 by adding
+  `recursive replay <file>`. Clean run.
+- **goal-10 shell-cwd (minimax)**: 15 steps, **0 errors**,
+  apply:write=0:2, $0.1187. Smallest single-file change; agent
+  rewrote `shell.rs` whole even though the goal asked for
+  `apply_patch` ("Notes for the agent" said use apply_patch). That's
+  a recurring MiniMax pattern: when the file is small, it picks
+  `write_file` even when patch was suggested.
+- Wall-clock for the pair ≈ 1.5 min — faster than the first
+  concurrent batch because both goals were smaller. No merge
+  conflicts at all this time (09 changed main.rs + transcript.rs,
+  10 changed only tools/shell.rs).
+- Pair total cost: **$0.26**. Cheapest two-goal batch on record.
 
 ## Caveats
 
