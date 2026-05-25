@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::compact::Compactor;
 use crate::error::{Error, Result};
+use crate::hooks::{Hook, HookAction, HookEvent, HookRegistry};
 use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::tools::ToolRegistry;
@@ -195,6 +196,7 @@ pub struct Agent {
     total_llm_latency_ms: u64,
     compactor: Option<Compactor>,
     permission_hook: Option<PermissionHook>,
+    hooks: HookRegistry,
 }
 
 impl Agent {
@@ -207,7 +209,8 @@ impl Agent {
     pub async fn run(&mut self, goal: impl Into<String>) -> Result<AgentOutcome> {
         let goal = goal.into();
         info!(target: "recursive::agent", goal = %truncate(&goal, 200), "agent run starting");
-        self.transcript.push(Message::user(goal));
+        self.transcript.push(Message::user(goal.clone()));
+        self.hooks.dispatch(HookEvent::SessionStart { goal: &goal });
 
         let mut final_message: Option<String> = None;
         let specs = self.tools.specs();
@@ -247,6 +250,9 @@ impl Agent {
             }
 
             // Optionally compact the transcript if it exceeds the threshold.
+            self.hooks.dispatch(HookEvent::PreCompact {
+                transcript_len: self.transcript.iter().map(|m| m.content.len()).sum(),
+            });
             self.maybe_compact(step).await?;
 
             debug!(target: "recursive::agent", step, "calling llm");
@@ -353,9 +359,51 @@ impl Agent {
                     call.arguments.clone()
                 };
 
-                let result = match self.tools.invoke(&call.name, effective_args).await {
-                    Ok(output) => output,
-                    Err(err) => format!("ERROR: {err}"),
+                // Apply lifecycle hooks before executing the tool
+                let hook_action = self.hooks.dispatch(HookEvent::PreToolCall {
+                    name: &call.name,
+                    args: &effective_args,
+                });
+                let result = match hook_action {
+                    HookAction::Skip => {
+                        let result = "ERROR: tool call skipped by hook".to_string();
+                        self.emit(StepEvent::ToolResult {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            output: result.clone(),
+                            step,
+                        });
+                        self.transcript
+                            .push(Message::tool_result(call.id.clone(), result));
+                        continue;
+                    }
+                    HookAction::Error(msg) => {
+                        let result = format!("ERROR: {msg}");
+                        self.emit(StepEvent::ToolResult {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            output: result.clone(),
+                            step,
+                        });
+                        self.transcript
+                            .push(Message::tool_result(call.id.clone(), result));
+                        continue;
+                    }
+                    HookAction::Continue => {
+                        let tool_start = std::time::Instant::now();
+                        let result = match self.tools.invoke(&call.name, effective_args).await {
+                            Ok(output) => output,
+                            Err(err) => format!("ERROR: {err}"),
+                        };
+                        let duration_ms = tool_start.elapsed().as_millis() as u64;
+                        self.hooks.dispatch(HookEvent::PostToolCall {
+                            name: &call.name,
+                            args: &call.arguments,
+                            result: &result,
+                            duration_ms,
+                        });
+                        result
+                    }
                 };
 
                 // Anti-stuck heuristic: track identical failing calls
@@ -479,6 +527,11 @@ impl Agent {
         self.transcript.drain(..split);
         self.transcript.insert(0, summary_msg);
 
+        self.hooks.dispatch(HookEvent::PostCompact {
+            removed,
+            summary_chars,
+        });
+
         self.emit(StepEvent::Compacted {
             removed,
             kept,
@@ -562,6 +615,7 @@ pub struct AgentBuilder {
     streaming: bool,
     compactor: Option<Compactor>,
     permission_hook: Option<PermissionHook>,
+    hooks: HookRegistry,
 }
 
 impl AgentBuilder {
@@ -663,6 +717,14 @@ impl AgentBuilder {
         self.permission_hook = Some(Box::new(hook));
         self
     }
+    /// Register a lifecycle hook (optional).
+    ///
+    /// Hooks are invoked at well-defined lifecycle points during the agent run.
+    /// Multiple hooks are supported; they fire in registration order.
+    pub fn hook(mut self, hook: Arc<dyn Hook>) -> Self {
+        self.hooks.register(hook);
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self
             .llm
@@ -683,6 +745,7 @@ impl AgentBuilder {
             total_llm_latency_ms: 0,
             compactor: self.compactor,
             permission_hook: self.permission_hook,
+            hooks: self.hooks,
         })
     }
 }
