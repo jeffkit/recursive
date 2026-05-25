@@ -52,12 +52,12 @@ Make the crate publishable and usable by external developers.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 7.1 | API stabilization + breaking change cleanup | M | 🔴 |
-| 7.2 | docs.rs documentation (user-facing, not internal) | S | 🔴 |
-| 7.3 | examples/ directory (5 runnable examples) | S | 🔴 |
-| 7.4 | Feature flags (mcp, web_fetch, anthropic optional) | M | 🔴 |
-| 7.5 | crates.io publish + CI release workflow | S | 🔴 |
-| 7.6 | Error type refinement (structured errors for library) | S | 🔴 |
+| 7.1 | API stabilization + breaking change cleanup | M | ✅ g69 (no changes needed) |
+| 7.2 | docs.rs documentation (user-facing, not internal) | S | ✅ g73 |
+| 7.3 | examples/ directory (5 runnable examples) | S | ✅ g72 |
+| 7.4 | Feature flags (mcp, web_fetch, anthropic optional) | M | ✅ g70 |
+| 7.5 | crates.io publish + CI release workflow | S | ✅ g75 |
+| 7.6 | Error type refinement (structured errors for library) | S | ✅ g71 |
 
 **Total**: ~2 batches
 
@@ -69,8 +69,8 @@ Make the agent handle harder tasks.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 8.1 | Parallel tool execution | M | 🔴 |
-| 8.2 | Tool Transport: SSH adapter | M | 🔴 |
+| 8.1 | Parallel tool execution | M | ✅ g74 |
+| 8.2 | Tool Transport: SSH adapter | M | ✅ g76 |
 | 8.3 | Background task execution (fire-and-forget + poll) | M | 🔴 |
 | 8.4 | Multi-turn Planning (plan → confirm → execute) | L | 🔴 |
 
@@ -96,12 +96,13 @@ Batch 19 (done): Validation — dogfood hooks, integration tests
 Batch 20 (done): Phase 5 partial — g59 refs, g60 scripts, g61 params, g62 injection modes
 Batch 21 (done): Phase 5 finish + Phase 6.1 MCP HTTP+SSE
 Batch 22 (done): Phase 6.2 integration test, 6.4 resources/prompts (6.3 server mode deferred)
-Batch 23 (next): Phase 7 (Ship It) — API stabilization, docs, examples, feature flags
-Batch 24-25: Phase 7 continued + Phase 8 (Capability)
+Batch 23 (done): Phase 7 partial — g69 API audit, g70 feature flags, g71 errors, g72 examples
+Batch 24 (done): Phase 7 finish + Phase 8 start — g73 docs, g74 parallel, g75 CI, g76 SSH
+Batch 25 (next): Phase 8 finish — g77 background tasks, g78 multi-turn planning
 Batch 26+: Phase 9 (Ecosystem) — as needed
 ```
 
-**Estimated total: 8-10 more batches to v0.2 release.**
+**Estimated total: 1-2 more batches to v0.2 release.**
 
 ---
 
