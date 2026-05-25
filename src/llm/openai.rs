@@ -109,7 +109,10 @@ impl OpenAiProvider {
 
     /// Build an `Error::Llm` with the model name prefixed.
     fn make_err(&self, ctx: impl Into<String>) -> Error {
-        Error::Llm { provider: self.model.clone(), message: format!("{}", ctx.into()) }
+        Error::Llm {
+            provider: self.model.clone(),
+            message: ctx.into().to_string(),
+        }
     }
 
     pub fn with_temperature(mut self, t: f64) -> Self {
