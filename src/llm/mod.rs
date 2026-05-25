@@ -17,10 +17,12 @@ use crate::message::Message;
 
 use tokio::sync::mpsc;
 
+#[cfg(feature = "anthropic")]
 pub mod anthropic;
 pub mod mock;
 pub mod openai;
 
+#[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicProvider;
 pub use mock::MockProvider;
 pub use openai::OpenAiProvider;

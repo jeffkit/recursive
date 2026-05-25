@@ -13,6 +13,11 @@ keywords = ["agent", "llm", "coding-agent", "ai", "tool-use"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.75"
 exclude = [".dev/", "journal/", "goals/"]
+[features]
+default = ["mcp", "web_fetch", "anthropic"]
+mcp = ["dep:futures-util"]
+web_fetch = []
+anthropic = []
 
 [lib]
 name = "recursive"
@@ -36,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 walkdir = "2"
 regex = "1"
 blake3 = "1"
-futures-util = "0.3.32"
+futures-util = { version = "0.3.32", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }

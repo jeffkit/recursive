@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod hooks;
 pub mod llm;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod message;
 pub mod session;
@@ -31,6 +32,7 @@ pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
 pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
+#[cfg(feature = "mcp")]
 pub use mcp::{
     discover_mcp_servers, load_mcp_config, McpClient, McpPrompt, McpPromptArgument,
     McpPromptMessage, McpResource, McpResourceContent, McpServer, McpServerConfig, McpTool,

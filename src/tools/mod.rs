@@ -22,6 +22,7 @@ pub mod search;
 pub mod shell;
 pub mod sub_agent;
 pub mod transport;
+#[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
 pub use apply_patch::ApplyPatch;
@@ -34,6 +35,7 @@ pub use search::SearchFiles;
 pub use shell::RunShell;
 pub use sub_agent::SubAgent;
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
+#[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
 
 impl Default for ToolRegistry {
