@@ -19,6 +19,8 @@ pub struct Skill {
     pub refs: Vec<SkillRef>,
     /// Parameters declared in frontmatter.
     pub params: Vec<SkillParam>,
+    /// Executable scripts found in <skill_dir>/scripts/
+    pub scripts: Vec<SkillScript>,
 }
 
 /// A reference document within a skill's `refs/` directory.
@@ -41,6 +43,17 @@ pub struct SkillParam {
     pub default: Option<String>,
 }
 
+/// An executable script within a skill's `scripts/` directory.
+#[derive(Debug, Clone)]
+pub struct SkillScript {
+    /// Script name (filename without extension), e.g. "lint"
+    pub name: String,
+    /// Absolute path to the script file
+    pub path: PathBuf,
+    /// Brief description from the first comment line (if present)
+    pub description: String,
+}
+
 /// Discover skills in the given search paths.
 ///
 /// For each `<path>/<name>/SKILL.md`, parses optional YAML frontmatter.
@@ -48,7 +61,8 @@ pub struct SkillParam {
 /// non-empty line of body as `description`.
 ///
 /// Also scans `<skill_dir>/refs/` for `.md` and `.txt` files and populates
-/// `Skill::refs` with what's found.
+/// `Skill::refs` with what's found. Also scans `<skill_dir>/scripts/` for
+/// executable scripts and populates `Skill::scripts`.
 pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
 
@@ -72,12 +86,14 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                 if let Ok(content) = fs::read_to_string(&skill_file) {
                     let (name, description, params) = parse_skill_meta(&content, &dir_path);
                     let refs = discover_refs(&dir_path);
+                    let scripts = discover_scripts(&dir_path);
                     skills.push(Skill {
                         name,
                         description,
                         path: skill_file,
                         refs,
                         params,
+                        scripts,
                     });
                 }
             }
@@ -114,6 +130,100 @@ fn discover_refs(skill_dir: &Path) -> Vec<SkillRef> {
     }
 
     refs
+}
+
+/// Scan `<skill_dir>/scripts/` for executable files.
+///
+/// Accepts files with execute permission (Unix) or common script extensions:
+/// `.sh`, `.py`, `.rb`, `.js`. Extracts a description from the first comment
+/// line (shebang excluded).
+fn discover_scripts(skill_dir: &Path) -> Vec<SkillScript> {
+    let scripts_dir = skill_dir.join("scripts");
+    if !scripts_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut scripts = Vec::new();
+    if let Ok(entries) = fs::read_dir(&scripts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            // Check if it's executable (Unix) or has a known script extension
+            let is_exec = is_executable(&path);
+            let has_script_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e, "sh" | "py" | "rb" | "js"))
+                .unwrap_or(false);
+
+            if !is_exec && !has_script_ext {
+                continue;
+            }
+
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let description = extract_script_description(&path);
+                scripts.push(SkillScript {
+                    name: stem.to_string(),
+                    path,
+                    description,
+                });
+            }
+        }
+    }
+
+    scripts
+}
+
+/// Check if a file has execute permission (Unix-only).
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    false
+}
+
+/// Extract a description from the first comment line of a script.
+///
+/// Reads the first line. If it starts with `#!` (shebang), reads the second
+/// line. If a line starts with `#` or `//`, returns it (with the comment
+/// prefix stripped). Otherwise returns empty string.
+fn extract_script_description(path: &Path) -> String {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let mut lines = content.lines();
+    let first = lines.next();
+
+    // Skip shebang line
+    let target = match first {
+        Some(l) if l.starts_with("#!") => lines.next(),
+        other => other,
+    };
+
+    match target {
+        Some(l) if l.starts_with("# ") || l.starts_with("#") => l
+            .trim_start_matches("# ")
+            .trim_start_matches('#')
+            .trim()
+            .to_string(),
+        Some(l) if l.starts_with("// ") || l.starts_with("//") => l
+            .trim_start_matches("// ")
+            .trim_start_matches("//")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Parse YAML frontmatter (if present) from skill content.
@@ -264,6 +374,9 @@ pub fn skill_index(skills: &[Skill]) -> String {
             suffix_parts.push(format!("params: {}", param_strs.join(", ")));
         }
 
+        // Scripts
+        let script_names: Vec<&str> = skill.scripts.iter().map(|s| s.name.as_str()).collect();
+
         if suffix_parts.is_empty() {
             lines.push(format!("- {}: {}", skill.name, skill.description));
         } else {
@@ -273,6 +386,12 @@ pub fn skill_index(skills: &[Skill]) -> String {
                 skill.description,
                 suffix_parts.join(", ")
             ));
+        }
+
+        // Append scripts suffix if present (after the main line)
+        if !script_names.is_empty() {
+            let last = lines.last_mut().unwrap();
+            *last = format!("{} [scripts: {}]", last, script_names.join(", "));
         }
     }
 
@@ -335,6 +454,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/rust-traits/SKILL.md"),
                 refs: vec![],
                 params: vec![],
+                scripts: vec![],
             },
             Skill {
                 name: "python-api".to_string(),
@@ -342,6 +462,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/python-api/SKILL.md"),
                 refs: vec![],
                 params: vec![],
+                scripts: vec![],
             },
         ];
 
@@ -431,6 +552,7 @@ mod tests {
                     },
                 ],
                 params: vec![],
+                scripts: vec![],
             },
             Skill {
                 name: "no-refs".to_string(),
@@ -438,6 +560,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/no-refs/SKILL.md"),
                 refs: vec![],
                 params: vec![],
+                scripts: vec![],
             },
         ];
 
@@ -531,6 +654,7 @@ mod tests {
                         default: None,
                     },
                 ],
+                scripts: vec![],
             },
             Skill {
                 name: "simple".to_string(),
@@ -538,6 +662,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/simple/SKILL.md"),
                 refs: vec![],
                 params: vec![],
+                scripts: vec![],
             },
         ];
 
@@ -550,5 +675,146 @@ mod tests {
             result.contains("- simple: No params"),
             "should show skill without params normally"
         );
+    }
+
+    #[test]
+    fn discover_skills_populates_scripts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a skill with scripts
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A skill with scripts\n---\n\nBody",
+        )
+        .unwrap();
+
+        // Create scripts directory
+        let scripts_dir = skill_dir.join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        fs::write(
+            scripts_dir.join("lint.sh"),
+            "#!/bin/sh\n# Run the linter\necho 'linting...'\n",
+        )
+        .unwrap();
+        fs::write(
+            scripts_dir.join("format.py"),
+            "#!/usr/bin/env python3\n# Format the code\nprint('formatting')\n",
+        )
+        .unwrap();
+        // Non-script extension should be ignored
+        fs::write(scripts_dir.join("notes.txt"), "not a script").unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+
+        let skill = &skills[0];
+        assert_eq!(skill.name, "my-skill");
+        assert_eq!(
+            skill.scripts.len(),
+            2,
+            "should find 2 scripts (sh + py), ignoring txt"
+        );
+
+        let lint = skill.scripts.iter().find(|s| s.name == "lint").unwrap();
+        assert!(lint.path.ends_with("lint.sh"));
+        assert_eq!(lint.description, "Run the linter");
+
+        let format = skill.scripts.iter().find(|s| s.name == "format").unwrap();
+        assert!(format.path.ends_with("format.py"));
+        assert_eq!(format.description, "Format the code");
+    }
+
+    #[test]
+    fn discover_skills_handles_no_scripts_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a skill without scripts directory
+        let skill_dir = base.join("simple-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: simple-skill\ndescription: No scripts\n---\n\nBody",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+        assert!(
+            skills[0].scripts.is_empty(),
+            "skill with no scripts/ dir should have empty scripts"
+        );
+    }
+
+    #[test]
+    fn skill_index_shows_script_names() {
+        let skills = vec![
+            Skill {
+                name: "with-scripts".to_string(),
+                description: "Has scripts".to_string(),
+                path: PathBuf::from("/tmp/skills/with-scripts/SKILL.md"),
+                refs: vec![],
+                params: vec![],
+                scripts: vec![
+                    SkillScript {
+                        name: "lint".to_string(),
+                        path: PathBuf::from("/tmp/skills/with-scripts/scripts/lint.sh"),
+                        description: "Run the linter".to_string(),
+                    },
+                    SkillScript {
+                        name: "format".to_string(),
+                        path: PathBuf::from("/tmp/skills/with-scripts/scripts/format.py"),
+                        description: "Format the code".to_string(),
+                    },
+                ],
+            },
+            Skill {
+                name: "no-scripts".to_string(),
+                description: "No scripts".to_string(),
+                path: PathBuf::from("/tmp/skills/no-scripts/SKILL.md"),
+                refs: vec![],
+                params: vec![],
+                scripts: vec![],
+            },
+        ];
+
+        let result = skill_index(&skills);
+        assert!(result.contains("- with-scripts: Has scripts [scripts: lint, format]"));
+        assert!(result.contains("- no-scripts: No scripts"));
+    }
+
+    #[test]
+    fn extract_script_description_shebang_then_comment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.sh");
+        fs::write(&path, "#!/bin/sh\n# Run the linter\necho hi\n").unwrap();
+        assert_eq!(extract_script_description(&path), "Run the linter");
+    }
+
+    #[test]
+    fn extract_script_description_no_shebang() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.py");
+        fs::write(&path, "# Format the code\nprint('hi')\n").unwrap();
+        assert_eq!(extract_script_description(&path), "Format the code");
+    }
+
+    #[test]
+    fn extract_script_description_js_comment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.js");
+        fs::write(&path, "// Run the build\nconsole.log('hi')\n").unwrap();
+        assert_eq!(extract_script_description(&path), "Run the build");
+    }
+
+    #[test]
+    fn extract_script_description_empty_when_no_comment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.sh");
+        fs::write(&path, "#!/bin/sh\necho hi\n").unwrap();
+        assert_eq!(extract_script_description(&path), "");
     }
 }

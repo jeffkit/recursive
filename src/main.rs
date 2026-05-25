@@ -29,7 +29,8 @@ use recursive::{
     tools::memory::memory_summary,
     tools::{
         ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, LocalTransport, ReadFile, Recall,
-        Remember, RunShell, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
+        Remember, RunShell, RunSkillScript, SearchFiles, SubAgent, ToolTransport, WebFetch,
+        WriteFile,
     },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
@@ -364,7 +365,12 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(Forget::new(root)));
     let skills = discover_loaded_skills(config);
     if !skills.is_empty() {
-        registry = registry.register(Arc::new(LoadSkill::new(skills)));
+        registry = registry.register(Arc::new(LoadSkill::new(skills.clone())));
+        registry = registry.register(Arc::new(RunSkillScript::new(
+            skills,
+            root.clone(),
+            Duration::from_secs(config.shell_timeout_secs),
+        )));
     }
     registry
 }

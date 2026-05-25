@@ -33,6 +33,6 @@ pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
 pub use message::{Message, Role};
 pub use session::SessionFile;
-pub use skills::{discover_skills, skill_index, Skill, SkillParam, SkillRef};
+pub use skills::{discover_skills, skill_index, Skill, SkillParam, SkillRef, SkillScript};
 pub use tools::{Tool, ToolRegistry};
 pub use transcript::{TranscriptFile, TranscriptMeta};
