@@ -281,6 +281,10 @@ struct ResponseUsage {
     completion_tokens: Option<u32>,
     #[serde(default)]
     total_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u32>,
 }
 
 impl ResponseUsage {
@@ -289,6 +293,8 @@ impl ResponseUsage {
             prompt_tokens: self.prompt_tokens.unwrap_or(0),
             completion_tokens: self.completion_tokens.unwrap_or(0),
             total_tokens: self.total_tokens.unwrap_or(0),
+            cache_hit_tokens: self.prompt_cache_hit_tokens.unwrap_or(0),
+            cache_miss_tokens: self.prompt_cache_miss_tokens.unwrap_or(0),
         }
     }
 }
@@ -425,6 +431,45 @@ mod tests {
         assert_eq!(u.prompt_tokens, 0);
         assert_eq!(u.completion_tokens, 0);
         assert_eq!(u.total_tokens, 50);
+        assert_eq!(u.cache_hit_tokens, 0);
+        assert_eq!(u.cache_miss_tokens, 0);
+    }
+
+    #[test]
+    fn parses_cache_fields_from_deepseek_usage() {
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":100,
+                "completion_tokens":50,
+                "total_tokens":150,
+                "prompt_cache_hit_tokens":60,
+                "prompt_cache_miss_tokens":40
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        assert!(c.usage.is_some());
+        let u = c.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.cache_hit_tokens, 60);
+        assert_eq!(u.cache_miss_tokens, 40);
+    }
+
+    #[test]
+    fn parses_cache_fields_as_zero_when_absent() {
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        assert!(c.usage.is_some());
+        let u = c.usage.unwrap();
+        assert_eq!(u.cache_hit_tokens, 0);
+        assert_eq!(u.cache_miss_tokens, 0);
     }
 
     #[test]

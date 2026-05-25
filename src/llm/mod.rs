@@ -24,6 +24,8 @@ pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub cache_hit_tokens: u32,
+    pub cache_miss_tokens: u32,
 }
 
 impl TokenUsage {
@@ -35,6 +37,10 @@ impl TokenUsage {
                 .completion_tokens
                 .saturating_add(other.completion_tokens),
             total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            cache_hit_tokens: self.cache_hit_tokens.saturating_add(other.cache_hit_tokens),
+            cache_miss_tokens: self
+                .cache_miss_tokens
+                .saturating_add(other.cache_miss_tokens),
         }
     }
 }
@@ -124,11 +130,15 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
             prompt_tokens: 20,
             completion_tokens: 30,
             total_tokens: 50,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let acc = u1.accumulate(u2);
         assert_eq!(acc.prompt_tokens, 30);
@@ -142,11 +152,15 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
             prompt_tokens: 20,
             completion_tokens: 30,
             total_tokens: 50,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         assert_eq!(u1.accumulate(u2), u2.accumulate(u1));
     }
@@ -157,11 +171,15 @@ mod tests {
             prompt_tokens: u32::MAX,
             completion_tokens: 1,
             total_tokens: u32::MAX,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
             prompt_tokens: 1,
             completion_tokens: u32::MAX,
             total_tokens: u32::MAX,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let acc = u1.accumulate(u2);
         assert_eq!(acc.prompt_tokens, u32::MAX);
@@ -191,6 +209,8 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 0,
             total_tokens: 1_000_000,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let cost = pricing.cost_usd(usage);
         assert!((cost - 1.0).abs() < 1e-9);
@@ -207,6 +227,8 @@ mod tests {
             prompt_tokens: 500_000,
             completion_tokens: 250_000,
             total_tokens: 750_000,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let cost = pricing.cost_usd(usage);
         // 0.5 * 1.0 + 0.25 * 2.0 = 0.5 + 0.5 = 1.0
@@ -228,5 +250,29 @@ mod tests {
     fn pricing_for_unknown_returns_none() {
         let p = pricing_for("unknown-model-xyz");
         assert!(p.is_none());
+    }
+
+    #[test]
+    fn token_usage_accumulate_cache_fields() {
+        let u1 = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cache_hit_tokens: 60,
+            cache_miss_tokens: 40,
+        };
+        let u2 = TokenUsage {
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            total_tokens: 300,
+            cache_hit_tokens: 120,
+            cache_miss_tokens: 80,
+        };
+        let acc = u1.accumulate(u2);
+        assert_eq!(acc.cache_hit_tokens, 180);
+        assert_eq!(acc.cache_miss_tokens, 120);
+        assert_eq!(acc.prompt_tokens, 300);
+        assert_eq!(acc.completion_tokens, 150);
+        assert_eq!(acc.total_tokens, 450);
     }
 }

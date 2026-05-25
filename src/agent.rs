@@ -637,11 +637,15 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -690,6 +694,8 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
         };
         let llm = Arc::new(MockProvider::new(vec![Completion {
             content: "first".into(),
