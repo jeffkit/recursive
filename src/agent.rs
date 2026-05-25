@@ -24,6 +24,28 @@ use crate::tools::ToolRegistry;
 const STUCK_THRESHOLD: usize = 3;
 
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
+/// Decision returned by a permission hook to allow, deny, or transform a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// Let the tool execute with the original arguments.
+    Allow,
+    /// Block execution and return the reason as a tool error to the model.
+    Deny(String),
+    /// Replace the arguments before execution.
+    Transform(serde_json::Value),
+}
+
+/// Signature for a permission hook: `Fn(&tool_name, &arguments) -> PermissionDecision`.
+///
+/// The hook is invoked just before each tool execution. It can:
+/// - `Allow` the call unchanged,
+/// - `Deny` it with a reason (fed back as a tool error),
+/// - `Transform` the arguments before execution.
+///
+/// Hooks must be `Send + Sync` because the agent loop is `Send`.
+pub type PermissionHook = Box<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
+
 const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +194,7 @@ pub struct Agent {
     streaming: bool,
     total_llm_latency_ms: u64,
     compactor: Option<Compactor>,
+    permission_hook: Option<PermissionHook>,
 }
 
 impl Agent {
@@ -307,7 +330,30 @@ impl Agent {
                     call: call.clone(),
                     step,
                 });
-                let result = match self.tools.invoke(&call.name, call.arguments.clone()).await {
+
+                // Apply permission hook before executing the tool
+                let effective_args = if let Some(ref hook) = self.permission_hook {
+                    match hook(&call.name, &call.arguments) {
+                        PermissionDecision::Allow => call.arguments.clone(),
+                        PermissionDecision::Deny(reason) => {
+                            let result = format!("ERROR: {reason}");
+                            self.emit(StepEvent::ToolResult {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                output: result.clone(),
+                                step,
+                            });
+                            self.transcript
+                                .push(Message::tool_result(call.id.clone(), result));
+                            continue;
+                        }
+                        PermissionDecision::Transform(new_args) => new_args,
+                    }
+                } else {
+                    call.arguments.clone()
+                };
+
+                let result = match self.tools.invoke(&call.name, effective_args).await {
                     Ok(output) => output,
                     Err(err) => format!("ERROR: {err}"),
                 };
@@ -515,6 +561,7 @@ pub struct AgentBuilder {
     seed: Vec<Message>,
     streaming: bool,
     compactor: Option<Compactor>,
+    permission_hook: Option<PermissionHook>,
 }
 
 impl AgentBuilder {
@@ -604,6 +651,18 @@ impl AgentBuilder {
         self.compactor = Some(compactor);
         self
     }
+    /// Attach a permission hook that is invoked before each tool execution (optional).
+    ///
+    /// The hook can allow, deny, or transform tool arguments. If denied, the tool
+    /// is not executed and the reason is returned as a tool error. If transformed,
+    /// the new arguments are passed to the tool instead.
+    pub fn permission_hook<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync + 'static,
+    {
+        self.permission_hook = Some(Box::new(hook));
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self
             .llm
@@ -623,6 +682,7 @@ impl AgentBuilder {
             streaming: self.streaming,
             total_llm_latency_ms: 0,
             compactor: self.compactor,
+            permission_hook: self.permission_hook,
         })
     }
 }
@@ -1628,6 +1688,143 @@ mod tests {
             .unwrap();
         let out = agent.run("hi").await.unwrap();
         assert!(matches!(out.finish, FinishReason::TranscriptLimit { .. }));
+    }
+
+    // ========================================================================
+    // Permission hook tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn permission_hook_allow_passes_args_unchanged() {
+        // Hook returns Allow; tool should receive the original args.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "let me add".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a": 2, "b": 3}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "5".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .permission_hook(|_name, _args| PermissionDecision::Allow)
+            .build()
+            .unwrap();
+        let out = agent.run("what is 2+3?").await.unwrap();
+        assert_eq!(out.final_message.as_deref(), Some("5"));
+        assert_eq!(out.steps, 2);
+    }
+
+    #[tokio::test]
+    async fn permission_hook_deny_returns_error_to_model() {
+        // Hook returns Deny; tool should NOT be executed, and the model
+        // should receive an error result.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "let me add".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a": 2, "b": 3}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "i see the error".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .permission_hook(|_name, _args| PermissionDecision::Deny("not allowed".into()))
+            .build()
+            .unwrap();
+        let out = agent.run("add numbers").await.unwrap();
+        // The tool result should contain the denial reason
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(tool_msgs[0].content.contains("not allowed"));
+        // The model should have received the error and responded
+        assert_eq!(out.final_message.as_deref(), Some("i see the error"));
+    }
+
+    #[tokio::test]
+    async fn permission_hook_transform_replaces_args() {
+        // Hook returns Transform with different args; tool should receive
+        // the transformed args, not the original ones.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "let me add".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a": 100, "b": 200}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        // Transform args to add 1+2 instead of 100+200
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .permission_hook(|_name, _args| PermissionDecision::Transform(json!({"a": 1, "b": 2})))
+            .build()
+            .unwrap();
+        let out = agent.run("add numbers").await.unwrap();
+        // The tool result should be 3 (1+2), not 300 (100+200)
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert_eq!(tool_msgs[0].content, "3");
+    }
+
+    #[tokio::test]
+    async fn default_no_hook_is_unchanged() {
+        // Without permission_hook(), existing behavior is preserved.
+        // This is the same as terminates_when_model_emits_no_tool_calls.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let mut agent = Agent::builder().llm(llm).build().unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out.final_message.as_deref(), Some("done"));
+        assert_eq!(out.steps, 1);
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
     }
 }
 
