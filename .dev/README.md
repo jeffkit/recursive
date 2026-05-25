@@ -10,14 +10,29 @@ inside the product surface.
 - `AGENTS.md` — the contract Recursive reads when invoked against its own
   source. Out of scope for end-users who invoke Recursive on their own
   codebase.
+- `OPERATIONS.md` — SOP for the **orchestrator** role (the one who picks
+  goals, launches runs, merges results, decides what to do next). Read
+  this if you're picking up the self-improve loop after the previous
+  orchestrator stepped away.
+- `loop-state.md` — live snapshot of the orchestrator session: what's in
+  flight, last batch landed, candidate next goals, background watchers.
+  Refreshed by the orchestrator on every wake.
 - `goals/` — supervisor-authored task descriptions, one per planned
   self-improvement iteration.
 - `journal/` — append-only record of every self-improvement run: goal,
   transcript, test outcome, verdict (committed / rolled-back). Acts as
   long-term memory across runs.
+- `observations/INDEX.md` + per-run files — structured metrics
+  (steps, tool-call mix, errors, cost) auto-extracted from each
+  journal by `scripts/observe.sh` and pinned to a rolling
+  comparison table.
 - `scripts/self-improve.sh` — wrapper that points Recursive at its own
   source, injects `AGENTS.md` + recent journal as the system prompt, runs
   the agent, verifies tests, then either commits or rolls back.
+- `scripts/parallel-self-improve.sh` — wraps the above in a fresh git
+  worktree on a new branch, so multiple goals can run concurrently
+  without touching each other.
+- `scripts/observe.sh` — journal → structured metrics extractor.
 
 ## Why a `.dev/` boundary
 
