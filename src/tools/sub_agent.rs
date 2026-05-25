@@ -16,8 +16,7 @@ use std::sync::Arc;
 use crate::agent::{Agent, FinishReason, PermissionHook};
 use crate::error::{Error, Result};
 use crate::llm::{LlmProvider, ToolSpec};
-use crate::tools::Tool;
-use crate::tools::ToolRegistry;
+use crate::tools::{Tool, ToolRegistry};
 
 /// The sub-agent tool.
 ///
@@ -58,7 +57,7 @@ impl SubAgent {
 
     /// Build a restricted tool registry containing only the named tools.
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
-        let mut reg = ToolRegistry::new();
+        let mut reg = self.all_tools.with_same_transport();
         for name in tool_names {
             if let Some(tool) = self.all_tools.get(name) {
                 reg = reg.register(tool);
@@ -191,7 +190,7 @@ impl Tool for SubAgent {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider, ToolCall};
-    use crate::tools::{ApplyPatch, ListDir, ReadFile, SearchFiles, WriteFile};
+    use crate::tools::{ApplyPatch, ListDir, LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile};
 
     /// Helper: create a MockProvider with the given scripted completions.
     fn mock_provider(script: Vec<Completion>) -> Arc<dyn LlmProvider> {
@@ -200,7 +199,8 @@ mod tests {
 
     /// Helper: build a full tool registry with read-only + write tools.
     fn full_tool_registry(workspace: &std::path::Path) -> ToolRegistry {
-        ToolRegistry::new()
+        let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+        ToolRegistry::new(transport)
             .register(Arc::new(ReadFile::new(workspace)))
             .register(Arc::new(ListDir::new(workspace)))
             .register(Arc::new(SearchFiles::new(workspace)))

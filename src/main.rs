@@ -29,7 +29,7 @@ use recursive::{
     tools::memory::memory_summary,
     tools::{
         ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, ReadFile, Recall, Remember,
-        RunShell, SearchFiles, SubAgent, WebFetch, WriteFile,
+        LocalTransport, RunShell, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
     },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
@@ -340,7 +340,8 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
 /// Build the tool registry, optionally registering MCP tools from a config file.
 async fn build_tools(config: &Config) -> ToolRegistry {
     let root = &config.workspace;
-    let mut registry = ToolRegistry::new()
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    let mut registry = ToolRegistry::new(transport)
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ApplyPatch::new(root)))

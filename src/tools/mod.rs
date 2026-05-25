@@ -19,6 +19,7 @@ pub mod load_skill;
 pub mod memory;
 pub mod search;
 pub mod shell;
+pub mod transport;
 pub mod sub_agent;
 pub mod web_fetch;
 
@@ -29,8 +30,15 @@ pub use load_skill::LoadSkill;
 pub use memory::{Forget, Recall, Remember};
 pub use search::SearchFiles;
 pub use shell::RunShell;
+pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 pub use sub_agent::SubAgent;
 pub use web_fetch::WebFetch;
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::local()
+    }
+}
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -38,14 +46,31 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, arguments: Value) -> Result<String>;
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl ToolRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(transport: Arc<dyn ToolTransport>) -> Self {
+        Self {
+            tools: BTreeMap::new(),
+            transport,
+        }
+    }
+
+    /// Create a registry with the default local transport.
+    pub fn local() -> Self {
+        Self::new(Arc::new(LocalTransport))
+    }
+
+    /// Create a new empty registry that shares the same transport.
+    pub fn with_same_transport(&self) -> Self {
+        Self {
+            tools: BTreeMap::new(),
+            transport: self.transport.clone(),
+        }
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
@@ -170,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_dispatches_and_errors_on_unknown() {
-        let reg = ToolRegistry::new().register(Arc::new(Echo));
+        let reg = ToolRegistry::local().register(Arc::new(Echo));
         let out = reg
             .invoke("echo", serde_json::json!({"msg":"hi"}))
             .await
