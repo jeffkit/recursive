@@ -20,12 +20,12 @@ system needs progressive disclosure, reference docs, and executable scripts.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 5.1 | Skill refs/ — reference documents accessible via tool | S | 🔴 |
-| 5.2 | Skill scripts/ — executable scripts the agent can invoke | S | 🔴 |
+| 5.1 | Skill refs/ — reference documents accessible via tool | S | ✅ g59 |
+| 5.2 | Skill scripts/ — executable scripts the agent can invoke | S | ✅ g60 |
 | 5.3 | Trigger-based progressive disclosure | M | 🔴 |
-| 5.4 | Skill parameters (frontmatter args) | S | 🔴 |
+| 5.4 | Skill parameters (frontmatter args) | S | ✅ g61 |
 | 5.5 | Skill composition (depends_on) | S | 🔴 |
-| 5.6 | Injection modes: always / trigger / manual | S | 🔴 |
+| 5.6 | Injection modes: always / trigger / manual | S | ✅ g62 |
 
 **Total**: ~2 batches (6 goals, mostly S)
 
@@ -92,8 +92,9 @@ Make the agent handle harder tasks.
 ## Execution Order
 
 ```
-Batch 19 (current): Validation — dogfood hooks, integration tests
-Batch 20-21: Phase 5 (Skill v2) — 6 goals, 4-wide
+Batch 19 (done): Validation — dogfood hooks, integration tests
+Batch 20 (done): Phase 5 partial — g59 refs, g60 scripts, g61 params, g62 injection modes
+Batch 21 (next): Phase 5 finish + Phase 6 start — g63 progressive disclosure, g64 composition, g65 MCP HTTP+SSE
 Batch 22-23: Phase 6 (MCP) — 4 goals, 2-wide (complex)
 Batch 24-25: Phase 7 (Ship) — 6 goals, 4-wide
 Batch 26-27: Phase 8 (Capability) — 4 goals
