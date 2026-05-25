@@ -40,7 +40,7 @@ Touches: `src/config.rs` and `src/main.rs`.
 ## Acceptance
 
 - `cargo build` green.
-- `cargo test` green (119 baseline + 2 new = 121).
+- `cargo test` green (123 baseline + 2 new = 125).
 - `cargo clippy --all-targets -- -D warnings` green.
 - `cargo fmt --all` clean.
 
