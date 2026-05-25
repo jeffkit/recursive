@@ -17,7 +17,7 @@ use tracing::Level;
 use recursive::{
     config::Config,
     llm::{LlmProvider, OpenAiProvider},
-    tools::{CountLines, ListDir, ReadFile, RunShell, WriteFile},
+    tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, WriteFile},
     Agent, StepEvent, ToolRegistry,
 };
 
@@ -98,6 +98,7 @@ fn build_tools(root: &std::path::Path) -> ToolRegistry {
     ToolRegistry::new()
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(WriteFile::new(root)))
+        .register(Arc::new(ApplyPatch::new(root)))
         .register(Arc::new(ListDir::new(root)))
         .register(Arc::new(CountLines::new(root)))
         .register(Arc::new(RunShell::new(root)))

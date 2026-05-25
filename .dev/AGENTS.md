@@ -54,14 +54,21 @@ tests/
 3. `list_dir src/` then read the files you'll touch.
 4. Make the smallest possible change. If you add a tool, add it as a new file
    under `src/tools/` and register it in `src/tools/mod.rs`.
-5. After writing code, **always**:
+5. **Prefer `apply_patch` over `write_file`** for any change to a file you
+   didn't just create. `write_file` overwrites the entire file and risks
+   silently dropping unrelated code; `apply_patch` requires you to quote
+   the context you're editing, which catches drift early.
+   - Use `write_file` only for: brand-new files, or whole-file rewrites
+     when you have read the entire current contents and intentionally
+     want to replace them.
+6. After writing code, **always**:
    ```
    run_shell: cargo build 2>&1 | tail -40
    run_shell: cargo test 2>&1 | tail -40
    ```
-6. If something fails, read the error, fix it, repeat. Do not declare success
+7. If something fails, read the error, fix it, repeat. Do not declare success
    on a red build.
-7. When done, write a final message that lists: files touched, what was added,
+8. When done, write a final message that lists: files touched, what was added,
    how you verified it. The supervisor reads this.
 
 ## Hard limits

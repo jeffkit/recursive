@@ -9,8 +9,8 @@ Recursive is a tiny ReAct-style agent loop that wires together:
 
 - an **LLM provider** (OpenAI-compatible HTTP by default; works with OpenAI,
   GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, …)
-- a **tool registry** (`read_file`, `write_file`, `list_dir`, `run_shell`,
-  `count_lines` out of the box; trivially extensible)
+- a **tool registry** (`read_file`, `write_file`, `apply_patch`, `list_dir`,
+  `run_shell`, `count_lines` out of the box; trivially extensible)
 - a **transcript** plus a `StepEvent` stream you can observe
 
 The whole kernel is intentionally small enough to read in one sitting.
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use recursive::{
     Agent, ToolRegistry,
     llm::OpenAiProvider,
-    tools::{ReadFile, WriteFile, ListDir, RunShell},
+    tools::{ApplyPatch, ListDir, ReadFile, RunShell, WriteFile},
 };
 
 # async fn run() -> anyhow::Result<()> {
@@ -35,6 +35,7 @@ let llm = Arc::new(OpenAiProvider::new(
 let tools = ToolRegistry::new()
     .register(Arc::new(ReadFile::new(".")))
     .register(Arc::new(WriteFile::new(".")))
+    .register(Arc::new(ApplyPatch::new(".")))
     .register(Arc::new(ListDir::new(".")))
     .register(Arc::new(RunShell::new(".")));
 

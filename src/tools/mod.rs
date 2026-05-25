@@ -11,10 +11,12 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
+pub mod apply_patch;
 pub mod count_lines;
 pub mod fs;
 pub mod shell;
 
+pub use apply_patch::ApplyPatch;
 pub use count_lines::CountLines;
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use shell::RunShell;
