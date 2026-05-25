@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use super::StructuredRequest;
 use super::{Completion, LlmProvider, StreamSender, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::Message;
@@ -16,6 +17,8 @@ use tracing::Instrument;
 #[derive(Default)]
 pub struct MockProvider {
     scripted: Mutex<Vec<Completion>>,
+    /// Queue of pre-baked JSON responses for `complete_structured`.
+    structured_responses: Mutex<Vec<Result<serde_json::Value>>>,
     calls: Mutex<Vec<Vec<Message>>>,
 }
 
@@ -31,12 +34,21 @@ impl MockProvider {
         Self {
             scripted: Mutex::new(scripted),
             calls: Mutex::new(Vec::new()),
+            structured_responses: Mutex::new(Vec::new()),
         }
     }
 
     /// Snapshot of the transcripts the agent has sent to this provider.
     pub fn calls(&self) -> Vec<Vec<Message>> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Set the queue of structured responses for `complete_structured`.
+    /// Each call to `complete_structured` pops the next response.
+    /// If the queue is empty, it returns an error (fallback path).
+    pub fn with_structured_responses(self, responses: Vec<Result<serde_json::Value>>) -> Self {
+        *self.structured_responses.lock().unwrap() = responses;
+        self
     }
 }
 
@@ -58,6 +70,17 @@ impl LlmProvider for MockProvider {
         }
         .instrument(span)
         .await
+    }
+
+    async fn complete_structured(&self, _req: StructuredRequest) -> Result<serde_json::Value> {
+        let mut queue = self.structured_responses.lock().unwrap();
+        if queue.is_empty() {
+            // Default: return error to trigger fallback
+            return Err(Error::Config(
+                "MockProvider: no structured responses configured".into(),
+            ));
+        }
+        queue.remove(0)
     }
 
     async fn stream(

@@ -175,9 +175,9 @@ mod tests {
 
     #[tokio::test]
     async fn mock_structured_returns_default_error() {
-        // The default impl of complete_structured should return an error,
-        // not panic. MockProvider doesn't override it.
-        let provider = MockProvider::new(vec![]);
+        // MockProvider overrides complete_structured. When no structured
+        // responses are configured, it returns an error (triggering fallback).
+        let provider = MockProvider::new(vec![]).with_structured_responses(vec![]);
         let req = StructuredRequest {
             messages: vec![Message::user("hi".to_string())],
             schema: serde_json::json!({"type": "object", "properties": {"answer": {"type": "string"}}}),
@@ -188,8 +188,8 @@ mod tests {
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("does not support structured output"),
-            "error should mention structured output: {msg}"
+            msg.contains("no structured responses configured"),
+            "error should mention no structured responses: {msg}"
         );
     }
 

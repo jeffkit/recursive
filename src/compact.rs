@@ -9,7 +9,7 @@
 //! it via `AgentBuilder::compactor(...)`.
 
 use crate::error::Result;
-use crate::llm::{LlmProvider, ToolSpec};
+use crate::llm::{LlmProvider, StructuredRequest, ToolSpec};
 use crate::message::Message;
 
 /// Configuration for LLM-driven transcript compaction.
@@ -54,6 +54,99 @@ impl Compactor {
         transcript.iter().map(|m| m.content.len()).sum()
     }
 
+    /// JSON schema for structured compaction output.
+    const COMPACT_SCHEMA: &'static str = r#"{"type":"object","properties":{"summary":{"type":"string","description":"1-3 paragraph summary of the conversation so far, preserving key decisions, file paths touched, and outcomes."},"kept_facts":{"type":"array","items":{"type":"string"},"description":"Discrete facts worth remembering across compaction (e.g. 'goal=add_X_to_Y', 'compaction happened at step N', 'tool X failed 3 times')."},"next_steps":{"type":"array","items":{"type":"string"},"description":"Outstanding TODOs the agent identified before compaction (each one a single-sentence imperative)."}},"required":["summary","kept_facts"]}"#;
+
+    /// Render a structured compaction result into the message format.
+    fn render_structured(summary: &str, kept_facts: &[String], next_steps: &[String]) -> String {
+        let mut rendered = format!(
+            "[Context compacted at step N]\n\nSummary: {summary}\n\nKey facts to remember:\n"
+        );
+        for fact in kept_facts {
+            rendered.push_str(&format!("- {fact}\n"));
+        }
+        if !next_steps.is_empty() {
+            rendered.push_str("\nOutstanding TODOs:\n");
+            for step in next_steps {
+                rendered.push_str(&format!("- {step}\n"));
+            }
+        }
+        rendered
+    }
+
+    /// Try structured compaction, returning the rendered string on success.
+    /// Returns None if the provider doesn't support it or the response is invalid.
+    async fn try_structured_compact(
+        &self,
+        provider: &dyn LlmProvider,
+        older_text: &str,
+    ) -> Option<String> {
+        let structured_prompt = format!(
+            "Summarize the following conversation. \
+             Preserve: file paths modified, key technical decisions, test \
+             outcomes, and any errors not yet resolved. Drop: file contents, \
+             repeated tool errors, exploratory dead-ends.\n\n\
+             Conversation to summarize:\n{older_text}"
+        );
+
+        let structured_req = StructuredRequest {
+            messages: vec![Message::user(structured_prompt)],
+            schema: serde_json::from_str(Self::COMPACT_SCHEMA)
+                .expect("COMPACT_SCHEMA is valid JSON"),
+            schema_name: "compaction_result".to_string(),
+        };
+
+        let json_val = match provider.complete_structured(structured_req).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::info!(error = %e, "structured compaction not available, falling back to free-text");
+                return None;
+            }
+        };
+
+        let obj = match json_val.as_object() {
+            Some(o) => o,
+            None => {
+                tracing::warn!(
+                    "structured compaction returned non-object, falling back to free-text"
+                );
+                return None;
+            }
+        };
+
+        let summary = match obj.get("summary").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                tracing::warn!(
+                    "structured compaction missing 'summary' field, falling back to free-text"
+                );
+                return None;
+            }
+        };
+
+        let kept_facts: Vec<String> = obj
+            .get("kept_facts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let next_steps: Vec<String> = obj
+            .get("next_steps")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(Self::render_structured(&summary, &kept_facts, &next_steps))
+    }
+
     /// Compact the transcript: summarize older messages into a single system
     /// message, keeping the last `keep_recent_n` messages verbatim.
     ///
@@ -85,20 +178,25 @@ impl Compactor {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let summary_prompt = format!(
-            "Summarize the following conversation in ≤300 words. \
-             Preserve: file paths modified, key technical decisions, test \
-             outcomes, and any errors not yet resolved. Drop: file contents, \
-             repeated tool errors, exploratory dead-ends.\n\n\
-             Conversation to summarize:\n{older_text}"
-        );
+        // Try structured output first
+        let summary = match self.try_structured_compact(provider, &older_text).await {
+            Some(rendered) => rendered,
+            None => {
+                // Fall back to free-text path
+                let summary_prompt = format!(
+                    "Summarize the following conversation in ≤300 words. \
+                     Preserve: file paths modified, key technical decisions, test \
+                     outcomes, and any errors not yet resolved. Drop: file contents, \
+                     repeated tool errors, exploratory dead-ends.\n\n\
+                     Conversation to summarize:\n{older_text}"
+                );
+                let completion = provider
+                    .complete(&[Message::user(summary_prompt)], &[] as &[ToolSpec])
+                    .await?;
+                completion.content
+            }
+        };
 
-        let summary_messages = vec![Message::user(summary_prompt)];
-        let completion = provider
-            .complete(&summary_messages, &[] as &[ToolSpec])
-            .await?;
-
-        let summary = completion.content;
         let _older_chars: usize = older.iter().map(|m| m.content.len()).sum();
         let summary_chars = summary.len();
 
@@ -211,5 +309,107 @@ mod tests {
         let c = Compactor::new(500).keep_recent_n(4);
         assert_eq!(c.threshold_chars, 500);
         assert_eq!(c.keep_recent_n, 4);
+    }
+
+    // ========================================================================
+    // Structured compaction tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn compactor_structured_happy_path() {
+        let json = serde_json::json!({
+            "summary": "Added adder tool and verified tests pass.",
+            "kept_facts": [
+                "goal=add_adder_tool",
+                "tool adder created successfully",
+                "tests pass"
+            ],
+            "next_steps": [
+                "Add subtractor tool",
+                "Run integration tests"
+            ]
+        });
+        let provider = MockProvider::new(vec![]).with_structured_responses(vec![Ok(json)]);
+
+        let transcript = vec![
+            Message::system("You are a coding agent.".to_string()),
+            Message::user("Add an adder tool".to_string()),
+            Message::assistant("Let me create the tool.".to_string()),
+            Message::user("Done. Now test it.".to_string()),
+            Message::assistant("Tests pass.".to_string()),
+        ];
+
+        let compactor = Compactor::new(200).keep_recent_n(2);
+        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+
+        assert_eq!(summary_msg.role, crate::message::Role::System);
+        // Should contain the structured rendering format
+        assert!(summary_msg
+            .content
+            .contains("[Context compacted at step N]"));
+        assert!(summary_msg.content.contains("Summary: Added adder tool"));
+        assert!(summary_msg.content.contains("Key facts to remember:"));
+        assert!(summary_msg.content.contains("- goal=add_adder_tool"));
+        assert!(summary_msg
+            .content
+            .contains("- tool adder created successfully"));
+        assert!(summary_msg.content.contains("- tests pass"));
+        assert!(summary_msg.content.contains("Outstanding TODOs:"));
+        assert!(summary_msg.content.contains("- Add subtractor tool"));
+        assert!(summary_msg.content.contains("- Run integration tests"));
+    }
+
+    #[tokio::test]
+    async fn compactor_falls_back_on_structured_error() {
+        // MockProvider with no structured responses configured -> returns error
+        let provider = MockProvider::new(vec![Completion {
+            content: "Free-text fallback summary.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        }]);
+
+        let transcript = vec![
+            Message::user("goal".to_string()),
+            Message::assistant("response".to_string()),
+        ];
+
+        let compactor = Compactor::new(100).keep_recent_n(1);
+        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+
+        assert_eq!(summary_msg.role, crate::message::Role::System);
+        // Should have fallen back to free-text format
+        assert!(summary_msg.content.contains("[compacted:"));
+        assert!(summary_msg.content.contains("Free-text fallback summary."));
+    }
+
+    #[tokio::test]
+    async fn compactor_structured_invalid_response_falls_back() {
+        // Return valid JSON but not matching the schema (missing 'summary')
+        let json = serde_json::json!({
+            "foo": "bar"
+        });
+        let provider = MockProvider::new(vec![Completion {
+            content: "Fallback after invalid structured response.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        }])
+        .with_structured_responses(vec![Ok(json)]);
+
+        let transcript = vec![
+            Message::user("goal".to_string()),
+            Message::assistant("response".to_string()),
+        ];
+
+        let compactor = Compactor::new(100).keep_recent_n(1);
+        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+
+        assert_eq!(summary_msg.role, crate::message::Role::System);
+        // Should have fallen back to free-text format
+        assert!(summary_msg.content.contains("[compacted:"));
+        assert!(summary_msg
+            .content
+            .contains("Fallback after invalid structured response."));
     }
 }
