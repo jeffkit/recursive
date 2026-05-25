@@ -254,19 +254,14 @@ fn build_agent_seeded(
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let provider: Arc<dyn LlmProvider> = Arc::new(
-        OpenAiProvider::new(&config.api_base, api_key, &config.model)
-            .with_temperature(config.temperature)
-            .with_retry_policy(retry)
-            .with_stream_tx(
-                stream
-                    .then(|| {
-                        let (tx, _rx) = mpsc::unbounded_channel();
-                        tx
-                    })
-                    .unwrap(),
-            ),
-    );
+    let mut openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
+        .with_temperature(config.temperature)
+        .with_retry_policy(retry);
+    if stream {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        openai = openai.with_stream_tx(tx);
+    }
+    let provider: Arc<dyn LlmProvider> = Arc::new(openai);
     let tools = build_tools(config);
     let skills = discover_loaded_skills(config);
     let system_prompt = if skills.is_empty() {
@@ -553,5 +548,47 @@ async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
         if let Ok(line) = serde_json::to_string(&ev) {
             println!("{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_config(tmp: &std::path::Path) -> Config {
+        Config {
+            workspace: tmp.to_path_buf(),
+            api_base: "https://example.invalid/v1".into(),
+            api_key: Some("dummy-test-key".into()),
+            model: "test-model".into(),
+            max_steps: 1,
+            temperature: 0.0,
+            system_prompt: "test".into(),
+            retry_max: 0,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 1,
+            shell_timeout_secs: 5,
+        }
+    }
+
+    // Regression for the streaming-SSE merge bug (commit 92d257e) where
+    // the non-streaming code path called `bool::then(...).unwrap()` and
+    // panicked because `then(false)` returns None. This made every
+    // `recursive run` (default: stream=false) panic at startup, which
+    // in turn broke all parallel-self-improve.sh launches in batch 13.
+    #[test]
+    fn build_agent_does_not_panic_without_stream() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = dummy_config(tmp.path());
+        let built = build_agent_seeded(&cfg, None, Vec::new(), /* stream */ false);
+        assert!(built.is_ok(), "construction must not panic or fail");
+    }
+
+    #[test]
+    fn build_agent_does_not_panic_with_stream() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = dummy_config(tmp.path());
+        let built = build_agent_seeded(&cfg, None, Vec::new(), /* stream */ true);
+        assert!(built.is_ok(), "construction must not panic or fail");
     }
 }
