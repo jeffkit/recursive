@@ -34,6 +34,8 @@ pub struct Skill {
     /// Hint string for trigger-mode skills (short description for injection).
     /// Auto-generated from description if absent for trigger mode.
     pub hint: String,
+    /// Skills that should be auto-loaded before this one.
+    pub depends_on: Vec<String>,
     /// Reference documents found in <skill_dir>/refs/
     pub refs: Vec<SkillRef>,
     /// Parameters declared in frontmatter.
@@ -115,7 +117,7 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                 }
 
                 if let Ok(content) = fs::read_to_string(&skill_file) {
-                    let (name, description, mode, triggers, hint, params) =
+                    let (name, description, mode, triggers, hint, depends_on, params) =
                         parse_skill_meta(&content, &dir_path);
                     let refs = discover_refs(&dir_path);
                     let scripts = discover_scripts(&dir_path);
@@ -127,6 +129,7 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                         mode,
                         triggers,
                         hint,
+                        depends_on,
                         refs,
                         params,
                         scripts,
@@ -299,11 +302,21 @@ fn extract_script_description(path: &Path) -> String {
 ///
 /// Returns (name, description, mode, triggers, hint, params). If frontmatter is
 /// absent, falls back to using the parent directory name and first non-empty
-/// line, with default mode (Manual), empty triggers, and empty hint.
-fn parse_skill_meta(
+/// Returns (name, description, mode, triggers, hint, depends_on, params). If frontmatter is
+/// absent, falls back to using the parent directory name and first non-empty
+/// line, with default mode (Manual), empty triggers, empty hint, and empty depends_on.
+pub fn parse_skill_meta(
     content: &str,
     dir_path: &Path,
-) -> (String, String, SkillMode, Vec<String>, String, Vec<SkillParam>) {
+) -> (
+    String,
+    String,
+    SkillMode,
+    Vec<String>,
+    String,
+    Vec<String>,
+    Vec<SkillParam>,
+) {
     // Try to extract YAML frontmatter: --- ... ---
     if let Some(frontmatter) = content.strip_prefix("---") {
         if let Some(end) = frontmatter.find("---") {
@@ -317,6 +330,7 @@ fn parse_skill_meta(
             let mut triggers = Vec::new();
             let mut hint = String::new();
             let mut params = Vec::new();
+            let mut depends_on = Vec::new();
 
             let lines: Vec<&str> = yaml.lines().collect();
             let mut i = 0;
@@ -338,6 +352,13 @@ fn parse_skill_meta(
                 } else if let Some(stripped) = line.strip_prefix("triggers:") {
                     // Parse comma-separated trigger words
                     triggers = stripped
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                } else if let Some(stripped) = line.strip_prefix("depends_on:") {
+                    // Parse comma-separated dependency names
+                    depends_on = stripped
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
@@ -413,7 +434,15 @@ fn parse_skill_meta(
                 hint = format!("{}: {}", final_name, final_description);
             }
 
-            return (final_name, final_description, mode, triggers, hint, params);
+            return (
+                final_name,
+                final_description,
+                mode,
+                triggers,
+                hint,
+                depends_on,
+                params,
+            );
         }
     }
 
@@ -430,7 +459,15 @@ fn parse_skill_meta(
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
 
-    (name, description, SkillMode::Manual, Vec::new(), String::new(), Vec::new())
+    (
+        name,
+        description,
+        SkillMode::Manual,
+        Vec::new(),
+        String::new(),
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 /// Select skills whose mode is `Always`, plus any `Trigger` skills whose
@@ -439,10 +476,7 @@ fn parse_skill_meta(
 /// Returns `Vec<(name, body_or_hint)>` of matching skills.
 /// For `Always` mode, the full body is returned.
 /// For `Trigger` mode, the hint is returned (short description).
-pub fn skills_for_injection(
-    skills: &[Skill],
-    goal: &str,
-) -> Vec<(String, String)> {
+pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String)> {
     let mut result: Vec<(String, String)> = Vec::new();
 
     for skill in skills {
@@ -457,9 +491,10 @@ pub fn skills_for_injection(
             SkillMode::Trigger => {
                 // Check if any trigger matches the goal (case-insensitive)
                 let goal_lower = goal.to_lowercase();
-                let matched = skill.triggers.iter().any(|t| {
-                    goal_lower.contains(&t.to_lowercase())
-                });
+                let matched = skill
+                    .triggers
+                    .iter()
+                    .any(|t| goal_lower.contains(&t.to_lowercase()));
                 if matched {
                     // Inject the hint (short description) instead of full body
                     result.push((skill.name.clone(), skill.hint.clone()));
@@ -535,6 +570,11 @@ pub fn skill_index(skills: &[Skill]) -> String {
             suffix_parts.push(format!("sections: {}", section_names.join(", ")));
         }
 
+        // Depends on
+        if !skill.depends_on.is_empty() {
+            suffix_parts.push(format!("depends_on: {}", skill.depends_on.join(", ")));
+        }
+
         // Scripts
         let script_names: Vec<&str> = skill.scripts.iter().map(|s| s.name.as_str()).collect();
 
@@ -547,11 +587,7 @@ pub fn skill_index(skills: &[Skill]) -> String {
         if suffix_parts.is_empty() {
             lines.push(prefix);
         } else {
-            lines.push(format!(
-                "{} ({})",
-                prefix,
-                suffix_parts.join(", ")
-            ));
+            lines.push(format!("{} ({})", prefix, suffix_parts.join(", ")));
         }
 
         // Append scripts suffix if present (after the main line)
@@ -621,6 +657,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -633,6 +670,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -718,6 +756,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![
                     SkillRef {
                         name: "api-spec".to_string(),
@@ -739,6 +778,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -826,6 +866,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![
                     SkillParam {
@@ -849,6 +890,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -949,6 +991,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![
@@ -972,6 +1015,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -1024,7 +1068,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\nmode: always\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, _depends_on, params) = parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Always);
@@ -1040,7 +1084,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust, trait\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, _depends_on, params) = parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Trigger);
@@ -1057,7 +1101,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust\nhint: Rust-related helper\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, _depends_on, params) = parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Trigger);
@@ -1072,7 +1116,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\n---\n\nBody text";
-        let (_, _, mode, triggers, hint, _) = parse_skill_meta(content, &dir);
+        let (_, _, mode, triggers, hint, _, _) = parse_skill_meta(content, &dir);
         assert_eq!(mode, SkillMode::Manual);
         assert!(triggers.is_empty());
         assert!(hint.is_empty());
@@ -1084,7 +1128,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "Body text";
-        let (_, _, mode, triggers, hint, _) = parse_skill_meta(content, &dir);
+        let (_, _, mode, triggers, hint, _, _) = parse_skill_meta(content, &dir);
         assert_eq!(mode, SkillMode::Manual);
         assert!(triggers.is_empty());
         assert!(hint.is_empty());
@@ -1169,6 +1213,7 @@ mod tests {
                 mode: SkillMode::Always,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -1181,6 +1226,7 @@ mod tests {
                 mode: SkillMode::Trigger,
                 triggers: vec!["rust".to_string()],
                 hint: "trigger-skill: Trigger based".to_string(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -1193,6 +1239,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -1249,6 +1296,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
@@ -1270,6 +1318,7 @@ mod tests {
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
+                depends_on: vec![],
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],

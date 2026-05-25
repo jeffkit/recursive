@@ -564,19 +564,25 @@ async fn build_agent(
         let mut total_chars = 0usize;
         let max_injection_chars = 8192usize;
         for (name, body) in &injected {
-            let snippet = format!("=== Skill: {name} (auto-loaded) ===
+            let snippet = format!(
+                "=== Skill: {name} (auto-loaded) ===
 {body}
 
-");
+"
+            );
             if total_chars + snippet.len() > max_injection_chars {
                 let remaining = max_injection_chars.saturating_sub(total_chars);
                 let truncated = if remaining > 20 {
-                    format!("{}...
+                    format!(
+                        "{}...
 [truncated]
-", &snippet[..remaining.saturating_sub(20)])
+",
+                        &snippet[..remaining.saturating_sub(20)]
+                    )
                 } else {
                     "[truncated]
-".to_string()
+"
+                    .to_string()
                 };
                 injection_block.push_str(&truncated);
                 break;
@@ -584,9 +590,12 @@ async fn build_agent(
             injection_block.push_str(&snippet);
             total_chars += snippet.len();
         }
-        system_prompt = format!("{}
+        system_prompt = format!(
+            "{}
 
-{}", system_prompt, injection_block);
+{}",
+            system_prompt, injection_block
+        );
     }
     // Inject memory summary (top 5 most recent notes) into the system prompt (top 5 most recent notes) into the system prompt
     let memory_block = memory_summary(&config.workspace, 5);
@@ -1048,10 +1057,28 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
 
-        let r1 = build_agent(&cfg, None, Vec::new(), /* stream */ false, None, false, None).await;
+        let r1 = build_agent(
+            &cfg,
+            None,
+            Vec::new(),
+            /* stream */ false,
+            None,
+            false,
+            None,
+        )
+        .await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
 
-        let r2 = build_agent(&cfg, None, Vec::new(), /* stream */ true, None, false, None).await;
+        let r2 = build_agent(
+            &cfg,
+            None,
+            Vec::new(),
+            /* stream */ true,
+            None,
+            false,
+            None,
+        )
+        .await;
         assert!(r2.is_ok(), "openai/stream=true: must not panic or fail");
 
         let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();

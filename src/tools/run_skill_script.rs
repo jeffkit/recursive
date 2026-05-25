@@ -251,6 +251,7 @@ mod tests {
             mode: SkillMode::Manual,
             triggers: vec![],
             hint: String::new(),
+            depends_on: vec![],
             sections: vec![],
         }]
     }
