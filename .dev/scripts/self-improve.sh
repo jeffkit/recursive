@@ -257,9 +257,22 @@ Baseline: ${BASELINE_SHORT}
 Model:    ${RECURSIVE_MODEL}
 Goal:     ${GOAL_SOURCE}
 "
+      # Auto-generate the structured observation for this run, alongside
+      # the journal. Use a separate commit so the metrics file can be
+      # regenerated later (e.g. after observe.sh evolves) without
+      # rewriting the self-improve commit.
+      OBS_FILE="$DEV_DIR/observations/${GOAL_TAG}-${SELECTED_PROVIDER:-unknown}-${TS}.md"
+      mkdir -p "$DEV_DIR/observations"
+      if "$DEV_DIR/scripts/observe.sh" "$LOG" > "$OBS_FILE" 2>/dev/null; then
+        git add "$OBS_FILE"
+        git commit --quiet -m "dev: observation — ${GOAL_TAG} (${SELECTED_PROVIDER:-unknown})"
+      else
+        rm -f "$OBS_FILE"
+      fi
       echo ""
       echo "=== ✓ committed: $(git log --oneline -1) ==="
       echo "=== journaled to ${LOG} ==="
+      [[ -f "$OBS_FILE" ]] && echo "=== observed at ${OBS_FILE} ==="
       exit 0
       ;;
     rolled-back)
