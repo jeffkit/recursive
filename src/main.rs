@@ -15,10 +15,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::Level;
 
+use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
-    tools::{ApplyPatch, ListDir, ReadFile, RunShell, SearchFiles, WriteFile},
+    tools::{ApplyPatch, ListDir, LoadSkill, ReadFile, RunShell, SearchFiles, WriteFile},
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
 
@@ -202,7 +203,7 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
 
 fn build_tools(config: &Config) -> ToolRegistry {
     let root = &config.workspace;
-    ToolRegistry::new()
+    let mut registry = ToolRegistry::new()
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ApplyPatch::new(root)))
@@ -210,7 +211,28 @@ fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
-        .register(Arc::new(SearchFiles::new(root)))
+        .register(Arc::new(SearchFiles::new(root)));
+    let skills = discover_loaded_skills(config);
+    if !skills.is_empty() {
+        registry = registry.register(Arc::new(LoadSkill::new(skills)));
+    }
+    registry
+}
+
+/// Discover skills from configured search paths.
+/// Defaults: <workspace>/.recursive/skills/, ~/.recursive/skills/.
+/// Override with RECURSIVE_SKILL_PATHS=path1:path2 (colon-separated).
+fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
+    let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
+        env_paths.split(':').map(PathBuf::from).collect()
+    } else {
+        let mut defaults = vec![config.workspace.join(".recursive").join("skills")];
+        if let Some(home) = std::env::var_os("HOME") {
+            defaults.push(PathBuf::from(home).join(".recursive").join("skills"));
+        }
+        defaults
+    };
+    discover_skills(&paths)
 }
 
 fn build_agent(
@@ -246,11 +268,17 @@ fn build_agent_seeded(
             ),
     );
     let tools = build_tools(config);
+    let skills = discover_loaded_skills(config);
+    let system_prompt = if skills.is_empty() {
+        config.system_prompt.clone()
+    } else {
+        format!("{}\n{}", config.system_prompt, skill_index(&skills))
+    };
     let (tx, rx) = mpsc::unbounded_channel();
     let mut builder = Agent::builder()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&config.system_prompt)
+        .system_prompt(&system_prompt)
         .max_steps(config.max_steps)
         .events(tx);
     if let Some(n) = max_transcript_chars {

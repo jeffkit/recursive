@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod llm;
 pub mod message;
+pub mod skills;
 pub mod tools;
 pub mod transcript;
 
@@ -25,5 +26,6 @@ pub use error::{Error, Result};
 pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
 pub use message::{Message, Role};
+pub use skills::{discover_skills, skill_index, Skill};
 pub use tools::{Tool, ToolRegistry};
 pub use transcript::{TranscriptFile, TranscriptMeta};
