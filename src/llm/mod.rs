@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::Error;
 use crate::error::Result;
 use crate::message::Message;
 
@@ -113,6 +114,15 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Request for a structured JSON response conforming to a JSON schema.
+pub struct StructuredRequest {
+    pub messages: Vec<Message>,
+    /// JSON Schema describing the expected response shape.
+    pub schema: Value,
+    /// Name for the schema (sent to the provider as `schema_name`).
+    pub schema_name: String,
+}
+
 /// One step of model output.
 #[derive(Debug, Clone)]
 pub struct Completion {
@@ -125,6 +135,15 @@ pub struct Completion {
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion>;
+
+    /// Request a JSON response conforming to a caller-supplied schema.
+    /// Default impl returns an error. Providers that support structured
+    /// output (e.g. OpenAI-compatible) override this.
+    async fn complete_structured(&self, _req: StructuredRequest) -> Result<Value> {
+        Err(Error::Config(
+            "provider does not support structured output".into(),
+        ))
+    }
 
     /// Stream a completion token-by-token.
     ///
@@ -153,6 +172,26 @@ pub trait LlmProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mock_structured_returns_default_error() {
+        // The default impl of complete_structured should return an error,
+        // not panic. MockProvider doesn't override it.
+        let provider = MockProvider::new(vec![]);
+        let req = StructuredRequest {
+            messages: vec![Message::user("hi".to_string())],
+            schema: serde_json::json!({"type": "object", "properties": {"answer": {"type": "string"}}}),
+            schema_name: "test_schema".to_string(),
+        };
+        let result = provider.complete_structured(req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not support structured output"),
+            "error should mention structured output: {msg}"
+        );
+    }
 
     #[test]
     fn token_usage_default_is_all_zeros() {
