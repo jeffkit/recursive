@@ -185,8 +185,11 @@ Goal:     ${GOAL_SOURCE}
 - detail:      ${detail}
 EOF
       mv "$LOG.tmp" "$LOG"
+      # Commit the failed-run journal so the next run starts on a clean tree.
+      git add "$LOG"
+      git commit --quiet -m "dev: journal — rolled-back run ${TS} (${GOAL_TAG}: ${detail})"
       echo ""
-      echo "=== ✗ rolled back to ${BASELINE_SHORT} (${detail}) ==="
+      echo "=== ✗ rolled back to ${BASELINE_SHORT} (${detail}); journal committed ==="
       echo "=== journaled to ${LOG} ==="
       exit 1
       ;;
