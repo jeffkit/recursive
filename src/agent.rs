@@ -100,6 +100,19 @@ impl Agent {
             }
 
             if completion.tool_calls.is_empty() {
+                // Treat a length-limit truncation as a real failure: the model
+                // didn't decide to stop, the server cut it off, so any "result"
+                // here is partial. Surfacing this as an error lets wrappers
+                // (CLI, self-improve scripts, etc.) react instead of silently
+                // believing the run succeeded.
+                if matches!(completion.finish_reason.as_deref(), Some("length")) {
+                    self.emit(StepEvent::Finished {
+                        reason: FinishReason::ProviderStop("length".into()),
+                        steps: step,
+                    });
+                    return Err(Error::ProviderTruncated("length".into()));
+                }
+
                 self.transcript
                     .push(Message::assistant(completion.content.clone()));
                 let finish = match completion.finish_reason {
@@ -451,6 +464,21 @@ mod tests {
             assert_eq!(repeated_call, "UnknownTool");
             assert_eq!(*repeats, 3);
         }
+    }
+
+    #[tokio::test]
+    async fn truncated_response_surfaces_as_error() {
+        // Provider says finish_reason = "length": the response was cut off by
+        // the server, not a deliberate stop. The agent must treat this as
+        // failure rather than pretend the assistant ended its turn.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "I was going to say more but ran out of".into(),
+            tool_calls: vec![],
+            finish_reason: Some("length".into()),
+        }]));
+        let mut agent = Agent::builder().llm(llm).build().unwrap();
+        let err = agent.run("hi").await.unwrap_err();
+        assert!(matches!(err, Error::ProviderTruncated(ref s) if s == "length"));
     }
 
     #[tokio::test]

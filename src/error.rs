@@ -25,6 +25,9 @@ pub enum Error {
     #[error("agent exceeded step budget ({0})")]
     StepBudgetExceeded(usize),
 
+    #[error("llm response truncated by provider (finish_reason = {0:?})")]
+    ProviderTruncated(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
