@@ -23,6 +23,7 @@ pub mod shell;
 pub mod sub_agent;
 pub mod transport;
 pub mod web_fetch;
+pub mod web_search;
 
 pub use apply_patch::ApplyPatch;
 pub use estimate_tokens::EstimateTokens;
@@ -35,6 +36,7 @@ pub use shell::RunShell;
 pub use sub_agent::SubAgent;
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 pub use web_fetch::WebFetch;
+pub use web_search::WebSearch;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
