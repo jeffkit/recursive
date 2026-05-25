@@ -24,7 +24,7 @@ use recursive::{
     tools::memory::memory_summary,
     tools::{
         ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, ReadFile, Recall, Remember,
-        RunShell, SearchFiles, WebFetch, WriteFile,
+        RunShell, SearchFiles, SubAgent, WebFetch, WriteFile,
     },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
@@ -331,6 +331,24 @@ async fn build_agent(
     let provider: Arc<dyn LlmProvider> = Arc::new(openai);
     let mut tools = build_tools(config).await;
     register_mcp_tools(&mut tools, mcp_config).await;
+
+    // Conditionally register sub-agent tool (opt-in via env var)
+    let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1");
+    if sub_agent_enabled {
+        let max_depth: usize = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        let sub = SubAgent::new(
+            &config.workspace,
+            provider.clone(),
+            tools.clone(),
+            max_depth,
+            0,
+        );
+        tools = tools.register(Arc::new(sub));
+    }
+
     let skills = discover_loaded_skills(config);
 
     // Load project context from AGENTS.md if present
@@ -360,6 +378,17 @@ async fn build_agent(
     } else {
         format!("{}\n\n{}", system_prompt, memory_block)
     };
+
+    // When sub-agent is enabled, append a hint about its usage
+    let system_prompt = if sub_agent_enabled {
+        format!(
+            "{}\n\nWhen you need to do focused research or scan files without polluting your main context, use the `sub_agent` tool. It spawns a fresh agent with its own transcript and a restricted tool set (read-only by default).",
+            system_prompt
+        )
+    } else {
+        system_prompt
+    };
+
     let (tx, rx) = mpsc::unbounded_channel();
     let mut builder = Agent::builder()
         .llm(provider)
