@@ -185,6 +185,9 @@ fi
 # separate worktrees can't collide on the same TS in the same second.
 TS="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG="$DEV_DIR/journal/run-${TS}.md"
+TRANSCRIPT_DIR="$DEV_DIR/transcripts"
+TRANSCRIPT_OUT="$TRANSCRIPT_DIR/run-${TS}.json"
+mkdir -p "$TRANSCRIPT_DIR"
 
 {
   echo "# Run ${TS}"
@@ -211,6 +214,7 @@ LOG="$DEV_DIR/journal/run-${TS}.md"
 set +e
 "$BIN" --workspace . \
   --system-prompt-file "$SYSPROMPT_FILE" \
+  --transcript-out "$TRANSCRIPT_OUT" \
   --log warn \
   run "$GOAL_BODY" 2>&1 | tee -a "$LOG"
 AGENT_STATUS=${PIPESTATUS[0]}

@@ -7,9 +7,28 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T07:56Z.** Empty between batches 5 and 6.
+> **As of 2026-05-25T08:05Z.** Empty between batches 6 and 7.
 
 ## Last batch landed
+
+> **Goals 16 + 17 (rolled-back, transient)**, sixth concurrent batch.
+> - goal-16 kill-count-lines (minimax): merged. Surgical removal of
+>   the obsolete `count_lines` tool. **Minimax missed one stale
+>   reference in `src/config.rs::default_system_prompt`** because the
+>   self-improve flow overrides that prompt via `--system-prompt-file`,
+>   so the goal-12 nudge "prefer apply_patch" reaches the agent via
+>   AGENTS.md, not via the in-binary default. Orchestrator hand-fixed
+>   the stale `count_lines` reference post-merge. 109 tests green.
+> - goal-17 replay-from-step (deepseek): **rolled back at step 3**
+>   due to upstream DeepSeek HTTP 503 (transient infra). Not an
+>   agent-side problem; queued for retry in batch 7.
+> - **New diagnostic discovery**: `self-improve.sh` was not using
+>   any of the CLI flags the agent itself added (`--json`,
+>   `--transcript-out`, `--max-transcript-chars`,
+>   `RECURSIVE_RETRY_MAX`). Orchestrator hand-patched the script to
+>   pass `--transcript-out .dev/transcripts/run-${TS}.json` so future
+>   rollback diagnostics can `recursive replay` the saved transcript
+>   instead of grep'ing the raw log.
 
 > **Goals 14 (manual) + 15**, fifth concurrent batch.
 > - goal-15 retry-policy-config (minimax): merged. 29 steps, $0.1590,
@@ -87,6 +106,8 @@ files yet; pick one, write the goal file, launch:
 - ~~**search_files regex support**~~ — done (goal 13).
 - ~~**JSON event output via `--json`**~~ — done (goal 14, manual).
 - ~~**error-retry policy configurable**~~ — done (goal 15).
+- ~~**kill `CountLines` tool**~~ — done (goal 16).
+- ~~**self-improve.sh uses --transcript-out**~~ — done (orchestrator hand-patch, no goal).
 
 ## Open follow-ups (human-facing)
 
