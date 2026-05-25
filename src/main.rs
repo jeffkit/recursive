@@ -21,8 +21,10 @@ use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
     tools::memory::memory_summary,
-    tools::{ApplyPatch, ListDir, LoadSkill, ReadFile, RunShell, SearchFiles, WriteFile},
-    tools::{Forget, Recall, Remember},
+    tools::{
+        ApplyPatch, Forget, ListDir, LoadSkill, ReadFile, Recall, Remember, RunShell, SearchFiles,
+        WebFetch, WriteFile,
+    },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
 
@@ -214,7 +216,8 @@ fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
-        .register(Arc::new(SearchFiles::new(root)));
+        .register(Arc::new(SearchFiles::new(root)))
+        .register(Arc::new(WebFetch::new()));
     registry = registry
         .register(Arc::new(Remember::new(root)))
         .register(Arc::new(Recall::new(root)))
