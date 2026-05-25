@@ -115,6 +115,18 @@ tests/
   for product changes.
 - Do not run `git push`, `cargo install`, or anything outside the workspace.
 - Do not touch `target/` or `.git/` directly.
+- **Do not modify source files via shell tricks.** Specifically, never use
+  `head` / `tail` / `cat heredoc` / `sed -i` / `mv` to rewrite or splice a
+  file under `src/` or `tests/`. They look surgical but routinely truncate
+  files mid-block, leaving unclosed `{` or unterminated strings. Always use
+  `apply_patch` (preferred) or `write_file` (whole file, contents provided
+  in one call). Both are atomic; shell pipelines are not.
+- **Never run `git` against the working tree.** No `git checkout`, no
+  `git reset`, no `git restore`, no `git stash`. The wrapper script owns
+  rollback; if you try to "undo" yourself you will silently destroy your
+  own in-progress work and lose the run. If you painted yourself into a
+  corner, write a final message describing the situation and stop — the
+  supervisor will roll you back cleanly.
 
 ## Where things live
 

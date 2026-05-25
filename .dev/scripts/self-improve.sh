@@ -19,8 +19,16 @@
 #   RECURSIVE_API_KEY (required; falls back to GLM_API_KEY / MINIMAX_API_KEY)
 #   RECURSIVE_API_BASE (default: MiniMax)
 #   RECURSIVE_MODEL    (default: MiniMax-M2)
-#   RECURSIVE_MAX_STEPS (default: 30)
+#   RECURSIVE_MAX_STEPS (default: 50)
 #   RECURSIVE_NO_COMMIT (set to 1 to skip the auto-commit step)
+#
+#   RECURSIVE_PROVIDER       — force a named profile for this run: minimax | deepseek
+#   RECURSIVE_PROVIDERS=a,b  — auto-rotate across a comma-separated list, persisting
+#                              the last one used to .dev/.last-provider. Each
+#                              invocation picks the next profile in the cycle.
+#
+# Profiles map a short name to (API_BASE, MODEL, API_KEY env). Add new ones in
+# the `apply_provider_profile` function below.
 
 set -euo pipefail
 
@@ -85,16 +93,85 @@ trap 'rm -f "$SYSPROMPT_FILE"' EXIT
   fi
 } > "$SYSPROMPT_FILE"
 
-# ---- Env defaults -----------------------------------------------------------
+# ---- Provider profiles + rotation ------------------------------------------
 
-export RECURSIVE_API_BASE="${RECURSIVE_API_BASE:-https://api.minimaxi.com/v1}"
-export RECURSIVE_MODEL="${RECURSIVE_MODEL:-MiniMax-M2}"
-export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-50}"
-export RECURSIVE_API_KEY="${RECURSIVE_API_KEY:-${MINIMAX_API_KEY:-${GLM_API_KEY:-}}}"
-if [[ -z "${RECURSIVE_API_KEY}" ]]; then
-  echo "error: set RECURSIVE_API_KEY (or MINIMAX_API_KEY / GLM_API_KEY)" >&2
-  exit 2
+# Apply a named provider profile by exporting RECURSIVE_API_BASE / _MODEL /
+# _API_KEY. Returns non-zero (but doesn't `exit`) if the named API-key env is
+# unset, letting the caller try a fallback.
+apply_provider_profile() {
+  case "$1" in
+    minimax)
+      export RECURSIVE_API_BASE="https://api.minimaxi.com/v1"
+      export RECURSIVE_MODEL="MiniMax-M2"
+      export RECURSIVE_API_KEY="${MINIMAX_API_KEY:-}"
+      ;;
+    deepseek)
+      export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
+      export RECURSIVE_MODEL="deepseek-chat"
+      export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
+      ;;
+    glm)
+      export RECURSIVE_API_BASE="https://open.bigmodel.cn/api/paas/v4"
+      export RECURSIVE_MODEL="glm-4-flash"
+      export RECURSIVE_API_KEY="${GLM_API_KEY:-}"
+      ;;
+    *)
+      echo "error: unknown provider profile '$1' (known: minimax | deepseek | glm)" >&2
+      return 2
+      ;;
+  esac
+  [[ -n "${RECURSIVE_API_KEY:-}" ]]
+}
+
+PROVIDER_STATE_FILE="$DEV_DIR/.last-provider"
+
+# Pick which provider profile to use for this run, in priority order:
+#   1. If RECURSIVE_API_KEY is already set (legacy/manual override), do nothing.
+#   2. If RECURSIVE_PROVIDER is set, apply that single profile.
+#   3. If RECURSIVE_PROVIDERS is set, rotate to the next in the cycle.
+#   4. Else default to 'minimax' (back-compat).
+SELECTED_PROVIDER=""
+
+if [[ -n "${RECURSIVE_API_KEY:-}" ]]; then
+  # Manual override: caller set everything explicitly.
+  SELECTED_PROVIDER="manual"
+elif [[ -n "${RECURSIVE_PROVIDER:-}" ]]; then
+  if apply_provider_profile "$RECURSIVE_PROVIDER"; then
+    SELECTED_PROVIDER="$RECURSIVE_PROVIDER"
+  else
+    echo "error: provider '$RECURSIVE_PROVIDER' selected but its API key env is unset" >&2
+    exit 2
+  fi
+elif [[ -n "${RECURSIVE_PROVIDERS:-}" ]]; then
+  IFS=',' read -r -a CYCLE <<< "$RECURSIVE_PROVIDERS"
+  LAST=""
+  [[ -f "$PROVIDER_STATE_FILE" ]] && LAST="$(cat "$PROVIDER_STATE_FILE")"
+  # Find LAST's index; pick (LAST+1) mod N. If LAST not in cycle, start at 0.
+  NEXT_IDX=0
+  for i in "${!CYCLE[@]}"; do
+    if [[ "${CYCLE[$i]}" == "$LAST" ]]; then
+      NEXT_IDX=$(( (i + 1) % ${#CYCLE[@]} ))
+      break
+    fi
+  done
+  SELECTED_PROVIDER="${CYCLE[$NEXT_IDX]}"
+  if ! apply_provider_profile "$SELECTED_PROVIDER"; then
+    echo "error: rotation picked '$SELECTED_PROVIDER' but its API key env is unset" >&2
+    exit 2
+  fi
+  echo "$SELECTED_PROVIDER" > "$PROVIDER_STATE_FILE"
+else
+  if apply_provider_profile "minimax"; then
+    SELECTED_PROVIDER="minimax"
+  else
+    echo "error: default provider 'minimax' selected but MINIMAX_API_KEY is unset" >&2
+    exit 2
+  fi
 fi
+
+echo "[self-improve] provider=$SELECTED_PROVIDER  model=${RECURSIVE_MODEL}" >&2
+
+export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-50}"
 
 # Use release build if available, else dev.
 if [[ -x ./target/release/recursive ]]; then
@@ -112,6 +189,7 @@ LOG="$DEV_DIR/journal/run-${TS}.md"
   echo ""
   echo "- goal source: ${GOAL_SOURCE}"
   echo "- goal tag:    ${GOAL_TAG}"
+  echo "- provider:    ${SELECTED_PROVIDER}"
   echo "- model:       ${RECURSIVE_MODEL}"
   echo "- baseline:    ${BASELINE_SHORT}"
   echo ""

@@ -4,3 +4,6 @@ Cargo.lock.bak
 .recursive/
 .env
 .envrc.local
+
+# self-improve.sh runtime state (rotation cursor)
+.dev/.last-provider
