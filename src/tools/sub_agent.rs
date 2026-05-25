@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::agent::{Agent, FinishReason};
+use crate::agent::{Agent, FinishReason, PermissionHook};
 use crate::error::{Error, Result};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::tools::Tool;
@@ -27,12 +27,14 @@ use crate::tools::ToolRegistry;
 /// - `all_tools`: the full tool registry from which the sub-agent can draw
 /// - `max_depth`: absolute depth limit (env-configured)
 /// - `current_depth`: how deep we already are (passed from parent)
+/// - `permission_hook`: optional permission hook inherited from the parent agent
 pub struct SubAgent {
     workspace: std::path::PathBuf,
     provider: Arc<dyn LlmProvider>,
     all_tools: ToolRegistry,
     max_depth: usize,
     current_depth: usize,
+    permission_hook: Option<PermissionHook>,
 }
 
 impl SubAgent {
@@ -42,6 +44,7 @@ impl SubAgent {
         all_tools: ToolRegistry,
         max_depth: usize,
         current_depth: usize,
+        permission_hook: Option<PermissionHook>,
     ) -> Self {
         Self {
             workspace: workspace.into(),
@@ -49,6 +52,7 @@ impl SubAgent {
             all_tools,
             max_depth,
             current_depth,
+            permission_hook,
         }
     }
 
@@ -141,20 +145,24 @@ impl Tool for SubAgent {
             self.all_tools.clone(),
             self.max_depth,
             self.current_depth + 1,
+            self.permission_hook.clone(),
         );
         sub_registry = sub_registry.register(Arc::new(child_sub));
 
         // Build and run the sub-agent
-        let mut agent = Agent::builder()
+        let builder = Agent::builder()
             .llm(self.provider.clone())
             .tools(sub_registry)
             .system_prompt("You are a focused sub-agent. Complete the given task using the available tools. Be concise.")
-            .max_steps(max_steps)
-            .build()
-            .map_err(|e| Error::Tool {
-                name: "sub_agent".into(),
-                message: format!("failed to build sub-agent: {e}"),
-            })?;
+            .max_steps(max_steps);
+
+        // Inherit the parent's permission hook, if any
+        let builder = builder.permission_hook_opt(self.permission_hook.clone());
+
+        let mut agent = builder.build().map_err(|e| Error::Tool {
+            name: "sub_agent".into(),
+            message: format!("failed to build sub-agent: {e}"),
+        })?;
 
         let outcome = agent.run(prompt).await.map_err(|e| Error::Tool {
             name: "sub_agent".into(),
@@ -213,7 +221,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let all_tools = full_tool_registry(tmp.path());
 
-        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
         let result = sub
             .execute(json!({"prompt": "What is the meaning of life?"}))
@@ -232,7 +240,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let all_tools = full_tool_registry(tmp.path());
 
-        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 2);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 2, None);
 
         let result = sub
             .execute(json!({"prompt": "do something"}))
@@ -256,7 +264,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let all_tools = full_tool_registry(tmp.path());
 
-        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
         // Execute with only read_file allowed
         let _ = sub
@@ -298,7 +306,7 @@ mod tests {
         let provider = mock_provider(script);
         let all_tools = full_tool_registry(tmp.path());
 
-        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
         let result = sub
             .execute(json!({"prompt": "loop", "max_steps": 5}))
@@ -324,7 +332,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let all_tools = full_tool_registry(tmp.path());
 
-        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
         let result = sub.execute(json!({})).await;
         assert!(result.is_err());
@@ -389,7 +397,7 @@ mod tests {
         let all_tools = full_tool_registry(tmp.path());
 
         // Parent at depth=0, max_depth=2
-        let parent = SubAgent::new(tmp.path(), provider, all_tools, 2, 0);
+        let parent = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
         let result = parent
             .execute(json!({"prompt": "parent task", "tools": ["sub_agent", "read_file"]}))
