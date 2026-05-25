@@ -73,6 +73,14 @@ tests/
        patch. To make multiple edits to the same file, put multiple hunks
        (each optionally preceded by its own `@@ anchor`) inside one
        `*** Update File:` block.
+     - **Common Rust trap in tests:** when a constructor signature is
+       `fn user(s: impl Into<String>)`, writing `Message::user("foo".into())`
+       in a test gives the compiler no way to choose the `.into()` target
+       and you get a *type-annotation needed* error. Use
+       `Message::user("foo".to_string())` instead. The agent that wrote
+       goal-17 burned its anti-stuck budget on exactly this — three
+       identical patch retries because the unique-context rule of V4A
+       can't disambiguate three near-identical lines.
      - Worked example, editing `src/llm/mod.rs` to add a struct after the
        `pub use openai::OpenAiProvider;` line:
        ```
