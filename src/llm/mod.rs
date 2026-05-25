@@ -70,6 +70,13 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
             input_per_million: 0.10,
             output_per_million: 0.10,
         }),
+        // GLM-5.1 pricing is currently a placeholder pending official
+        // confirmation; the per-run `cost: $X` line will be approximate
+        // until calibrated against the Zhipu billing dashboard.
+        "glm-5.1" => Some(ModelPricing {
+            input_per_million: 0.50,
+            output_per_million: 2.00,
+        }),
         _ => None,
     }
 }

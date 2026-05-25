@@ -112,7 +112,7 @@ apply_provider_profile() {
       ;;
     glm)
       export RECURSIVE_API_BASE="https://open.bigmodel.cn/api/paas/v4"
-      export RECURSIVE_MODEL="glm-4-flash"
+      export RECURSIVE_MODEL="glm-5.1"
       export RECURSIVE_API_KEY="${GLM_API_KEY:-}"
       ;;
     *)

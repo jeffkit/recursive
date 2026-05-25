@@ -55,7 +55,7 @@ Profiles are configured inside `self-improve.sh`. Pick one with
 | -------- | ------------- | ---------------- | --------------------------- |
 | minimax  | MiniMax-M2    | `MINIMAX_API_KEY` | default. Prone to `write_file` on small files. |
 | deepseek | deepseek-chat | `DEEPSEEK_API_KEY` | Cheaper-looking per-token, but often higher prompt-volume per run. Strong patch discipline. |
-| glm      | glm-4-flash   | `GLM_API_KEY`    | Tried briefly, weak at tool-use. Not currently used. |
+| glm      | glm-5.1       | `GLM_API_KEY`    | First serious GLM run on 5.1 from batch 9. glm-4-flash earlier was unable to drive a tool loop (one read_file then "stop" as final answer). Pricing placeholder until calibrated against Zhipu billing. |
 
 Both `MINIMAX_API_KEY` and `DEEPSEEK_API_KEY` are expected to be
 present in the parent shell. The wrapper script will fail loud if
