@@ -33,7 +33,16 @@ VERDICT="$(rg -m1 '^- verdict:\s+(.+)$' -r '$1' "$JOURNAL" || echo "?")"
 STEPS="$(rg -o '^\[step (\d+)\]' -r '$1' "$JOURNAL" | sort -un | wc -l | tr -d ' ')"
 
 # ---- Termination reason ----
-REASON="$(rg -m1 '^\[done after \d+ steps\] reason: (.+)$' -r '$1' "$JOURNAL" || echo "(unknown)")"
+# Take the LAST `[done after N steps] reason: X` line. On auto-resumed
+# runs the first attempt's BudgetExceeded sits earlier in the journal;
+# the truth of record is whatever happened at the very end. See
+# self-improve.sh's auto-resume block.
+REASON="$(rg '^\[done after \d+ steps\] reason: (.+)$' -r '$1' "$JOURNAL" | tail -n1)"
+[[ -z "$REASON" ]] && REASON="(unknown)"
+
+# ---- Resume detection ----
+RESUMED="no"
+rg -q '^--- AUTO-RESUME: ' "$JOURNAL" && RESUMED="yes"
 
 # ---- Tool-call distribution ----
 TOOL_COUNTS="$(rg -o '^\[step \d+\] -> (\w+)' -r '$1' "$JOURNAL" | sort | uniq -c | sort -rn | awk '{print "  - "$2": "$1}')"
@@ -47,14 +56,16 @@ ERRORS="$(rg -c '^ERROR: ' "$JOURNAL" || echo 0)"
 # *not* code-shaped occurrences in transcribed source. Without anchoring,
 # anything writing `BudgetExceeded` or `ProviderTruncated` as a Rust
 # identifier inside a write_file/apply_patch body would trip these.
+# Use the LAST reason (REASON above) — auto-resumed runs may have a
+# transient BudgetExceeded that was recovered by the replay.
 HIT_STUCK="no"
-rg -q '^\[done after \d+ steps\] reason: Stuck' "$JOURNAL" && HIT_STUCK="yes"
+[[ "$REASON" == "Stuck" ]] && HIT_STUCK="yes"
 
 HIT_BUDGET="no"
-rg -q '^\[done after \d+ steps\] reason: BudgetExceeded' "$JOURNAL" && HIT_BUDGET="yes"
+[[ "$REASON" == "BudgetExceeded" ]] && HIT_BUDGET="yes"
 
 HIT_TRUNCATED="no"
-rg -q '^\[done after \d+ steps\] reason: ProviderStop\("length"\)' "$JOURNAL" && HIT_TRUNCATED="yes"
+[[ "$REASON" == 'ProviderStop("length")' ]] && HIT_TRUNCATED="yes"
 
 # ---- apply_patch vs write_file ratio (patch discipline) ----
 N_APPLY="$(rg -c '^\[step \d+\] -> apply_patch' "$JOURNAL" || echo 0)"
@@ -77,6 +88,7 @@ cat <<EOF
 | ERROR results from tools | ${ERRORS} |
 | hit anti-stuck | ${HIT_STUCK} |
 | hit step budget | ${HIT_BUDGET} |
+| auto-resumed | ${RESUMED} |
 | hit length truncation | ${HIT_TRUNCATED} |
 | apply_patch invocations | ${N_APPLY} |
 | write_file invocations | ${N_WRITE} |

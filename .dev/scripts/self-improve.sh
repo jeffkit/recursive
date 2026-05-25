@@ -19,8 +19,14 @@
 #   RECURSIVE_API_KEY (required; falls back to GLM_API_KEY / MINIMAX_API_KEY)
 #   RECURSIVE_API_BASE (default: MiniMax)
 #   RECURSIVE_MODEL    (default: MiniMax-M2)
-#   RECURSIVE_MAX_STEPS (default: 50)
+#   RECURSIVE_MAX_STEPS (default: 100)
 #   RECURSIVE_NO_COMMIT (set to 1 to skip the auto-commit step)
+#   RECURSIVE_AUTO_RESUME (default: 1; set to 0 to disable). When the
+#                         first agent attempt exits with BudgetExceeded,
+#                         the wrapper auto-replays from the saved
+#                         transcript with the same goal exactly once.
+#                         Effective budget = MAX_STEPS × 2 on hard
+#                         goals; simple goals pay no extra cost.
 #
 #   RECURSIVE_PROVIDER       — force a named profile for this run: minimax | deepseek
 #   RECURSIVE_PROVIDERS=a,b  — auto-rotate across a comma-separated list, persisting
@@ -171,7 +177,8 @@ fi
 
 echo "[self-improve] provider=$SELECTED_PROVIDER  model=${RECURSIVE_MODEL}" >&2
 
-export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-50}"
+export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-100}"
+RECURSIVE_AUTO_RESUME="${RECURSIVE_AUTO_RESUME:-1}"
 
 # Use release build if available, else dev.
 if [[ -x ./target/release/recursive ]]; then
@@ -219,6 +226,37 @@ set +e
   run "$GOAL_BODY" 2>&1 | tee -a "$LOG"
 AGENT_STATUS=${PIPESTATUS[0]}
 set -e
+
+# ---- Auto-resume on BudgetExceeded -----------------------------------------
+# If the first attempt hit the step ceiling, re-seed a fresh run with the
+# saved transcript and let it continue from where it left off. One resume
+# only — repeated resumes hit diminishing returns and stack cost.
+if [[ "$AGENT_STATUS" -ne 0 ]] \
+   && [[ "$RECURSIVE_AUTO_RESUME" == "1" ]] \
+   && [[ -f "$TRANSCRIPT_OUT" ]] \
+   && rg -q 'reason: BudgetExceeded' "$LOG" 2>/dev/null \
+   && command -v jq >/dev/null 2>&1; then
+  RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
+  if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
+    RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-resumed.json"
+    {
+      echo ""
+      echo "--- AUTO-RESUME: budget exceeded after ${RESUME_FROM} messages;"
+      echo "    replaying with --resume-from ${RESUME_FROM} (one chance) ---"
+      echo ""
+    } | tee -a "$LOG"
+
+    set +e
+    "$BIN" --workspace . \
+      --system-prompt-file "$SYSPROMPT_FILE" \
+      --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+      --log warn \
+      replay "$TRANSCRIPT_OUT" \
+      --resume-from "$RESUME_FROM" "$GOAL_BODY" 2>&1 | tee -a "$LOG"
+    AGENT_STATUS=${PIPESTATUS[0]}
+    set -e
+  fi
+fi
 
 {
   echo '```'

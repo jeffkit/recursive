@@ -240,9 +240,28 @@ of:
 - You'd otherwise need to invent a new product direction (streaming,
   switching language, dropping a feature, open-sourcing decisions).
 - Spend on a single batch exceeds ~$1.50 (sanity check; not a hard
-  budget). Cost is in the per-run observation footer.
+  budget). Cost is in the per-run observation footer. Note: with
+  auto-resume enabled (see below), a single goal can pay up to 2×
+  the per-attempt cost when it BudgetExceeds and replays.
 - A goal would require touching `src/agent.rs`'s main loop in a
   non-trivial way.
+
+### Auto-resume on BudgetExceeded
+
+`self-improve.sh` will, by default, transparently re-attempt a goal
+once when the first run exits with `reason: BudgetExceeded`. The
+resumed run is seeded with the full saved transcript via
+`recursive replay --resume-from N <goal>` (goal-17 plumbing).
+
+- Default `RECURSIVE_MAX_STEPS=100` (was 50 before goal-30 batch).
+- Effective ceiling on a hard goal = 200 steps across two attempts.
+- Resume is **once only**. If both attempts BudgetExceed, the run
+  rolls back exactly as before.
+- `observe.sh` reports `auto-resumed: yes/no` in the metrics table
+  and uses the *last* termination reason as truth (so a recovered
+  run shows `NoMoreToolCalls`, not the transient BudgetExceeded).
+- Disable per-run with `RECURSIVE_AUTO_RESUME=0` if you want to
+  characterize raw single-shot performance of a provider/goal pair.
 - 10 successful merges have accumulated since the last human-facing
   summary. Send a short status note.
 
