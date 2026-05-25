@@ -17,6 +17,8 @@ files in this folder; this index is the side-by-side comparison.
 | 10 shell-cwd | minimax | MiniMax-M2 | 15 | 14 | 0 | 0:2 | $0.1187 | NoMoreToolCalls |
 | 11 search-files-tool | deepseek | deepseek-chat | 29 | 31 | 2 | 13:1 | $0.2425 | NoMoreToolCalls |
 | 12 default-system-prompt | minimax | MiniMax-M2 | 15 | 14 | 2 | 2:1 | $0.0804 | NoMoreToolCalls |
+| 13 search-regex | deepseek | deepseek-chat | 12 | 12 | 1 | 6:1 | $0.0681 | NoMoreToolCalls |
+| 14 json-events (1st) | minimax | MiniMax-M2 | 50 | ~50 | ? | (varied) | (rolled back) | BudgetExceeded |
 
 ## Key insight: prompt-token amplification
 
@@ -157,6 +159,27 @@ Worth re-running the same goal on both providers later to control for it.
   says "prefer apply_patch over write_file when modifying existing
   files". The next MiniMax small-file run will tell us if the nudge
   works.
+
+### Fourth concurrent batch (13 + 14 — first rollback)
+
+- **goal-13 search-regex (deepseek)**: 12 steps, 1 error, **\$0.0681
+  — new cheapest record**. Built incrementally on its own
+  goal-11 work (DeepSeek doing follow-up extensions to its own
+  prior contribution is the most efficient pattern observed).
+- **goal-14 json-events (minimax)**: **rolled back** at step 50
+  (BudgetExceeded). MiniMax kept making *correct* surgical edits but
+  the goal touched too many places in `main.rs` (run_once signature,
+  repl signature, dispatcher, output suppression in two places).
+  Each edit's tool result extended the transcript; the next LLM call
+  re-sent everything; the budget ran out before the final
+  `cargo test`. Failure mode is "death by surface area", not "agent
+  confusion".
+- Lesson encoded: when a goal's "Scope" lists 4+ edits in one file,
+  prefer DeepSeek (better step economy) over MiniMax. Or split into
+  two smaller goals.
+- Recovery: goal-14 is being rerun on DeepSeek in batch 5. The
+  rolled-back journal commit is cherry-picked to main for the
+  diagnostic record.
 
 ## Caveats
 
