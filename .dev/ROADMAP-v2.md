@@ -71,8 +71,8 @@ Make the agent handle harder tasks.
 |----|---------|--------|--------|
 | 8.1 | Parallel tool execution | M | ✅ g74 |
 | 8.2 | Tool Transport: SSH adapter | M | ✅ g76 |
-| 8.3 | Background task execution (fire-and-forget + poll) | M | 🔴 |
-| 8.4 | Multi-turn Planning (plan → confirm → execute) | L | 🔴 |
+| 8.3 | Background task execution (fire-and-forget + poll) | M | ✅ g77 |
+| 8.4 | Multi-turn Planning (plan → confirm → execute) | L | ⏸️ deferred (budget exceeded) |
 
 **Total**: ~2 batches
 
@@ -98,11 +98,11 @@ Batch 21 (done): Phase 5 finish + Phase 6.1 MCP HTTP+SSE
 Batch 22 (done): Phase 6.2 integration test, 6.4 resources/prompts (6.3 server mode deferred)
 Batch 23 (done): Phase 7 partial — g69 API audit, g70 feature flags, g71 errors, g72 examples
 Batch 24 (done): Phase 7 finish + Phase 8 start — g73 docs, g74 parallel, g75 CI, g76 SSH
-Batch 25 (next): Phase 8 finish — g77 background tasks, g78 multi-turn planning
+Batch 25 (done): Phase 8 — g77 background tasks ✅, g78 planning deferred
 Batch 26+: Phase 9 (Ecosystem) — as needed
 ```
 
-**Estimated total: 1-2 more batches to v0.2 release.**
+**v0.2 RELEASE READY.** Deferred items (6.3, 8.4) are stretch goals for v0.3.
 
 ---
 
