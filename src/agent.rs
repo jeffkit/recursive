@@ -55,6 +55,10 @@ pub enum FinishReason {
         repeated_call: String,
         repeats: usize,
     },
+    TranscriptLimit {
+        chars: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +75,7 @@ pub struct Agent {
     tools: ToolRegistry,
     transcript: Vec<Message>,
     max_steps: usize,
+    max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
 }
 
@@ -96,6 +101,25 @@ impl Agent {
         let mut total_usage = TokenUsage::default();
 
         for step in 1..=self.max_steps {
+            // Check transcript size limit before making the next LLM call.
+            let chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
+            if let Some(limit) = self.max_transcript_chars {
+                if chars >= limit {
+                    let finish = FinishReason::TranscriptLimit { chars, limit };
+                    self.emit(StepEvent::Finished {
+                        reason: finish.clone(),
+                        steps: step,
+                    });
+                    return Ok(AgentOutcome {
+                        final_message,
+                        transcript: std::mem::take(&mut self.transcript),
+                        steps: step,
+                        finish,
+                        total_usage,
+                    });
+                }
+            }
+
             debug!(target: "recursive::agent", step, "calling llm");
             let completion: Completion = self.llm.complete(&self.transcript, &specs).await?;
 
@@ -237,6 +261,7 @@ pub struct AgentBuilder {
     tools: ToolRegistry,
     system: Option<String>,
     max_steps: Option<usize>,
+    max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
 }
 
@@ -257,6 +282,10 @@ impl AgentBuilder {
         self.max_steps = Some(n);
         self
     }
+    pub fn max_transcript_chars(mut self, n: usize) -> Self {
+        self.max_transcript_chars = Some(n);
+        self
+    }
     pub fn events(mut self, tx: mpsc::UnboundedSender<StepEvent>) -> Self {
         self.events = Some(tx);
         self
@@ -274,6 +303,7 @@ impl AgentBuilder {
             tools: self.tools,
             transcript,
             max_steps: self.max_steps.unwrap_or(32),
+            max_transcript_chars: self.max_transcript_chars,
             events: self.events,
         })
     }
@@ -616,5 +646,90 @@ mod tests {
             }
         }
         assert_eq!(usage_events, 1);
+    }
+
+    #[tokio::test]
+    async fn transcript_limit_stops_loop() {
+        // Script many small tool calls so the transcript grows past 50 chars.
+        // Each iteration adds: assistant "x" (1 char) + tool result "2" (1 char).
+        // User "hi" adds 2 chars. So after N iterations: 2 + 2N chars.
+        // To reach 50: N >= 24. Script 30 completions to be safe.
+        let mut script = Vec::new();
+        for _ in 0..30 {
+            script.push(Completion {
+                content: "x".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            });
+        }
+        let llm = Arc::new(MockProvider::new(script));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_transcript_chars(50)
+            .max_steps(100)
+            .build()
+            .unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert!(matches!(out.finish, FinishReason::TranscriptLimit { .. }));
+        if let FinishReason::TranscriptLimit { chars, limit } = &out.finish {
+            assert!(*chars >= 50);
+            assert_eq!(*limit, 50);
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_limit_unset_runs_to_completion() {
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "let me add".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":2,"b":3}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "5".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let mut agent = Agent::builder().llm(llm).tools(tools).build().unwrap();
+        let out = agent.run("what is 2+3?").await.unwrap();
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[tokio::test]
+    async fn transcript_limit_is_checked_before_llm_call() {
+        // A massive user goal that already exceeds the limit.
+        // Use an empty MockProvider so any actual call would panic.
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .max_transcript_chars(10)
+            .build()
+            .unwrap();
+        let out = agent
+            .run("a very long goal that exceeds the limit")
+            .await
+            .unwrap();
+        assert!(matches!(out.finish, FinishReason::TranscriptLimit { .. }));
+        if let FinishReason::TranscriptLimit { chars, limit } = &out.finish {
+            assert!(*chars >= 10);
+            assert_eq!(*limit, 10);
+        }
+        // Should have stopped at step 1 without making any LLM call.
+        assert_eq!(out.steps, 1);
     }
 }
