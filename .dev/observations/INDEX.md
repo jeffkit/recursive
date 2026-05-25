@@ -54,6 +54,61 @@ files in this folder; this index is the side-by-side comparison.
 | 40 sub-agent | deepseek | deepseek-chat | 38 | ~ | ? | 16:1 | $0.6251 | NoMoreToolCalls (recursive agent primitive; 7 new tests; default-off via env flag) |
 | 41 structured-output | deepseek | deepseek-chat | 29 | ~ | ? | 10:0 | $0.3146 | NoMoreToolCalls (LlmProvider extension; perfect patch discipline; 3 new tests) |
 | 42 otel-tracing | minimax | MiniMax-M2 | 103 | ~ | ? | 45:4 | **$2.1722** | NoMoreToolCalls (NEW cost record; instrumenting agent.rs + llm/* + tools/* needed 45 surgical patches; 3 new tests) |
+| 43 permission-hooks (wave-3) | deepseek | deepseek-chat | 49 | ~49 | ? | (varied) | $0.7060 | NoMoreToolCalls (wave-1 ✗ compactor orphan; relaunched after hotfix `e8fd05a`) |
+| 45 session-management (wave-3) | deepseek | deepseek-chat | 93 | ~93 | ? | (varied) | $1.2301 | NoMoreToolCalls (wave-1+2 ✗ on MiniMax flakiness/rate-limit; switched to deepseek) |
+| 46 compactor-uses-structured-output | deepseek | deepseek-chat | 23 | ~23 | ? | (varied) | $0.3747 | NoMoreToolCalls (wave-1 winner; first consumer of g41 structured output) |
+| 47 anthropic-provider-dogfood (wave-3) | deepseek | deepseek-chat | 33 | ~33 | ? | (varied) | $0.4319 | NoMoreToolCalls (script crashed mid-journal write; agent product correct; manual land) |
+
+### Batch 15 (g43+g45+g46+g47) — Phase 3 complete, dogfooding-driven
+
+All four eventually landed but it took **three waves** and a hotfix.
+The headline finding: **dogfooding worked exactly as intended**.
+Wiring up Compactor + Skill + AGENTS.md inflated the prompt enough
+that the new 200KB compaction threshold actually fired during the
+runs — and immediately exposed a latent bug in `Agent::maybe_compact`:
+the kept window could start at a `Role::Tool` message, orphaning it
+from its parent assistant's `tool_calls`. DeepSeek rejected this
+with HTTP 400, MiniMax returned an empty response body.
+
+Wave-1 (initial launch): g46 ✓ won; g43, g45, g47 all rolled back
+on the compactor orphan bug. Hotfix landed in main as `e8fd05a`
+(retreat split until non-Tool message + regression test).
+
+Wave-2 (relaunch from hotfixed main): g43 still alive (would win);
+g45 + g47 (both MiniMax) crashed — g45 from MiniMax flakiness,
+g47 hit the 5-hour rate limit (1500/1500 tokens used in the day).
+
+Wave-3 (switch g45 + g47 to DeepSeek): both ran cleanly.
+
+**Total cost ≈ $2.74** for product (g43 $0.71 + g45 $1.23 + g46
+$0.37 + g47 $0.43) plus ~$0.6 in failed-but-billable retry attempts
+on MiniMax that produced no commit. Wave-3 retry winners' cache hit
+rates were 97-98%.
+
+Highlights:
+- **g43 permission-hooks**: closes Phase 3. AgentBuilder gains a
+  closure that can Allow/Deny/Transform tool calls. 4 new tests.
+- **g45 session-management**: pause/resume across processes via
+  `SessionFile` + new `recursive resume <file>` / `recursive sessions`
+  subcommands. 93 steps because the agent built BLAKE3-based tool
+  registry hashing from scratch + extensive round-trip tests.
+- **g46 compactor-uses-structured-output**: first real consumer of
+  g41's `complete_structured()`. Compactor now requests structured
+  `{summary, kept_facts, next_steps}` JSON, falls back gracefully.
+  Smoothest of the four — 23 steps, $0.37, 98.6% cache hit.
+- **g47 anthropic-provider-dogfood**: activates g34, which had been
+  dormant for 3 batches. `RECURSIVE_PROVIDER_TYPE=anthropic` selector
+  + two new `anthropic-{minimax,deepseek}` profiles in
+  `self-improve.sh` + integration smoke test.
+
+**Merge conflicts**: 3 of 4. All resolved by NOT taking the worktree's
+agent.rs (forks predated the hotfix, would have reverted it) and
+manually merging lib.rs / main.rs to keep BOTH g43's permission hooks
+AND g45's session exports. Test consolidation: merged 3 small
+build_agent tests into ONE per AGENTS.md env-var test discipline.
+
+Tests: 230 lib → 242 lib (+12) + 2 new integration tests
+(anthropic_smoke). Now 245 total tests.
 
 ### Batch 14 (g39-g42) — Phase 1 done, Phase 4 starts
 

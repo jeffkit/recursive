@@ -7,50 +7,40 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T11:50Z.** Batch 15 wave-1 launched 11:34Z. **Two
-> worktrees died immediately** to a Compactor bug surfaced by
-> dogfooding (orphans a `Role::Tool` from its parent assistant
-> when `keep_recent_n` lands on it → HTTP 400). Two still healthy.
+> **As of 2026-05-25T12:00Z.** Idle. **Batch 15 fully landed** — 4/4
+> green eventually but it took three waves + a hotfix. Tree clean
+> at `effa8ca`.
 >
-> | Goal | Provider | PID | Status |
-> |---|---|---|---|
-> | g43 permission-hooks | deepseek | 82457 | ✗ ROLLED BACK — HTTP 400 from compactor orphan |
-> | g45 session-mgmt | minimax | 86000 | ✓ alive @ step ~14, no compaction yet |
-> | g46 compactor-structured | deepseek | 89129 | ✓ alive @ step 22, "all green" verification |
-> | g47 anthropic-dogfood | minimax | 92770 | ✗ ROLLED BACK — empty resp after compactor orphan |
+> Tests: 234 → 245 (+11 net new; 242 lib + 2 anthropic_smoke + 1
+> existing smoke). Total cost ≈ **$2.74** product + ~$0.6 wasted on
+> MiniMax retries.
 >
-> **Hotfix landed in main `e8fd05a`:** retreat split point until
-> `transcript[split].role != Tool`. +1 regression test
-> (`compaction_keeps_tool_calls_paired_with_results`). 234 tests.
-> Invariant #8 codified in `.dev/AGENTS.md` and workspace `AGENTS.md`.
+> **The dogfooding payoff**: turning on Compactor + Skill +
+> AGENTS.md project context in self-improve.sh inflated the prompt
+> enough that the new 200KB compaction threshold actually fired
+> during runs — and that surfaced a latent orphan-Tool bug in
+> `Agent::maybe_compact` (caused HTTP 400 on DeepSeek, empty body
+> on MiniMax). Now fixed + tested + codified as Invariant #8.
 >
-> **g46 landed (`20b0164`)**: Compactor now requests structured JSON
-> (`summary`, `kept_facts`, `next_steps`) via `complete_structured`,
-> falls back to free-text on error. g41 plumbing validated end-to-end.
-> $0.37, 23 steps, 98.6% cache hit, branch surgically merged (skipped
-> the agent.rs revert + doc churn).
+> **Roadmap status after batch 15**:
+> - Phase 1 Foundation: **4/4 done — COMPLETE**
+> - Phase 2 Ecosystem: **3/3 done — COMPLETE**
+> - Phase 3 Agent Intelligence: **4/4 done — COMPLETE**
+> - Phase 4 Production Readiness: **4/5 done** (only 4.1 Docker
+>   Sandbox + 4.4 Hooks left)
 >
-> **Wave-3 in flight from hotfixed main `20b0164`** (g45/g47 switched
-> off MiniMax — quota exhausted, resets 20:00 local):
+> Two roadmap items left:
+>   - **4.1 Docker Sandbox (L)** — needs its own batch with prep.
+>   - **4.4 Hooks (M)** — general lifecycle observer pattern.
 >
-> | Goal | Provider | PID | Status |
-> |---|---|---|---|
-> | g43 permission-hooks | deepseek | 26931 | running |
-> | g45 session-mgmt | deepseek | 12680 | running |
-> | g47 anthropic-dogfood | deepseek | 18197 | running |
+> Plus follow-ups: an OTel exporter for 4.5, permission-hook
+> inheritance for sub_agent, structured-output for AnthropicProvider,
+> streaming for Anthropic.
 >
-> **Wave-1/2 carnage**:
->   - Wave-1: g43 (deepseek HTTP 400 orphan), g45 (minimax empty
->     body — same bug, different symptom), g47 (minimax empty body),
->     g46 ✓ won (cherry-picked to main).
->   - Wave-2: g43 still going from wave-1 actually no — wave-2 was
->     ALL three from hotfixed main. g45 (minimax empty body, possibly
->     rate-limit precursor), g47 (minimax explicit 429 — quota burned
->     by repeated retries).
->
-> Previously: Batch 14 fully landed — 4/4 green on first attempt,
-> all NoMoreToolCalls. Tests 214 → 233 → 234. Cost so far for B15
-> ≈ **$0.37** (g46 only, others rolled back).
+> **Strategic note**: the roadmap is now ~90% complete. Next phase
+> of work is either (a) the two remaining items, (b) follow-up
+> polish from previous batches, or (c) something new based on
+> usage signals once the project is open-sourced.
 >
 > **Roadmap status after batch 14**:
 > - Phase 1 Foundation: **4/4 done — COMPLETE**
