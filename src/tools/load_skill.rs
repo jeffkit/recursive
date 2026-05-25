@@ -2,8 +2,9 @@
 //!
 //! Supports loading the main SKILL.md body, or an individual reference
 //! document from the skill's `refs/` directory via the optional `ref`
-//! parameter. Also supports parameter substitution via the `params`
-//! object.
+//! parameter, or a named section from the skill body via the optional
+//! `section` parameter. Also supports parameter substitution via the
+//! `params` object.
 
 use std::fs;
 use std::sync::Arc;
@@ -16,7 +17,8 @@ use crate::llm::ToolSpec;
 use crate::skills::Skill;
 use crate::tools::Tool;
 
-/// Tool to load a skill's SKILL.md body content, or a specific ref document.
+/// Tool to load a skill's SKILL.md body content, or a specific ref document,
+/// or a named section.
 pub struct LoadSkill {
     skills: Arc<Vec<Skill>>,
 }
@@ -34,7 +36,7 @@ impl Tool for LoadSkill {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "load_skill".into(),
-            description: "Load a skill's content by name (case-insensitive). Optionally load a reference document from the skill's refs/ directory, or pass params for template substitution.".into(),
+            description: "Load a skill's content by name (case-insensitive). Optionally load a reference document from the skill's refs/ directory, or a named section from the skill body. Pass params for template substitution.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -45,6 +47,10 @@ impl Tool for LoadSkill {
                     "ref": {
                         "type": "string",
                         "description": "Optional name of a reference document to load (e.g. 'api-spec'). Use `load_skill` without `ref` first to see available refs."
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Optional name of a section to load (e.g. 'Overview'). Sections are delimited by ## headings in the skill body. Use `load_skill` without `section` first to see available sections."
                     },
                     "params": {
                         "type": "object",
@@ -113,7 +119,52 @@ impl Tool for LoadSkill {
             return Ok(content.trim().to_string());
         }
 
-        // No ref specified — return the main SKILL.md body
+        // Check if a specific section is requested
+        if let Some(section_name) = arguments["section"].as_str() {
+            let section_name = section_name.trim();
+            if section_name.is_empty() {
+                return Err(Error::BadToolArgs {
+                    name: "load_skill".into(),
+                    message: "section parameter must be a non-empty string".to_string(),
+                });
+            }
+
+            // Case-insensitive search in sections
+            let section = skill
+                .sections
+                .iter()
+                .find(|s| s.name.to_lowercase() == section_name.to_lowercase())
+                .ok_or_else(|| {
+                    let available: Vec<&str> = skill.sections.iter().map(|s| s.name.as_str()).collect();
+                    let available_list = if available.is_empty() {
+                        "no sections available for this skill".to_string()
+                    } else {
+                        format!("available sections: {}", available.join(", "))
+                    };
+                    Error::Tool {
+                        name: "load_skill".into(),
+                        message: format!("section not found: '{section_name}'. {available_list}"),
+                    }
+                })?;
+
+            // Apply param substitution to section content if params provided
+            let provided_params = arguments["params"].as_object();
+            let resolved = resolve_params(skill, provided_params)?;
+
+            let rendered = if resolved.is_empty() {
+                section.content.clone()
+            } else {
+                let mut result = section.content.clone();
+                for (key, value) in &resolved {
+                    result = result.replace(&format!("{{{{{key}}}}}"), value);
+                }
+                result
+            };
+
+            return Ok(rendered);
+        }
+
+        // No ref or section specified — return the main SKILL.md body
         let content = fs::read_to_string(&skill.path).map_err(|e| Error::Tool {
             name: "load_skill".into(),
             message: format!("failed to read skill file: {e}"),
@@ -127,50 +178,7 @@ impl Tool for LoadSkill {
 
         // Resolve params and perform template substitution
         let provided_params = arguments["params"].as_object();
-
-        // Build resolved values map
-        let mut resolved = Vec::new();
-        let mut missing_required = Vec::new();
-
-        for param in &skill.params {
-            // Check if provided
-            if let Some(obj) = provided_params {
-                if let Some(val) = obj.get(&param.name).and_then(|v| v.as_str()) {
-                    resolved.push((param.name.clone(), val.to_string()));
-                    continue;
-                }
-            }
-
-            // Fall back to default
-            if let Some(ref default) = param.default {
-                resolved.push((param.name.clone(), default.clone()));
-            } else {
-                // Required param with no value provided
-                missing_required.push(param.name.clone());
-            }
-        }
-
-        if !missing_required.is_empty() {
-            return Err(Error::BadToolArgs {
-                name: "load_skill".into(),
-                message: format!(
-                    "missing required params: {}. Declared params: {}",
-                    missing_required.join(", "),
-                    skill
-                        .params
-                        .iter()
-                        .map(|p| {
-                            if let Some(ref d) = p.default {
-                                format!("{}={}", p.name, d)
-                            } else {
-                                format!("{} (required)", p.name)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
+        let resolved = resolve_params(skill, provided_params)?;
 
         // Perform template substitution: replace {{key}} with value
         let rendered = if resolved.is_empty() {
@@ -185,6 +193,58 @@ impl Tool for LoadSkill {
 
         Ok(rendered)
     }
+}
+
+/// Resolve parameter values: use provided values, fall back to defaults,
+/// error on missing required params.
+fn resolve_params(
+    skill: &Skill,
+    provided_params: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<(String, String)>> {
+    let mut resolved = Vec::new();
+    let mut missing_required = Vec::new();
+
+    for param in &skill.params {
+        // Check if provided
+        if let Some(obj) = provided_params {
+            if let Some(val) = obj.get(&param.name).and_then(|v| v.as_str()) {
+                resolved.push((param.name.clone(), val.to_string()));
+                continue;
+            }
+        }
+
+        // Fall back to default
+        if let Some(ref default) = param.default {
+            resolved.push((param.name.clone(), default.clone()));
+        } else {
+            // Required param with no value provided
+            missing_required.push(param.name.clone());
+        }
+    }
+
+    if !missing_required.is_empty() {
+        return Err(Error::BadToolArgs {
+            name: "load_skill".into(),
+            message: format!(
+                "missing required params: {}. Declared params: {}",
+                missing_required.join(", "),
+                skill
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if let Some(ref d) = p.default {
+                            format!("{}={}", p.name, d)
+                        } else {
+                            format!("{} (required)", p.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -519,5 +579,149 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Lang=python Mode=lax");
+    }
+
+    // --- Section loading tests ---
+
+    #[test]
+    fn load_skill_with_section_returns_section_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("sectioned-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sectioned-skill\ndescription: Has sections\n---\n\n## Overview\n\nGeneral info.\n\n## Details\n\nSpecific content.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "sectioned-skill", "section": "Overview"})));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "General info.");
+    }
+
+    #[test]
+    fn load_skill_with_section_case_insensitive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("sectioned-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sectioned-skill\ndescription: Has sections\n---\n\n## Overview\n\nGeneral info.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "sectioned-skill", "section": "overview"})));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "General info.");
+    }
+
+    #[test]
+    fn load_skill_with_unknown_section_returns_error_with_available() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("sectioned-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sectioned-skill\ndescription: Has sections\n---\n\n## Overview\n\nGeneral info.\n\n## Details\n\nSpecific content.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "sectioned-skill", "section": "Nonexistent"})));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("section not found"),
+            "error should mention section not found: {err}"
+        );
+        assert!(
+            err.contains("Overview") && err.contains("Details"),
+            "error should list available sections: {err}"
+        );
+    }
+
+    #[test]
+    fn load_skill_with_empty_section_returns_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("sectioned-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sectioned-skill\ndescription: Has sections\n---\n\n## Overview\n\nGeneral info.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "sectioned-skill", "section": ""})));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_skill_with_section_and_params_performs_substitution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("template-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: template-skill\n\
+             description: Has templates\n\
+             params:\n\
+             \x20\x20- name: lang\n\
+             \x20\x20  description: Language\n\
+             \x20\x20  default: rust\n\
+             ---\n\
+             \n\
+             ## Overview\n\
+             \n\
+             Review {{lang}} code.\n\
+             \n\
+             ## Details\n\
+             \n\
+             More about {{lang}}.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            tool.execute(json!({"name": "template-skill", "section": "Overview", "params": {"lang": "python"}})),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Review python code.");
     }
 }
