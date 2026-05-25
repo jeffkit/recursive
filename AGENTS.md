@@ -69,3 +69,11 @@ If sub-agent is enabled (`RECURSIVE_SUBAGENT_ENABLED=1`):
 - Termination reasons (`BudgetExceeded`, `TranscriptLimit`,
   `Stuck`, `NoMoreToolCalls`) are **data, not errors**. Your
   transcript is saved on all of them. Don't panic.
+
+- **Tool-call ↔ tool-result pairing.** If you write code that
+  rearranges the transcript (compaction, trimming, replay, session
+  resume), each `Role::Tool` message MUST stay immediately after the
+  `Role::Assistant` message whose `tool_calls` lists its `id`.
+  OpenAI/DeepSeek/Anthropic all reject orphans with HTTP 400. See
+  invariant #8 in `.dev/AGENTS.md` and the regression test
+  `compaction_keeps_tool_calls_paired_with_results`.

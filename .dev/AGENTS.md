@@ -56,6 +56,19 @@ tests/
    a new `Error::XxxBudget` or `Error::XxxLimit` variant that
    short-circuits the transcript save. self-improve.sh's auto-resume
    gate depends on the saved transcript existing on disk.
+8. **Tool-call ↔ tool-result pairing.** Every `Role::Tool` message
+   in the transcript MUST be immediately preceded by a `Role::Assistant`
+   message whose `tool_calls` contains the matching id. OpenAI,
+   DeepSeek, and Anthropic all enforce this server-side (HTTP 400
+   "Messages with role 'tool' must be a response to a preceding
+   message with 'tool_calls'"). Any operation that mutates the
+   transcript mid-run — compaction, trimming, splicing, resume
+   replay — MUST preserve this invariant or rebase the window past
+   the orphan. Discovered via batch 15 dogfood: a naive
+   `keep_recent_n=N` split in `agent::Agent::maybe_compact` orphaned
+   a tool result whose parent assistant had just been drained. Fix:
+   retreat the split until `transcript[split].role != Role::Tool`.
+   Tested by `compaction_keeps_tool_calls_paired_with_results`.
 
 ## How to do work
 

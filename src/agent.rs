@@ -412,7 +412,20 @@ impl Agent {
         // Replace the older portion with the summary message.
         // Keep the last keep_recent_n messages verbatim.
         let keep = compactor.keep_recent_n;
-        let split = self.transcript.len().saturating_sub(keep);
+        let mut split = self.transcript.len().saturating_sub(keep);
+
+        // Invariant: every `Role::Tool` message must be immediately preceded by
+        // an `Role::Assistant` message containing the matching `tool_calls`.
+        // OpenAI/DeepSeek/Anthropic all enforce this on the request side. If
+        // the kept window starts at a `Role::Tool` message, the parent
+        // assistant has just been drained — the next LLM request fails with
+        // HTTP 400 ("Messages with role 'tool' must be a response to a
+        // preceding message with 'tool_calls'"). Retreat the split until the
+        // window starts at a non-Tool message.
+        while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool) {
+            split -= 1;
+        }
+
         let removed = split;
         let kept = self.transcript.len() - split;
 
@@ -1245,6 +1258,100 @@ mod tests {
             compacted_count, 0,
             "expected no Compacted events by default"
         );
+    }
+
+    /// Regression: a compaction whose `keep_recent_n` window started with a
+    /// `Role::Tool` message orphaned that tool from its parent assistant's
+    /// `tool_calls`. Subsequent LLM requests failed with HTTP 400 (DeepSeek)
+    /// or 422 (OpenAI). Fix retreats the split point until the kept window
+    /// begins at a non-Tool message.
+    ///
+    /// Discovered during batch 15 dogfooding: g43 + g47 both rolled back
+    /// the moment Compactor fired with the new 200 KB threshold + AGENTS.md
+    /// + skill_index inflation.
+    ///
+    /// Scenario: transcript after step 1 looks like
+    ///   [0] System (prompt)
+    ///   [1] User (goal)
+    ///   [2] Assistant + tool_calls("adder")
+    ///   [3] Tool result
+    /// With `keep_recent_n=1`, naive split = len-1 = 3 lands on the Tool
+    /// message. Without the fix, kept window = [Tool] — orphan. With the
+    /// fix, split retreats to 2 (the parent Assistant).
+    #[tokio::test]
+    async fn compaction_keeps_tool_calls_paired_with_results() {
+        use crate::message::Role;
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "looking...".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "adder".to_string(),
+                    arguments: json!({"a": 1, "b": 2}),
+                }],
+                finish_reason: None,
+                usage: None,
+            },
+            // Summary returned by the compactor's call to provider.complete()
+            Completion {
+                content: "Summary of older messages.".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            },
+            Completion {
+                content: "done".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        // keep_recent_n=1 forces the naive split onto the Tool message.
+        // min_messages check is keep_recent_n + 2 = 3, satisfied at step 2.
+        let compactor = crate::compact::Compactor::new(10).keep_recent_n(1);
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+
+        let out = agent.run("test").await.unwrap();
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+
+        // Sanity: at least one Compacted event must have fired, otherwise
+        // the test isn't exercising the code path we care about.
+        // (We can't introspect easily here — instead assert via transcript
+        // shape: the first message after compaction should be a synthetic
+        // System summary with the "[compacted:" header.)
+        let first = &out.transcript[0];
+        assert!(
+            matches!(first.role, Role::System) && first.content.contains("[compacted:"),
+            "compaction never fired — transcript[0] = {:?}, content={:?}",
+            first.role,
+            &first.content.chars().take(60).collect::<String>()
+        );
+
+        // The kept transcript must NOT have an orphaned Tool message at
+        // position 1 (right after the summary system message at position 0).
+        for (i, m) in out.transcript.iter().enumerate() {
+            if m.role == Role::Tool {
+                assert!(
+                    i > 0,
+                    "Tool message at index 0 (right after summary) is impossible"
+                );
+                let prev = &out.transcript[i - 1];
+                assert!(
+                    matches!(prev.role, Role::Assistant) && !prev.tool_calls.is_empty(),
+                    "tool message at index {i} is orphaned — previous message \
+                     has role={:?}, tool_calls={}",
+                    prev.role,
+                    prev.tool_calls.len()
+                );
+            }
+        }
     }
 
     #[test]
