@@ -73,8 +73,11 @@ trap 'rm -f "$SYSPROMPT_FILE"' EXIT
   cat "$DEV_DIR/AGENTS.md"
   echo ""
   if [[ -d "$DEV_DIR/journal" && -n "$(ls -A "$DEV_DIR/journal" 2>/dev/null || true)" ]]; then
-    echo "=== Recent journal (last 3 entries, most recent first) ==="
-    ls -1t "$DEV_DIR/journal"/*.md 2>/dev/null | head -3 | while read -r f; do
+    # Only the single most recent journal entry, to keep system-prompt size
+    # bounded. Earlier 3-entry context blew past MiniMax's response-length
+    # budget on multi-step goals and the LLM truncated at step 1.
+    echo "=== Most recent journal entry ==="
+    ls -1t "$DEV_DIR/journal"/*.md 2>/dev/null | head -1 | while read -r f; do
       echo "--- $(basename "$f") ---"
       cat "$f"
       echo ""
@@ -211,13 +214,25 @@ if ! cargo test --quiet >/dev/null 2>&1; then
   verdict_and_exit "rolled-back" "post-agent cargo test failed"
 fi
 
-if [[ -z "$(git status --porcelain)" ]]; then
-  verdict_and_exit "skip-commit" "agent succeeded but made no file changes"
+# Decide whether a meaningful change happened. Journal files are this
+# script's own artifact, not agent output; they must not count toward
+# "the agent made changes". Without this filter, every run gets credited
+# as a success purely because we wrote a transcript.
+PRODUCT_CHANGES="$(git status --porcelain | grep -vE '^.. \.dev/journal/' || true)"
+
+if [[ -z "$PRODUCT_CHANGES" ]]; then
+  # Still commit any journal (untracked transcript) so the tree is clean
+  # for the next run.
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git add -A
+    git commit --quiet -m "dev: journal — run ${TS} (no product changes)"
+  fi
+  verdict_and_exit "skip-commit" "agent succeeded but made no product changes"
 fi
 
 if [[ "${RECURSIVE_NO_COMMIT:-0}" == "1" ]]; then
   verdict_and_exit "skip-commit" "RECURSIVE_NO_COMMIT=1 set"
 fi
 
-CHANGED_COUNT="$(git status --porcelain | wc -l | tr -d ' ')"
+CHANGED_COUNT="$(echo "$PRODUCT_CHANGES" | wc -l | tr -d ' ')"
 verdict_and_exit "committed" "${CHANGED_COUNT} files changed, cargo test green"
