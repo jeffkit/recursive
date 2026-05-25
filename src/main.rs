@@ -77,6 +77,9 @@ struct Cli {
     /// Enable token-by-token streaming. Deltas are printed live on stderr.
     #[arg(long, env = "RECURSIVE_STREAM")]
     stream: bool,
+    /// Enable tool timing hook that prints tool call durations to stderr.
+    #[arg(long)]
+    hook_timing: bool,
     /// Path to write a session file for non-success finishes (budget exceeded,
     /// stuck, transcript limit). The session can be resumed later with `resume`.
     #[arg(long, env = "RECURSIVE_SESSION_OUT")]
@@ -199,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.stream,
                 cli.mcp_config,
                 external_pricing,
+                cli.hook_timing,
             )
             .await
         }
@@ -258,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.json,
                         cli.mcp_config,
                         external_pricing,
+                        cli.hook_timing,
                     )
                     .await
                 }
@@ -283,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.json,
                 cli.mcp_config,
                 external_pricing,
+                cli.hook_timing,
             )
             .await
         }
@@ -464,6 +470,7 @@ async fn build_agent(
     seed: Vec<recursive::message::Message>,
     stream: bool,
     mcp_config: Option<PathBuf>,
+    hook_timing: bool,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     // Provider selector: `openai` (default) uses the OpenAI-compatible adapter,
@@ -584,6 +591,9 @@ async fn build_agent(
                 builder = builder.compactor(recursive::Compactor::new(n));
             }
         }
+    }
+    if hook_timing {
+        builder = builder.hook(Arc::new(recursive::hooks::ToolTimingHook::new()));
     }
     builder = builder.streaming(stream);
     let agent = builder.build()?;
@@ -724,10 +734,18 @@ async fn run_resumed(
     json_mode: bool,
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
+    hook_timing: bool,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
-    let (mut agent, rx) =
-        build_agent(&config, max_transcript_chars, seed, false, mcp_config).await?;
+    let (mut agent, rx) = build_agent(
+        &config,
+        max_transcript_chars,
+        seed,
+        false,
+        mcp_config,
+        hook_timing,
+    )
+    .await?;
     let tools = build_tools(&config).await;
     let tool_specs = tools.specs();
     if !json_mode {
@@ -778,6 +796,7 @@ async fn run_once(
     stream: bool,
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
+    hook_timing: bool,
 ) -> anyhow::Result<()> {
     let (mut agent, rx) = build_agent(
         &config,
@@ -785,6 +804,7 @@ async fn run_once(
         Vec::new(),
         stream,
         mcp_config,
+        hook_timing,
     )
     .await?;
     let tools = build_tools(&config).await;
@@ -853,6 +873,7 @@ async fn repl(
             Vec::new(),
             false,
             mcp_config.clone(),
+            false,
         )
         .await?;
         let printer = if json_mode {
@@ -986,19 +1007,34 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
 
-        let r1 = build_agent(&cfg, None, Vec::new(), /* stream */ false, None).await;
+        let r1 = build_agent(&cfg, None, Vec::new(), /* stream */ false, None, false).await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
 
-        let r2 = build_agent(&cfg, None, Vec::new(), /* stream */ true, None).await;
+        let r2 = build_agent(&cfg, None, Vec::new(), /* stream */ true, None, false).await;
         assert!(r2.is_ok(), "openai/stream=true: must not panic or fail");
 
         let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
-        let r3 = build_agent(&cfg, None, Vec::new(), false, None).await;
+        let r3 = build_agent(&cfg, None, Vec::new(), false, None, false).await;
         match original {
             Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),
         }
         assert!(r3.is_ok(), "anthropic/stream=false: must not panic or fail");
+    }
+
+    #[test]
+    fn hook_timing_flag_accepted() {
+        // Verify --hook-timing is accepted by the CLI parser
+        let args = vec!["recursive", "--hook-timing", "run", "test goal"];
+        let cli = Cli::parse_from(args);
+        assert!(cli.hook_timing);
+    }
+
+    #[test]
+    fn hook_timing_flag_defaults_to_false() {
+        let args = vec!["recursive", "run", "test goal"];
+        let cli = Cli::parse_from(args);
+        assert!(!cli.hook_timing);
     }
 }
