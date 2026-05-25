@@ -12,11 +12,17 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::message::Message;
 
+use tokio::sync::mpsc;
+
 pub mod mock;
 pub mod openai;
 
 pub use mock::MockProvider;
 pub use openai::OpenAiProvider;
+
+/// Channel sender for streaming partial tokens during a streaming LLM call.
+/// Each `String` is a delta chunk (partial token) emitted by the provider.
+pub type StreamSender = mpsc::UnboundedSender<String>;
 
 /// Token usage data from an LLM response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +123,29 @@ pub struct Completion {
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion>;
+
+    /// Stream a completion token-by-token.
+    ///
+    /// The default implementation delegates to [`complete`] and emits the
+    /// entire content as a single delta via the channel (if configured).
+    /// Providers that support native SSE streaming should override this.
+    ///
+    /// The `stream_tx` channel receives partial-token deltas as they are
+    /// parsed. The returned `Completion` is the fully accumulated result.
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        let completion = self.complete(messages, tools).await?;
+        if let Some(tx) = stream_tx {
+            if !completion.content.is_empty() {
+                let _ = tx.send(completion.content.clone());
+            }
+        }
+        Ok(completion)
+    }
 }
 
 #[cfg(test)]

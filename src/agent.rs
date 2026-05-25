@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::llm::{Completion, LlmProvider, TokenUsage, ToolCall};
+use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::tools::ToolRegistry;
 
@@ -99,6 +99,7 @@ pub struct Agent {
     max_steps: usize,
     max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
+    streaming: bool,
     total_llm_latency_ms: u64,
 }
 
@@ -150,7 +151,23 @@ impl Agent {
 
             debug!(target: "recursive::agent", step, "calling llm");
             let start = std::time::Instant::now();
-            let completion: Completion = self.llm.complete(&self.transcript, &specs).await?;
+            let completion: Completion = if self.streaming {
+                // Create a channel for streaming deltas
+                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+                let stream_tx: Option<StreamSender> = Some(delta_tx);
+                // Spawn a task to forward deltas as PartialToken events
+                let events_tx = self.events.clone();
+                tokio::spawn(async move {
+                    while let Some(text) = delta_rx.recv().await {
+                        if let Some(ref tx) = events_tx {
+                            let _ = tx.send(StepEvent::PartialToken { text, step });
+                        }
+                    }
+                });
+                self.llm.stream(&self.transcript, &specs, stream_tx).await?
+            } else {
+                self.llm.complete(&self.transcript, &specs).await?
+            };
             let llm_ms = start.elapsed().as_millis() as u64;
             self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
             self.emit(StepEvent::Latency { step, llm_ms });
@@ -341,6 +358,7 @@ pub struct AgentBuilder {
     max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
     seed: Vec<Message>,
+    streaming: bool,
 }
 
 impl AgentBuilder {
@@ -376,6 +394,10 @@ impl AgentBuilder {
         self.seed = messages;
         self
     }
+    pub fn streaming(mut self, enabled: bool) -> Self {
+        self.streaming = enabled;
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self
             .llm
@@ -392,6 +414,7 @@ impl AgentBuilder {
             max_steps: self.max_steps.unwrap_or(32),
             max_transcript_chars: self.max_transcript_chars,
             events: self.events,
+            streaming: self.streaming,
             total_llm_latency_ms: 0,
         })
     }
