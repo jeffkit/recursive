@@ -18,7 +18,7 @@ use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
     tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, WriteFile},
-    Agent, StepEvent, ToolRegistry,
+    Agent, FinishReason, StepEvent, ToolRegistry,
 };
 
 #[derive(Parser, Debug)]
@@ -35,6 +35,10 @@ struct Cli {
     /// Maximum agent loop iterations per goal.
     #[arg(long, env = "RECURSIVE_MAX_STEPS")]
     max_steps: Option<usize>,
+
+    /// Stop when total transcript content reaches this many characters.
+    #[arg(long, env = "RECURSIVE_MAX_TRANSCRIPT_CHARS")]
+    max_transcript_chars: Option<usize>,
 
     /// Path to a system prompt file (overrides default).
     #[arg(long, env = "RECURSIVE_SYSTEM_PROMPT_FILE")]
@@ -85,8 +89,8 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
         }
-        Cmd::Run { goal } => run_once(config, goal.join(" ")).await,
-        Cmd::Repl => repl(config).await,
+        Cmd::Run { goal } => run_once(config, goal.join(" "), cli.max_transcript_chars).await,
+        Cmd::Repl => repl(config, cli.max_transcript_chars).await,
     }
 }
 
@@ -112,7 +116,10 @@ fn build_tools(root: &std::path::Path) -> ToolRegistry {
         .register(Arc::new(RunShell::new(root)))
 }
 
-fn build_agent(config: &Config) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
+fn build_agent(
+    config: &Config,
+    max_transcript_chars: Option<usize>,
+) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     let provider: Arc<dyn LlmProvider> = Arc::new(
         OpenAiProvider::new(&config.api_base, api_key, &config.model)
@@ -120,13 +127,16 @@ fn build_agent(config: &Config) -> anyhow::Result<(Agent, mpsc::UnboundedReceive
     );
     let tools = build_tools(&config.workspace);
     let (tx, rx) = mpsc::unbounded_channel();
-    let agent = Agent::builder()
+    let mut builder = Agent::builder()
         .llm(provider)
         .tools(tools)
         .system_prompt(&config.system_prompt)
         .max_steps(config.max_steps)
-        .events(tx)
-        .build()?;
+        .events(tx);
+    if let Some(n) = max_transcript_chars {
+        builder = builder.max_transcript_chars(n);
+    }
+    let agent = builder.build()?;
     Ok((agent, rx))
 }
 
@@ -143,8 +153,21 @@ fn print_usage(usage: TokenUsage, model: &str) {
     }
 }
 
-async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
-    let (mut agent, rx) = build_agent(&config)?;
+fn print_finish_note(finish: &FinishReason) {
+    if let FinishReason::TranscriptLimit { chars, limit } = finish {
+        eprintln!(
+            "note: stopped because transcript reached {} chars (limit {})",
+            chars, limit
+        );
+    }
+}
+
+async fn run_once(
+    config: Config,
+    goal: String,
+    max_transcript_chars: Option<usize>,
+) -> anyhow::Result<()> {
+    let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
     let printer = tokio::spawn(stream_events(rx));
     let outcome = agent.run(goal).await?;
     drop(agent);
@@ -153,10 +176,11 @@ async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
         println!("\n=== final ===\n{msg}");
     }
     print_usage(outcome.total_usage, &config.model);
+    print_finish_note(&outcome.finish);
     Ok(())
 }
 
-async fn repl(config: Config) -> anyhow::Result<()> {
+async fn repl(config: Config, max_transcript_chars: Option<usize>) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     loop {
@@ -173,7 +197,7 @@ async fn repl(config: Config) -> anyhow::Result<()> {
         if matches!(goal, ":q" | ":quit" | "exit") {
             break;
         }
-        let (mut agent, rx) = build_agent(&config)?;
+        let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
         let printer = tokio::spawn(stream_events(rx));
         match agent.run(goal.to_string()).await {
             Ok(outcome) => {
@@ -183,6 +207,7 @@ async fn repl(config: Config) -> anyhow::Result<()> {
                     println!("\n=== final ===\n{msg}\n");
                 }
                 print_usage(outcome.total_usage, &config.model);
+                print_finish_note(&outcome.finish);
             }
             Err(e) => {
                 eprintln!("error: {e}");

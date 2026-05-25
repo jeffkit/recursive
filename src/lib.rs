@@ -16,7 +16,7 @@ pub mod llm;
 pub mod message;
 pub mod tools;
 
-pub use agent::{Agent, AgentOutcome, StepEvent};
+pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
