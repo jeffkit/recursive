@@ -41,7 +41,7 @@ set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <provider> <goal-file>" >&2
-  echo "       provider: minimax | deepseek | glm" >&2
+  echo "       provider: minimax | deepseek | deepseek-pro | glm" >&2
   exit 2
 fi
 
@@ -60,10 +60,11 @@ fi
 # Provider key check up-front so we don't create a worktree only to fail.
 case "$PROVIDER" in
   minimax)  KEY_NAME="MINIMAX_API_KEY"  ;;
-  deepseek) KEY_NAME="DEEPSEEK_API_KEY" ;;
+  deepseek|deepseek-flash) KEY_NAME="DEEPSEEK_API_KEY" ;;
+  deepseek-pro) KEY_NAME="DEEPSEEK_API_KEY" ;;
   glm)      KEY_NAME="GLM_API_KEY"      ;;
   *)
-    echo "error: unknown provider '$PROVIDER' (known: minimax | deepseek | glm)" >&2
+    echo "error: unknown provider '$PROVIDER' (known: minimax | deepseek | deepseek-pro | glm)" >&2
     exit 2
     ;;
 esac

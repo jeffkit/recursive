@@ -21,7 +21,7 @@ use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::SessionFile;
 use recursive::{
     config::Config,
-    llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
+    llm::{pricing_for, AnthropicProvider, LlmProvider, OpenAiProvider, TokenUsage},
     tools::memory::memory_summary,
     tools::{
         ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, ReadFile, Recall, Remember,
@@ -398,6 +398,12 @@ async fn build_agent(
     mcp_config: Option<PathBuf>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
+    // Provider selector: `openai` (default) uses the OpenAI-compatible adapter,
+    // `anthropic` switches to the Anthropic Messages API adapter. Both MiniMax
+    // and DeepSeek expose Anthropic-compatible endpoints, so the same config
+    // (api_base, model, api_key) can target either path depending on this env.
+    let provider_type =
+        std::env::var("RECURSIVE_PROVIDER_TYPE").unwrap_or_else(|_| "openai".to_string());
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
@@ -410,7 +416,22 @@ async fn build_agent(
         let (tx, _rx) = mpsc::unbounded_channel::<String>();
         openai = openai.with_stream_tx(tx);
     }
-    let provider: Arc<dyn LlmProvider> = Arc::new(openai);
+    let provider: Arc<dyn LlmProvider> = match provider_type.as_str() {
+        "anthropic" => {
+            // AnthropicProvider has its own RetryPolicy type; mirror the same
+            // values from the shared Config so behavior is consistent.
+            let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
+                max_retries: config.retry_max,
+                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+            };
+            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)
+                .with_temperature(config.temperature)
+                .with_retry_policy(anthropic_retry);
+            Arc::new(anthropic)
+        }
+        _ => Arc::new(openai),
+    };
     let mut tools = build_tools(config).await;
     register_mcp_tools(&mut tools, mcp_config).await;
 
@@ -855,19 +876,34 @@ mod tests {
     // panicked because `then(false)` returns None. This made every
     // `recursive run` (default: stream=false) panic at startup, which
     // in turn broke all parallel-self-improve.sh launches in batch 13.
+    /// Smoke test for `build_agent` across the matrix of stream flag and
+    /// provider selector. Consolidated into ONE test per AGENTS.md guidance
+    /// because the anthropic branch reads `RECURSIVE_PROVIDER_TYPE` from the
+    /// process env — running it in parallel with other build-agent tests
+    /// would race on that global. Asserts:
+    ///   - stream=false / openai (default)  → ok (regresses 92d257e bug)
+    ///   - stream=true  / openai            → ok (regresses streaming-merge bug)
+    ///   - stream=false / anthropic         → ok (g47 dogfood)
+    /// The anthropic branch sets+restores the env var to keep the test
+    /// hermetic for any tests that come after it.
     #[tokio::test]
-    async fn build_agent_does_not_panic_without_stream() {
+    async fn build_agent_construction_smoke() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
-        let built = build_agent(&cfg, None, Vec::new(), /* stream */ false, None).await;
-        assert!(built.is_ok(), "construction must not panic or fail");
-    }
 
-    #[tokio::test]
-    async fn build_agent_does_not_panic_with_stream() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = dummy_config(tmp.path());
-        let built = build_agent(&cfg, None, Vec::new(), /* stream */ true, None).await;
-        assert!(built.is_ok(), "construction must not panic or fail");
+        let r1 = build_agent(&cfg, None, Vec::new(), /* stream */ false, None).await;
+        assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
+
+        let r2 = build_agent(&cfg, None, Vec::new(), /* stream */ true, None).await;
+        assert!(r2.is_ok(), "openai/stream=true: must not panic or fail");
+
+        let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
+        std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
+        let r3 = build_agent(&cfg, None, Vec::new(), false, None).await;
+        match original {
+            Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
+            None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),
+        }
+        assert!(r3.is_ok(), "anthropic/stream=false: must not panic or fail");
     }
 }

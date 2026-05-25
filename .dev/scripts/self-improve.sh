@@ -122,8 +122,20 @@ apply_provider_profile() {
       export RECURSIVE_MODEL="glm-5.1"
       export RECURSIVE_API_KEY="${GLM_API_KEY:-}"
       ;;
+    anthropic-minimax)
+      export RECURSIVE_PROVIDER_TYPE="anthropic"
+      export RECURSIVE_API_BASE="https://api.minimaxi.com/anthropic"
+      export RECURSIVE_MODEL="MiniMax-M2"
+      export RECURSIVE_API_KEY="${MINIMAX_API_KEY:-}"
+      ;;
+    anthropic-deepseek)
+      export RECURSIVE_PROVIDER_TYPE="anthropic"
+      export RECURSIVE_API_BASE="https://api.deepseek.com/anthropic"
+      export RECURSIVE_MODEL="deepseek-chat"
+      export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
+      ;;
     *)
-      echo "error: unknown provider profile '$1' (known: minimax | deepseek | glm)" >&2
+      echo "error: unknown provider profile '$1' (known: minimax | deepseek | glm | anthropic-minimax | anthropic-deepseek)" >&2
       return 2
       ;;
   esac

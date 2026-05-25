@@ -77,9 +77,15 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
             input_per_million: 0.30,
             output_per_million: 1.20,
         }),
-        "deepseek-chat" => Some(ModelPricing {
+        "deepseek-chat" | "deepseek-v4-flash" => Some(ModelPricing {
             input_per_million: 0.27,
             output_per_million: 1.10,
+        }),
+        // V4-Pro is ~7× flash on input; placeholder until calibrated
+        // against the DeepSeek billing dashboard.
+        "deepseek-v4-pro" => Some(ModelPricing {
+            input_per_million: 1.89,
+            output_per_million: 7.70,
         }),
         "glm-4-flash" => Some(ModelPricing {
             input_per_million: 0.10,

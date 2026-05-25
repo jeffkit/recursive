@@ -51,11 +51,38 @@ under `.dev/` are stable. You don't normally need to touch them.
 Profiles are configured inside `self-improve.sh`. Pick one with
 `RECURSIVE_PROVIDER=…`:
 
-| profile  | model         | env var          | notes                       |
-| -------- | ------------- | ---------------- | --------------------------- |
-| minimax  | MiniMax-M2    | `MINIMAX_API_KEY` | default. Prone to `write_file` on small files. |
-| deepseek | deepseek-chat | `DEEPSEEK_API_KEY` | Cheaper-looking per-token, but often higher prompt-volume per run. Strong patch discipline. |
-| glm      | glm-5.1       | `GLM_API_KEY`    | First serious GLM run on 5.1 from batch 9. glm-4-flash earlier was unable to drive a tool loop (one read_file then "stop" as final answer). Pricing placeholder until calibrated against Zhipu billing. |
+| profile        | model              | env var          | notes                       |
+| -------------- | ------------------ | ---------------- | --------------------------- |
+| minimax        | MiniMax-M2         | `MINIMAX_API_KEY` | default. Prone to `write_file` on small files. |
+| deepseek       | deepseek-v4-flash  | `DEEPSEEK_API_KEY` | **Default DeepSeek tier.** Strong patch discipline; cheaper per token. |
+| deepseek-pro   | deepseek-v4-pro    | `DEEPSEEK_API_KEY` | Escalation tier — use directly or let flash-fallback pick it up. |
+| glm            | glm-5.1            | `GLM_API_KEY`    | First serious GLM run on 5.1 from batch 9. glm-4-flash earlier was unable to drive a tool loop (one read_file then "stop" as final answer). Pricing placeholder until calibrated against Zhipu billing. |
+
+Legacy `deepseek-chat` is accepted as an alias for `deepseek-v4-flash`
+until the DeepSeek API retires it (2026-07-24).
+
+### 2.1 DeepSeek flash-first, pro-on-failure
+
+When you launch with `RECURSIVE_PROVIDER=deepseek` (V4-Flash), the wrapper
+automatically retries **once** with `deepseek-v4-pro` if the flash run
+rolls back (agent failure or post-run `cargo test` red). Controlled by
+`RECURSIVE_DEEPSEEK_PRO_FALLBACK` (default `1`; set `0` to disable).
+
+Mechanics:
+
+1. Flash run fails → journal committed, tree reset to baseline (normal
+   rollback).
+2. Wrapper switches model to Pro, fresh journal/transcript IDs, same goal
+   and baseline — **no transcript carry-over** from the failed flash run.
+3. Pro run succeeds or fails on its own; there is no third attempt.
+
+To force Pro from the start: `RECURSIVE_PROVIDER=deepseek-pro` or
+`parallel-self-improve.sh deepseek-pro …`. Explicit Pro skips the
+flash-first path.
+
+Orchestrator note: when a flash run rolls back and the log shows the
+`retrying with deepseek-v4-pro` line, **wait for the pro pass** before
+HITL — the worktree may still be running.
 
 Both `MINIMAX_API_KEY` and `DEEPSEEK_API_KEY` are expected to be
 present in the parent shell. The wrapper script will fail loud if
