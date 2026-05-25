@@ -92,6 +92,21 @@ tests/
        `src/config.rs::shell_timeout_default_and_env_override` is the
        reference. See also `retry_env_overrides_apply` (one test that
        toggles all retry vars at once).
+     - **Network tests must set explicit timeouts.** `reqwest::Client`
+       has NO default connect timeout and NO default request timeout.
+       A test that connects to an unreachable address (e.g.
+       `http://127.0.0.1:1` where the OS silently drops SYN packets)
+       will hang `cargo test` *forever*, holding the build lock and
+       deadlocking every subsequent `cargo test` invocation. Always
+       build provider clients in tests with
+       `.timeout(std::time::Duration::from_secs(2))` (request) AND
+       `.connect_timeout(std::time::Duration::from_secs(1))`
+       (connect). Goal-30 burned 5 wall-clock minutes deadlocked on
+       three concurrent hung `cargo test` processes before the
+       orchestrator manually killed them. If a test legitimately
+       needs to assert "this hangs", do it with
+       `tokio::time::timeout(...)` wrapping the call, not by letting
+       reqwest run unbounded.
      - Worked example, editing `src/llm/mod.rs` to add a struct after the
        `pub use openai::OpenAiProvider;` line:
        ```
