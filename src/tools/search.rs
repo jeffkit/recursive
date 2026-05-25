@@ -42,7 +42,8 @@ impl Tool for SearchFiles {
                     "pattern":   { "type": "string", "description": "Pattern to search for. Literal substring by default; use `regex: true` for regex mode." },
                     "path":      { "type": "string", "description": "Optional subdirectory (workspace-relative) to scope the search to. Defaults to workspace root." },
                     "max_results": { "type": "integer", "description": "Cap on results (default 50, max 200)." },
-                    "regex":     { "type": "boolean", "description": "If true, interpret `pattern` as a regular expression (Rust regex crate syntax). Default false (literal substring)." }
+                    "regex":     { "type": "boolean", "description": "If true, interpret `pattern` as a regular expression (Rust regex crate syntax). Default false (literal substring)." },
+                    "case_insensitive": { "type": "boolean", "description": "If true, matching ignores ASCII case. Works in both literal and regex modes; in regex mode this is equivalent to wrapping the pattern in `(?i:...)`. Default false." }
                 },
                 "required": ["pattern"]
             }),
@@ -62,8 +63,19 @@ impl Tool for SearchFiles {
         }
 
         let use_regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let case_insensitive = args
+            .get("case_insensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let re_opt: Option<Regex> = if use_regex {
-            Some(Regex::new(pattern).map_err(|e| Error::BadToolArgs {
+            let regex = if case_insensitive {
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+            } else {
+                Regex::new(pattern)
+            };
+            Some(regex.map_err(|e| Error::BadToolArgs {
                 name: "search_files".into(),
                 message: format!("invalid regex: {e}"),
             })?)
@@ -113,7 +125,14 @@ impl Tool for SearchFiles {
             for (line_no, line) in contents.lines().enumerate() {
                 let is_match = match &re_opt {
                     Some(re) => re.is_match(line),
-                    None => line.contains(pattern),
+                    None => {
+                        if case_insensitive {
+                            line.to_ascii_lowercase()
+                                .contains(&pattern.to_ascii_lowercase())
+                        } else {
+                            line.contains(pattern)
+                        }
+                    }
                 };
                 if is_match {
                     let truncated = if line.len() > DEFAULT_MAX_LINE_LEN {
@@ -250,5 +269,60 @@ mod tests {
         assert!(out.contains("helper"));
         assert!(out.contains("main"));
         assert!(!out.contains("outside.txt"));
+    }
+
+    // Tests for case_insensitive flag (goal-29)
+    #[tokio::test]
+    async fn literal_mode_case_insensitive_finds_match() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "todo.txt",
+            "TODO: fix this
+todo: done",
+        );
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "TODO", "case_insensitive": true}))
+            .await
+            .unwrap();
+        assert!(out.contains("TODO: fix this"));
+        assert!(out.contains("todo: done"));
+    }
+
+    #[tokio::test]
+    async fn regex_mode_case_insensitive_finds_match() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "test.txt",
+            "foo123
+bar456",
+        );
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": r"FOO\d+", "regex": true, "case_insensitive": true}))
+            .await
+            .unwrap();
+        assert!(out.contains("foo123"));
+        assert!(!out.contains("bar456"));
+    }
+
+    #[tokio::test]
+    async fn case_sensitive_by_default() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp,
+            "mixed.txt",
+            "TODO
+todo
+Todo",
+        );
+        // Without case_insensitive, should only find exact match
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "TODO"}))
+            .await
+            .unwrap();
+        assert!(out.contains("TODO"));
+        assert!(!out.contains("todo"));
+        assert!(!out.contains("Todo"));
     }
 }
