@@ -27,6 +27,38 @@ files in this folder; this index is the side-by-side comparison.
 | 17 replay-from-step (2nd) | deepseek | deepseek-chat | 20 | 20 | ? | (varied) | $0.1991 | Stuck (rolled back) |
 | 17 replay-from-step (manual) | orchestrator | — | — | — | — | — | $0.0000 | manual landing of DeepSeek's design |
 | 18 default-prompt-dogfood | minimax | MiniMax-M2 | 25 | 25 | ? | (varied) | $0.0546 | NoMoreToolCalls |
+| 19 transcript-budget-trim | deepseek | deepseek-chat | 50 | ~ | ? | (varied) | $0.2179 | NoMoreToolCalls |
+| 20 replay-tail | minimax | MiniMax-M2 | 42 | ~ | ? | (varied) | $0.0849 | NoMoreToolCalls |
+| 21 deepseek-cache-hits | deepseek | deepseek-chat | 55 | ~ | ? | (varied) | $0.2136 | NoMoreToolCalls |
+| 22 apply-patch-nicer-error | minimax | MiniMax-M2 | 71 | ~ | ? | (varied) | $0.4186 | NoMoreToolCalls (high cost — apply_patch.rs is large) |
+| 23 shell-timeout-env (glm) | glm | glm-5.1 | 1 | 0 | 0 | 0:0 | $0.0000 | 429 quota exhausted (rolled back) |
+| 23 shell-timeout-env (minimax) | minimax | MiniMax-M2 | 50 | ~ | ? | (varied) | (rolled back) | BudgetExceeded — env-var test race |
+| 23 shell-timeout-env (manual) | orchestrator | — | — | — | — | — | $0.0000 | manual landing of MiniMax's product code, consolidated test |
+| 24 per-step-latency | deepseek | deepseek-chat | 48 | ~ | ? | (varied) | **$0.7374** | NoMoreToolCalls (record high — agent.rs is large) |
+| 25 apply-patch-dry-run | deepseek | deepseek-chat | 11 | ~ | ? | (varied) | $0.0869 | NoMoreToolCalls (cheap — apply_patch.rs is well-factored) |
+| 26 read-file-range | minimax | MiniMax-M2 | 35 | ~ | ? | (varied) | $0.2714 | NoMoreToolCalls |
+| 27 shell-env-passthrough | deepseek | deepseek-chat | ~ | ~ | ? | (varied) | $0.1017 | NoMoreToolCalls |
+| 28 transcript-head | minimax | MiniMax-M2 | ~ | ~ | ? | (varied) | $0.2508 | NoMoreToolCalls |
+| 29 search-case-insensitive | minimax | MiniMax-M2 | 21 | ~ | ? | (varied) | $0.1173 | NoMoreToolCalls |
+| 30 openai-error-model | deepseek | deepseek-chat | 36 | ~ | ? | (varied) | $0.3129 | NoMoreToolCalls (orchestrator killed 4 zombie cargo tests during run — lesson in AGENTS.md) |
+
+### Batch 11 (g27-g30) — first true 4-wide
+
+All four green on the first 4-wide steady-state batch. Goal-30 cost
+($0.3129) understates real wall-clock because the orchestrator
+manually killed 4 zombie cargo-test processes deadlocked on hanging
+reqwest connections. Lesson recorded in AGENTS.md section 5
+("Network tests must set explicit reqwest timeouts").
+
+### Cost stratification by file size (top expensive vs top cheap)
+
+- **Top 3 most expensive**: g24 latency ($0.7374, agent.rs), g22
+  apply-patch nicer-err ($0.4186, apply_patch.rs), g30
+  openai-error-model ($0.3129, openai.rs + mock server debugging).
+- **Top 3 cheapest**: g18 dogfood ($0.0546), g13 search-regex
+  ($0.0681), g16 kill-count-lines ($0.0851).
+- Strong correlation: per-goal cost ≈ (steps × transcript size at
+  step N). Touching a large file inflates transcripts geometrically.
 
 ## Key insight: prompt-token amplification
 
