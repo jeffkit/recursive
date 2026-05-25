@@ -15,6 +15,8 @@ files in this folder; this index is the side-by-side comparison.
 | 08 persistent-transcripts | minimax | MiniMax-M2 | 19 | 19 | 2 | 2:5 | $0.1871 | NoMoreToolCalls |
 | 09 transcript-replay | deepseek | deepseek-chat | 18 | 18 | 4 | 4:2 | $0.1437 | NoMoreToolCalls |
 | 10 shell-cwd | minimax | MiniMax-M2 | 15 | 14 | 0 | 0:2 | $0.1187 | NoMoreToolCalls |
+| 11 search-files-tool | deepseek | deepseek-chat | 29 | 31 | 2 | 13:1 | $0.2425 | NoMoreToolCalls |
+| 12 default-system-prompt | minimax | MiniMax-M2 | 15 | 14 | 2 | 2:1 | $0.0804 | NoMoreToolCalls |
 
 ## Key insight: prompt-token amplification
 
@@ -135,6 +137,26 @@ Worth re-running the same goal on both providers later to control for it.
   conflicts at all this time (09 changed main.rs + transcript.rs,
   10 changed only tools/shell.rs).
 - Pair total cost: **$0.26**. Cheapest two-goal batch on record.
+
+### Third concurrent batch (11 + 12)
+
+- **goal-11 search-files-tool (deepseek)**: 29 steps, 2 errors,
+  **apply:write = 13:1** (best discipline ratio yet), $0.2425.
+  Added a new `SearchFiles` tool with substring search, capped +
+  sandboxed, plus `walkdir` dep. 5 new tests.
+- **goal-12 default-system-prompt (minimax)**: 15 steps, 2 errors,
+  apply:write = 2:1 (much better than goal-10's 0:2), **$0.0804 —
+  cheapest run on record**. Replaced the minimal default system
+  prompt with an opinionated short version pointing at apply_patch
+  + post-change tests + anti-stuck guidance. 3 new tests.
+- **Zero merge conflicts**. Surface was actually disjoint this time
+  (11 = src/tools/* + Cargo.toml + main.rs build_tools, 12 = only
+  src/config.rs). Pair total **$0.32**.
+- Note: the goal-12 fix may itself improve future goal-10-style
+  small-file runs because the new default prompt now explicitly
+  says "prefer apply_patch over write_file when modifying existing
+  files". The next MiniMax small-file run will tell us if the nudge
+  works.
 
 ## Caveats
 

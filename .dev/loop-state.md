@@ -7,22 +7,17 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T07:35Z.** Update this whenever a batch is
-> launched or a run terminates.
+> **As of 2026-05-25T07:38Z.** Empty — batch 3 fully landed; next
+> batch not yet picked.
 
-| worktree id | provider | goal | started | log file | pid (may be stale) |
-| --- | --- | --- | --- | --- | --- |
-| `search-files-tool-deepseek-20260525T073301Z-35012` | deepseek | 11 search-files | 07:33Z | `.dev/runs/search-files-tool-deepseek-20260525T073301Z-35012.log` | 35038 |
-
-The other half of this batch (`default-system-prompt-minimax-…-35040`)
-already committed at 50a8a61 on its branch. Wait for the deepseek half
-before merging both at once.
+(none)
 
 ## Last batch landed
 
-> **Goals 09 + 10**, second concurrent batch. Merge commits
-> `58c2bcb` (09) and `929a998` (10) on `main`. INDEX.md row written.
-> Worktrees + branches cleaned. 95 tests green after the pair.
+> **Goals 11 + 12**, third concurrent batch. Merge commits on `main`:
+> goal-11 search-files-tool (deepseek), goal-12 default-system-prompt
+> (minimax). Zero merge conflicts. 103 tests green. Pair cost $0.32.
+> Notable: goal-11 hit apply:write=13:1, best discipline yet.
 
 ## Background processes
 
@@ -65,9 +60,6 @@ files yet; pick one, write the goal file, launch:
 - **DeepSeek cache_control headers** — DeepSeek charges ~10× less
   for cached prompt tokens. Plumb the right header. Touches
   `src/llm/openai.rs`.
-- **`max_transcript_chars` default from env** — already supported
-  via CLI in goal-07; surface as a `Config` default-from-env so
-  programmatic users get it for free. Touches `src/config.rs`.
 - **transcript replay-from-step** — load a saved transcript, prompt
   a new provider starting from message N. Builds on 08+09.
 - **system-prompt context budgeting** — auto-trim oldest tool
@@ -77,6 +69,10 @@ files yet; pick one, write the goal file, launch:
   policy is currently hardcoded. Pull it out to `Config`.
 - **kill `CountLines` tool** — it predates `wc -l` via `run_shell`
   and isn't paying its keep. Cleanup goal.
+- **search_files regex support** — extend goal-11's substring-only
+  search to optional regex via `regex` crate.
+- **JSON event output via `--json`** — emit `StepEvent`s as
+  newline-delimited JSON for programmatic consumption.
 - **streaming output (LlmProvider::complete_stream)** — the big
   one. Reserved until worktree concurrency has more mileage.
 
