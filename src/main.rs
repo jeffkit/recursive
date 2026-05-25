@@ -16,7 +16,7 @@ use tracing::Level;
 
 use recursive::{
     config::Config,
-    llm::{LlmProvider, OpenAiProvider, TokenUsage},
+    llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
     tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, WriteFile},
     Agent, StepEvent, ToolRegistry,
 };
@@ -130,12 +130,16 @@ fn build_agent(config: &Config) -> anyhow::Result<(Agent, mpsc::UnboundedReceive
     Ok((agent, rx))
 }
 
-fn print_usage(usage: TokenUsage) {
+fn print_usage(usage: TokenUsage, model: &str) {
     if usage.total_tokens > 0 {
         eprintln!(
             "tokens: prompt={} completion={} total={}",
             usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
         );
+        if let Some(pricing) = pricing_for(model) {
+            let cost = pricing.cost_usd(usage);
+            eprintln!("cost: ${:.4} ({})", cost, model);
+        }
     }
 }
 
@@ -148,7 +152,7 @@ async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
     if let Some(msg) = outcome.final_message {
         println!("\n=== final ===\n{msg}");
     }
-    print_usage(outcome.total_usage);
+    print_usage(outcome.total_usage, &config.model);
     Ok(())
 }
 
@@ -178,7 +182,7 @@ async fn repl(config: Config) -> anyhow::Result<()> {
                 if let Some(msg) = outcome.final_message {
                     println!("\n=== final ===\n{msg}\n");
                 }
-                print_usage(outcome.total_usage);
+                print_usage(outcome.total_usage, &config.model);
             }
             Err(e) => {
                 eprintln!("error: {e}");
