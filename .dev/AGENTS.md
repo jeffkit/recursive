@@ -61,11 +61,47 @@ tests/
    - Use `write_file` only for: brand-new files, or whole-file rewrites
      when you have read the entire current contents and intentionally
      want to replace them.
+   - **V4A patch format — read this carefully, it is NOT unified diff:**
+     - The `@@` lines are **optional anchors** containing a *unique line of
+       source code* that already exists in the file. They disambiguate
+       when the same context block appears more than once. They are NOT
+       hunk headers with line numbers. Do not write `@@ -14,6 +14,28 @@`
+       — that is unified-diff syntax and `apply_patch` will reject it.
+     - Each `*** Update File: <path>` block must appear AT MOST ONCE per
+       patch. To make multiple edits to the same file, put multiple hunks
+       (each optionally preceded by its own `@@ anchor`) inside one
+       `*** Update File:` block.
+     - Worked example, editing `src/llm/mod.rs` to add a struct after the
+       `pub use openai::OpenAiProvider;` line:
+       ```
+       *** Begin Patch
+       *** Update File: src/llm/mod.rs
+       @@ pub use openai::OpenAiProvider;
+        pub use openai::OpenAiProvider;
+
+       +/// New thing.
+       +pub struct NewThing;
+       +
+        /// JSON-schema description of a tool, sent verbatim to the model.
+       *** End Patch
+       ```
+       Note: the `@@` line cites an existing line of code; the lines after
+       it that start with a space are unchanged context that must match
+       the file byte-for-byte; `+` adds; `-` removes.
 6. After writing code, **always**:
    ```
    run_shell: cargo build 2>&1 | tail -40
    run_shell: cargo test 2>&1 | tail -40
+   run_shell: cargo fmt --all
+   run_shell: cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -40
    ```
+   All four must be green before you stop. `-D warnings` means even a
+   clippy *warning* will fail the build. Common fix patterns:
+   - `clippy::should_implement_trait` (method named `add` / `sub` / …):
+     either rename the method (e.g. `add` → `accumulate`) or implement the
+     corresponding `std::ops` trait. Both are acceptable.
+   - `clippy::needless_borrow`, `clippy::redundant_clone`: just apply the
+     suggested fix; these are mechanical.
 7. If something fails, read the error, fix it, repeat. Do not declare success
    on a red build.
 8. When done, write a final message that lists: files touched, what was added,

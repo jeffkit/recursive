@@ -23,8 +23,8 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Saturating element-wise add. Used to accumulate across LLM calls.
-    pub fn add(self, other: TokenUsage) -> TokenUsage {
+    /// Saturating element-wise sum. Used to accumulate across LLM calls.
+    pub fn accumulate(self, other: TokenUsage) -> TokenUsage {
         TokenUsage {
             prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
             completion_tokens: self.completion_tokens.saturating_add(other.completion_tokens),
@@ -33,6 +33,10 @@ impl TokenUsage {
     }
 }
 ```
+
+(Don't call this method `add`; clippy's `should_implement_trait` lint will
+reject any custom method named like a `std::ops` trait method under the
+crate's `-D warnings` policy.)
 
 ### 2. Extend `Completion`
 
@@ -105,7 +109,7 @@ and after every `self.llm.complete(...)` returns, do:
 
 ```rust
 if let Some(u) = completion.usage {
-    total_usage = total_usage.add(u);
+    total_usage = total_usage.accumulate(u);
 }
 ```
 
@@ -144,7 +148,7 @@ Don't add new CLI flags — this is information that should just appear.
 
 In `src/llm/mod.rs` or a sibling test module:
 
-1. `TokenUsage::add` is saturating and commutative.
+1. `TokenUsage::accumulate` is saturating and commutative.
 2. `TokenUsage::default()` is all zeros.
 
 In `src/llm/openai.rs` tests:
