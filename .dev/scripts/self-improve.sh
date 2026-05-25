@@ -221,10 +221,13 @@ set -e
 
 # ---- Post-run verification + commit/reset ----------------------------------
 
-verdict_and_exit() {
+# Append the ## Result footer to the journal. Always called *before* any
+# git operations, so the journal change can be folded into the same commit
+# (or be wiped by reset, or be on its own — but never left as dirty residue
+# after the script returns).
+append_result_footer() {
   local verdict="$1"
   local detail="$2"
-
   {
     echo "## Result"
     echo ""
@@ -236,6 +239,13 @@ verdict_and_exit() {
     git status --short
     echo '```'
   } >> "$LOG"
+}
+
+verdict_and_exit() {
+  local verdict="$1"
+  local detail="$2"
+
+  append_result_footer "$verdict" "$detail"
 
   case "$verdict" in
     committed)
@@ -299,13 +309,18 @@ fi
 PRODUCT_CHANGES="$(git status --porcelain | grep -vE '^.. \.dev/journal/' || true)"
 
 if [[ -z "$PRODUCT_CHANGES" ]]; then
+  # Append the result footer first so it gets folded into the same commit.
+  append_result_footer "skip-commit" "agent succeeded but made no product changes"
   # Still commit any journal (untracked transcript) so the tree is clean
   # for the next run.
   if [[ -n "$(git status --porcelain)" ]]; then
     git add -A
     git commit --quiet -m "dev: journal — run ${TS} (no product changes)"
   fi
-  verdict_and_exit "skip-commit" "agent succeeded but made no product changes"
+  echo ""
+  echo "=== ✓ agent succeeded but made no product changes; journal committed ==="
+  echo "=== journaled to ${LOG} ==="
+  exit 0
 fi
 
 if [[ "${RECURSIVE_NO_COMMIT:-0}" == "1" ]]; then
