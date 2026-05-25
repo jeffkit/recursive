@@ -82,6 +82,23 @@ impl TranscriptFile {
         }
         out
     }
+
+    /// Return the first `n` messages (`None` if `n` exceeds the count).
+    /// `n == 0` returns an empty slice, useful for "start fresh but
+    /// preserve nothing" callers.
+    pub fn take_first_n(&self, n: usize) -> Option<&[Message]> {
+        if n > self.messages.len() {
+            None
+        } else {
+            Some(&self.messages[..n])
+        }
+    }
+
+    /// Expose the messages slice for callers that need full access (e.g.
+    /// `replay --resume-from N` printing context before continuing).
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
 }
 
 // Tiny RFC3339-ish timestamp without pulling in `chrono`. Format:
@@ -241,5 +258,32 @@ mod tests {
         let output = file.pretty();
         assert!(output.contains("--- [0] User ---"));
         // No crash; section header still present
+    }
+
+    #[test]
+    fn take_first_n_returns_prefix() {
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("usr".to_string()),
+            Message::assistant("asst".to_string()),
+        ];
+        let file = TranscriptFile::new(messages, 3, None);
+        let prefix = file.take_first_n(2).expect("n=2 fits");
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(prefix[0].content, "sys");
+        assert_eq!(prefix[1].content, "usr");
+    }
+
+    #[test]
+    fn take_first_n_zero_returns_empty_slice() {
+        let file = TranscriptFile::new(vec![Message::user("x".to_string())], 1, None);
+        let prefix = file.take_first_n(0).expect("n=0 always valid");
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn take_first_n_too_large_returns_none() {
+        let file = TranscriptFile::new(vec![Message::user("only".to_string())], 1, None);
+        assert!(file.take_first_n(2).is_none());
     }
 }

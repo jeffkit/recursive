@@ -73,10 +73,19 @@ enum Cmd {
     Repl,
     /// Print registered tool specs as JSON (sanity check).
     Tools,
-    /// Pretty-print a previously saved transcript JSON file.
+    /// Pretty-print a previously saved transcript JSON file, or resume a
+    /// run from a saved transcript when `--resume-from N <goal>` is given.
     Replay {
         /// Path to the transcript JSON file (as written by --transcript-out).
         path: PathBuf,
+        /// Take the first N messages of the saved transcript as seed
+        /// context for a new run. Requires a trailing <goal>.
+        #[arg(long)]
+        resume_from: Option<usize>,
+        /// Goal for the resumed run. Required when --resume-from is given;
+        /// ignored otherwise.
+        #[arg(trailing_var_arg = true)]
+        goal: Vec<String>,
     },
 }
 
@@ -115,10 +124,40 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Repl => repl(config, cli.max_transcript_chars, cli.json).await,
-        Cmd::Replay { path } => {
+        Cmd::Replay {
+            path,
+            resume_from,
+            goal,
+        } => {
             let file = recursive::TranscriptFile::read_from(&path)?;
-            print!("{}", file.pretty());
-            Ok(())
+            match resume_from {
+                None => {
+                    print!("{}", file.pretty());
+                    Ok(())
+                }
+                Some(_) if goal.is_empty() => {
+                    anyhow::bail!(
+                        "--resume-from requires a trailing <goal> to continue the run"
+                    );
+                }
+                Some(n) => {
+                    let seed = file.take_first_n(n).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--resume-from {n} exceeds saved transcript length ({})",
+                            file.messages().len()
+                        )
+                    })?;
+                    run_resumed(
+                        config,
+                        seed.to_vec(),
+                        goal.join(" "),
+                        cli.max_transcript_chars,
+                        cli.transcript_out,
+                        cli.json,
+                    )
+                    .await
+                }
+            }
         }
     }
 }
@@ -149,6 +188,14 @@ fn build_agent(
     config: &Config,
     max_transcript_chars: Option<usize>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
+    build_agent_seeded(config, max_transcript_chars, Vec::new())
+}
+
+fn build_agent_seeded(
+    config: &Config,
+    max_transcript_chars: Option<usize>,
+    seed: Vec<recursive::message::Message>,
+) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     let retry = RetryPolicy {
         max_retries: config.retry_max,
@@ -170,6 +217,9 @@ fn build_agent(
         .events(tx);
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
+    }
+    if !seed.is_empty() {
+        builder = builder.seed_transcript(seed);
     }
     let agent = builder.build()?;
     Ok((agent, rx))
@@ -195,6 +245,50 @@ fn print_finish_note(finish: &FinishReason) {
             chars, limit
         );
     }
+}
+
+async fn run_resumed(
+    config: Config,
+    seed: Vec<recursive::message::Message>,
+    goal: String,
+    max_transcript_chars: Option<usize>,
+    transcript_out: Option<PathBuf>,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    let seed_len = seed.len();
+    let (mut agent, rx) = build_agent_seeded(&config, max_transcript_chars, seed)?;
+    if !json_mode {
+        eprintln!("resuming from {seed_len} seeded message(s)");
+    }
+    let printer = if json_mode {
+        tokio::spawn(stream_events_json(rx))
+    } else {
+        tokio::spawn(stream_events(rx))
+    };
+    let outcome = agent.run(goal).await?;
+    drop(agent);
+    printer.await.ok();
+    if !json_mode {
+        if let Some(msg) = outcome.final_message {
+            println!("\n=== final ===\n{msg}");
+        }
+        print_usage(outcome.total_usage, &config.model);
+        print_finish_note(&outcome.finish);
+    }
+    if let Some(path) = transcript_out {
+        let file = TranscriptFile::new(
+            outcome.transcript.clone(),
+            outcome.steps,
+            Some(config.model.clone()),
+        );
+        file.write_to(&path)?;
+        eprintln!(
+            "transcript: wrote {} messages to {}",
+            outcome.transcript.len(),
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn run_once(

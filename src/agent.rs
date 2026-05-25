@@ -267,6 +267,7 @@ pub struct AgentBuilder {
     max_steps: Option<usize>,
     max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
+    seed: Vec<Message>,
 }
 
 impl AgentBuilder {
@@ -294,6 +295,14 @@ impl AgentBuilder {
         self.events = Some(tx);
         self
     }
+    /// Seed the agent with a pre-existing transcript. Seeded messages are
+    /// placed in the transcript *after* the system prompt but *before* the
+    /// new goal. No `StepEvent`s are emitted for seeded messages; only events
+    /// produced during the new run are streamed.
+    pub fn seed_transcript(mut self, messages: Vec<Message>) -> Self {
+        self.seed = messages;
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self
             .llm
@@ -302,6 +311,7 @@ impl AgentBuilder {
         if let Some(sys) = self.system {
             transcript.push(Message::system(sys));
         }
+        transcript.extend(self.seed);
         Ok(Agent {
             llm,
             tools: self.tools,
@@ -786,5 +796,65 @@ mod tests {
         let json = serde_json::to_string(&fr).unwrap();
         let back: FinishReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, fr);
+    }
+
+    #[tokio::test]
+    async fn seeded_transcript_lands_before_new_goal() {
+        let seed = vec![
+            Message::system("sys".to_string()),
+            Message::user("old goal".to_string()),
+            Message::assistant("old reply".to_string()),
+        ];
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "fresh reply".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .seed_transcript(seed)
+            .build()
+            .unwrap();
+        let out = agent.run("new goal").await.unwrap();
+        // seed (3) + new user goal + new assistant reply = 5
+        assert_eq!(out.transcript.len(), 5);
+        assert_eq!(out.transcript[0].content, "sys");
+        assert_eq!(out.transcript[1].content, "old goal");
+        assert_eq!(out.transcript[2].content, "old reply");
+        assert_eq!(out.transcript[3].content, "new goal");
+        assert_eq!(out.transcript[4].content, "fresh reply");
+    }
+
+    #[tokio::test]
+    async fn seed_transcript_does_not_emit_events_for_seed() {
+        let seed = vec![
+            Message::user("old goal".to_string()),
+            Message::assistant("old reply".to_string()),
+        ];
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "fresh".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .seed_transcript(seed)
+            .events(tx)
+            .build()
+            .unwrap();
+        agent.run("new goal").await.unwrap();
+        let mut kinds: Vec<&'static str> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(match ev {
+                StepEvent::AssistantText { .. } => "text",
+                StepEvent::Finished { .. } => "done",
+                _ => "other",
+            });
+        }
+        // Only events from the new run; nothing fired for seeded messages.
+        assert_eq!(kinds, vec!["text", "done"]);
     }
 }
