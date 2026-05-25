@@ -14,12 +14,14 @@ use crate::llm::ToolSpec;
 pub mod apply_patch;
 pub mod fs;
 pub mod load_skill;
+pub mod memory;
 pub mod search;
 pub mod shell;
 
 pub use apply_patch::ApplyPatch;
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use load_skill::LoadSkill;
+pub use memory::{Forget, Recall, Remember};
 pub use search::SearchFiles;
 pub use shell::RunShell;
 
