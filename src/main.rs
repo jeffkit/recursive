@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::Level;
 
+use recursive::config::load_project_context;
 use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::{
     config::Config,
@@ -264,10 +265,26 @@ fn build_agent_seeded(
     let provider: Arc<dyn LlmProvider> = Arc::new(openai);
     let tools = build_tools(config);
     let skills = discover_loaded_skills(config);
-    let system_prompt = if skills.is_empty() {
-        config.system_prompt.clone()
-    } else {
-        format!("{}\n{}", config.system_prompt, skill_index(&skills))
+
+    // Load project context from AGENTS.md if present
+    let project_context = load_project_context(&config.workspace);
+    let system_prompt = match (&project_context, skills.is_empty()) {
+        (Some(ctx), true) => {
+            format!(
+                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}",
+                ctx, config.system_prompt
+            )
+        }
+        (Some(ctx), false) => {
+            format!(
+                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}\n{}",
+                ctx,
+                config.system_prompt,
+                skill_index(&skills)
+            )
+        }
+        (None, true) => config.system_prompt.clone(),
+        (None, false) => format!("{}\n{}", config.system_prompt, skill_index(&skills)),
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let mut builder = Agent::builder()

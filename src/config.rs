@@ -4,7 +4,7 @@
 //! defaults make the binary runnable with just `RECURSIVE_API_KEY` and
 //! `RECURSIVE_MODEL` set.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -140,6 +140,43 @@ pub fn default_system_prompt() -> String {
     .join("\n")
 }
 
+/// Maximum size for project context file (AGENTS.md) in bytes.
+/// 16 KB is enough for a detailed project context without blowing
+/// the context window.
+const MAX_PROJECT_CONTEXT_SIZE: usize = 16 * 1024;
+
+/// Load project context from AGENTS.md at workspace root.
+///
+/// Returns the file content if present, truncated to 16 KB with a
+/// marker if larger. Returns None if absent.
+pub fn load_project_context(workspace: &Path) -> Option<String> {
+    let path = workspace.join("AGENTS.md");
+    if !path.exists() {
+        return None;
+    }
+
+    let metadata = std::fs::metadata(&path).ok()?;
+    let file_size = metadata.len() as usize;
+
+    if file_size <= MAX_PROJECT_CONTEXT_SIZE {
+        let content = std::fs::read_to_string(&path).ok()?;
+        Some(content)
+    } else {
+        // File is too large: read first 16 KB and append truncation marker
+        let mut file = std::fs::File::open(&path).ok()?;
+        use std::io::Read;
+        let mut buffer = vec![0u8; MAX_PROJECT_CONTEXT_SIZE];
+        let bytes_read = file.read(&mut buffer).ok()?;
+        buffer.truncate(bytes_read);
+        let content = String::from_utf8_lossy(&buffer).to_string();
+        let truncated_msg = format!(
+            "\n\n[…truncated, AGENTS.md is {} KB; consider trimming for fresh agent sessions]",
+            file_size / 1024
+        );
+        Some(content + &truncated_msg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +294,41 @@ mod tests {
         } else {
             std::env::remove_var("RECURSIVE_SHELL_TIMEOUT_SECS");
         }
+    }
+
+    // Tests for load_project_context
+    #[test]
+    fn test_a_load_project_context_with_small_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("AGENTS.md");
+        std::fs::write(&path, "# Project Context\n\nHello world").expect("write");
+
+        let content = load_project_context(tmp.path());
+        assert!(content.is_some());
+        assert!(content.unwrap().contains("Hello world"));
+    }
+
+    #[test]
+    fn test_b_load_project_context_truncates_large_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("AGENTS.md");
+        // Write 20 KB of content
+        let large_content = "x".repeat(20 * 1024);
+        std::fs::write(&path, large_content).expect("write");
+
+        let content = load_project_context(tmp.path());
+        assert!(content.is_some());
+        let c = content.unwrap();
+        // Should contain truncation marker
+        assert!(c.contains("truncated"));
+        assert!(c.contains("20 KB"));
+    }
+
+    #[test]
+    fn test_c_load_project_context_none_when_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No AGENTS.md file
+        let content = load_project_context(tmp.path());
+        assert!(content.is_none());
     }
 }
