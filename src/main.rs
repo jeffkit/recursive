@@ -205,11 +205,19 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
     let lvl: Level = level.parse().context("invalid log level")?;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(lvl.to_string()));
-    tracing_subscriber::fmt()
+    let mut layer = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .compact()
-        .init();
+        .with_writer(std::io::stderr)
+        .compact();
+    // Opt-in span timings: when RECURSIVE_TRACE_SPANS=1, emit a line on
+    // each instrumented function's close with its elapsed duration. This
+    // lights up the spans added in goal-42 without forcing telemetry
+    // overhead on every default invocation.
+    if std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1") {
+        layer = layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+    }
+    layer.init();
     Ok(())
 }
 
@@ -401,6 +409,17 @@ async fn build_agent(
     }
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
+    }
+    // Optional Compactor wiring. Default off; set
+    // RECURSIVE_COMPACT_THRESHOLD=<chars> to enable. When the transcript
+    // grows past `chars` characters, the agent asks the model to
+    // summarize older messages, freeing context budget.
+    if let Ok(threshold) = std::env::var("RECURSIVE_COMPACT_THRESHOLD") {
+        if let Ok(n) = threshold.parse::<usize>() {
+            if n > 0 {
+                builder = builder.compactor(recursive::Compactor::new(n));
+            }
+        }
     }
     builder = builder.streaming(stream);
     let agent = builder.build()?;

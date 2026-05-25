@@ -1,7 +1,11 @@
 /target
 **/*.rs.bk
 Cargo.lock.bak
-.recursive/
+# Ignore per-workspace runtime state (memory, mcp cache, etc.) but
+# allow committing example/shipped skills. Parent dir must use /*
+# (not trailing /) so the negation below can re-include children.
+.recursive/*
+!.recursive/skills/
 .env
 .envrc.local
 

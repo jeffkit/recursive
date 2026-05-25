@@ -181,6 +181,21 @@ echo "[self-improve] provider=$SELECTED_PROVIDER  model=${RECURSIVE_MODEL}" >&2
 export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-200}"
 RECURSIVE_AUTO_RESUME="${RECURSIVE_AUTO_RESUME:-1}"
 
+# Dogfood feature wiring. Each variable defaults to "exercise the
+# feature so latent bugs surface during self-improve runs". Override
+# in the environment if a goal needs the feature disabled.
+#
+# Context compaction (g31): when the transcript exceeds this many
+# characters, the agent asks the model to summarize older messages.
+# 200000 chars ≈ 50K tokens; large enough that easy goals never
+# trigger it, but big enough that long runs (g37/g42-style) will.
+export RECURSIVE_COMPACT_THRESHOLD="${RECURSIVE_COMPACT_THRESHOLD:-200000}"
+
+# OpenTelemetry-style span timings (g42): emit a stderr line at each
+# instrumented function's close with its duration. Cheap, visible,
+# helps debug "where did 30 sec go" without a real OTLP exporter.
+export RECURSIVE_TRACE_SPANS="${RECURSIVE_TRACE_SPANS:-1}"
+
 # Use release build if available, else dev.
 if [[ -x ./target/release/recursive ]]; then
   BIN=./target/release/recursive
