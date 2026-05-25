@@ -6,10 +6,26 @@ files in this folder; this index is the side-by-side comparison.
 
 ## Successful runs
 
-| goal | provider | model | steps | tool calls | err results | apply:write | reason |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 04 token-usage | minimax | MiniMax-M2 | 43 | 42 | 10 | 10:7 | NoMoreToolCalls |
-| 05 apply-patch-unified | deepseek | deepseek-chat | 23 | 23 | 6 | 6:3 | NoMoreToolCalls |
+| goal | provider | model | steps | tool calls | err results | apply:write | cost USD | reason |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 04 token-usage | minimax | MiniMax-M2 | 43 | 42 | 10 | 10:7 | (no tracking) | NoMoreToolCalls |
+| 05 apply-patch-unified | deepseek | deepseek-chat | 23 | 23 | 6 | 6:3 | (no tracking) | NoMoreToolCalls |
+| 06 cost-estimation | minimax | MiniMax-M2 | 29 | 29 | 9 | 9:4 | ~$0.38 | NoMoreToolCalls |
+
+## Key insight: prompt-token amplification
+
+Goal 06 (MiniMax) consumed **1,240,880 prompt tokens** vs only **9,028
+completion tokens** across 29 steps — a **137:1 ratio**. The full
+system prompt + accumulated transcript is re-sent on every LLM call.
+That means the marginal cost per *agent step* is essentially the
+**transcript at that point in time**, not "input + output of one
+message".
+
+Practical consequence: a goal that costs $0.38 on MiniMax could be
+much cheaper if we trimmed the journal context in the system prompt,
+or if we used a cache-aware provider (DeepSeek charges cache-hit at
+~10× less). This points squarely at the next observation we want:
+re-run the same goal on DeepSeek and compare.
 
 ## Observations so far
 
@@ -38,6 +54,23 @@ files in this folder; this index is the side-by-side comparison.
 - Outcome: implemented `normalize_hunk_header` plus 9 unified-diff tests
   (4 more than the 5 the goal required — added empty/whitespace/non-unified
   edge cases on its own).
+
+### MiniMax-M2 — goal 06 (cost estimation)
+
+- **29 steps** out of 50 budget (58%) — comfortable margin.
+- **9 errors** — mostly apply_patch anchor mismatches during the
+  middle of the implementation; recovered each time.
+- **apply_patch:write_file = 9:4** — better discipline than goal-04
+  (10:7) without giving up the four legitimate write_file uses (new
+  test file content, full re-edit of `print_usage`).
+- **Cost: $0.3831 USD** (prompt 1,240,880 @ \$0.30/M + completion
+  9,028 @ \$1.20/M). First cycle where we have a real dollar figure
+  to compare against future runs.
+- Outcome: shipped `ModelPricing` + `pricing_for` + CLI cost line.
+  3 product files changed, 5 new tests, 81 total green.
+- Goal phrasing did its job: agent stuck to the listed files
+  (`src/llm/mod.rs`, `src/lib.rs`, `src/main.rs`), used `apply_patch`
+  for the existing files as instructed, and didn't sprawl.
 
 ## Caveats
 
