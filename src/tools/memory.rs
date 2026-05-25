@@ -1,0 +1,623 @@
+//! Persistent memory tools: `remember`, `recall`, `forget`.
+//!
+//! Notes are stored in `<workspace>/.recursive/memory.json` (or
+//! `~/.recursive/memory.json` if `RECURSIVE_MEMORY_GLOBAL=1`).
+//! Schema:
+//! ```json
+//! { "notes": [ { "id": "N1", "tags": ["rust"], "text": "...", "ts": "..." } ] }
+//! ```
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use crate::error::{Error, Result};
+use crate::llm::ToolSpec;
+use crate::tools::Tool;
+
+/// A single memory note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Note {
+    pub id: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub text: String,
+    pub ts: String,
+}
+
+/// The on-disk store.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryStore {
+    pub notes: Vec<Note>,
+}
+
+impl MemoryStore {
+    /// Load from a path, returning an empty store if the file doesn't exist.
+    fn load(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path).map_err(|e| Error::Tool {
+            name: "memory".into(),
+            message: format!("failed to read memory file: {e}"),
+        })?;
+        serde_json::from_str(&raw).map_err(|e| Error::Tool {
+            name: "memory".into(),
+            message: format!("malformed memory file: {e}"),
+        })
+    }
+
+    /// Save to disk, creating parent directories if needed.
+    fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
+                name: "memory".into(),
+                message: format!("failed to create memory directory: {e}"),
+            })?;
+        }
+        let raw = serde_json::to_string_pretty(self).map_err(|e| Error::Tool {
+            name: "memory".into(),
+            message: format!("failed to serialize memory: {e}"),
+        })?;
+        std::fs::write(path, raw).map_err(|e| Error::Tool {
+            name: "memory".into(),
+            message: format!("failed to write memory file: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Generate the next monotonic ID.
+    fn next_id(&self) -> String {
+        let max = self
+            .notes
+            .iter()
+            .filter_map(|n| n.id.strip_prefix('N'))
+            .filter_map(|s| s.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        format!("N{}", max + 1)
+    }
+
+    /// Add a note, returning its ID.
+    fn add(&mut self, text: String, tags: Vec<String>) -> String {
+        let id = self.next_id();
+        let ts = chrono_now_rfc3339();
+        self.notes.push(Note {
+            id: id.clone(),
+            tags,
+            text,
+            ts,
+        });
+        id
+    }
+
+    /// Remove a note by ID. Returns true if found.
+    fn remove(&mut self, id: &str) -> bool {
+        let before = self.notes.len();
+        self.notes.retain(|n| n.id != id);
+        self.notes.len() < before
+    }
+
+    /// Search notes by query (case-insensitive substring in text or tags)
+    /// or by exact tag match. Returns up to `limit` results, most recent first.
+    fn search(&self, query: Option<&str>, tag: Option<&str>, limit: usize) -> Vec<&Note> {
+        let mut results: Vec<&Note> = self
+            .notes
+            .iter()
+            .filter(|n| {
+                let matches_query = query.map_or(true, |q| {
+                    let q_lower = q.to_lowercase();
+                    n.text.to_lowercase().contains(&q_lower)
+                        || n.tags.iter().any(|t| t.to_lowercase().contains(&q_lower))
+                });
+                let matches_tag = tag.map_or(true, |t| n.tags.iter().any(|nt| nt == t));
+                matches_query && matches_tag
+            })
+            .collect();
+        // Most recent first (reverse chronological)
+        results.reverse();
+        results.truncate(limit);
+        results
+    }
+}
+
+/// Get an RFC 3339 timestamp string.
+fn chrono_now_rfc3339() -> String {
+    // Use std::time to build a simple UTC timestamp without chrono dependency.
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    // Format as ISO 8601 / RFC 3339
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+
+    // Compute year/month/day from days since epoch (simplified)
+    let (year, month, day) = days_to_date(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+/// Uses a simple leap-year-aware algorithm.
+fn days_to_date(mut days: u64) -> (u64, u64, u64) {
+    // Start from 1970-01-01
+    let mut year: u64 = 1970;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let months_days: [u64; 12] = if is_leap(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month: u64 = 1;
+    for &md in &months_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+    let day = days + 1; // 1-indexed
+    (year, month, day)
+}
+
+fn is_leap(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Determine the memory file path based on workspace and env var.
+pub fn memory_path(workspace: &std::path::Path) -> PathBuf {
+    if std::env::var("RECURSIVE_MEMORY_GLOBAL").as_deref() == Ok("1") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".recursive").join("memory.json");
+        }
+    }
+    workspace.join(".recursive").join("memory.json")
+}
+
+/// Load the memory store from the workspace-relative path.
+pub fn load_memory(workspace: &std::path::Path) -> Result<MemoryStore> {
+    let path = memory_path(workspace);
+    MemoryStore::load(&path)
+}
+
+/// Build a memory summary string for injection into the system prompt.
+/// Returns the top N most recent notes as a formatted block, or empty
+/// string if no notes exist.
+pub fn memory_summary(workspace: &std::path::Path, limit: usize) -> String {
+    let store = match load_memory(workspace) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    if store.notes.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("# Memory (top {} most recent notes; use `recall` for more)".to_string());
+    // Most recent first
+    let mut notes: Vec<&Note> = store.notes.iter().collect();
+    notes.reverse();
+    for note in notes.iter().take(limit) {
+        let tags_str = if note.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", note.tags.join(","))
+        };
+        // Truncate long text for the summary
+        let text_preview = if note.text.len() > 120 {
+            format!("{}...", &note.text[..117])
+        } else {
+            note.text.clone()
+        };
+        lines.push(format!("- {}{} {}", note.id, tags_str, text_preview));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Tool implementations
+// ---------------------------------------------------------------------------
+
+pub struct Remember {
+    workspace: PathBuf,
+    /// Mutex for thread-safe access to the memory file.
+    lock: Mutex<()>,
+}
+
+impl Remember {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            lock: Mutex::new(()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Remember {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "remember".into(),
+            description: "Save a note to persistent memory. The note will be available in future sessions via `recall` or injected into the system prompt.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The note text to remember"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for categorising the note"
+                    }
+                },
+                "required": ["text"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let text = arguments["text"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "remember".into(),
+                message: "missing required parameter: text".to_string(),
+            })?
+            .to_string();
+
+        let tags: Vec<String> = arguments["tags"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let _guard = self.lock.lock().unwrap();
+        let path = memory_path(&self.workspace);
+        let mut store = MemoryStore::load(&path)?;
+        let id = store.add(text, tags);
+        store.save(&path)?;
+        Ok(format!("saved note {id}"))
+    }
+}
+
+pub struct Recall {
+    workspace: PathBuf,
+}
+
+impl Recall {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Recall {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "recall".into(),
+            description: "Search persistent memory for notes matching a query or tag. Returns up to `limit` results, most recent first.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Case-insensitive substring to search for in note text or tags"
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Exact tag to filter by"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 10)",
+                        "default": 10
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let query = arguments["query"].as_str();
+        let tag = arguments["tag"].as_str();
+        let limit = arguments["limit"].as_i64().unwrap_or(10) as usize;
+
+        let path = memory_path(&self.workspace);
+        let store = MemoryStore::load(&path)?;
+        let results = store.search(query, tag, limit);
+
+        if results.is_empty() {
+            return Ok("no matching notes found".to_string());
+        }
+
+        let lines: Vec<String> = results
+            .iter()
+            .map(|n| {
+                let tags_str = if n.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", n.tags.join(","))
+                };
+                format!("{}{} {}", n.id, tags_str, n.text)
+            })
+            .collect();
+
+        Ok(lines.join("\n"))
+    }
+}
+
+pub struct Forget {
+    workspace: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl Forget {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            lock: Mutex::new(()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Forget {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "forget".into(),
+            description: "Remove a note from persistent memory by its ID.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The ID of the note to remove (e.g. N3)"
+                    }
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let id = arguments["id"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "forget".into(),
+                message: "missing required parameter: id".to_string(),
+            })?
+            .to_string();
+
+        let _guard = self.lock.lock().unwrap();
+        let path = memory_path(&self.workspace);
+        let mut store = MemoryStore::load(&path)?;
+        if store.remove(&id) {
+            store.save(&path)?;
+            Ok(format!("removed {id}"))
+        } else {
+            Ok(format!("no such id: {id}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Helper: create a temporary workspace dir.
+    fn tmp_workspace() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        (tmp, ws)
+    }
+
+    #[test]
+    fn test_a_remember_then_recall() {
+        let (_tmp, ws) = tmp_workspace();
+        let remember = Remember::new(&ws);
+        let recall = Recall::new(&ws);
+
+        // Remember a note with tags
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({
+                "text": "When testing reqwest-based code, always set explicit timeouts",
+                "tags": ["rust", "testing"]
+            })));
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert!(msg.starts_with("saved note N"), "got: {msg}");
+
+        // Recall by query
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(recall.execute(json!({"query": "reqwest"})));
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("N1"), "output: {output}");
+        assert!(output.contains("reqwest"), "output: {output}");
+        assert!(output.contains("[rust,testing]"), "output: {output}");
+
+        // Recall by tag
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(recall.execute(json!({"tag": "rust"})));
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("N1"));
+    }
+
+    #[test]
+    fn test_b_remember_forget_recall_empty() {
+        let (_tmp, ws) = tmp_workspace();
+        let remember = Remember::new(&ws);
+        let forget = Forget::new(&ws);
+        let recall = Recall::new(&ws);
+
+        // Remember
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": "test note"})))
+            .unwrap();
+
+        // Forget
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(forget.execute(json!({"id": "N1"})));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "removed N1");
+
+        // Recall should be empty
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(recall.execute(json!({})));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "no matching notes found");
+    }
+
+    #[test]
+    fn test_c_malformed_json_errors_cleanly() {
+        let (_tmp, ws) = tmp_workspace();
+        let path = memory_path(&ws);
+        // Write invalid JSON
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "this is not json").unwrap();
+        drop(f);
+
+        let recall = Recall::new(&ws);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(recall.execute(json!({})));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("malformed memory file"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_no_memory_file_returns_empty() {
+        let (_tmp, ws) = tmp_workspace();
+        let recall = Recall::new(&ws);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(recall.execute(json!({})));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "no matching notes found");
+    }
+
+    #[test]
+    fn test_remember_no_tags() {
+        let (_tmp, ws) = tmp_workspace();
+        let remember = Remember::new(&ws);
+        let recall = Recall::new(&ws);
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": "plain note"})))
+            .unwrap();
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(recall.execute(json!({"query": "plain"})));
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("N1"));
+        // No tags bracket
+        assert!(!output.contains("[]"));
+    }
+
+    #[test]
+    fn test_forget_nonexistent_id() {
+        let (_tmp, ws) = tmp_workspace();
+        let forget = Forget::new(&ws);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(forget.execute(json!({"id": "N99"})));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "no such id: N99");
+    }
+
+    #[test]
+    fn test_memory_summary_empty() {
+        let (_tmp, ws) = tmp_workspace();
+        let summary = memory_summary(&ws, 5);
+        assert_eq!(summary, "");
+    }
+
+    #[test]
+    fn test_memory_summary_with_notes() {
+        let (_tmp, ws) = tmp_workspace();
+        let remember = Remember::new(&ws);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": "first note", "tags": ["a"]})))
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": "second note", "tags": ["b"]})))
+            .unwrap();
+
+        let summary = memory_summary(&ws, 5);
+        assert!(!summary.is_empty());
+        assert!(summary.contains("N2"));
+        assert!(summary.contains("second note"));
+        assert!(summary.contains("N1"));
+        assert!(summary.contains("first note"));
+        // N2 should appear before N1 (most recent first)
+        let n2_pos = summary.find("N2").unwrap();
+        let n1_pos = summary.find("N1").unwrap();
+        assert!(n2_pos < n1_pos, "most recent note should come first");
+    }
+
+    #[test]
+    fn test_days_to_date() {
+        // Unix epoch
+        assert_eq!(days_to_date(0), (1970, 1, 1));
+        // 2026-05-25 (approx 20593 days from epoch)
+        let may_25_2026 = days_between(1970, 1, 1, 2026, 5, 25);
+        assert_eq!(days_to_date(may_25_2026), (2026, 5, 25));
+    }
+
+    /// Count days between two dates (naive, for testing).
+    fn days_between(y1: u64, m1: u64, d1: u64, y2: u64, m2: u64, d2: u64) -> u64 {
+        fn days_since_epoch(y: u64, m: u64, d: u64) -> u64 {
+            let mut total = 0u64;
+            for yr in 1970..y {
+                total += if is_leap(yr) { 366 } else { 365 };
+            }
+            let months_days: [u64; 12] = if is_leap(y) {
+                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            } else {
+                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            };
+            for md in months_days.iter().take((m - 1) as usize) {
+                total += md;
+            }
+            total += d - 1;
+            total
+        }
+        days_since_epoch(y2, m2, d2) - days_since_epoch(y1, m1, d1)
+    }
+}

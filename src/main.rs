@@ -19,7 +19,9 @@ use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
+    tools::memory::memory_summary,
     tools::{ApplyPatch, ListDir, LoadSkill, ReadFile, RunShell, SearchFiles, WriteFile},
+    tools::{Forget, Recall, Remember},
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
 
@@ -212,6 +214,10 @@ fn build_tools(config: &Config) -> ToolRegistry {
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
         .register(Arc::new(SearchFiles::new(root)));
+    registry = registry
+        .register(Arc::new(Remember::new(root)))
+        .register(Arc::new(Recall::new(root)))
+        .register(Arc::new(Forget::new(root)));
     let skills = discover_loaded_skills(config);
     if !skills.is_empty() {
         registry = registry.register(Arc::new(LoadSkill::new(skills)));
@@ -268,6 +274,13 @@ fn build_agent_seeded(
         config.system_prompt.clone()
     } else {
         format!("{}\n{}", config.system_prompt, skill_index(&skills))
+    };
+    // Inject memory summary (top 5 most recent notes) into the system prompt
+    let memory_block = memory_summary(&config.workspace, 5);
+    let system_prompt = if memory_block.is_empty() {
+        system_prompt
+    } else {
+        format!("{}\n\n{}", system_prompt, memory_block)
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let mut builder = Agent::builder()
