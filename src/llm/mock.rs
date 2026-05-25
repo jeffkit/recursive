@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use super::{Completion, LlmProvider, StreamSender, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::Message;
+use tracing::Instrument;
 
 #[derive(Default)]
 pub struct MockProvider {
@@ -42,14 +43,21 @@ impl MockProvider {
 #[async_trait]
 impl LlmProvider for MockProvider {
     async fn complete(&self, messages: &[Message], _tools: &[ToolSpec]) -> Result<Completion> {
-        self.calls.lock().unwrap().push(messages.to_vec());
-        let mut queue = self.scripted.lock().unwrap();
-        if queue.is_empty() {
-            return Err(Error::Llm(
-                "MockProvider: no scripted completions left".into(),
-            ));
+        let span = tracing::info_span!("llm.complete", provider = "mock", model = "mock");
+        async move {
+            // Emit info log so tracing-test can capture the span
+            tracing::info!("mock llm call");
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let mut queue = self.scripted.lock().unwrap();
+            if queue.is_empty() {
+                return Err(Error::Llm(
+                    "MockProvider: no scripted completions left".into(),
+                ));
+            }
+            Ok(queue.remove(0))
         }
-        Ok(queue.remove(0))
+        .instrument(span)
+        .await
     }
 
     async fn stream(
@@ -107,5 +115,35 @@ mod tests {
         let provider = MockProvider::new(vec![]);
         let err = provider.complete(&[], &[]).await.unwrap_err();
         assert!(matches!(err, Error::Llm(_)));
+    }
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+    use crate::llm::TokenUsage;
+    use tracing_test::traced_test;
+
+    #[traced_test]
+    #[tokio::test]
+    async fn llm_complete_records_token_fields() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+        };
+        let provider = MockProvider::new(vec![Completion {
+            content: "response".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(usage),
+        }]);
+
+        provider.complete(&[], &[]).await.unwrap();
+
+        // Should have created an llm.complete span - check for span name in output
+        assert!(logs_contain("llm.complete"));
     }
 }

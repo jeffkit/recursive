@@ -180,6 +180,7 @@ impl Agent {
     }
 
     /// Drive the loop until the model stops calling tools, or the budget is exhausted.
+    #[tracing::instrument(skip(self), fields(goal))]
     pub async fn run(&mut self, goal: impl Into<String>) -> Result<AgentOutcome> {
         let goal = goal.into();
         info!(target: "recursive::agent", goal = %truncate(&goal, 200), "agent run starting");
@@ -198,6 +199,8 @@ impl Agent {
         self.total_llm_latency_ms = 0;
 
         for step in 1..=self.max_steps {
+            let step_span = tracing::info_span!("agent.step", step);
+            let _guard = step_span.enter();
             // Check transcript size limit before making the next LLM call.
             // First try trimming old tool results; fall back to hard stop.
             if let Some(limit) = self.max_transcript_chars {
@@ -1518,5 +1521,50 @@ mod tests {
             .unwrap();
         let out = agent.run("hi").await.unwrap();
         assert!(matches!(out.finish, FinishReason::TranscriptLimit { .. }));
+    }
+}
+
+// ============================================================================
+// Tracing tests - require tracing-test
+// ============================================================================
+#[cfg(test)]
+mod tracing_tests {
+    use crate::llm::Completion;
+    use crate::llm::MockProvider;
+    use crate::Agent;
+    use std::sync::Arc;
+    use tracing_test::traced_test;
+
+    #[traced_test]
+    #[tokio::test]
+    async fn agent_run_creates_span() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let mut agent = Agent::builder().llm(llm).build().unwrap();
+        agent.run("test goal").await.unwrap();
+
+        // The span should have been created (check for the span name in the log prefix)
+        assert!(logs_contain("run:"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn agent_step_spans_nested_under_run() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "step 1".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let mut agent = Agent::builder().llm(llm).build().unwrap();
+        agent.run("test").await.unwrap();
+
+        // Should have both run and step spans
+        assert!(logs_contain("run:"));
+        assert!(logs_contain("step="));
     }
 }

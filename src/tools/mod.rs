@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -68,16 +69,22 @@ impl ToolRegistry {
     }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
-        let tool = self
-            .get(name)
-            .ok_or_else(|| Error::UnknownTool(name.into()))?;
-        tool.execute(arguments).await.map_err(|e| match e {
-            Error::Tool { .. } | Error::BadToolArgs { .. } | Error::UnknownTool(_) => e,
-            other => Error::Tool {
-                name: name.into(),
-                message: other.to_string(),
-            },
-        })
+        let args_size = arguments.to_string().len();
+        let span = tracing::info_span!("tool.execute", name = %name, args_size);
+        async move {
+            let tool = self
+                .get(name)
+                .ok_or_else(|| Error::UnknownTool(name.into()))?;
+            tool.execute(arguments).await.map_err(|e| match e {
+                Error::Tool { .. } | Error::BadToolArgs { .. } | Error::UnknownTool(_) => e,
+                other => Error::Tool {
+                    name: name.into(),
+                    message: other.to_string(),
+                },
+            })
+        }
+        .instrument(span)
+        .await
     }
 }
 

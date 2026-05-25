@@ -129,6 +129,10 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    #[tracing::instrument(skip(self, messages, tools), fields(
+        provider = %self.base_url.split('/').next_back().unwrap_or("unknown"),
+        model = %self.model
+    ))]
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let body = build_request(
             &self.model,
