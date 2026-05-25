@@ -21,16 +21,36 @@
 >
 > **Hotfix landed in main `e8fd05a`:** retreat split point until
 > `transcript[split].role != Tool`. +1 regression test
-> (`compaction_keeps_tool_calls_paired_with_results`). Now 232 tests.
+> (`compaction_keeps_tool_calls_paired_with_results`). 234 tests.
 > Invariant #8 codified in `.dev/AGENTS.md` and workspace `AGENTS.md`.
 >
-> **Plan**: wait for g45 + g46 to finish, merge into hotfixed main,
-> then re-launch g43 + g47 from the new baseline.
+> **g46 landed (`20b0164`)**: Compactor now requests structured JSON
+> (`summary`, `kept_facts`, `next_steps`) via `complete_structured`,
+> falls back to free-text on error. g41 plumbing validated end-to-end.
+> $0.37, 23 steps, 98.6% cache hit, branch surgically merged (skipped
+> the agent.rs revert + doc churn).
+>
+> **Wave-3 in flight from hotfixed main `20b0164`** (g45/g47 switched
+> off MiniMax — quota exhausted, resets 20:00 local):
+>
+> | Goal | Provider | PID | Status |
+> |---|---|---|---|
+> | g43 permission-hooks | deepseek | 26931 | running |
+> | g45 session-mgmt | deepseek | 12680 | running |
+> | g47 anthropic-dogfood | deepseek | 18197 | running |
+>
+> **Wave-1/2 carnage**:
+>   - Wave-1: g43 (deepseek HTTP 400 orphan), g45 (minimax empty
+>     body — same bug, different symptom), g47 (minimax empty body),
+>     g46 ✓ won (cherry-picked to main).
+>   - Wave-2: g43 still going from wave-1 actually no — wave-2 was
+>     ALL three from hotfixed main. g45 (minimax empty body, possibly
+>     rate-limit precursor), g47 (minimax explicit 429 — quota burned
+>     by repeated retries).
 >
 > Previously: Batch 14 fully landed — 4/4 green on first attempt,
-> all NoMoreToolCalls, no auto-resume. Tests 214 → 233 (+19 net).
-> Cost ≈ **$3.43**. Then dogfooding wired g31/g33/g36/g42 into
-> self-improve.sh (commits 473b89e, c84485e).
+> all NoMoreToolCalls. Tests 214 → 233 → 234. Cost so far for B15
+> ≈ **$0.37** (g46 only, others rolled back).
 >
 > **Roadmap status after batch 14**:
 > - Phase 1 Foundation: **4/4 done — COMPLETE**
