@@ -250,6 +250,8 @@ mod tests {
             scripts: skill_scripts,
             mode: SkillMode::Manual,
             triggers: vec![],
+            hint: String::new(),
+            sections: vec![],
         }]
     }
 

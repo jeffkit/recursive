@@ -31,12 +31,27 @@ pub struct Skill {
     pub mode: SkillMode,
     /// Trigger words (only relevant when mode == Trigger).
     pub triggers: Vec<String>,
+    /// Hint string for trigger-mode skills (short description for injection).
+    /// Auto-generated from description if absent for trigger mode.
+    pub hint: String,
     /// Reference documents found in <skill_dir>/refs/
     pub refs: Vec<SkillRef>,
     /// Parameters declared in frontmatter.
     pub params: Vec<SkillParam>,
     /// Executable scripts found in <skill_dir>/scripts/
     pub scripts: Vec<SkillScript>,
+    /// Named sections within the skill body (parsed from ## headings).
+    pub sections: Vec<SkillSection>,
+}
+
+/// A named section within a skill's body, delimited by `## Section Name`.
+#[derive(Debug, Clone)]
+pub struct SkillSection {
+    /// Section name (the text after `## `, trimmed).
+    pub name: String,
+    /// Content of the section (everything between this heading and the next
+    /// heading of the same or higher level, trimmed).
+    pub content: String,
 }
 
 /// A reference document within a skill's `refs/` directory.
@@ -100,19 +115,22 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                 }
 
                 if let Ok(content) = fs::read_to_string(&skill_file) {
-                    let (name, description, mode, triggers, params) =
+                    let (name, description, mode, triggers, hint, params) =
                         parse_skill_meta(&content, &dir_path);
                     let refs = discover_refs(&dir_path);
                     let scripts = discover_scripts(&dir_path);
+                    let sections = parse_sections(&content);
                     skills.push(Skill {
                         name,
                         description,
                         path: skill_file,
                         mode,
                         triggers,
+                        hint,
                         refs,
                         params,
                         scripts,
+                        sections,
                     });
                 }
             }
@@ -120,6 +138,38 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
     }
 
     skills
+}
+
+/// Parse named sections from a skill's body content.
+///
+/// Sections are delimited by `## Section Name` headings (level-2 markdown).
+/// The content of each section runs from after the heading line until the
+/// next heading of the same or higher level, or end of body.
+/// Frontmatter is stripped before parsing.
+fn parse_sections(content: &str) -> Vec<SkillSection> {
+    let body = extract_body(content);
+    let mut sections = Vec::new();
+    let mut lines = body.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            let name = heading.trim().to_string();
+            let mut section_lines = Vec::new();
+
+            // Collect content until next ## heading or end
+            while let Some(next) = lines.peek() {
+                if next.starts_with("## ") {
+                    break;
+                }
+                section_lines.push(lines.next().unwrap());
+            }
+
+            let content = section_lines.join("\n").trim().to_string();
+            sections.push(SkillSection { name, content });
+        }
+    }
+
+    sections
 }
 
 /// Scan `<skill_dir>/refs/` for `.md` and `.txt` files.
@@ -247,13 +297,13 @@ fn extract_script_description(path: &Path) -> String {
 
 /// Parse YAML frontmatter (if present) from skill content.
 ///
-/// Returns (name, description, mode, triggers, params). If frontmatter is
+/// Returns (name, description, mode, triggers, hint, params). If frontmatter is
 /// absent, falls back to using the parent directory name and first non-empty
-/// line, with default mode (Manual) and empty triggers.
+/// line, with default mode (Manual), empty triggers, and empty hint.
 fn parse_skill_meta(
     content: &str,
     dir_path: &Path,
-) -> (String, String, SkillMode, Vec<String>, Vec<SkillParam>) {
+) -> (String, String, SkillMode, Vec<String>, String, Vec<SkillParam>) {
     // Try to extract YAML frontmatter: --- ... ---
     if let Some(frontmatter) = content.strip_prefix("---") {
         if let Some(end) = frontmatter.find("---") {
@@ -265,6 +315,7 @@ fn parse_skill_meta(
             let mut description = None;
             let mut mode = SkillMode::Manual;
             let mut triggers = Vec::new();
+            let mut hint = String::new();
             let mut params = Vec::new();
 
             let lines: Vec<&str> = yaml.lines().collect();
@@ -275,6 +326,8 @@ fn parse_skill_meta(
                     name = Some(stripped.trim().to_string());
                 } else if let Some(stripped) = line.strip_prefix("description:") {
                     description = Some(stripped.trim().to_string());
+                } else if let Some(stripped) = line.strip_prefix("hint:") {
+                    hint = stripped.trim().to_string();
                 } else if let Some(stripped) = line.strip_prefix("mode:") {
                     let raw = stripped.trim().to_lowercase();
                     mode = match raw.as_str() {
@@ -355,7 +408,12 @@ fn parse_skill_meta(
                     .unwrap_or_default()
             });
 
-            return (final_name, final_description, mode, triggers, params);
+            // Auto-generate hint for trigger-mode skills if not explicitly set
+            if hint.is_empty() && mode == SkillMode::Trigger {
+                hint = format!("{}: {}", final_name, final_description);
+            }
+
+            return (final_name, final_description, mode, triggers, hint, params);
         }
     }
 
@@ -372,13 +430,15 @@ fn parse_skill_meta(
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
 
-    (name, description, SkillMode::Manual, Vec::new(), Vec::new())
+    (name, description, SkillMode::Manual, Vec::new(), String::new(), Vec::new())
 }
 
 /// Select skills whose mode is `Always`, plus any `Trigger` skills whose
 /// triggers match the given goal text.
 ///
-/// Returns  of matching skills.
+/// Returns `Vec<(name, body_or_hint)>` of matching skills.
+/// For `Always` mode, the full body is returned.
+/// For `Trigger` mode, the hint is returned (short description).
 pub fn skills_for_injection(
     skills: &[Skill],
     goal: &str,
@@ -401,10 +461,8 @@ pub fn skills_for_injection(
                     goal_lower.contains(&t.to_lowercase())
                 });
                 if matched {
-                    if let Ok(content) = fs::read_to_string(&skill.path) {
-                        let body = extract_body(&content);
-                        result.push((skill.name.clone(), body.to_string()));
-                    }
+                    // Inject the hint (short description) instead of full body
+                    result.push((skill.name.clone(), skill.hint.clone()));
                 }
             }
             SkillMode::Manual => {
@@ -469,6 +527,12 @@ pub fn skill_index(skills: &[Skill]) -> String {
                 })
                 .collect();
             suffix_parts.push(format!("params: {}", param_strs.join(", ")));
+        }
+
+        // Sections
+        if !skill.sections.is_empty() {
+            let section_names: Vec<&str> = skill.sections.iter().map(|s| s.name.as_str()).collect();
+            suffix_parts.push(format!("sections: {}", section_names.join(", ")));
         }
 
         // Scripts
@@ -556,9 +620,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/rust-traits/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
             Skill {
                 name: "python-api".to_string(),
@@ -566,9 +632,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/python-api/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
         ];
 
@@ -649,6 +717,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/with-refs/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![
                     SkillRef {
                         name: "api-spec".to_string(),
@@ -661,6 +730,7 @@ mod tests {
                 ],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
             Skill {
                 name: "no-refs".to_string(),
@@ -668,9 +738,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/no-refs/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
         ];
 
@@ -753,6 +825,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/code-review/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![
                     SkillParam {
@@ -767,6 +840,7 @@ mod tests {
                     },
                 ],
                 scripts: vec![],
+                sections: vec![],
             },
             Skill {
                 name: "simple".to_string(),
@@ -774,9 +848,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/simple/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
         ];
 
@@ -872,6 +948,7 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/with-scripts/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![
@@ -886,6 +963,7 @@ mod tests {
                         description: "Format the code".to_string(),
                     },
                 ],
+                sections: vec![],
             },
             Skill {
                 name: "no-scripts".to_string(),
@@ -893,9 +971,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/no-scripts/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
         ];
 
@@ -944,11 +1024,12 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\nmode: always\n---\n\nBody text";
-        let (name, desc, mode, triggers, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, params) = parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Always);
         assert!(triggers.is_empty());
+        assert!(hint.is_empty());
         assert!(params.is_empty());
     }
 
@@ -959,11 +1040,29 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust, trait\n---\n\nBody text";
-        let (name, desc, mode, triggers, params) = parse_skill_meta(content, &dir);
+        let (name, desc, mode, triggers, hint, params) = parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
         assert_eq!(mode, SkillMode::Trigger);
         assert_eq!(triggers, vec!["rust", "trait"]);
+        // Hint should be auto-generated for trigger mode
+        assert_eq!(hint, "test-skill: A test");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn parse_skill_meta_parses_explicit_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("test-skill");
+        fs::create_dir(&dir).unwrap();
+        let content =
+            "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust\nhint: Rust-related helper\n---\n\nBody text";
+        let (name, desc, mode, triggers, hint, params) = parse_skill_meta(content, &dir);
+        assert_eq!(name, "test-skill");
+        assert_eq!(desc, "A test");
+        assert_eq!(mode, SkillMode::Trigger);
+        assert_eq!(triggers, vec!["rust"]);
+        assert_eq!(hint, "Rust-related helper");
         assert!(params.is_empty());
     }
 
@@ -973,9 +1072,10 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\n---\n\nBody text";
-        let (_, _, mode, triggers, _) = parse_skill_meta(content, &dir);
+        let (_, _, mode, triggers, hint, _) = parse_skill_meta(content, &dir);
         assert_eq!(mode, SkillMode::Manual);
         assert!(triggers.is_empty());
+        assert!(hint.is_empty());
     }
 
     #[test]
@@ -984,9 +1084,10 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "Body text";
-        let (_, _, mode, triggers, _) = parse_skill_meta(content, &dir);
+        let (_, _, mode, triggers, hint, _) = parse_skill_meta(content, &dir);
         assert_eq!(mode, SkillMode::Manual);
         assert!(triggers.is_empty());
+        assert!(hint.is_empty());
     }
 
     #[test]
@@ -1022,7 +1123,8 @@ mod tests {
         let result = skills_for_injection(&skills, "I need help with Rust traits");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "rust-skill");
-        assert_eq!(result[0].1, "Rust body content");
+        // Trigger mode should return hint, not full body
+        assert_eq!(result[0].1, "rust-skill: Rust helper");
     }
 
     #[test]
@@ -1066,9 +1168,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/always-skill/SKILL.md"),
                 mode: SkillMode::Always,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
             Skill {
                 name: "trigger-skill".to_string(),
@@ -1076,9 +1180,11 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/trigger-skill/SKILL.md"),
                 mode: SkillMode::Trigger,
                 triggers: vec!["rust".to_string()],
+                hint: "trigger-skill: Trigger based".to_string(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
             Skill {
                 name: "manual-skill".to_string(),
@@ -1086,15 +1192,115 @@ mod tests {
                 path: PathBuf::from("/tmp/skills/manual-skill/SKILL.md"),
                 mode: SkillMode::Manual,
                 triggers: vec![],
+                hint: String::new(),
                 refs: vec![],
                 params: vec![],
                 scripts: vec![],
+                sections: vec![],
             },
         ];
 
         let result = skill_index(&skills);
         assert!(result.contains("[always] always-skill"));
         assert!(result.contains("[trigger] trigger-skill"));
-        assert!(result.contains("- manual-skill"));
+        assert!(result.contains("- manual-skill: Manual only"));
+    }
+
+    // --- Section parsing tests ---
+
+    #[test]
+    fn parse_sections_extracts_named_sections() {
+        let content = "---\nname: test\ndescription: Test\n---\n\n## Overview\n\nGeneral info here.\n\n## Details\n\nMore specific content.\n\n## Examples\n\nExample 1\nExample 2";
+        let sections = parse_sections(content);
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].name, "Overview");
+        assert_eq!(sections[0].content, "General info here.");
+        assert_eq!(sections[1].name, "Details");
+        assert_eq!(sections[1].content, "More specific content.");
+        assert_eq!(sections[2].name, "Examples");
+        assert_eq!(sections[2].content, "Example 1\nExample 2");
+    }
+
+    #[test]
+    fn parse_sections_returns_empty_for_no_headings() {
+        let content = "---\nname: test\ndescription: Test\n---\n\nJust a body with no sections.";
+        let sections = parse_sections(content);
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn parse_sections_handles_no_frontmatter() {
+        let content = "## Intro\n\nHello world\n\n## Conclusion\n\nBye";
+        let sections = parse_sections(content);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "Intro");
+        assert_eq!(sections[0].content, "Hello world");
+        assert_eq!(sections[1].name, "Conclusion");
+        assert_eq!(sections[1].content, "Bye");
+    }
+
+    #[test]
+    fn skill_index_shows_sections() {
+        let skills = vec![
+            Skill {
+                name: "with-sections".to_string(),
+                description: "Has sections".to_string(),
+                path: PathBuf::from("/tmp/skills/with-sections/SKILL.md"),
+                mode: SkillMode::Manual,
+                triggers: vec![],
+                hint: String::new(),
+                refs: vec![],
+                params: vec![],
+                scripts: vec![],
+                sections: vec![
+                    SkillSection {
+                        name: "Overview".to_string(),
+                        content: "General info".to_string(),
+                    },
+                    SkillSection {
+                        name: "Details".to_string(),
+                        content: "Specific info".to_string(),
+                    },
+                ],
+            },
+            Skill {
+                name: "no-sections".to_string(),
+                description: "No sections".to_string(),
+                path: PathBuf::from("/tmp/skills/no-sections/SKILL.md"),
+                mode: SkillMode::Manual,
+                triggers: vec![],
+                hint: String::new(),
+                refs: vec![],
+                params: vec![],
+                scripts: vec![],
+                sections: vec![],
+            },
+        ];
+
+        let result = skill_index(&skills);
+        assert!(result.contains("sections: Overview, Details"));
+        assert!(result.contains("- no-sections: No sections"));
+    }
+
+    #[test]
+    fn discover_skills_populates_sections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("sectioned-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sectioned-skill\ndescription: A skill with sections\n---\n\n## Setup\n\nInstallation steps.\n\n## Usage\n\nHow to use it.\n\n## API\n\nReference docs.",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+        let skill = &skills[0];
+        assert_eq!(skill.sections.len(), 3);
+        assert_eq!(skill.sections[0].name, "Setup");
+        assert_eq!(skill.sections[1].name, "Usage");
+        assert_eq!(skill.sections[2].name, "API");
     }
 }
