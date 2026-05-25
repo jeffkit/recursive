@@ -22,6 +22,11 @@ files in this folder; this index is the side-by-side comparison.
 | 14 json-events (2nd) | deepseek | deepseek-chat | 50 | ~50 | ? | (varied) | $0.0003 | BudgetExceeded (rolled back) |
 | 14 json-events (manual) | orchestrator | — | — | — | — | — | $0.0000 | manual landing of DeepSeek's patches |
 | 15 retry-policy-config | minimax | MiniMax-M2 | 29 | 29 | 1 | 8:0 | $0.1590 | NoMoreToolCalls |
+| 16 kill-count-lines | minimax | MiniMax-M2 | 25 | 25 | 0 | 3:0 | $0.0851 | NoMoreToolCalls |
+| 17 replay-from-step (1st) | deepseek | deepseek-chat | 3 | 1 | 0 | 0:0 | $0.0000 | infra-503 (rolled back) |
+| 17 replay-from-step (2nd) | deepseek | deepseek-chat | 20 | 20 | ? | (varied) | $0.1991 | Stuck (rolled back) |
+| 17 replay-from-step (manual) | orchestrator | — | — | — | — | — | $0.0000 | manual landing of DeepSeek's design |
+| 18 default-prompt-dogfood | minimax | MiniMax-M2 | 25 | 25 | ? | (varied) | $0.0546 | NoMoreToolCalls |
 
 ## Key insight: prompt-token amplification
 
@@ -183,6 +188,58 @@ Worth re-running the same goal on both providers later to control for it.
 - Recovery: goal-14 is being rerun on DeepSeek in batch 5. The
   rolled-back journal commit is cherry-picked to main for the
   diagnostic record.
+
+### Seventh concurrent batch (17 retry + 18, second manual landing in two batches)
+
+- **goal-18 default-prompt-dogfood (minimax)**: 25 messages, **$0.0546
+  (new cheapest record)**, no rollbacks. Expanded
+  `default_system_prompt()` with V4A worked example + "Don't" hard
+  limits + cargo-test-not-jq lesson. Adds 1 new test asserting the
+  prompt contains the four key strings. Bumped the existing
+  "well-under-a-kilobyte" threshold from 1024 to 2048 (the new prompt
+  is ~1.4 KB).
+- **goal-17 replay-from-step (deepseek, 2nd attempt)**: **rolled back
+  again**. First attempt was upstream HTTP 503 (transient infra);
+  second attempt was a Stuck verdict at step 20 from two mechanical
+  bugs — `.into()` ambiguity in tests (`Message::system("sys".into())`
+  needs `.to_string()` because constructors take `impl Into<String>`)
+  and three near-identical `Message::user("hello".into())` context
+  blocks that violate V4A "must be unique" → repeated identical
+  patch retry → anti-stuck.
+- **Recovery: manual landing again.** The agent's design was correct;
+  I hand-applied it with the two mechanical fixes. 115 tests total
+  (+5 new). The `--transcript-out` plumbing landed in batch-6
+  pre-flight saved a 192KB structured transcript that made this
+  manual landing direct — first time the orchestrator-side tooling
+  investment paid off concretely.
+- Batch 7 lesson: **the goal-17 design surface is fine, but
+  Message constructors that take `impl Into<String>` are a common
+  Rust ergonomic trap when writing test setup with `&str` literals.
+  Future goals should warn agents to prefer `.to_string()` over
+  `.into()` inside fixture literals.**
+
+### Sixth concurrent batch (16 + 17 first attempt)
+
+- **goal-16 kill-count-lines (minimax)**: 25 steps, **apply:write =
+  3:0 (perfect again)**, $0.0851. Single-file deletion + 2 module
+  edits. Hand-fixed one stale `count_lines` reference in
+  `src/config.rs::default_system_prompt` that the agent didn't see
+  because self-improve.sh overrides the default prompt via
+  `--system-prompt-file`. The goal-12 nudge "prefer apply_patch"
+  reaches the self-improve agent via AGENTS.md (which always was
+  enforced) — *not* via the in-binary default. This corrects the
+  earlier (batch 5) attribution claim.
+- **goal-17 replay-from-step (deepseek, 1st attempt)**: rolled back
+  at step 3 — upstream DeepSeek HTTP 503 (transient infra). Not an
+  agent-side problem; retry queued.
+- **Orchestrator-side discovery**: `self-improve.sh` was not using
+  any of the agent's own CLI affordances (`--json`,
+  `--transcript-out`, `--max-transcript-chars`,
+  `RECURSIVE_RETRY_MAX`). Hand-patched the script to pass
+  `--transcript-out .dev/transcripts/run-${TS}.json` so future
+  rollback diagnostics use `recursive replay` on the saved
+  transcript instead of grep'ing the raw log. This investment paid
+  off in the very next batch (goal-17 retry).
 
 ### Fifth concurrent batch (14 retry + 15 — second rollback, manual landing)
 

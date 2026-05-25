@@ -7,9 +7,29 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T08:05Z.** Empty between batches 6 and 7.
+> **As of 2026-05-25T08:15Z.** Empty between batches 7 and 8.
 
 ## Last batch landed
+
+> **Goals 17 (manual) + 18**, seventh concurrent batch.
+> - goal-18 default-prompt-dogfood (minimax): merged. 25 messages,
+>   **$0.0546 (cheapest record again)**. Expanded
+>   `default_system_prompt()` with V4A worked example + "Don't" hard
+>   limits + the cargo-test-not-jq lesson. 1 new test, threshold
+>   bumped 1024→2048. Library/CLI users now see in-binary defaults
+>   that match the AGENTS.md guidance feeding the self-improve agent.
+> - goal-17 replay-from-step (deepseek, 2nd attempt): rolled back at
+>   step 20 due to two mechanical V4A/Rust ergonomics traps. The
+>   agent's design was correct; **manual landing** got it across
+>   with $0.0 incremental API spend, leveraging the new
+>   `--transcript-out` save (192KB structured JSON) that the
+>   orchestrator added in batch 6.
+> - **Tooling investment milestone**: this is the first batch where
+>   the orchestrator-side `--transcript-out` patch directly enabled
+>   faster recovery of a failed agent run. Total recoveries that
+>   relied on transcript persistence so far: 2 (goal-14 manual,
+>   goal-17 manual).
+> - 115 tests green on main.
 
 > **Goals 16 + 17 (rolled-back, transient)**, sixth concurrent batch.
 > - goal-16 kill-count-lines (minimax): merged. Surgical removal of
@@ -108,6 +128,17 @@ files yet; pick one, write the goal file, launch:
 - ~~**error-retry policy configurable**~~ — done (goal 15).
 - ~~**kill `CountLines` tool**~~ — done (goal 16).
 - ~~**self-improve.sh uses --transcript-out**~~ — done (orchestrator hand-patch, no goal).
+- ~~**transcript replay-from-step**~~ — done (goal 17, manual landing).
+- ~~**dogfood default_system_prompt with V4A + hard limits**~~ — done (goal 18).
+- **observe.sh handles manual-landing journals** — `observe.sh`
+  currently expects `## Result` + agent transcript blocks; manual
+  journals (goals 14, 17) don't include those, so `INDEX.md` rows
+  for them lack metrics. Small dev-infra fix.
+- **agent message ergonomics warning** — fix the V4A trap from
+  goal-17: add a one-liner to AGENTS.md or default prompt that
+  `Message::user("foo".to_string())` is preferred over
+  `Message::user("foo".into())` in test setup because `.into()`
+  can't infer the target type. Prevents anti-stuck loops.
 
 ## Open follow-ups (human-facing)
 
