@@ -45,7 +45,7 @@ pub enum PermissionDecision {
 /// - `Transform` the arguments before execution.
 ///
 /// Hooks must be `Send + Sync` because the agent loop is `Send`.
-pub type PermissionHook = Box<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
+pub type PermissionHook = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
 
 const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
@@ -714,7 +714,17 @@ impl AgentBuilder {
     where
         F: Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync + 'static,
     {
-        self.permission_hook = Some(Box::new(hook));
+        self.permission_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Attach a pre-built permission hook (e.g. cloned from a parent agent).
+    ///
+    /// This is useful when inheriting a permission hook from a parent agent
+    /// into a sub-agent. Unlike `permission_hook()`, this accepts an
+    /// `Option<PermissionHook>` directly, avoiding the need to re-wrap.
+    pub fn permission_hook_opt(mut self, hook: Option<PermissionHook>) -> Self {
+        self.permission_hook = hook;
         self
     }
     /// Register a lifecycle hook (optional).

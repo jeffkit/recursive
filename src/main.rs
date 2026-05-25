@@ -490,6 +490,7 @@ async fn build_agent(
             tools.clone(),
             max_depth,
             0,
+            None,
         );
         tools = tools.register(Arc::new(sub));
     }
