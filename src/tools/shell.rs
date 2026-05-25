@@ -56,6 +56,13 @@ impl Tool for RunShell {
                     "cwd": {
                         "type": "string",
                         "description": "Optional subdirectory (relative to workspace root) to run the command in. Must stay inside the workspace."
+                    },
+                    "env": {
+                        "type": "object",
+                        "description": "Optional extra env vars set for this command only. Values must be strings; non-string values are rejected. These add to (or override) the inherited env.",
+                        "additionalProperties": {
+                            "type": "string"
+                        }
                     }
                 },
                 "required": ["command"]
@@ -84,6 +91,17 @@ impl Tool for RunShell {
         cmd.current_dir(&cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+
+        // Apply optional env overrides
+        if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
+            for (key, val) in env_map {
+                let val_str = val.as_str().ok_or_else(|| Error::BadToolArgs {
+                    name: "run_shell".to_string(),
+                    message: format!("env value for `{key}` must be a string, got {:?}", val),
+                })?;
+                cmd.env(key, val_str);
+            }
+        }
 
         let mut child = cmd.spawn().map_err(|e| Error::Tool {
             name: "run_shell".into(),
@@ -234,6 +252,41 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(out.contains("exit: 0"));
+        assert!(out.contains("hello"));
+    }
+
+    // Tests for env-vars passthrough (goal-27)
+    #[tokio::test]
+    async fn env_overrides_and_errors() {
+        let tmp = TempDir::new().unwrap();
+        let tool = RunShell::new(tmp.path());
+
+        // Test A: env var is set and visible in the command
+        let out = tool
+            .execute(json!({"command": "echo $RECURSIVE_TEST_VAR", "env": {"RECURSIVE_TEST_VAR": "hello"}}))
+            .await
+            .unwrap();
+        assert!(out.contains("exit: 0"));
+        assert!(out.contains("hello"));
+
+        // Test B: non-string env value returns BadToolArgs
+        let err = tool
+            .execute(json!({"command": "echo x", "env": {"MY_KEY": 42}}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadToolArgs { .. }));
+        let err_msg = format!("{err}");
+        assert!(
+            err_msg.contains("MY_KEY"),
+            "error should mention the offending key: {err_msg}"
+        );
+
+        // Test C (regression): omitting env works exactly as before
+        let out = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
         assert!(out.contains("exit: 0"));
         assert!(out.contains("hello"));
     }
