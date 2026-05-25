@@ -86,6 +86,10 @@ enum Cmd {
         /// ignored otherwise.
         #[arg(trailing_var_arg = true)]
         goal: Vec<String>,
+        /// Print only the last N messages of the transcript.
+        /// Ignored when --resume-from is given.
+        #[arg(long)]
+        tail: Option<usize>,
     },
 }
 
@@ -128,11 +132,17 @@ async fn main() -> anyhow::Result<()> {
             path,
             resume_from,
             goal,
+            tail,
         } => {
             let file = recursive::TranscriptFile::read_from(&path)?;
             match resume_from {
                 None => {
-                    print!("{}", file.pretty());
+                    // If --tail is provided without --resume-from, use pretty_tail
+                    if let Some(n) = tail {
+                        print!("{}", file.pretty_tail(n));
+                    } else {
+                        print!("{}", file.pretty());
+                    }
                     Ok(())
                 }
                 Some(_) if goal.is_empty() => {

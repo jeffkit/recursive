@@ -83,6 +83,43 @@ impl TranscriptFile {
         out
     }
 
+    /// Render the last `n` messages as a human-readable string.
+    /// If `n` is less than the total, prepends a "skipped" notice.
+    pub fn pretty_tail(&self, n: usize) -> String {
+        let total = self.messages.len();
+        // If n >= total, behave like pretty()
+        if n >= total {
+            return self.pretty();
+        }
+
+        let skipped = total - n;
+        let mut out = String::new();
+        out.push_str(&format!("...skipped {} earlier messages\n\n", skipped));
+        out.push_str(&format!(
+            "=== transcript ({} messages) ===\n",
+            self.messages.len()
+        ));
+        out.push_str(&format!(
+            "saved_at: {}\nsteps: {}\nmodel: {}\n\n",
+            self.meta.saved_at,
+            self.meta.steps,
+            self.meta.model.as_deref().unwrap_or("(unknown)"),
+        ));
+        // Only render the last n messages, but preserve their original indices
+        let start_idx = total - n;
+        for (i, msg) in self.messages.iter().enumerate().skip(start_idx) {
+            out.push_str(&format!("--- [{}] {:?} ---\n", i, msg.role));
+            if !msg.content.is_empty() {
+                out.push_str(&msg.content);
+                if !msg.content.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// Return the first `n` messages (`None` if `n` exceeds the count).
     /// `n == 0` returns an empty slice, useful for "start fresh but
     /// preserve nothing" callers.
@@ -285,5 +322,53 @@ mod tests {
     fn take_first_n_too_large_returns_none() {
         let file = TranscriptFile::new(vec![Message::user("only".to_string())], 1, None);
         assert!(file.take_first_n(2).is_none());
+    }
+
+    #[test]
+    fn pretty_tail_shows_skipped_notice_and_tail() {
+        let messages = vec![
+            Message::system("first".to_string()),
+            Message::user("second".to_string()),
+            Message::assistant("third".to_string()),
+            Message::system("fourth".to_string()),
+            Message::user("fifth".to_string()),
+        ];
+        let file = TranscriptFile::new(messages, 5, None);
+        let output = file.pretty_tail(2);
+
+        // Should contain skipped notice
+        assert!(output.contains("...skipped 3 earlier messages"));
+        // Should contain header
+        assert!(output.contains("=== transcript (5 messages) ==="));
+        // Should contain the last 2 messages (indices 3 and 4)
+        assert!(output.contains("--- [3] System ---"));
+        assert!(output.contains("fourth"));
+        assert!(output.contains("--- [4] User ---"));
+        assert!(output.contains("fifth"));
+        // Should NOT contain the first 3 messages
+        assert!(!output.contains("--- [0] System ---"));
+        assert!(!output.contains("first"));
+        assert!(!output.contains("--- [1] User ---"));
+        assert!(!output.contains("second"));
+        assert!(!output.contains("--- [2] Assistant ---"));
+        assert!(!output.contains("third"));
+    }
+
+    #[test]
+    fn pretty_tail_equals_pretty_when_n_large() {
+        let messages = vec![
+            Message::system("one".to_string()),
+            Message::user("two".to_string()),
+        ];
+        let file = TranscriptFile::new(messages, 2, Some("model".to_string()));
+
+        // n >= total should be equivalent to pretty()
+        let tail_5 = file.pretty_tail(5);
+        let full = file.pretty();
+        assert_eq!(tail_5, full);
+
+        // n == total should also be equivalent
+        let tail_2 = file.pretty_tail(2);
+        assert_eq!(tail_2, full);
     }
 }
