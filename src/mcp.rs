@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,6 +19,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use std::fmt;
+use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -26,6 +28,16 @@ use crate::tools::Tool;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// Configuration for a single MCP server in the Claude Code `.mcp.json` format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+}
 
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +428,92 @@ struct McpConfigFile {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace discovery (Claude Code .mcp.json format)
+// ---------------------------------------------------------------------------
+
+/// Top-level structure of a Claude Code `.mcp.json` file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpDiscoveryFile {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: HashMap<String, McpServerConfig>,
+}
+
+/// Discover MCP server configurations from the workspace.
+///
+/// Looks for (in priority order):
+/// 1. `<workspace>/.mcp.json` (Claude Code format)
+/// 2. `<workspace>/.recursive/mcp.json` (alternative location)
+///
+/// Returns an empty vec if neither file exists (not an error).
+pub async fn discover_mcp_servers(workspace: &Path) -> Result<Vec<McpServer>> {
+    // Priority 1: workspace root .mcp.json
+    let primary = workspace.join(".mcp.json");
+    if primary.exists() {
+        let configs = load_mcp_discovery_config(&primary).await?;
+        if !configs.is_empty() {
+            return Ok(configs);
+        }
+    }
+
+    // Priority 2: .recursive/mcp.json
+    let fallback = workspace.join(".recursive").join("mcp.json");
+    if fallback.exists() {
+        let configs = load_mcp_discovery_config(&fallback).await?;
+        return Ok(configs);
+    }
+
+    Ok(Vec::new())
+}
+
+/// Parse a Claude Code `.mcp.json` file into `Vec<McpServer>`.
+///
+/// Expected format:
+/// ```json
+/// {
+///   "mcpServers": {
+///     "server-name": {
+///       "command": "path/to/server",
+///       "args": ["--flag"],
+///       "env": { "KEY": "value" }
+///     }
+///   }
+/// }
+/// ```
+async fn load_mcp_discovery_config(path: &Path) -> Result<Vec<McpServer>> {
+    let contents = tokio::fs::read_to_string(path).await.map_err(|e| {
+        Error::Other(format!(
+            "failed to read MCP discovery config `{}`: {e}",
+            path.display()
+        ))
+    })?;
+
+    // Handle empty file gracefully
+    if contents.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed: McpDiscoveryFile = serde_json::from_str(&contents).map_err(|e| {
+        Error::Other(format!(
+            "failed to parse MCP discovery config `{}`: {e}",
+            path.display()
+        ))
+    })?;
+
+    let servers: Vec<McpServer> = parsed
+        .mcp_servers
+        .into_iter()
+        .map(|(name, config)| McpServer {
+            name,
+            command: config.command,
+            args: config.args,
+        })
+        .collect();
+
+    Ok(servers)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -648,5 +746,182 @@ done
         let path = dir.path().join("nonexistent.json");
         let err = load_mcp_config(&path).unwrap_err();
         assert!(err.to_string().contains("failed to read MCP config"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Discovery tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn discover_finds_dot_mcp_json_in_workspace_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mcp_path = dir.path().join(".mcp.json");
+        tokio::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "fs": {
+                        "command": "mcp-fs",
+                        "args": ["--root", "."]
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "fs");
+        assert_eq!(servers[0].command, "mcp-fs");
+        assert_eq!(servers[0].args, vec!["--root", "."]);
+    }
+
+    #[tokio::test]
+    async fn discover_returns_empty_vec_when_no_config_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_parses_claude_code_format_with_env() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mcp_path = dir.path().join(".mcp.json");
+        tokio::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "github": {
+                        "command": "mcp-gh",
+                        "args": [],
+                        "env": {
+                            "GITHUB_TOKEN": "abc123"
+                        }
+                    },
+                    "filesystem": {
+                        "command": "mcp-fs",
+                        "args": ["--root", "/tmp"]
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert_eq!(servers.len(), 2);
+
+        let gh = servers.iter().find(|s| s.name == "github").unwrap();
+        assert_eq!(gh.command, "mcp-gh");
+        assert!(gh.args.is_empty());
+
+        let fs = servers.iter().find(|s| s.name == "filesystem").unwrap();
+        assert_eq!(fs.command, "mcp-fs");
+        assert_eq!(fs.args, vec!["--root", "/tmp"]);
+    }
+
+    #[tokio::test]
+    async fn discover_finds_dot_recursive_mcp_json_as_fallback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let recursive_dir = dir.path().join(".recursive");
+        tokio::fs::create_dir(&recursive_dir).await.unwrap();
+        let mcp_path = recursive_dir.join("mcp.json");
+        tokio::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "db": {
+                        "command": "mcp-db",
+                        "args": ["--port", "5432"]
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "db");
+        assert_eq!(servers[0].command, "mcp-db");
+    }
+
+    #[tokio::test]
+    async fn discover_dot_mcp_json_takes_priority_over_dot_recursive() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Primary .mcp.json
+        tokio::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{
+                "mcpServers": {
+                    "primary": {
+                        "command": "primary-server",
+                        "args": []
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        // Fallback .recursive/mcp.json
+        let recursive_dir = dir.path().join(".recursive");
+        tokio::fs::create_dir(&recursive_dir).await.unwrap();
+        tokio::fs::write(
+            recursive_dir.join("mcp.json"),
+            r#"{
+                "mcpServers": {
+                    "fallback": {
+                        "command": "fallback-server",
+                        "args": []
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "primary");
+    }
+
+    #[tokio::test]
+    async fn discover_malformed_json_returns_descriptive_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join(".mcp.json"), "not valid json")
+            .await
+            .unwrap();
+
+        let err = discover_mcp_servers(dir.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse MCP discovery config"),
+            "error should mention parsing failure: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_empty_file_returns_empty_vec() {
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join(".mcp.json"), "")
+            .await
+            .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_empty_mcp_servers_object_returns_empty_vec() {
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join(".mcp.json"), r#"{"mcpServers": {}}"#)
+            .await
+            .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert!(servers.is_empty());
     }
 }

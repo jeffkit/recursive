@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::Level;
 
 use recursive::config::load_project_context;
-use recursive::mcp::{load_mcp_config, McpClient, McpServer, McpTool};
+use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::skills::{discover_skills, skill_index, Skill};
 use recursive::SessionFile;
 use recursive::{
@@ -364,19 +364,44 @@ async fn build_tools(config: &Config) -> ToolRegistry {
 }
 
 /// Register MCP tools from a config file into the registry.
-async fn register_mcp_tools(registry: &mut ToolRegistry, mcp_config_path: Option<PathBuf>) {
-    let Some(path) = mcp_config_path else {
-        return;
-    };
-    if !path.exists() {
-        eprintln!("warning: MCP config file not found: {}", path.display());
-        return;
-    }
-    let servers = match load_mcp_config(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: failed to load MCP config: {e}");
+async fn register_mcp_tools(
+    registry: &mut ToolRegistry,
+    workspace: &Path,
+    mcp_config_path: Option<PathBuf>,
+) {
+    let servers: Vec<McpServer> = if let Some(path) = &mcp_config_path {
+        // Explicit config file provided
+        if !path.exists() {
+            eprintln!("warning: MCP config file not found: {}", path.display());
             return;
+        }
+        match load_mcp_config(path) {
+            Ok(s) => {
+                eprintln!(
+                    "mcp: loaded {} server(s) from explicit config `{}`",
+                    s.len(),
+                    path.display()
+                );
+                s
+            }
+            Err(e) => {
+                eprintln!("warning: failed to load MCP config: {e}");
+                return;
+            }
+        }
+    } else {
+        // Auto-discover from workspace
+        match discover_mcp_servers(workspace).await {
+            Ok(s) => {
+                if !s.is_empty() {
+                    eprintln!("mcp: auto-discovered {} server(s) from workspace", s.len());
+                }
+                s
+            }
+            Err(e) => {
+                eprintln!("warning: failed to auto-discover MCP servers: {e}");
+                return;
+            }
         }
     };
     if servers.is_empty() {
@@ -476,7 +501,7 @@ async fn build_agent(
         _ => Arc::new(openai),
     };
     let mut tools = build_tools(config).await;
-    register_mcp_tools(&mut tools, mcp_config).await;
+    register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
 
     // Conditionally register sub-agent tool (opt-in via env var)
     let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1");
