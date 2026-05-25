@@ -1,6 +1,7 @@
 //! `search_files`: substring/regex search across workspace files.
 
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use walkdir::WalkDir;
@@ -33,14 +34,15 @@ impl Tool for SearchFiles {
         ToolSpec {
             name: "search_files".into(),
             description:
-                "Find lines containing a pattern across files in the workspace. Returns up to N matches as 'path:line: text'."
+                "Find lines containing a pattern (literal substring or regex) across files in the workspace. Returns up to N matches as 'path:line: text'."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pattern":   { "type": "string", "description": "Substring to search for (literal, case-sensitive)." },
+                    "pattern":   { "type": "string", "description": "Pattern to search for. Literal substring by default; use `regex: true` for regex mode." },
                     "path":      { "type": "string", "description": "Optional subdirectory (workspace-relative) to scope the search to. Defaults to workspace root." },
-                    "max_results": { "type": "integer", "description": "Cap on results (default 50, max 200)." }
+                    "max_results": { "type": "integer", "description": "Cap on results (default 50, max 200)." },
+                    "regex":     { "type": "boolean", "description": "If true, interpret `pattern` as a regular expression (Rust regex crate syntax). Default false (literal substring)." }
                 },
                 "required": ["pattern"]
             }),
@@ -58,6 +60,16 @@ impl Tool for SearchFiles {
                 message: "`pattern` must not be empty".into(),
             });
         }
+
+        let use_regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let re_opt: Option<Regex> = if use_regex {
+            Some(Regex::new(pattern).map_err(|e| Error::BadToolArgs {
+                name: "search_files".into(),
+                message: format!("invalid regex: {e}"),
+            })?)
+        } else {
+            None
+        };
 
         let scope = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => resolve_within(&self.root, p).map_err(|e| Error::BadToolArgs {
@@ -99,7 +111,11 @@ impl Tool for SearchFiles {
             };
             let rel = path.strip_prefix(&self.root).unwrap_or(path);
             for (line_no, line) in contents.lines().enumerate() {
-                if line.contains(pattern) {
+                let is_match = match &re_opt {
+                    Some(re) => re.is_match(line),
+                    None => line.contains(pattern),
+                };
+                if is_match {
                     let truncated = if line.len() > DEFAULT_MAX_LINE_LEN {
                         format!("{}…", &line[..DEFAULT_MAX_LINE_LEN])
                     } else {
@@ -187,6 +203,52 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("inside.txt"));
+        assert!(!out.contains("outside.txt"));
+    }
+    #[tokio::test]
+    async fn regex_mode_matches_pattern() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "lib.rs", "fn foo() {}\nfn bar() {}\nfn foobar() {}");
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "fn f\\w+", "regex": true}))
+            .await
+            .unwrap();
+        assert!(out.contains("foo"));
+        assert!(out.contains("foobar"));
+        assert!(!out.contains(": fn bar()"));
+    }
+    #[tokio::test]
+    async fn regex_mode_invalid_pattern_is_bad_args() {
+        let tmp = TempDir::new().unwrap();
+        let err = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "(unclosed", "regex": true}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadToolArgs { .. }));
+        assert!(format!("{err}").contains("invalid regex"));
+    }
+    #[tokio::test]
+    async fn literal_mode_treats_pattern_as_substring() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "data.txt", "abc\nadc");
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "a.c"}))
+            .await
+            .unwrap();
+        assert!(out.contains("no matches"));
+    }
+    #[tokio::test]
+    async fn regex_mode_with_path_scope() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        write(&tmp, "outside.txt", "fn main()");
+        std::fs::write(tmp.path().join("src/lib.rs"), "fn helper()\nfn main()").unwrap();
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "fn \\w+", "regex": true, "path": "src"}))
+            .await
+            .unwrap();
+        assert!(out.contains("helper"));
+        assert!(out.contains("main"));
         assert!(!out.contains("outside.txt"));
     }
 }
