@@ -7,13 +7,30 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T10:55Z.** Idle. Batch 14 fully landed — 4/4 green
-> on first attempt, all NoMoreToolCalls, no auto-resume.
-> Tests 214 → 233 (+19 net). Cost ≈ **$3.43** (dominated by g42
-> at $2.17 — instrumentation is more expensive than the "S" effort
-> estimate suggested).
+> **As of 2026-05-25T11:50Z.** Batch 15 wave-1 launched 11:34Z. **Two
+> worktrees died immediately** to a Compactor bug surfaced by
+> dogfooding (orphans a `Role::Tool` from its parent assistant
+> when `keep_recent_n` lands on it → HTTP 400). Two still healthy.
 >
-> Tree clean at `2df8fc4`.
+> | Goal | Provider | PID | Status |
+> |---|---|---|---|
+> | g43 permission-hooks | deepseek | 82457 | ✗ ROLLED BACK — HTTP 400 from compactor orphan |
+> | g45 session-mgmt | minimax | 86000 | ✓ alive @ step ~14, no compaction yet |
+> | g46 compactor-structured | deepseek | 89129 | ✓ alive @ step 22, "all green" verification |
+> | g47 anthropic-dogfood | minimax | 92770 | ✗ ROLLED BACK — empty resp after compactor orphan |
+>
+> **Hotfix landed in main `e8fd05a`:** retreat split point until
+> `transcript[split].role != Tool`. +1 regression test
+> (`compaction_keeps_tool_calls_paired_with_results`). Now 232 tests.
+> Invariant #8 codified in `.dev/AGENTS.md` and workspace `AGENTS.md`.
+>
+> **Plan**: wait for g45 + g46 to finish, merge into hotfixed main,
+> then re-launch g43 + g47 from the new baseline.
+>
+> Previously: Batch 14 fully landed — 4/4 green on first attempt,
+> all NoMoreToolCalls, no auto-resume. Tests 214 → 233 (+19 net).
+> Cost ≈ **$3.43**. Then dogfooding wired g31/g33/g36/g42 into
+> self-improve.sh (commits 473b89e, c84485e).
 >
 > **Roadmap status after batch 14**:
 > - Phase 1 Foundation: **4/4 done — COMPLETE**
