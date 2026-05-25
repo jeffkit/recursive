@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use super::resolve_within;
 use super::Tool;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -43,12 +44,19 @@ impl Tool for RunShell {
         ToolSpec {
             name: "run_shell".into(),
             description:
-                "Run a shell command (sh -c) from the workspace root. Returns combined stdout/stderr and exit status."
+                "Run a shell command (sh -c) from the workspace root, or from an optional subdirectory inside it via `cwd`."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Command line to execute via sh -c"}
+                    "command": {
+                        "type": "string",
+                        "description": "Command line to execute via sh -c"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional subdirectory (relative to workspace root) to run the command in. Must stay inside the workspace."
+                    }
                 },
                 "required": ["command"]
             }),
@@ -61,9 +69,19 @@ impl Tool for RunShell {
             message: "missing `command`".into(),
         })?;
 
+        // Determine the working directory: resolve optional cwd or use root.
+        let cwd = if let Some(rel) = args.get("cwd").and_then(|v| v.as_str()) {
+            resolve_within(&self.root, rel).map_err(|e| Error::BadToolArgs {
+                name: "run_shell".into(),
+                message: format!("cwd: {e}"),
+            })?
+        } else {
+            self.root.clone()
+        };
+
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(command);
-        cmd.current_dir(&self.root);
+        cmd.current_dir(&cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -163,5 +181,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
+    }
+
+    #[tokio::test]
+    async fn runs_in_subdir_when_cwd_given() {
+        let tmp = TempDir::new().unwrap();
+        // Create a subdirectory with a marker file
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("marker.txt"), "content").unwrap();
+
+        let out = RunShell::new(tmp.path())
+            .execute(json!({"command": "ls", "cwd": "sub"}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("exit: 0"));
+        assert!(out.contains("marker.txt"));
+    }
+
+    #[tokio::test]
+    async fn rejects_cwd_outside_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let err = RunShell::new(tmp.path())
+            .execute(json!({"command": "echo hello", "cwd": "../escape"}))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::BadToolArgs { ref name, .. } if name == "run_shell"));
+        let err_msg = format!("{err}");
+        assert!(err_msg.contains("cwd"));
+    }
+
+    #[tokio::test]
+    async fn accepts_dot_cwd_as_root() {
+        let tmp = TempDir::new().unwrap();
+        let out = RunShell::new(tmp.path())
+            .execute(json!({"command": "pwd", "cwd": "."}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("exit: 0"));
+        // pwd should output something non-empty
+        assert!(out.contains("--- stdout ---"));
+    }
+
+    #[tokio::test]
+    async fn existing_no_cwd_call_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let out = RunShell::new(tmp.path())
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("exit: 0"));
+        assert!(out.contains("hello"));
     }
 }
