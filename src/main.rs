@@ -28,9 +28,9 @@ use recursive::{
     },
     tools::memory::memory_summary,
     tools::{
-        ApplyPatch, EstimateTokens, Forget, ListDir, LoadSkill, LocalTransport, ReadFile, Recall,
-        Remember, RunShell, RunSkillScript, SearchFiles, SubAgent, ToolTransport, WebFetch,
-        WriteFile,
+        ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
+        LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
+        RunSkillScript, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
     },
     Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
@@ -348,6 +348,7 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
 async fn build_tools(config: &Config) -> ToolRegistry {
     let root = &config.workspace;
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let mut registry = ToolRegistry::new(transport)
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(WriteFile::new(root)))
@@ -357,7 +358,9 @@ async fn build_tools(config: &Config) -> ToolRegistry {
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
         .register(Arc::new(SearchFiles::new(root)))
-        .register(Arc::new(WebFetch::new()));
+        .register(Arc::new(WebFetch::new()))
+        .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
+        .register(Arc::new(CheckBackground::new(bg_manager.clone())));
     registry = registry.register(Arc::new(EstimateTokens::new(root)));
     registry = registry
         .register(Arc::new(Remember::new(root)))
