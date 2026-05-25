@@ -203,18 +203,25 @@ async fn main() -> anyhow::Result<()> {
 
 fn init_logging(level: &str) -> anyhow::Result<()> {
     let lvl: Level = level.parse().context("invalid log level")?;
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(lvl.to_string()));
+    let trace_spans = std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1");
+    // When span timings are requested, the user-provided `--log warn`
+    // would suppress the close events (they fire at INFO). Layer an
+    // info-level filter for the `recursive` crate's instrumented spans
+    // while leaving the rest of the filter alone.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let base = lvl.to_string();
+        if trace_spans {
+            tracing_subscriber::EnvFilter::new(format!("{base},recursive=info"))
+        } else {
+            tracing_subscriber::EnvFilter::new(base)
+        }
+    });
     let mut layer = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
         .compact();
-    // Opt-in span timings: when RECURSIVE_TRACE_SPANS=1, emit a line on
-    // each instrumented function's close with its elapsed duration. This
-    // lights up the spans added in goal-42 without forcing telemetry
-    // overhead on every default invocation.
-    if std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1") {
+    if trace_spans {
         layer = layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
     }
     layer.init();
