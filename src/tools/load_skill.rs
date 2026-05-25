@@ -2,7 +2,8 @@
 //!
 //! Supports loading the main SKILL.md body, or an individual reference
 //! document from the skill's `refs/` directory via the optional `ref`
-//! parameter.
+//! parameter. Also supports parameter substitution via the `params`
+//! object.
 
 use std::fs;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ impl Tool for LoadSkill {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "load_skill".into(),
-            description: "Load a skill's content by name (case-insensitive). Optionally load a reference document from the skill's refs/ directory.".into(),
+            description: "Load a skill's content by name (case-insensitive). Optionally load a reference document from the skill's refs/ directory, or pass params for template substitution.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -44,6 +45,13 @@ impl Tool for LoadSkill {
                     "ref": {
                         "type": "string",
                         "description": "Optional name of a reference document to load (e.g. 'api-spec'). Use `load_skill` without `ref` first to see available refs."
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Optional parameter values for template substitution (e.g. {\"language\": \"python\"}). See skill index for declared params.",
+                        "additionalProperties": {
+                            "type": "string"
+                        }
                     }
                 },
                 "required": ["name"]
@@ -114,9 +122,68 @@ impl Tool for LoadSkill {
         let body = content
             .strip_prefix("---")
             .and_then(|rest| rest.find("---").map(|end| rest[end + 3..].trim()))
-            .unwrap_or(content.trim());
+            .unwrap_or(content.trim())
+            .to_string();
 
-        Ok(body.to_string())
+        // Resolve params and perform template substitution
+        let provided_params = arguments["params"].as_object();
+
+        // Build resolved values map
+        let mut resolved = Vec::new();
+        let mut missing_required = Vec::new();
+
+        for param in &skill.params {
+            // Check if provided
+            if let Some(obj) = provided_params {
+                if let Some(val) = obj.get(&param.name).and_then(|v| v.as_str()) {
+                    resolved.push((param.name.clone(), val.to_string()));
+                    continue;
+                }
+            }
+
+            // Fall back to default
+            if let Some(ref default) = param.default {
+                resolved.push((param.name.clone(), default.clone()));
+            } else {
+                // Required param with no value provided
+                missing_required.push(param.name.clone());
+            }
+        }
+
+        if !missing_required.is_empty() {
+            return Err(Error::BadToolArgs {
+                name: "load_skill".into(),
+                message: format!(
+                    "missing required params: {}. Declared params: {}",
+                    missing_required.join(", "),
+                    skill
+                        .params
+                        .iter()
+                        .map(|p| {
+                            if let Some(ref d) = p.default {
+                                format!("{}={}", p.name, d)
+                            } else {
+                                format!("{} (required)", p.name)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+
+        // Perform template substitution: replace {{key}} with value
+        let rendered = if resolved.is_empty() {
+            body
+        } else {
+            let mut result = body;
+            for (key, value) in &resolved {
+                result = result.replace(&format!("{{{{{key}}}}}"), value);
+            }
+            result
+        };
+
+        Ok(rendered)
     }
 }
 
@@ -305,5 +372,152 @@ mod tests {
             .block_on(tool.execute(json!({"name": "my-skill", "ref": ""})));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_skill_with_params_performs_substitution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("code-review");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: code-review\n\
+             description: Review code\n\
+             params:\n\
+             \x20\x20- name: language\n\
+             \x20\x20  description: Target language\n\
+             \x20\x20  default: rust\n\
+             ---\n\
+             \n\
+             Review {{language}} code.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            tool.execute(json!({"name": "code-review", "params": {"language": "python"}})),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Review python code.");
+    }
+
+    #[test]
+    fn load_skill_uses_defaults_when_params_not_provided() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("code-review");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: code-review\n\
+             description: Review code\n\
+             params:\n\
+             \x20\x20- name: language\n\
+             \x20\x20  description: Target language\n\
+             \x20\x20  default: rust\n\
+             ---\n\
+             \n\
+             Review {{language}} code.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        // No params provided — should use default "rust"
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "code-review"})));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Review rust code.");
+    }
+
+    #[test]
+    fn load_skill_errors_on_missing_required_param() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("greeter");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: greeter\n\
+             description: Greet someone\n\
+             params:\n\
+             \x20\x20- name: name\n\
+             \x20\x20  description: Name to greet\n\
+             ---\n\
+             \n\
+             Hello {{name}}!",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        // No params provided and no default — should error
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "greeter"})));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing required params"),
+            "error should mention missing required params: {err}"
+        );
+        assert!(
+            err.contains("name"),
+            "error should mention the missing param name: {err}"
+        );
+    }
+
+    #[test]
+    fn load_skill_with_params_substitutes_multiple() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("multi-param");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: multi-param\n\
+             description: Multiple params\n\
+             params:\n\
+             \x20\x20- name: lang\n\
+             \x20\x20  description: Language\n\
+             \x20\x20  default: rust\n\
+             \x20\x20- name: mode\n\
+             \x20\x20  description: Mode\n\
+             \x20\x20  default: strict\n\
+             ---\n\
+             \n\
+             Lang={{lang}} Mode={{mode}}",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result =
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(tool.execute(
+                    json!({"name": "multi-param", "params": {"lang": "python", "mode": "lax"}}),
+                ));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Lang=python Mode=lax");
     }
 }
