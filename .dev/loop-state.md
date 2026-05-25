@@ -7,25 +7,32 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T09:55Z.** Idle. Batch 12 fully landed (3 auto +
-> 1 manual). Batch 13 drafted in `.dev/goals/draft/` (g35-g38)
-> queued for next launch:
-> - **goal-35 mcp-client-v1** (deepseek A target) — 2.1, L size,
->   the headline. Use auto-resume buffer (200 effective steps).
-> - **goal-36 project-context-file** (minimax A target) — 1.2, S.
-> - **goal-37 web-fetch-tool** (minimax B target) — 2.2, S.
-> - **goal-38 persistent-memory** (deepseek B target) — 3.2, S.
+> **As of 2026-05-25T10:28Z.** Batch 13 launched. 4 worktrees alive,
+> baseline `c5b2b8d` (streaming-bug fix). Effective step ceiling per
+> goal: **400** (single-pass=200, auto-resume×2). User confirmed
+> force-push of jeffkit history succeeded; local/remote already in
+> sync.
 >
-> Coordination concern for batch 13: g35 + g36 + g37 + g38 all touch
-> `main.rs`. Plan staged edits to disjoint zones (g35 = MCP block
-> after build_tools; g36 = system-prompt augmentation; g37 = tool
-> registration alongside existing; g38 = memory injection block +
-> tool registration). May need a prep commit to extract the
-> "extension points" into helpers if conflicts spike.
+> - **goal-35 mcp-client-v1** (deepseek, pid 96147) — 2.1, L, headline.
+>   Worktree `mcp-client-v1-deepseek-20260525T102631Z-95996`.
+> - **goal-36 project-context-file** (minimax, pid 8545) — 1.2, S.
+>   Worktree `project-context-file-minimax-20260525T102706Z-8275`.
+> - **goal-37 web-fetch-tool** (minimax, pid 13441) — 2.2, S.
+>   Worktree `web-fetch-tool-minimax-20260525T102716Z-13156`.
+> - **goal-38 persistent-memory** (deepseek, pid 18564) — 3.2, S.
+>   Worktree `persistent-memory-deepseek-20260525T102727Z-18243`.
 >
-> **Awaiting user signal** before launching. Force-push of jeffkit
-> identity history rewrite is still pending — would be a good moment
-> to do it before batch 13 (which will add more commits on top).
+> Coordination risks for merge: all four touch `src/main.rs`
+> (system_prompt building + tool registration + skill_index injection).
+> Triage merge order: smallest diff first, hardest case (g35) last so
+> earlier merges absorb easier conflicts.
+>
+> **Pre-batch infra fixes already landed**:
+> - `c5b2b8d` — non-streaming runs no longer panic (g32 merge bug
+>   that crashed first batch-13 launch within seconds).
+> - `936bc34` — `RECURSIVE_MAX_STEPS` bumped 100 → 200.
+> - `2459ef8` — auto-resume transcript bug fixed (Phase 0 chore).
+> - `29e941f` — `.gitignore` covers `.claude/`, `.cursor/local/`.
 
 ## Roadmap delta (live)
 
@@ -33,8 +40,8 @@
 > Matrix for the canonical status column.
 >
 > **Just landed (batch 12)**: 1.1 ✅, 1.3 ✅, 2.3 ✅, 3.3 ✅
-> **In progress**: none
-> **Queued (batch 13 drafts)**: 1.2, 2.1, 2.2, 3.2
+> **In progress (batch 13, launched 10:28Z)**: 1.2, 2.1, 2.2, 3.2
+> **Queued**: none — Phase 1 fully closes if 1.2 lands.
 >
 > **Phase 0 (kernel polish, pre-roadmap)**: all 27 goals (04-30)
 > landed. ~140 tests baseline. Now 175 tests after batch 12.
@@ -50,14 +57,17 @@
 > **Phase 4 status**: not started. All items deferred until Phase
 > 1-3 majority done.
 >
-> **Phase 0 follow-ups (infra gaps surfaced in batch 12)**:
-> 1. **Auto-resume transcript-save bug**: `agent.run().await?` in
->    `src/main.rs::run_once` short-circuits the `--transcript-out`
->    save on BudgetExceeded. Auto-resume in self-improve.sh requires
->    the transcript file to exist, so it never fired for g33. Fix:
->    write transcript regardless of Result; or treat BudgetExceeded
->    as a normal finish reason rather than an error.
-> 2. **MiniMax batch-12 over-testing**: g34 added 19 tests for a
+> **Phase 0 follow-ups**:
+> 1. ✅ Auto-resume transcript-save bug — fixed in `2459ef8`.
+>    Invariant #7 added to AGENTS.md ("Finish reasons are data,
+>    not errors").
+> 2. ✅ Streaming-merge regression — fixed in `c5b2b8d` after batch
+>    13's first launch attempt died at startup. Two regression
+>    tests added (`build_agent_does_not_panic_with{,out}_stream`).
+>    Lesson: merge-time `cargo test` alone misses bugs that only
+>    surface in `cargo run`. Worth adding an integration smoke
+>    later — deferred for now.
+> 3. **MiniMax batch-12 over-testing**: g34 added 19 tests for a
 >    new-file goal, mostly low-value parametric variants. Worth a
 >    style note in AGENTS.md? Defer judgment until pattern repeats.
 
