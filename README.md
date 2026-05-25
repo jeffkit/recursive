@@ -80,8 +80,12 @@ The kernel has five concepts, each independently testable:
 ## CLI
 
 ```bash
-cargo install --path .   # or once published: cargo install recursive
+cargo install --path .   # or once published: cargo install recursive-agent
 ```
+
+> The crate is published as `recursive-agent` because the name `recursive` was
+> taken on crates.io. The installed binary is still called `recursive`, and the
+> library is imported as `use recursive::*;`.
 
 ```bash
 # one-off goal

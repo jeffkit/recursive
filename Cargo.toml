@@ -1,13 +1,14 @@
 [package]
-name = "recursive"
+name = "recursive-agent"
 version = "0.1.0"
 edition = "2021"
+authors = ["Jeff Kit"]
 description = "A minimal, orthogonal, embeddable coding-agent kernel."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/kongjie/recursive"
-homepage = "https://github.com/kongjie/recursive"
-documentation = "https://docs.rs/recursive"
+repository = "https://github.com/jeffkit/recursive"
+homepage = "https://github.com/jeffkit/recursive"
+documentation = "https://docs.rs/recursive-agent"
 keywords = ["agent", "llm", "coding-agent", "ai", "tool-use"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.75"
