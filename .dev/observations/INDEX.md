@@ -19,6 +19,9 @@ files in this folder; this index is the side-by-side comparison.
 | 12 default-system-prompt | minimax | MiniMax-M2 | 15 | 14 | 2 | 2:1 | $0.0804 | NoMoreToolCalls |
 | 13 search-regex | deepseek | deepseek-chat | 12 | 12 | 1 | 6:1 | $0.0681 | NoMoreToolCalls |
 | 14 json-events (1st) | minimax | MiniMax-M2 | 50 | ~50 | ? | (varied) | (rolled back) | BudgetExceeded |
+| 14 json-events (2nd) | deepseek | deepseek-chat | 50 | ~50 | ? | (varied) | $0.0003 | BudgetExceeded (rolled back) |
+| 14 json-events (manual) | orchestrator | — | — | — | — | — | $0.0000 | manual landing of DeepSeek's patches |
+| 15 retry-policy-config | minimax | MiniMax-M2 | 29 | 29 | 1 | 8:0 | $0.1590 | NoMoreToolCalls |
 
 ## Key insight: prompt-token amplification
 
@@ -180,6 +183,36 @@ Worth re-running the same goal on both providers later to control for it.
 - Recovery: goal-14 is being rerun on DeepSeek in batch 5. The
   rolled-back journal commit is cherry-picked to main for the
   diagnostic record.
+
+### Fifth concurrent batch (14 retry + 15 — second rollback, manual landing)
+
+- **goal-15 retry-policy-config (minimax)**: 29 steps, 1 error,
+  **apply:write = 8:0 (perfect discipline)**, $0.1590. The opinionated
+  default system prompt from goal-12 is doing its job — MiniMax now
+  *never* falls back to `write_file` on existing files. Two new tests
+  for default + env-override behavior. Outcome: `RECURSIVE_RETRY_MAX`,
+  `RECURSIVE_RETRY_INITIAL_BACKOFF_SECS`, `RECURSIVE_RETRY_MAX_BACKOFF_SECS`
+  are honored by `Config::from_env` and threaded into `OpenAiProvider`.
+- **goal-14 json-events (deepseek, 2nd attempt)**: **also rolled back**
+  at step 50 (BudgetExceeded). The product code was *correct* — the
+  agent's JSON output `{"kind":"usage", …}` was the exact shape goal-14
+  required — but the agent burned its late steps trying to verify with
+  `cargo run … | jq` on a fresh worktree, where the first `cargo build`'s
+  `Compiling …` lines polluted stdout enough to break jq. Two consecutive
+  rollbacks on the same goal, both **for the same verification-path
+  reason, not a product-code reason**.
+- **Recovery: manual landing.** Per SOP §6 (two rollbacks → human
+  intervention), but in this case the diagnosis is unambiguous and the
+  patches are recoverable from the run log. I hand-applied DeepSeek's
+  7 patches plus 4 new serialization unit tests. 113 tests pass,
+  clippy clean.
+- **Lesson encoded in `.dev/AGENTS.md`:** "Verify behavior through
+  `cargo test`, never through `cargo run | jq`. On a fresh worktree
+  `cargo run` emits `Compiling …` lines that break jq parsing and
+  burn your step budget. If you need to assert on JSON shape, write a
+  unit test."
+- Batch 5 pair total cost: **$0.16 spent + manual diagnostic time
+  saved $0.15** vs a 3rd LLM attempt on goal-14.
 
 ## Caveats
 

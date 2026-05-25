@@ -7,19 +7,30 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T07:48Z.** Empty between batches 4 and 5.
+> **As of 2026-05-25T07:56Z.** Empty between batches 5 and 6.
 
 ## Last batch landed
 
-> **Goals 13 + 14 (partial)**, fourth concurrent batch.
-> - goal-13 search_files regex (deepseek): merged. 12 steps, $0.0681,
->   cheapest single run yet, 4 tests added. apply:write impressive.
-> - goal-14 --json events (minimax): **rolled back at step 50**
->   (BudgetExceeded). The rolled-back journal is cherry-picked to
->   main for the record (commit 25b9031 → on main as `dev: journal
->   — rolled-back run …`). The product surface was too wide for one
->   MiniMax run; rerunning on DeepSeek next batch.
-> - 107 tests green on main.
+> **Goals 14 (manual) + 15**, fifth concurrent batch.
+> - goal-15 retry-policy-config (minimax): merged. 29 steps, $0.1590,
+>   **apply:write = 8:0 (perfect discipline)**. Two new tests. The
+>   goal-12 system-prompt nudge is now demonstrably working — MiniMax
+>   no longer reaches for `write_file` on existing files.
+> - goal-14 --json events (deepseek, 2nd attempt): **also rolled back
+>   at step 50** (BudgetExceeded), same cause as MiniMax's first
+>   attempt. Product code was *correct* both times; the agent's
+>   self-verification path (`cargo run | jq` on fresh worktree) is
+>   what burned the step budget. The first `cargo build` emits
+>   `Compiling …` lines that pollute stdout and break jq parsing.
+> - **Manual landing of goal-14.** Hand-applied the 7 patches DeepSeek
+>   produced before the budget ran out, plus 4 new serialization
+>   tests. 113 tests pass; clippy clean. SOP §6 says two rollbacks →
+>   human intervention, and that's what happened, just orchestrator
+>   shortcut rather than HITL because diagnosis was unambiguous.
+> - **Lesson encoded in `.dev/AGENTS.md`**: "Verify behavior through
+>   `cargo test`, never through `cargo run | jq`." Future agents will
+>   not fall into this trap.
+> - 113 tests green on main.
 
 ## Background processes
 
@@ -61,22 +72,21 @@ files yet; pick one, write the goal file, launch:
 
 - **DeepSeek cache_control headers** — DeepSeek charges ~10× less
   for cached prompt tokens. Plumb the right header. Touches
-  `src/llm/openai.rs`.
+  `src/llm/openai.rs`. *High-leverage cost win.*
 - **transcript replay-from-step** — load a saved transcript, prompt
   a new provider starting from message N. Builds on 08+09.
 - **system-prompt context budgeting** — auto-trim oldest tool
   results when transcript exceeds N chars. Adjacent to goal-07 but
   trims instead of stopping.
-- **error-retry policy configurable** — `OpenAiProvider`'s retry
-  policy is currently hardcoded. Pull it out to `Config`.
 - **kill `CountLines` tool** — it predates `wc -l` via `run_shell`
-  and isn't paying its keep. Cleanup goal.
-- **search_files regex support** — extend goal-11's substring-only
-  search to optional regex via `regex` crate.
-- **JSON event output via `--json`** — emit `StepEvent`s as
-  newline-delimited JSON for programmatic consumption.
+  and isn't paying its keep. Small cleanup goal.
+- **rotating LLM transcript file pruning** — `.dev/runs/*.log` grew
+  to 700+ lines; nice for diagnosis but eventually wants a cap.
 - **streaming output (LlmProvider::complete_stream)** — the big
   one. Reserved until worktree concurrency has more mileage.
+- ~~**search_files regex support**~~ — done (goal 13).
+- ~~**JSON event output via `--json`**~~ — done (goal 14, manual).
+- ~~**error-retry policy configurable**~~ — done (goal 15).
 
 ## Open follow-ups (human-facing)
 

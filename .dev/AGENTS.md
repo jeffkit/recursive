@@ -98,7 +98,21 @@ tests/
    run_shell: cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -40
    ```
    All four must be green before you stop. `-D warnings` means even a
-   clippy *warning* will fail the build. Common fix patterns:
+   clippy *warning* will fail the build.
+
+   **Verify behavior through `cargo test`, never through `cargo run | jq`.**
+   On a fresh worktree, `cargo run` first does a full `cargo build`, whose
+   "Compiling …" / "Finished …" lines spill onto stderr *and sometimes
+   stdout*. Piping that into `jq` blows up with `parse error: Invalid
+   numeric literal`, sends you on a multi-step debugging detour, and burns
+   the step budget. Two prior runs were rolled back this exact way.
+
+   If you need to assert on JSON / CLI output shape, write a unit test
+   (e.g. `serde_json::from_str(&serialized).unwrap()` round-trip in
+   `#[cfg(test)] mod tests`). Tests run against a pre-built binary, give
+   structured pass/fail, and cost one tool call.
+
+   Common fix patterns:
    - `clippy::should_implement_trait` (method named `add` / `sub` / …):
      either rename the method (e.g. `add` → `accumulate`) or implement the
      corresponding `std::ops` trait. Both are acceptable.
