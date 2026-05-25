@@ -7,59 +7,106 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T09:30Z. Batch 12 = strategic pivot to roadmap
-> Phase 1 + Skills + Anthropic.** User upweighted: streaming, skills,
-> MCP, context compaction. MCP held for batch 13 (L size; benefits
-> from Skills landing first). Anthropic free-rides Phase 2.3 here
-> because MiniMax + DeepSeek already expose Anthropic-compat endpoints
-> — adapter testable without new keys.
+> **As of 2026-05-25T09:55Z.** Idle. Batch 12 fully landed (3 auto +
+> 1 manual). Batch 13 drafted in `.dev/goals/draft/` (g35-g38)
+> queued for next launch:
+> - **goal-35 mcp-client-v1** (deepseek A target) — 2.1, L size,
+>   the headline. Use auto-resume buffer (200 effective steps).
+> - **goal-36 project-context-file** (minimax A target) — 1.2, S.
+> - **goal-37 web-fetch-tool** (minimax B target) — 2.2, S.
+> - **goal-38 persistent-memory** (deepseek B target) — 3.2, S.
 >
-> **Gating**: batch 12 launch waits on git history force-push
-> (jeffkit identity rewrite, user is doing manually).
-> Once push confirmed, prep commit goes in first
-> (`StepEvent::Compacted` + `StepEvent::PartialToken` stubs as no-op
-> variants, decouples g31 & g32 from `agent.rs::StepEvent` conflict),
-> then 4 worktrees launch.
+> Coordination concern for batch 13: g35 + g36 + g37 + g38 all touch
+> `main.rs`. Plan staged edits to disjoint zones (g35 = MCP block
+> after build_tools; g36 = system-prompt augmentation; g37 = tool
+> registration alongside existing; g38 = memory injection block +
+> tool registration). May need a prep commit to extract the
+> "extension points" into helpers if conflicts spike.
 >
-> Planned slot assignment:
-> - **goal-31 context-compaction** (deepseek A) — new `src/compact.rs`
->   + 1 agent.rs hook. Big refactor, hot-path. DeepSeek's strength.
-> - **goal-32 streaming-sse** (deepseek B) — `llm/openai.rs` SSE +
->   `agent.rs` `StepEvent::PartialToken`. Network + protocol parsing.
-> - **goal-33 skills-v1** (minimax A) — new `src/skills.rs` + new
->   `tools/load_skill.rs` + `config.rs` injection. Greenfield module
->   addition, well-suited to MiniMax.
-> - **goal-34 anthropic-provider** (minimax B) — new
->   `src/llm/anthropic.rs`. Template-from-openai pattern, MiniMax good
->   at mechanical adaptations.
->
-> Expected wall-clock: ~10-15 min (g31 has the most agent.rs reads,
-> likely the slowest; others cheap-to-moderate).
+> **Awaiting user signal** before launching. Force-push of jeffkit
+> identity history rewrite is still pending — would be a good moment
+> to do it before batch 13 (which will add more commits on top).
 
 ## Roadmap delta (live)
 
 > Updated each time a batch lands. See `.dev/ROADMAP.md` Priority
 > Matrix for the canonical status column.
 >
-> **In progress (batch 12)**: 1.1 Context Compaction · 1.3 Streaming ·
-> 2.3 Anthropic Provider · 3.3 Skill System
+> **Just landed (batch 12)**: 1.1 ✅, 1.3 ✅, 2.3 ✅, 3.3 ✅
+> **In progress**: none
+> **Queued (batch 13 drafts)**: 1.2, 2.1, 2.2, 3.2
 >
 > **Phase 0 (kernel polish, pre-roadmap)**: all 27 goals (04-30)
-> landed. ~140 tests on main, ~$3.50 cumulative LLM spend.
+> landed. ~140 tests baseline. Now 175 tests after batch 12.
 >
-> **Phase 1 status**: 2/4 in flight (1.1, 1.3). 1.2 (Project Context
-> File) + 1.4 (estimate_tokens) queued for batch 13/14.
+> **Phase 1 status**: 2/4 landed (1.1, 1.3). Queued: 1.2 (g36 draft).
+> Remaining: 1.4 (estimate_tokens, not scheduled).
 >
-> **Phase 2 status**: 1/3 in flight (2.3). 2.1 MCP queued for batch
-> 13. 2.2 Web Fetch queued (small, slot-filler).
+> **Phase 2 status**: 1/3 landed (2.3). Queued: 2.1 (g35), 2.2 (g37).
 >
-> **Phase 3 status**: 1/4 in flight (3.3 promoted). 3.1 Sub-Agent,
-> 3.2 Memory, 3.4 Permission Hooks queued.
+> **Phase 3 status**: 1/4 landed (3.3). Queued: 3.2 (g38). Remaining:
+> 3.1 Sub-Agent, 3.4 Permission Hooks (not scheduled).
 >
 > **Phase 4 status**: not started. All items deferred until Phase
 > 1-3 majority done.
+>
+> **Phase 0 follow-ups (infra gaps surfaced in batch 12)**:
+> 1. **Auto-resume transcript-save bug**: `agent.run().await?` in
+>    `src/main.rs::run_once` short-circuits the `--transcript-out`
+>    save on BudgetExceeded. Auto-resume in self-improve.sh requires
+>    the transcript file to exist, so it never fired for g33. Fix:
+>    write transcript regardless of Result; or treat BudgetExceeded
+>    as a normal finish reason rather than an error.
+> 2. **MiniMax batch-12 over-testing**: g34 added 19 tests for a
+>    new-file goal, mostly low-value parametric variants. Worth a
+>    style note in AGENTS.md? Defer judgment until pattern repeats.
 
 ## Last batch landed
+
+> **Goals 31 + 32 + 33 + 34**, batch 12 — **roadmap Phase 1 pivot,
+> first SOTA-feature batch**. 3 auto-merged, 1 manually recovered.
+> User upweighted (streaming/skills/MCP/compaction); MCP held for
+> batch 13. Wall-clock: <5 min for all 4 worktrees to terminate,
+> ~10 min for merge + manual recovery + housekeeping.
+>
+> Prep commit `be68e80`: added `StepEvent::Compacted` and
+> `StepEvent::PartialToken` stubs to decouple g31 + g32 from enum
+> definition conflict. Worked perfectly — both g31 and g32 only
+> filled behavior, never touched the enum.
+>
+> - goal-31 context-compaction (deepseek): merged `e63eb63`,
+>   51 steps. New `src/compact.rs` (214 LOC) + agent.rs hook (184
+>   LOC added). `Compactor { threshold_chars }` configured via
+>   AgentBuilder; disabled by default. LLM-driven summarization
+>   replaces old transcript portion with a single system message
+>   marked `[compacted: N msgs → M chars]`. +8 tests.
+> - goal-32 streaming-sse (deepseek): merged `92d257e`, 53 steps.
+>   `LlmProvider::stream(...)` extended trait method with default
+>   fallback to `complete`. `OpenAiProvider` implements SSE via
+>   `text/event-stream`. `--stream` CLI flag opt-in. +2 tests.
+>   Light surface — agent stays unaware of streaming.
+> - goal-33 skills-v1 (minimax → manual recovery): committed
+>   `efef2cc`. MiniMax wrote complete `src/skills.rs` (207 LOC) +
+>   `src/tools/load_skill.rs` (156 LOC) with 6 tests, but ran
+>   out at 100 steps before wiring. Files survived rollback as
+>   untracked; orchestrator did the wiring (lib.rs re-export,
+>   tools/mod.rs registration, main.rs `discover_loaded_skills`
+>   helper + skill_index injection). 2 clippy nits cleaned along
+>   the way. +6 tests.
+> - goal-34 anthropic-provider (minimax): merged `44cec95`, 28
+>   steps — fastest of the batch. New `src/llm/anthropic.rs`
+>   (752 LOC, including 19 tests — minimax over-tested). Maps
+>   Anthropic Messages API shape to our `LlmProvider` trait. Tests
+>   use mock TCP server, all set explicit reqwest timeouts per
+>   AGENTS.md section 5. +19 tests.
+>
+> Cumulative: 140 → 175 tests on main. Phase 1 is now 2/4 done
+> (1.1, 1.3); Phase 2 is 1/3 done (2.3); Phase 3 is 1/4 done (3.3).
+>
+> **Infra bug discovered**: auto-resume on BudgetExceeded didn't
+> trigger for g33 because `run_once` short-circuits transcript save
+> on the `?` propagating `agent.run().await?` error. Filed as a
+> Phase 0 follow-up.
 
 > **Goals 27 + 28 + 29 + 30**, batch 11 — second 4-wide, all green.
 > One incident (g30 hung cargo test from missing reqwest timeout)
