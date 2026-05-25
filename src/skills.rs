@@ -15,6 +15,17 @@ pub struct Skill {
     pub description: String,
     /// Absolute path to the SKILL.md file.
     pub path: PathBuf,
+    /// Reference documents found in <skill_dir>/refs/
+    pub refs: Vec<SkillRef>,
+}
+
+/// A reference document within a skill's `refs/` directory.
+#[derive(Debug, Clone)]
+pub struct SkillRef {
+    /// Filename without extension, e.g. "api-spec"
+    pub name: String,
+    /// Absolute path to the ref file
+    pub path: PathBuf,
 }
 
 /// Discover skills in the given search paths.
@@ -22,6 +33,9 @@ pub struct Skill {
 /// For each `<path>/<name>/SKILL.md`, parses optional YAML frontmatter.
 /// If absent, uses the parent directory name as `name` and the first
 /// non-empty line of body as `description`.
+///
+/// Also scans `<skill_dir>/refs/` for `.md` and `.txt` files and populates
+/// `Skill::refs` with what's found.
 pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
 
@@ -44,10 +58,12 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
 
                 if let Ok(content) = fs::read_to_string(&skill_file) {
                     let (name, description) = parse_skill_meta(&content, &dir_path);
+                    let refs = discover_refs(&dir_path);
                     skills.push(Skill {
                         name,
                         description,
                         path: skill_file,
+                        refs,
                     });
                 }
             }
@@ -55,6 +71,35 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
     }
 
     skills
+}
+
+/// Scan `<skill_dir>/refs/` for `.md` and `.txt` files.
+fn discover_refs(skill_dir: &Path) -> Vec<SkillRef> {
+    let refs_dir = skill_dir.join("refs");
+    if !refs_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut refs = Vec::new();
+    if let Ok(entries) = fs::read_dir(&refs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext == "md" || ext == "txt" {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            refs.push(SkillRef {
+                                name: stem.to_string(),
+                                path,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    refs
 }
 
 /// Parse YAML frontmatter (if present) from skill content.
@@ -131,7 +176,15 @@ pub fn skill_index(skills: &[Skill]) -> String {
     ];
 
     for skill in skills {
-        lines.push(format!("- {}: {}", skill.name, skill.description));
+        let ref_count = skill.refs.len();
+        if ref_count > 0 {
+            lines.push(format!(
+                "- {}: {} ({} refs)",
+                skill.name, skill.description, ref_count
+            ));
+        } else {
+            lines.push(format!("- {}: {}", skill.name, skill.description));
+        }
     }
 
     lines.push("".to_string());
@@ -191,11 +244,13 @@ mod tests {
                 name: "rust-traits".to_string(),
                 description: "Explain Rust trait design".to_string(),
                 path: PathBuf::from("/tmp/skills/rust-traits/SKILL.md"),
+                refs: vec![],
             },
             Skill {
                 name: "python-api".to_string(),
                 description: "Python API patterns".to_string(),
                 path: PathBuf::from("/tmp/skills/python-api/SKILL.md"),
+                refs: vec![],
             },
         ];
 
@@ -203,5 +258,102 @@ mod tests {
         assert!(result.contains("Available skills"));
         assert!(result.contains("- rust-traits: Explain Rust trait design"));
         assert!(result.contains("- python-api: Python API patterns"));
+    }
+
+    #[test]
+    fn discover_skills_populates_refs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a skill with refs
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A skill with refs\n---\n\nBody",
+        )
+        .unwrap();
+
+        // Create refs directory with some files
+        let refs_dir = skill_dir.join("refs");
+        fs::create_dir(&refs_dir).unwrap();
+        fs::write(refs_dir.join("api-spec.md"), "# API Spec\n\nDetails here.").unwrap();
+        fs::write(refs_dir.join("examples.txt"), "Example 1\nExample 2").unwrap();
+        // Non-matching extension should be ignored
+        fs::write(refs_dir.join("notes.json"), "{}").unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+
+        let skill = &skills[0];
+        assert_eq!(skill.name, "my-skill");
+        assert_eq!(
+            skill.refs.len(),
+            2,
+            "should find 2 ref files (md + txt), ignoring json"
+        );
+
+        let api_spec = skill.refs.iter().find(|r| r.name == "api-spec").unwrap();
+        assert!(api_spec.path.ends_with("api-spec.md"));
+
+        let examples = skill.refs.iter().find(|r| r.name == "examples").unwrap();
+        assert!(examples.path.ends_with("examples.txt"));
+    }
+
+    #[test]
+    fn discover_skills_handles_no_refs_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a skill without refs directory
+        let skill_dir = base.join("simple-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: simple-skill\ndescription: No refs\n---\n\nBody",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&[base.to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+        assert!(
+            skills[0].refs.is_empty(),
+            "skill with no refs/ dir should have empty refs"
+        );
+    }
+
+    #[test]
+    fn skill_index_shows_ref_count() {
+        let skills = vec![
+            Skill {
+                name: "with-refs".to_string(),
+                description: "Has references".to_string(),
+                path: PathBuf::from("/tmp/skills/with-refs/SKILL.md"),
+                refs: vec![
+                    SkillRef {
+                        name: "api-spec".to_string(),
+                        path: PathBuf::from("/tmp/skills/with-refs/refs/api-spec.md"),
+                    },
+                    SkillRef {
+                        name: "examples".to_string(),
+                        path: PathBuf::from("/tmp/skills/with-refs/refs/examples.txt"),
+                    },
+                ],
+            },
+            Skill {
+                name: "no-refs".to_string(),
+                description: "No references".to_string(),
+                path: PathBuf::from("/tmp/skills/no-refs/SKILL.md"),
+                refs: vec![],
+            },
+        ];
+
+        let result = skill_index(&skills);
+        assert!(result.contains("- with-refs: Has references (2 refs)"));
+        assert!(result.contains("- no-refs: No references"));
+        assert!(
+            !result.contains("(0 refs)"),
+            "should not show count for 0 refs"
+        );
     }
 }
