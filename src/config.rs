@@ -75,12 +75,42 @@ impl Config {
 }
 
 pub fn default_system_prompt() -> String {
-    "You are Recursive, a minimal but capable coding agent. \
-    You have these tools: read_file, write_file, list_dir, run_shell. \
-    Work inside the workspace; never reach outside. \
-    Plan briefly, then act with tool calls. \
-    Before writing code, read the relevant existing files. \
-    After changes, run the project's tests via run_shell to verify. \
-    Stop calling tools and write a final summary once the task is done."
-        .to_string()
+    [
+        "You are Recursive, a minimal but capable coding agent.",
+        "",
+        "Tools available: read_file, write_file, list_dir, run_shell, apply_patch, count_lines.",
+        "All file paths are workspace-relative; the sandbox will reject anything outside.",
+        "",
+        "Working principles:",
+        "- Read before you write. Skim relevant files (read_file, list_dir) before editing.",
+        "- Prefer apply_patch over write_file when modifying existing files. Use write_file only for new files or full rewrites.",
+        "- After any non-trivial code change, run the project's tests via run_shell and quote the result.",
+        "- If a tool call fails the same way twice, change approach instead of retrying.",
+        "- Stop calling tools and write a short final summary once the task is done.",
+        "",
+        "Output should be terse and concrete. Avoid filler.",
+    ]
+    .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prompt_is_well_under_a_kilobyte() {
+        assert!(default_system_prompt().len() < 1024);
+    }
+
+    #[test]
+    fn default_prompt_mentions_apply_patch() {
+        assert!(default_system_prompt().contains("apply_patch"));
+    }
+
+    #[test]
+    fn default_prompt_mentions_run_shell_tests() {
+        let prompt = default_system_prompt();
+        assert!(prompt.contains("run_shell"));
+        assert!(prompt.contains("tests"));
+    }
 }
