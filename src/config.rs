@@ -55,7 +55,7 @@ impl Config {
 
         let system_prompt = match std::env::var("RECURSIVE_SYSTEM_PROMPT_FILE") {
             Ok(path) => std::fs::read_to_string(&path)
-                .map_err(|e| Error::Config(format!("read system prompt {path}: {e}")))?,
+                .map_err(|e| Error::Config { message: format!("read system prompt {path}: {e}") })?,
             Err(_) => default_system_prompt(),
         };
 
@@ -95,7 +95,7 @@ impl Config {
     pub fn require_api_key(&self) -> Result<&str> {
         self.api_key
             .as_deref()
-            .ok_or_else(|| Error::Config("set RECURSIVE_API_KEY (or OPENAI_API_KEY)".into()))
+            .ok_or_else(|| Error::Config { message: "set RECURSIVE_API_KEY (or OPENAI_API_KEY)".into() })
     }
 }
 

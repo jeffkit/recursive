@@ -167,6 +167,8 @@ pub struct McpClient {
     next_id: u64,
     /// Capabilities advertised by the server during initialization.
     capabilities: ServerCapabilities,
+    /// Name of the MCP server (for error reporting).
+    server_name: String,
 }
 
 /// Capabilities advertised by an MCP server during the initialize handshake.
@@ -218,21 +220,22 @@ impl McpClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| {
-                Error::Other(format!("failed to spawn MCP server `{}`: {e}", server.name))
+            .map_err(|e| Error::Mcp {
+                server: server.name.clone(),
+                message: format!("failed to spawn: {e}"),
             })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
-            Error::Other(format!(
-                "failed to open stdin for MCP server `{}`",
-                server.name
-            ))
+            Error::Mcp {
+                server: server.name.clone(),
+                message: "failed to open stdin".into(),
+            }
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
-            Error::Other(format!(
-                "failed to open stdout for MCP server `{}`",
-                server.name
-            ))
+            Error::Mcp {
+                server: server.name.clone(),
+                message: "failed to open stdout".into(),
+            }
         })?;
         let reader = BufReader::new(stdout);
 
@@ -244,6 +247,7 @@ impl McpClient {
             },
             next_id: 1,
             capabilities: ServerCapabilities::default(),
+            server_name: server.name.clone(),
         };
 
         client.do_initialize(&server.name).await?;
@@ -255,7 +259,7 @@ impl McpClient {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::Other(format!("failed to build HTTP client: {e}")))?;
+            .map_err(|e| Error::Mcp { server: server.name.clone(), message: format!("failed to build HTTP client: {e}") })?;
 
         // Connect to the SSE endpoint and read the initial event to discover
         // the message endpoint.
@@ -265,16 +269,11 @@ impl McpClient {
             .send()
             .await
             .map_err(|e| {
-                Error::Other(format!(
-                    "failed to connect to MCP SSE endpoint `{url}`: {e}"
-                ))
+                Error::Mcp { server: server.name.clone(), message: format!("failed to connect to SSE endpoint `{url}`: {e}") }
             })?;
 
         if !response.status().is_success() {
-            return Err(Error::Other(format!(
-                "MCP SSE endpoint `{url}` returned HTTP {}",
-                response.status()
-            )));
+            return Err(Error::Mcp { server: server.name.clone(), message: format!("SSE endpoint `{url}` returned HTTP {}", response.status()) });
         }
 
         // Read the SSE stream to find the `endpoint` event (which tells us
@@ -303,25 +302,17 @@ impl McpClient {
                     }
                 }
                 Ok(Some(Err(e))) => {
-                    return Err(Error::Other(format!(
-                        "error reading SSE stream from `{url}`: {e}"
-                    )));
+                    return Err(Error::Mcp { server: server.name.clone(), message: format!("error reading SSE stream from `{url}`: {e}") });
                 }
                 Ok(None) => break, // Stream ended
                 Err(_) => {
-                    return Err(Error::Other(format!(
-                        "timeout reading SSE stream from `{url}`"
-                    )));
+                    return Err(Error::Mcp { server: server.name.clone(), message: format!("timeout reading SSE stream from `{url}`") });
                 }
             }
         }
 
         if !found_endpoint {
-            return Err(Error::Other(format!(
-                "MCP SSE endpoint `{url}` did not send an `endpoint` event. \
-                 Received data: {}",
-                &sse_buffer[..sse_buffer.len().min(200)]
-            )));
+            return Err(Error::Mcp { server: server.name.clone(), message: format!("SSE endpoint `{url}` did not send an `endpoint` event. Received data: {}", &sse_buffer[..sse_buffer.len().min(200)]) });
         }
 
         let mut client = Self {
@@ -333,6 +324,7 @@ impl McpClient {
             },
             next_id: 1,
             capabilities: ServerCapabilities::default(),
+            server_name: server.name.clone(),
         };
 
         client.do_initialize(&server.name).await?;
@@ -398,7 +390,7 @@ impl McpClient {
             .get("tools")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                Error::Other("MCP `tools/list` response missing `tools` array".into())
+                Error::Mcp { server: self.server_name.clone(), message: "`tools/list` response missing `tools` array".into() }
             })?;
 
         let mut specs = Vec::with_capacity(tools_arr.len());
@@ -406,7 +398,7 @@ impl McpClient {
             let name = item
                 .get("name")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Other("MCP tool entry missing `name`".into()))?;
+                .ok_or_else(|| Error::Mcp { server: self.server_name.clone(), message: "tool entry missing `name`".into() })?;
             let description = item
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -482,9 +474,7 @@ impl McpClient {
     /// Call `resources/list` and return the discovered resources.
     pub async fn list_resources(&mut self) -> Result<Vec<McpResource>> {
         if !self.capabilities.resources {
-            return Err(Error::Other(
-                "MCP server does not advertise `resources` capability".into(),
-            ));
+            return Err(Error::Mcp { server: self.server_name.clone(), message: "server does not advertise `resources` capability".into() });
         }
 
         let result: Value = self
@@ -495,13 +485,13 @@ impl McpClient {
             .get("resources")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                Error::Other("MCP `resources/list` response missing `resources` array".into())
+                Error::Mcp { server: self.server_name.clone(), message: "`resources/list` response missing `resources` array".into() }
             })?;
 
         let mut resources = Vec::with_capacity(resources_arr.len());
         for item in resources_arr {
             let resource: McpResource = serde_json::from_value(item.clone())
-                .map_err(|e| Error::Other(format!("failed to parse MCP resource: {e}")))?;
+                .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("failed to parse resource: {e}") })?;
             resources.push(resource);
         }
 
@@ -512,9 +502,7 @@ impl McpClient {
     /// Returns the list of content items.
     pub async fn read_resource(&mut self, uri: &str) -> Result<Vec<McpResourceContent>> {
         if !self.capabilities.resources {
-            return Err(Error::Other(
-                "MCP server does not advertise `resources` capability".into(),
-            ));
+            return Err(Error::Mcp { server: self.server_name.clone(), message: "server does not advertise `resources` capability".into() });
         }
 
         let result: Value = self
@@ -525,13 +513,13 @@ impl McpClient {
             .get("contents")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                Error::Other("MCP `resources/read` response missing `contents` array".into())
+                Error::Mcp { server: self.server_name.clone(), message: "`resources/read` response missing `contents` array".into() }
             })?;
 
         let mut contents = Vec::with_capacity(contents_arr.len());
         for item in contents_arr {
             let content: McpResourceContent = serde_json::from_value(item.clone())
-                .map_err(|e| Error::Other(format!("failed to parse MCP resource content: {e}")))?;
+                .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("failed to parse resource content: {e}") })?;
             contents.push(content);
         }
 
@@ -541,9 +529,7 @@ impl McpClient {
     /// Call `prompts/list` and return the discovered prompts.
     pub async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>> {
         if !self.capabilities.prompts {
-            return Err(Error::Other(
-                "MCP server does not advertise `prompts` capability".into(),
-            ));
+            return Err(Error::Mcp { server: self.server_name.clone(), message: "server does not advertise `prompts` capability".into() });
         }
 
         let result: Value = self
@@ -554,13 +540,13 @@ impl McpClient {
             .get("prompts")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                Error::Other("MCP `prompts/list` response missing `prompts` array".into())
+                Error::Mcp { server: self.server_name.clone(), message: "`prompts/list` response missing `prompts` array".into() }
             })?;
 
         let mut prompts = Vec::with_capacity(prompts_arr.len());
         for item in prompts_arr {
             let prompt: McpPrompt = serde_json::from_value(item.clone())
-                .map_err(|e| Error::Other(format!("failed to parse MCP prompt: {e}")))?;
+                .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("failed to parse prompt: {e}") })?;
             prompts.push(prompt);
         }
 
@@ -575,15 +561,13 @@ impl McpClient {
         arguments: Option<HashMap<String, String>>,
     ) -> Result<Vec<McpPromptMessage>> {
         if !self.capabilities.prompts {
-            return Err(Error::Other(
-                "MCP server does not advertise `prompts` capability".into(),
-            ));
+            return Err(Error::Mcp { server: self.server_name.clone(), message: "server does not advertise `prompts` capability".into() });
         }
 
         let mut params = serde_json::json!({ "name": name });
         if let Some(args) = arguments {
             params["arguments"] = serde_json::to_value(args)
-                .map_err(|e| Error::Other(format!("failed to serialize prompt arguments: {e}")))?;
+                .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("failed to serialize prompt arguments: {e}") })?;
         }
 
         let result: Value = self.send_request("prompts/get", params).await?;
@@ -592,7 +576,7 @@ impl McpClient {
             .get("messages")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                Error::Other("MCP `prompts/get` response missing `messages` array".into())
+                Error::Mcp { server: self.server_name.clone(), message: "`prompts/get` response missing `messages` array".into() }
             })?;
 
         let mut messages = Vec::with_capacity(messages_arr.len());
@@ -600,12 +584,12 @@ impl McpClient {
             let role = item
                 .get("role")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Other("MCP prompt message missing `role`".into()))?;
+                .ok_or_else(|| Error::Mcp { server: self.server_name.clone(), message: "prompt message missing `role`".into() })?;
             let content = item
                 .get("content")
                 .and_then(|v| v.get("text"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Other("MCP prompt message missing `content.text`".into()))?;
+                .ok_or_else(|| Error::Mcp { server: self.server_name.clone(), message: "prompt message missing `content.text`".into() })?;
             messages.push(McpPromptMessage {
                 role: role.to_string(),
                 content: content.to_string(),
@@ -656,18 +640,18 @@ impl McpClient {
                 stdin
                     .write_all(&full)
                     .await
-                    .map_err(|e| Error::Other(format!("MCP write error: {e}")))?;
+                    .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("write error: {e}") })?;
                 stdin
                     .flush()
                     .await
-                    .map_err(|e| Error::Other(format!("MCP flush error: {e}")))?;
+                    .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("flush error: {e}") })?;
                 Ok(())
             }
             McpTransport::HttpSse {
                 client, post_url, ..
             } => {
                 let url = post_url.as_ref().ok_or_else(|| {
-                    Error::Other("MCP HTTP transport: no POST endpoint available".into())
+                    Error::Mcp { server: self.server_name.clone(), message: "HTTP transport: no POST endpoint available".into() }
                 })?;
                 let body = serde_json::to_string(value)?;
                 let response = client
@@ -676,12 +660,9 @@ impl McpClient {
                     .body(body)
                     .send()
                     .await
-                    .map_err(|e| Error::Other(format!("MCP HTTP POST error: {e}")))?;
+                    .map_err(|e| Error::Mcp { server: self.server_name.clone(), message: format!("HTTP POST error: {e}") })?;
                 if !response.status().is_success() {
-                    return Err(Error::Other(format!(
-                        "MCP HTTP POST to `{url}` returned HTTP {}",
-                        response.status()
-                    )));
+                    return Err(Error::Mcp { server: self.server_name.clone(), message: format!("HTTP POST to `{url}` returned HTTP {}", response.status()) });
                 }
                 Ok(())
             }
@@ -692,14 +673,14 @@ impl McpClient {
     async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
         match &mut self.transport {
             McpTransport::Stdio { reader, .. } => {
-                Self::read_stdio_response(reader, expected_id).await
+                Self::read_stdio_response(reader, expected_id, &self.server_name).await
             }
             McpTransport::HttpSse {
                 client,
                 sse_url,
                 post_url,
                 buffer,
-            } => Self::read_sse_response(client, sse_url, post_url, buffer, expected_id).await,
+            } => Self::read_sse_response(client, sse_url, post_url, buffer, expected_id, &self.server_name).await,
         }
     }
 
@@ -707,6 +688,7 @@ impl McpClient {
     async fn read_stdio_response(
         reader: &mut BufReader<ChildStdout>,
         expected_id: u64,
+        server_name: &str,
     ) -> Result<Value> {
         let mut line_buf = String::new();
 
@@ -716,7 +698,7 @@ impl McpClient {
             let read_future = reader.read_line(&mut line_buf);
             match timeout(Duration::from_secs(10), read_future).await {
                 Ok(Ok(0)) => {
-                    return Err(Error::Other("MCP server closed stdout unexpectedly".into()));
+                    return Err(Error::Mcp { server: server_name.to_string(), message: "server closed stdout unexpectedly".into() });
                 }
                 Ok(Ok(_)) => {
                     let trimmed = line_buf.trim();
@@ -725,9 +707,7 @@ impl McpClient {
                     }
 
                     let parsed: Value = serde_json::from_str(trimmed).map_err(|e| {
-                        Error::Other(format!(
-                            "MCP server returned non-JSON line: {e}; line: {trimmed}"
-                        ))
+                        Error::Mcp { server: server_name.to_string(), message: format!("server returned non-JSON line: {e}; line: {trimmed}") }
                     })?;
 
                     if let Some(resp_id) = parsed.get("id") {
@@ -738,26 +718,20 @@ impl McpClient {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown error");
                                 let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                                return Err(Error::Other(format!(
-                                    "MCP error (code {code}): {msg}"
-                                )));
+                                return Err(Error::Mcp { server: server_name.to_string(), message: format!("error (code {code}): {msg}") });
                             }
                             if let Some(result) = parsed.get("result") {
                                 return Ok(result.clone());
                             }
-                            return Err(Error::Other(
-                                "MCP response missing both `result` and `error`".into(),
-                            ));
+                            return Err(Error::Mcp { server: server_name.to_string(), message: "response missing both `result` and `error`".into() });
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    return Err(Error::Other(format!("MCP read error: {e}")));
+                    return Err(Error::Mcp { server: server_name.to_string(), message: format!("read error: {e}") });
                 }
                 Err(_) => {
-                    return Err(Error::Other(
-                        "MCP server timed out (no response within 10s)".into(),
-                    ));
+                    return Err(Error::Mcp { server: server_name.to_string(), message: "server timed out (no response within 10s)".into() });
                 }
             }
         }
@@ -770,10 +744,11 @@ impl McpClient {
         _post_url: &Option<String>,
         buffer: &mut String,
         expected_id: u64,
+        server_name: &str,
     ) -> Result<Value> {
         // If we have buffered data, try to parse a response from it first.
         if !buffer.is_empty() {
-            if let Some(result) = parse_sse_response(buffer, expected_id) {
+            if let Some(result) = parse_sse_response(buffer, expected_id, server_name) {
                 return result;
             }
         }
@@ -785,16 +760,11 @@ impl McpClient {
             .send()
             .await
             .map_err(|e| {
-                Error::Other(format!(
-                    "failed to reconnect to MCP SSE endpoint `{sse_url}`: {e}"
-                ))
+                Error::Mcp { server: server_name.to_string(), message: format!("failed to reconnect to SSE endpoint `{sse_url}`: {e}") }
             })?;
 
         if !response.status().is_success() {
-            return Err(Error::Other(format!(
-                "MCP SSE endpoint `{sse_url}` returned HTTP {}",
-                response.status()
-            )));
+            return Err(Error::Mcp { server: server_name.to_string(), message: format!("SSE endpoint `{sse_url}` returned HTTP {}", response.status()) });
         }
 
         let mut stream = response.bytes_stream();
@@ -805,24 +775,18 @@ impl McpClient {
                     let chunk_str = String::from_utf8_lossy(&chunk);
                     buffer.push_str(&chunk_str);
 
-                    if let Some(result) = parse_sse_response(buffer, expected_id) {
+                    if let Some(result) = parse_sse_response(buffer, expected_id, server_name) {
                         return result;
                     }
                 }
                 Ok(Some(Err(e))) => {
-                    return Err(Error::Other(format!(
-                        "error reading SSE stream from `{sse_url}`: {e}"
-                    )));
+                    return Err(Error::Mcp { server: server_name.to_string(), message: format!("error reading SSE stream from `{sse_url}`: {e}") });
                 }
                 Ok(None) => {
-                    return Err(Error::Other(format!(
-                        "MCP SSE stream ended without response for id {expected_id}"
-                    )));
+                    return Err(Error::Mcp { server: server_name.to_string(), message: format!("SSE stream ended without response for id {expected_id}") });
                 }
                 Err(_) => {
-                    return Err(Error::Other(format!(
-                        "MCP SSE timed out waiting for response for id {expected_id}"
-                    )));
+                    return Err(Error::Mcp { server: server_name.to_string(), message: format!("SSE timed out waiting for response for id {expected_id}") });
                 }
             }
         }
@@ -860,7 +824,7 @@ fn parse_sse_endpoint(buffer: &str) -> Option<String> {
 /// Parse an SSE stream buffer looking for a JSON-RPC response with the
 /// given id. Returns `Some(Ok(result))` or `Some(Err(...))` if found,
 /// or `None` if not yet available.
-fn parse_sse_response(buffer: &str, expected_id: u64) -> Option<Result<Value>> {
+fn parse_sse_response(buffer: &str, expected_id: u64, server_name: &str) -> Option<Result<Value>> {
     let mut current_data = String::new();
 
     for line in buffer.lines() {
@@ -879,16 +843,12 @@ fn parse_sse_response(buffer: &str, expected_id: u64) -> Option<Result<Value>> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown error");
                             let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                            return Some(Err(Error::Other(format!(
-                                "MCP error (code {code}): {msg}"
-                            ))));
+                            return Some(Err(Error::Mcp { server: server_name.to_string(), message: format!("error (code {code}): {msg}") }));
                         }
                         if let Some(result) = parsed.get("result") {
                             return Some(Ok(result.clone()));
                         }
-                        return Some(Err(Error::Other(
-                            "MCP response missing both `result` and `error`".into(),
-                        )));
+                        return Some(Err(Error::Mcp { server: server_name.to_string(), message: "response missing both `result` and `error`".into() }));
                     }
                 }
             }
@@ -919,7 +879,7 @@ fn parse_sse_response(buffer: &str, expected_id: u64) -> Option<Result<Value>> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown error");
                         let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        return Some(Err(Error::Other(format!("MCP error (code {code}): {msg}"))));
+                        return Some(Err(Error::Mcp { server: server_name.to_string(), message: format!("error (code {code}): {msg}") }));
                     }
                     if let Some(result) = parsed.get("result") {
                         return Some(Ok(result.clone()));
@@ -985,16 +945,10 @@ impl Tool for McpTool {
 /// ```
 pub fn load_mcp_config(path: &std::path::Path) -> Result<Vec<McpServer>> {
     let contents = std::fs::read_to_string(path).map_err(|e| {
-        Error::Other(format!(
-            "failed to read MCP config `{}`: {e}",
-            path.display()
-        ))
+        Error::Mcp { server: "config".into(), message: format!("failed to read config `{}`: {e}", path.display()) }
     })?;
     let parsed: McpConfigFile = serde_json::from_str(&contents).map_err(|e| {
-        Error::Other(format!(
-            "failed to parse MCP config `{}`: {e}",
-            path.display()
-        ))
+        Error::Mcp { server: "config".into(), message: format!("failed to parse config `{}`: {e}", path.display()) }
     })?;
     Ok(parsed.servers)
 }
@@ -1069,10 +1023,7 @@ pub async fn discover_mcp_servers(workspace: &Path) -> Result<Vec<McpServer>> {
 /// ```
 async fn load_mcp_discovery_config(path: &Path) -> Result<Vec<McpServer>> {
     let contents = tokio::fs::read_to_string(path).await.map_err(|e| {
-        Error::Other(format!(
-            "failed to read MCP discovery config `{}`: {e}",
-            path.display()
-        ))
+        Error::Mcp { server: "discovery".into(), message: format!("failed to read discovery config `{}`: {e}", path.display()) }
     })?;
 
     // Handle empty file gracefully
@@ -1081,10 +1032,7 @@ async fn load_mcp_discovery_config(path: &Path) -> Result<Vec<McpServer>> {
     }
 
     let parsed: McpDiscoveryFile = serde_json::from_str(&contents).map_err(|e| {
-        Error::Other(format!(
-            "failed to parse MCP discovery config `{}`: {e}",
-            path.display()
-        ))
+        Error::Mcp { server: "discovery".into(), message: format!("failed to parse discovery config `{}`: {e}", path.display()) }
     })?;
 
     let servers: Vec<McpServer> = parsed
@@ -1346,7 +1294,7 @@ done
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.json");
         let err = load_mcp_config(&path).unwrap_err();
-        assert!(err.to_string().contains("failed to read MCP config"));
+        assert!(err.to_string().contains("failed to read config"));
     }
 
     // -----------------------------------------------------------------------
@@ -1499,7 +1447,7 @@ done
         let err = discover_mcp_servers(dir.path()).await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("failed to parse MCP discovery config"),
+            msg.contains("failed to parse discovery config"),
             "error should mention parsing failure: {msg}"
         );
     }
@@ -1575,19 +1523,19 @@ done
     #[test]
     fn test_parse_sse_response() {
         let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"key\":\"value\"}}\n\n";
-        let result = parse_sse_response(buffer, 1);
+        let result = parse_sse_response(buffer, 1, "test");
         assert!(result.is_some());
         let result = result.unwrap().unwrap();
         assert_eq!(result.get("key").and_then(|v| v.as_str()), Some("value"));
 
         // Wrong id
-        let result = parse_sse_response(buffer, 2);
+        let result = parse_sse_response(buffer, 2, "test");
         assert!(result.is_none());
 
         // Error response
         let buffer =
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}\n\n";
-        let result = parse_sse_response(buffer, 1);
+        let result = parse_sse_response(buffer, 1, "test");
         assert!(result.is_some());
         assert!(result.unwrap().is_err());
     }
@@ -1596,7 +1544,7 @@ done
     fn test_parse_sse_response_multiline_data() {
         let buffer =
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\"\ndata: :{\"key\":\"value\"}}\n\n";
-        let result = parse_sse_response(buffer, 1);
+        let result = parse_sse_response(buffer, 1, "test");
         assert!(result.is_some());
         let result = result.unwrap().unwrap();
         assert_eq!(result.get("key").and_then(|v| v.as_str()), Some("value"));

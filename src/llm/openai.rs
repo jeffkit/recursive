@@ -109,7 +109,7 @@ impl OpenAiProvider {
 
     /// Build an `Error::Llm` with the model name prefixed.
     fn make_err(&self, ctx: impl Into<String>) -> Error {
-        Error::Llm(format!("model={}: {}", self.model, ctx.into()))
+        Error::Llm { provider: self.model.clone(), message: format!("{}", ctx.into()) }
     }
 
     pub fn with_temperature(mut self, t: f64) -> Self {
@@ -825,7 +825,7 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("model=test-model"),
+            msg.contains("test-model"),
             "error should contain model name: {msg}"
         );
     }
@@ -860,7 +860,7 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("model=test-model-http"),
+            msg.contains("test-model-http"),
             "error should contain model name: {msg}"
         );
         assert!(
