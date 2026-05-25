@@ -50,6 +50,101 @@ const ADD: &str = "*** Add File: ";
 const DELETE: &str = "*** Delete File: ";
 const HUNK_SEP: &str = "@@";
 
+/// Normalize a unified-diff-style hunk header to a V4A anchor.
+///
+/// Unified-diff headers look like `@@ -14,6 +14,28 @@ anchor text` or
+/// `@@ -14 +14 @@ anchor text`. The line-number range is discarded; only
+/// the trailing text after the second `@@` is returned as the anchor.
+///
+/// Returns `None` when the trailing text is empty or whitespace-only.
+fn normalize_hunk_header(rest: &str) -> Option<String> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Check for unified-diff pattern: `-N[,M] +N[,M] @@ [trailing]`
+    // We scan manually (no regex crate).
+    let bytes = trimmed.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    // Skip leading whitespace.
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Must start with '-'.
+    if i < len && bytes[i] == b'-' {
+        i += 1;
+        // Consume digits and optional comma+digits (the "old" range).
+        let mut has_digits = false;
+        while i < len && bytes[i].is_ascii_digit() {
+            has_digits = true;
+            i += 1;
+        }
+        if i < len && bytes[i] == b',' {
+            i += 1;
+            while i < len && bytes[i].is_ascii_digit() {
+                has_digits = true;
+                i += 1;
+            }
+        }
+        if !has_digits {
+            // Not a unified-diff header after all; return whole trimmed.
+            return Some(trimmed.to_string());
+        }
+
+        // Skip whitespace.
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        // Must have '+'.
+        if i < len && bytes[i] == b'+' {
+            i += 1;
+            // Consume digits and optional comma+digits (the "new" range).
+            let mut has_digits2 = false;
+            while i < len && bytes[i].is_ascii_digit() {
+                has_digits2 = true;
+                i += 1;
+            }
+            if i < len && bytes[i] == b',' {
+                i += 1;
+                while i < len && bytes[i].is_ascii_digit() {
+                    has_digits2 = true;
+                    i += 1;
+                }
+            }
+            if !has_digits2 {
+                return Some(trimmed.to_string());
+            }
+
+            // Skip whitespace.
+            while i < len && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            // Must have '@@'.
+            if i + 1 < len && bytes[i] == b'@' && bytes[i + 1] == b'@' {
+                i += 2;
+                // Skip whitespace after the second @@.
+                while i < len && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let trailing = trimmed[i..].trim().to_string();
+                if trailing.is_empty() {
+                    return None;
+                }
+                return Some(trailing);
+            }
+        }
+    }
+
+    // Not a unified-diff header; return the whole trimmed string.
+    Some(trimmed.to_string())
+}
+
 // ---- Tool ------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -84,7 +179,11 @@ impl Tool for ApplyPatch {
                 "*** End Patch\n",
                 "Context lines must match the file exactly. If a hunk's pattern ",
                 "appears multiple times in the file, add an @@ anchor (some unique ",
-                "line that appears earlier in the file) before the hunk."
+                "line that appears earlier in the file) before the hunk. ",
+                "Both `@@ <unique_line>` (V4A) and ",
+                "`@@ -N,M +N,M @@ <unique_line>` (unified-diff style) headers are ",
+                "accepted; the line-number range is ignored, only the anchor text ",
+                "after the final `@@` is used to locate the hunk."
             )
             .into(),
             parameters: json!({
@@ -227,12 +326,7 @@ pub(crate) fn parse_patch(input: &str) -> std::result::Result<Patch, String> {
             FileOp::Update { hunks, .. } => {
                 if let Some(rest) = line.strip_prefix(HUNK_SEP) {
                     // New hunk; first hunk is pre-allocated above, so we only push if the current is non-empty.
-                    let anchor_str = rest.trim();
-                    let anchor = if anchor_str.is_empty() {
-                        None
-                    } else {
-                        Some(anchor_str.to_string())
-                    };
+                    let anchor = normalize_hunk_header(rest);
                     let last = hunks.last_mut().unwrap();
                     if last.lines.is_empty() {
                         last.anchor = anchor;
@@ -524,6 +618,56 @@ mod tests {
         parse_patch(input).expect("parse")
     }
 
+    // -- normalize_hunk_header ------------------------------------------
+
+    #[test]
+    fn parses_v4a_anchor() {
+        assert_eq!(normalize_hunk_header("fn foo"), Some("fn foo".to_string()));
+    }
+
+    #[test]
+    fn parses_unified_header_with_anchor() {
+        assert_eq!(
+            normalize_hunk_header("-10,5 +10,7 @@ pub use foo;"),
+            Some("pub use foo;".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_unified_header_without_anchor() {
+        assert_eq!(normalize_hunk_header("-10,5 +10,7 @@"), None);
+    }
+
+    #[test]
+    fn parses_unified_header_singular_counts() {
+        assert_eq!(
+            normalize_hunk_header("-10 +10 @@ fn bar"),
+            Some("fn bar".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_empty_returns_none() {
+        assert_eq!(normalize_hunk_header(""), None);
+        assert_eq!(normalize_hunk_header("  "), None);
+    }
+
+    #[test]
+    fn normalize_non_unified_returns_whole() {
+        assert_eq!(
+            normalize_hunk_header("some random text"),
+            Some("some random text".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_unified_with_extra_whitespace() {
+        assert_eq!(
+            normalize_hunk_header("  -14,6 +14,28 @@  pub use mock::MockProvider;  "),
+            Some("pub use mock::MockProvider;".to_string())
+        );
+    }
+
     // -- parser ----------------------------------------------------------
 
     #[test]
@@ -575,6 +719,47 @@ mod tests {
                 assert_eq!(hunks.len(), 2);
                 assert_eq!(hunks[0].anchor.as_deref(), Some("fn foo"));
                 assert_eq!(hunks[1].anchor.as_deref(), Some("fn bar"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_unified_header_hunk() {
+        // A hunk header in unified-diff style should be accepted.
+        let patch = p("\
+*** Begin Patch
+*** Update File: a.txt
+@@ -10,5 +10,7 @@ pub use foo;
+ a
+-b
++B
+*** End Patch
+");
+        match &patch.ops[0] {
+            FileOp::Update { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].anchor.as_deref(), Some("pub use foo;"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_unified_header_no_anchor() {
+        let patch = p("\
+*** Begin Patch
+*** Update File: a.txt
+@@ -10,5 +10,7 @@
+ a
+-b
++B
+*** End Patch
+");
+        match &patch.ops[0] {
+            FileOp::Update { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].anchor, None);
             }
             _ => panic!(),
         }
@@ -938,5 +1123,26 @@ fn sub(a: i32, b: i32) -> i32 {
         let got = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
         assert!(got.contains("a.saturating_sub(b)"));
         assert!(got.contains("a + b"), "add() unchanged");
+    }
+
+    #[tokio::test]
+    async fn tool_applies_patch_with_unified_header() {
+        // End-to-end test using a unified-diff-style header.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("greeting.txt"), "hello\nworld\n").unwrap();
+        let tool = ApplyPatch::new(tmp.path());
+        tool.execute(json!({"patch": "\
+*** Begin Patch
+*** Update File: greeting.txt
+@@ -1,3 +1,4 @@ hello
+ hello
+-world
++earth
+*** End Patch
+"}))
+            .await
+            .unwrap();
+        let got = std::fs::read_to_string(tmp.path().join("greeting.txt")).unwrap();
+        assert_eq!(got, "hello\nearth\n");
     }
 }

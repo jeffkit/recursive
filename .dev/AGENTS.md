@@ -65,8 +65,10 @@ tests/
      - The `@@` lines are **optional anchors** containing a *unique line of
        source code* that already exists in the file. They disambiguate
        when the same context block appears more than once. They are NOT
-       hunk headers with line numbers. Do not write `@@ -14,6 +14,28 @@`
-       — that is unified-diff syntax and `apply_patch` will reject it.
+       hunk headers with line numbers. Both `@@ <anchor>` and
+       `@@ -N,M +N,M @@ <anchor>` are accepted; the line-number range,
+       when present, is ignored. What matters is the anchor text after
+       the final `@@` and the byte-for-byte context lines that follow.
      - Each `*** Update File: <path>` block must appear AT MOST ONCE per
        patch. To make multiple edits to the same file, put multiple hunks
        (each optionally preceded by its own `@@ anchor`) inside one
