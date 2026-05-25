@@ -204,20 +204,35 @@ The current goal pool / completed list is in `INDEX.md` and
 
 ## 5. Goal-file conventions
 
-Every goal file must include these top-level sections, in this order
-(see existing files for templates):
+Every goal file under `.dev/goals/` MUST include this header (above
+any other section) **starting from batch 12 onward**:
 
 ```
 # Goal NN — <title>
 
-## What
+**Roadmap**: <id> — <feature>   |   dev-infra   |   chore
+
+**Design principle check**:
+- Implemented as: [new Tool | new LlmProvider | new StepEvent observer
+                   | system prompt source | new module that the agent
+                   loop *calls into*]
+- ❌ Does NOT branch inside `agent.rs::Agent::run`'s main loop
+```
+
+This is the contract that keeps the kernel orthogonal as features pile
+on. Goals lacking the header should be REJECTED before launching
+(amend the goal file, then proceed). Pre-batch-12 goal files
+(04-30) are grandfathered — only new ones are subject to this rule.
+
+Rest of the goal file:
+
+```
 ## Why
 ## Scope (do exactly this, no more)
 ### 1. <file or area>
 ### 2. <…>
 ### 3. Tests
-## Out of scope
-## Definition of done
+## Acceptance (was: Definition of done)
 ## Notes for the agent
 ```
 
@@ -226,6 +241,45 @@ The product-editing agent is bound by `.dev/AGENTS.md`. Anything in
 contract.
 
 Be explicit. Vague goals waste tokens (and money).
+
+### 5.1 Roadmap ↔ loop-state ↔ goals — coordination protocol
+
+Four documents, distinct rhythms:
+
+| Doc | Role | Update rhythm | Updater |
+|---|---|---|---|
+| `.dev/ROADMAP.md` | Strategic plan, design principle, ❌ "won't build" list, status column (✅/🟡/🔴/⏸️) | When a batch lands → flip status; rare strategic edits | Orchestrator on land; user for direction shifts |
+| `.dev/loop-state.md` | Session snapshot: in-flight, last batch landed, roadmap delta, candidate pool | Every wake | Orchestrator |
+| `.dev/goals/NN-*.md` | Single task spec with roadmap link in header | When picking next batch | Orchestrator |
+| `.dev/observations/INDEX.md` + `<id>.md` | Per-run metrics archive | After each merge | observe.sh + orchestrator catch-up |
+
+Trigger relationships:
+
+```
+user edits ROADMAP.md (rare) ─┐
+                              ├→ orchestrator must pick next batch
+goal merges to main ──────────┤  from 🔴-status items
+                              │
+                              ├→ flip ROADMAP.md status to ✅ <commit>
+                              ├→ update loop-state.md "last batch"
+                              ├→ update loop-state.md "Roadmap delta"
+                              └→ append INDEX.md row + per-run file
+
+phase complete (all Phase-N items ✅) ─→ HITL: send phase summary
+                                          to user, await direction
+                                          on next phase
+```
+
+What the orchestrator does NOT touch in ROADMAP.md without HITL:
+- Adding new feature rows (phase scope is a user-level decision)
+- Removing rows from "What NOT to Build"
+- Reordering phases
+- Changing Effort or Impact estimates substantially
+
+What the orchestrator MAY freely edit in ROADMAP.md:
+- Status column (flipping 🔴/🟡/✅/⏸️)
+- Status-row commentary parenthetical (e.g. "promoted from medium")
+- "Phase 0" historical record under Priority Matrix
 
 ## 6. When to wake the human
 

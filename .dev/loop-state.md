@@ -7,20 +7,95 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T08:42Z.** Batch 11, **4-wide** (2 DeepSeek + 2
-> MiniMax). User confirmed MiniMax can also be multi-process'd.
-> Batch 10 was the first successful 4-wide and completed all 4 in
-> ~6 min wall-clock; capacity verified for steady-state 4-wide.
-> - **goal-27 shell-env-passthrough** (deepseek A).
->   Surface: `src/tools/shell.rs` only.
-> - **goal-28 transcript-head** (minimax A).
->   Surface: `src/transcript.rs` + `src/main.rs::replay` cmd.
-> - **goal-29 search-case-insensitive** (minimax B).
->   Surface: `src/tools/search.rs` only.
-> - **goal-30 openai-error-model** (deepseek B).
->   Surface: `src/llm/openai.rs` only.
+> **As of 2026-05-25T09:30Z. Batch 12 = strategic pivot to roadmap
+> Phase 1 + Skills + Anthropic.** User upweighted: streaming, skills,
+> MCP, context compaction. MCP held for batch 13 (L size; benefits
+> from Skills landing first). Anthropic free-rides Phase 2.3 here
+> because MiniMax + DeepSeek already expose Anthropic-compat endpoints
+> — adapter testable without new keys.
+>
+> **Gating**: batch 12 launch waits on git history force-push
+> (jeffkit identity rewrite, user is doing manually).
+> Once push confirmed, prep commit goes in first
+> (`StepEvent::Compacted` + `StepEvent::PartialToken` stubs as no-op
+> variants, decouples g31 & g32 from `agent.rs::StepEvent` conflict),
+> then 4 worktrees launch.
+>
+> Planned slot assignment:
+> - **goal-31 context-compaction** (deepseek A) — new `src/compact.rs`
+>   + 1 agent.rs hook. Big refactor, hot-path. DeepSeek's strength.
+> - **goal-32 streaming-sse** (deepseek B) — `llm/openai.rs` SSE +
+>   `agent.rs` `StepEvent::PartialToken`. Network + protocol parsing.
+> - **goal-33 skills-v1** (minimax A) — new `src/skills.rs` + new
+>   `tools/load_skill.rs` + `config.rs` injection. Greenfield module
+>   addition, well-suited to MiniMax.
+> - **goal-34 anthropic-provider** (minimax B) — new
+>   `src/llm/anthropic.rs`. Template-from-openai pattern, MiniMax good
+>   at mechanical adaptations.
+>
+> Expected wall-clock: ~10-15 min (g31 has the most agent.rs reads,
+> likely the slowest; others cheap-to-moderate).
+
+## Roadmap delta (live)
+
+> Updated each time a batch lands. See `.dev/ROADMAP.md` Priority
+> Matrix for the canonical status column.
+>
+> **In progress (batch 12)**: 1.1 Context Compaction · 1.3 Streaming ·
+> 2.3 Anthropic Provider · 3.3 Skill System
+>
+> **Phase 0 (kernel polish, pre-roadmap)**: all 27 goals (04-30)
+> landed. ~140 tests on main, ~$3.50 cumulative LLM spend.
+>
+> **Phase 1 status**: 2/4 in flight (1.1, 1.3). 1.2 (Project Context
+> File) + 1.4 (estimate_tokens) queued for batch 13/14.
+>
+> **Phase 2 status**: 1/3 in flight (2.3). 2.1 MCP queued for batch
+> 13. 2.2 Web Fetch queued (small, slot-filler).
+>
+> **Phase 3 status**: 1/4 in flight (3.3 promoted). 3.1 Sub-Agent,
+> 3.2 Memory, 3.4 Permission Hooks queued.
+>
+> **Phase 4 status**: not started. All items deferred until Phase
+> 1-3 majority done.
 
 ## Last batch landed
+
+> **Goals 27 + 28 + 29 + 30**, batch 11 — second 4-wide, all green.
+> One incident (g30 hung cargo test from missing reqwest timeout)
+> resolved manually, lesson added to AGENTS.md section 5.
+> - goal-27 shell-env-passthrough (deepseek): merged. $0.1017.
+>   `run_shell` now accepts an optional `env: object` parameter,
+>   overlays on top of inherited environment. +2 tests.
+> - goal-28 transcript-head (minimax): merged. $0.2508.
+>   `recursive replay --head N` shows just the first N messages with
+>   "...skipped K later messages" suffix. Adjacent to goal-09/17/20.
+>   +2 tests.
+> - goal-29 search-case-insensitive (minimax): merged. $0.1173.
+>   `search_files` now accepts optional `case_insensitive: bool`
+>   (applies to both literal and regex modes). +1 test.
+> - goal-30 openai-error-model (deepseek): merged. $0.3129.
+>   `OpenAiProvider` error messages now embed the model name via a
+>   new `make_err` helper. **Run triggered an OS-level hang on
+>   `cargo test` because the new live-API test had no reqwest
+>   timeout — multiple zombie test processes piled up.** Killed
+>   manually; agent later switched to `timeout 30 cargo test`. Added
+>   AGENTS.md section 5 lesson: "Network tests must set explicit
+>   reqwest timeout + connect_timeout".
+> - 140 tests green on main after batch 11.
+>
+> Side-track this wake: user requested git history rewrite to
+> `jeffkit <bbmyth@gmail.com>` identity. Done via `git filter-repo`,
+> backup tag `pre-rewrite-backup` preserved. Local config updated.
+> Force-push to origin handled by user manually (SSH key mismatch
+> prevented us from doing it).
+>
+> Infra changes also committed in this wake:
+> - `RECURSIVE_MAX_STEPS` default 50 → 100 in self-improve.sh.
+> - `RECURSIVE_AUTO_RESUME` logic: on `BudgetExceeded`, replay from
+>   last transcript step once, then accept or rollback.
+> - `observe.sh` now reads the LAST termination reason (post-resume)
+>   and reports an `auto-resumed: yes/no` field.
 
 > **Goals 23 + 24 + 25 + 26**, batch 10 — **first 4-wide, all green**.
 > g23 manually landed after MiniMax's run rolled back on a test
@@ -46,11 +121,6 @@
 >   files like `agent.rs` (the very thing that bit goal-24).
 > - 132 tests green on main (126 + g23 manual +1, +g24 +1+, +g25 +3,
 >   +g26 +3, give or take counting).
-
-> **Goals 21 + 22**, ninth concurrent batch (first attempted 3-wide,
-> de-facto 2-wide because GLM rolled back). Both intended slots green.
-
-## Last batch landed
 
 > **Goals 21 + 22**, ninth concurrent batch (first attempted 3-wide,
 > de-facto 2-wide because GLM rolled back). Both intended slots green.
