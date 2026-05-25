@@ -90,6 +90,10 @@ enum Cmd {
         /// Ignored when --resume-from is given.
         #[arg(long)]
         tail: Option<usize>,
+        /// Print only the first N messages of the transcript.
+        /// Mutually exclusive with --tail. Ignored when --resume-from is given.
+        #[arg(long)]
+        head: Option<usize>,
     },
 }
 
@@ -133,12 +137,21 @@ async fn main() -> anyhow::Result<()> {
             resume_from,
             goal,
             tail,
+            head,
         } => {
+            // Check mutual exclusivity of --head and --tail
+            if tail.is_some() && head.is_some() {
+                anyhow::bail!("--head and --tail are mutually exclusive");
+            }
+
             let file = recursive::TranscriptFile::read_from(&path)?;
             match resume_from {
                 None => {
+                    // If --head is provided, use pretty_head
+                    if let Some(n) = head {
+                        print!("{}", file.pretty_head(n));
                     // If --tail is provided without --resume-from, use pretty_tail
-                    if let Some(n) = tail {
+                    } else if let Some(n) = tail {
                         print!("{}", file.pretty_tail(n));
                     } else {
                         print!("{}", file.pretty());
