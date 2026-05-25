@@ -18,7 +18,7 @@ use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
     tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, WriteFile},
-    Agent, StepEvent, ToolRegistry,
+    Agent, StepEvent, ToolRegistry, TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -43,6 +43,10 @@ struct Cli {
     /// Log level: error|warn|info|debug|trace.
     #[arg(long, default_value = "info")]
     log: String,
+
+    /// Persist the full transcript to <path> as JSON when the run finishes.
+    #[arg(long, env = "RECURSIVE_TRANSCRIPT_OUT")]
+    transcript_out: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -85,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
         }
-        Cmd::Run { goal } => run_once(config, goal.join(" ")).await,
+        Cmd::Run { goal } => run_once(config, goal.join(" "), cli.transcript_out).await,
         Cmd::Repl => repl(config).await,
     }
 }
@@ -143,7 +147,11 @@ fn print_usage(usage: TokenUsage, model: &str) {
     }
 }
 
-async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
+async fn run_once(
+    config: Config,
+    goal: String,
+    transcript_out: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let (mut agent, rx) = build_agent(&config)?;
     let printer = tokio::spawn(stream_events(rx));
     let outcome = agent.run(goal).await?;
@@ -153,6 +161,22 @@ async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
         println!("\n=== final ===\n{msg}");
     }
     print_usage(outcome.total_usage, &config.model);
+
+    // Write transcript if requested
+    if let Some(path) = transcript_out {
+        let file = TranscriptFile::new(
+            outcome.transcript.clone(),
+            outcome.steps,
+            Some(config.model.clone()),
+        );
+        file.write_to(&path)?;
+        eprintln!(
+            "transcript: wrote {} messages to {}",
+            outcome.transcript.len(),
+            path.display()
+        );
+    }
+
     Ok(())
 }
 
