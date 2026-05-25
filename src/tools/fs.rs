@@ -32,12 +32,15 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file under the workspace. Returns the file contents."
-                .into(),
+            description:
+                "Read a UTF-8 text file under the workspace. Optionally return a line range."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path relative to the workspace root"}
+                    "path": {"type": "string", "description": "Path relative to the workspace root"},
+                    "start_line": {"type": "integer", "description": "Optional 1-indexed inclusive start line. If end_line is set but not start_line, defaults to 1."},
+                    "end_line": {"type": "integer", "description": "Optional 1-indexed inclusive end line. If start_line is set but not end_line, defaults to last line."}
                 },
                 "required": ["path"]
             }),
@@ -64,10 +67,81 @@ impl Tool for ReadFile {
                 ),
             });
         }
-        String::from_utf8(bytes).map_err(|e| Error::Tool {
+        let content = String::from_utf8(bytes).map_err(|e| Error::Tool {
             name: "read_file".into(),
             message: format!("not utf-8: {e}"),
-        })
+        })?;
+
+        // Parse optional line range parameters
+        let start_line = args["start_line"].as_u64();
+        let end_line = args["end_line"].as_u64();
+
+        // If no range specified, return full content
+        if start_line.is_none() && end_line.is_none() {
+            return Ok(content);
+        }
+
+        // Count total lines
+        let total_lines = content.lines().count();
+        if total_lines == 0 {
+            return Ok(content); // Empty file, return as-is
+        }
+
+        // Validate and clamp line numbers (1-indexed)
+        let start = match start_line {
+            Some(0) => {
+                return Err(Error::BadToolArgs {
+                    name: "read_file".to_string(),
+                    message: "start_line must be >= 1 (1-indexed)".to_string(),
+                });
+            }
+            Some(n) => n as usize,
+            None => 1,
+        };
+
+        let end = match end_line {
+            Some(0) => {
+                return Err(Error::BadToolArgs {
+                    name: "read_file".to_string(),
+                    message: "end_line must be >= 1 (1-indexed)".to_string(),
+                });
+            }
+            Some(n) => n as usize,
+            None => total_lines,
+        };
+
+        // Validate start <= end
+        if start > end {
+            return Err(Error::BadToolArgs {
+                name: "read_file".to_string(),
+                message: format!("start_line ({}) must be <= end_line ({})", start, end),
+            });
+        }
+
+        // Clamp to valid range
+        let start = start.min(total_lines);
+        let end = end.min(total_lines);
+
+        // Check if start exceeds total lines
+        if start_line.is_some() && start > total_lines {
+            return Err(Error::BadToolArgs {
+                name: "read_file".to_string(),
+                message: format!("start_line {} exceeds total lines {}", start, total_lines),
+            });
+        }
+
+        // Extract the requested slice (1-indexed, inclusive)
+        let slice: String = content
+            .lines()
+            .skip(start - 1)
+            .take(end - start + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(format!(
+            "# range: lines {}-{} of {}\n{}",
+            start, end, total_lines, slice
+        ))
     }
 }
 
@@ -229,5 +303,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::BadToolArgs { .. }));
+    }
+    // Tests for line range support (goal-26)
+    #[tokio::test]
+    async fn read_file_with_line_range() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("test.txt"),
+            "line1
+line2
+line3
+line4
+line5
+",
+        )
+        .unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r
+            .execute(json!({"path":"test.txt", "start_line": 2, "end_line": 3}))
+            .await
+            .unwrap();
+        // Should include range header and the sliced content
+        assert!(got.starts_with(
+            "# range: lines 2-3 of 5
+"
+        ));
+        assert!(got.contains("line2"));
+        assert!(got.contains("line3"));
+        assert!(!got.contains("line1"));
+        assert!(!got.contains("line4"));
+        assert!(!got.contains("line5"));
+    }
+
+    #[tokio::test]
+    async fn read_file_without_range_returns_full() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("test.txt"),
+            "line1
+line2
+line3",
+        )
+        .unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r.execute(json!({"path":"test.txt"})).await.unwrap();
+        // Should NOT have range header when no range specified
+        assert!(!got.starts_with("# range:"));
+        assert_eq!(
+            got,
+            "line1
+line2
+line3"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_invalid_range_start_greater_than_end() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("test.txt"),
+            "line1
+line2
+line3
+",
+        )
+        .unwrap();
+        let r = ReadFile::new(tmp.path());
+        let err = r
+            .execute(json!({"path":"test.txt", "start_line": 10, "end_line": 5}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadToolArgs { .. }));
+        let err_msg = format!("{:?}", err);
+        assert!(err_msg.contains("start_line") && err_msg.contains("end_line"));
     }
 }
