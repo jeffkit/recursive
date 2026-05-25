@@ -7,3 +7,7 @@ Cargo.lock.bak
 
 # self-improve.sh runtime state (rotation cursor)
 .dev/.last-provider
+
+# Parallel self-improve runtime state
+.worktrees/
+.dev/runs/
