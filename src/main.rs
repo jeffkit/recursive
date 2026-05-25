@@ -236,7 +236,7 @@ fn build_agent_seeded(
     Ok((agent, rx))
 }
 
-fn print_usage(usage: TokenUsage, model: &str) {
+fn print_usage(usage: TokenUsage, model: &str, total_llm_latency_ms: u64, steps: usize) {
     if usage.total_tokens > 0 {
         eprintln!(
             "tokens: prompt={} completion={} total={}",
@@ -258,6 +258,13 @@ fn print_usage(usage: TokenUsage, model: &str) {
             let cost = pricing.cost_usd(usage);
             eprintln!("cost: ${:.4} ({})", cost, model);
         }
+    }
+    if total_llm_latency_ms > 0 && steps > 0 {
+        let avg = total_llm_latency_ms / steps as u64;
+        eprintln!(
+            "llm latency: total={}ms avg={}ms over {} steps",
+            total_llm_latency_ms, avg, steps
+        );
     }
 }
 
@@ -295,7 +302,12 @@ async fn run_resumed(
         if let Some(msg) = outcome.final_message {
             println!("\n=== final ===\n{msg}");
         }
-        print_usage(outcome.total_usage, &config.model);
+        print_usage(
+            outcome.total_usage,
+            &config.model,
+            outcome.total_llm_latency_ms,
+            outcome.steps,
+        );
         print_finish_note(&outcome.finish);
     }
     if let Some(path) = transcript_out {
@@ -334,7 +346,12 @@ async fn run_once(
         if let Some(msg) = outcome.final_message {
             println!("\n=== final ===\n{msg}");
         }
-        print_usage(outcome.total_usage, &config.model);
+        print_usage(
+            outcome.total_usage,
+            &config.model,
+            outcome.total_llm_latency_ms,
+            outcome.steps,
+        );
         print_finish_note(&outcome.finish);
     }
 
@@ -389,7 +406,12 @@ async fn repl(
                     if let Some(msg) = outcome.final_message {
                         println!("\n=== final ===\n{msg}\n");
                     }
-                    print_usage(outcome.total_usage, &config.model);
+                    print_usage(
+                        outcome.total_usage,
+                        &config.model,
+                        outcome.total_llm_latency_ms,
+                        outcome.steps,
+                    );
                     print_finish_note(&outcome.finish);
                 }
             }
@@ -427,6 +449,9 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             }
             StepEvent::Usage { .. } => {
                 // Usage events are already accumulated and printed at end of run
+            }
+            StepEvent::Latency { step, llm_ms } => {
+                println!("[step {step}] llm latency: {llm_ms}ms");
             }
         }
     }

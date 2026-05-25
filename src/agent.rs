@@ -36,6 +36,10 @@ pub enum StepEvent {
         call: ToolCall,
         step: usize,
     },
+    Latency {
+        step: usize,
+        llm_ms: u64,
+    },
     ToolResult {
         id: String,
         name: String,
@@ -75,6 +79,7 @@ pub struct AgentOutcome {
     pub steps: usize,
     pub finish: FinishReason,
     pub total_usage: TokenUsage,
+    pub total_llm_latency_ms: u64,
 }
 
 pub struct Agent {
@@ -84,6 +89,7 @@ pub struct Agent {
     max_steps: usize,
     max_transcript_chars: Option<usize>,
     events: Option<mpsc::UnboundedSender<StepEvent>>,
+    total_llm_latency_ms: u64,
 }
 
 impl Agent {
@@ -106,6 +112,8 @@ impl Agent {
 
         // Accumulate token usage across all LLM calls
         let mut total_usage = TokenUsage::default();
+        // Reset latency accumulator at start of run
+        self.total_llm_latency_ms = 0;
 
         for step in 1..=self.max_steps {
             // Check transcript size limit before making the next LLM call.
@@ -125,12 +133,17 @@ impl Agent {
                         steps: step,
                         finish,
                         total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
                     });
                 }
             }
 
             debug!(target: "recursive::agent", step, "calling llm");
+            let start = std::time::Instant::now();
             let completion: Completion = self.llm.complete(&self.transcript, &specs).await?;
+            let llm_ms = start.elapsed().as_millis() as u64;
+            self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
+            self.emit(StepEvent::Latency { step, llm_ms });
 
             // Accumulate usage from this completion
             if let Some(u) = completion.usage {
@@ -176,6 +189,7 @@ impl Agent {
                     steps: step,
                     finish,
                     total_usage,
+                    total_llm_latency_ms: self.total_llm_latency_ms,
                 });
             }
 
@@ -231,6 +245,7 @@ impl Agent {
                         steps: step,
                         finish,
                         total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
                     });
                 }
 
@@ -367,6 +382,7 @@ impl AgentBuilder {
             max_steps: self.max_steps.unwrap_or(32),
             max_transcript_chars: self.max_transcript_chars,
             events: self.events,
+            total_llm_latency_ms: 0,
         })
     }
 }
@@ -547,9 +563,13 @@ mod tests {
                 StepEvent::ToolResult { .. } => "result",
                 StepEvent::Finished { .. } => "done",
                 StepEvent::Usage { .. } => "usage",
+                StepEvent::Latency { .. } => "latency",
             });
         }
-        assert_eq!(kinds, vec!["text", "call", "result", "text", "done"]);
+        assert_eq!(
+            kinds,
+            vec!["latency", "text", "call", "result", "latency", "text", "done"]
+        );
     }
 
     #[tokio::test]
@@ -830,6 +850,20 @@ mod tests {
     }
 
     #[test]
+    fn step_event_latency_serializes_with_kind_tag() {
+        let ev = StepEvent::Latency {
+            step: 3,
+            llm_ms: 42,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""kind":"latency""#));
+        assert!(json.contains(r#""step":3"#));
+        assert!(json.contains(r#""llm_ms":42"#));
+        let back: StepEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, StepEvent::Latency { step, llm_ms } if step == 3 && llm_ms == 42));
+    }
+
+    #[test]
     fn finish_reason_serializes_with_kind_tag() {
         let fr = FinishReason::Stuck {
             repeated_call: "read_file".into(),
@@ -905,11 +939,57 @@ mod tests {
             kinds.push(match ev {
                 StepEvent::AssistantText { .. } => "text",
                 StepEvent::Finished { .. } => "done",
+                StepEvent::Latency { .. } => "latency",
                 _ => "other",
             });
         }
         // Only events from the new run; nothing fired for seeded messages.
-        assert_eq!(kinds, vec!["text", "done"]);
+        assert_eq!(kinds, vec!["latency", "text", "done"]);
+    }
+
+    #[tokio::test]
+    async fn emits_latency_event_per_llm_call() {
+        // Run the agent through 2 steps and verify Latency events are emitted.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "step 1".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "step 2".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .events(tx)
+            .build()
+            .unwrap();
+        let out = agent.run("add twice").await.unwrap();
+
+        // total_llm_latency_ms should exist and be u64 (compile check)
+        let _: u64 = out.total_llm_latency_ms;
+
+        // Count Latency events
+        let mut latency_count = 0;
+        while let Ok(e) = rx.try_recv() {
+            if matches!(e, StepEvent::Latency { .. }) {
+                latency_count += 1;
+            }
+        }
+        // Should have one Latency event per LLM call (2 steps)
+        assert_eq!(latency_count, 2);
     }
 
     // --- Transcript trimming tests ---
