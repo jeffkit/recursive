@@ -189,7 +189,8 @@ impl Tool for ApplyPatch {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "patch": {"type": "string", "description": "The V4A patch text"}
+                    "patch": {"type": "string", "description": "The V4A patch text"},
+                    "dry_run": {"type": "boolean", "description": "If true, validate and resolve the patch but do not write any files. Returns the same success/error message it would produce in a normal run.", "default": false}
                 },
                 "required": ["patch"]
             }),
@@ -201,6 +202,10 @@ impl Tool for ApplyPatch {
             name: "apply_patch".into(),
             message: "missing `patch`".into(),
         })?;
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let patch = parse_patch(input).map_err(|e| Error::Tool {
             name: "apply_patch".into(),
             message: e,
@@ -209,6 +214,24 @@ impl Tool for ApplyPatch {
             name: "apply_patch".into(),
             message: e,
         })?;
+        if dry_run {
+            let file_count = writes.len();
+            let hunk_count: usize = patch
+                .ops
+                .iter()
+                .map(|op| match op {
+                    FileOp::Update { hunks, .. } => hunks.len(),
+                    _ => 1,
+                })
+                .sum();
+            let paths: Vec<&str> = writes.iter().map(|w| w.rel_path.as_str()).collect();
+            return Ok(format!(
+                "dry-run: would apply {} hunk(s) across {} file(s): {}",
+                hunk_count,
+                file_count,
+                paths.join(", ")
+            ));
+        }
         commit(writes).await.map_err(|e| Error::Tool {
             name: "apply_patch".into(),
             message: e,
@@ -1221,5 +1244,73 @@ fn sub(a: i32, b: i32) -> i32 {
             .unwrap();
         let got = std::fs::read_to_string(tmp.path().join("greeting.txt")).unwrap();
         assert_eq!(got, "hello\nearth\n");
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_summary_and_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("target.txt"), "before\n").unwrap();
+        let tool = ApplyPatch::new(tmp.path());
+        let result = tool
+            .execute(json!({"patch": "\
+*** Begin Patch
+*** Update File: target.txt
+-before
++after
+*** End Patch
+", "dry_run": true}))
+            .await
+            .unwrap();
+        assert!(result.contains("dry-run: would apply"));
+        assert!(result.contains("target.txt"));
+        // File must be unchanged
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+            "before\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_errors_on_ambiguous_anchor() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("dup.txt"), "x\ny\nx\ny\n").unwrap();
+        let tool = ApplyPatch::new(tmp.path());
+        let err = tool
+            .execute(json!({"patch": "\
+*** Begin Patch
+*** Update File: dup.txt
+ x
+-y
++Y
+*** End Patch
+", "dry_run": true}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Tool { .. }));
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("matches"),
+            "error should mention multiple matches: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_false_is_same_as_omitting_field() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "old\n").unwrap();
+        let tool = ApplyPatch::new(tmp.path());
+        tool.execute(json!({"patch": "\
+*** Begin Patch
+*** Update File: test.txt
+-old
++new
+*** End Patch
+", "dry_run": false}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("test.txt")).unwrap(),
+            "new\n"
+        );
     }
 }
