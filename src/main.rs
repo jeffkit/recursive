@@ -136,9 +136,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
                 Some(_) if goal.is_empty() => {
-                    anyhow::bail!(
-                        "--resume-from requires a trailing <goal> to continue the run"
-                    );
+                    anyhow::bail!("--resume-from requires a trailing <goal> to continue the run");
                 }
                 Some(n) => {
                     let seed = file.take_first_n(n).ok_or_else(|| {

@@ -22,6 +22,9 @@ use crate::tools::ToolRegistry;
 /// Threshold for consecutive identical failing tool calls before declaring stuck.
 const STUCK_THRESHOLD: usize = 3;
 
+/// Placeholder text used when trimming old tool results to fit the transcript budget.
+const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepEvent {
@@ -106,8 +109,10 @@ impl Agent {
 
         for step in 1..=self.max_steps {
             // Check transcript size limit before making the next LLM call.
-            let chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
+            // First try trimming old tool results; fall back to hard stop.
             if let Some(limit) = self.max_transcript_chars {
+                self.maybe_trim_transcript(limit, step);
+                let chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
                 if chars >= limit {
                     let finish = FinishReason::TranscriptLimit { chars, limit };
                     self.emit(StepEvent::Finished {
@@ -246,6 +251,49 @@ impl Agent {
             steps: self.max_steps,
         });
         Err(Error::StepBudgetExceeded(self.max_steps))
+    }
+
+    /// Try to trim old tool results to bring the transcript under the character limit.
+    ///
+    /// Walks the transcript from index 1 (skipping the system prompt at 0) forward,
+    /// and for any `Role::Tool` message whose content is longer than 200 characters,
+    /// replaces the content with [`TRIM_PLACEHOLDER`]. Stops as soon as the total
+    /// character count is below `limit`. Emits an `AssistantText` event (reusing the
+    /// existing variant) to surface that trimming happened.
+    fn maybe_trim_transcript(&mut self, limit: usize, step: usize) {
+        let mut chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
+        if chars < limit {
+            return;
+        }
+
+        let mut trimmed_count: usize = 0;
+        let placeholder_len = TRIM_PLACEHOLDER.len();
+
+        // Walk from index 1 (skip system prompt at 0) forward, trimming old tool results.
+        // Track the running total ourselves to avoid re-borrowing self.transcript.
+        for msg in self.transcript.iter_mut().skip(1) {
+            if msg.role == crate::message::Role::Tool && msg.content.len() > 200 {
+                let old_len = msg.content.len();
+                msg.content = TRIM_PLACEHOLDER.to_string();
+                trimmed_count += 1;
+                // Adjust the running total: we removed old_len and added placeholder_len.
+                chars = chars
+                    .saturating_sub(old_len)
+                    .saturating_add(placeholder_len);
+                if chars < limit {
+                    break;
+                }
+            }
+        }
+
+        if trimmed_count > 0 {
+            let note = format!(
+                "[trimmed {} old tool result{} to fit budget]",
+                trimmed_count,
+                if trimmed_count == 1 { "" } else { "s" }
+            );
+            self.emit(StepEvent::AssistantText { text: note, step });
+        }
     }
 
     pub fn transcript(&self) -> &[Message] {
@@ -856,5 +904,110 @@ mod tests {
         }
         // Only events from the new run; nothing fired for seeded messages.
         assert_eq!(kinds, vec!["text", "done"]);
+    }
+
+    // --- Transcript trimming tests ---
+
+    #[tokio::test]
+    async fn trims_old_tool_result_to_fit_budget() {
+        // Build a transcript with a large tool result followed by a small
+        // assistant message. Set max_transcript_chars just under the big
+        // result's size so trimming is triggered.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "let me run a tool".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "big".into(),
+                    arguments: json!({}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        // Use a custom tool that returns a big result
+        struct BigResultTool;
+        #[async_trait]
+        impl Tool for BigResultTool {
+            fn spec(&self) -> crate::llm::ToolSpec {
+                crate::llm::ToolSpec {
+                    name: "big".into(),
+                    description: "returns a big result".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn execute(&self, _args: Value) -> Result<String> {
+                Ok("x".repeat(500))
+            }
+        }
+        let tools = ToolRegistry::new().register(Arc::new(BigResultTool));
+        // Set limit so the big result (500 chars) plus user goal (2 chars)
+        // plus assistant text (~17 chars) would exceed, but trimming the
+        // tool result to the placeholder (~50 chars) brings it under.
+        // User "hi" = 2, assistant "let me run a tool" = 17, tool result
+        // placeholder = 50, assistant "done" = 4. Total ~73.
+        // Set limit to 100: the big result alone (500) would blow it,
+        // but after trimming we're under.
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_transcript_chars(100)
+            .max_steps(10)
+            .build()
+            .unwrap();
+        let out = agent.run("hi").await.unwrap();
+        // Should complete normally, not hit TranscriptLimit
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+        // The tool result should have been trimmed
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert!(!tool_msgs.is_empty());
+        for msg in &tool_msgs {
+            assert_eq!(msg.content, TRIM_PLACEHOLDER);
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_limit_fires_when_trimming_not_enough() {
+        // Build a transcript where even after trimming all tool results,
+        // the non-tool messages alone exceed the budget.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "x".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "y".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        // Set a very tight limit that even the user goal alone exceeds.
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_transcript_chars(1)
+            .max_steps(10)
+            .build()
+            .unwrap();
+        let out = agent.run("hi").await.unwrap();
+        assert!(matches!(out.finish, FinishReason::TranscriptLimit { .. }));
     }
 }
