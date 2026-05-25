@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, env = "RECURSIVE_TRANSCRIPT_OUT")]
     transcript_out: Option<PathBuf>,
 
+    /// Emit StepEvents as newline-delimited JSON on stdout instead of the
+    /// human-readable trace. Pipeable to jq or other downstream tooling.
+    #[arg(long, env = "RECURSIVE_JSON")]
+    json: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -105,10 +110,11 @@ async fn main() -> anyhow::Result<()> {
                 goal.join(" "),
                 cli.max_transcript_chars,
                 cli.transcript_out,
+                cli.json,
             )
             .await
         }
-        Cmd::Repl => repl(config, cli.max_transcript_chars).await,
+        Cmd::Repl => repl(config, cli.max_transcript_chars, cli.json).await,
         Cmd::Replay { path } => {
             let file = recursive::TranscriptFile::read_from(&path)?;
             print!("{}", file.pretty());
@@ -197,17 +203,24 @@ async fn run_once(
     goal: String,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
+    json_mode: bool,
 ) -> anyhow::Result<()> {
     let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
-    let printer = tokio::spawn(stream_events(rx));
+    let printer = if json_mode {
+        tokio::spawn(stream_events_json(rx))
+    } else {
+        tokio::spawn(stream_events(rx))
+    };
     let outcome = agent.run(goal).await?;
     drop(agent);
     printer.await.ok();
-    if let Some(msg) = outcome.final_message {
-        println!("\n=== final ===\n{msg}");
+    if !json_mode {
+        if let Some(msg) = outcome.final_message {
+            println!("\n=== final ===\n{msg}");
+        }
+        print_usage(outcome.total_usage, &config.model);
+        print_finish_note(&outcome.finish);
     }
-    print_usage(outcome.total_usage, &config.model);
-    print_finish_note(&outcome.finish);
 
     if let Some(path) = transcript_out {
         let file = TranscriptFile::new(
@@ -225,7 +238,11 @@ async fn run_once(
     Ok(())
 }
 
-async fn repl(config: Config, max_transcript_chars: Option<usize>) -> anyhow::Result<()> {
+async fn repl(
+    config: Config,
+    max_transcript_chars: Option<usize>,
+    json_mode: bool,
+) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     loop {
@@ -243,16 +260,22 @@ async fn repl(config: Config, max_transcript_chars: Option<usize>) -> anyhow::Re
             break;
         }
         let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
-        let printer = tokio::spawn(stream_events(rx));
+        let printer = if json_mode {
+            tokio::spawn(stream_events_json(rx))
+        } else {
+            tokio::spawn(stream_events(rx))
+        };
         match agent.run(goal.to_string()).await {
             Ok(outcome) => {
                 drop(agent);
                 printer.await.ok();
-                if let Some(msg) = outcome.final_message {
-                    println!("\n=== final ===\n{msg}\n");
+                if !json_mode {
+                    if let Some(msg) = outcome.final_message {
+                        println!("\n=== final ===\n{msg}\n");
+                    }
+                    print_usage(outcome.total_usage, &config.model);
+                    print_finish_note(&outcome.finish);
                 }
-                print_usage(outcome.total_usage, &config.model);
-                print_finish_note(&outcome.finish);
             }
             Err(e) => {
                 eprintln!("error: {e}");
@@ -289,6 +312,14 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             StepEvent::Usage { .. } => {
                 // Usage events are already accumulated and printed at end of run
             }
+        }
+    }
+}
+
+async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
+    while let Some(ev) = rx.recv().await {
+        if let Ok(line) = serde_json::to_string(&ev) {
+            println!("{line}");
         }
     }
 }

@@ -9,6 +9,8 @@
 //! observe progress without coupling to the agent's internals.
 
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -20,7 +22,8 @@ use crate::tools::ToolRegistry;
 /// Threshold for consecutive identical failing tool calls before declaring stuck.
 const STUCK_THRESHOLD: usize = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepEvent {
     AssistantText {
         text: String,
@@ -46,7 +49,8 @@ pub enum StepEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FinishReason {
     NoMoreToolCalls,
     BudgetExceeded,
@@ -731,5 +735,56 @@ mod tests {
         }
         // Should have stopped at step 1 without making any LLM call.
         assert_eq!(out.steps, 1);
+    }
+
+    #[test]
+    fn step_event_serializes_with_kind_tag() {
+        let ev = StepEvent::AssistantText {
+            text: "hello".into(),
+            step: 1,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""kind":"assistant_text""#));
+        let back: StepEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, StepEvent::AssistantText { text, step } if text == "hello" && step == 1)
+        );
+    }
+
+    #[test]
+    fn step_event_tool_call_uses_snake_case() {
+        let ev = StepEvent::ToolCall {
+            call: ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "foo.txt"}),
+            },
+            step: 2,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""kind":"tool_call""#));
+    }
+
+    #[test]
+    fn finish_reason_serializes_with_kind_tag() {
+        let fr = FinishReason::Stuck {
+            repeated_call: "read_file".into(),
+            repeats: 3,
+        };
+        let json = serde_json::to_string(&fr).unwrap();
+        assert!(json.contains(r#""kind":"stuck""#));
+        let back: FinishReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fr);
+    }
+
+    #[test]
+    fn finish_reason_transcript_limit_roundtrips() {
+        let fr = FinishReason::TranscriptLimit {
+            chars: 4096,
+            limit: 2048,
+        };
+        let json = serde_json::to_string(&fr).unwrap();
+        let back: FinishReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fr);
     }
 }

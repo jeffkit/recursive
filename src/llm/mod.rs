@@ -19,7 +19,7 @@ pub use mock::MockProvider;
 pub use openai::OpenAiProvider;
 
 /// Token usage data from an LLM response.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
