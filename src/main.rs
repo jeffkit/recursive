@@ -18,7 +18,7 @@ use recursive::{
     config::Config,
     llm::{pricing_for, LlmProvider, OpenAiProvider, TokenUsage},
     tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, WriteFile},
-    Agent, FinishReason, StepEvent, ToolRegistry,
+    Agent, FinishReason, StepEvent, ToolRegistry, TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -47,6 +47,10 @@ struct Cli {
     /// Log level: error|warn|info|debug|trace.
     #[arg(long, default_value = "info")]
     log: String,
+
+    /// Persist the full transcript to <path> as JSON when the run finishes.
+    #[arg(long, env = "RECURSIVE_TRANSCRIPT_OUT")]
+    transcript_out: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -89,7 +93,15 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
         }
-        Cmd::Run { goal } => run_once(config, goal.join(" "), cli.max_transcript_chars).await,
+        Cmd::Run { goal } => {
+            run_once(
+                config,
+                goal.join(" "),
+                cli.max_transcript_chars,
+                cli.transcript_out,
+            )
+            .await
+        }
         Cmd::Repl => repl(config, cli.max_transcript_chars).await,
     }
 }
@@ -166,6 +178,7 @@ async fn run_once(
     config: Config,
     goal: String,
     max_transcript_chars: Option<usize>,
+    transcript_out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let (mut agent, rx) = build_agent(&config, max_transcript_chars)?;
     let printer = tokio::spawn(stream_events(rx));
@@ -177,6 +190,20 @@ async fn run_once(
     }
     print_usage(outcome.total_usage, &config.model);
     print_finish_note(&outcome.finish);
+
+    if let Some(path) = transcript_out {
+        let file = TranscriptFile::new(
+            outcome.transcript.clone(),
+            outcome.steps,
+            Some(config.model.clone()),
+        );
+        file.write_to(&path)?;
+        eprintln!(
+            "transcript: wrote {} messages to {}",
+            outcome.transcript.len(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
