@@ -301,7 +301,7 @@ pub trait LlmProvider: Send + Sync {
 
     /// Stream a completion token-by-token.
     ///
-    /// The default implementation delegates to [`complete`] and emits the
+    /// The default implementation delegates to [`LlmProvider::complete`] and emits the
     /// entire content as a single delta via the channel (if configured).
     /// Providers that support native SSE streaming should override this.
     ///
