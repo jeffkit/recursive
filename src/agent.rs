@@ -17,6 +17,9 @@ use crate::llm::{Completion, LlmProvider, ToolCall};
 use crate::message::Message;
 use crate::tools::ToolRegistry;
 
+/// Threshold for consecutive identical failing tool calls before declaring stuck.
+const STUCK_THRESHOLD: usize = 3;
+
 #[derive(Debug, Clone)]
 pub enum StepEvent {
     AssistantText { text: String, step: usize },
@@ -30,6 +33,7 @@ pub enum FinishReason {
     NoMoreToolCalls,
     BudgetExceeded,
     ProviderStop(String),
+    Stuck { repeated_call: String, repeats: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,10 @@ impl Agent {
 
         let mut final_message: Option<String> = None;
         let specs = self.tools.specs();
+
+        // Tracking for anti-stuck heuristic
+        let mut last_call_key: Option<(String, String)> = None;
+        let mut consecutive_errors: usize = 0;
 
         for step in 1..=self.max_steps {
             debug!(target: "recursive::agent", step, "calling llm");
@@ -100,6 +108,40 @@ impl Agent {
                     Ok(output) => output,
                     Err(err) => format!("ERROR: {err}"),
                 };
+
+                // Anti-stuck heuristic: track identical failing calls
+                let call_key = (call.name.clone(), serde_json::to_string(&call.arguments).unwrap_or_default());
+                let is_error = result.starts_with("ERROR:");
+
+                if is_error {
+                    if last_call_key == Some(call_key.clone()) {
+                        consecutive_errors += 1;
+                    } else {
+                        consecutive_errors = 1;
+                    }
+                } else {
+                    consecutive_errors = 0;
+                }
+
+                last_call_key = Some(call_key);
+
+                // Check if stuck threshold reached
+                if consecutive_errors >= STUCK_THRESHOLD {
+                    let repeated_call = call.name.clone();
+                    let repeats = consecutive_errors;
+                    let finish = FinishReason::Stuck {
+                        repeated_call,
+                        repeats,
+                    };
+                    self.emit(StepEvent::Finished { reason: finish.clone(), steps: step });
+                    return Ok(AgentOutcome {
+                        final_message,
+                        transcript: std::mem::take(&mut self.transcript),
+                        steps: step,
+                        finish,
+                    });
+                }
+
                 self.emit(StepEvent::ToolResult {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -300,5 +342,57 @@ mod tests {
             });
         }
         assert_eq!(kinds, vec!["text", "call", "result", "text", "done"]);
+    }
+
+    #[tokio::test]
+    async fn stops_when_repeated_call_keeps_erroring() {
+        // MockProvider scripted to call a non-existent tool 4 times
+        let mut script = Vec::new();
+        for i in 0..4 {
+            script.push(Completion {
+                content: "".into(),
+                tool_calls: vec![ToolCall {
+                    id: format!("c{}", i),
+                    name: "UnknownTool".into(),
+                    arguments: json!({"arg": "value"}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+            });
+        }
+        let llm = Arc::new(MockProvider::new(script));
+        let mut agent = Agent::builder().llm(llm).max_steps(10).build().unwrap();
+        let out = agent.run("call unknown tool").await.unwrap();
+        
+        // Should be stuck after 3 consecutive errors
+        assert!(matches!(out.finish, FinishReason::Stuck { .. }));
+        if let FinishReason::Stuck { repeated_call, repeats } = &out.finish {
+            assert_eq!(repeated_call, "UnknownTool");
+            assert_eq!(*repeats, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_trigger_when_args_differ() {
+        // MockProvider scripted to call same tool with different args each time
+        let mut script = Vec::new();
+        for i in 0..3 {
+            script.push(Completion {
+                content: "".into(),
+                tool_calls: vec![ToolCall {
+                    id: format!("c{}", i),
+                    name: "add".into(),
+                    arguments: json!({"a": i, "b": i}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+            });
+        }
+        let llm = Arc::new(MockProvider::new(script));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        // Set max_steps low so test terminates with budget
+        let mut agent = Agent::builder().llm(llm).tools(tools).max_steps(3).build().unwrap();
+        let err = agent.run("add with different args").await.unwrap_err();
+        
+        // Should hit budget, not stuck (args differ each time)
+        assert!(matches!(err, Error::StepBudgetExceeded(3)));
     }
 }
