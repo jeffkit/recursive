@@ -7,9 +7,27 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T08:15Z.** Empty between batches 7 and 8.
+> **As of 2026-05-25T08:22Z.** Empty between batches 8 and 9.
+> Batch 9 will be the **first 3-wide run** (GLM-4-flash joins
+> DeepSeek + MiniMax).
 
 ## Last batch landed
+
+> **Goals 19 + 20**, eighth concurrent batch — both green, no
+> rollbacks, no manual landings. First batch since #5 that's
+> "fully successful".
+> - goal-19 transcript-budget-trim (deepseek): merged. 50 messages,
+>   $0.2179, 2 new tests. **Recovered from a Rust E0502 borrow
+>   checker error mid-run** without going Stuck — proof the
+>   apply_patch + cargo test verification loop scales to non-trivial
+>   refactors. The agent now auto-trims old ToolResult content
+>   (>200 chars) to fit `max_transcript_chars`, only falling back to
+>   the hard stop if every trimable message is already short.
+> - goal-20 replay-tail (minimax): merged. 42 messages, $0.0849,
+>   2 new tests. `recursive replay --tail N` now shows just the
+>   last N messages with a "...skipped K earlier messages" prefix.
+>   Adjacent extension to goal-09 / goal-17.
+> - 119 tests green on main.
 
 > **Goals 17 (manual) + 18**, seventh concurrent batch.
 > - goal-18 default-prompt-dogfood (minimax): merged. 25 messages,
@@ -130,6 +148,8 @@ files yet; pick one, write the goal file, launch:
 - ~~**self-improve.sh uses --transcript-out**~~ — done (orchestrator hand-patch, no goal).
 - ~~**transcript replay-from-step**~~ — done (goal 17, manual landing).
 - ~~**dogfood default_system_prompt with V4A + hard limits**~~ — done (goal 18).
+- ~~**transcript context budget auto-trim**~~ — done (goal 19).
+- ~~**replay --tail N**~~ — done (goal 20).
 - **observe.sh handles manual-landing journals** — `observe.sh`
   currently expects `## Result` + agent transcript blocks; manual
   journals (goals 14, 17) don't include those, so `INDEX.md` rows
