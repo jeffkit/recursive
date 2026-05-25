@@ -7,16 +7,48 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T08:32Z.** Batch 10, 3-wide with 2x DeepSeek + 1x
-> MiniMax (GLM dropped — `余额不足` on the only available 5.1 model).
-> User confirmed DeepSeek can be safely double-booked.
-> - **goal-24 per-step-latency** (deepseek, PID 28325).
->   Surface: `src/agent.rs` + `src/main.rs::print_usage`.
-> - **goal-25 apply-patch-dry-run** (deepseek, PID 28704).
->   Surface: `src/tools/apply_patch.rs` only.
-> - **goal-23 shell-timeout-env** (minimax, PID 28964).
->   Surface: `src/config.rs` + `src/main.rs::build_tools`.
-> - Watcher: PID 40149, heartbeat PID 40241 (30-min fallback).
+> **As of 2026-05-25T08:42Z.** Batch 11, **4-wide** (2 DeepSeek + 2
+> MiniMax). User confirmed MiniMax can also be multi-process'd.
+> Batch 10 was the first successful 4-wide and completed all 4 in
+> ~6 min wall-clock; capacity verified for steady-state 4-wide.
+> - **goal-27 shell-env-passthrough** (deepseek A).
+>   Surface: `src/tools/shell.rs` only.
+> - **goal-28 transcript-head** (minimax A).
+>   Surface: `src/transcript.rs` + `src/main.rs::replay` cmd.
+> - **goal-29 search-case-insensitive** (minimax B).
+>   Surface: `src/tools/search.rs` only.
+> - **goal-30 openai-error-model** (deepseek B).
+>   Surface: `src/llm/openai.rs` only.
+
+## Last batch landed
+
+> **Goals 23 + 24 + 25 + 26**, batch 10 — **first 4-wide, all green**.
+> g23 manually landed after MiniMax's run rolled back on a test
+> parallelism race; product code was right, lesson recorded in
+> AGENTS.md section 5 ("Env-var tests must be ONE test, not many").
+> - goal-23 shell-timeout-env (minimax → manual): MiniMax's product
+>   patches (config field + env parsing + `build_tools(&Config)`
+>   refactor) were correct; rolled back at 50 steps trying to debug
+>   `cargo test` parallel race on `RECURSIVE_SHELL_TIMEOUT_SECS`.
+>   Manually landed with one consolidated test. +1 test.
+> - goal-24 per-step-latency (deepseek): merged. 48 steps,
+>   **$0.7374 — new single-run high-water mark**. `agent.rs` is
+>   the largest file in the tree; every read inflates the transcript
+>   exponentially over 48 steps. `StepEvent::Latency { step, llm_ms }`
+>   now emitted, `total_llm_latency_ms` summary in `print_usage`.
+> - goal-25 apply-patch-dry-run (deepseek): merged. 11 steps,
+>   $0.0869 — extremely cheap, `apply_patch.rs` is well-factored
+>   so the dry-run helper plumbed cleanly. +3 tests.
+> - goal-26 read-file-range (minimax): merged. 35 steps, $0.2714.
+>   `read_file` now takes optional `start_line` / `end_line`;
+>   range-mode adds a `# range: lines s-e of total` header. Should
+>   reduce future transcript inflation when agents inspect big
+>   files like `agent.rs` (the very thing that bit goal-24).
+> - 132 tests green on main (126 + g23 manual +1, +g24 +1+, +g25 +3,
+>   +g26 +3, give or take counting).
+
+> **Goals 21 + 22**, ninth concurrent batch (first attempted 3-wide,
+> de-facto 2-wide because GLM rolled back). Both intended slots green.
 
 ## Last batch landed
 
