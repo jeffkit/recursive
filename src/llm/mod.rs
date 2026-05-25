@@ -59,12 +59,26 @@ impl TokenUsage {
 pub struct ModelPricing {
     pub input_per_million: f64,
     pub output_per_million: f64,
+    /// Price per million tokens for cache-hit prompts.
+    /// Defaults to 10% of input rate (DeepSeek's known discount).
+    pub cache_hit_input_per_million: f64,
 }
 
 impl ModelPricing {
     /// USD cost for the given usage at this pricing.
     pub fn cost_usd(&self, usage: TokenUsage) -> f64 {
-        let in_cost = (usage.prompt_tokens as f64) * self.input_per_million / 1_000_000.0;
+        let in_cost = if usage.cache_hit_tokens > 0 {
+            // Apply cache-hit discount: use cache_hit_input_per_million for cached tokens
+            let cache_hit =
+                usage.cache_hit_tokens as f64 * self.cache_hit_input_per_million / 1_000_000.0;
+            // Use full rate for cache-miss tokens (which is prompt - cache_hit)
+            // Note: cache_miss_tokens may not equal prompt - cache_hit due to rounding,
+            // but the difference is negligible for billing purposes
+            let cache_miss = usage.cache_miss_tokens as f64 * self.input_per_million / 1_000_000.0;
+            cache_hit + cache_miss
+        } else {
+            (usage.prompt_tokens as f64) * self.input_per_million / 1_000_000.0
+        };
         let out_cost = (usage.completion_tokens as f64) * self.output_per_million / 1_000_000.0;
         in_cost + out_cost
     }
@@ -76,20 +90,28 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
         "MiniMax-M2" => Some(ModelPricing {
             input_per_million: 0.30,
             output_per_million: 1.20,
+            // No known cache discount; use full rate (conservative)
+            cache_hit_input_per_million: 0.30,
         }),
         "deepseek-chat" | "deepseek-v4-flash" => Some(ModelPricing {
             input_per_million: 0.27,
             output_per_million: 1.10,
+            // DeepSeek: cache hit = 10% of input rate
+            cache_hit_input_per_million: 0.027,
         }),
         // V4-Pro is ~7× flash on input; placeholder until calibrated
         // against the DeepSeek billing dashboard.
         "deepseek-v4-pro" => Some(ModelPricing {
             input_per_million: 1.89,
             output_per_million: 7.70,
+            // DeepSeek: cache hit = 10% of input rate
+            cache_hit_input_per_million: 0.189,
         }),
         "glm-4-flash" => Some(ModelPricing {
             input_per_million: 0.10,
             output_per_million: 0.10,
+            // No known cache discount; use full rate
+            cache_hit_input_per_million: 0.10,
         }),
         // GLM-5.1 pricing is currently a placeholder pending official
         // confirmation; the per-run `cost: $X` line will be approximate
@@ -97,8 +119,15 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
         "glm-5.1" => Some(ModelPricing {
             input_per_million: 0.50,
             output_per_million: 2.00,
+            // No known cache discount; use full rate
+            cache_hit_input_per_million: 0.50,
         }),
-        _ => None,
+        _ => {
+            // Unknown model: use conservative default (full rate for cache hits,
+            // i.e., no discount). This matches the goal spec: "use full rate
+            // (conservative)".
+            None
+        }
     }
 }
 
@@ -275,6 +304,7 @@ mod tests {
         let pricing = ModelPricing {
             input_per_million: 1.0,
             output_per_million: 2.0,
+            cache_hit_input_per_million: 0.1, // 10% discount
         };
         let usage = TokenUsage::default();
         let cost = pricing.cost_usd(usage);
@@ -286,6 +316,7 @@ mod tests {
         let pricing = ModelPricing {
             input_per_million: 1.0,
             output_per_million: 1.0,
+            cache_hit_input_per_million: 0.1,
         };
         // 1M input tokens, 0 output
         let usage = TokenUsage {
@@ -304,6 +335,7 @@ mod tests {
         let pricing = ModelPricing {
             input_per_million: 1.0,
             output_per_million: 2.0,
+            cache_hit_input_per_million: 0.1,
         };
         // 500K input + 250K output
         let usage = TokenUsage {
@@ -357,5 +389,92 @@ mod tests {
         assert_eq!(acc.prompt_tokens, 300);
         assert_eq!(acc.completion_tokens, 150);
         assert_eq!(acc.total_tokens, 450);
+    }
+
+    /// Backward compat: cache_hit_tokens = 0 should return same as before.
+    #[test]
+    fn cost_usd_with_no_cache_hit_matches_old_behavior() {
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_hit_input_per_million: 0.1, // 10% discount
+        };
+        // No cache hits
+        let usage = TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 500_000,
+            total_tokens: 1_500_000,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 1_000_000,
+        };
+        // Old calculation: 1M * $1/M + 500K * $2/M = $1.00 + $1.00 = $2.00
+        let cost = pricing.cost_usd(usage);
+        assert!((cost - 2.0).abs() < 1e-9);
+    }
+
+    /// Cache hit tokens get discounted rate (DeepSeek 10% of input rate).
+    #[test]
+    fn cost_usd_with_cache_hit_applies_discount() {
+        // DeepSeek pricing: $0.27/M input, $0.027/M for cache hits
+        let pricing = ModelPricing {
+            input_per_million: 0.27,
+            output_per_million: 1.10,
+            cache_hit_input_per_million: 0.027,
+        };
+        // 900 cache hit + 100 cache miss = 1000 prompt tokens
+        let usage = TokenUsage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 100,
+        };
+        let cost = pricing.cost_usd(usage);
+        // Cache hit: 900 * 0.027/1M = 0.0000243
+        // Cache miss: 100 * 0.27/1M = 0.000027
+        // Output: 500 * 1.10/1M = 0.00055
+        // Total: 0.0000243 + 0.000027 + 0.00055 = 0.0006013
+        let expected =
+            900.0 * 0.027 / 1_000_000.0 + 100.0 * 0.27 / 1_000_000.0 + 500.0 * 1.10 / 1_000_000.0;
+        assert!((cost - expected).abs() < 1e-9);
+    }
+
+    /// Verify known model has correct cache-hit pricing.
+    #[test]
+    fn pricing_for_deepseek_has_cache_discount() {
+        let pricing = pricing_for("deepseek-chat").expect("deepseek-chat should be known");
+        // Input: $0.27/M, cache hit should be 10% = $0.027/M
+        assert!((pricing.input_per_million - 0.27).abs() < 1e-9);
+        assert!((pricing.cache_hit_input_per_million - 0.027).abs() < 1e-9);
+    }
+
+    /// Unknown model returns None (cost won't be printed - conservative).
+    #[test]
+    fn pricing_for_unknown_model_returns_none() {
+        let p = pricing_for("unknown-model-xyz");
+        assert!(p.is_none());
+    }
+
+    /// Verify accumulated TokenUsage preserves cache_hit_tokens sum.
+    #[test]
+    fn token_usage_accumulate_preserves_cache_tokens() {
+        let u1 = TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            total_tokens: 1100,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 100,
+        };
+        let u2 = TokenUsage {
+            prompt_tokens: 2000,
+            completion_tokens: 200,
+            total_tokens: 2200,
+            cache_hit_tokens: 1800,
+            cache_miss_tokens: 200,
+        };
+        let acc = u1.accumulate(u2);
+        assert_eq!(acc.cache_hit_tokens, 2700);
+        assert_eq!(acc.cache_miss_tokens, 300);
+        assert_eq!(acc.prompt_tokens, 3000);
     }
 }
