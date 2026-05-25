@@ -239,6 +239,18 @@ fn print_usage(usage: TokenUsage, model: &str) {
             "tokens: prompt={} completion={} total={}",
             usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
         );
+        if usage.cache_hit_tokens > 0 {
+            let total_cache = usage.cache_hit_tokens + usage.cache_miss_tokens;
+            let hit_rate = if total_cache > 0 {
+                (usage.cache_hit_tokens as f64 / total_cache as f64) * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "cache: hit={} miss={} ({:.1}% hit rate)",
+                usage.cache_hit_tokens, usage.cache_miss_tokens, hit_rate
+            );
+        }
         if let Some(pricing) = pricing_for(model) {
             let cost = pricing.cost_usd(usage);
             eprintln!("cost: ${:.4} ({})", cost, model);
