@@ -374,9 +374,7 @@ mod tests {
         };
         let mut reg = HookRegistry::new();
         reg.register(Arc::new(CaptureOutcome(c)));
-        reg.dispatch(HookEvent::SessionEnd {
-            outcome: &outcome,
-        });
+        reg.dispatch(HookEvent::SessionEnd { outcome: &outcome });
         let captured = captured.lock().unwrap().take().unwrap();
         assert_eq!(captured.final_message.as_deref(), Some("done"));
         assert_eq!(captured.steps, 3);

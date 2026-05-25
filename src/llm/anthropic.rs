@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 
-use super::{Completion, LlmProvider, TokenUsage, ToolCall, ToolSpec};
+use super::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
@@ -196,6 +196,329 @@ impl LlmProvider for AnthropicProvider {
             }
         }
     }
+
+    async fn stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        self.stream_inner(messages, tools, stream_tx).await
+    }
+}
+
+impl AnthropicProvider {
+    /// Internal streaming implementation.
+    async fn stream_inner(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        let (system, messages) = extract_system_message(messages);
+        let messages = filter_leading_assistant(&messages);
+
+        let mut body = build_request(
+            &self.model,
+            self.temperature,
+            self.max_tokens,
+            system.as_deref(),
+            &messages,
+            tools,
+        );
+        body["stream"] = Value::Bool(true);
+
+        let url = format!("{}/v1/messages", self.base_url);
+
+        let mut attempt = 0;
+        loop {
+            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (stream)", url);
+            let result = self
+                .client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return self.parse_sse_stream(resp, stream_tx.clone()).await;
+                    }
+
+                    // Non-2xx: read body and check retry
+                    let text = resp.text().await?;
+                    tracing::debug!(target: "recursive::llm", body = %text, "error response (stream)");
+
+                    if let Some(backoff) =
+                        self.retry
+                            .backoff_for(attempt, Some(status.as_u16()), false)
+                    {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            status = status.as_u16(),
+                            "transient HTTP error, retrying (stream)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
+                }
+                Err(e) => {
+                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            error = %e,
+                            "network error, retrying (stream)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(self.make_err(format!("request failed: {e}")));
+                }
+            }
+        }
+    }
+
+    /// Parse an Anthropic SSE stream from a successful HTTP response.
+    ///
+    /// Anthropic SSE format:
+    ///   event: message_start\n
+    ///   data: {"type":"message_start","message":{...}}\n\n
+    ///   event: content_block_start\n
+    ///   data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Hello"}}\n\n
+    ///   event: content_block_delta\n
+    ///   data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" World"}}\n\n
+    ///   event: message_delta\n
+    ///   data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n
+    ///   event: message_stop\n
+    ///   data: {"type":"message_stop"}\n\n
+    async fn parse_sse_stream(
+        &self,
+        resp: reqwest::Response,
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        let mut content = String::new();
+        let mut tool_calls: Vec<StreamToolCall> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage: Option<TokenUsage> = None;
+        let mut input_tokens: Option<u32> = None;
+        let mut output_tokens: Option<u32> = None;
+        let mut cache_creation: Option<u32> = None;
+        let mut cache_read: Option<u32> = None;
+
+        // Read the full response body as text and parse line by line
+        let reader = resp.text().await?;
+        let mut current_event: Option<String> = None;
+
+        for line in reader.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                current_event = Some(event_name.to_string());
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                let event_type = current_event.as_deref().unwrap_or("unknown");
+
+                match event_type {
+                    "message_start" => {
+                        // Extract input tokens from the message
+                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                            self.make_err(format!(
+                                "SSE parse error (message_start): {e}; data: {data}"
+                            ))
+                        })?;
+                        if let Some(msg) = parsed.get("message") {
+                            if let Some(u) = msg.get("usage") {
+                                input_tokens = u
+                                    .get("input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32);
+                                cache_creation = u
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32);
+                                cache_read = u
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32);
+                            }
+                        }
+                    }
+                    "content_block_start" => {
+                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                            self.make_err(format!(
+                                "SSE parse error (content_block_start): {e}; data: {data}"
+                            ))
+                        })?;
+                        if let Some(block) = parsed.get("content_block") {
+                            let block_type =
+                                block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            let index =
+                                parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            match block_type {
+                                "tool_use" => {
+                                    let id = block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    // Ensure the vec is large enough
+                                    while tool_calls.len() <= index {
+                                        tool_calls.push(StreamToolCall::default());
+                                    }
+                                    tool_calls[index].id = id;
+                                    tool_calls[index].name = name;
+                                }
+                                "text" => {
+                                    // Initial text content (if any)
+                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                        if !text.is_empty() {
+                                            content.push_str(text);
+                                            if let Some(ref tx) = stream_tx {
+                                                let _ = tx.send(text.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    "content_block_delta" => {
+                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                            self.make_err(format!(
+                                "SSE parse error (content_block_delta): {e}; data: {data}"
+                            ))
+                        })?;
+                        if let Some(delta) = parsed.get("delta") {
+                            let delta_type =
+                                delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            match delta_type {
+                                "text_delta" => {
+                                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                        if !text.is_empty() {
+                                            content.push_str(text);
+                                            if let Some(ref tx) = stream_tx {
+                                                let _ = tx.send(text.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(partial) =
+                                        delta.get("partial_json").and_then(|v| v.as_str())
+                                    {
+                                        let index = parsed
+                                            .get("index")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as usize;
+                                        while tool_calls.len() <= index {
+                                            tool_calls.push(StreamToolCall::default());
+                                        }
+                                        tool_calls[index].partial_json.push_str(partial);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    "message_delta" => {
+                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                            self.make_err(format!(
+                                "SSE parse error (message_delta): {e}; data: {data}"
+                            ))
+                        })?;
+                        if let Some(delta) = parsed.get("delta") {
+                            if let Some(reason) = delta.get("stop_reason").and_then(|v| v.as_str())
+                            {
+                                finish_reason = Some(reason.to_string());
+                            }
+                        }
+                        if let Some(u) = parsed.get("usage") {
+                            output_tokens = u
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32);
+                        }
+                    }
+                    "message_stop" => {
+                        // End of stream - nothing to extract
+                    }
+                    "ping" => {
+                        // Anthropic sends periodic pings to keep the connection alive
+                    }
+                    _ => {
+                        tracing::debug!(target: "recursive::llm", event = %event_type, data = %data, "unhandled SSE event");
+                    }
+                }
+
+                current_event = None;
+            }
+        }
+
+        // Build final TokenUsage from accumulated fields
+        if input_tokens.is_some() || output_tokens.is_some() {
+            let prompt = input_tokens.unwrap_or(0);
+            let completion = output_tokens.unwrap_or(0);
+            usage = Some(TokenUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt.saturating_add(completion),
+                cache_hit_tokens: cache_read.unwrap_or(0),
+                cache_miss_tokens: cache_creation.unwrap_or(0),
+            });
+        }
+
+        // Convert streamed tool calls to final ToolCall objects
+        let final_tool_calls: Vec<ToolCall> = tool_calls
+            .into_iter()
+            .filter(|tc| !tc.id.is_empty())
+            .map(|tc| {
+                let args: Value = if tc.partial_json.trim().is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&tc.partial_json)
+                        .unwrap_or_else(|_| Value::String(tc.partial_json.clone()))
+                };
+                ToolCall {
+                    id: tc.id,
+                    name: tc.name,
+                    arguments: args,
+                }
+            })
+            .collect();
+
+        Ok(Completion {
+            content,
+            tool_calls: final_tool_calls,
+            finish_reason: finish_reason.map(|r| match r.as_str() {
+                "end_turn" => "stop".to_string(),
+                "max_tokens" => "length".to_string(),
+                "tool_use" => "tool_calls".to_string(),
+                other => other.to_string(),
+            }),
+            usage,
+        })
+    }
 }
 
 /// Extract system message if present, return (system_content, remaining_messages).
@@ -358,6 +681,14 @@ impl AnthropicUsage {
             cache_miss_tokens: self.cache_creation_input_tokens.unwrap_or(0),
         }
     }
+}
+
+/// Accumulator for tool calls being built from SSE stream events.
+#[derive(Default)]
+struct StreamToolCall {
+    id: String,
+    name: String,
+    partial_json: String,
 }
 
 fn parse_completion(response: AnthropicResponse) -> Completion {
@@ -717,6 +1048,274 @@ mod tests {
         assert_eq!(tc.id, "call_abc123");
         assert_eq!(tc.name, "read_file");
         assert_eq!(tc.arguments["path"], "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn test_d_stream_request_includes_stream_true() {
+        // Spawn a mock server that captures the request body and returns
+        // a valid SSE response. Assert the request body contains "stream": true.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            if let Some(body_start) = request.find("\r\n\r\n") {
+                let body = request[body_start + 4..].trim().to_string();
+                *captured_clone.lock().unwrap() = body.clone();
+            }
+            // Return a valid SSE stream (just message_stop to end quickly)
+            let body = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+        let _ = provider
+            .stream(&[Message::user("hi".to_string())], &[], None)
+            .await;
+
+        let body_str = captured.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn test_e_stream_text_deltas_accumulate() {
+        // Spawn a mock server that sends text deltas via SSE.
+        // Assert the returned Completion's content is the concatenation.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Hello\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" \"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"World\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None)
+            .await
+            .unwrap();
+        assert_eq!(completion.content, "Hello World");
+        assert_eq!(completion.finish_reason.as_deref(), Some("stop"));
+        assert!(completion.usage.is_some());
+        let u = completion.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn test_f_stream_tool_use_assembles_tool_calls() {
+        // Spawn a mock server that sends tool_use blocks via SSE.
+        // Assert the returned Completion has the correct tool_calls.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_abc123\",\"name\":\"read_file\",\"input\":{}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"src/\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"lib.rs\\\"}\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":30}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+        let completion = provider
+            .stream(&[Message::user("read the file".to_string())], &[], None)
+            .await
+            .unwrap();
+        assert_eq!(completion.tool_calls.len(), 1);
+        let tc = &completion.tool_calls[0];
+        assert_eq!(tc.id, "call_abc123");
+        assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.arguments["path"], "src/lib.rs");
+        assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn test_g_stream_tx_receives_text_chunks() {
+        // Spawn a mock server that sends text deltas via SSE.
+        // Assert the stream_tx channel receives incremental chunks.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"A\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"C\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], Some(tx))
+            .await
+            .unwrap();
+        assert_eq!(completion.content, "ABC");
+
+        // Should have received 3 deltas
+        let mut deltas = Vec::new();
+        while let Some(d) = rx.recv().await {
+            deltas.push(d);
+            if deltas.len() >= 3 {
+                break;
+            }
+        }
+        assert_eq!(deltas, vec!["A", "B", "C"]);
+    }
+
+    #[tokio::test]
+    async fn test_h_stream_with_end_turn_produces_stop_reason() {
+        // Spawn a mock server that sends a complete SSE stream with
+        // end_turn stop_reason. Assert the Completion has finish_reason "stop".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Hello\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None)
+            .await
+            .unwrap();
+        assert_eq!(completion.content, "Hello");
+        assert_eq!(completion.finish_reason.as_deref(), Some("stop"));
+        assert!(completion.usage.is_some());
     }
 
     #[test]
