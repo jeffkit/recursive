@@ -50,6 +50,16 @@ pub enum StepEvent {
         usage: TokenUsage,
         step: usize,
     },
+    PartialToken {
+        text: String,
+        step: usize,
+    },
+    Compacted {
+        removed: usize,
+        kept: usize,
+        summary_chars: usize,
+        step: usize,
+    },
     Finished {
         reason: FinishReason,
         steps: usize,
@@ -564,6 +574,8 @@ mod tests {
                 StepEvent::Finished { .. } => "done",
                 StepEvent::Usage { .. } => "usage",
                 StepEvent::Latency { .. } => "latency",
+                StepEvent::PartialToken { .. } => "partial",
+                StepEvent::Compacted { .. } => "compacted",
             });
         }
         assert_eq!(

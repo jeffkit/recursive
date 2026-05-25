@@ -466,6 +466,19 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             StepEvent::Latency { step, llm_ms } => {
                 println!("[step {step}] llm latency: {llm_ms}ms");
             }
+            StepEvent::PartialToken { .. } => {
+                // Streaming not yet active; goal-32 will wire rendering.
+            }
+            StepEvent::Compacted {
+                removed,
+                kept,
+                summary_chars,
+                step,
+            } => {
+                println!(
+                    "[step {step}] compacted {removed} msgs -> {kept} kept + {summary_chars}-char summary"
+                );
+            }
         }
     }
 }
