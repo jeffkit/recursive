@@ -12,9 +12,11 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::message::Message;
 
+pub mod anthropic;
 pub mod mock;
 pub mod openai;
 
+pub use anthropic::AnthropicProvider;
 pub use mock::MockProvider;
 pub use openai::OpenAiProvider;
 
