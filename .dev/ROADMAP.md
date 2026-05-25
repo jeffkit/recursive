@@ -335,7 +335,7 @@ Status legend: **✅ landed** | **🟡 in-batch-N** | **🔴 not started** | **�
 | 3.2   | Persistent Memory    | S      | Medium   | ✅ new Tool+startup  | ✅ landed `15249ef` (g38 deepseek, batch-13) |
 | 3.3   | Skill System         | M      | Medium   | ✅ new Tool+index    | ✅ landed `efef2cc` (g33 minimax→manual, batch-12; auto-resume infra bug surfaced — see Phase 0 follow-ups) |
 | 3.4   | Permission Hooks     | S      | High     | ✅ builder callback  | ✅ landed `31dc682` (g43 deepseek, batch-15; **Phase 3 complete**) |
-| 4.1   | Docker Sandbox       | L      | Medium   | ✅ wrapper           | 🔴 not started |
+| 4.1   | Docker Sandbox       | L      | Medium   | ✅ wrapper           | ⏸️ deferred — redesign as Tool Transport / Remote Execution (tool alias approach, not Docker-specific wrapper) |
 | 4.2   | Session Management   | M      | Medium   | ✅ persistence layer | ✅ landed `eb5bffe` (g45 deepseek, batch-15) |
 | 4.3   | Structured Output    | S      | Medium   | ✅ LlmProvider       | ✅ landed `477e689` (g41 deepseek, batch-14); first consumer wired `20b0164` (g46 deepseek, batch-15 — Compactor uses structured JSON) |
 | 4.4   | Hooks                | M      | Medium   | ✅ observer pattern  | ✅ landed `52c0433` (g48 deepseek, batch-16) |
