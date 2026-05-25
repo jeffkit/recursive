@@ -181,7 +181,9 @@ else
   BIN=./target/debug/recursive
 fi
 
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
+# Per-run identifier. Includes the shell PID so concurrent runs in
+# separate worktrees can't collide on the same TS in the same second.
+TS="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG="$DEV_DIR/journal/run-${TS}.md"
 
 {
