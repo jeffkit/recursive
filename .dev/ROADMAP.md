@@ -264,14 +264,14 @@ Status legend: **✅ landed** | **🟡 in-batch-N** | **🔴 not started** | **�
 | ID    | Feature              | Effort | Impact   | Orthogonality       | Status         |
 |-------|----------------------|--------|----------|---------------------|----------------|
 | 1.1   | Context Compaction   | M      | Critical | ✅ agent.rs only     | ✅ landed `e63eb63` (g31 deepseek, batch-12) |
-| 1.2   | Project Context File | S      | High     | ✅ config/context    | 🟡 batch-13 (queued, g36) |
-| 1.3   | Streaming            | M      | High     | ✅ LlmProvider trait | ✅ landed `92d257e` (g32 deepseek, batch-12) |
+| 1.2   | Project Context File | S      | High     | ✅ config/context    | ✅ landed `2dbe297` (g36 minimax, batch-13) |
+| 1.3   | Streaming            | M      | High     | ✅ LlmProvider trait | ✅ landed `92d257e` (g32 deepseek, batch-12; startup-panic regression fixed in `c5b2b8d`) |
 | 1.4   | estimate_tokens Tool | S      | Medium   | ✅ new Tool          | 🔴 not started (renamed from "Count Lines" — was removed in goal-16; new tool is token estimator, not just line count) |
-| 2.1   | MCP Client           | L      | Critical | ✅ new Tool source   | 🟡 batch-13 (queued, g35) |
-| 2.2   | Web Fetch            | S      | High     | ✅ new Tool          | 🟡 batch-13 (queued, g37) |
+| 2.1   | MCP Client           | L      | Critical | ✅ new Tool source   | ✅ landed `8792131` (g35 deepseek, batch-13; the headline) |
+| 2.2   | Web Fetch            | S      | High     | ✅ new Tool          | ✅ landed `13df912` (g37 minimax, batch-13) |
 | 2.3   | Anthropic Provider   | M      | High     | ✅ new LlmProvider   | ✅ landed `44cec95` (g34 minimax, batch-12; MiniMax + DeepSeek both expose Anthropic-compatible endpoints — free testing surface) |
 | 3.1   | Sub-Agent            | M      | High     | ✅ new Tool          | 🔴 not started |
-| 3.2   | Persistent Memory    | S      | Medium   | ✅ new Tool+startup  | 🟡 batch-13 (queued, g38) |
+| 3.2   | Persistent Memory    | S      | Medium   | ✅ new Tool+startup  | ✅ landed `15249ef` (g38 deepseek, batch-13) |
 | 3.3   | Skill System         | M      | Medium   | ✅ new Tool+index    | ✅ landed `efef2cc` (g33 minimax→manual, batch-12; auto-resume infra bug surfaced — see Phase 0 follow-ups) |
 | 3.4   | Permission Hooks     | S      | High     | ✅ builder callback  | 🔴 not started |
 | 4.1   | Docker Sandbox       | L      | Medium   | ✅ wrapper           | 🔴 not started |

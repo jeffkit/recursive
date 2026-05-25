@@ -41,6 +41,43 @@ files in this folder; this index is the side-by-side comparison.
 | 28 transcript-head | minimax | MiniMax-M2 | ~ | ~ | ? | (varied) | $0.2508 | NoMoreToolCalls |
 | 29 search-case-insensitive | minimax | MiniMax-M2 | 21 | ~ | ? | (varied) | $0.1173 | NoMoreToolCalls |
 | 30 openai-error-model | deepseek | deepseek-chat | 36 | ~ | ? | (varied) | $0.3129 | NoMoreToolCalls (orchestrator killed 4 zombie cargo tests during run — lesson in AGENTS.md) |
+| 31 context-compaction | deepseek | deepseek-chat | 51 | ~ | ? | (varied) | (b12) | NoMoreToolCalls |
+| 32 streaming-sse | deepseek | deepseek-chat | ~ | ~ | ? | (varied) | (b12) | NoMoreToolCalls (introduced startup-panic regression — fixed in `c5b2b8d`) |
+| 33 skills-v1 (minimax) | minimax | MiniMax-M2 | 100 | ~ | ? | (varied) | (b12, rolled back) | BudgetExceeded (auto-resume infrastructure was broken at the time) |
+| 33 skills-v1 (manual) | orchestrator | — | — | — | — | — | $0.0000 | manual landing of MiniMax's complete source files + wiring |
+| 34 anthropic-provider | minimax | MiniMax-M2 | ~ | ~ | ? | (varied) | (b12) | NoMoreToolCalls (19 new tests, on the high side for a new-file goal) |
+| 35 mcp-client-v1 | deepseek | deepseek-chat | 41 | 34 | ? | 10:2 | **$0.7282** | NoMoreToolCalls (headline; 97.7% cache hit; 9 new tests) |
+| 36 project-context-file | minimax | MiniMax-M2 | 35 | 34 | 3 | 9:0 | $0.3544 | NoMoreToolCalls (perfect patch discipline — 0 write_file invocations) |
+| 37 web-fetch-tool | minimax | MiniMax-M2 | 110 | ~ | ? | 16:4 | (varied) | NoMoreToolCalls (highest-step batch-13 goal — HTML extraction is non-trivial) |
+| 38 persistent-memory | deepseek | deepseek-chat | 28 | ~ | ? | 9:1 | $0.3065 | NoMoreToolCalls (97.9% cache hit; 9 new tests across remember/recall/forget) |
+
+### Batch 13 (g35-g38) — Phase 1 closes, Phase 2 majority
+
+All four green on the first try. **Total cost ≈ $1.40, all of it on the
+4-pass batch.** Highlights:
+
+- **g35 mcp-client-v1** (headline): MCP server config + spawn client +
+  tool wrapper, 41 steps and $0.73 on deepseek. 97.7% cache hit kept
+  cost reasonable for a multi-file feature touching `lib.rs`, `mcp.rs`,
+  `tools/mod.rs`, and `main.rs`.
+- **g37 web-fetch-tool**: 110 steps — biggest. HTML extraction (script
+  + style tag stripping, whitespace collapse) needed more iteration.
+  Under the new 200-step ceiling with room to spare.
+- **g36, g38**: textbook small additions (35 + 28 steps, $0.35 + $0.31).
+  Perfect patch discipline (9:0 and 9:1).
+
+**Merge conflicts in `src/main.rs`**: 2 of the 4 merges. Both auto-marker
+conflicts at `use` imports and tool-registration chains. Resolved by
+straightforward combination (no semantic merge needed). After all four
+landed, tests jumped 178 → 214 (+36 new tests).
+
+### Batch 12 (g31-g34) — Phase 1 pivot, first SOTA-feature batch
+
+3 of 4 auto-merged; g33 manually recovered after a transcript-save bug
+prevented auto-resume from firing. The orchestrator fixed the
+infrastructure bug (`2459ef8`) as a Phase 0 follow-up so future
+BudgetExceeded runs survive the rollback boundary. Total tests:
+140 → 175.
 
 ### Batch 11 (g27-g30) — first true 4-wide
 

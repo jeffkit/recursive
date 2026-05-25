@@ -7,41 +7,35 @@
 
 ## Currently in flight
 
-> **As of 2026-05-25T10:28Z.** Batch 13 launched. 4 worktrees alive,
-> baseline `c5b2b8d` (streaming-bug fix). Effective step ceiling per
-> goal: **400** (single-pass=200, auto-resume×2). User confirmed
-> force-push of jeffkit history succeeded; local/remote already in
-> sync.
+> **As of 2026-05-25T10:42Z.** Idle. Batch 13 fully landed — 4/4 green
+> on first attempt, all `NoMoreToolCalls`, no auto-resume. Total tests
+> 178 → 214 (+36 new). Total cost ≈ **$1.40 across batch 13**.
 >
-> - **goal-35 mcp-client-v1** (deepseek, pid 96147) — 2.1, L, headline.
->   Worktree `mcp-client-v1-deepseek-20260525T102631Z-95996`.
-> - **goal-36 project-context-file** (minimax, pid 8545) — 1.2, S.
->   Worktree `project-context-file-minimax-20260525T102706Z-8275`.
-> - **goal-37 web-fetch-tool** (minimax, pid 13441) — 2.2, S.
->   Worktree `web-fetch-tool-minimax-20260525T102716Z-13156`.
-> - **goal-38 persistent-memory** (deepseek, pid 18564) — 3.2, S.
->   Worktree `persistent-memory-deepseek-20260525T102727Z-18243`.
+> All worktrees torn down. Tree clean at `8792131`.
 >
-> Coordination risks for merge: all four touch `src/main.rs`
-> (system_prompt building + tool registration + skill_index injection).
-> Triage merge order: smallest diff first, hardest case (g35) last so
-> earlier merges absorb easier conflicts.
+> Next: draft batch 14. Phase 1 (Foundation) now **3/4 done** —
+> only 1.4 (estimate_tokens) remains. Phase 2 (Connectors) **3/3
+> done**. Phase 3 (Agent Intelligence) **2/4 done** — 3.1 Sub-Agent,
+> 3.4 Permission Hooks remain. Phase 4 still untouched.
 >
-> **Pre-batch infra fixes already landed**:
-> - `c5b2b8d` — non-streaming runs no longer panic (g32 merge bug
->   that crashed first batch-13 launch within seconds).
-> - `936bc34` — `RECURSIVE_MAX_STEPS` bumped 100 → 200.
-> - `2459ef8` — auto-resume transcript bug fixed (Phase 0 chore).
-> - `29e941f` — `.gitignore` covers `.claude/`, `.cursor/local/`.
+> Strategic question for batch 14: **start Phase 4** (Docker Sandbox,
+> Session Management, Structured Output, Hooks, OpenTelemetry —
+> production-readiness theme) OR **finish Phases 1-3** (4 small goals
+> remaining)? Suggest a hybrid: finish Phase 1+3 small ones in batch
+> 14 alongside one Phase 4 starter. Await HITL signal on prioritization.
 
 ## Roadmap delta (live)
 
 > Updated each time a batch lands. See `.dev/ROADMAP.md` Priority
 > Matrix for the canonical status column.
 >
-> **Just landed (batch 12)**: 1.1 ✅, 1.3 ✅, 2.3 ✅, 3.3 ✅
-> **In progress (batch 13, launched 10:28Z)**: 1.2, 2.1, 2.2, 3.2
-> **Queued**: none — Phase 1 fully closes if 1.2 lands.
+> **Just landed (batch 13)**: 1.2 ✅, 2.1 ✅, 2.2 ✅, 3.2 ✅
+> **In progress**: none
+> **Phase 1 (Foundation)**: 3/4 done. Only 1.4 (estimate_tokens) left.
+> **Phase 2 (Connectors)**: 3/3 done — phase complete.
+> **Phase 3 (Agent Intelligence)**: 2/4 done. 3.1 (Sub-Agent), 3.4
+>   (Permission Hooks) remain.
+> **Phase 4 (Production Readiness)**: 0/5, not started.
 >
 > **Phase 0 (kernel polish, pre-roadmap)**: all 27 goals (04-30)
 > landed. ~140 tests baseline. Now 175 tests after batch 12.
@@ -73,11 +67,56 @@
 
 ## Last batch landed
 
-> **Goals 31 + 32 + 33 + 34**, batch 12 — **roadmap Phase 1 pivot,
-> first SOTA-feature batch**. 3 auto-merged, 1 manually recovered.
-> User upweighted (streaming/skills/MCP/compaction); MCP held for
-> batch 13. Wall-clock: <5 min for all 4 worktrees to terminate,
-> ~10 min for merge + manual recovery + housekeeping.
+> **Goals 35 + 36 + 37 + 38**, batch 13 — **Phase 1 closes, Phase 2
+> majority lands**. **4/4 green on first attempt**, no auto-resume,
+> all NoMoreToolCalls. Wall-clock from launch to all-verdicts ≈ 9 min
+> (10:28Z → 10:36Z); add ~3 min for merging + housekeeping.
+>
+> Pre-batch infrastructure work paid off:
+> - Bumped `RECURSIVE_MAX_STEPS` 100 → 200 (matches Cursor).
+> - Fixed auto-resume transcript-save bug (`2459ef8`); not triggered
+>   this batch since no goal hit the budget.
+> - Fixed g32 streaming-merge startup-panic (`c5b2b8d`) before the
+>   first worktree could land it — caught by the immediate launch
+>   attempt that died at step 0. Lesson: cargo-test alone can miss
+>   `cargo run` regressions; consider an integration smoke later.
+> - Added `.gitignore` for `.claude/`, `.cursor/local/`.
+>
+> Goal-by-goal:
+>
+> - **goal-35 mcp-client-v1** (deepseek, headline): merged `8792131`.
+>   41 steps, $0.73, 97.7% cache hit. 188 lib tests (incl. 8 new MCP
+>   tests). 4 product files: `src/mcp.rs` (new), `src/main.rs`,
+>   `src/tools/mod.rs`, `src/lib.rs`. Config-driven MCP servers
+>   spawned as subprocesses; tools surfaced into the registry under
+>   `mcp_<server>_<tool>` names. **MCP is now real.**
+>
+> - **goal-36 project-context-file** (minimax): merged `2dbe297`.
+>   35 steps, $0.35. **Perfect patch discipline (9:0)**. Added
+>   `load_project_context(&workspace)` to `src/config.rs` — reads
+>   AGENTS.md if present, with size cap + truncation marker. Result
+>   is appended to system prompt at agent start. 3 new tests.
+>
+> - **goal-37 web-fetch-tool** (minimax): merged `13df912`. **110
+>   steps** — largest batch-13 goal. New `src/tools/web_fetch.rs`
+>   with `<script>`/`<style>` stripping + whitespace collapse.
+>   HTML extraction is non-trivial; agent iterated through several
+>   regex-vs-state-machine approaches before settling on the latter.
+>   Auto-merge conflict on `src/main.rs` (use imports + tool chain)
+>   — resolved by combining lines.
+>
+> - **goal-38 persistent-memory** (deepseek): merged `15249ef`.
+>   28 steps, $0.31, 97.9% cache hit. New `src/tools/memory.rs`
+>   with `remember`, `recall`, `forget` tools backed by
+>   `<workspace>/.recursive/memory/`. Memory summary appended to
+>   system prompt at start (top 5 entries). 9 new tests.
+>
+> Total tests: 178 → 214 (+36). Total batch cost ≈ $1.40.
+>
+> **Batch 12 (previous)**: see git log `e63eb63`, `92d257e`,
+> `efef2cc`, `44cec95` for goals 31-34 (Context Compaction, Streaming
+> SSE, Skills v1, Anthropic Provider). 3 auto-merged, 1 manually
+> recovered. 140 → 175 tests.
 >
 > Prep commit `be68e80`: added `StepEvent::Compacted` and
 > `StepEvent::PartialToken` stubs to decouple g31 + g32 from enum
