@@ -39,3 +39,32 @@ feature of the product. Keeping these artifacts under `.dev/` means:
 
 The script will commit on success and hard-reset on failure. You only need
 to read the resulting journal entry to know what happened.
+
+## How to cut a release
+
+CI on `main` must already be green. Then:
+
+```bash
+# 1. Bump version in Cargo.toml (and update Cargo.lock with `cargo build`)
+vim Cargo.toml
+
+# 2. Commit
+git commit -am "chore: release 0.2.0"
+
+# 3. Tag + push tag
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin main v0.2.0
+```
+
+Pushing the tag fires `.github/workflows/release.yml`, which:
+
+1. Verifies the tag (e.g. `v0.2.0`) matches `Cargo.toml`'s `version` (e.g.
+   `0.2.0`). Mismatch fails the run before anything else happens.
+2. Re-runs `fmt --check`, `clippy -D warnings`, and the full test suite.
+3. Runs `cargo publish` using the `CRATES_IO_TOKEN` repository secret.
+4. Creates a GitHub Release at that tag with auto-generated notes (skipped
+   if the release already exists).
+
+No tokens leave your machine; rotating the publish token is one click in
+`https://crates.io/settings/tokens` followed by updating the secret in
+`https://github.com/jeffkit/recursive/settings/secrets/actions`.
