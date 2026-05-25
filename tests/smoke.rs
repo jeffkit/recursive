@@ -27,6 +27,7 @@ async fn agent_writes_reads_and_summarises() {
                 arguments: json!({"path": "greet.txt", "contents": "hello recursive"}),
             }],
             finish_reason: Some("tool_calls".into()),
+            usage: None,
         },
         Completion {
             content: "".into(),
@@ -36,6 +37,7 @@ async fn agent_writes_reads_and_summarises() {
                 arguments: json!({"path": "greet.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
+            usage: None,
         },
         Completion {
             content: "".into(),
@@ -45,11 +47,13 @@ async fn agent_writes_reads_and_summarises() {
                 arguments: json!({"path": "."}),
             }],
             finish_reason: Some("tool_calls".into()),
+            usage: None,
         },
         Completion {
             content: "Created greet.txt containing 'hello recursive'.".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
+            usage: None,
         },
     ];
 

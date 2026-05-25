@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-use super::{Completion, LlmProvider, ToolCall, ToolSpec};
+use super::{Completion, LlmProvider, TokenUsage, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
@@ -131,7 +131,7 @@ impl LlmProvider for OpenAiProvider {
                             .into_iter()
                             .next()
                             .ok_or_else(|| Error::Llm("response had no choices".into()))?;
-                        return Ok(parse_completion(choice));
+                        return Ok(parse_completion(choice, parsed.usage));
                     }
 
                     // Non-2xx response: check if it's transient (5xx)
@@ -241,6 +241,28 @@ fn serialize_message(m: &Message) -> Value {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl ResponseUsage {
+    fn to_token_usage(&self) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.prompt_tokens.unwrap_or(0),
+            completion_tokens: self.completion_tokens.unwrap_or(0),
+            total_tokens: self.total_tokens.unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,7 +295,7 @@ struct RawFunction {
     arguments: String,
 }
 
-fn parse_completion(choice: ChatChoice) -> Completion {
+fn parse_completion(choice: ChatChoice, usage: Option<ResponseUsage>) -> Completion {
     let content = choice.message.content.unwrap_or_default();
     let tool_calls = choice
         .message
@@ -297,6 +319,7 @@ fn parse_completion(choice: ChatChoice) -> Completion {
         content,
         tool_calls,
         finish_reason: choice.finish_reason,
+        usage: usage.map(|u| u.to_token_usage()),
     }
 }
 
@@ -308,10 +331,11 @@ mod tests {
     fn parses_plain_text_choice() {
         let raw = r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
         let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
-        let c = parse_completion(parsed.choices.into_iter().next().unwrap());
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
         assert_eq!(c.content, "hi");
         assert!(c.tool_calls.is_empty());
         assert_eq!(c.finish_reason.as_deref(), Some("stop"));
+        assert!(c.usage.is_none());
     }
 
     #[test]
@@ -331,10 +355,48 @@ mod tests {
             }]
         }"#;
         let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
-        let c = parse_completion(parsed.choices.into_iter().next().unwrap());
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
         assert_eq!(c.tool_calls.len(), 1);
         assert_eq!(c.tool_calls[0].name, "read_file");
         assert_eq!(c.tool_calls[0].arguments["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn parses_usage_from_response() {
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":41,"completion_tokens":7,"total_tokens":48}
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        assert!(c.usage.is_some());
+        let u = c.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 41);
+        assert_eq!(u.completion_tokens, 7);
+        assert_eq!(u.total_tokens, 48);
+    }
+
+    #[test]
+    fn parses_missing_usage_as_none() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        assert!(c.usage.is_none());
+    }
+
+    #[test]
+    fn parses_partial_usage_fills_zeros() {
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"total_tokens":50}
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        assert!(c.usage.is_some());
+        let u = c.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 0);
+        assert_eq!(u.completion_tokens, 0);
+        assert_eq!(u.total_tokens, 50);
     }
 
     #[test]

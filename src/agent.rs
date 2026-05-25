@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::llm::{Completion, LlmProvider, ToolCall};
+use crate::llm::{Completion, LlmProvider, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::tools::ToolRegistry;
 
@@ -34,6 +34,10 @@ pub enum StepEvent {
         id: String,
         name: String,
         output: String,
+        step: usize,
+    },
+    Usage {
+        usage: TokenUsage,
         step: usize,
     },
     Finished {
@@ -59,6 +63,7 @@ pub struct AgentOutcome {
     pub transcript: Vec<Message>,
     pub steps: usize,
     pub finish: FinishReason,
+    pub total_usage: TokenUsage,
 }
 
 pub struct Agent {
@@ -87,9 +92,18 @@ impl Agent {
         let mut last_call_key: Option<(String, String)> = None;
         let mut consecutive_errors: usize = 0;
 
+        // Accumulate token usage across all LLM calls
+        let mut total_usage = TokenUsage::default();
+
         for step in 1..=self.max_steps {
             debug!(target: "recursive::agent", step, "calling llm");
             let completion: Completion = self.llm.complete(&self.transcript, &specs).await?;
+
+            // Accumulate usage from this completion
+            if let Some(u) = completion.usage {
+                total_usage = total_usage.accumulate(u);
+                self.emit(StepEvent::Usage { usage: u, step });
+            }
 
             if !completion.content.is_empty() {
                 self.emit(StepEvent::AssistantText {
@@ -128,6 +142,7 @@ impl Agent {
                     transcript: std::mem::take(&mut self.transcript),
                     steps: step,
                     finish,
+                    total_usage,
                 });
             }
 
@@ -182,6 +197,7 @@ impl Agent {
                         transcript: std::mem::take(&mut self.transcript),
                         steps: step,
                         finish,
+                        total_usage,
                     });
                 }
 
@@ -276,7 +292,7 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{Completion, MockProvider, ToolCall};
+    use crate::llm::{Completion, MockProvider, TokenUsage, ToolCall};
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -305,6 +321,7 @@ mod tests {
             content: "done".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
+            usage: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let out = agent.run("hi").await.unwrap();
@@ -324,11 +341,13 @@ mod tests {
                     arguments: json!({"a":2,"b":3}),
                 }],
                 finish_reason: Some("tool_calls".into()),
+                usage: None,
             },
             Completion {
                 content: "5".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
+                usage: None,
             },
         ]));
         let tools = ToolRegistry::new().register(Arc::new(Adder));
@@ -352,6 +371,7 @@ mod tests {
                     arguments: json!({"a":1,"b":1}),
                 }],
                 finish_reason: Some("tool_calls".into()),
+                usage: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -377,11 +397,13 @@ mod tests {
                     arguments: json!({}),
                 }],
                 finish_reason: Some("tool_calls".into()),
+                usage: None,
             },
             Completion {
                 content: "ok i give up".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
+                usage: None,
             },
         ]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
@@ -407,11 +429,13 @@ mod tests {
                     arguments: json!({"a":1,"b":1}),
                 }],
                 finish_reason: Some("tool_calls".into()),
+                usage: None,
             },
             Completion {
                 content: "two".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
+                usage: None,
             },
         ]));
         let tools = ToolRegistry::new().register(Arc::new(Adder));
@@ -430,6 +454,7 @@ mod tests {
                 StepEvent::ToolCall { .. } => "call",
                 StepEvent::ToolResult { .. } => "result",
                 StepEvent::Finished { .. } => "done",
+                StepEvent::Usage { .. } => "usage",
             });
         }
         assert_eq!(kinds, vec!["text", "call", "result", "text", "done"]);
@@ -448,6 +473,7 @@ mod tests {
                     arguments: json!({"arg": "value"}),
                 }],
                 finish_reason: Some("tool_calls".into()),
+                usage: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -475,6 +501,7 @@ mod tests {
             content: "I was going to say more but ran out of".into(),
             tool_calls: vec![],
             finish_reason: Some("length".into()),
+            usage: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let err = agent.run("hi").await.unwrap_err();
@@ -494,6 +521,7 @@ mod tests {
                     arguments: json!({"a": i, "b": i}),
                 }],
                 finish_reason: Some("tool_calls".into()),
+                usage: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -509,5 +537,84 @@ mod tests {
 
         // Should hit budget, not stuck (args differ each time)
         assert!(matches!(err, Error::StepBudgetExceeded(3)));
+    }
+
+    #[tokio::test]
+    async fn accumulates_usage_across_llm_calls() {
+        let u1 = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        };
+        let u2 = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        };
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "step 1".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a":1,"b":1}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: Some(u1),
+            },
+            Completion {
+                content: "step 2".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: Some(u2),
+            },
+        ]));
+        let tools = ToolRegistry::new().register(Arc::new(Adder));
+        let mut agent = Agent::builder().llm(llm).tools(tools).build().unwrap();
+        let out = agent.run("add twice").await.unwrap();
+
+        assert_eq!(out.total_usage.prompt_tokens, 20);
+        assert_eq!(out.total_usage.completion_tokens, 10);
+        assert_eq!(out.total_usage.total_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn outcome_has_zero_usage_when_provider_never_reports() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let mut agent = Agent::builder().llm(llm).build().unwrap();
+        let out = agent.run("hi").await.unwrap();
+
+        assert_eq!(out.total_usage, TokenUsage::default());
+    }
+
+    #[tokio::test]
+    async fn step_event_usage_emitted_per_llm_call() {
+        let u = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        };
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "first".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(u),
+        }]));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::builder().llm(llm).events(tx).build().unwrap();
+        agent.run("hi").await.unwrap();
+
+        let mut usage_events = 0;
+        while let Ok(e) = rx.try_recv() {
+            if matches!(e, StepEvent::Usage { .. }) {
+                usage_events += 1;
+            }
+        }
+        assert_eq!(usage_events, 1);
     }
 }

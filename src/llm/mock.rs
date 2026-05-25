@@ -19,6 +19,13 @@ pub struct MockProvider {
 }
 
 impl MockProvider {
+    /// Alias for `new` — both accept completions that may have `usage` set.
+    /// Provided for API symmetry when callers want to be explicit about usage.
+    pub fn with_usage(scripted: Vec<Completion>) -> Self {
+        Self::new(scripted)
+    }
+
+    /// Create a new MockProvider with the given scripted completions.
     pub fn new(scripted: Vec<Completion>) -> Self {
         Self {
             scripted: Mutex::new(scripted),
@@ -57,11 +64,13 @@ mod tests {
                 content: "one".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
+                usage: None,
             },
             Completion {
                 content: "two".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
+                usage: None,
             },
         ]);
 

@@ -16,7 +16,7 @@ use tracing::Level;
 
 use recursive::{
     config::Config,
-    llm::{LlmProvider, OpenAiProvider},
+    llm::{LlmProvider, OpenAiProvider, TokenUsage},
     tools::{ApplyPatch, CountLines, ListDir, ReadFile, RunShell, WriteFile},
     Agent, StepEvent, ToolRegistry,
 };
@@ -130,6 +130,15 @@ fn build_agent(config: &Config) -> anyhow::Result<(Agent, mpsc::UnboundedReceive
     Ok((agent, rx))
 }
 
+fn print_usage(usage: TokenUsage) {
+    if usage.total_tokens > 0 {
+        eprintln!(
+            "tokens: prompt={} completion={} total={}",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        );
+    }
+}
+
 async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
     let (mut agent, rx) = build_agent(&config)?;
     let printer = tokio::spawn(stream_events(rx));
@@ -139,6 +148,7 @@ async fn run_once(config: Config, goal: String) -> anyhow::Result<()> {
     if let Some(msg) = outcome.final_message {
         println!("\n=== final ===\n{msg}");
     }
+    print_usage(outcome.total_usage);
     Ok(())
 }
 
@@ -168,6 +178,7 @@ async fn repl(config: Config) -> anyhow::Result<()> {
                 if let Some(msg) = outcome.final_message {
                     println!("\n=== final ===\n{msg}\n");
                 }
+                print_usage(outcome.total_usage);
             }
             Err(e) => {
                 eprintln!("error: {e}");
@@ -200,6 +211,9 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             }
             StepEvent::Finished { reason, steps } => {
                 println!("[done after {steps} steps] reason: {:?}", reason);
+            }
+            StepEvent::Usage { .. } => {
+                // Usage events are already accumulated and printed at end of run
             }
         }
     }
