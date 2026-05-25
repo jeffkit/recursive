@@ -46,23 +46,28 @@ impl Hook for CountingHook {
     fn on_event(&self, event: HookEvent) -> HookAction {
         match event {
             HookEvent::PreToolCall { .. } => {
-                self.pre_tool_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.pre_tool_call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 HookAction::Continue
             }
             HookEvent::PostToolCall { .. } => {
-                self.post_tool_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.post_tool_call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 HookAction::Continue
             }
             HookEvent::SessionStart { .. } => {
-                self.session_start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.session_start_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 HookAction::Continue
             }
             HookEvent::PreCompact { .. } => {
-                self.pre_compact_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.pre_compact_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 HookAction::Continue
             }
             HookEvent::PostCompact { .. } => {
-                self.post_compact_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.post_compact_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 HookAction::Continue
             }
             _ => HookAction::Continue,
@@ -164,28 +169,35 @@ async fn hooks_and_compaction() {
 
     // Hook should have fired for each tool call (3 pre, 3 post).
     assert_eq!(
-        hook.pre_tool_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        hook.pre_tool_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         3,
         "expected 3 PreToolCall events"
     );
     assert_eq!(
-        hook.post_tool_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        hook.post_tool_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         3,
         "expected 3 PostToolCall events"
     );
     assert_eq!(
-        hook.session_start_count.load(std::sync::atomic::Ordering::SeqCst),
+        hook.session_start_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         1,
         "expected 1 SessionStart event"
     );
 
     // Compaction should have fired (transcript exceeded 500 chars).
     assert!(
-        hook.pre_compact_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        hook.pre_compact_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
         "expected at least 1 PreCompact event"
     );
     assert!(
-        hook.post_compact_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        hook.post_compact_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
         "expected at least 1 PostCompact event"
     );
 
@@ -481,8 +493,8 @@ async fn session_pause_and_resume() {
 
     let llm = Arc::new(MockProvider::new(script_part1));
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
-    let tools = ToolRegistry::new(transport)
-        .register(Arc::new(recursive::tools::ReadFile::new(root)));
+    let tools =
+        ToolRegistry::new(transport).register(Arc::new(recursive::tools::ReadFile::new(root)));
 
     let mut agent = Agent::builder()
         .llm(llm.clone())
@@ -521,7 +533,10 @@ async fn session_pause_and_resume() {
         outcome1.transcript.len(),
         "restored session should have same transcript length"
     );
-    assert_eq!(restored.steps_consumed, 2, "restored session should have 2 steps consumed");
+    assert_eq!(
+        restored.steps_consumed, 2,
+        "restored session should have 2 steps consumed"
+    );
 
     // Now resume: create a new agent seeded with the saved transcript.
     let script_part2 = vec![
@@ -628,8 +643,8 @@ async fn tool_transport_explicit() {
 
     let llm = Arc::new(MockProvider::new(script));
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
-    let tools = ToolRegistry::new(transport)
-        .register(Arc::new(recursive::tools::ReadFile::new(root)));
+    let tools =
+        ToolRegistry::new(transport).register(Arc::new(recursive::tools::ReadFile::new(root)));
 
     let mut agent = Agent::builder()
         .llm(llm)
