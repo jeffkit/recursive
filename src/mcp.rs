@@ -625,9 +625,9 @@ fn parse_sse_endpoint(buffer: &str) -> Option<String> {
     for line in buffer.lines() {
         let line = line.trim();
         if line.starts_with("event:") {
-            current_event = Some(line["event:".len()..].trim());
+            current_event = Some(line.strip_prefix("event:").unwrap_or("").trim());
         } else if line.starts_with("data:") && current_event == Some("endpoint") {
-            let data = line["data:".len()..].trim();
+            let data = line.strip_prefix("data:").unwrap_or("").trim();
             if !data.is_empty() {
                 return Some(data.to_string());
             }
@@ -650,7 +650,7 @@ fn parse_sse_response(buffer: &str, expected_id: u64) -> Option<Result<Value>> {
     for line in buffer.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("data:") {
-            let data = trimmed["data:".len()..].trim();
+            let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
             current_data.push_str(data);
         } else if trimmed.is_empty() && !current_data.is_empty() {
             // End of an SSE event — try to parse the accumulated data as JSON
