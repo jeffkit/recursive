@@ -32,7 +32,7 @@ use recursive::{
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
         RunSkillScript, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
     },
-    Agent, FinishReason, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
+    Agent, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -85,6 +85,10 @@ struct Cli {
     /// stuck, transcript limit). The session can be resumed later with `resume`.
     #[arg(long, env = "RECURSIVE_SESSION_OUT")]
     session_out: Option<PathBuf>,
+
+    /// Enable plan-first mode: agent proposes a plan, user confirms before execution.
+    #[arg(long = "plan-first")]
+    plan_first: bool,
 
     /// Path to external pricing YAML file. If provided, pricing from this file
     /// takes precedence over hardcoded values. Models not in the file fall back
@@ -201,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.session_out,
                 cli.json,
                 cli.stream,
+                cli.plan_first,
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
@@ -473,11 +478,13 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
 }
 
 /// Build an agent, optionally registering MCP tools from a config file.
+#[allow(clippy::too_many_arguments)]
 async fn build_agent(
     config: &Config,
     max_transcript_chars: Option<usize>,
     seed: Vec<recursive::message::Message>,
     stream: bool,
+    plan_first: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     goal: Option<&str>,
@@ -646,6 +653,9 @@ async fn build_agent(
         builder = builder.hook(Arc::new(recursive::hooks::ToolTimingHook::new()));
     }
     builder = builder.streaming(stream);
+    if plan_first {
+        builder = builder.planning_mode(PlanningMode::PlanFirst);
+    }
     let agent = builder.build()?;
     Ok((agent, rx))
 }
@@ -792,6 +802,7 @@ async fn run_resumed(
         max_transcript_chars,
         seed,
         false,
+        false, /* plan_first */
         mcp_config,
         hook_timing,
         Some(&goal),
@@ -845,6 +856,7 @@ async fn run_once(
     session_out: Option<PathBuf>,
     json_mode: bool,
     stream: bool,
+    plan_first: bool,
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
@@ -854,6 +866,7 @@ async fn run_once(
         max_transcript_chars,
         Vec::new(),
         stream,
+        plan_first,
         mcp_config,
         hook_timing,
         None,
@@ -866,7 +879,26 @@ async fn run_once(
     } else {
         tokio::spawn(stream_events(rx))
     };
-    let outcome = agent.run(goal.clone()).await?;
+    let outcome = loop {
+        let outcome = agent.run(goal.clone()).await?;
+        if !matches!(outcome.finish, FinishReason::PlanPending) {
+            break outcome;
+        }
+        let plan_text = outcome.final_message.as_deref().unwrap_or("(no plan)");
+        eprintln!("\n=== Proposed Plan ===\n{plan_text}");
+        eprint!("Confirm plan? [Y/n] ");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if input.is_empty() || input == "y" || input == "yes" {
+            agent.confirm_plan();
+        } else {
+            agent.reject_plan("User rejected the plan");
+            break outcome;
+        }
+    };
     drop(agent);
     printer.await.ok();
     if !json_mode {
@@ -924,6 +956,7 @@ async fn repl(
             max_transcript_chars,
             Vec::new(),
             false,
+            false, /* plan_first */
             mcp_config.clone(),
             false,
             None,
@@ -1074,6 +1107,7 @@ mod tests {
             None,
             Vec::new(),
             /* stream */ false,
+            false,
             None,
             false,
             None,
@@ -1086,6 +1120,7 @@ mod tests {
             None,
             Vec::new(),
             /* stream */ true,
+            false,
             None,
             false,
             None,
@@ -1095,7 +1130,7 @@ mod tests {
 
         let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
-        let r3 = build_agent(&cfg, None, Vec::new(), false, None, false, None).await;
+let r3 = build_agent(&cfg, None, Vec::new(), false, false, None, false, None).await;
         match original {
             Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),
