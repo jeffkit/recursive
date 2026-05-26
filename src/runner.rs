@@ -161,6 +161,61 @@ impl AgentRunner {
         }
         Ok(outcomes)
     }
+
+    /// Run a loop with background job awareness.
+    ///
+    /// After each turn, checks both:
+    /// 1. The `WakeupSlot` for an explicit wakeup request (from `schedule_wakeup` tool)
+    /// 2. The `BackgroundJobManager` for completed jobs
+    ///
+    /// If a background job completed, its output is injected as the next turn's
+    /// goal. If a wakeup was scheduled, the runner sleeps for the requested
+    /// delay then continues. If neither is present, the loop ends.
+    ///
+    /// The `wakeup_slot` should be the same slot registered with the
+    /// `ScheduleWakeup` tool in the agent's tool registry.
+    pub async fn run_event_loop(
+        &mut self,
+        initial_goal: impl Into<String>,
+        wakeup_slot: &crate::tools::WakeupSlot,
+        events: Option<mpsc::UnboundedSender<StepEvent>>,
+    ) -> Result<Vec<AgentOutcome>> {
+        let mut outcomes = Vec::new();
+        let mut next_goal = initial_goal.into();
+
+        loop {
+            let outcome = self.turn(&next_goal, events.clone()).await?;
+            outcomes.push(outcome);
+
+            // Priority 1: explicit wakeup
+            let wakeup = wakeup_slot
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            if let Some(req) = wakeup {
+                tokio::time::sleep(req.delay).await;
+                next_goal = req.prompt;
+                continue;
+            }
+
+            // Priority 2: background job completed
+            if let Some(ref mgr) = self.bg_manager {
+                if let Ok(mut mgr) = mgr.try_lock() {
+                    if let Some((id, output)) = mgr.take_completed() {
+                        next_goal = format!(
+                            "Background job '{}' completed:\n{}",
+                            id, output
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Nothing to do → loop ends
+            break;
+        }
+        Ok(outcomes)
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +442,119 @@ mod tests {
         let _agent_ref = runner.agent();
         // Mutable access
         let _agent_mut = runner.agent_mut();
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_triggers_on_wakeup() {
+        use std::sync::Mutex as StdMutex;
+        use crate::tools::WakeupSlot;
+
+        let script = vec![
+            Completion {
+                content: "Turn 1".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "Turn 2".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ];
+        let agent = make_agent(script);
+        let mut runner = AgentRunner::new(agent);
+        let wakeup_slot: WakeupSlot = Arc::new(StdMutex::new(None));
+
+        // Pre-seed a wakeup so the loop runs a second turn
+        {
+            let mut slot = wakeup_slot.lock().unwrap();
+            *slot = Some(crate::tools::WakeupRequest {
+                delay: std::time::Duration::from_millis(1),
+                reason: "continue".into(),
+                prompt: "Second goal".into(),
+            });
+        }
+
+        let outcomes = runner
+            .run_event_loop("First goal", &wakeup_slot, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 2, "should have run 2 turns");
+        assert_eq!(runner.turns(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_ends_when_no_wakeup_or_bg() {
+        let script = vec![Completion {
+            content: "Only turn".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }];
+        let agent = make_agent(script);
+        let mut runner = AgentRunner::new(agent);
+        let wakeup_slot = Arc::new(std::sync::Mutex::new(None));
+
+        let outcomes = runner
+            .run_event_loop("Single goal", &wakeup_slot, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1, "should have run exactly 1 turn");
+        assert_eq!(runner.turns(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_triggers_on_bg_completion() {
+        use std::sync::Mutex as StdMutex;
+        use crate::tools::WakeupSlot;
+
+        let script = vec![
+            Completion {
+                content: "Turn 1".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "Turn 2".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ];
+        let agent = make_agent(script);
+        let bg_manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let mut runner = AgentRunner::with_bg_manager(agent, bg_manager.clone());
+        let wakeup_slot: WakeupSlot = Arc::new(StdMutex::new(None));
+
+        // Pre-seed a completed background job
+        {
+            let mut mgr = bg_manager.lock().await;
+            mgr.insert(crate::tools::run_background::Job {
+                state: crate::tools::run_background::JobState::Completed {
+                    stdout: "build succeeded".into(),
+                    stderr: "".into(),
+                    exit_code: 0,
+                },
+                created_at: std::time::Instant::now(),
+            });
+        }
+
+        let outcomes = runner
+            .run_event_loop("First goal", &wakeup_slot, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 2, "should have run 2 turns (initial + bg trigger)");
+        assert_eq!(runner.turns(), 2);
     }
 }
