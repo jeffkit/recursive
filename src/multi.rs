@@ -1,10 +1,11 @@
-//! Multi-agent orchestration: agent pool and role definitions.
+//! Multi-agent orchestration: agent pool, role definitions, and message bus.
 
 use crate::{Agent, AgentOutcome, Config, LlmProvider};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 /// Shared memory store for multi-agent coordination.
 #[derive(Clone)]
@@ -85,6 +86,127 @@ impl Default for SharedMemory {
     }
 }
 
+// --- Inter-agent messaging ---
+
+/// Message type for inter-agent communication.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum MessageType {
+    Task,
+    Result,
+    Question,
+    Feedback,
+    Broadcast,
+}
+
+/// A message exchanged between agents via the message bus.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AgentMessage {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub content: String,
+    pub msg_type: MessageType,
+    pub timestamp: u64,
+}
+
+/// Generate a unique message ID using blake3 hash of timestamp + atomic counter.
+fn generate_message_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let input = format!("msg-{}-{}", now.as_nanos(), count);
+    let hash = blake3::hash(input.as_bytes());
+    hash.to_hex()[..16].to_string()
+}
+
+/// Get current timestamp as seconds since UNIX epoch.
+fn now_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// An inter-agent message bus supporting publish/subscribe and history.
+#[derive(Clone)]
+pub struct MessageBus {
+    messages: Arc<RwLock<Vec<AgentMessage>>>,
+    subscribers: Arc<RwLock<HashMap<String, broadcast::Sender<AgentMessage>>>>,
+}
+
+impl MessageBus {
+    pub fn new() -> Self {
+        Self {
+            messages: Arc::new(RwLock::new(Vec::new())),
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Send a message. Stores in history and notifies relevant subscribers.
+    pub async fn send(&self, msg: AgentMessage) {
+        self.messages.write().await.push(msg.clone());
+        let subs = self.subscribers.read().await;
+        if msg.to == "broadcast" {
+            for tx in subs.values() {
+                let _ = tx.send(msg.clone());
+            }
+        } else if let Some(tx) = subs.get(&msg.to) {
+            let _ = tx.send(msg);
+        }
+    }
+
+    /// Subscribe to messages for a given role. Returns a broadcast receiver.
+    pub async fn subscribe(&self, role: &str) -> broadcast::Receiver<AgentMessage> {
+        let mut subs = self.subscribers.write().await;
+        let tx = subs.entry(role.to_string()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(64);
+            tx
+        });
+        tx.subscribe()
+    }
+
+    /// Get all messages addressed to this role (including broadcasts).
+    pub async fn inbox(&self, role: &str) -> Vec<AgentMessage> {
+        self.messages
+            .read()
+            .await
+            .iter()
+            .filter(|m| m.to == role || m.to == "broadcast")
+            .cloned()
+            .collect()
+    }
+
+    /// Get all messages sent by this role.
+    pub async fn outbox(&self, role: &str) -> Vec<AgentMessage> {
+        self.messages
+            .read()
+            .await
+            .iter()
+            .filter(|m| m.from == role)
+            .cloned()
+            .collect()
+    }
+
+    /// Get the full message history.
+    pub async fn history(&self) -> Vec<AgentMessage> {
+        self.messages.read().await.clone()
+    }
+
+    /// Clear all stored messages.
+    pub async fn clear(&self) {
+        self.messages.write().await.clear();
+    }
+}
+
+impl Default for MessageBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Definition of an agent role.
 #[derive(Clone, Debug)]
 pub struct AgentRole {
@@ -101,6 +223,7 @@ pub struct AgentPool {
     #[allow(dead_code)]
     config: Config,
     memory: SharedMemory,
+    bus: MessageBus,
 }
 
 impl AgentPool {
@@ -110,11 +233,16 @@ impl AgentPool {
             provider,
             config,
             memory: SharedMemory::new(),
+            bus: MessageBus::new(),
         }
     }
 
     pub fn memory(&self) -> &SharedMemory {
         &self.memory
+    }
+
+    pub fn bus(&self) -> &MessageBus {
+        &self.bus
     }
 
     pub fn add_role(&mut self, role: AgentRole) {
@@ -159,6 +287,34 @@ impl AgentPool {
             .build()?;
 
         agent.run(goal).await
+    }
+
+    /// Send a task message from one agent role to another.
+    pub async fn send_task(&self, from: &str, to: &str, content: &str) {
+        self.bus
+            .send(AgentMessage {
+                id: generate_message_id(),
+                from: from.to_string(),
+                to: to.to_string(),
+                content: content.to_string(),
+                msg_type: MessageType::Task,
+                timestamp: now_timestamp(),
+            })
+            .await;
+    }
+
+    /// Send a result message from one agent role to another.
+    pub async fn send_result(&self, from: &str, to: &str, content: &str) {
+        self.bus
+            .send(AgentMessage {
+                id: generate_message_id(),
+                from: from.to_string(),
+                to: to.to_string(),
+                content: content.to_string(),
+                msg_type: MessageType::Result,
+                timestamp: now_timestamp(),
+            })
+            .await;
     }
 }
 
@@ -400,5 +556,131 @@ mod tests {
         assert_eq!(outcome.finish, crate::agent::FinishReason::NoMoreToolCalls);
         // The run succeeded with memory context injected — no error means integration works
         assert!(outcome.final_message.is_some());
+    }
+
+    // --- MessageBus tests ---
+
+    fn make_msg(from: &str, to: &str, content: &str, msg_type: MessageType) -> AgentMessage {
+        AgentMessage {
+            id: generate_message_id(),
+            from: from.to_string(),
+            to: to.to_string(),
+            content: content.to_string(),
+            msg_type,
+            timestamp: now_timestamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn message_bus_send_and_inbox() {
+        let bus = MessageBus::new();
+        let msg = make_msg("planner", "coder", "implement feature X", MessageType::Task);
+        bus.send(msg).await;
+
+        let inbox = bus.inbox("coder").await;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].content, "implement feature X");
+        assert_eq!(inbox[0].from, "planner");
+        assert_eq!(inbox[0].msg_type, MessageType::Task);
+
+        // Other roles see empty inbox
+        let empty = bus.inbox("reviewer").await;
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_bus_outbox() {
+        let bus = MessageBus::new();
+        bus.send(make_msg("coder", "reviewer", "done coding", MessageType::Result))
+            .await;
+        bus.send(make_msg("coder", "planner", "need clarification", MessageType::Question))
+            .await;
+        bus.send(make_msg("planner", "coder", "here is the plan", MessageType::Task))
+            .await;
+
+        let outbox = bus.outbox("coder").await;
+        assert_eq!(outbox.len(), 2);
+        assert!(outbox.iter().all(|m| m.from == "coder"));
+
+        let planner_outbox = bus.outbox("planner").await;
+        assert_eq!(planner_outbox.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn message_bus_broadcast_reaches_all() {
+        let bus = MessageBus::new();
+        bus.send(make_msg("admin", "broadcast", "system update", MessageType::Broadcast))
+            .await;
+
+        let coder_inbox = bus.inbox("coder").await;
+        let reviewer_inbox = bus.inbox("reviewer").await;
+        let planner_inbox = bus.inbox("planner").await;
+
+        assert_eq!(coder_inbox.len(), 1);
+        assert_eq!(reviewer_inbox.len(), 1);
+        assert_eq!(planner_inbox.len(), 1);
+        assert_eq!(coder_inbox[0].content, "system update");
+    }
+
+    #[tokio::test]
+    async fn message_bus_subscribe_receives() {
+        let bus = MessageBus::new();
+        let mut rx = bus.subscribe("coder").await;
+
+        // Send after subscribing
+        let msg = make_msg("planner", "coder", "task for you", MessageType::Task);
+        bus.send(msg).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.content, "task for you");
+        assert_eq!(received.from, "planner");
+    }
+
+    #[tokio::test]
+    async fn message_bus_history() {
+        let bus = MessageBus::new();
+        bus.send(make_msg("a", "b", "msg1", MessageType::Task)).await;
+        bus.send(make_msg("b", "a", "msg2", MessageType::Result)).await;
+        bus.send(make_msg("a", "broadcast", "msg3", MessageType::Broadcast))
+            .await;
+
+        let history = bus.history().await;
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, "msg1");
+        assert_eq!(history[1].content, "msg2");
+        assert_eq!(history[2].content, "msg3");
+    }
+
+    #[tokio::test]
+    async fn message_bus_clear() {
+        let bus = MessageBus::new();
+        bus.send(make_msg("a", "b", "hello", MessageType::Task)).await;
+        assert_eq!(bus.history().await.len(), 1);
+
+        bus.clear().await;
+        assert!(bus.history().await.is_empty());
+        assert!(bus.inbox("b").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_pool_send_task_convenience() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let pool = AgentPool::new(provider, test_config());
+
+        pool.send_task("planner", "coder", "build module Y").await;
+        pool.send_result("coder", "planner", "module Y complete").await;
+
+        let inbox = pool.bus().inbox("coder").await;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].content, "build module Y");
+        assert_eq!(inbox[0].msg_type, MessageType::Task);
+
+        let planner_inbox = pool.bus().inbox("planner").await;
+        assert_eq!(planner_inbox.len(), 1);
+        assert_eq!(planner_inbox[0].content, "module Y complete");
+        assert_eq!(planner_inbox[0].msg_type, MessageType::Result);
+
+        let history = pool.bus().history().await;
+        assert_eq!(history.len(), 2);
     }
 }
