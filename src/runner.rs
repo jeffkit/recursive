@@ -6,9 +6,12 @@
 //! made reusable for loop mode, HTTP API sessions, and TUI.
 
 use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::agent::{Agent, AgentOutcome, StepEvent};
 use crate::error::Result;
+use crate::tools::BackgroundJobManager;
 
 /// Manages an Agent across multiple conversation turns.
 ///
@@ -16,6 +19,9 @@ use crate::error::Result;
 /// channel, and tracks cumulative turn count. Each call to `turn()` runs
 /// the agent once with the given goal, then restores the transcript so the
 /// next turn continues the conversation.
+///
+/// Optionally holds a reference to a shared `BackgroundJobManager`. When
+/// `clear()` is called, any pending background jobs are also cleared.
 ///
 /// # Example
 ///
@@ -35,6 +41,9 @@ use crate::error::Result;
 pub struct AgentRunner {
     agent: Agent,
     total_turns: usize,
+    /// Optional shared background job manager. When set, `clear()` will
+    /// also cancel all tracked background jobs.
+    bg_manager: Option<Arc<Mutex<BackgroundJobManager>>>,
 }
 
 impl AgentRunner {
@@ -43,6 +52,22 @@ impl AgentRunner {
         Self {
             agent,
             total_turns: 0,
+            bg_manager: None,
+        }
+    }
+
+    /// Create a runner that also manages background jobs.
+    ///
+    /// When `clear()` is called, all tracked background jobs are removed
+    /// from the shared manager in addition to clearing the transcript.
+    pub fn with_bg_manager(
+        agent: Agent,
+        bg_manager: Arc<Mutex<BackgroundJobManager>>,
+    ) -> Self {
+        Self {
+            agent,
+            total_turns: 0,
+            bg_manager: Some(bg_manager),
         }
     }
 
@@ -71,9 +96,18 @@ impl AgentRunner {
     }
 
     /// Clear the conversation history and reset the turn counter.
+    ///
+    /// If a `BackgroundJobManager` was provided, all tracked background
+    /// jobs are also removed.
     pub fn clear(&mut self) {
         self.agent.set_transcript(Vec::new());
         self.total_turns = 0;
+        if let Some(ref mgr) = self.bg_manager {
+            // Best-effort: if the lock is poisoned, we still clear the agent state.
+            if let Ok(mut mgr) = mgr.try_lock() {
+                mgr.clear();
+            }
+        }
     }
 
     /// Number of turns completed so far.

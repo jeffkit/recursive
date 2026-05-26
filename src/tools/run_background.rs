@@ -106,6 +106,11 @@ impl BackgroundJobManager {
         let cutoff = Instant::now() - JOB_TTL;
         self.jobs.retain(|_, job| job.created_at > cutoff);
     }
+
+    /// Remove all jobs immediately.
+    pub fn clear(&mut self) {
+        self.jobs.clear();
+    }
 }
 
 /// The `run_background` tool: spawn a command and return immediately.
