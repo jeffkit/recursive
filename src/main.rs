@@ -130,9 +130,12 @@ enum Cmd {
     },
     /// Interactive multi-turn REPL (default when no command is given).
     Repl,
-    /// Run as an MCP stdio server: read JSON-RPC requests from stdin,
-    /// dispatch them to the agent's tools, and write responses to stdout.
-    Serve,
+    /// Start as an MCP server (stdio transport).
+    Serve {
+        /// Workspace path for tool sandboxing.
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
     /// Interactive setup wizard — configure provider, model, and API key.
     Init,
     /// Print registered tool specs as JSON (sanity check).
@@ -269,7 +272,9 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
         }
-        Cmd::Serve => {
+        Cmd::Serve { workspace } => {
+            let workspace = std::fs::canonicalize(&workspace)?;
+            config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
         }
         Cmd::Init => {

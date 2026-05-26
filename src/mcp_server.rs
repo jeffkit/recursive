@@ -31,6 +31,243 @@ use tracing::{info, instrument};
 use crate::error::{Error, Result};
 use crate::mcp::{McpClient, McpServer, McpTool};
 use crate::tools::ToolRegistry;
+use crate::llm::ToolSpec;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 protocol types (MCP server side)
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC 2.0 request.
+#[derive(Debug, Deserialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: String,
+    #[serde(default)]
+    pub id: Option<Value>,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// A JSON-RPC 2.0 response.
+#[derive(Debug, Serialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    pub id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+}
+
+/// A JSON-RPC 2.0 error object.
+#[derive(Debug, Serialize)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl JsonRpcResponse {
+    /// Create a success response.
+    pub fn success(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(id: Value, code: i32, message: String) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError { code, message }),
+        }
+    }
+
+    /// Create a parse error response (-32700).
+    pub fn parse_error() -> Self {
+        Self::error(Value::Null, -32700, "Parse error".to_string())
+    }
+
+    /// Create a method not found error response (-32601).
+    pub fn method_not_found(id: Value) -> Self {
+        Self::error(id, -32601, "Method not found".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch a parsed JSON-RPC request and return a response.
+/// Returns `None` for notifications (no response needed).
+pub async fn dispatch_request(
+    request: &JsonRpcRequest,
+    tool_specs: &[ToolSpec],
+    tools: &ToolRegistry,
+) -> Option<JsonRpcResponse> {
+    match request.method.as_str() {
+        "initialize" => Some(handle_initialize(request)),
+        "notifications/initialized" => None,
+        "tools/list" => Some(handle_tools_list(request, tool_specs)),
+        "tools/call" => Some(handle_tools_call(request, tools).await),
+        _ => {
+            let id = request.id.clone().unwrap_or(Value::Null);
+            Some(JsonRpcResponse::method_not_found(id))
+        }
+    }
+}
+
+/// Handle `initialize` — return server capabilities and info.
+fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
+    let id = request.id.clone().unwrap_or(Value::Null);
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "recursive-mcp-server",
+                "version": "0.1.0"
+            }
+        }),
+    )
+}
+
+/// Handle `tools/list` — return the list of tool specs in MCP format.
+fn handle_tools_list(request: &JsonRpcRequest, tool_specs: &[ToolSpec]) -> JsonRpcResponse {
+    let id = request.id.clone().unwrap_or(Value::Null);
+    let tools: Vec<Value> = tool_specs
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "inputSchema": spec.parameters,
+            })
+        })
+        .collect();
+    JsonRpcResponse::success(id, serde_json::json!({ "tools": tools }))
+}
+
+/// Handle `tools/call` — execute a tool and return the result.
+async fn handle_tools_call(request: &JsonRpcRequest, tools: &ToolRegistry) -> JsonRpcResponse {
+    let id = request.id.clone().unwrap_or(Value::Null);
+    let tool_name = request
+        .params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let arguments = request
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    if tool_name.is_empty() {
+        return JsonRpcResponse::error(id, -32602, "Missing tool name".to_string());
+    }
+
+    match tools.get(tool_name) {
+        Some(tool) => match tool.execute(arguments).await {
+            Ok(text) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{"type": "text", "text": text}]
+                }),
+            ),
+            Err(e) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{"type": "text", "text": e.to_string()}]
+                }),
+            ),
+        },
+        None => JsonRpcResponse::error(
+            id,
+            -32602,
+            format!("Tool not found: {tool_name}"),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// McpServerRunner — stdio transport loop
+// ---------------------------------------------------------------------------
+
+/// Runs the MCP server stdio loop: reads JSON-RPC from stdin, dispatches,
+/// and writes responses to stdout.
+pub struct McpServerRunner {
+    tool_specs: Vec<ToolSpec>,
+    tools: ToolRegistry,
+}
+
+impl McpServerRunner {
+    /// Create a new runner from a [`ToolRegistry`].
+    ///
+    /// The tool specs are extracted immediately so they can be served
+    /// without holding a borrow on the registry.
+    pub fn new(tools: ToolRegistry) -> Self {
+        let tool_specs = tools.specs();
+        Self { tool_specs, tools }
+    }
+
+    /// Run the stdio server loop until EOF on stdin.
+    pub async fn run(&self) -> Result<()> {
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+        self.run_on(BufReader::new(stdin), stdout).await
+    }
+
+    /// Run the server loop on generic reader/writer (testable).
+    pub async fn run_on<R, W>(&self, reader: R, writer: W) -> Result<()>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut lines = BufReader::new(reader).lines();
+        let mut out = writer;
+
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Parse the request
+            let request: JsonRpcRequest = match serde_json::from_str(&line) {
+                Ok(req) => req,
+                Err(_) => {
+                    let resp = JsonRpcResponse::parse_error();
+                    let json = serde_json::to_string(&resp)?;
+                    out.write_all(json.as_bytes()).await?;
+                    out.write_all(b"\n").await?;
+                    out.flush().await?;
+                    continue;
+                }
+            };
+
+            // Dispatch
+            if let Some(response) = dispatch_request(&request, &self.tool_specs, &self.tools).await {
+                let json = serde_json::to_string(&response)?;
+                out.write_all(json.as_bytes()).await?;
+                out.write_all(b"\n").await?;
+                out.flush().await?;
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// Manages the lifecycle of one or more MCP servers and their tools.
 ///

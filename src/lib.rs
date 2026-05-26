@@ -38,12 +38,12 @@ pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
 #[cfg(feature = "mcp")]
 pub use mcp::{
-    discover_mcp_servers, dispatch_request, load_mcp_config, JsonRpcRequest, JsonRpcResponse,
+    discover_mcp_servers, load_mcp_config,
     McpClient, McpPrompt, McpPromptArgument, McpPromptMessage, McpResource, McpResourceContent,
     McpServer, McpServerConfig, McpTool, McpToolSpec, ServerCapabilities,
 };
 #[cfg(feature = "mcp")]
-pub use mcp_server::McpServerManager;
+pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
 pub use session::SessionFile;
 pub use skills::{
