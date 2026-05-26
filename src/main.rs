@@ -129,6 +129,12 @@ enum Cmd {
     },
     /// Interactive multi-turn REPL (default when no command is given).
     Repl,
+    /// Start as an MCP server (stdio transport).
+    Serve {
+        /// Workspace path for tool sandboxing.
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
     /// Interactive setup wizard — configure provider, model, and API key.
     Init,
     /// Print registered tool specs as JSON (sanity check).
@@ -263,6 +269,14 @@ async fn main() -> anyhow::Result<()> {
             let tools = build_tools(&config).await;
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
+            Ok(())
+        }
+        Cmd::Serve { workspace } => {
+            let workspace = std::fs::canonicalize(&workspace)?;
+            config.workspace = workspace;
+            let tools = build_tools(&config).await;
+            let runner = recursive::McpServerRunner::new(tools);
+            runner.run().await?;
             Ok(())
         }
         Cmd::Init => {

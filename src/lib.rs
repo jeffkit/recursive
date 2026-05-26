@@ -43,7 +43,7 @@ pub use mcp::{
     McpToolSpec, ServerCapabilities,
 };
 #[cfg(feature = "mcp")]
-pub use mcp_server::McpServerManager;
+pub use mcp_server::{dispatch_request, JsonRpcRequest, JsonRpcResponse, McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
 pub use session::SessionFile;
 pub use skills::{
