@@ -14,12 +14,13 @@ categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.75"
 exclude = [".dev/", "journal/", "goals/"]
 [features]
-default = ["cli", "mcp", "web_fetch", "anthropic"]
+default = ["cli", "mcp", "web_fetch", "anthropic", "http"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:anyhow"]
 test-utils = []
 mcp = ["dep:futures-util"]
 web_fetch = []
 anthropic = []
+http = ["dep:axum", "dep:tower-http"]
 
 [lib]
 name = "recursive"
@@ -47,12 +48,16 @@ walkdir = "2"
 regex = "1"
 blake3 = "1"
 futures-util = { version = "0.3.32", optional = true }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 tempfile = "3"
 tracing-test = "0.2"
 recursive-agent = { path = ".", features = ["test-utils"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.dev]
 opt-level = 0

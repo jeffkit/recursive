@@ -20,6 +20,8 @@ pub mod llm;
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod message;
 pub mod runner;
 pub mod session;

@@ -138,6 +138,13 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    /// Start the HTTP API server.
+    #[cfg(feature = "http")]
+    Http {
+        /// Address to bind (e.g. 127.0.0.1:3000).
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        addr: String,
+    },
     /// Interactive setup wizard — configure provider, model, and API key.
     Init,
     /// Print registered tool specs as JSON (sanity check).
@@ -284,6 +291,25 @@ async fn main() -> anyhow::Result<()> {
             let workspace = std::fs::canonicalize(&workspace)?;
             config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
+        }
+        #[cfg(feature = "http")]
+        Cmd::Http { addr } => {
+            let tools = build_tools(&config).await;
+            let tool_infos: Vec<recursive::http::ToolInfo> = tools
+                .specs()
+                .into_iter()
+                .map(|spec| recursive::http::ToolInfo {
+                    name: spec.name,
+                    description: spec.description,
+                    parameters: spec.parameters,
+                })
+                .collect();
+            let state = recursive::http::AppState { tools: tool_infos };
+            let router = recursive::http::build_router(state);
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            eprintln!("Recursive HTTP API listening on {addr}");
+            axum::serve(listener, router).await?;
+            Ok(())
         }
         Cmd::Init => run_init().await,
         Cmd::Run { goal } => {
