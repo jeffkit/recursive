@@ -186,3 +186,9 @@ Add it to the default tool registration (gated behind a `WakeupSlot` parameter).
   is passed to a tool — same pattern for `WakeupSlot`.
 - The `WakeupSlot` is `Arc<Mutex<Option<WakeupRequest>>>`. Very simple.
 - ~120-180 LOC of new code total.
+- **DO NOT modify `src/tools/shell.rs`, `src/tools/mod.rs` beyond adding
+  `pub mod schedule_wakeup;` and `pub use schedule_wakeup::*;`, or any
+  other existing tool file.** The scope is: create one new file + extend runner.
+- **DO NOT refactor ToolTransport, RunShell, or any transport mechanism.**
+  This goal is ONLY about the schedule_wakeup tool and the AgentRunner loop.
+- If you find yourself editing shell.rs, STOP. You are off-scope.
