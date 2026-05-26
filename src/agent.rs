@@ -254,7 +254,9 @@ impl Agent {
                     .push(Message::tool_result(call.id.clone(), result));
             }
         }
-        self.emit(StepEvent::PlanRejected { reason: reason.into() });
+        self.emit(StepEvent::PlanRejected {
+            reason: reason.into(),
+        });
     }
 
     /// Drive the loop until the model stops calling tools, or the budget is exhausted.
