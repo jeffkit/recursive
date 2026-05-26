@@ -20,7 +20,7 @@ test-utils = []
 mcp = ["dep:futures-util"]
 web_fetch = []
 anthropic = []
-http = ["dep:axum", "dep:tower-http"]
+http = ["dep:axum", "dep:tower-http", "dep:tokio-stream", "dep:futures-util"]
 
 [lib]
 name = "recursive"
@@ -50,6 +50,7 @@ blake3 = "1"
 futures-util = { version = "0.3.32", optional = true }
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }

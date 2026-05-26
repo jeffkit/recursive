@@ -4,13 +4,13 @@
 mod http_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use recursive::http::{AppState, ToolInfo, build_router};
+    use recursive::http::{AppState, SseEvent, ToolInfo, build_router, map_step_event};
     use recursive::llm::{Completion, MockProvider};
     use recursive::config::Config;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{broadcast, RwLock};
     use tower::ServiceExt;
 
     fn mock_config() -> Config {
@@ -67,6 +67,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -76,6 +77,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -149,6 +151,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         });
 
         let response = app
@@ -190,6 +193,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -231,6 +235,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -281,6 +286,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -343,6 +349,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -412,6 +419,7 @@ mod http_tests {
             config: mock_config(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -733,5 +741,229 @@ mod http_tests {
             .unwrap();
 
         assert_eq!(response.status(), 404);
+    }
+
+    // ── SSE endpoint tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_events_returns_sse_content_type() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+
+        // Create a session first
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = create_resp["id"].as_str().unwrap();
+
+        // Request SSE stream
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{}/events", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header missing")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/event-stream"),
+            "Expected text/event-stream, got: {}",
+            content_type
+        );
+    }
+
+    #[tokio::test]
+    async fn session_events_nonexistent_returns_404() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions/nonexistent-id/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn sse_event_serialization() {
+        // Verify SseEvent serializes to expected JSON structure
+        let tool_call = SseEvent::ToolCall {
+            name: "read_file".into(),
+            step: 1,
+        };
+        let json = serde_json::to_value(&tool_call).unwrap();
+        assert_eq!(json["type"], "tool_call");
+        assert_eq!(json["name"], "read_file");
+        assert_eq!(json["step"], 1);
+
+        let tool_result = SseEvent::ToolResult {
+            name: "read_file".into(),
+            success: true,
+        };
+        let json = serde_json::to_value(&tool_result).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["name"], "read_file");
+        assert_eq!(json["success"], true);
+
+        let done = SseEvent::Done {
+            finish_reason: "NoMoreToolCalls".into(),
+            total_steps: 3,
+        };
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json["type"], "done");
+        assert_eq!(json["finish_reason"], "NoMoreToolCalls");
+        assert_eq!(json["total_steps"], 3);
+
+        let error = SseEvent::Error {
+            message: "something went wrong".into(),
+        };
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["message"], "something went wrong");
+    }
+
+    #[tokio::test]
+    async fn map_step_event_tool_call() {
+        use recursive::llm::ToolCall as LlmToolCall;
+        use recursive::StepEvent;
+
+        let step_event = StepEvent::ToolCall {
+            call: LlmToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/test"}),
+            },
+            step: 2,
+        };
+        let sse = map_step_event(&step_event).unwrap();
+        assert_eq!(
+            sse,
+            SseEvent::ToolCall {
+                name: "write_file".into(),
+                step: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn map_step_event_tool_result_success() {
+        use recursive::StepEvent;
+
+        let step_event = StepEvent::ToolResult {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            output: "file contents here".into(),
+            step: 1,
+        };
+        let sse = map_step_event(&step_event).unwrap();
+        assert_eq!(
+            sse,
+            SseEvent::ToolResult {
+                name: "read_file".into(),
+                success: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn map_step_event_tool_result_error() {
+        use recursive::StepEvent;
+
+        let step_event = StepEvent::ToolResult {
+            id: "call_2".into(),
+            name: "write_file".into(),
+            output: "ERROR: permission denied".into(),
+            step: 3,
+        };
+        let sse = map_step_event(&step_event).unwrap();
+        assert_eq!(
+            sse,
+            SseEvent::ToolResult {
+                name: "write_file".into(),
+                success: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn map_step_event_finished() {
+        use recursive::FinishReason;
+        use recursive::StepEvent;
+
+        let step_event = StepEvent::Finished {
+            reason: FinishReason::NoMoreToolCalls,
+            steps: 5,
+        };
+        let sse = map_step_event(&step_event).unwrap();
+        assert_eq!(
+            sse,
+            SseEvent::Done {
+                finish_reason: "NoMoreToolCalls".into(),
+                total_steps: 5,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn map_step_event_returns_none_for_unrelated() {
+        use recursive::StepEvent;
+
+        let step_event = StepEvent::Latency {
+            step: 1,
+            llm_ms: 500,
+        };
+        assert!(map_step_event(&step_event).is_none());
+
+        let step_event = StepEvent::PartialToken {
+            text: "hello".into(),
+            step: 1,
+        };
+        assert!(map_step_event(&step_event).is_none());
+    }
+
+    #[tokio::test]
+    async fn broadcast_channel_delivers_events() {
+        // Verify that the broadcast channel properly delivers SseEvents
+        let (tx, _) = broadcast::channel::<SseEvent>(64);
+        let mut rx = tx.subscribe();
+
+        let event = SseEvent::ToolCall {
+            name: "test".into(),
+            step: 1,
+        };
+        tx.send(event.clone()).unwrap();
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received, event);
     }
 }

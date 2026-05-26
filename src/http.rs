@@ -2,20 +2,24 @@
 //!
 //! Provides a lightweight axum-based HTTP server that exposes the agent's
 //! tool registry as a read-only JSON endpoint, a health check, a POST /run
-//! endpoint that executes the agent with a given goal, and session management
-//! endpoints for multi-turn conversations.
+//! endpoint that executes the agent with a given goal, session management
+//! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::sse::{Event, Sse},
     routing::{get, post},
     Json, Router,
 };
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
+use crate::agent::StepEvent;
 use crate::config::Config;
 use crate::llm::LlmProvider;
 use crate::message::Message;
@@ -73,6 +77,25 @@ pub struct SessionDetailResponse {
     pub messages: Vec<serde_json::Value>,
 }
 
+// ── SSE event types ──────────────────────────────────────────────────────
+
+/// Server-Sent Event payload emitted during an agent session run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SseEvent {
+    /// A tool is being called.
+    ToolCall { name: String, step: usize },
+    /// A tool call completed.
+    ToolResult { name: String, success: bool },
+    /// The agent run completed.
+    Done {
+        finish_reason: String,
+        total_steps: usize,
+    },
+    /// An error occurred.
+    Error { message: String },
+}
+
 // ── App state ──────────────────────────────────────────────────────────────
 
 /// Shared application state for the HTTP server.
@@ -82,6 +105,7 @@ pub struct AppState {
     pub config: Config,
     pub provider: Arc<dyn LlmProvider>,
     pub sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+    pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseEvent>>>>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -134,6 +158,7 @@ pub struct ErrorResponse {
 /// - `GET /sessions/:id` — get session detail with messages
 /// - `POST /sessions/:id/messages` — send a message in a session
 /// - `DELETE /sessions/:id` — remove a session
+/// - `GET /sessions/:id/events` — SSE stream of agent events for a session
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -144,6 +169,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}", axum::routing::delete(delete_session))
         .route("/sessions/{id}/messages", post(send_session_message))
+        .route("/sessions/{id}/events", get(session_events))
         .with_state(Arc::new(state))
 }
 
@@ -386,10 +412,14 @@ async fn send_session_message(
         (session.system_prompt.clone(), session.transcript.clone())
     };
 
-    // Build agent with session context
+    // Set up event forwarding: mpsc from agent -> broadcast for SSE clients
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Build agent with session context and event sender
     let mut agent = crate::Agent::builder()
         .llm(state.provider.clone())
         .system_prompt(system_prompt)
+        .events(event_tx)
         .build()
         .map_err(|e| {
             (
@@ -406,6 +436,25 @@ async fn send_session_message(
         agent.set_transcript(transcript);
     }
 
+    // Ensure broadcast channel exists for this session
+    let broadcast_tx = {
+        let mut channels = state.event_channels.write().await;
+        let tx = channels.entry(id.clone()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(64);
+            tx
+        });
+        tx.clone()
+    };
+
+    // Spawn a task to forward StepEvents from mpsc to broadcast channel
+    let forward_handle = tokio::spawn(async move {
+        while let Some(step_event) = event_rx.recv().await {
+            if let Some(sse_event) = map_step_event(&step_event) {
+                let _ = broadcast_tx.send(sse_event);
+            }
+        }
+    });
+
     // Run agent with the new message
     let outcome = agent.run(&body.content).await.map_err(|e| {
         (
@@ -416,6 +465,13 @@ async fn send_session_message(
             }),
         )
     })?;
+
+    // Drop the event sender so the forwarder task can finish
+    agent.set_events(None);
+    drop(agent);
+
+    // Wait for the forwarder to finish draining events
+    let _ = forward_handle.await;
 
     // Extract the last assistant message
     let last_assistant = outcome
@@ -438,4 +494,76 @@ async fn send_session_message(
         role: "assistant".into(),
         content: last_assistant,
     }))
+}
+
+// ── SSE endpoint ─────────────────────────────────────────────────────────
+
+/// GET /sessions/:id/events — subscribe to SSE stream of agent events.
+async fn session_events(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Verify session exists
+    {
+        let sessions = state.sessions.read().await;
+        if !sessions.contains_key(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+
+    // Get or create broadcast channel for this session
+    let rx = {
+        let mut channels = state.event_channels.write().await;
+        let tx = channels.entry(id.clone()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(64);
+            tx
+        });
+        tx.subscribe()
+    };
+
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(sse_event) => {
+            let event_type = match &sse_event {
+                SseEvent::ToolCall { .. } => "tool_call",
+                SseEvent::ToolResult { .. } => "tool_result",
+                SseEvent::Done { .. } => "done",
+                SseEvent::Error { .. } => "error",
+            };
+            let data = serde_json::to_string(&sse_event).unwrap_or_default();
+            Some(Ok(Event::default().event(event_type).data(data)))
+        }
+        Err(_) => None,
+    });
+
+    Ok(Sse::new(stream))
+}
+
+// ── Event mapping ────────────────────────────────────────────────────────
+
+/// Map an agent `StepEvent` to an `SseEvent` for broadcasting.
+///
+/// Returns `None` for events that don't have an SSE equivalent (e.g., latency,
+/// partial tokens, usage stats).
+pub fn map_step_event(event: &StepEvent) -> Option<SseEvent> {
+    match event {
+        StepEvent::ToolCall { call, step } => Some(SseEvent::ToolCall {
+            name: call.name.clone(),
+            step: *step,
+        }),
+        StepEvent::ToolResult {
+            name, output, step: _, ..
+        } => {
+            let success = !output.starts_with("ERROR: ");
+            Some(SseEvent::ToolResult {
+                name: name.clone(),
+                success,
+            })
+        }
+        StepEvent::Finished { reason, steps } => Some(SseEvent::Done {
+            finish_reason: format!("{:?}", reason),
+            total_steps: *steps,
+        }),
+        // Other events don't map to SSE events
+        _ => None,
+    }
 }
