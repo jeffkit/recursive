@@ -17,6 +17,14 @@ Recursive is a tiny ReAct-style agent loop that wires together:
 
 The whole kernel is intentionally small enough to read in one sitting.
 
+## What's New in v0.5.0
+
+- **HTTP API** — axum-based REST server with sessions, SSE streaming, OpenAPI spec
+- **Terminal UI** — ratatui-based TUI with streaming tool indicators, plan mode
+- **Multi-Agent** — agent pool, shared memory, messaging bus, pipeline & team orchestration
+- **Python SDK** — `pip install recursive-client` for programmatic access
+- **Loop Mode** — `recursive loop` for self-scheduling autonomous agent runs
+
 ## At a glance
 
 ```rust
@@ -96,6 +104,15 @@ recursive run "list files in src and summarise the kernel"
 # interactive REPL (one goal per line, :q to exit)
 recursive repl
 
+# loop mode — agent self-schedules wakeups
+recursive loop "monitor src/ for changes and report"
+
+# HTTP API server
+recursive http --addr 127.0.0.1:3000
+
+# Terminal UI (connects to HTTP server)
+cargo run -p recursive-tui
+
 # inspect what tools are registered (no API key needed)
 recursive tools
 ```
@@ -141,10 +158,10 @@ surface lives in `src/lib.rs`.
 ## Testing
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
-Coverage includes:
+540+ tests covering:
 
 - Agent loop: termination, tool dispatch, error recovery, step budget,
   event stream order.
@@ -154,8 +171,26 @@ Coverage includes:
 - Shell tool: success / non-zero status / timeout.
 - HTTP provider: request shape (with and without tools), response parsing
   (plain text / tool-call), tool-call argument round-trip.
+- HTTP API: health, tools, run, sessions CRUD, SSE streaming, OpenAPI spec.
+- TUI: app state, key handling, message styling, scroll, plan mode.
+- Multi-Agent: pool, roles, shared memory, messaging bus, pipeline, orchestrator.
 - End-to-end smoke (`tests/smoke.rs`): scripted `MockProvider` driving real
   filesystem tools.
+
+## Python SDK
+
+```bash
+cd sdk/python && pip install -e .
+```
+
+```python
+from recursive_client import RecursiveClient
+
+client = RecursiveClient("http://127.0.0.1:3000")
+print(client.health())  # "ok"
+result = client.run("list files in src/")
+print(result.finish_reason)
+```
 
 ## License
 
