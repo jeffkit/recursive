@@ -1673,7 +1673,8 @@ done
     fn test_parse_sse_response_empty_data_lines() {
         // Empty data: lines interspersed — they should be skipped (contribute nothing)
         // and the valid JSON line should still be parsed correctly.
-        let buffer = "data: \ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\ndata: \n\n";
+        let buffer =
+            "data: \ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\ndata: \n\n";
         let result = parse_sse_response(buffer, 1, "test");
         assert!(result.is_some());
         let result = result.unwrap().unwrap();
@@ -2013,7 +2014,10 @@ done
         let mut client = spawn_mock_server(script).await.expect("spawn mock server");
 
         // Empty name — client should still send the request without panicking
-        let messages = client.get_prompt("", None).await.expect("get_prompt with empty name");
+        let messages = client
+            .get_prompt("", None)
+            .await
+            .expect("get_prompt with empty name");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "default prompt");

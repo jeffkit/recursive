@@ -359,7 +359,12 @@ impl Agent {
                         PermissionDecision::Allow => call.arguments.clone(),
                         PermissionDecision::Deny(reason) => {
                             let result = format!("ERROR: {reason}");
-                            results.push((call.id.clone(), call.name.clone(), result, call.arguments.clone()));
+                            results.push((
+                                call.id.clone(),
+                                call.name.clone(),
+                                result,
+                                call.arguments.clone(),
+                            ));
                             continue;
                         }
                         PermissionDecision::Transform(new_args) => new_args,
@@ -376,12 +381,22 @@ impl Agent {
                 match hook_action {
                     HookAction::Skip => {
                         let result = "ERROR: tool call skipped by hook".to_string();
-                            results.push((call.id.clone(), call.name.clone(), result, call.arguments.clone()));
+                        results.push((
+                            call.id.clone(),
+                            call.name.clone(),
+                            result,
+                            call.arguments.clone(),
+                        ));
                         continue;
                     }
                     HookAction::Error(msg) => {
                         let result = format!("ERROR: {msg}");
-                            results.push((call.id.clone(), call.name.clone(), result, call.arguments.clone()));
+                        results.push((
+                            call.id.clone(),
+                            call.name.clone(),
+                            result,
+                            call.arguments.clone(),
+                        ));
                         continue;
                     }
                     HookAction::Continue => {}
@@ -438,7 +453,12 @@ impl Agent {
                             .iter()
                             .find(|(n, _, _)| n == &pc.name)
                             .unwrap();
-                        results.push((pc.id.clone(), pc.name.clone(), result.clone(), pc.args.clone()));
+                        results.push((
+                            pc.id.clone(),
+                            pc.name.clone(),
+                            result.clone(),
+                            pc.args.clone(),
+                        ));
                         self.hooks.dispatch(HookEvent::PostToolCall {
                             name: &pc.name,
                             args: &pc.args,
@@ -455,7 +475,12 @@ impl Agent {
                         Err(err) => format!("ERROR: {err}"),
                     };
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
-                    results.push((pc.id.clone(), pc.name.clone(), result.clone(), pc.args.clone()));
+                    results.push((
+                        pc.id.clone(),
+                        pc.name.clone(),
+                        result.clone(),
+                        pc.args.clone(),
+                    ));
                     self.hooks.dispatch(HookEvent::PostToolCall {
                         name: &pc.name,
                         args: &pc.args,
@@ -927,7 +952,7 @@ mod tests {
             .build()
             .unwrap();
         let out = agent.run("loop").await.unwrap();
-assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert_eq!(out.steps, 3);
         // Transcript MUST be populated even on budget-exceeded — this is
         // what unlocks auto-resume in self-improve.sh.
@@ -1090,7 +1115,7 @@ assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         let out = agent.run("add with different args").await.unwrap();
 
         // Should hit budget, not stuck (args differ each time)
-assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert_eq!(out.steps, 3);
     }
 
@@ -1137,7 +1162,7 @@ assert!(matches!(out.finish, FinishReason::BudgetExceeded));
             .unwrap();
         let out = agent.run("loop").await.unwrap();
 
-assert!(matches!(out.finish, FinishReason::BudgetExceeded));
+        assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert!(
             !out.transcript.is_empty(),
             "transcript must survive BudgetExceeded for auto-resume"
@@ -2016,8 +2041,8 @@ mod tracing_tests {
 mod parallel_tests {
     use super::*;
     use crate::llm::{Completion, MockProvider, ToolCall};
-    use crate::ToolSpec;
     use crate::tools::Tool;
+    use crate::ToolSpec;
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2039,7 +2064,9 @@ mod parallel_tests {
                 parameters: json!({"type": "object"}),
             }
         }
-        fn is_readonly(&self) -> bool { true }
+        fn is_readonly(&self) -> bool {
+            true
+        }
         async fn execute(&self, _args: Value) -> Result<String> {
             let order = self.counter.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
@@ -2081,9 +2108,7 @@ mod parallel_tests {
             delay_ms: 100,
         });
 
-        let tools = ToolRegistry::local()
-            .register(tool1)
-            .register(tool2);
+        let tools = ToolRegistry::local().register(tool1).register(tool2);
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -2150,9 +2175,7 @@ mod parallel_tests {
             counter: counter.clone(),
         });
 
-        let tools = ToolRegistry::local()
-            .register(tool1)
-            .register(tool2);
+        let tools = ToolRegistry::local().register(tool1).register(tool2);
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -2276,8 +2299,7 @@ mod parallel_tests {
             delay_ms: 10,
         });
 
-        let tools = ToolRegistry::local()
-            .register(read_tool);
+        let tools = ToolRegistry::local().register(read_tool);
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -2410,19 +2432,16 @@ mod parallel_tests {
             delay_ms: 10,
         });
 
-        let tools = ToolRegistry::local()
-            .register(read_tool);
+        let tools = ToolRegistry::local().register(read_tool);
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
                 content: "single call...".into(),
-                tool_calls: vec![
-                    ToolCall {
-                        id: "c1".into(),
-                        name: "slow_read".into(),
-                        arguments: json!({}),
-                    },
-                ],
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "slow_read".into(),
+                    arguments: json!({}),
+                }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
             },
@@ -2460,8 +2479,7 @@ mod parallel_tests {
             counter: counter.clone(),
         });
 
-        let tools = ToolRegistry::local()
-            .register(write_tool);
+        let tools = ToolRegistry::local().register(write_tool);
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -2519,20 +2537,14 @@ mod parallel_tests {
     async fn no_tool_calls_completes_immediately() {
         // When the provider returns a completion with empty tool_calls and
         // finish_reason "stop", the agent should complete with NoMoreToolCalls.
-        let llm = Arc::new(MockProvider::new(vec![
-            Completion {
-                content: "nothing to do".into(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".into()),
-                usage: None,
-            },
-        ]));
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "nothing to do".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
 
-        let mut agent = Agent::builder()
-            .llm(llm)
-            .max_steps(5)
-            .build()
-            .unwrap();
+        let mut agent = Agent::builder().llm(llm).max_steps(5).build().unwrap();
         let out = agent.run("no tools needed").await.unwrap();
 
         assert_eq!(out.finish, FinishReason::NoMoreToolCalls);

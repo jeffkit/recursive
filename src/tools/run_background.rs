@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -259,11 +259,10 @@ impl Tool for CheckBackground {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "check_background".into(),
-            description:
-                "Check the status and output of a previously spawned background job. \
+            description: "Check the status and output of a previously spawned background job. \
                  Returns the current state (running, completed, failed, or timed out) \
                  along with any captured stdout/stderr."
-                    .into(),
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -426,13 +425,14 @@ mod tests {
     use tokio::time::sleep;
 
     /// Poll `check_background` until the job is no longer running, with a timeout.
-    async fn poll_until_done(check_tool: &CheckBackground, job_id: &str, max_wait: Duration) -> Value {
+    async fn poll_until_done(
+        check_tool: &CheckBackground,
+        job_id: &str,
+        max_wait: Duration,
+    ) -> Value {
         let start = Instant::now();
         loop {
-            let result = check_tool
-                .execute(json!({"job_id": job_id}))
-                .await
-                .unwrap();
+            let result = check_tool.execute(json!({"job_id": job_id})).await.unwrap();
             let parsed: Value = serde_json::from_str(&result).unwrap();
             if parsed["status"] != "running" {
                 return parsed;

@@ -47,7 +47,9 @@ impl Tool for ReadFile {
         }
     }
 
-    fn is_readonly(&self) -> bool { true }
+    fn is_readonly(&self) -> bool {
+        true
+    }
 
     async fn execute(&self, args: Value) -> Result<String> {
         let path = args["path"].as_str().ok_or_else(|| Error::BadToolArgs {
@@ -231,9 +233,10 @@ impl Tool for ListDir {
         }
     }
 
-    fn is_readonly(&self) -> bool { true }
+    fn is_readonly(&self) -> bool {
+        true
+    }
     async fn execute(&self, args: Value) -> Result<String> {
-
         let path = args["path"].as_str().unwrap_or(".");
         let abs = resolve_within(&self.root, path)?;
         let mut entries = tokio::fs::read_dir(&abs).await.map_err(|e| Error::Tool {

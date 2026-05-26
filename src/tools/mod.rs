@@ -17,12 +17,12 @@ pub mod estimate_tokens;
 pub mod fs;
 pub mod load_skill;
 pub mod memory;
+pub mod run_background;
 pub mod run_skill_script;
 pub mod search;
 pub mod shell;
 pub mod sub_agent;
 pub mod transport;
-pub mod run_background;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
@@ -31,10 +31,10 @@ pub use estimate_tokens::EstimateTokens;
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use load_skill::LoadSkill;
 pub use memory::{Forget, Recall, Remember};
+pub use run_background::{BackgroundJobManager, CheckBackground, RunBackground};
 pub use run_skill_script::RunSkillScript;
 pub use search::SearchFiles;
 pub use shell::RunShell;
-pub use run_background::{BackgroundJobManager, CheckBackground, RunBackground};
 pub use sub_agent::SubAgent;
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]

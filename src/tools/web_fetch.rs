@@ -216,7 +216,9 @@ impl Tool for WebFetch {
         }
     }
 
-    fn is_readonly(&self) -> bool { true }
+    fn is_readonly(&self) -> bool {
+        true
+    }
 
     async fn execute(&self, args: Value) -> Result<String> {
         let url = args["url"].as_str().ok_or_else(|| Error::BadToolArgs {
