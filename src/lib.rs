@@ -49,7 +49,10 @@ pub use mcp::{
 #[cfg(feature = "mcp")]
 pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
-pub use multi::{AgentMessage, AgentPool, AgentRole, MemoryEntry, MessageBus, MessageType, SharedMemory};
+pub use multi::{
+    AgentMessage, AgentPool, AgentRole, MemoryEntry, MessageBus, MessageType, Pipeline,
+    PipelineResult, SharedMemory, StageOutcome,
+};
 pub use runner::AgentRunner;
 pub use session::SessionFile;
 pub use skills::{

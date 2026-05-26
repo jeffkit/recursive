@@ -318,6 +318,74 @@ impl AgentPool {
     }
 }
 
+/// A pipeline chains multiple agent roles in sequence.
+pub struct Pipeline {
+    stages: Vec<String>,
+}
+
+impl Pipeline {
+    pub fn new(stages: Vec<String>) -> Self {
+        Self { stages }
+    }
+
+    /// Execute the pipeline. Each stage's output becomes next stage's input.
+    pub async fn execute(
+        &self,
+        pool: &AgentPool,
+        initial_goal: &str,
+    ) -> Result<PipelineResult, crate::Error> {
+        let mut current_input = initial_goal.to_string();
+        let mut stage_outcomes = Vec::new();
+
+        for role_name in &self.stages {
+            let outcome = pool.run_with_role(role_name, &current_input).await?;
+
+            let output = outcome
+                .transcript
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::message::Role::Assistant)
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+
+            stage_outcomes.push(StageOutcome {
+                role: role_name.clone(),
+                output: output.clone(),
+                steps: outcome.steps,
+            });
+
+            current_input = output;
+        }
+
+        Ok(PipelineResult {
+            stages: stage_outcomes,
+        })
+    }
+}
+
+/// The result of running a full pipeline.
+#[derive(Debug)]
+pub struct PipelineResult {
+    pub stages: Vec<StageOutcome>,
+}
+
+/// The outcome of a single pipeline stage.
+#[derive(Debug)]
+pub struct StageOutcome {
+    pub role: String,
+    pub output: String,
+    pub steps: usize,
+}
+
+impl PipelineResult {
+    pub fn final_output(&self) -> &str {
+        self.stages.last().map(|s| s.output.as_str()).unwrap_or("")
+    }
+    pub fn stage_count(&self) -> usize {
+        self.stages.len()
+    }
+}
+
 /// Default role set for common multi-agent patterns.
 pub fn default_roles() -> Vec<AgentRole> {
     vec![
@@ -682,5 +750,161 @@ mod tests {
 
         let history = pool.bus().history().await;
         assert_eq!(history.len(), 2);
+    }
+
+    // --- Pipeline tests ---
+
+    #[tokio::test]
+    async fn pipeline_empty_returns_empty_result() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let pool = AgentPool::new(provider, test_config());
+
+        let pipeline = Pipeline::new(vec![]);
+        let result = pipeline.execute(&pool, "hello").await.unwrap();
+        assert_eq!(result.stage_count(), 0);
+        assert_eq!(result.final_output(), "");
+    }
+
+    #[tokio::test]
+    async fn pipeline_single_stage() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "stage one output".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+
+        let mut pool = AgentPool::new(provider, test_config());
+        pool.add_role(AgentRole {
+            name: "writer".into(),
+            system_prompt: "You write things.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+
+        let pipeline = Pipeline::new(vec!["writer".into()]);
+        let result = pipeline.execute(&pool, "write something").await.unwrap();
+
+        assert_eq!(result.stage_count(), 1);
+        assert_eq!(result.stages[0].role, "writer");
+        assert_eq!(result.stages[0].output, "stage one output");
+        assert_eq!(result.final_output(), "stage one output");
+    }
+
+    #[tokio::test]
+    async fn pipeline_multi_stage_passes_output() {
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "draft text".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "polished text".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let mock_ref = provider.clone();
+        let mut pool = AgentPool::new(provider, test_config());
+        pool.add_role(AgentRole {
+            name: "drafter".into(),
+            system_prompt: "You draft text.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+        pool.add_role(AgentRole {
+            name: "editor".into(),
+            system_prompt: "You polish text.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+
+        let pipeline = Pipeline::new(vec!["drafter".into(), "editor".into()]);
+        let result = pipeline.execute(&pool, "original goal").await.unwrap();
+
+        assert_eq!(result.stage_count(), 2);
+        assert_eq!(result.stages[0].output, "draft text");
+        assert_eq!(result.stages[1].output, "polished text");
+        assert_eq!(result.final_output(), "polished text");
+
+        // Verify second stage received first stage's output as its goal
+        let calls = mock_ref.calls();
+        assert_eq!(calls.len(), 2);
+        // The second call's user message should contain "draft text"
+        let second_call_user_msg = calls[1].iter().find(|m| m.role == crate::message::Role::User);
+        assert!(second_call_user_msg.unwrap().content.contains("draft text"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_fails_on_unknown_role() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let pool = AgentPool::new(provider, test_config());
+
+        let pipeline = Pipeline::new(vec!["nonexistent".into()]);
+        let result = pipeline.execute(&pool, "hello").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unknown role"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_final_output() {
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "second".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "final answer".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let mut pool = AgentPool::new(provider, test_config());
+        pool.add_role(AgentRole {
+            name: "a".into(),
+            system_prompt: "A".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+        pool.add_role(AgentRole {
+            name: "b".into(),
+            system_prompt: "B".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+        pool.add_role(AgentRole {
+            name: "c".into(),
+            system_prompt: "C".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+
+        let pipeline = Pipeline::new(vec!["a".into(), "b".into(), "c".into()]);
+        let result = pipeline.execute(&pool, "start").await.unwrap();
+
+        assert_eq!(result.final_output(), "final answer");
+        assert_eq!(result.stage_count(), 3);
     }
 }
