@@ -5,6 +5,7 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use crate::error::{Error, Result};
 
 /// Return the path to the global config file: ~/.recursive/config.toml.
 /// Returns None if the home directory cannot be determined.
@@ -41,7 +42,7 @@ impl FileConfig {
     /// Load from the default path (~/.recursive/config.toml).
     /// Returns Ok(None) if the file doesn't exist.
     /// Returns Err if the file exists but is malformed.
-    pub fn load() -> anyhow::Result<Option<Self>> {
+    pub fn load() -> Result<Option<Self>> {
         let path = match config_file_path() {
             Some(p) => p,
             None => return Ok(None),
@@ -50,12 +51,14 @@ impl FileConfig {
     }
 
     /// Load from an explicit path.
-    pub fn load_from(path: &Path) -> anyhow::Result<Option<Self>> {
+    pub fn load_from(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
-        let content = std::fs::read_to_string(path)?;
-        let config: FileConfig = toml::from_str(&content)?;
+        let content = std::fs::read_to_string(path).map_err(Error::Io)?;
+        let config: FileConfig = toml::from_str(&content).map_err(|e| Error::Config {
+            message: format!("failed to parse config file {}: {}", path.display(), e),
+        })?;
         Ok(Some(config))
     }
 }
@@ -63,18 +66,20 @@ impl FileConfig {
 /// Write a dotted key=value to ~/.recursive/config.toml.
 /// Supports dotted keys like "provider.model", "agent.max_steps".
 /// Creates the file and parent directory if needed.
-pub fn set_value(key: &str, value: &str) -> anyhow::Result<()> {
+pub fn set_value(key: &str, value: &str) -> Result<()> {
     let path = config_file_path()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        .ok_or_else(|| Error::Config {
+            message: "cannot determine home directory".into(),
+        })?;
 
     // Ensure directory exists
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
     }
 
     // Read existing or start fresh
     let content = if path.exists() {
-        std::fs::read_to_string(&path)?
+        std::fs::read_to_string(&path).map_err(Error::Io)?
     } else {
         String::new()
     };
@@ -95,10 +100,15 @@ pub fn set_value(key: &str, value: &str) -> anyhow::Result<()> {
         [field] => {
             doc.insert(field.to_string(), smart_value(value));
         }
-        _ => anyhow::bail!("invalid key format: {key}"),
+        _ => return Err(Error::Config {
+            message: format!("invalid key format: {key}"),
+        }),
     }
 
-    std::fs::write(&path, toml::to_string_pretty(&doc)?)?;
+    let toml_str = toml::to_string_pretty(&doc).map_err(|e| Error::Config {
+        message: format!("failed to serialize config: {}", e),
+    })?;
+    std::fs::write(&path, toml_str).map_err(Error::Io)?;
     Ok(())
 }
 

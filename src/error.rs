@@ -85,12 +85,6 @@ impl Error {
     }
 }
 
-impl From<anyhow::Error> for Error {
-    fn from(value: anyhow::Error) -> Self {
-        Error::Other(value.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,15 +217,6 @@ mod tests {
         assert!(err.to_string().contains("file not found"));
     }
 
-    #[test]
-    fn test_from_anyhow_error() {
-        let anyhow_err = anyhow::anyhow!("something went wrong");
-        let err: Error = anyhow_err.into();
-        assert!(matches!(err, Error::Other(_)));
-        assert!(err.to_string().contains("something went wrong"));
-    }
-
-    #[test]
     fn test_unknown_tool_format() {
         let err = Error::UnknownTool("nonexistent".into());
         let msg = err.to_string();
