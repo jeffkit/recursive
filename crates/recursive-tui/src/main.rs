@@ -18,6 +18,7 @@ enum StyledMessage {
     ToolCall(String),
     ToolResult { name: String, success: bool },
     System(String),
+    Separator,
 }
 
 impl StyledMessage {
@@ -39,6 +40,10 @@ impl StyledMessage {
             }
             Self::System(text) => Line::from(text.clone())
                 .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            Self::Separator => {
+                Line::from("────────────────────────────────")
+                    .style(Style::default().fg(Color::DarkGray))
+            }
         }
     }
 }
@@ -58,6 +63,7 @@ struct App {
     session_id: Option<String>,
     base_url: String,
     connected: bool,
+    scroll_offset: u16,
 }
 
 impl App {
@@ -71,6 +77,7 @@ impl App {
             session_id: None,
             base_url: "http://127.0.0.1:3000".into(),
             connected: false,
+            scroll_offset: 0,
         }
     }
 
@@ -121,6 +128,7 @@ impl App {
                     let msg = self.input.clone();
                     self.messages.push(StyledMessage::User(msg.clone()));
                     self.input.clear();
+                    self.scroll_to_bottom();
 
                     let session_id = self.session_id.clone().unwrap();
                     let base_url = self.base_url.clone();
@@ -192,7 +200,20 @@ impl App {
                         "No active session — message not sent.".into(),
                     ));
                     self.input.clear();
+                    self.scroll_to_bottom();
                 }
+            }
+            KeyCode::Up if self.input.is_empty() => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+            }
+            KeyCode::Down if self.input.is_empty() => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+            KeyCode::PageUp if self.input.is_empty() => {
+                self.scroll_offset = self.scroll_offset.saturating_add(10);
+            }
+            KeyCode::PageDown if self.input.is_empty() => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(10);
             }
             KeyCode::Char('q') if self.input.is_empty() => {
                 self.should_quit = true;
@@ -220,12 +241,19 @@ impl App {
             }
             UiEvent::AssistantMessage { content } => {
                 self.messages.push(StyledMessage::Assistant(content));
+                self.messages.push(StyledMessage::Separator);
             }
             UiEvent::Error { message } => {
                 self.messages
                     .push(StyledMessage::System(format!("Error: {message}")));
             }
         }
+        self.scroll_to_bottom();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        // Reset scroll to show the latest messages
+        self.scroll_offset = 0;
     }
 }
 
@@ -234,21 +262,47 @@ fn ui(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),    // messages
+            Constraint::Length(1), // status bar
             Constraint::Length(3), // input
         ])
         .split(frame.area());
 
-    // Messages panel with styled lines
+    // Messages panel with styled lines and scroll support
     let lines: Vec<Line> = app.messages.iter().map(|m| m.to_line()).collect();
+    let total_lines = lines.len() as u16;
+    // The visible area is the chunk height minus 2 for borders
+    let visible_lines = chunks[0].height.saturating_sub(2);
+    // Clamp scroll_offset so we don't scroll past the content
+    let max_scroll = total_lines.saturating_sub(visible_lines);
+    // scroll_offset=0 means "at bottom"; convert to ratatui scroll (from top)
+    let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
     let messages = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" Messages "))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((effective_scroll, 0));
     frame.render_widget(messages, chunks[0]);
 
-    // Input panel
-    let input = Paragraph::new(app.input.as_str())
+    // Status bar
+    let status_text = if app.connected {
+        let session_display = app
+            .session_id
+            .as_ref()
+            .map(|id| &id[..id.len().min(8)])
+            .unwrap_or("none");
+        let msg_count = app.messages.len();
+        format!(" Connected | Session: {session_display} | Messages: {msg_count}")
+    } else {
+        " Not connected".to_string()
+    };
+    let status_bar = Paragraph::new(status_text)
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    frame.render_widget(status_bar, chunks[1]);
+
+    // Input panel with visual cursor
+    let display_input = format!("{}▌", app.input);
+    let input = Paragraph::new(display_input)
         .block(Block::default().borders(Borders::ALL).title(" Input "));
-    frame.render_widget(input, chunks[1]);
+    frame.render_widget(input, chunks[2]);
 }
 
 #[tokio::main]
@@ -427,9 +481,11 @@ mod tests {
         app.handle_ui_event(UiEvent::AssistantMessage {
             content: "Hello!".into(),
         });
+        // Assistant message is second-to-last (Separator is last)
+        let len = app.messages.len();
         assert!(matches!(
-            app.messages.last(),
-            Some(StyledMessage::Assistant(t)) if t == "Hello!"
+            &app.messages[len - 2],
+            StyledMessage::Assistant(t) if t == "Hello!"
         ));
     }
 
@@ -451,5 +507,91 @@ mod tests {
         assert!(app.session_id.is_none());
         // The welcome message is a system message
         assert!(matches!(&app.messages[0], StyledMessage::System(t) if t.contains("Welcome")));
+    }
+
+    #[tokio::test]
+    async fn scroll_up_increases_offset() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        // Add enough messages to allow scrolling
+        for i in 0..30 {
+            app.messages.push(StyledMessage::System(format!("msg {i}")));
+        }
+        app.handle_key(KeyCode::Up, &tx).await;
+        assert_eq!(app.scroll_offset, 1);
+        app.handle_key(KeyCode::Up, &tx).await;
+        assert_eq!(app.scroll_offset, 2);
+    }
+
+    #[tokio::test]
+    async fn scroll_down_decreases_offset_stops_at_zero() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.scroll_offset = 3;
+        app.handle_key(KeyCode::Down, &tx).await;
+        assert_eq!(app.scroll_offset, 2);
+        app.handle_key(KeyCode::Down, &tx).await;
+        assert_eq!(app.scroll_offset, 1);
+        app.handle_key(KeyCode::Down, &tx).await;
+        assert_eq!(app.scroll_offset, 0);
+        // Should not go below 0
+        app.handle_key(KeyCode::Down, &tx).await;
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn new_message_resets_scroll_to_bottom() {
+        let mut app = App::new();
+        app.scroll_offset = 5;
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "hello".into(),
+        });
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn separator_to_line_produces_correct_output() {
+        let msg = StyledMessage::Separator;
+        let line = msg.to_line();
+        let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(content.contains("────────"));
+        assert_eq!(line.style, Style::default().fg(Color::DarkGray));
+    }
+
+    #[test]
+    fn assistant_message_adds_separator() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "response".into(),
+        });
+        assert!(matches!(app.messages.last(), Some(StyledMessage::Separator)));
+    }
+
+    #[tokio::test]
+    async fn scroll_keys_ignored_when_input_not_empty() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.input = "typing".to_string();
+        app.handle_key(KeyCode::Up, &tx).await;
+        assert_eq!(app.scroll_offset, 0);
+        app.handle_key(KeyCode::PageUp, &tx).await;
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn page_up_scrolls_by_ten() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.handle_key(KeyCode::PageUp, &tx).await;
+        assert_eq!(app.scroll_offset, 10);
+    }
+
+    #[tokio::test]
+    async fn page_down_scrolls_by_ten() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.scroll_offset = 15;
+        app.handle_key(KeyCode::PageDown, &tx).await;
+        assert_eq!(app.scroll_offset, 5);
     }
 }
