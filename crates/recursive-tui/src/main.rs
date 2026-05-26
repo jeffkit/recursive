@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 enum AppScreen {
     Splash,
     Chat,
+    PlanReview { plan_text: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +134,115 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyCode, event_tx: &mpsc::UnboundedSender<UiEvent>) {
+        // Handle PlanReview state keys
+        if let AppScreen::PlanReview { ref plan_text } = self.screen {
+            let plan_text = plan_text.clone();
+            match key {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.messages
+                        .push(StyledMessage::System("Plan approved".into()));
+                    self.messages
+                        .push(StyledMessage::Assistant(plan_text.clone()));
+                    self.screen = AppScreen::Chat;
+
+                    // Send "approved" to session
+                    if let Some(session_id) = self.session_id.clone() {
+                        let base_url = self.base_url.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let client = reqwest::Client::builder()
+                                .no_proxy()
+                                .build()
+                                .unwrap_or_default();
+                            let url =
+                                format!("{base_url}/sessions/{session_id}/messages");
+                            match client
+                                .post(&url)
+                                .json(&serde_json::json!({"content": "approved"}))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) => {
+                                    if let Ok(body) =
+                                        resp.json::<serde_json::Value>().await
+                                    {
+                                        let content = body
+                                            .get("content")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if !content.is_empty() {
+                                            let _ = tx.send(
+                                                UiEvent::AssistantMessage { content },
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(UiEvent::Error {
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.messages
+                        .push(StyledMessage::System("Plan rejected".into()));
+                    self.screen = AppScreen::Chat;
+
+                    // Send "rejected" to session
+                    if let Some(session_id) = self.session_id.clone() {
+                        let base_url = self.base_url.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let client = reqwest::Client::builder()
+                                .no_proxy()
+                                .build()
+                                .unwrap_or_default();
+                            let url =
+                                format!("{base_url}/sessions/{session_id}/messages");
+                            match client
+                                .post(&url)
+                                .json(&serde_json::json!({"content": "rejected"}))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) => {
+                                    if let Ok(body) =
+                                        resp.json::<serde_json::Value>().await
+                                    {
+                                        let content = body
+                                            .get("content")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if !content.is_empty() {
+                                            let _ = tx.send(
+                                                UiEvent::AssistantMessage { content },
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(UiEvent::Error {
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+                KeyCode::Char('e') => {
+                    self.input = plan_text;
+                    self.screen = AppScreen::Chat;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key {
             KeyCode::Enter => {
                 if !self.input.is_empty() && self.session_id.is_some() {
@@ -251,8 +361,16 @@ impl App {
                 self.messages.push(StyledMessage::ToolResult { name, success });
             }
             UiEvent::AssistantMessage { content } => {
-                self.messages.push(StyledMessage::Assistant(content));
-                self.messages.push(StyledMessage::Separator);
+                let first_line = content.lines().next().unwrap_or("");
+                let lower = first_line.to_lowercase();
+                if lower.starts_with("plan:") || lower.starts_with("## plan") {
+                    self.screen = AppScreen::PlanReview {
+                        plan_text: content,
+                    };
+                } else {
+                    self.messages.push(StyledMessage::Assistant(content));
+                    self.messages.push(StyledMessage::Separator);
+                }
             }
             UiEvent::Error { message } => {
                 self.messages
@@ -304,6 +422,41 @@ fn render_splash(frame: &mut Frame) {
 
     let paragraph = Paragraph::new(logo_lines).alignment(Alignment::Center);
     frame.render_widget(paragraph, layout[1]);
+}
+
+fn render_plan_review(frame: &mut Frame, plan_text: &str) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),    // plan text
+            Constraint::Length(1), // status bar
+            Constraint::Length(3), // empty bottom
+        ])
+        .split(frame.area());
+
+    // Plan text panel
+    let lines: Vec<Line> = plan_text
+        .lines()
+        .map(|l| Line::from(l.to_string()).style(Style::default().fg(Color::White)))
+        .collect();
+    let plan = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Plan Proposal "),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(plan, chunks[0]);
+
+    // Status bar with keybindings
+    let status_bar = Paragraph::new(" [Enter/y] Approve  [n/Esc] Reject  [e] Edit ")
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    frame.render_widget(status_bar, chunks[1]);
+
+    // Empty bottom panel
+    let empty = Paragraph::new("")
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(empty, chunks[2]);
 }
 
 fn ui(frame: &mut Frame, app: &App) {
@@ -365,9 +518,10 @@ async fn main() -> io::Result<()> {
 
     loop {
         terminal.draw(|frame| {
-            match app.screen {
+            match &app.screen {
                 AppScreen::Splash => render_splash(frame),
                 AppScreen::Chat => ui(frame, &app),
+                AppScreen::PlanReview { plan_text } => render_plan_review(frame, plan_text),
             }
         })?;
 
@@ -684,5 +838,123 @@ mod tests {
         app.scroll_offset = 15;
         app.handle_key(KeyCode::PageDown, &tx).await;
         assert_eq!(app.scroll_offset, 5);
+    }
+
+    // ─── Plan Mode Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn plan_message_triggers_plan_review() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "## Plan\n1. Do thing A\n2. Do thing B".into(),
+        });
+        assert!(matches!(
+            app.screen,
+            AppScreen::PlanReview { ref plan_text }
+            if plan_text == "## Plan\n1. Do thing A\n2. Do thing B"
+        ));
+    }
+
+    #[test]
+    fn plan_message_with_plan_colon_triggers_review() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "Plan: refactor the module".into(),
+        });
+        assert!(matches!(app.screen, AppScreen::PlanReview { .. }));
+    }
+
+    #[test]
+    fn non_plan_message_stays_in_chat() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "Hello, I can help you.".into(),
+        });
+        assert_eq!(app.screen, AppScreen::Chat);
+    }
+
+    #[tokio::test]
+    async fn plan_approve_sends_and_returns_to_chat() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.screen = AppScreen::PlanReview {
+            plan_text: "## Plan\nDo X".into(),
+        };
+        app.handle_key(KeyCode::Enter, &tx).await;
+        assert_eq!(app.screen, AppScreen::Chat);
+        // Should have System("Plan approved") and Assistant(plan_text)
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::System(t) if t == "Plan approved")));
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::Assistant(t) if t == "## Plan\nDo X")));
+    }
+
+    #[tokio::test]
+    async fn plan_approve_with_y_key() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.screen = AppScreen::PlanReview {
+            plan_text: "Plan: do stuff".into(),
+        };
+        app.handle_key(KeyCode::Char('y'), &tx).await;
+        assert_eq!(app.screen, AppScreen::Chat);
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::System(t) if t == "Plan approved")));
+    }
+
+    #[tokio::test]
+    async fn plan_reject_returns_to_chat() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.screen = AppScreen::PlanReview {
+            plan_text: "## Plan\nDo Y".into(),
+        };
+        app.handle_key(KeyCode::Esc, &tx).await;
+        assert_eq!(app.screen, AppScreen::Chat);
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::System(t) if t == "Plan rejected")));
+        // Plan text should NOT be in messages
+        assert!(!app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::Assistant(t) if t.contains("Do Y"))));
+    }
+
+    #[tokio::test]
+    async fn plan_reject_with_n_key() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.screen = AppScreen::PlanReview {
+            plan_text: "Plan: something".into(),
+        };
+        app.handle_key(KeyCode::Char('n'), &tx).await;
+        assert_eq!(app.screen, AppScreen::Chat);
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::System(t) if t == "Plan rejected")));
+    }
+
+    #[tokio::test]
+    async fn plan_edit_prefills_input() {
+        let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut app = App::new();
+        app.screen = AppScreen::PlanReview {
+            plan_text: "## Plan\nEdit me".into(),
+        };
+        app.handle_key(KeyCode::Char('e'), &tx).await;
+        assert_eq!(app.screen, AppScreen::Chat);
+        assert_eq!(app.input, "## Plan\nEdit me");
     }
 }
