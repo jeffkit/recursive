@@ -1008,6 +1008,15 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
                     "[step {step}] compacted {removed} msgs -> {kept} kept + {summary_chars}-char summary"
                 );
             }
+            StepEvent::PlanProposed { plan_text, .. } => {
+                println!("[plan] proposed: {plan_text}");
+            }
+            StepEvent::PlanConfirmed => {
+                println!("[plan] confirmed");
+            }
+            StepEvent::PlanRejected { reason } => {
+                println!("[plan] rejected: {reason}");
+            }
         }
     }
 }
