@@ -24,6 +24,7 @@ pub mod openai;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicProvider;
+#[cfg(any(test, feature = "test-utils"))]
 pub use mock::MockProvider;
 pub use openai::OpenAiProvider;
 

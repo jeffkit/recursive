@@ -930,6 +930,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "recursive-agent",
  "regex",
  "reqwest",
  "serde",
