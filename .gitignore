@@ -23,3 +23,9 @@ Cargo.lock.bak
 # Personal IDE / AI assistant config (per-user, not project policy).
 .claude/
 .cursor/local/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
