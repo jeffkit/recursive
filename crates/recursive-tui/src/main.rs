@@ -1,4 +1,5 @@
 use std::io;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -10,6 +11,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
+
+#[derive(Clone, Debug, PartialEq)]
+enum AppScreen {
+    Splash,
+    Chat,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum StyledMessage {
@@ -64,6 +71,8 @@ struct App {
     base_url: String,
     connected: bool,
     scroll_offset: u16,
+    screen: AppScreen,
+    splash_start: Instant,
 }
 
 impl App {
@@ -78,6 +87,8 @@ impl App {
             base_url: "http://127.0.0.1:3000".into(),
             connected: false,
             scroll_offset: 0,
+            screen: AppScreen::Splash,
+            splash_start: Instant::now(),
         }
     }
 
@@ -257,6 +268,44 @@ impl App {
     }
 }
 
+fn render_splash(frame: &mut Frame) {
+    let area = frame.area();
+
+    let logo_lines = vec![
+        Line::from(""),
+        Line::from("   ╱╲    Recursive Agent".to_string())
+            .style(Style::default().fg(Color::Cyan)),
+        Line::from("  ╱  ╲   ─────────────────".to_string())
+            .style(Style::default().fg(Color::Cyan)),
+        Line::from(" ╱ ╱╲ ╲  v0.4.0".to_string())
+            .style(Style::default().fg(Color::White)),
+        Line::from(" ╲ ╲╱ ╱".to_string())
+            .style(Style::default().fg(Color::Cyan)),
+        Line::from("  ╲  ╱   Self-improving AI agent".to_string())
+            .style(Style::default().fg(Color::Cyan)),
+        Line::from("   ╲╱    in Rust".to_string())
+            .style(Style::default().fg(Color::Cyan)),
+        Line::from(""),
+        Line::from("  Press any key to continue...".to_string())
+            .style(Style::default().fg(Color::DarkGray)),
+    ];
+
+    let logo_height = logo_lines.len() as u16;
+    let vertical_pad = area.height.saturating_sub(logo_height) / 2;
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(vertical_pad),
+            Constraint::Length(logo_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let paragraph = Paragraph::new(logo_lines).alignment(Alignment::Center);
+    frame.render_widget(paragraph, layout[1]);
+}
+
 fn ui(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -314,11 +363,13 @@ async fn main() -> io::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<UiEvent>();
     let mut app = App::new();
 
-    // Try to connect
-    app.try_connect().await;
-
     loop {
-        terminal.draw(|frame| ui(frame, &app))?;
+        terminal.draw(|frame| {
+            match app.screen {
+                AppScreen::Splash => render_splash(frame),
+                AppScreen::Chat => ui(frame, &app),
+            }
+        })?;
 
         tokio::select! {
             // Check for keyboard events (with timeout to not block)
@@ -326,7 +377,12 @@ async fn main() -> io::Result<()> {
                 while event::poll(std::time::Duration::ZERO)? {
                     if let Event::Key(key) = event::read()? {
                         if key.kind == KeyEventKind::Press {
-                            app.handle_key(key.code, &event_tx).await;
+                            if app.screen == AppScreen::Splash {
+                                app.screen = AppScreen::Chat;
+                                app.try_connect().await;
+                            } else {
+                                app.handle_key(key.code, &event_tx).await;
+                            }
                         }
                     }
                 }
@@ -335,6 +391,12 @@ async fn main() -> io::Result<()> {
             Some(ui_event) = event_rx.recv() => {
                 app.handle_ui_event(ui_event);
             }
+        }
+
+        // Auto-transition after 2 seconds
+        if app.screen == AppScreen::Splash && app.splash_start.elapsed() > Duration::from_secs(2) {
+            app.screen = AppScreen::Chat;
+            app.try_connect().await;
         }
 
         if app.should_quit {
@@ -359,10 +421,25 @@ mod tests {
         assert!(!app.should_quit);
     }
 
+    #[test]
+    fn app_new_starts_in_splash_screen() {
+        let app = App::new();
+        assert_eq!(app.screen, AppScreen::Splash);
+    }
+
+    #[test]
+    fn splash_auto_transitions_after_elapsed() {
+        let app = App::new();
+        // splash_start is set to now, so elapsed < 2s
+        assert!(app.splash_start.elapsed() < Duration::from_secs(2));
+        assert_eq!(app.screen, AppScreen::Splash);
+    }
+
     #[tokio::test]
     async fn enter_moves_input_to_messages() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         // Set session_id to None so offline path is taken
         app.input = "hello".to_string();
         app.handle_key(KeyCode::Enter, &tx).await;
@@ -374,6 +451,7 @@ mod tests {
     async fn esc_sets_should_quit() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_key(KeyCode::Esc, &tx).await;
         assert!(app.should_quit);
     }
@@ -382,6 +460,7 @@ mod tests {
     async fn char_appends_to_input() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_key(KeyCode::Char('h'), &tx).await;
         app.handle_key(KeyCode::Char('i'), &tx).await;
         assert_eq!(app.input, "hi");
@@ -391,6 +470,7 @@ mod tests {
     async fn backspace_removes_last_char() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.input = "hello".to_string();
         app.handle_key(KeyCode::Backspace, &tx).await;
         assert_eq!(app.input, "hell");
@@ -453,6 +533,7 @@ mod tests {
     #[test]
     fn handle_ui_event_adds_tool_call() {
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::ToolCall {
             name: "search".into(),
         });
@@ -465,6 +546,7 @@ mod tests {
     #[test]
     fn handle_ui_event_adds_tool_result() {
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::ToolResult {
             name: "search".into(),
             success: true,
@@ -478,6 +560,7 @@ mod tests {
     #[test]
     fn handle_ui_event_adds_assistant_message() {
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::AssistantMessage {
             content: "Hello!".into(),
         });
@@ -492,6 +575,7 @@ mod tests {
     #[test]
     fn handle_ui_event_adds_error_as_system() {
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::Error {
             message: "timeout".into(),
         });
@@ -513,6 +597,7 @@ mod tests {
     async fn scroll_up_increases_offset() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         // Add enough messages to allow scrolling
         for i in 0..30 {
             app.messages.push(StyledMessage::System(format!("msg {i}")));
@@ -527,6 +612,7 @@ mod tests {
     async fn scroll_down_decreases_offset_stops_at_zero() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.scroll_offset = 3;
         app.handle_key(KeyCode::Down, &tx).await;
         assert_eq!(app.scroll_offset, 2);
@@ -542,6 +628,7 @@ mod tests {
     #[test]
     fn new_message_resets_scroll_to_bottom() {
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.scroll_offset = 5;
         app.handle_ui_event(UiEvent::AssistantMessage {
             content: "hello".into(),
@@ -561,6 +648,7 @@ mod tests {
     #[test]
     fn assistant_message_adds_separator() {
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::AssistantMessage {
             content: "response".into(),
         });
@@ -571,6 +659,7 @@ mod tests {
     async fn scroll_keys_ignored_when_input_not_empty() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.input = "typing".to_string();
         app.handle_key(KeyCode::Up, &tx).await;
         assert_eq!(app.scroll_offset, 0);
@@ -582,6 +671,7 @@ mod tests {
     async fn page_up_scrolls_by_ten() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.handle_key(KeyCode::PageUp, &tx).await;
         assert_eq!(app.scroll_offset, 10);
     }
@@ -590,6 +680,7 @@ mod tests {
     async fn page_down_scrolls_by_ten() {
         let (tx, _rx) = mpsc::unbounded_channel::<UiEvent>();
         let mut app = App::new();
+        app.screen = AppScreen::Chat;
         app.scroll_offset = 15;
         app.handle_key(KeyCode::PageDown, &tx).await;
         assert_eq!(app.scroll_offset, 5);
