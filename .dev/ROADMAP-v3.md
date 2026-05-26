@@ -28,21 +28,20 @@ The agent needs to sustain itself across turns without user input.
 
 ---
 
-## Phase 11 — TUI (Priority: High)
+## Phase 11 — TUI (Priority: High) ✅ COMPLETE
 
 Interactive terminal UI, decoupled from agent core (orthogonal).
-Reference: `~/Downloads/fake-cc` (Claude Code's Ink/React TUI).
 Implementation: `ratatui` (Rust) in a separate crate `recursive-tui`.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 11.1 | TUI crate scaffold + basic REPL display | M | 🔴 |
-| 11.2 | Streaming output + tool call indicators | M | 🔴 |
-| 11.3 | Multi-turn conversation view | S | 🔴 |
-| 11.4 | Logo + splash screen | S | 🔴 |
-| 11.5 | Plan mode UI (approve/reject) | S | 🔴 |
+| 11.1 | TUI crate scaffold + basic REPL display | M | ✅ g97 |
+| 11.2 | Streaming output + tool call indicators | M | ✅ g98 |
+| 11.3 | Multi-turn conversation view | S | ✅ g99 |
+| 11.4 | Logo + splash screen | S | ✅ g100 |
+| 11.5 | Plan mode UI (approve/reject) | S | ✅ g101 |
 
-**Total**: ~2-3 batches
+**Total**: 1 batch (5 goals in single session)
 
 ---
 
