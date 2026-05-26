@@ -7,8 +7,10 @@ mod http_tests {
     use recursive::http::{AppState, ToolInfo, build_router};
     use recursive::llm::{Completion, MockProvider};
     use recursive::config::Config;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn mock_config() -> Config {
@@ -64,6 +66,16 @@ mod http_tests {
             ],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
+        AppState {
+            tools: vec![],
+            config: mock_config(),
+            provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -136,6 +148,7 @@ mod http_tests {
             tools: vec![],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         });
 
         let response = app
@@ -176,6 +189,7 @@ mod http_tests {
             tools: vec![],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -216,6 +230,7 @@ mod http_tests {
             tools: vec![],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -265,6 +280,7 @@ mod http_tests {
             tools: vec![],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -326,6 +342,7 @@ mod http_tests {
             tools: vec![],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -394,6 +411,7 @@ mod http_tests {
             tools: vec![],
             config: mock_config(),
             provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = build_router(state);
 
@@ -424,5 +442,296 @@ mod http_tests {
         assert_eq!(resp["status"], "success");
         assert!(resp["finish_reason"].as_str().unwrap().contains("BudgetExceeded"));
         assert_eq!(resp["usage"]["total_steps"], 2);
+    }
+
+    // ── Session endpoint tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn post_sessions_creates_session() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 201);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(resp["id"].is_string());
+        assert!(!resp["id"].as_str().unwrap().is_empty());
+        assert!(resp["created_at"].is_string());
+        assert!(resp["created_at"].as_str().unwrap().contains('T'));
+    }
+
+    #[tokio::test]
+    async fn get_sessions_lists_sessions() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        // Create a session first
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+
+        // List sessions
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp.len(), 1);
+        assert!(resp[0]["id"].is_string());
+        assert_eq!(resp[0]["message_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn post_session_messages_returns_assistant_response() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "Hello! How can I help?".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+
+        // Create a session
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = create_resp["id"].as_str().unwrap();
+
+        // Send a message
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/messages", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "Hi there"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["role"], "assistant");
+        assert_eq!(resp["content"], "Hello! How can I help?");
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_session_with_messages() {
+        // Create a provider with one response for when we send a message
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "I'm here to help.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+
+        // Create a session
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "system_prompt": "Be helpful."
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = create_resp["id"].as_str().unwrap();
+
+        // Send a message to populate the transcript
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/messages", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "Hello"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Now GET the session detail
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["id"], session_id);
+        assert!(resp["created_at"].is_string());
+        assert!(resp["messages"].is_array());
+        // Should have at least system + user + assistant messages
+        assert!(resp["messages"].as_array().unwrap().len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_it() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+
+        // Create a session
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = create_resp["id"].as_str().unwrap();
+
+        // Delete it
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+
+        // Confirm it's gone
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn post_message_to_nonexistent_session_returns_404() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent-id/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "Hello?"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 404);
     }
 }
