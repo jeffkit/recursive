@@ -437,10 +437,8 @@ impl Agent {
                                 call.name,
                                 serde_json::to_string(&call.arguments).unwrap_or_default()
                             );
-                            self.transcript.push(Message::tool_result(
-                                call.id.clone(),
-                                result,
-                            ));
+                            self.transcript
+                                .push(Message::tool_result(call.id.clone(), result));
                         }
                         self.plan_buffer = None;
                         // Continue to next iteration of the loop so the model
@@ -457,10 +455,8 @@ impl Agent {
                                 call.name,
                                 serde_json::to_string(&call.arguments).unwrap_or_default()
                             );
-                            self.transcript.push(Message::tool_result(
-                                call.id.clone(),
-                                result,
-                            ));
+                            self.transcript
+                                .push(Message::tool_result(call.id.clone(), result));
                         }
                         self.plan_buffer = None;
                         continue;
