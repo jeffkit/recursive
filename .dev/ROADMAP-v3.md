@@ -46,20 +46,20 @@ Implementation: `ratatui` (Rust) in a separate crate `recursive-tui`.
 
 ---
 
-## Phase 12 — HTTP API (Priority: High)
+## Phase 12 — HTTP API (Priority: High) ✅ COMPLETE
 
 REST server exposing agent capabilities for external integration.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 12.1 | axum server scaffold + /tools endpoint | S | 🔴 |
-| 12.2 | POST /run — one-shot execution | S | 🔴 |
-| 12.3 | Sessions: create, message, list | M | 🔴 |
-| 12.4 | SSE event streaming (GET /sessions/:id/events) | M | 🔴 |
-| 12.5 | OpenAPI spec generation | S | 🔴 |
-| 12.6 | Python SDK (thin client) | S | 🔴 |
+| 12.1 | axum server scaffold + /tools endpoint | S | ✅ g91 |
+| 12.2 | POST /run — one-shot execution | S | ✅ g92 |
+| 12.3 | Sessions: create, message, list | M | ✅ g93 |
+| 12.4 | SSE event streaming (GET /sessions/:id/events) | M | ✅ g94 |
+| 12.5 | OpenAPI spec generation | S | ✅ g95 |
+| 12.6 | Python SDK (thin client) | S | ✅ g96 |
 
-**Total**: ~2-3 batches
+**Total**: 1 batch (6 goals in single session)
 
 ---
 
