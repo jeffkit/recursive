@@ -1006,6 +1006,266 @@ fn parse_sse_response(buffer: &str, expected_id: u64, server_name: &str) -> Opti
 }
 
 // ---------------------------------------------------------------------------
+// JSON-RPC 2.0 types for stdio MCP server mode
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC 2.0 request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// A JSON-RPC 2.0 response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+}
+
+impl JsonRpcResponse {
+    /// Create a successful response.
+    pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(id: Option<serde_json::Value>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    /// Create a method-not-found error response.
+    pub fn method_not_found(id: Option<serde_json::Value>, method: &str) -> Self {
+        Self::error(id, -32601, format!("Method not found: {method}"))
+    }
+
+    /// Create an internal error response.
+    pub fn internal_error(id: Option<serde_json::Value>, message: impl Into<String>) -> Self {
+        Self::error(id, -32603, message)
+    }
+}
+
+/// A JSON-RPC 2.0 error object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Dispatch a JSON-RPC request to the appropriate handler.
+///
+/// Supports the MCP methods needed for tool proxy:
+/// - `initialize` / `notifications/initialized`
+/// - `tools/list` / `tools/call`
+/// - `resources/list` / `resources/read`
+/// - `prompts/list` / `prompts/get`
+///
+/// Returns a JSON-RPC response. Notifications (no `id`) return `None`.
+pub async fn dispatch_request(
+    request: &JsonRpcRequest,
+    client: &mut McpClient,
+) -> Option<JsonRpcResponse> {
+    let id = request.id.clone();
+
+    match request.method.as_str() {
+        "initialize" => {
+            // The client is already initialized by McpClient::spawn, so we
+            // return a canned response matching what the server would expect.
+            let result = serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": true,
+                    "resources": true,
+                    "prompts": true
+                },
+                "serverInfo": {
+                    "name": "recursive-agent",
+                    "version": "0.1.0"
+                }
+            });
+            Some(JsonRpcResponse::success(id, result))
+        }
+        "notifications/initialized" => {
+            // No response expected for notifications.
+            None
+        }
+        "tools/list" => {
+            match client.list_tools().await {
+                Ok(tools) => {
+                    let tools_arr: Vec<serde_json::Value> = tools
+                        .into_iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": t.input_schema,
+                            })
+                        })
+                        .collect();
+                    Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "tools": tools_arr }),
+                    ))
+                }
+                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+            }
+        }
+        "tools/call" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let arguments = request.params.get("arguments").cloned().unwrap_or_default();
+
+            match client.call_tool(name, arguments).await {
+                Ok(text) => {
+                    let result = serde_json::json!({
+                        "content": [{"type": "text", "text": text}]
+                    });
+                    Some(JsonRpcResponse::success(id, result))
+                }
+                Err(e) => {
+                    // Return the error as a tool-level isError result, not a
+                    // JSON-RPC error, so the client can handle it gracefully.
+                    let result = serde_json::json!({
+                        "isError": true,
+                        "content": [{"type": "text", "text": e.to_string()}]
+                    });
+                    Some(JsonRpcResponse::success(id, result))
+                }
+            }
+        }
+        "resources/list" => {
+            match client.list_resources().await {
+                Ok(resources) => {
+                    let resources_arr: Vec<serde_json::Value> = resources
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "uri": r.uri,
+                                "name": r.name,
+                                "description": r.description,
+                                "mimeType": r.mime_type,
+                            })
+                        })
+                        .collect();
+                    Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "resources": resources_arr }),
+                    ))
+                }
+                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+            }
+        }
+        "resources/read" => {
+            let uri = request
+                .params
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            match client.read_resource(uri).await {
+                Ok(contents) => {
+                    let contents_arr: Vec<serde_json::Value> = contents
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "uri": c.uri,
+                                "mimeType": c.mime_type,
+                                "text": c.text,
+                                "blob": c.blob,
+                            })
+                        })
+                        .collect();
+                    Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "contents": contents_arr }),
+                    ))
+                }
+                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+            }
+        }
+        "prompts/list" => {
+            match client.list_prompts().await {
+                Ok(prompts) => {
+                    let prompts_arr: Vec<serde_json::Value> = prompts
+                        .into_iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "name": p.name,
+                                "description": p.description,
+                                "arguments": p.arguments,
+                            })
+                        })
+                        .collect();
+                    Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "prompts": prompts_arr }),
+                    ))
+                }
+                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+            }
+        }
+        "prompts/get" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let arguments = request.params.get("arguments").and_then(|v| {
+                serde_json::from_value::<HashMap<String, String>>(v.clone()).ok()
+            });
+
+            match client.get_prompt(name, arguments).await {
+                Ok(messages) => {
+                    let messages_arr: Vec<serde_json::Value> = messages
+                        .into_iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "role": m.role,
+                                "content": {"type": "text", "text": m.content},
+                            })
+                        })
+                        .collect();
+                    Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "messages": messages_arr }),
+                    ))
+                }
+                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+            }
+        }
+        _ => Some(JsonRpcResponse::method_not_found(id, &request.method)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // McpTool — implements the Tool trait by delegating to an McpClient
 // ---------------------------------------------------------------------------
 
