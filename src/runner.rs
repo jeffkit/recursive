@@ -5,8 +5,8 @@
 //! caller. This is the extracted pattern from the REPL in `main.rs`,
 //! made reusable for loop mode, HTTP API sessions, and TUI.
 
-use tokio::sync::mpsc;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use crate::agent::{Agent, AgentOutcome, StepEvent};
@@ -60,10 +60,7 @@ impl AgentRunner {
     ///
     /// When `clear()` is called, all tracked background jobs are removed
     /// from the shared manager in addition to clearing the transcript.
-    pub fn with_bg_manager(
-        agent: Agent,
-        bg_manager: Arc<Mutex<BackgroundJobManager>>,
-    ) -> Self {
+    pub fn with_bg_manager(agent: Agent, bg_manager: Arc<Mutex<BackgroundJobManager>>) -> Self {
         Self {
             agent,
             total_turns: 0,
@@ -146,10 +143,7 @@ impl AgentRunner {
             outcomes.push(outcome);
 
             // Check if the agent scheduled a wakeup
-            let wakeup = wakeup_slot
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take());
+            let wakeup = wakeup_slot.lock().ok().and_then(|mut slot| slot.take());
 
             match wakeup {
                 Some(req) => {
