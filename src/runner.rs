@@ -124,6 +124,43 @@ impl AgentRunner {
     pub fn agent_mut(&mut self) -> &mut Agent {
         &mut self.agent
     }
+
+    /// Run a loop: execute turns until the agent stops scheduling wakeups.
+    ///
+    /// Between turns, sleeps for the requested `delay`. If the agent doesn't
+    /// call `schedule_wakeup` during a turn, the loop ends.
+    ///
+    /// The `wakeup_slot` should be the same slot registered with the
+    /// `ScheduleWakeup` tool in the agent's tool registry.
+    pub async fn run_loop(
+        &mut self,
+        initial_goal: impl Into<String>,
+        wakeup_slot: &crate::tools::WakeupSlot,
+        events: Option<mpsc::UnboundedSender<StepEvent>>,
+    ) -> Result<Vec<AgentOutcome>> {
+        let mut outcomes = Vec::new();
+        let mut next_goal = initial_goal.into();
+
+        loop {
+            let outcome = self.turn(&next_goal, events.clone()).await?;
+            outcomes.push(outcome);
+
+            // Check if the agent scheduled a wakeup
+            let wakeup = wakeup_slot
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+
+            match wakeup {
+                Some(req) => {
+                    tokio::time::sleep(req.delay).await;
+                    next_goal = req.prompt;
+                }
+                None => break, // No wakeup = loop ends
+            }
+        }
+        Ok(outcomes)
+    }
 }
 
 #[cfg(test)]
