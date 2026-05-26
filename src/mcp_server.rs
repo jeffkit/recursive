@@ -29,9 +29,9 @@ use tokio::sync::Mutex;
 use tracing::{info, instrument};
 
 use crate::error::{Error, Result};
+use crate::llm::ToolSpec;
 use crate::mcp::{McpClient, McpServer, McpTool};
 use crate::tools::ToolRegistry;
-use crate::llm::ToolSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -192,11 +192,7 @@ async fn handle_tools_call(request: &JsonRpcRequest, tools: &ToolRegistry) -> Js
                 }),
             ),
         },
-        None => JsonRpcResponse::error(
-            id,
-            -32602,
-            format!("Tool not found: {tool_name}"),
-        ),
+        None => JsonRpcResponse::error(id, -32602, format!("Tool not found: {tool_name}")),
     }
 }
 
@@ -257,7 +253,8 @@ impl McpServerRunner {
             };
 
             // Dispatch
-            if let Some(response) = dispatch_request(&request, &self.tool_specs, &self.tools).await {
+            if let Some(response) = dispatch_request(&request, &self.tool_specs, &self.tools).await
+            {
                 let json = serde_json::to_string(&response)?;
                 out.write_all(json.as_bytes()).await?;
                 out.write_all(b"\n").await?;
@@ -309,11 +306,9 @@ impl McpServerManager {
             let name = server.name.clone();
             info!(server = %name, "Starting MCP server");
 
-            let client = McpClient::spawn(server).await.map_err(|e| {
-                Error::Tool {
-                    name: format!("mcp_server:{name}"),
-                    message: format!("Failed to start MCP server: {e}"),
-                }
+            let client = McpClient::spawn(server).await.map_err(|e| Error::Tool {
+                name: format!("mcp_server:{name}"),
+                message: format!("Failed to start MCP server: {e}"),
             })?;
 
             let client = Arc::new(Mutex::new(client));
