@@ -1670,6 +1670,72 @@ done
     }
 
     #[test]
+    fn test_parse_sse_response_empty_data_lines() {
+        // Empty data: lines interspersed — they should be skipped (contribute nothing)
+        // and the valid JSON line should still be parsed correctly.
+        let buffer = "data: \ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\ndata: \n\n";
+        let result = parse_sse_response(buffer, 1, "test");
+        assert!(result.is_some());
+        let result = result.unwrap().unwrap();
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn test_parse_sse_response_invalid_json() {
+        // data line with completely invalid JSON — should not panic, should return None
+        // (the parse fails silently and current_data is cleared on the blank line).
+        let buffer = "data: not-json-at-all\n\n";
+        let result = parse_sse_response(buffer, 1, "test");
+        // No valid JSON-RPC response could be extracted → None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_sse_response_no_data_prefix() {
+        // Lines without `data:` prefix should be ignored entirely.
+        let buffer = "some random line\nanother line\n\n";
+        let result = parse_sse_response(buffer, 1, "test");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_sse_config_url_takes_priority() {
+        // When both `command` and `url` are set in the config, the url-based
+        // transport should be selected (url takes priority per spawn logic).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mcp_path = dir.path().join(".mcp.json");
+        tokio::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "hybrid": {
+                        "command": "some-binary",
+                        "args": ["--flag"],
+                        "url": "http://example.com/sse"
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "hybrid");
+        // url is present → spawn will choose HTTP+SSE transport
+        assert_eq!(servers[0].url.as_deref(), Some("http://example.com/sse"));
+        // command is also stored but url takes priority in spawn()
+        assert_eq!(servers[0].command, "some-binary");
+
+        // Verify the spawn logic: url.is_some() → spawn_http_sse path
+        let server = &servers[0];
+        assert!(
+            server.url.is_some(),
+            "url should be present, meaning HTTP+SSE transport is selected"
+        );
+    }
+
+    #[test]
     fn test_load_mcp_config_with_url() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
@@ -1855,6 +1921,153 @@ done
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "Hello, Alice!");
+    }
+
+    // -----------------------------------------------------------------------
+    // Resources/prompts edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_resources_capability_not_advertised() {
+        // Server that advertises only tools — no resources capability.
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        // list_resources should fail because resources capability is not advertised
+        let err = client.list_resources().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not advertise"),
+            "expected capability error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompts_get_with_missing_name() {
+        // Call get_prompt with an empty name string — verify it sends the request
+        // and the server can respond (behavior check, not a client-side validation error).
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"prompts":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        prompts/get)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"messages":[{"role":"assistant","content":{"type":"text","text":"default prompt"}}]}}'
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        // Empty name — client should still send the request without panicking
+        let messages = client.get_prompt("", None).await.expect("get_prompt with empty name");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "default prompt");
+    }
+
+    #[tokio::test]
+    async fn test_resources_read_empty_content() {
+        // Server returns resources/read with an empty contents array.
+        let script = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('id', 0))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+    method=$(echo "$line" | python3 -c "
+import sys, json
+try:
+    req = json.loads(sys.stdin.readline())
+    print(req.get('method', ''))
+except:
+    pass
+" 2>/dev/null <<< "$line")
+
+    case "$method" in
+        initialize)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":true},"serverInfo":{"name":"mock-server","version":"1.0"}}}'
+            ;;
+        notifications/initialized)
+            ;;
+        resources/read)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[]}}'
+            ;;
+        *)
+            echo '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"Method not found"}}'
+            ;;
+    esac
+done
+"#;
+        let mut client = spawn_mock_server(script).await.expect("spawn mock server");
+
+        // Empty contents array — should be handled gracefully (return empty vec)
+        let contents = client
+            .read_resource("file:///tmp/nonexistent.txt")
+            .await
+            .expect("read_resource with empty contents");
+        assert!(
+            contents.is_empty(),
+            "expected empty contents vec, got {} items",
+            contents.len()
+        );
     }
 
     // -----------------------------------------------------------------------

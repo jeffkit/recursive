@@ -195,7 +195,7 @@ fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
+    use crate::message::{Message, Role};
 
     #[test]
     fn session_round_trip() {
@@ -329,5 +329,179 @@ mod tests {
         // into_transcript should give back the messages
         let restored = session.into_transcript();
         assert_eq!(restored.len(), 3);
+    }
+
+    #[test]
+    fn round_trip_with_tool_calls() {
+        use crate::llm::ToolCall;
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "call_001".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "/tmp/foo.rs"}),
+            },
+            ToolCall {
+                id: "call_002".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({"path": "/tmp/bar.rs", "content": "fn main() {}"}),
+            },
+        ];
+
+        let transcript = vec![
+            Message::system("You are an agent.".to_string()),
+            Message::user("refactor the code".to_string()),
+            Message::assistant_with_tool_calls(
+                "I'll read the file first.".to_string(),
+                tool_calls.clone(),
+            ),
+            Message::tool_result("call_001", "fn main() { println!(\"hello\"); }"),
+        ];
+
+        let session = SessionFile::new(
+            "refactor".into(),
+            "gpt-4o".into(),
+            "openai".into(),
+            &[],
+            3,
+            transcript,
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        session.write_to(tmp.path()).unwrap();
+
+        let restored = SessionFile::read_from(tmp.path()).unwrap();
+        assert_eq!(restored.transcript.len(), 4);
+
+        // Verify the assistant message with tool_calls is preserved
+        let assistant_msg = &restored.transcript[2];
+        assert_eq!(assistant_msg.role, Role::Assistant);
+        assert_eq!(assistant_msg.content, "I'll read the file first.");
+        assert_eq!(assistant_msg.tool_calls.len(), 2);
+        assert_eq!(assistant_msg.tool_calls[0].id, "call_001");
+        assert_eq!(assistant_msg.tool_calls[0].name, "read_file");
+        assert_eq!(
+            assistant_msg.tool_calls[0].arguments,
+            serde_json::json!({"path": "/tmp/foo.rs"})
+        );
+        assert_eq!(assistant_msg.tool_calls[1].id, "call_002");
+        assert_eq!(assistant_msg.tool_calls[1].name, "write_file");
+        assert_eq!(
+            assistant_msg.tool_calls[1].arguments,
+            serde_json::json!({"path": "/tmp/bar.rs", "content": "fn main() {}"})
+        );
+
+        // Verify the tool result message
+        let tool_msg = &restored.transcript[3];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id, Some("call_001".to_string()));
+        assert_eq!(tool_msg.content, "fn main() { println!(\"hello\"); }");
+    }
+
+    #[test]
+    fn read_from_nonexistent_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bogus_path = tmp.path().join("does_not_exist.json");
+
+        let result = SessionFile::read_from(&bogus_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_from_corrupt_json() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "this is not valid json {{{garbage").unwrap();
+
+        let result = SessionFile::read_from(tmp.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn validate_tool_registry_mismatch() {
+        let original_specs = vec![
+            ToolSpec {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            ToolSpec {
+                name: "write_file".into(),
+                description: "Write a file".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+
+        let session = SessionFile::new(
+            "test".into(),
+            "model".into(),
+            "provider".into(),
+            &original_specs,
+            0,
+            vec![],
+        );
+
+        // Validate against a completely different set of tools
+        let different_specs = vec![ToolSpec {
+            name: "execute_command".into(),
+            description: "Run a shell command".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+        }];
+
+        let result = session.validate_tool_registry(&different_specs);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("mismatch"),
+            "Expected error to contain 'mismatch', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn default_session_path_sanitizes_special_chars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        // Goal with spaces, slashes, unicode, and other special chars
+        let goal = "fix bug/issue #42 — with spëcial chars™ 日本語";
+        let path = default_session_path(ws, goal);
+
+        // Extract just the filename (without the .json extension)
+        let filename = path.file_stem().unwrap().to_str().unwrap();
+
+        // The filename format is "{timestamp}-{sanitized_goal}".
+        // The timestamp is fixed-format (YYYY-MM-DDTHH:MM:SSZ) and contains colons.
+        // We verify the goal-derived suffix: strip the timestamp prefix
+        // (everything up to and including the "Z-" separator).
+        let goal_suffix = filename
+            .find("Z-")
+            .map(|i| &filename[i + 2..])
+            .expect("filename should contain Z- separator between timestamp and goal");
+
+        // The goal suffix should contain only alphanumeric (unicode-aware), underscore, or dash
+        for ch in goal_suffix.chars() {
+            assert!(
+                ch.is_alphanumeric() || ch == '_' || ch == '-',
+                "Unexpected character '{}' (U+{:04X}) in goal suffix: {}",
+                ch,
+                ch as u32,
+                goal_suffix
+            );
+        }
+
+        // Spaces, slashes, #, —, ™ should all be stripped
+        assert!(!goal_suffix.contains(' '));
+        assert!(!goal_suffix.contains('/'));
+        assert!(!goal_suffix.contains('#'));
+        assert!(!goal_suffix.contains('™'));
+        assert!(!goal_suffix.contains('—'));
+
+        // The path should still be under the sessions directory
+        assert!(path.starts_with(ws.join(".recursive").join("sessions")));
+        // And should have .json extension
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
     }
 }

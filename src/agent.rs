@@ -2324,4 +2324,226 @@ mod parallel_tests {
         assert!(tool_msgs[1].content.contains("ERROR"));
         assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
     }
+
+    #[tokio::test]
+    async fn mixed_read_write_executes_sequentially() {
+        // A write tool between read-only tools breaks parallel batching.
+        // Calls: [read, write, read] — the write separates the reads into
+        // two sequential batches, so total time >= 200ms (not ~100ms).
+        let counter = Arc::new(AtomicUsize::new(0));
+        let read_tool = Arc::new(SlowReadOnly {
+            counter: counter.clone(),
+            delay_ms: 100,
+        });
+        let write_tool = Arc::new(TrackingWrite {
+            counter: counter.clone(),
+        });
+
+        let tools = ToolRegistry::local()
+            .register(read_tool)
+            .register(write_tool);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "mixed rw...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let start = std::time::Instant::now();
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("mixed read write").await.unwrap();
+        let elapsed = start.elapsed();
+
+        // read(100ms) + write(~0ms) + read(100ms) = >=200ms
+        assert!(
+            elapsed.as_millis() >= 200,
+            "mixed read/write took {}ms, expected >=200ms (write breaks parallel batching)",
+            elapsed.as_millis()
+        );
+
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 3);
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[tokio::test]
+    async fn single_tool_call_unaffected_by_parallel_mode() {
+        // A single read-only tool call should execute normally regardless
+        // of parallel execution logic. Regression test.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let read_tool = Arc::new(SlowReadOnly {
+            counter: counter.clone(),
+            delay_ms: 10,
+        });
+
+        let tools = ToolRegistry::local()
+            .register(read_tool);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "single call...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "slow_read".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("single tool call").await.unwrap();
+
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(tool_msgs[0].content.contains("read-0"));
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[tokio::test]
+    async fn multiple_write_tools_preserve_order() {
+        // 3 write tool calls must execute in strict order: 0, 1, 2.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let write_tool = Arc::new(TrackingWrite {
+            counter: counter.clone(),
+        });
+
+        let tools = ToolRegistry::local()
+            .register(write_tool);
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "writing three...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        name: "track_write".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .tools(tools)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("write three times").await.unwrap();
+
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 3);
+        // Verify strict sequential order via atomic counter
+        assert!(tool_msgs[0].content.contains("write-0"));
+        assert!(tool_msgs[1].content.contains("write-1"));
+        assert!(tool_msgs[2].content.contains("write-2"));
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[tokio::test]
+    async fn no_tool_calls_completes_immediately() {
+        // When the provider returns a completion with empty tool_calls and
+        // finish_reason "stop", the agent should complete with NoMoreToolCalls.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "nothing to do".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::builder()
+            .llm(llm)
+            .max_steps(5)
+            .build()
+            .unwrap();
+        let out = agent.run("no tools needed").await.unwrap();
+
+        assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
+        assert_eq!(out.final_message.as_deref(), Some("nothing to do"));
+        assert_eq!(out.steps, 1);
+        // No tool messages in transcript
+        let tool_msgs: Vec<&Message> = out
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 0);
+    }
 }

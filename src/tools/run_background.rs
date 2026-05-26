@@ -61,6 +61,12 @@ pub struct BackgroundJobManager {
     next_id: u64,
 }
 
+impl Default for BackgroundJobManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BackgroundJobManager {
     pub fn new() -> Self {
         Self {
