@@ -217,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 cli.max_transcript_chars,
                 cli.json,
+                cli.plan_first,
                 cli.mcp_config,
                 external_pricing,
             )
@@ -266,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.transcript_out,
                         cli.session_out,
                         cli.json,
+                        cli.plan_first,
                         cli.mcp_config,
                         external_pricing,
                         cli.hook_timing,
@@ -292,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.transcript_out,
                 cli.session_out,
                 cli.json,
+                cli.plan_first,
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
@@ -792,6 +795,7 @@ async fn run_resumed(
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
     json_mode: bool,
+    plan_first: bool,
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
@@ -802,7 +806,7 @@ async fn run_resumed(
         max_transcript_chars,
         seed,
         false,
-        false, /* plan_first */
+        plan_first,
         mcp_config,
         hook_timing,
         Some(&goal),
@@ -946,6 +950,7 @@ async fn repl(
     config: Config,
     max_transcript_chars: Option<usize>,
     json_mode: bool,
+    plan_first: bool,
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
 ) -> anyhow::Result<()> {
@@ -970,7 +975,7 @@ async fn repl(
             max_transcript_chars,
             Vec::new(),
             false,
-            false, /* plan_first */
+            plan_first,
             mcp_config.clone(),
             false,
             None,
