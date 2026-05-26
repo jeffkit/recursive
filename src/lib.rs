@@ -18,6 +18,8 @@ pub mod hooks;
 pub mod llm;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mcp")]
+pub mod mcp_server;
 pub mod message;
 pub mod session;
 pub mod skills;
@@ -40,6 +42,8 @@ pub use mcp::{
     McpPromptMessage, McpResource, McpResourceContent, McpServer, McpServerConfig, McpTool,
     McpToolSpec, ServerCapabilities,
 };
+#[cfg(feature = "mcp")]
+pub use mcp_server::McpServerManager;
 pub use message::{Message, Role};
 pub use session::SessionFile;
 pub use skills::{
