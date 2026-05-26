@@ -50,8 +50,9 @@ pub use mcp::{
 pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
 pub use multi::{
-    AgentMessage, AgentPool, AgentRole, MemoryEntry, MessageBus, MessageType, Pipeline,
-    PipelineResult, SharedMemory, StageOutcome,
+    parse_delegations, AgentMessage, AgentPool, AgentRole, DelegationResult, MemoryEntry,
+    MessageBus, MessageType, Pipeline, PipelineResult, SharedMemory, StageOutcome,
+    TeamOrchestrator, TeamResult,
 };
 pub use runner::AgentRunner;
 pub use session::SessionFile;

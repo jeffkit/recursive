@@ -386,6 +386,153 @@ impl PipelineResult {
     }
 }
 
+/// A team orchestrator uses a lead agent to dynamically assign work
+/// to specialist agents.
+pub struct TeamOrchestrator {
+    lead_role: String,
+    available_roles: Vec<String>,
+}
+
+impl TeamOrchestrator {
+    pub fn new(lead_role: String, available_roles: Vec<String>) -> Self {
+        Self {
+            lead_role,
+            available_roles,
+        }
+    }
+
+    /// Run orchestration: lead plans delegations, specialists execute, lead synthesizes.
+    pub async fn run(
+        &self,
+        pool: &AgentPool,
+        goal: &str,
+    ) -> Result<TeamResult, crate::Error> {
+        // Phase 1: Ask lead to plan
+        let delegation_prompt = format!(
+            "{}\n\nAvailable specialists: {}\n\nTo delegate, use: DELEGATE:<role>:<task>\nWhen done, provide your final answer.",
+            goal,
+            self.available_roles.join(", ")
+        );
+
+        let lead_outcome = pool.run_with_role(&self.lead_role, &delegation_prompt).await?;
+        let lead_response = lead_outcome
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::message::Role::Assistant)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        let delegations = parse_delegations(&lead_response);
+
+        // Phase 2: Execute delegations
+        let mut delegation_results = Vec::new();
+        for (role, task) in &delegations {
+            if self.available_roles.contains(role) {
+                match pool.run_with_role(role, task).await {
+                    Ok(outcome) => {
+                        let result = outcome
+                            .transcript
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == crate::message::Role::Assistant)
+                            .map(|m| m.content.clone())
+                            .unwrap_or_default();
+                        delegation_results.push(DelegationResult {
+                            role: role.clone(),
+                            task: task.clone(),
+                            output: result,
+                            success: true,
+                        });
+                    }
+                    Err(e) => {
+                        delegation_results.push(DelegationResult {
+                            role: role.clone(),
+                            task: task.clone(),
+                            output: format!("Error: {e}"),
+                            success: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 3: If delegations happened, synthesize
+        let final_output = if delegation_results.is_empty() {
+            lead_response
+        } else {
+            let results_summary = delegation_results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "- {} ({}): {}",
+                        r.role,
+                        if r.success { "ok" } else { "failed" },
+                        r.output
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let synthesis_prompt = format!(
+                "Results from delegated tasks:\n\n{}\n\nProvide a final synthesis.",
+                results_summary
+            );
+
+            let synthesis = pool
+                .run_with_role(&self.lead_role, &synthesis_prompt)
+                .await?;
+            synthesis
+                .transcript
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::message::Role::Assistant)
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
+        };
+
+        Ok(TeamResult {
+            delegations: delegation_results,
+            final_output,
+        })
+    }
+}
+
+/// Parse "DELEGATE:<role>:<task>" lines from text.
+pub fn parse_delegations(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("DELEGATE:") {
+                let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The result of a team orchestration run.
+#[derive(Debug)]
+pub struct TeamResult {
+    pub delegations: Vec<DelegationResult>,
+    pub final_output: String,
+}
+
+/// The result of a single delegation to a specialist.
+#[derive(Debug)]
+pub struct DelegationResult {
+    pub role: String,
+    pub task: String,
+    pub output: String,
+    pub success: bool,
+}
+
 /// Default role set for common multi-agent patterns.
 pub fn default_roles() -> Vec<AgentRole> {
     vec![
@@ -906,5 +1053,126 @@ mod tests {
 
         assert_eq!(result.final_output(), "final answer");
         assert_eq!(result.stage_count(), 3);
+    }
+
+    // --- TeamOrchestrator / parse_delegations tests ---
+
+    #[test]
+    fn parse_delegations_extracts_role_and_task() {
+        let text = "DELEGATE:coder:write hello";
+        let result = parse_delegations(text);
+        assert_eq!(result, vec![("coder".to_string(), "write hello".to_string())]);
+    }
+
+    #[test]
+    fn parse_delegations_ignores_non_delegation() {
+        let text = "Here is my plan:\n- Think about it\nDELEGATE:coder:implement feature\nSome other text\nDELEGATE:reviewer:check code";
+        let result = parse_delegations(text);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("coder".to_string(), "implement feature".to_string()));
+        assert_eq!(result[1], ("reviewer".to_string(), "check code".to_string()));
+    }
+
+    #[test]
+    fn parse_delegations_handles_colons_in_task() {
+        let text = "DELEGATE:coder:write file:test.rs";
+        let result = parse_delegations(text);
+        assert_eq!(
+            result,
+            vec![("coder".to_string(), "write file:test.rs".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_no_delegations_returns_lead_response() {
+        // Lead responds without any DELEGATE lines
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "I will handle this myself. The answer is 42.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+
+        let mut pool = AgentPool::new(provider, test_config());
+        pool.add_role(AgentRole {
+            name: "lead".into(),
+            system_prompt: "You are the lead.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+        pool.add_role(AgentRole {
+            name: "coder".into(),
+            system_prompt: "You code.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+
+        let orchestrator = TeamOrchestrator::new(
+            "lead".into(),
+            vec!["coder".into()],
+        );
+        let result = orchestrator.run(&pool, "What is the meaning of life?").await.unwrap();
+
+        assert!(result.delegations.is_empty());
+        assert_eq!(result.final_output, "I will handle this myself. The answer is 42.");
+    }
+
+    #[tokio::test]
+    async fn orchestrator_with_delegations_executes_them() {
+        // Completions: 1) lead delegates, 2) specialist responds, 3) lead synthesizes
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "Let me delegate this.\nDELEGATE:coder:write a hello world program".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "fn main() { println!(\"Hello, world!\"); }".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "The coder produced a working hello world program in Rust.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let mut pool = AgentPool::new(provider, test_config());
+        pool.add_role(AgentRole {
+            name: "lead".into(),
+            system_prompt: "You are the lead.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+        pool.add_role(AgentRole {
+            name: "coder".into(),
+            system_prompt: "You write code.".into(),
+            max_steps: 5,
+            allowed_tools: vec![],
+        });
+
+        let orchestrator = TeamOrchestrator::new(
+            "lead".into(),
+            vec!["coder".into()],
+        );
+        let result = orchestrator.run(&pool, "Create a hello world program").await.unwrap();
+
+        assert_eq!(result.delegations.len(), 1);
+        assert_eq!(result.delegations[0].role, "coder");
+        assert_eq!(result.delegations[0].task, "write a hello world program");
+        assert!(result.delegations[0].success);
+        assert!(result.delegations[0].output.contains("Hello, world!"));
+        assert_eq!(
+            result.final_output,
+            "The coder produced a working hello world program in Rust."
+        );
     }
 }
