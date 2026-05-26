@@ -1130,7 +1130,7 @@ mod tests {
 
         let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
-let r3 = build_agent(&cfg, None, Vec::new(), false, false, None, false, None).await;
+        let r3 = build_agent(&cfg, None, Vec::new(), false, false, None, false, None).await;
         match original {
             Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),
