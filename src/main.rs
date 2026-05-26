@@ -31,9 +31,11 @@ use recursive::{
     tools::{
         ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
-        RunSkillScript, SearchFiles, SubAgent, ToolTransport, WebFetch, WriteFile,
+        RunSkillScript, ScheduleWakeup, SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch,
+        WriteFile,
     },
-    Agent, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry, TranscriptFile,
+    Agent, AgentRunner, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry,
+    TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -178,6 +180,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Run the agent in loop mode: agent self-schedules wakeups until it stops.
+    Loop {
+        /// Initial goal to start the loop with.
+        #[arg(trailing_var_arg = true, required = true)]
+        goal: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -303,6 +311,20 @@ async fn main() -> anyhow::Result<()> {
                 cli.mcp_config,
                 external_pricing,
                 cli.stream,
+                cli.hook_timing,
+            )
+            .await
+        }
+        Cmd::Loop { goal } => {
+            run_loop(
+                config,
+                goal.join(" "),
+                cli.max_transcript_chars,
+                cli.json,
+                cli.stream,
+                cli.plan_first,
+                cli.mcp_config,
+                external_pricing,
                 cli.hook_timing,
             )
             .await
@@ -984,6 +1006,112 @@ async fn run_resumed(
         }
     }
     exit_for_finish(&outcome.finish, outcome.steps)
+}
+
+/// Run the agent in loop mode: agent self-schedules wakeups until it stops.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    config: Config,
+    goal: String,
+    max_transcript_chars: Option<usize>,
+    json_mode: bool,
+    stream: bool,
+    plan_first: bool,
+    _mcp_config: Option<PathBuf>,
+    _external_pricing: Option<HashMap<String, ModelPricing>>,
+    hook_timing: bool,
+) -> anyhow::Result<()> {
+    use std::sync::Mutex;
+
+    if let Err(msg) = config.validate_for_agent() {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+
+    // Create the shared wakeup slot
+    let wakeup_slot: WakeupSlot = Arc::new(Mutex::new(None));
+    let wakeup_slot_clone = wakeup_slot.clone();
+
+    // Build tools with ScheduleWakeup registered
+    let mut tools = build_tools(&config).await;
+    tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot_clone)));
+
+    // Build the LLM provider
+    let api_key = config.require_api_key()?;
+    let retry = RetryPolicy {
+        max_retries: config.retry_max,
+        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+    };
+    let provider: Arc<dyn LlmProvider> = match config.provider_type.as_str() {
+        "anthropic" => {
+            let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
+                max_retries: config.retry_max,
+                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+            };
+            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)
+                .with_temperature(config.temperature)
+                .with_retry_policy(anthropic_retry);
+            Arc::new(anthropic)
+        }
+        _ => {
+            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
+                .with_temperature(config.temperature)
+                .with_retry_policy(retry);
+            Arc::new(openai)
+        }
+    };
+
+    // Build the agent
+    let mut builder = Agent::builder()
+        .llm(provider)
+        .tools(tools)
+        .system_prompt(&config.system_prompt)
+        .max_steps(config.max_steps);
+
+    if let Some(n) = max_transcript_chars {
+        builder = builder.max_transcript_chars(n);
+    }
+    if hook_timing {
+        builder = builder.hook(Arc::new(recursive::hooks::ToolTimingHook::new()));
+    }
+    if stream {
+        builder = builder.streaming(true);
+    }
+    if plan_first {
+        builder = builder.planning_mode(PlanningMode::PlanFirst);
+    }
+
+    let agent = builder.build()?;
+
+    // Run the loop
+    let mut runner = AgentRunner::new(agent);
+    let outcomes = runner.run_loop(&goal, &wakeup_slot, None).await?;
+
+    // Print summary
+    if json_mode {
+        // For JSON mode, just output a simple summary
+        let summary: Vec<_> = outcomes
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "finish": format!("{:?}", o.finish),
+                    "steps": o.steps,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&summary)?);
+    } else {
+        eprintln!("Loop completed: {} turn(s)", outcomes.len());
+    }
+
+    // Use the finish reason from the last outcome
+    if let Some(last) = outcomes.last() {
+        let _ = exit_for_finish(&last.finish, last.steps);
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
