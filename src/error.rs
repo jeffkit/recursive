@@ -217,6 +217,7 @@ mod tests {
         assert!(err.to_string().contains("file not found"));
     }
 
+    #[test]
     fn test_unknown_tool_format() {
         let err = Error::UnknownTool("nonexistent".into());
         let msg = err.to_string();
