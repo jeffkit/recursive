@@ -50,9 +50,9 @@ pub enum JobState {
 }
 
 /// A single background job.
-struct Job {
-    state: JobState,
-    created_at: Instant,
+pub struct Job {
+    pub state: JobState,
+    pub created_at: Instant,
 }
 
 /// Shared manager for background jobs.
@@ -83,14 +83,14 @@ impl BackgroundJobManager {
     }
 
     /// Insert a new job and return its ID.
-    fn insert(&mut self, job: Job) -> String {
+    pub fn insert(&mut self, job: Job) -> String {
         let id = self.next_id();
         self.jobs.insert(id.clone(), job);
         id
     }
 
     /// Get a reference to a job's state.
-    fn get_state(&self, id: &str) -> Option<JobState> {
+    pub fn get_state(&self, id: &str) -> Option<JobState> {
         self.jobs.get(id).map(|j| j.state.clone())
     }
 
@@ -110,6 +110,36 @@ impl BackgroundJobManager {
     /// Remove all jobs immediately.
     pub fn clear(&mut self) {
         self.jobs.clear();
+    }
+
+    /// Remove and return the first completed job, if any.
+    ///
+    /// Returns `Some((job_id, output_string))` where `output_string` includes
+    /// the exit code and captured stdout/stderr. Completed jobs are removed
+    /// from the tracked set.
+    pub fn take_completed(&mut self) -> Option<(String, String)> {
+        let id = self.jobs.iter().find_map(|(id, job)| match &job.state {
+            JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut => {
+                Some(id.clone())
+            }
+            JobState::Running => None,
+        })?;
+        let job = self.jobs.remove(&id)?;
+        let output = match &job.state {
+            JobState::Completed { stdout, stderr, exit_code } => {
+                format!(
+                    "exit code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+            }
+            JobState::Failed { message } => {
+                format!("failed: {message}")
+            }
+            JobState::TimedOut => {
+                "timed out".to_string()
+            }
+            JobState::Running => unreachable!(), // filtered above
+        };
+        Some((id, output))
     }
 }
 
@@ -590,5 +620,77 @@ mod tests {
 
         let err = check_tool.execute(json!({})).await.unwrap_err();
         assert!(matches!(err, Error::BadToolArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn take_completed_returns_finished_job() {
+        let mut manager = BackgroundJobManager::new();
+        // Insert a running job
+        let running_id = manager.insert(Job {
+            state: JobState::Running,
+            created_at: Instant::now(),
+        });
+        // Insert a completed job
+        let completed_id = manager.insert(Job {
+            state: JobState::Completed {
+                stdout: "hello".into(),
+                stderr: "".into(),
+                exit_code: 0,
+            },
+            created_at: Instant::now(),
+        });
+
+        // take_completed should return the completed job
+        let (id, output) = manager.take_completed().unwrap();
+        assert_eq!(id, completed_id);
+        assert!(output.contains("hello"));
+        assert!(output.contains("exit code: 0"));
+
+        // Running job should still be there
+        assert!(manager.get_state(&running_id).is_some());
+        // Completed job should be removed
+        assert!(manager.get_state(&completed_id).is_none());
+
+        // No more completed jobs
+        assert!(manager.take_completed().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_completed_returns_failed_job() {
+        let mut manager = BackgroundJobManager::new();
+        manager.insert(Job {
+            state: JobState::Failed {
+                message: "something went wrong".into(),
+            },
+            created_at: Instant::now(),
+        });
+
+        let (id, output) = manager.take_completed().unwrap();
+        assert!(id.starts_with("bg-"));
+        assert!(output.contains("failed"));
+        assert!(output.contains("something went wrong"));
+    }
+
+    #[tokio::test]
+    async fn take_completed_returns_timed_out_job() {
+        let mut manager = BackgroundJobManager::new();
+        manager.insert(Job {
+            state: JobState::TimedOut,
+            created_at: Instant::now(),
+        });
+
+        let (id, output) = manager.take_completed().unwrap();
+        assert!(id.starts_with("bg-"));
+        assert!(output.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn take_completed_empty_when_no_finished_jobs() {
+        let mut manager = BackgroundJobManager::new();
+        manager.insert(Job {
+            state: JobState::Running,
+            created_at: Instant::now(),
+        });
+        assert!(manager.take_completed().is_none());
     }
 }
