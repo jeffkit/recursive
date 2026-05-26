@@ -12,7 +12,7 @@ Recursive is a tiny ReAct-style agent loop that wires together:
 - an **LLM provider** (OpenAI-compatible HTTP by default; works with OpenAI,
   GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, …)
 - a **tool registry** (`read_file`, `write_file`, `apply_patch`, `list_dir`,
-  `run_shell`, `count_lines` out of the box; trivially extensible)
+  `run_shell` out of the box; trivially extensible)
 - a **transcript** plus a `StepEvent` stream you can observe
 
 The whole kernel is intentionally small enough to read in one sitting.
@@ -34,7 +34,7 @@ let llm = Arc::new(OpenAiProvider::new(
     "gpt-4o-mini",
 ));
 
-let tools = ToolRegistry::new()
+let tools = ToolRegistry::local()
     .register(Arc::new(ReadFile::new(".")))
     .register(Arc::new(WriteFile::new(".")))
     .register(Arc::new(ApplyPatch::new(".")))

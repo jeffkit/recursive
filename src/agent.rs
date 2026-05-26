@@ -61,6 +61,7 @@ pub enum PlanningMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StepEvent {
     /// Model generated text without tool calls.
     ///
@@ -151,6 +152,7 @@ pub enum StepEvent {
 /// - `TranscriptLimit`: Transcript size hit `max_transcript_chars` hard limit before
 ///   compaction could reduce it further. Agent cannot continue. `chars` is final size,
 ///   `limit` is the configured maximum.
+#[non_exhaustive]
 pub enum FinishReason {
     /// Model generated final response without requesting more tools.
     NoMoreToolCalls,
@@ -364,14 +366,17 @@ impl Agent {
                     reason: finish.clone(),
                     steps: step,
                 });
-                return Ok(AgentOutcome {
+                let outcome = AgentOutcome {
                     final_message,
                     transcript: std::mem::take(&mut self.transcript),
                     steps: step,
                     finish,
                     total_usage,
                     total_llm_latency_ms: self.total_llm_latency_ms,
-                });
+                };
+                self.hooks
+                    .dispatch(HookEvent::SessionEnd { outcome: &outcome });
+                return Ok(outcome);
             }
 
             self.transcript.push(Message::assistant_with_tool_calls(
@@ -636,14 +641,17 @@ impl Agent {
             reason: finish.clone(),
             steps: self.max_steps,
         });
-        Ok(AgentOutcome {
+        let outcome = AgentOutcome {
             final_message,
             transcript: std::mem::take(&mut self.transcript),
             steps: self.max_steps,
             finish,
             total_usage,
             total_llm_latency_ms: self.total_llm_latency_ms,
-        })
+        };
+        self.hooks
+            .dispatch(HookEvent::SessionEnd { outcome: &outcome });
+        Ok(outcome)
     }
 
     /// Try to trim old tool results to bring the transcript under the character limit.

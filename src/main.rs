@@ -841,7 +841,14 @@ async fn run_resumed(
     if let Some(path) = session_out {
         let is_success = matches!(outcome.finish, FinishReason::NoMoreToolCalls);
         if !is_success {
-            save_session(&outcome, goal, &config.model, "openai", &tool_specs, &path)?;
+            save_session(
+                &outcome,
+                goal,
+                &config.model,
+                &std::env::var("RECURSIVE_PROVIDER_TYPE").unwrap_or_else(|_| "openai".to_string()),
+                &tool_specs,
+                &path,
+            )?;
         }
     }
     exit_for_finish(&outcome.finish, outcome.steps)
@@ -922,7 +929,14 @@ async fn run_once(
     if let Some(path) = session_out {
         let is_success = matches!(outcome.finish, FinishReason::NoMoreToolCalls);
         if !is_success {
-            save_session(&outcome, goal, &config.model, "openai", &tool_specs, &path)?;
+            save_session(
+                &outcome,
+                goal,
+                &config.model,
+                &std::env::var("RECURSIVE_PROVIDER_TYPE").unwrap_or_else(|_| "openai".to_string()),
+                &tool_specs,
+                &path,
+            )?;
         }
     }
     exit_for_finish(&outcome.finish, outcome.steps)
@@ -995,6 +1009,7 @@ async fn repl(
 
 async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
     while let Some(ev) = rx.recv().await {
+        #[allow(clippy::collapsible_match)]
         match ev {
             StepEvent::AssistantText { text, step } => {
                 if !text.trim().is_empty() {
@@ -1050,6 +1065,7 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             StepEvent::PlanRejected { reason } => {
                 println!("[plan] rejected: {reason}");
             }
+            _ => {}
         }
     }
 }

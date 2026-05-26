@@ -60,7 +60,7 @@ pub trait Tool: Send + Sync {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
-    pub transport: Arc<dyn ToolTransport>,
+    transport: Arc<dyn ToolTransport>,
 }
 
 impl ToolRegistry {
@@ -74,6 +74,11 @@ impl ToolRegistry {
     /// Create a registry with the default local transport.
     pub fn local() -> Self {
         Self::new(Arc::new(LocalTransport))
+    }
+
+    /// Returns a reference to the transport layer.
+    pub fn transport(&self) -> &Arc<dyn ToolTransport> {
+        &self.transport
     }
 
     /// Create a new empty registry that shares the same transport.
