@@ -294,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "http")]
         Cmd::Http { addr } => {
+            if let Err(msg) = config.validate_for_agent() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
             let tools = build_tools(&config).await;
             let tool_infos: Vec<recursive::http::ToolInfo> = tools
                 .specs()
@@ -304,7 +308,42 @@ async fn main() -> anyhow::Result<()> {
                     parameters: spec.parameters,
                 })
                 .collect();
-            let state = recursive::http::AppState { tools: tool_infos };
+            // Build the LLM provider from config
+            let api_key = config.require_api_key()?;
+            let retry = RetryPolicy {
+                max_retries: config.retry_max,
+                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+            };
+            let provider: Arc<dyn recursive::llm::LlmProvider> =
+                match config.provider_type.as_str() {
+                    "anthropic" => {
+                        let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
+                            max_retries: config.retry_max,
+                            initial_backoff: Duration::from_secs(
+                                config.retry_initial_backoff_secs,
+                            ),
+                            max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+                        };
+                        let anthropic =
+                            AnthropicProvider::new(&config.api_base, api_key, &config.model)
+                                .with_temperature(config.temperature)
+                                .with_retry_policy(anthropic_retry);
+                        Arc::new(anthropic)
+                    }
+                    _ => {
+                        let openai =
+                            OpenAiProvider::new(&config.api_base, api_key, &config.model)
+                                .with_temperature(config.temperature)
+                                .with_retry_policy(retry);
+                        Arc::new(openai)
+                    }
+                };
+            let state = recursive::http::AppState {
+                tools: tool_infos,
+                config: config.clone(),
+                provider,
+            };
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
