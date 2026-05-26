@@ -224,6 +224,7 @@ pub struct Agent {
     hooks: HookRegistry,
     planning_mode: PlanningMode,
     plan_buffer: Option<Vec<ToolCall>>,
+    plan_confirmed: bool,
 }
 
 impl Agent {
@@ -233,7 +234,8 @@ impl Agent {
 
     /// Confirm a proposed plan, allowing execution to proceed.
     pub fn confirm_plan(&mut self) {
-        self.plan_buffer = None;
+        self.plan_confirmed = true;
+        self.emit(StepEvent::PlanConfirmed);
     }
 
     /// Reject a proposed plan with a reason.
@@ -252,9 +254,162 @@ impl Agent {
                     .push(Message::tool_result(call.id.clone(), result));
             }
         }
+        self.emit(StepEvent::PlanRejected { reason: reason.into() });
     }
 
     /// Drive the loop until the model stops calling tools, or the budget is exhausted.
+    /// Execute a set of tool calls, returning (id, name, output, args) for each.
+    /// Read-only calls are batched and executed in parallel; write calls run
+    /// sequentially to preserve ordering guarantees.
+    async fn execute_tool_calls(
+        &mut self,
+        calls: &[ToolCall],
+        _step: usize,
+    ) -> Vec<(String, String, String, serde_json::Value)> {
+        let mut results: Vec<(String, String, String, serde_json::Value)> = Vec::new();
+
+        // First pass: handle denied/skipped calls immediately, collect the rest.
+        struct PendingCall {
+            id: String,
+            name: String,
+            args: serde_json::Value,
+        }
+        let mut pending: Vec<PendingCall> = Vec::new();
+
+        for call in calls {
+            let effective_args = if let Some(ref hook) = self.permission_hook {
+                match hook(&call.name, &call.arguments) {
+                    PermissionDecision::Allow => call.arguments.clone(),
+                    PermissionDecision::Deny(reason) => {
+                        let result = format!("ERROR: {reason}");
+                        results.push((
+                            call.id.clone(),
+                            call.name.clone(),
+                            result,
+                            call.arguments.clone(),
+                        ));
+                        continue;
+                    }
+                    PermissionDecision::Transform(new_args) => new_args,
+                }
+            } else {
+                call.arguments.clone()
+            };
+
+            // Apply lifecycle hooks before executing the tool
+            let hook_action = self.hooks.dispatch(HookEvent::PreToolCall {
+                name: &call.name,
+                args: &effective_args,
+            });
+            match hook_action {
+                HookAction::Skip => {
+                    let result = "ERROR: tool call skipped by hook".to_string();
+                    results.push((
+                        call.id.clone(),
+                        call.name.clone(),
+                        result,
+                        call.arguments.clone(),
+                    ));
+                    continue;
+                }
+                HookAction::Error(msg) => {
+                    let result = format!("ERROR: {msg}");
+                    results.push((
+                        call.id.clone(),
+                        call.name.clone(),
+                        result,
+                        call.arguments.clone(),
+                    ));
+                    continue;
+                }
+                HookAction::Continue => {}
+            }
+
+            pending.push(PendingCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args: effective_args,
+            });
+        }
+
+        // Second pass: execute read-only calls in parallel, write calls sequentially.
+        let mut i = 0;
+        while i < pending.len() {
+            if self.tools.is_readonly(&pending[i].name) {
+                // Batch consecutive read-only calls
+                let batch_start = i;
+                while i < pending.len() && self.tools.is_readonly(&pending[i].name) {
+                    i += 1;
+                }
+                let batch: Vec<PendingCall> = pending.drain(batch_start..i).collect();
+                i = batch_start;
+
+                let mut join_set = tokio::task::JoinSet::new();
+                for pc in &batch {
+                    let name = pc.name.clone();
+                    let args = pc.args.clone();
+                    let tools = self.tools.clone();
+                    join_set.spawn(async move {
+                        let tool_start = std::time::Instant::now();
+                        let result = match tools.invoke(&name, args).await {
+                            Ok(output) => output,
+                            Err(err) => format!("ERROR: {err}"),
+                        };
+                        let duration_ms = tool_start.elapsed().as_millis() as u64;
+                        (name, result, duration_ms)
+                    });
+                }
+
+                let mut batch_results: Vec<(String, String, u64)> = Vec::new();
+                while let Some(res) = join_set.join_next().await {
+                    let (name, result, duration_ms) = res.unwrap();
+                    batch_results.push((name, result, duration_ms));
+                }
+
+                for pc in &batch {
+                    let (_, result, duration_ms) = batch_results
+                        .iter()
+                        .find(|(n, _, _)| n == &pc.name)
+                        .unwrap();
+                    results.push((
+                        pc.id.clone(),
+                        pc.name.clone(),
+                        result.clone(),
+                        pc.args.clone(),
+                    ));
+                    self.hooks.dispatch(HookEvent::PostToolCall {
+                        name: &pc.name,
+                        args: &pc.args,
+                        result,
+                        duration_ms: *duration_ms,
+                    });
+                }
+            } else {
+                let pc = pending.remove(i);
+                let tool_start = std::time::Instant::now();
+                let result = match self.tools.invoke(&pc.name, pc.args.clone()).await {
+                    Ok(output) => output,
+                    Err(err) => format!("ERROR: {err}"),
+                };
+                let duration_ms = tool_start.elapsed().as_millis() as u64;
+                results.push((
+                    pc.id.clone(),
+                    pc.name.clone(),
+                    result.clone(),
+                    pc.args.clone(),
+                ));
+                self.hooks.dispatch(HookEvent::PostToolCall {
+                    name: &pc.name,
+                    args: &pc.args,
+                    result: &result,
+                    duration_ms,
+                });
+            }
+        }
+
+        results
+    }
+
     #[tracing::instrument(skip(self), fields(goal))]
     pub async fn run(&mut self, goal: impl Into<String>) -> Result<AgentOutcome> {
         let goal = goal.into();
@@ -304,6 +459,25 @@ impl Agent {
                 transcript_len: self.transcript.iter().map(|m| m.content.len()).sum(),
             });
             self.maybe_compact(step).await?;
+
+            // If a plan was confirmed, execute the buffered calls without
+            // calling the LLM again.
+            if self.plan_confirmed {
+                self.plan_confirmed = false;
+                if let Some(calls) = self.plan_buffer.take() {
+                    let results = self.execute_tool_calls(&calls, step).await;
+                    for (id, name, output, _args) in results {
+                        self.emit(StepEvent::ToolResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: output.clone(),
+                            step,
+                        });
+                        self.transcript.push(Message::tool_result(id, output));
+                    }
+                    continue;
+                }
+            }
 
             debug!(target: "recursive::agent", step, "calling llm");
             let start = std::time::Instant::now();
@@ -431,154 +605,7 @@ impl Agent {
             // Phase 2: separate read-only and write calls, then execute.
             // Read-only calls run in parallel; write calls run sequentially
             // to preserve ordering guarantees.
-            let mut results: Vec<(String, String, String, serde_json::Value)> = Vec::new(); // (id, name, output, args)
-
-            // First pass: handle denied/skipped calls immediately, collect
-            // the rest for execution.
-            struct PendingCall {
-                id: String,
-                name: String,
-                args: serde_json::Value,
-            }
-            let mut pending: Vec<PendingCall> = Vec::new();
-
-            for call in &completion.tool_calls {
-                let effective_args = if let Some(ref hook) = self.permission_hook {
-                    match hook(&call.name, &call.arguments) {
-                        PermissionDecision::Allow => call.arguments.clone(),
-                        PermissionDecision::Deny(reason) => {
-                            let result = format!("ERROR: {reason}");
-                            results.push((
-                                call.id.clone(),
-                                call.name.clone(),
-                                result,
-                                call.arguments.clone(),
-                            ));
-                            continue;
-                        }
-                        PermissionDecision::Transform(new_args) => new_args,
-                    }
-                } else {
-                    call.arguments.clone()
-                };
-
-                // Apply lifecycle hooks before executing the tool
-                let hook_action = self.hooks.dispatch(HookEvent::PreToolCall {
-                    name: &call.name,
-                    args: &effective_args,
-                });
-                match hook_action {
-                    HookAction::Skip => {
-                        let result = "ERROR: tool call skipped by hook".to_string();
-                        results.push((
-                            call.id.clone(),
-                            call.name.clone(),
-                            result,
-                            call.arguments.clone(),
-                        ));
-                        continue;
-                    }
-                    HookAction::Error(msg) => {
-                        let result = format!("ERROR: {msg}");
-                        results.push((
-                            call.id.clone(),
-                            call.name.clone(),
-                            result,
-                            call.arguments.clone(),
-                        ));
-                        continue;
-                    }
-                    HookAction::Continue => {}
-                }
-
-                pending.push(PendingCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    args: effective_args,
-                });
-            }
-
-            // Second pass: execute read-only calls in parallel, write calls sequentially.
-            // We process calls in order, but batch consecutive read-only calls together.
-            let mut i = 0;
-            while i < pending.len() {
-                if self.tools.is_readonly(&pending[i].name) {
-                    // Batch consecutive read-only calls
-                    let batch_start = i;
-                    while i < pending.len() && self.tools.is_readonly(&pending[i].name) {
-                        i += 1;
-                    }
-                    let batch: Vec<PendingCall> = pending.drain(batch_start..i).collect();
-                    i = batch_start; // reset i since we drained
-
-                    // Execute read-only batch in parallel
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for pc in &batch {
-                        let name = pc.name.clone();
-                        let args = pc.args.clone();
-                        let tools = self.tools.clone();
-                        join_set.spawn(async move {
-                            let tool_start = std::time::Instant::now();
-                            let result = match tools.invoke(&name, args).await {
-                                Ok(output) => output,
-                                Err(err) => format!("ERROR: {err}"),
-                            };
-                            let duration_ms = tool_start.elapsed().as_millis() as u64;
-                            (name, result, duration_ms)
-                        });
-                    }
-
-                    // Collect results in order (JoinSet yields as they complete,
-                    // but we need to map back to original order)
-                    let mut batch_results: Vec<(String, String, u64)> = Vec::new();
-                    while let Some(res) = join_set.join_next().await {
-                        let (name, result, duration_ms) = res.unwrap();
-                        batch_results.push((name, result, duration_ms));
-                    }
-
-                    // Map results back to original order
-                    for pc in &batch {
-                        let (_, result, duration_ms) = batch_results
-                            .iter()
-                            .find(|(n, _, _)| n == &pc.name)
-                            .unwrap();
-                        results.push((
-                            pc.id.clone(),
-                            pc.name.clone(),
-                            result.clone(),
-                            pc.args.clone(),
-                        ));
-                        self.hooks.dispatch(HookEvent::PostToolCall {
-                            name: &pc.name,
-                            args: &pc.args,
-                            result,
-                            duration_ms: *duration_ms,
-                        });
-                    }
-                } else {
-                    // Execute write call sequentially
-                    let pc = pending.remove(i);
-                    let tool_start = std::time::Instant::now();
-                    let result = match self.tools.invoke(&pc.name, pc.args.clone()).await {
-                        Ok(output) => output,
-                        Err(err) => format!("ERROR: {err}"),
-                    };
-                    let duration_ms = tool_start.elapsed().as_millis() as u64;
-                    results.push((
-                        pc.id.clone(),
-                        pc.name.clone(),
-                        result.clone(),
-                        pc.args.clone(),
-                    ));
-                    self.hooks.dispatch(HookEvent::PostToolCall {
-                        name: &pc.name,
-                        args: &pc.args,
-                        result: &result,
-                        duration_ms,
-                    });
-                    // i intentionally NOT incremented: remove(i) shifts remaining elements down
-                }
-            }
+            let results = self.execute_tool_calls(&completion.tool_calls, step).await;
 
             // Phase 3: emit results and push to transcript (preserving original order)
             for (id, name, result, args) in &results {
@@ -948,6 +975,7 @@ impl AgentBuilder {
             hooks: self.hooks,
             planning_mode: self.planning_mode,
             plan_buffer: None,
+            plan_confirmed: false,
         })
     }
 }
@@ -2193,9 +2221,10 @@ mod tests {
             hooks: HookRegistry::new(),
             planning_mode: PlanningMode::Immediate,
             plan_buffer: Some(vec![]),
+            plan_confirmed: false,
         };
         agent.confirm_plan();
-        assert!(agent.plan_buffer.is_none());
+        assert!(agent.plan_confirmed);
     }
 
     #[test]
@@ -2214,9 +2243,11 @@ mod tests {
             hooks: HookRegistry::new(),
             planning_mode: PlanningMode::Immediate,
             plan_buffer: Some(vec![]),
+            plan_confirmed: false,
         };
         agent.reject_plan("bad plan");
         assert!(agent.plan_buffer.is_none());
+        assert!(!agent.plan_confirmed);
     }
 }
 // ============================================================================
