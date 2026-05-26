@@ -1,0 +1,15 @@
+[package]
+name = "recursive-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal UI for the Recursive coding agent"
+
+[[bin]]
+name = "recursive-tui"
+path = "src/main.rs"
+
+[dependencies]
+recursive-agent = { path = "../.." }
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
