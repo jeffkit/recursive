@@ -24,6 +24,7 @@ pub mod tools;
 pub mod transcript;
 
 pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
+pub use agent::PlanningMode;
 pub use agent::{PermissionDecision, PermissionHook};
 pub use compact::Compactor;
 pub use config::Config;

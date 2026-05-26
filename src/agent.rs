@@ -49,6 +49,16 @@ pub type PermissionHook = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionDeci
 
 const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
+/// Controls whether the agent executes tools immediately or presents a plan first.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum PlanningMode {
+    /// Execute tool calls immediately (current behavior).
+    #[default]
+    Immediate,
+    /// Buffer tool calls and emit a plan for confirmation before executing.
+    PlanFirst,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepEvent {
@@ -113,6 +123,17 @@ pub enum StepEvent {
     /// detection, etc.). `steps` shows how many iterations were executed.
     /// After this event, no more events will be emitted for this run.
     Finished { reason: FinishReason, steps: usize },
+    /// Agent has produced a plan and is waiting for confirmation.
+    PlanProposed {
+        /// Human-readable plan description
+        plan_text: String,
+        /// The buffered tool calls
+        tool_calls: Vec<ToolCall>,
+    },
+    /// Plan was confirmed, execution will proceed.
+    PlanConfirmed,
+    /// Plan was rejected with a reason.
+    PlanRejected { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,11 +218,23 @@ pub struct Agent {
     compactor: Option<Compactor>,
     permission_hook: Option<PermissionHook>,
     hooks: HookRegistry,
+    planning_mode: PlanningMode,
+    plan_buffer: Option<Vec<ToolCall>>,
 }
 
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
+    }
+
+    /// Confirm a proposed plan, allowing execution to proceed.
+    pub fn confirm_plan(&mut self) {
+        self.plan_buffer = None;  // Will be used in g83
+    }
+
+    /// Reject a proposed plan with a reason.
+    pub fn reject_plan(&mut self, _reason: &str) {
+        self.plan_buffer = None;  // Will be used in g83
     }
 
     /// Drive the loop until the model stops calling tools, or the budget is exhausted.
@@ -679,6 +712,7 @@ pub struct AgentBuilder {
     compactor: Option<Compactor>,
     permission_hook: Option<PermissionHook>,
     hooks: HookRegistry,
+    planning_mode: PlanningMode,
 }
 
 impl AgentBuilder {
@@ -798,6 +832,15 @@ impl AgentBuilder {
         self.hooks.register(hook);
         self
     }
+    /// Set the planning mode (optional, defaults to Immediate).
+    ///
+    /// When set to `PlanFirst`, the agent will buffer tool calls and emit a
+    /// `PlanProposed` event instead of executing them immediately. The caller
+    /// must then call `confirm_plan()` or `reject_plan()` to proceed.
+    pub fn planning_mode(mut self, mode: PlanningMode) -> Self {
+        self.planning_mode = mode;
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.ok_or_else(|| Error::Config {
             message: "agent: missing llm provider".into(),
@@ -819,6 +862,8 @@ impl AgentBuilder {
             compactor: self.compactor,
             permission_hook: self.permission_hook,
             hooks: self.hooks,
+            planning_mode: self.planning_mode,
+            plan_buffer: None,
         })
     }
 }
@@ -1006,6 +1051,9 @@ assert!(matches!(out.finish, FinishReason::BudgetExceeded));
                 StepEvent::Latency { .. } => "latency",
                 StepEvent::PartialToken { .. } => "partial",
                 StepEvent::Compacted { .. } => "compacted",
+                StepEvent::PlanProposed { .. } => "plan_proposed",
+                StepEvent::PlanConfirmed => "plan_confirmed",
+                StepEvent::PlanRejected { .. } => "plan_rejected",
             });
         }
         assert_eq!(
@@ -1962,9 +2010,131 @@ assert!(matches!(out.finish, FinishReason::BudgetExceeded));
         assert_eq!(out.steps, 1);
         assert_eq!(out.finish, FinishReason::NoMoreToolCalls);
     }
-}
+    // --- PlanningMode tests ---
 
+    #[test]
+    fn planning_mode_default_is_immediate() {
+        assert_eq!(PlanningMode::default(), PlanningMode::Immediate);
+    }
+
+    #[test]
+    fn planning_mode_variants_are_distinct() {
+        assert_ne!(PlanningMode::Immediate, PlanningMode::PlanFirst);
+    }
+
+    #[tokio::test]
+    async fn builder_with_planfirst_succeeds() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let agent = Agent::builder()
+            .llm(llm)
+            .planning_mode(PlanningMode::PlanFirst)
+            .build()
+            .unwrap();
+        assert_eq!(agent.planning_mode, PlanningMode::PlanFirst);
+        assert!(agent.plan_buffer.is_none());
+    }
+
+    #[tokio::test]
+    async fn immediate_mode_runs_normally() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let mut agent = Agent::builder().llm(llm).build().unwrap();
+        let outcome = agent.run("test").await.unwrap();
+        assert_eq!(outcome.finish, FinishReason::NoMoreToolCalls);
+    }
+
+    #[test]
+    fn plan_proposed_can_be_constructed() {
+        let event = StepEvent::PlanProposed {
+            plan_text: "Step 1: read file, Step 2: edit file".into(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "test.txt"}),
+            }],
+        };
+        match &event {
+            StepEvent::PlanProposed { plan_text, tool_calls } => {
+                assert!(plan_text.contains("read file"));
+                assert_eq!(tool_calls.len(), 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn plan_confirmed_can_be_constructed() {
+        let event = StepEvent::PlanConfirmed;
+        assert!(matches!(event, StepEvent::PlanConfirmed));
+    }
+
+    #[test]
+    fn plan_rejected_can_be_constructed() {
+        let event = StepEvent::PlanRejected {
+            reason: "too many steps".into(),
+        };
+        match &event {
+            StepEvent::PlanRejected { reason } => {
+                assert_eq!(reason, "too many steps");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn confirm_plan_does_not_panic() {
+        let mut agent = Agent {
+            llm: Arc::new(MockProvider::new(vec![])),
+            tools: ToolRegistry::local(),
+            transcript: vec![],
+            max_steps: 32,
+            max_transcript_chars: None,
+            events: None,
+            streaming: false,
+            total_llm_latency_ms: 0,
+            compactor: None,
+            permission_hook: None,
+            hooks: HookRegistry::new(),
+            planning_mode: PlanningMode::Immediate,
+            plan_buffer: Some(vec![]),
+        };
+        agent.confirm_plan();
+        assert!(agent.plan_buffer.is_none());
+    }
+
+    #[test]
+    fn reject_plan_does_not_panic() {
+        let mut agent = Agent {
+            llm: Arc::new(MockProvider::new(vec![])),
+            tools: ToolRegistry::local(),
+            transcript: vec![],
+            max_steps: 32,
+            max_transcript_chars: None,
+            events: None,
+            streaming: false,
+            total_llm_latency_ms: 0,
+            compactor: None,
+            permission_hook: None,
+            hooks: HookRegistry::new(),
+            planning_mode: PlanningMode::Immediate,
+            plan_buffer: Some(vec![]),
+        };
+        agent.reject_plan("bad plan");
+        assert!(agent.plan_buffer.is_none());
+    }
+
+}
 // ============================================================================
+
 // Tracing tests - require tracing-test
 // ============================================================================
 #[cfg(test)]
@@ -2008,6 +2178,8 @@ mod tracing_tests {
         assert!(logs_contain("step="));
     }
 }
+
+// --- PlanningMode tests ---
 
 // ============================================================================
 // Parallel execution tests
