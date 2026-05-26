@@ -1,6 +1,14 @@
-# Loop State
+# Loop State — DEPRECATED
 
-> **Live session snapshot for the orchestrator.** This file changes
+> **⚠️ This file is frozen at batch 17 (2026-05-25, v0.1 era).**
+> It is no longer maintained. See `OPERATIONS.md` §10 for context.
+> For current project state, use: `ROADMAP-v3.md` + `git log` +
+> `observations/*.md`.
+
+---
+
+> *Original header (historical):*
+> Live session snapshot for the orchestrator. This file changes
 > every wake. Read it after `OPERATIONS.md` to know where the
 > previous orchestrator left off. Treat dates in UTC; product
 > baseline is whatever `git log -1` says on `main`.
