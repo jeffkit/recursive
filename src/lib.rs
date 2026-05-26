@@ -23,6 +23,7 @@ pub mod mcp_server;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod message;
+pub mod multi;
 pub mod runner;
 pub mod session;
 pub mod skills;
@@ -48,6 +49,7 @@ pub use mcp::{
 #[cfg(feature = "mcp")]
 pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
+pub use multi::{AgentPool, AgentRole};
 pub use runner::AgentRunner;
 pub use session::SessionFile;
 pub use skills::{
