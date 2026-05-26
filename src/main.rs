@@ -277,9 +277,7 @@ async fn main() -> anyhow::Result<()> {
             config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
         }
-        Cmd::Init => {
-            run_init().await
-        }
+        Cmd::Init => run_init().await,
         Cmd::Run { goal } => {
             run_once(
                 config,
@@ -423,7 +421,11 @@ async fn main() -> anyhow::Result<()> {
                     println!(
                         "\nconfig file:   {} {}",
                         path.display(),
-                        if path.exists() { "(exists)" } else { "(not found)" }
+                        if path.exists() {
+                            "(exists)"
+                        } else {
+                            "(not found)"
+                        }
                     );
                 }
                 Ok(())
@@ -1384,10 +1386,7 @@ async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
 ///
 /// This mode is designed to be used as a subprocess by MCP clients (e.g.
 /// Claude Desktop, VS Code extensions) that communicate via stdio.
-async fn run_mcp_server_stdio(
-    config: Config,
-    _mcp_config: Option<PathBuf>,
-) -> anyhow::Result<()> {
+async fn run_mcp_server_stdio(config: Config, _mcp_config: Option<PathBuf>) -> anyhow::Result<()> {
     // Build the tool registry (local tools only — no MCP servers, since
     // we *are* the MCP server).
     let tools = build_tools(&config).await;
@@ -1418,10 +1417,9 @@ async fn run_mcp_server_stdio(
             Err(e) => {
                 // Can't parse — write an error response if there's an id
                 // Try to extract an id from the raw JSON
-                let id: Option<serde_json::Value> =
-                    serde_json::from_str(&line).ok().and_then(|v: serde_json::Value| {
-                        v.get("id").cloned()
-                    });
+                let id: Option<serde_json::Value> = serde_json::from_str(&line)
+                    .ok()
+                    .and_then(|v: serde_json::Value| v.get("id").cloned());
                 let response = JsonRpcResponse::error(id, -32700, format!("Parse error: {e}"));
                 let output = serde_json::to_string(&response)?;
                 println!("{output}");
@@ -1517,32 +1515,24 @@ async fn dispatch_request_via_registry(
                 }
             }
         }
-        "resources/list" => {
-            Some(JsonRpcResponse::success(
-                id,
-                serde_json::json!({ "resources": [] }),
-            ))
-        }
-        "resources/read" => {
-            Some(JsonRpcResponse::error(
-                id,
-                -32601,
-                "resources/read not supported",
-            ))
-        }
-        "prompts/list" => {
-            Some(JsonRpcResponse::success(
-                id,
-                serde_json::json!({ "prompts": [] }),
-            ))
-        }
-        "prompts/get" => {
-            Some(JsonRpcResponse::error(
-                id,
-                -32601,
-                "prompts/get not supported",
-            ))
-        }
+        "resources/list" => Some(JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "resources": [] }),
+        )),
+        "resources/read" => Some(JsonRpcResponse::error(
+            id,
+            -32601,
+            "resources/read not supported",
+        )),
+        "prompts/list" => Some(JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "prompts": [] }),
+        )),
+        "prompts/get" => Some(JsonRpcResponse::error(
+            id,
+            -32601,
+            "prompts/get not supported",
+        )),
         _ => Some(JsonRpcResponse::method_not_found(id, &request.method)),
     }
 }
@@ -1618,7 +1608,17 @@ mod tests {
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
         let mut cfg_anthropic = dummy_config(tmp.path());
         cfg_anthropic.provider_type = "anthropic".into();
-        let r3 = build_agent(&cfg_anthropic, None, Vec::new(), false, false, None, false, None).await;
+        let r3 = build_agent(
+            &cfg_anthropic,
+            None,
+            Vec::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
         match original {
             Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),

@@ -1114,27 +1114,25 @@ pub async fn dispatch_request(
             // No response expected for notifications.
             None
         }
-        "tools/list" => {
-            match client.list_tools().await {
-                Ok(tools) => {
-                    let tools_arr: Vec<serde_json::Value> = tools
-                        .into_iter()
-                        .map(|t| {
-                            serde_json::json!({
-                                "name": t.name,
-                                "description": t.description,
-                                "inputSchema": t.input_schema,
-                            })
+        "tools/list" => match client.list_tools().await {
+            Ok(tools) => {
+                let tools_arr: Vec<serde_json::Value> = tools
+                    .into_iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
                         })
-                        .collect();
-                    Some(JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "tools": tools_arr }),
-                    ))
-                }
-                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+                    })
+                    .collect();
+                Some(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "tools": tools_arr }),
+                ))
             }
-        }
+            Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+        },
         "tools/call" => {
             let name = request
                 .params
@@ -1161,28 +1159,26 @@ pub async fn dispatch_request(
                 }
             }
         }
-        "resources/list" => {
-            match client.list_resources().await {
-                Ok(resources) => {
-                    let resources_arr: Vec<serde_json::Value> = resources
-                        .into_iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "uri": r.uri,
-                                "name": r.name,
-                                "description": r.description,
-                                "mimeType": r.mime_type,
-                            })
+        "resources/list" => match client.list_resources().await {
+            Ok(resources) => {
+                let resources_arr: Vec<serde_json::Value> = resources
+                    .into_iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "uri": r.uri,
+                            "name": r.name,
+                            "description": r.description,
+                            "mimeType": r.mime_type,
                         })
-                        .collect();
-                    Some(JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "resources": resources_arr }),
-                    ))
-                }
-                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+                    })
+                    .collect();
+                Some(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "resources": resources_arr }),
+                ))
             }
-        }
+            Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+        },
         "resources/read" => {
             let uri = request
                 .params
@@ -1211,36 +1207,35 @@ pub async fn dispatch_request(
                 Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
             }
         }
-        "prompts/list" => {
-            match client.list_prompts().await {
-                Ok(prompts) => {
-                    let prompts_arr: Vec<serde_json::Value> = prompts
-                        .into_iter()
-                        .map(|p| {
-                            serde_json::json!({
-                                "name": p.name,
-                                "description": p.description,
-                                "arguments": p.arguments,
-                            })
+        "prompts/list" => match client.list_prompts().await {
+            Ok(prompts) => {
+                let prompts_arr: Vec<serde_json::Value> = prompts
+                    .into_iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.name,
+                            "description": p.description,
+                            "arguments": p.arguments,
                         })
-                        .collect();
-                    Some(JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "prompts": prompts_arr }),
-                    ))
-                }
-                Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+                    })
+                    .collect();
+                Some(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "prompts": prompts_arr }),
+                ))
             }
-        }
+            Err(e) => Some(JsonRpcResponse::internal_error(id, e.to_string())),
+        },
         "prompts/get" => {
             let name = request
                 .params
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let arguments = request.params.get("arguments").and_then(|v| {
-                serde_json::from_value::<HashMap<String, String>>(v.clone()).ok()
-            });
+            let arguments = request
+                .params
+                .get("arguments")
+                .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok());
 
             match client.get_prompt(name, arguments).await {
                 Ok(messages) => {

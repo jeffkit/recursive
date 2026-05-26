@@ -567,10 +567,7 @@ fn serialize_message(m: &Message) -> Value {
     }
     // Echo reasoning_content back to the API (required by DeepSeek thinking mode)
     if let Some(ref reasoning) = m.reasoning_content {
-        obj.insert(
-            "reasoning_content".into(),
-            Value::String(reasoning.clone()),
-        );
+        obj.insert("reasoning_content".into(), Value::String(reasoning.clone()));
     }
     if !m.tool_calls.is_empty() {
         let calls: Vec<Value> = m

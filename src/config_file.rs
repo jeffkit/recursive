@@ -3,9 +3,9 @@
 //! Priority chain: CLI flag > env var > config file > hardcoded default.
 //! The config file is optional — if absent, we gracefully fall back.
 
+use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use crate::error::{Error, Result};
 
 /// Return the path to the global config file: ~/.recursive/config.toml.
 /// Returns None if the home directory cannot be determined.
@@ -67,10 +67,9 @@ impl FileConfig {
 /// Supports dotted keys like "provider.model", "agent.max_steps".
 /// Creates the file and parent directory if needed.
 pub fn set_value(key: &str, value: &str) -> Result<()> {
-    let path = config_file_path()
-        .ok_or_else(|| Error::Config {
-            message: "cannot determine home directory".into(),
-        })?;
+    let path = config_file_path().ok_or_else(|| Error::Config {
+        message: "cannot determine home directory".into(),
+    })?;
 
     // Ensure directory exists
     if let Some(parent) = path.parent() {
@@ -100,9 +99,11 @@ pub fn set_value(key: &str, value: &str) -> Result<()> {
         [field] => {
             doc.insert(field.to_string(), smart_value(value));
         }
-        _ => return Err(Error::Config {
-            message: format!("invalid key format: {key}"),
-        }),
+        _ => {
+            return Err(Error::Config {
+                message: format!("invalid key format: {key}"),
+            })
+        }
     }
 
     let toml_str = toml::to_string_pretty(&doc).map_err(|e| Error::Config {
@@ -180,10 +181,7 @@ temperature = 0.5
         assert_eq!(smart_value("42"), toml::Value::Integer(42));
         assert_eq!(smart_value("0.5"), toml::Value::Float(0.5));
         assert_eq!(smart_value("true"), toml::Value::Boolean(true));
-        assert_eq!(
-            smart_value("hello"),
-            toml::Value::String("hello".into())
-        );
+        assert_eq!(smart_value("hello"), toml::Value::String("hello".into()));
     }
 
     #[test]

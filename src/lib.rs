@@ -21,6 +21,7 @@ pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
 pub mod message;
+pub mod runner;
 pub mod session;
 pub mod skills;
 pub mod tools;
@@ -38,13 +39,14 @@ pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
 #[cfg(feature = "mcp")]
 pub use mcp::{
-    discover_mcp_servers, load_mcp_config,
-    McpClient, McpPrompt, McpPromptArgument, McpPromptMessage, McpResource, McpResourceContent,
-    McpServer, McpServerConfig, McpTool, McpToolSpec, ServerCapabilities,
+    discover_mcp_servers, load_mcp_config, McpClient, McpPrompt, McpPromptArgument,
+    McpPromptMessage, McpResource, McpResourceContent, McpServer, McpServerConfig, McpTool,
+    McpToolSpec, ServerCapabilities,
 };
 #[cfg(feature = "mcp")]
 pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
+pub use runner::AgentRunner;
 pub use session::SessionFile;
 pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
