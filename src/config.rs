@@ -14,6 +14,7 @@ pub struct Config {
     pub api_base: String,
     pub api_key: Option<String>,
     pub model: String,
+    pub provider_type: String,
     pub max_steps: usize,
     pub temperature: f64,
     pub system_prompt: String,
@@ -24,33 +25,51 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load from environment. The API key is optional here so commands that
-    /// don't need the LLM (e.g. `tools`, future offline ones) still run.
+    /// Load from environment, with config file (~/.recursive/config.toml) as fallback.
+    /// Priority: env var > config file > hardcoded default.
+    /// The API key is optional here so commands that don't need the LLM
+    /// (e.g. `tools`, `config`) still run.
     pub fn from_env() -> Result<Self> {
+        // Load file config (lowest priority, used as fallback)
+        let file_config = crate::config_file::FileConfig::load()
+            .map_err(|e| Error::Config {
+                message: format!("config file: {e}"),
+            })?
+            .unwrap_or_default();
+        let file_provider = file_config.provider.as_ref();
+        let file_agent = file_config.agent.as_ref();
+
         let workspace = std::env::var("RECURSIVE_WORKSPACE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         let api_base = std::env::var("RECURSIVE_API_BASE")
             .or_else(|_| std::env::var("OPENAI_API_BASE"))
-            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            .ok()
+            .or_else(|| file_provider.and_then(|p| p.api_base.clone()))
+            .unwrap_or_else(|| "https://api.openai.com/v1".into());
 
         let api_key = std::env::var("RECURSIVE_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok();
+            .ok()
+            .or_else(|| file_provider.and_then(|p| p.api_key.clone()));
 
         let model = std::env::var("RECURSIVE_MODEL")
             .or_else(|_| std::env::var("OPENAI_MODEL"))
-            .unwrap_or_else(|_| "gpt-4o-mini".into());
+            .ok()
+            .or_else(|| file_provider.and_then(|p| p.model.clone()))
+            .unwrap_or_else(|| "gpt-4o-mini".into());
 
         let max_steps = std::env::var("RECURSIVE_MAX_STEPS")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| file_agent.and_then(|a| a.max_steps))
             .unwrap_or(32);
 
         let temperature = std::env::var("RECURSIVE_TEMPERATURE")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| file_agent.and_then(|a| a.temperature))
             .unwrap_or(0.2);
 
         let system_prompt = match std::env::var("RECURSIVE_SYSTEM_PROMPT_FILE") {
@@ -75,13 +94,20 @@ impl Config {
         let shell_timeout_secs = std::env::var("RECURSIVE_SHELL_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| file_agent.and_then(|a| a.shell_timeout_secs))
             .unwrap_or(300);
+
+        let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
+            .ok()
+            .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
+            .unwrap_or_else(|| "openai".into());
 
         Ok(Self {
             workspace,
             api_base,
             api_key,
             model,
+            provider_type,
             max_steps,
             temperature,
             system_prompt,
@@ -97,6 +123,41 @@ impl Config {
         self.api_key.as_deref().ok_or_else(|| Error::Config {
             message: "set RECURSIVE_API_KEY (or OPENAI_API_KEY)".into(),
         })
+    }
+
+    /// Validate that the config has enough information to run the agent.
+    /// Returns a user-friendly error message if not.
+    pub fn validate_for_agent(&self) -> std::result::Result<(), String> {
+        if self.api_key.is_none() || self.api_key.as_deref() == Some("") {
+            return Err("\
+Error: No API key configured.
+
+Set one of:
+  --api-key <KEY>
+  RECURSIVE_API_KEY=<KEY>
+  OPENAI_API_KEY=<KEY>
+
+Or create ~/.recursive/config.toml:
+  [provider]
+  api_key = \"your-key-here\"
+
+Example:
+  recursive --api-key sk-xxx --model deepseek-chat run \"hello\"
+"
+            .to_string());
+        }
+        if !["openai", "anthropic"].contains(&self.provider_type.as_str()) {
+            return Err(format!(
+                "\
+Error: Unknown provider type '{}'.
+
+Supported providers: openai, anthropic
+Set via --provider or RECURSIVE_PROVIDER_TYPE.
+",
+                self.provider_type
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -217,6 +278,7 @@ mod tests {
             api_base: String::new(),
             api_key: None,
             model: String::new(),
+            provider_type: "openai".into(),
             max_steps: 32,
             temperature: 0.2,
             system_prompt: String::new(),

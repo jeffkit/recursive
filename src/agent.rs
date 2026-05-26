@@ -232,6 +232,19 @@ impl Agent {
         AgentBuilder::default()
     }
 
+    /// Restore transcript for multi-turn reuse. Call after `run()` returns
+    /// to re-seed the agent with the conversation history.
+    pub fn set_transcript(&mut self, transcript: Vec<Message>) {
+        self.transcript = transcript;
+    }
+
+    /// Replace the events channel. Dropping the old sender closes its
+    /// channel (letting any spawned printer task finish). Pass `None` to
+    /// disable event emission entirely.
+    pub fn set_events(&mut self, tx: Option<mpsc::UnboundedSender<StepEvent>>) {
+        self.events = tx;
+    }
+
     /// Confirm a proposed plan, allowing execution to proceed.
     pub fn confirm_plan(&mut self) {
         self.plan_confirmed = true;
@@ -534,6 +547,12 @@ impl Agent {
 
                 self.transcript
                     .push(Message::assistant(completion.content.clone()));
+                // Preserve reasoning_content for DeepSeek thinking mode
+                if completion.reasoning_content.is_some() {
+                    if let Some(msg) = self.transcript.last_mut() {
+                        msg.reasoning_content = completion.reasoning_content.clone();
+                    }
+                }
                 let finish = match completion.finish_reason {
                     Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
                     _ => FinishReason::NoMoreToolCalls,
@@ -559,6 +578,12 @@ impl Agent {
                 completion.content.clone(),
                 completion.tool_calls.clone(),
             ));
+            // Preserve reasoning_content for DeepSeek thinking mode
+            if completion.reasoning_content.is_some() {
+                if let Some(msg) = self.transcript.last_mut() {
+                    msg.reasoning_content = completion.reasoning_content.clone();
+                }
+            }
 
             // Phase 1: emit ToolCall events for all calls
             for call in &completion.tool_calls {
@@ -1025,6 +1050,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let out = agent.run("hi").await.unwrap();
@@ -1045,12 +1071,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "5".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1075,6 +1103,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -1105,12 +1134,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "ok i give up".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
@@ -1137,12 +1168,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "two".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1190,6 +1223,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -1218,6 +1252,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("length".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let err = agent.run("hi").await.unwrap_err();
@@ -1238,6 +1273,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -1287,6 +1323,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -1344,12 +1381,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: Some(u1),
+                reasoning_content: None,
             },
             Completion {
                 content: "step 2".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: Some(u2),
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1368,6 +1407,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let out = agent.run("hi").await.unwrap();
@@ -1389,6 +1429,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(u),
+            reasoning_content: None,
         }]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut agent = Agent::builder().llm(llm).events(tx).build().unwrap();
@@ -1420,6 +1461,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             });
         }
         let llm = Arc::new(MockProvider::new(script));
@@ -1451,12 +1493,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "5".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1505,6 +1549,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "second call".into(),
@@ -1515,6 +1560,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             // This completion is consumed by the compactor
             Completion {
@@ -1522,6 +1568,7 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
             // This completion is the agent's next step after compaction
             Completion {
@@ -1529,6 +1576,7 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1585,12 +1633,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1649,6 +1699,7 @@ mod tests {
                 }],
                 finish_reason: None,
                 usage: None,
+                reasoning_content: None,
             },
             // Summary returned by the compactor's call to provider.complete()
             Completion {
@@ -1656,12 +1707,14 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".to_string()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".to_string(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".to_string()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1789,6 +1842,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder()
             .llm(llm)
@@ -1816,6 +1870,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut agent = Agent::builder()
@@ -1851,12 +1906,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "step 2".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -1900,12 +1957,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         // Use a custom tool that returns a big result
@@ -1967,12 +2026,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "y".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -2005,12 +2066,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "5".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -2039,12 +2102,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "i see the error".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -2081,12 +2146,14 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
         let tools = ToolRegistry::local().register(Arc::new(Adder));
@@ -2117,6 +2184,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let out = agent.run("hi").await.unwrap();
@@ -2143,6 +2211,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let agent = Agent::builder()
             .llm(llm)
@@ -2160,6 +2229,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         let outcome = agent.run("test").await.unwrap();
@@ -2272,6 +2342,7 @@ mod tracing_tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         agent.run("test goal").await.unwrap();
@@ -2288,6 +2359,7 @@ mod tracing_tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
         let mut agent = Agent::builder().llm(llm).build().unwrap();
         agent.run("test").await.unwrap();
@@ -2393,12 +2465,14 @@ mod parallel_tests {
                 ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2460,12 +2534,14 @@ mod parallel_tests {
                 ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2528,12 +2604,14 @@ mod parallel_tests {
                 ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2584,12 +2662,14 @@ mod parallel_tests {
                 ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2653,12 +2733,14 @@ mod parallel_tests {
                 ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2710,12 +2792,14 @@ mod parallel_tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2769,12 +2853,14 @@ mod parallel_tests {
                 ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -2808,6 +2894,7 @@ mod parallel_tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]));
 
         let mut agent = Agent::builder().llm(llm).max_steps(5).build().unwrap();

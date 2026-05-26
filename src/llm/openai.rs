@@ -425,6 +425,7 @@ impl OpenAiProvider {
         stream_tx: Option<StreamSender>,
     ) -> Result<Completion> {
         let mut content = String::new();
+        let mut reasoning_content = String::new();
         let tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<TokenUsage> = None;
@@ -455,6 +456,14 @@ impl OpenAiProvider {
                                     if let Some(ref tx) = stream_tx {
                                         let _ = tx.send(delta_content.to_string());
                                     }
+                                }
+                            }
+                            // Accumulate reasoning_content deltas (DeepSeek thinking mode)
+                            if let Some(delta_reasoning) =
+                                delta.get("reasoning_content").and_then(|c| c.as_str())
+                            {
+                                if !delta_reasoning.is_empty() {
+                                    reasoning_content.push_str(delta_reasoning);
                                 }
                             }
                         }
@@ -501,6 +510,11 @@ impl OpenAiProvider {
             tool_calls,
             finish_reason,
             usage,
+            reasoning_content: if reasoning_content.is_empty() {
+                None
+            } else {
+                Some(reasoning_content)
+            },
         })
     }
 }
@@ -550,6 +564,13 @@ fn serialize_message(m: &Message) -> Value {
     obj.insert("content".into(), Value::String(m.content.clone()));
     if let Some(id) = &m.tool_call_id {
         obj.insert("tool_call_id".into(), Value::String(id.clone()));
+    }
+    // Echo reasoning_content back to the API (required by DeepSeek thinking mode)
+    if let Some(ref reasoning) = m.reasoning_content {
+        obj.insert(
+            "reasoning_content".into(),
+            Value::String(reasoning.clone()),
+        );
     }
     if !m.tool_calls.is_empty() {
         let calls: Vec<Value> = m
@@ -616,6 +637,8 @@ struct ChatChoiceMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<RawToolCall>,
 }
 
@@ -636,6 +659,7 @@ struct RawFunction {
 
 fn parse_completion(choice: ChatChoice, usage: Option<ResponseUsage>) -> Completion {
     let content = choice.message.content.unwrap_or_default();
+    let reasoning_content = choice.message.reasoning_content;
     let tool_calls = choice
         .message
         .tool_calls
@@ -659,6 +683,7 @@ fn parse_completion(choice: ChatChoice, usage: Option<ResponseUsage>) -> Complet
         tool_calls,
         finish_reason: choice.finish_reason,
         usage: usage.map(|u| u.to_token_usage()),
+        reasoning_content,
     }
 }
 
@@ -922,6 +947,7 @@ data: [DONE]\n\n";
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider

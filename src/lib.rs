@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod compact;
 pub mod config;
+pub mod config_file;
 pub mod error;
 pub mod hooks;
 pub mod llm;

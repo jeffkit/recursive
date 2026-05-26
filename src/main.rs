@@ -46,6 +46,22 @@ struct Cli {
     #[arg(long, env = "RECURSIVE_WORKSPACE")]
     workspace: Option<PathBuf>,
 
+    /// LLM model identifier (e.g., deepseek-chat, gpt-4o-mini, claude-sonnet-4-20250514).
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+
+    /// API key for the LLM provider.
+    #[arg(long, short = 'k', hide_env_values = true)]
+    api_key: Option<String>,
+
+    /// Base URL for the LLM API endpoint.
+    #[arg(long)]
+    api_base: Option<String>,
+
+    /// LLM provider protocol type.
+    #[arg(long, value_parser = ["openai", "anthropic"])]
+    provider: Option<String>,
+
     /// Maximum agent loop iterations per goal.
     #[arg(long, env = "RECURSIVE_MAX_STEPS")]
     max_steps: Option<usize>,
@@ -97,7 +113,11 @@ struct Cli {
     pricing_file: Option<PathBuf>,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+
+    /// Run a one-shot prompt (non-interactive). Like `recursive run` but shorter.
+    #[arg(short = 'p', long = "print")]
+    prompt: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -107,8 +127,10 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         goal: Vec<String>,
     },
-    /// Read goals from stdin, one per line.
+    /// Interactive multi-turn REPL (default when no command is given).
     Repl,
+    /// Interactive setup wizard — configure provider, model, and API key.
+    Init,
     /// Print registered tool specs as JSON (sanity check).
     Tools,
     /// Pretty-print a previously saved transcript JSON file, or resume a
@@ -144,12 +166,32 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// View or modify configuration.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum SessionCmd {
     /// List all session files in the workspace's session directory.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// Display the effective configuration (API keys are masked).
+    Show,
+    /// Set a config value in ~/.recursive/config.toml.
+    Set {
+        /// Config key (e.g., provider.model, agent.max_steps).
+        key: String,
+        /// Value to set.
+        value: String,
+    },
+    /// Print the config file path.
+    Path,
 }
 
 #[tokio::main]
@@ -163,6 +205,18 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(n) = cli.max_steps {
         config.max_steps = n;
+    }
+    if let Some(m) = cli.model {
+        config.model = m;
+    }
+    if let Some(k) = cli.api_key {
+        config.api_key = Some(k);
+    }
+    if let Some(b) = cli.api_base {
+        config.api_base = b;
+    }
+    if let Some(p) = cli.provider {
+        config.provider_type = p;
     }
     if let Some(p) = cli.system_prompt_file {
         config.system_prompt = std::fs::read_to_string(&p)
@@ -189,12 +243,30 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-    match cli.cmd {
+    // Determine effective command:
+    // - Explicit subcommand → use it
+    // - `-p "goal"` → one-shot run (like `claude -p`)
+    // - Nothing → interactive REPL
+    let effective_cmd = match cli.cmd {
+        Some(cmd) => cmd,
+        None => {
+            if let Some(prompt) = cli.prompt {
+                Cmd::Run { goal: vec![prompt] }
+            } else {
+                Cmd::Repl
+            }
+        }
+    };
+
+    match effective_cmd {
         Cmd::Tools => {
             let tools = build_tools(&config).await;
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
+        }
+        Cmd::Init => {
+            run_init().await
         }
         Cmd::Run { goal } => {
             run_once(
@@ -220,6 +292,8 @@ async fn main() -> anyhow::Result<()> {
                 cli.plan_first,
                 cli.mcp_config,
                 external_pricing,
+                cli.stream,
+                cli.hook_timing,
             )
             .await
         }
@@ -322,6 +396,49 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        Cmd::Config { cmd } => match cmd {
+            ConfigCmd::Show => {
+                println!("# Effective configuration (env > config file > default)");
+                println!("provider_type: {}", config.provider_type);
+                println!("model:         {}", config.model);
+                println!("api_base:      {}", config.api_base);
+                println!("api_key:       {}", mask_key(config.api_key.as_deref()));
+                println!("workspace:     {}", config.workspace.display());
+                println!("max_steps:     {}", config.max_steps);
+                println!("temperature:   {}", config.temperature);
+                println!("shell_timeout: {}s", config.shell_timeout_secs);
+                if let Some(path) = recursive::config_file::config_file_path() {
+                    println!(
+                        "\nconfig file:   {} {}",
+                        path.display(),
+                        if path.exists() { "(exists)" } else { "(not found)" }
+                    );
+                }
+                Ok(())
+            }
+            ConfigCmd::Set { key, value } => {
+                recursive::config_file::set_value(&key, &value)?;
+                if let Some(path) = recursive::config_file::config_file_path() {
+                    println!("Set {} = {} in {}", key, value, path.display());
+                }
+                Ok(())
+            }
+            ConfigCmd::Path => {
+                match recursive::config_file::config_file_path() {
+                    Some(p) => println!("{}", p.display()),
+                    None => anyhow::bail!("could not determine home directory"),
+                }
+                Ok(())
+            }
+        },
+    }
+}
+
+fn mask_key(key: Option<&str>) -> String {
+    match key {
+        None => "(not set)".to_string(),
+        Some(k) if k.len() <= 8 => "****".to_string(),
+        Some(k) => format!("{}...{}", &k[..4], &k[k.len() - 4..]),
     }
 }
 
@@ -494,11 +611,8 @@ async fn build_agent(
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     // Provider selector: `openai` (default) uses the OpenAI-compatible adapter,
-    // `anthropic` switches to the Anthropic Messages API adapter. Both MiniMax
-    // and DeepSeek expose Anthropic-compatible endpoints, so the same config
-    // (api_base, model, api_key) can target either path depending on this env.
-    let provider_type =
-        std::env::var("RECURSIVE_PROVIDER_TYPE").unwrap_or_else(|_| "openai".to_string());
+    // `anthropic` switches to the Anthropic Messages API adapter.
+    let provider_type = &config.provider_type;
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
@@ -849,7 +963,7 @@ async fn run_resumed(
                 &outcome,
                 goal,
                 &config.model,
-                &std::env::var("RECURSIVE_PROVIDER_TYPE").unwrap_or_else(|_| "openai".to_string()),
+                &config.provider_type,
                 &tool_specs,
                 &path,
             )?;
@@ -872,6 +986,10 @@ async fn run_once(
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
 ) -> anyhow::Result<()> {
+    if let Err(msg) = config.validate_for_agent() {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
     let (mut agent, rx) = build_agent(
         &config,
         max_transcript_chars,
@@ -937,7 +1055,7 @@ async fn run_once(
                 &outcome,
                 goal,
                 &config.model,
-                &std::env::var("RECURSIVE_PROVIDER_TYPE").unwrap_or_else(|_| "openai".to_string()),
+                &config.provider_type,
                 &tool_specs,
                 &path,
             )?;
@@ -946,6 +1064,110 @@ async fn run_once(
     exit_for_finish(&outcome.finish, outcome.steps)
 }
 
+/// Interactive setup wizard: walk the user through provider/model/key config.
+async fn run_init() -> anyhow::Result<()> {
+    use std::io::{self, Write};
+
+    println!("recursive init — interactive setup\n");
+
+    let config_path = recursive::config_file::config_file_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+
+    if config_path.exists() {
+        println!("  Existing config: {}\n", config_path.display());
+    }
+
+    // 1. Provider type
+    println!("Which LLM provider protocol?");
+    println!("  1) openai   — OpenAI, DeepSeek, GLM/Zhipu, Moonshot, Ollama, vLLM, ...");
+    println!("  2) anthropic — Anthropic (Claude)");
+    print!("\nChoice [1]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let provider_type = match input.trim() {
+        "2" | "anthropic" => "anthropic",
+        _ => "openai",
+    };
+
+    // 2. API base
+    let default_base = if provider_type == "anthropic" {
+        "https://api.anthropic.com"
+    } else {
+        "https://api.openai.com/v1"
+    };
+    println!("\nAPI base URL");
+    println!("  Common options:");
+    if provider_type == "openai" {
+        println!("    https://api.openai.com/v1       (OpenAI)");
+        println!("    https://api.deepseek.com        (DeepSeek)");
+        println!("    https://open.bigmodel.cn/api/paas/v4  (GLM/Zhipu)");
+        println!("    http://localhost:11434/v1        (Ollama)");
+    } else {
+        println!("    https://api.anthropic.com       (Anthropic)");
+    }
+    print!("\nAPI base [{}]: ", default_base);
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    let api_base = if input.trim().is_empty() {
+        default_base.to_string()
+    } else {
+        input.trim().to_string()
+    };
+
+    // 3. Model
+    let default_model = if api_base.contains("deepseek") {
+        "deepseek-chat"
+    } else if api_base.contains("bigmodel") {
+        "glm-4-flash"
+    } else if api_base.contains("anthropic") {
+        "claude-sonnet-4-20250514"
+    } else if api_base.contains("localhost") || api_base.contains("11434") {
+        "qwen2.5-coder"
+    } else {
+        "gpt-4o-mini"
+    };
+    print!("\nModel [{}]: ", default_model);
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    let model = if input.trim().is_empty() {
+        default_model.to_string()
+    } else {
+        input.trim().to_string()
+    };
+
+    // 4. API key
+    print!("\nAPI key: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    let api_key = input.trim().to_string();
+
+    if api_key.is_empty() {
+        println!("\n  Warning: no API key set. You can add it later:");
+        println!("    recursive config set provider.api_key <KEY>");
+    }
+
+    // Write config
+    recursive::config_file::set_value("provider.type", provider_type)?;
+    recursive::config_file::set_value("provider.api_base", &api_base)?;
+    recursive::config_file::set_value("provider.model", &model)?;
+    if !api_key.is_empty() {
+        recursive::config_file::set_value("provider.api_key", &api_key)?;
+    }
+
+    println!("\n  Config saved to: {}", config_path.display());
+    println!("\n  You can now run:");
+    println!("    recursive                — interactive REPL");
+    println!("    recursive -p \"hello\"     — one-shot");
+    println!("    recursive config show    — verify settings");
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn repl(
     config: Config,
     max_transcript_chars: Option<usize>,
@@ -953,9 +1175,43 @@ async fn repl(
     plan_first: bool,
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
+    stream: bool,
+    hook_timing: bool,
 ) -> anyhow::Result<()> {
+    if let Err(msg) = config.validate_for_agent() {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+    if !json_mode {
+        let version = env!("CARGO_PKG_VERSION");
+        eprintln!(
+            "recursive v{}\nmodel: {} | provider: {} | workspace: {}\nType your goal, or :q to quit.\n",
+            version,
+            config.model,
+            config.provider_type,
+            config.workspace.display()
+        );
+    }
+
+    // Build agent ONCE — MCP servers are spawned here and stay alive.
+    let (mut agent, rx) = build_agent(
+        &config,
+        max_transcript_chars,
+        Vec::new(),
+        stream,
+        plan_first,
+        mcp_config,
+        hook_timing,
+        None,
+    )
+    .await?;
+    // Drop the initial rx (no events to print before first turn)
+    drop(rx);
+
+    let mut total_turns = 0usize;
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
+
     loop {
         eprint!("recursive> ");
         use std::io::Write;
@@ -970,30 +1226,32 @@ async fn repl(
         if matches!(goal, ":q" | ":quit" | "exit") {
             break;
         }
-        let (mut agent, rx) = build_agent(
-            &config,
-            max_transcript_chars,
-            Vec::new(),
-            false,
-            plan_first,
-            mcp_config.clone(),
-            false,
-            None,
-        )
-        .await?;
+        if goal == ":clear" {
+            agent.set_transcript(Vec::new());
+            total_turns = 0;
+            if !json_mode {
+                eprintln!("(conversation cleared)");
+            }
+            continue;
+        }
+
+        // Create a fresh events channel for this turn
+        let (tx, rx) = mpsc::unbounded_channel();
+        agent.set_events(Some(tx));
+
         let printer = if json_mode {
             tokio::spawn(stream_events_json(rx))
         } else {
-            tokio::spawn(stream_events(rx))
+            tokio::spawn(stream_events_repl(rx))
         };
+
         match agent.run(goal.to_string()).await {
             Ok(outcome) => {
-                drop(agent);
+                // Close the events channel so the printer task finishes
+                agent.set_events(None);
                 printer.await.ok();
+
                 if !json_mode {
-                    if let Some(msg) = outcome.final_message {
-                        println!("\n=== final ===\n{msg}\n");
-                    }
                     print_usage(
                         outcome.total_usage,
                         &config.model,
@@ -1003,11 +1261,20 @@ async fn repl(
                     );
                     print_finish_note(&outcome.finish);
                 }
+
+                // Restore transcript for next turn (run() takes it via mem::take)
+                agent.set_transcript(outcome.transcript);
+                total_turns += 1;
             }
             Err(e) => {
+                agent.set_events(None);
+                printer.await.ok();
                 eprintln!("error: {e}");
             }
         }
+    }
+    if !json_mode && total_turns > 0 {
+        eprintln!("session: {} turn(s)", total_turns);
     }
     Ok(())
 }
@@ -1037,20 +1304,11 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
             StepEvent::Finished { reason, steps } => {
                 println!("[done after {steps} steps] reason: {:?}", reason);
             }
-            StepEvent::Usage { .. } => {
-                // Usage events are already accumulated and printed at end of run
-            }
+            StepEvent::Usage { .. } => {}
             StepEvent::Latency { step, llm_ms } => {
                 println!("[step {step}] llm latency: {llm_ms}ms");
             }
-            StepEvent::PartialToken { .. } => {
-                // Deltas are forwarded through the events channel.
-                // Print them live on stderr (no newline, tokens accumulate).
-                // The `text` field is destructured above; we use `..` here
-                // because the handler in `stream_events` is for non-streaming
-                // mode. In streaming mode, deltas are printed by the agent
-                // loop's spawned task.
-            }
+            StepEvent::PartialToken { .. } => {}
             StepEvent::Compacted {
                 removed,
                 kept,
@@ -1075,6 +1333,29 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
     }
 }
 
+/// REPL-specific event handler: clean output without step prefixes on assistant text.
+/// Tool calls are shown briefly; assistant text is printed directly.
+async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            StepEvent::AssistantText { ref text, .. } if !text.trim().is_empty() => {
+                println!("{text}");
+            }
+            StepEvent::AssistantText { .. } => {}
+            StepEvent::ToolCall { call, .. } => {
+                eprintln!("  ↳ {}", call.name);
+            }
+            StepEvent::ToolResult { .. } => {}
+            StepEvent::Finished { .. } => {}
+            StepEvent::Usage { .. } => {}
+            StepEvent::Latency { .. } => {}
+            StepEvent::PartialToken { .. } => {}
+            StepEvent::Compacted { .. } => {}
+            _ => {}
+        }
+    }
+}
+
 async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
     while let Some(ev) = rx.recv().await {
         if let Ok(line) = serde_json::to_string(&ev) {
@@ -1093,6 +1374,7 @@ mod tests {
             api_base: "https://example.invalid/v1".into(),
             api_key: Some("dummy-test-key".into()),
             model: "test-model".into(),
+            provider_type: "openai".into(),
             max_steps: 1,
             temperature: 0.0,
             system_prompt: "test".into(),
@@ -1151,7 +1433,9 @@ mod tests {
 
         let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
-        let r3 = build_agent(&cfg, None, Vec::new(), false, false, None, false, None).await;
+        let mut cfg_anthropic = dummy_config(tmp.path());
+        cfg_anthropic.provider_type = "anthropic".into();
+        let r3 = build_agent(&cfg_anthropic, None, Vec::new(), false, false, None, false, None).await;
         match original {
             Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),

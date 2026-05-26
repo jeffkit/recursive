@@ -223,6 +223,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
 
         let transcript = vec![
@@ -249,6 +250,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
 
         let transcript = vec![
@@ -275,6 +277,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
 
         let transcript = vec![Message::user("only message".to_string())];
@@ -367,6 +370,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
 
         let transcript = vec![
@@ -394,6 +398,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }])
         .with_structured_responses(vec![Ok(json)]);
 

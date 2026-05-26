@@ -49,12 +49,14 @@ async fn main() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "I greeted Alice.".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ]));
 

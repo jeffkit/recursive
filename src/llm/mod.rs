@@ -282,12 +282,15 @@ pub struct StructuredRequest {
 }
 
 /// One step of model output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Completion {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
     pub usage: Option<TokenUsage>,
+    /// DeepSeek reasoning/thinking content. Stored in the transcript and
+    /// echoed back on subsequent requests to satisfy the API contract.
+    pub reasoning_content: Option<String>,
 }
 
 #[async_trait]

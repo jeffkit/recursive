@@ -113,12 +113,14 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
             Completion {
                 content: "two".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]);
 
@@ -163,6 +165,7 @@ mod tracing_tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(usage),
+            reasoning_content: None,
         }]);
 
         provider.complete(&[], &[]).await.unwrap();

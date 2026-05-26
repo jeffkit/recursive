@@ -28,6 +28,7 @@ async fn agent_writes_reads_and_summarises() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "".into(),
@@ -38,6 +39,7 @@ async fn agent_writes_reads_and_summarises() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "".into(),
@@ -48,12 +50,14 @@ async fn agent_writes_reads_and_summarises() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "Created greet.txt containing 'hello recursive'.".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 

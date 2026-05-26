@@ -13,6 +13,7 @@ async fn main() {
         tool_calls: vec![],
         finish_reason: Some("stop".into()),
         usage: None,
+        reasoning_content: None,
     }]));
 
     // Build the agent with the mock provider.

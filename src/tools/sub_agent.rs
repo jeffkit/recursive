@@ -219,6 +219,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -262,6 +263,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         }]);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -303,6 +305,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             });
         }
 
@@ -369,6 +372,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             // 2. Grandchild agent: tries to spawn deeper (denied)
             Completion {
@@ -380,6 +384,7 @@ mod tests {
                 }],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
+                reasoning_content: None,
             },
             // 3. Grandchild agent: finishes after seeing depth error
             Completion {
@@ -387,6 +392,7 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
             // 4. Child agent: finishes
             Completion {
@@ -394,6 +400,7 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]);
 

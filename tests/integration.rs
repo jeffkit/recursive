@@ -100,6 +100,7 @@ async fn hooks_and_compaction() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "listing dir".into(),
@@ -110,6 +111,7 @@ async fn hooks_and_compaction() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "reading again".into(),
@@ -120,6 +122,7 @@ async fn hooks_and_compaction() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         // This completion is consumed by the compactor
         Completion {
@@ -127,6 +130,7 @@ async fn hooks_and_compaction() {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
         // Final completion after compaction
         Completion {
@@ -134,6 +138,7 @@ async fn hooks_and_compaction() {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 
@@ -253,6 +258,7 @@ async fn permission_hook_and_sub_agent() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         // 2. Sub-agent tries run_shell (denied by permission hook)
         Completion {
@@ -264,6 +270,7 @@ async fn permission_hook_and_sub_agent() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         // 3. Sub-agent tries read_file (allowed)
         Completion {
@@ -275,6 +282,7 @@ async fn permission_hook_and_sub_agent() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         // 4. Sub-agent finishes
         Completion {
@@ -282,6 +290,7 @@ async fn permission_hook_and_sub_agent() {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
         // 5. Parent finishes
         Completion {
@@ -289,6 +298,7 @@ async fn permission_hook_and_sub_agent() {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 
@@ -407,12 +417,14 @@ async fn skill_index_injection() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "skill loaded successfully".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 
@@ -482,12 +494,14 @@ async fn session_pause_and_resume() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "I see the config".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 
@@ -549,12 +563,14 @@ async fn session_pause_and_resume() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "resume complete".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 
@@ -632,12 +648,14 @@ async fn tool_transport_explicit() {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            reasoning_content: None,
         },
         Completion {
             content: "transport test complete".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            reasoning_content: None,
         },
     ];
 

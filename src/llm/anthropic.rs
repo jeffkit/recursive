@@ -520,6 +520,7 @@ impl AnthropicProvider {
                 other => other.to_string(),
             }),
             usage,
+            reasoning_content: None,
         })
     }
 }
@@ -725,6 +726,7 @@ fn parse_completion(response: AnthropicResponse) -> Completion {
         tool_calls,
         finish_reason,
         usage: response.usage.map(|u| u.to_token_usage()),
+        reasoning_content: None,
     }
 }
 

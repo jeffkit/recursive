@@ -25,6 +25,10 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// DeepSeek reasoning/thinking content. Must be echoed back to the API
+    /// when present, otherwise the API returns a 400 error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -34,6 +38,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -43,6 +48,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -52,6 +58,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -64,6 +71,7 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -73,6 +81,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
         }
     }
 }
