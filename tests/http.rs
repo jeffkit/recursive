@@ -966,4 +966,87 @@ mod http_tests {
         let received = rx.recv().await.unwrap();
         assert_eq!(received, event);
     }
+
+    // ── OpenAPI spec tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn openapi_spec_returns_200() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn openapi_spec_has_correct_version() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(spec["openapi"], "3.0.3");
+        assert_eq!(spec["info"]["title"], "Recursive Agent API");
+        assert_eq!(spec["info"]["version"], "0.4.0");
+    }
+
+    #[tokio::test]
+    async fn openapi_spec_has_all_paths() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let paths = spec["paths"].as_object().expect("paths should be an object");
+
+        // All registered endpoints must be present
+        assert!(paths.contains_key("/health"), "missing /health");
+        assert!(paths.contains_key("/tools"), "missing /tools");
+        assert!(paths.contains_key("/run"), "missing /run");
+        assert!(paths.contains_key("/sessions"), "missing /sessions");
+        assert!(paths.contains_key("/sessions/{id}"), "missing /sessions/{{id}}");
+        assert!(
+            paths.contains_key("/sessions/{id}/messages"),
+            "missing /sessions/{{id}}/messages"
+        );
+        assert!(
+            paths.contains_key("/sessions/{id}/events"),
+            "missing /sessions/{{id}}/events"
+        );
+        assert!(paths.contains_key("/openapi.json"), "missing /openapi.json");
+    }
 }

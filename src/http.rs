@@ -159,6 +159,7 @@ pub struct ErrorResponse {
 /// - `POST /sessions/:id/messages` — send a message in a session
 /// - `DELETE /sessions/:id` — remove a session
 /// - `GET /sessions/:id/events` — SSE stream of agent events for a session
+/// - `GET /openapi.json` — returns the OpenAPI 3.0.3 specification
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -170,11 +171,364 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/{id}", axum::routing::delete(delete_session))
         .route("/sessions/{id}/messages", post(send_session_message))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/openapi.json", get(openapi_spec))
         .with_state(Arc::new(state))
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn openapi_spec() -> Json<serde_json::Value> {
+    Json(build_openapi_spec())
+}
+
+/// Build a static OpenAPI 3.0.3 specification describing all API endpoints.
+pub fn build_openapi_spec() -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Recursive Agent API",
+            "version": "0.4.0",
+            "description": "HTTP API for the Recursive coding agent"
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Health check",
+                    "description": "Returns 'ok' if the server is running.",
+                    "responses": {
+                        "200": {
+                            "description": "Server is healthy",
+                            "content": {
+                                "text/plain": {
+                                    "schema": { "type": "string", "example": "ok" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/tools": {
+                "get": {
+                    "summary": "List registered tools",
+                    "description": "Returns the JSON array of tools available to the agent.",
+                    "responses": {
+                        "200": {
+                            "description": "Array of tool descriptors",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/ToolInfo" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/run": {
+                "post": {
+                    "summary": "Run the agent",
+                    "description": "Execute the agent with a goal and return the outcome.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/RunRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Agent completed successfully",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/RunResponse" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid request (e.g. empty goal)",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": { "description": "Request body failed deserialization" },
+                        "500": {
+                            "description": "Internal server error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/sessions": {
+                "get": {
+                    "summary": "List sessions",
+                    "description": "Returns all active sessions.",
+                    "responses": {
+                        "200": {
+                            "description": "Array of session info objects",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/SessionInfo" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "summary": "Create a session",
+                    "description": "Create a new multi-turn conversation session.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreateSessionRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Session created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CreateSessionResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/sessions/{id}": {
+                "get": {
+                    "summary": "Get session detail",
+                    "description": "Returns session metadata and full message transcript.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Session detail with messages",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/SessionDetailResponse" }
+                                }
+                            }
+                        },
+                        "404": { "description": "Session not found" }
+                    }
+                },
+                "delete": {
+                    "summary": "Delete a session",
+                    "description": "Remove a session and its transcript.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "204": { "description": "Session deleted" },
+                        "404": { "description": "Session not found" }
+                    }
+                }
+            },
+            "/sessions/{id}/messages": {
+                "post": {
+                    "summary": "Send a message",
+                    "description": "Send a user message in a session and get the assistant response.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SessionMessageRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Assistant response",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/SessionMessageResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Session not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal server error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/sessions/{id}/events": {
+                "get": {
+                    "summary": "Subscribe to session events",
+                    "description": "SSE stream of real-time agent events for a session.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "SSE event stream",
+                            "content": {
+                                "text/event-stream": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        },
+                        "404": { "description": "Session not found" }
+                    }
+                }
+            },
+            "/openapi.json": {
+                "get": {
+                    "summary": "OpenAPI specification",
+                    "description": "Returns this OpenAPI 3.0.3 spec as JSON.",
+                    "responses": {
+                        "200": {
+                            "description": "OpenAPI spec document",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "ToolInfo": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "parameters": { "type": "object" }
+                    },
+                    "required": ["name", "description", "parameters"]
+                },
+                "RunRequest": {
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string" },
+                        "max_steps": { "type": "integer", "nullable": true },
+                        "system_prompt": { "type": "string", "nullable": true }
+                    },
+                    "required": ["goal"]
+                },
+                "RunResponse": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string" },
+                        "finish_reason": { "type": "string" },
+                        "messages": { "type": "array", "items": { "type": "object" } },
+                        "usage": { "$ref": "#/components/schemas/UsageInfo" }
+                    },
+                    "required": ["status", "finish_reason", "messages", "usage"]
+                },
+                "UsageInfo": {
+                    "type": "object",
+                    "properties": {
+                        "total_steps": { "type": "integer" },
+                        "total_tokens": { "type": "integer" }
+                    },
+                    "required": ["total_steps", "total_tokens"]
+                },
+                "ErrorResponse": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string" },
+                        "error": { "type": "string" }
+                    },
+                    "required": ["status", "error"]
+                },
+                "CreateSessionRequest": {
+                    "type": "object",
+                    "properties": {
+                        "system_prompt": { "type": "string", "nullable": true }
+                    }
+                },
+                "CreateSessionResponse": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "created_at": { "type": "string" }
+                    },
+                    "required": ["id", "created_at"]
+                },
+                "SessionInfo": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "created_at": { "type": "string" },
+                        "message_count": { "type": "integer" }
+                    },
+                    "required": ["id", "created_at", "message_count"]
+                },
+                "SessionDetailResponse": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "created_at": { "type": "string" },
+                        "messages": { "type": "array", "items": { "type": "object" } }
+                    },
+                    "required": ["id", "created_at", "messages"]
+                },
+                "SessionMessageRequest": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string" }
+                    },
+                    "required": ["content"]
+                },
+                "SessionMessageResponse": {
+                    "type": "object",
+                    "properties": {
+                        "role": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["role", "content"]
+                }
+            }
+        }
+    })
 }
 
 async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<ToolInfo>> {
