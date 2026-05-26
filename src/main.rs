@@ -18,6 +18,7 @@ use tracing::Level;
 
 use recursive::config::load_project_context;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
+use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
 use recursive::SessionFile;
 use recursive::{
@@ -129,6 +130,9 @@ enum Cmd {
     },
     /// Interactive multi-turn REPL (default when no command is given).
     Repl,
+    /// Run as an MCP stdio server: read JSON-RPC requests from stdin,
+    /// dispatch them to the agent's tools, and write responses to stdout.
+    Serve,
     /// Interactive setup wizard — configure provider, model, and API key.
     Init,
     /// Print registered tool specs as JSON (sanity check).
@@ -264,6 +268,9 @@ async fn main() -> anyhow::Result<()> {
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
+        }
+        Cmd::Serve => {
+            run_mcp_server_stdio(config, cli.mcp_config).await
         }
         Cmd::Init => {
             run_init().await
@@ -1361,6 +1368,177 @@ async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
         if let Ok(line) = serde_json::to_string(&ev) {
             println!("{line}");
         }
+    }
+}
+
+/// Run as an MCP stdio server.
+///
+/// Reads newline-delimited JSON-RPC 2.0 requests from stdin, dispatches
+/// them to the agent's tools, and writes newline-delimited JSON-RPC
+/// responses to stdout.
+///
+/// This mode is designed to be used as a subprocess by MCP clients (e.g.
+/// Claude Desktop, VS Code extensions) that communicate via stdio.
+async fn run_mcp_server_stdio(
+    config: Config,
+    _mcp_config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // Build the tool registry (local tools only — no MCP servers, since
+    // we *are* the MCP server).
+    let tools = build_tools(&config).await;
+
+    // We don't need an LLM provider or agent for the stdio server mode.
+    // The tools are called directly via dispatch_request.
+    // However, we need an McpClient-like wrapper. Since we're acting as
+    // the MCP server ourselves, we create a thin adapter that wraps the
+    // tool registry.
+    let registry = Arc::new(tools);
+
+    let stdin = tokio::io::stdin();
+    let reader = BufReader::new(stdin);
+    let mut lines = reader.lines();
+
+    // Stderr is used for logging/diagnostics; stdout is for JSON-RPC responses.
+    eprintln!("mcp-server: ready (reading JSON-RPC from stdin)");
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse the JSON-RPC request
+        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(req) => req,
+            Err(e) => {
+                // Can't parse — write an error response if there's an id
+                // Try to extract an id from the raw JSON
+                let id: Option<serde_json::Value> =
+                    serde_json::from_str(&line).ok().and_then(|v: serde_json::Value| {
+                        v.get("id").cloned()
+                    });
+                let response = JsonRpcResponse::error(id, -32700, format!("Parse error: {e}"));
+                let output = serde_json::to_string(&response)?;
+                println!("{output}");
+                continue;
+            }
+        };
+
+        let is_notification = request.id.is_none();
+
+        // Dispatch the request
+        let response = dispatch_request_via_registry(&request, &registry).await;
+
+        // Notifications get no response
+        if is_notification {
+            continue;
+        }
+
+        if let Some(resp) = response {
+            let output = serde_json::to_string(&resp)?;
+            println!("{output}");
+        }
+    }
+
+    eprintln!("mcp-server: stdin closed, shutting down");
+    Ok(())
+}
+
+/// Dispatch a JSON-RPC request using the local tool registry.
+///
+/// This is a simplified dispatcher that handles the MCP methods by
+/// calling the local tools directly, without an LLM or agent loop.
+async fn dispatch_request_via_registry(
+    request: &JsonRpcRequest,
+    registry: &ToolRegistry,
+) -> Option<JsonRpcResponse> {
+    let id = request.id.clone();
+
+    match request.method.as_str() {
+        "initialize" => {
+            let result = serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": true,
+                    "resources": false,
+                    "prompts": false
+                },
+                "serverInfo": {
+                    "name": "recursive-agent",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            });
+            Some(JsonRpcResponse::success(id, result))
+        }
+        "notifications/initialized" => None,
+        "tools/list" => {
+            let specs = registry.specs();
+            let tools_arr: Vec<serde_json::Value> = specs
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "description": s.description,
+                        "inputSchema": s.parameters,
+                    })
+                })
+                .collect();
+            Some(JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "tools": tools_arr }),
+            ))
+        }
+        "tools/call" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let arguments = request.params.get("arguments").cloned().unwrap_or_default();
+
+            match registry.invoke(name, arguments).await {
+                Ok(text) => {
+                    let result = serde_json::json!({
+                        "content": [{"type": "text", "text": text}]
+                    });
+                    Some(JsonRpcResponse::success(id, result))
+                }
+                Err(e) => {
+                    let result = serde_json::json!({
+                        "isError": true,
+                        "content": [{"type": "text", "text": e.to_string()}]
+                    });
+                    Some(JsonRpcResponse::success(id, result))
+                }
+            }
+        }
+        "resources/list" => {
+            Some(JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "resources": [] }),
+            ))
+        }
+        "resources/read" => {
+            Some(JsonRpcResponse::error(
+                id,
+                -32601,
+                "resources/read not supported",
+            ))
+        }
+        "prompts/list" => {
+            Some(JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "prompts": [] }),
+            ))
+        }
+        "prompts/get" => {
+            Some(JsonRpcResponse::error(
+                id,
+                -32601,
+                "prompts/get not supported",
+            ))
+        }
+        _ => Some(JsonRpcResponse::method_not_found(id, &request.method)),
     }
 }
 
