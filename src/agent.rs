@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use crate::compact::Compactor;
@@ -49,12 +48,6 @@ pub enum PermissionDecision {
 pub type PermissionHook = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
 
 const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
-
-/// Internal signal sent from `confirm_plan`/`reject_plan` to the running agent loop.
-enum PlanDecision {
-    Confirmed,
-    Rejected(String),
-}
 
 /// Controls whether the agent executes tools immediately or presents a plan first.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -172,6 +165,8 @@ pub enum FinishReason {
     },
     /// Transcript size exceeded hard limit and cannot be reduced further.
     TranscriptLimit { chars: usize, limit: usize },
+    /// Agent proposed a plan (PlanFirst mode) and is waiting for confirmation.
+    PlanPending,
 }
 
 #[derive(Debug, Clone)]
@@ -227,9 +222,6 @@ pub struct Agent {
     hooks: HookRegistry,
     planning_mode: PlanningMode,
     plan_buffer: Option<Vec<ToolCall>>,
-    /// Sender half for the plan decision channel. Created when `run()` needs to
-    /// wait for a plan decision; consumed by `confirm_plan()` or `reject_plan()`.
-    plan_decision_tx: Option<oneshot::Sender<PlanDecision>>,
 }
 
 impl Agent {
@@ -240,16 +232,23 @@ impl Agent {
     /// Confirm a proposed plan, allowing execution to proceed.
     pub fn confirm_plan(&mut self) {
         self.plan_buffer = None;
-        if let Some(tx) = self.plan_decision_tx.take() {
-            let _ = tx.send(PlanDecision::Confirmed);
-        }
     }
 
     /// Reject a proposed plan with a reason.
     pub fn reject_plan(&mut self, reason: &str) {
-        self.plan_buffer = None;
-        if let Some(tx) = self.plan_decision_tx.take() {
-            let _ = tx.send(PlanDecision::Rejected(reason.to_string()));
+        // Feed the rejection back to the model as tool errors so it can revise.
+        if let Some(calls) = self.plan_buffer.take() {
+            for call in &calls {
+                let result = format!(
+                    "ERROR: Plan rejected. Reason: {reason}. \
+                     The tool call {}({}) was not executed. \
+                     Please revise your approach.",
+                    call.name,
+                    serde_json::to_string(&call.arguments).unwrap_or_default()
+                );
+                self.transcript
+                    .push(Message::tool_result(call.id.clone(), result));
+            }
         }
     }
 
@@ -409,59 +408,19 @@ impl Agent {
                 );
 
                 self.emit(StepEvent::PlanProposed {
-                    plan_text,
+                    plan_text: plan_text.clone(),
                     tool_calls: completion.tool_calls.clone(),
                 });
 
-                // Wait for external decision via confirm_plan() or reject_plan()
-                let (tx, rx) = oneshot::channel::<PlanDecision>();
-                self.plan_decision_tx = Some(tx);
-
-                match rx.await {
-                    Ok(PlanDecision::Confirmed) => {
-                        self.emit(StepEvent::PlanConfirmed);
-                        // Clear the buffer and proceed to execute
-                        self.plan_buffer = None;
-                    }
-                    Ok(PlanDecision::Rejected(reason)) => {
-                        self.emit(StepEvent::PlanRejected {
-                            reason: reason.clone(),
-                        });
-                        // Feed the rejection back to the model as a tool result
-                        // so it can adjust its approach.
-                        for call in &completion.tool_calls {
-                            let result = format!(
-                                "ERROR: Plan rejected. Reason: {reason}. \
-                                 The tool call {}({}) was not executed. \
-                                 Please revise your approach.",
-                                call.name,
-                                serde_json::to_string(&call.arguments).unwrap_or_default()
-                            );
-                            self.transcript
-                                .push(Message::tool_result(call.id.clone(), result));
-                        }
-                        self.plan_buffer = None;
-                        // Continue to next iteration of the loop so the model
-                        // can see the rejection and try again.
-                        continue;
-                    }
-                    Err(_) => {
-                        // Channel closed without a decision — treat as rejection
-                        // with a generic reason.
-                        for call in &completion.tool_calls {
-                            let result = format!(
-                                "ERROR: Plan decision channel closed unexpectedly. \
-                                 The tool call {}({}) was not executed.",
-                                call.name,
-                                serde_json::to_string(&call.arguments).unwrap_or_default()
-                            );
-                            self.transcript
-                                .push(Message::tool_result(call.id.clone(), result));
-                        }
-                        self.plan_buffer = None;
-                        continue;
-                    }
-                }
+                // Return PlanPending so the caller can decide via confirm_plan()/reject_plan()
+                return Ok(AgentOutcome {
+                    final_message: Some(plan_text),
+                    transcript: std::mem::take(&mut self.transcript),
+                    steps: step,
+                    finish: FinishReason::PlanPending,
+                    total_usage: TokenUsage::default(),
+                    total_llm_latency_ms: self.total_llm_latency_ms,
+                });
             }
 
             // Phase 2: separate read-only and write calls, then execute.
@@ -981,7 +940,6 @@ impl AgentBuilder {
             hooks: self.hooks,
             planning_mode: self.planning_mode,
             plan_buffer: None,
-            plan_decision_tx: None,
         })
     }
 }
@@ -2227,7 +2185,6 @@ mod tests {
             hooks: HookRegistry::new(),
             planning_mode: PlanningMode::Immediate,
             plan_buffer: Some(vec![]),
-            plan_decision_tx: None,
         };
         agent.confirm_plan();
         assert!(agent.plan_buffer.is_none());
@@ -2249,7 +2206,6 @@ mod tests {
             hooks: HookRegistry::new(),
             planning_mode: PlanningMode::Immediate,
             plan_buffer: Some(vec![]),
-            plan_decision_tx: None,
         };
         agent.reject_plan("bad plan");
         assert!(agent.plan_buffer.is_none());

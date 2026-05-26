@@ -174,6 +174,7 @@ impl Tool for SubAgent {
             FinishReason::ProviderStop(r) => r,
             FinishReason::Stuck { .. } => "Stuck",
             FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
+            FinishReason::PlanPending => "PlanPending",
         };
 
         let final_text = outcome
