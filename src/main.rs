@@ -34,6 +34,9 @@ use recursive::{
         WriteFile,
         ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
     },
+    tools::{
+        ForgetFact, RecallFact, RememberFact, UpdateFact,
+    },
     Agent, AgentRunner, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry,
     TranscriptFile,
 };
@@ -595,6 +598,11 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(Remember::new(root)))
         .register(Arc::new(Recall::new(root)))
         .register(Arc::new(Forget::new(root)));
+    registry = registry
+        .register(Arc::new(RememberFact::new(root)))
+        .register(Arc::new(RecallFact::new(root)))
+        .register(Arc::new(ForgetFact::new(root)))
+        .register(Arc::new(UpdateFact::new(root)));
     registry = registry
         .register(Arc::new(WorkingMemoryTool::new(root)))
         .register(Arc::new(ScratchpadGet::new(root)))

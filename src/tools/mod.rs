@@ -16,6 +16,7 @@ pub mod apply_patch;
 pub mod estimate_tokens;
 pub mod fs;
 pub mod load_skill;
+pub mod facts;
 pub mod memory;
 pub mod run_background;
 pub mod run_skill_script;
@@ -35,6 +36,10 @@ pub use memory::{Forget, Recall, Remember};
 pub use memory::{
     Scratchpad, ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
     load_scratchpad, scratchpad_path, scratchpad_summary,
+};
+pub use facts::{
+    Fact, FactStore, ForgetFact, RecallFact, RememberFact, UpdateFact,
+    facts_path, facts_summary, load_facts, search_facts, ScoredFact,
 };
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
