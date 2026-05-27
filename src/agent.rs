@@ -47,6 +47,9 @@ pub enum PermissionDecision {
 /// Hooks must be `Send + Sync` because the agent loop is `Send`.
 pub type PermissionHook = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
 
+/// Optional callback fired whenever a message is appended to the transcript.
+pub type OnMessageFn = Box<dyn Fn(&Message) + Send + Sync>;
+
 const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
 /// Controls whether the agent executes tools immediately or presents a plan first.
@@ -225,6 +228,7 @@ pub struct Agent {
     planning_mode: PlanningMode,
     plan_buffer: Option<Vec<ToolCall>>,
     plan_confirmed: bool,
+    on_message: Option<OnMessageFn>,
 }
 
 impl Agent {
@@ -263,8 +267,7 @@ impl Agent {
                     call.name,
                     serde_json::to_string(&call.arguments).unwrap_or_default()
                 );
-                self.transcript
-                    .push(Message::tool_result(call.id.clone(), result));
+                self.push_message(Message::tool_result(call.id.clone(), result));
             }
         }
         self.emit(StepEvent::PlanRejected {
@@ -429,7 +432,7 @@ impl Agent {
     pub async fn run(&mut self, goal: impl Into<String>) -> Result<AgentOutcome> {
         let goal = goal.into();
         info!(target: "recursive::agent", goal = %truncate(&goal, 200), "agent run starting");
-        self.transcript.push(Message::user(goal.clone()));
+        self.push_message(Message::user(goal.clone()));
         self.hooks.dispatch(HookEvent::SessionStart { goal: &goal });
 
         let mut final_message: Option<String> = None;
@@ -488,7 +491,7 @@ impl Agent {
                             output: output.clone(),
                             step,
                         });
-                        self.transcript.push(Message::tool_result(id, output));
+                        self.push_message(Message::tool_result(id, output));
                     }
                     continue;
                 }
@@ -545,8 +548,7 @@ impl Agent {
                     return Err(Error::ProviderTruncated("length".into()));
                 }
 
-                self.transcript
-                    .push(Message::assistant(completion.content.clone()));
+                self.push_message(Message::assistant(completion.content.clone()));
                 // Preserve reasoning_content for DeepSeek thinking mode
                 if completion.reasoning_content.is_some() {
                     if let Some(msg) = self.transcript.last_mut() {
@@ -574,7 +576,7 @@ impl Agent {
                 return Ok(outcome);
             }
 
-            self.transcript.push(Message::assistant_with_tool_calls(
+            self.push_message(Message::assistant_with_tool_calls(
                 completion.content.clone(),
                 completion.tool_calls.clone(),
             ));
@@ -684,8 +686,7 @@ impl Agent {
                     });
                 }
 
-                self.transcript
-                    .push(Message::tool_result(id.clone(), result.clone()));
+                self.push_message(Message::tool_result(id.clone(), result.clone()));
             }
         }
 
@@ -821,6 +822,14 @@ impl Agent {
             let _ = tx.send(event);
         }
     }
+
+    /// Push a message to the transcript and fire the `on_message` callback if set.
+    fn push_message(&mut self, msg: Message) {
+        if let Some(ref cb) = self.on_message {
+            cb(&msg);
+        }
+        self.transcript.push(msg);
+    }
 }
 
 /// Builder for configuring and creating an agent.
@@ -851,6 +860,7 @@ pub struct AgentBuilder {
     permission_hook: Option<PermissionHook>,
     hooks: HookRegistry,
     planning_mode: PlanningMode,
+    on_message: Option<OnMessageFn>,
 }
 
 impl AgentBuilder {
@@ -979,6 +989,21 @@ impl AgentBuilder {
         self.planning_mode = mode;
         self
     }
+    /// Attach a callback that fires whenever a message is appended to the transcript.
+    ///
+    /// The callback receives a reference to the newly appended `Message`.
+    /// It is called for every message pushed during `run()` (user goal,
+    /// assistant responses, tool results). It is **not** called for messages
+    /// added via `seed_transcript()`, `set_transcript()`, or compaction
+    /// (which replaces messages rather than appending).
+    ///
+    /// The callback must be `Send + Sync`. Panicking inside the callback
+    /// will propagate and abort the agent run — the caller is responsible
+    /// for catching panics if needed.
+    pub fn on_message(mut self, f: OnMessageFn) -> Self {
+        self.on_message = Some(f);
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.ok_or_else(|| Error::Config {
             message: "agent: missing llm provider".into(),
@@ -1003,6 +1028,7 @@ impl AgentBuilder {
             planning_mode: self.planning_mode,
             plan_buffer: None,
             plan_confirmed: false,
+            on_message: self.on_message,
         })
     }
 }
@@ -2294,6 +2320,7 @@ mod tests {
             planning_mode: PlanningMode::Immediate,
             plan_buffer: Some(vec![]),
             plan_confirmed: false,
+            on_message: None,
         };
         agent.confirm_plan();
         assert!(agent.plan_confirmed);
@@ -2316,6 +2343,7 @@ mod tests {
             planning_mode: PlanningMode::Immediate,
             plan_buffer: Some(vec![]),
             plan_confirmed: false,
+            on_message: None,
         };
         agent.reject_plan("bad plan");
         assert!(agent.plan_buffer.is_none());
