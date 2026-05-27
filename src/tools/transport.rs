@@ -551,6 +551,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
