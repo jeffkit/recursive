@@ -369,7 +369,9 @@ impl Agent {
                     let tools = self.tools.clone();
                     join_set.spawn(async move {
                         let tool_start = std::time::Instant::now();
-                        let result = match tools.invoke(&name, args).await {
+                        let span = tracing::info_span!("tool.exec", tool = %name);
+                        let result = span.in_scope(|| tools.invoke(&name, args)).await;
+                        let result = match result {
                             Ok(output) => output,
                             Err(err) => format!("ERROR: {err}"),
                         };
@@ -405,7 +407,9 @@ impl Agent {
             } else {
                 let pc = pending.remove(i);
                 let tool_start = std::time::Instant::now();
-                let result = match self.tools.invoke(&pc.name, pc.args.clone()).await {
+                let span = tracing::info_span!("tool.exec", tool = %pc.name);
+                let result = span.in_scope(|| self.tools.invoke(&pc.name, pc.args.clone())).await;
+                let result = match result {
                     Ok(output) => output,
                     Err(err) => format!("ERROR: {err}"),
                 };
@@ -461,6 +465,15 @@ impl Agent {
                         reason: finish.clone(),
                         steps: step,
                     });
+                    tracing::info!(
+                        target: "recursive::agent",
+                        steps = step,
+                        tokens_in = total_usage.prompt_tokens,
+                        tokens_out = total_usage.completion_tokens,
+                        finish = ?finish,
+                        llm_latency_ms = self.total_llm_latency_ms,
+                        "agent.run.complete"
+                    );
                     return Ok(AgentOutcome {
                         final_message,
                         transcript: std::mem::take(&mut self.transcript),
@@ -573,7 +586,16 @@ impl Agent {
                 };
                 self.hooks
                     .dispatch(HookEvent::SessionEnd { outcome: &outcome });
-                return Ok(outcome);
+                    tracing::info!(
+                        target: "recursive::agent",
+                        steps = step,
+                        tokens_in = total_usage.prompt_tokens,
+                        tokens_out = total_usage.completion_tokens,
+                        finish = ?outcome.finish,
+                        llm_latency_ms = self.total_llm_latency_ms,
+                        "agent.run.complete"
+                    );
+                    return Ok(outcome);
             }
 
             self.push_message(Message::assistant_with_tool_calls(
@@ -621,6 +643,15 @@ impl Agent {
                 });
 
                 // Return PlanPending so the caller can decide via confirm_plan()/reject_plan()
+                tracing::info!(
+                    target: "recursive::agent",
+                    steps = step,
+                    tokens_in = 0usize,
+                    tokens_out = 0usize,
+                    finish = ?FinishReason::PlanPending,
+                    llm_latency_ms = self.total_llm_latency_ms,
+                    "agent.run.complete"
+                );
                 return Ok(AgentOutcome {
                     final_message: Some(plan_text),
                     transcript: std::mem::take(&mut self.transcript),
@@ -676,6 +707,15 @@ impl Agent {
                         reason: finish.clone(),
                         steps: step,
                     });
+                    tracing::info!(
+                        target: "recursive::agent",
+                        steps = step,
+                        tokens_in = total_usage.prompt_tokens,
+                        tokens_out = total_usage.completion_tokens,
+                        finish = ?finish,
+                        llm_latency_ms = self.total_llm_latency_ms,
+                        "agent.run.complete"
+                    );
                     return Ok(AgentOutcome {
                         final_message,
                         transcript: std::mem::take(&mut self.transcript),
@@ -706,6 +746,15 @@ impl Agent {
         };
         self.hooks
             .dispatch(HookEvent::SessionEnd { outcome: &outcome });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = self.max_steps,
+            tokens_in = total_usage.prompt_tokens,
+            tokens_out = total_usage.completion_tokens,
+            finish = ?outcome.finish,
+            llm_latency_ms = self.total_llm_latency_ms,
+            "agent.run.complete"
+        );
         Ok(outcome)
     }
 
