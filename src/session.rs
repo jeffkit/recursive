@@ -342,15 +342,15 @@ impl SessionWriter {
 
     /// Finalise the session: flush the writer and update the meta file
     /// with the final message count and status.
-    pub fn finish(mut self, status: &str) -> std::io::Result<()> {
+    pub fn finish(&mut self, status: &str) -> std::io::Result<()> {
         self.writer.flush()?;
 
         let meta = SessionMeta {
-            session_id: self.session_id,
-            goal: self.goal,
-            model: self.model,
-            provider: self.provider,
-            created_at: self.created_at,
+            session_id: self.session_id.clone(),
+            goal: self.goal.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            created_at: self.created_at.clone(),
             updated_at: chrono_lite_now(),
             message_count: self.message_count,
             status: status.to_string(),
@@ -370,6 +370,11 @@ impl SessionWriter {
     /// Return the session directory path.
     pub fn session_dir(&self) -> &Path {
         &self.session_dir
+    }
+
+    /// Return the number of messages written so far.
+    pub fn message_count(&self) -> u64 {
+        self.message_count
     }
 }
 
@@ -817,7 +822,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
 
-        let writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
+        let mut writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
 
         let session_dir = writer.session_dir().to_path_buf();
         assert!(session_dir.join("transcript.jsonl").is_file());

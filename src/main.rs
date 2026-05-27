@@ -21,6 +21,8 @@ use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
 use recursive::SessionFile;
+use recursive::SessionWriter;
+use recursive::OnMessageFn;
 use recursive::{
     config::Config,
     llm::{
@@ -110,6 +112,12 @@ struct Cli {
     /// stuck, transcript limit). The session can be resumed later with `resume`.
     #[arg(long, env = "RECURSIVE_SESSION_OUT")]
     session_out: Option<PathBuf>,
+
+    /// Enable live session recording via SessionWriter. Every message is
+    /// written to a JSONL file under .recursive/sessions/<slug>/<session-id>/.
+    /// The session directory path is printed to stderr on completion.
+    #[arg(long, env = "RECURSIVE_SESSION")]
+    session: bool,
 
     /// Enable plan-first mode: agent proposes a plan, user confirms before execution.
     #[arg(long = "plan-first")]
@@ -373,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
+                cli.session,
             )
             .await
         }
@@ -451,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.mcp_config,
                         external_pricing,
                         cli.hook_timing,
+                        cli.session,
                     )
                     .await
                 }
@@ -478,6 +488,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
+                cli.session,
             )
             .await
         }
@@ -730,6 +741,7 @@ async fn build_agent(
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     goal: Option<&str>,
+    on_message: Option<recursive::OnMessageFn>,
 ) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
     let api_key = config.require_api_key()?;
     // Provider selector: `openai` (default) uses the OpenAI-compatible adapter,
@@ -887,6 +899,9 @@ async fn build_agent(
     if plan_first {
         builder = builder.planning_mode(PlanningMode::PlanFirst);
     }
+    if let Some(cb) = on_message {
+        builder = builder.on_message(cb);
+    }
     let agent = builder.build()?;
     Ok((agent, rx))
 }
@@ -1027,8 +1042,34 @@ async fn run_resumed(
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
+    session: bool,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
+
+    // Create SessionWriter if --session is enabled
+    let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
+        match SessionWriter::create(&config.workspace, &goal, &config.model, &config.provider_type) {
+            Ok(writer) => {
+                eprintln!("session: recording to {}", writer.session_dir().display());
+                Some(Arc::new(std::sync::Mutex::new(writer)))
+            }
+            Err(e) => {
+                eprintln!("session: failed to create session writer: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let on_message: Option<OnMessageFn> = session_writer.clone().map(|sw| {
+        Box::new(move |msg: &recursive::message::Message| {
+            if let Ok(mut writer) = sw.lock() {
+                let _ = writer.append(msg);
+            }
+        }) as OnMessageFn
+    });
+
     let (mut agent, rx) = build_agent(
         &config,
         max_transcript_chars,
@@ -1038,6 +1079,7 @@ async fn run_resumed(
         mcp_config,
         hook_timing,
         Some(&goal),
+        on_message,
     )
     .await?;
     let tools = build_tools(&config).await;
@@ -1053,6 +1095,37 @@ async fn run_resumed(
     let outcome = agent.run(goal.clone()).await?;
     drop(agent);
     printer.await.ok();
+
+    // Finalize session writer
+    let finish_status = if matches!(outcome.finish, FinishReason::NoMoreToolCalls) {
+        "success"
+    } else {
+        "incomplete"
+    };
+    if let Some(sw) = session_writer {
+        match Arc::into_inner(sw) {
+            Some(mutex) => {
+                let mut writer = match mutex.lock() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("session: failed to lock writer: {e}");
+                        return Ok(());
+                    }
+                };
+                if let Err(e) = writer.finish(finish_status) {
+                    eprintln!("session: failed to finalize: {e}");
+                } else {
+                    eprintln!("session: saved {} message(s) to {}",
+                        writer.message_count(),
+                        writer.session_dir().display());
+                }
+            }
+            None => {
+                eprintln!("session: writer still has other references; cannot finalize");
+            }
+        }
+    }
+
     if !json_mode {
         if let Some(ref msg) = outcome.final_message {
             println!("\n=== final ===\n{msg}");
@@ -1205,11 +1278,37 @@ async fn run_once(
     mcp_config: Option<PathBuf>,
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
+    session: bool,
 ) -> anyhow::Result<()> {
     if let Err(msg) = config.validate_for_agent() {
         eprintln!("{msg}");
         std::process::exit(1);
     }
+
+    // Create SessionWriter if --session is enabled
+    let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
+        match SessionWriter::create(&config.workspace, &goal, &config.model, &config.provider_type) {
+            Ok(writer) => {
+                eprintln!("session: recording to {}", writer.session_dir().display());
+                Some(Arc::new(std::sync::Mutex::new(writer)))
+            }
+            Err(e) => {
+                eprintln!("session: failed to create session writer: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let on_message: Option<OnMessageFn> = session_writer.clone().map(|sw| {
+        Box::new(move |msg: &recursive::message::Message| {
+            if let Ok(mut writer) = sw.lock() {
+                let _ = writer.append(msg);
+            }
+        }) as OnMessageFn
+    });
+
     let (mut agent, rx) = build_agent(
         &config,
         max_transcript_chars,
@@ -1219,6 +1318,7 @@ async fn run_once(
         mcp_config,
         hook_timing,
         None,
+        on_message,
     )
     .await?;
     let tools = build_tools(&config).await;
@@ -1262,6 +1362,36 @@ async fn run_once(
             &external_pricing,
         );
         print_finish_note(&outcome.finish);
+    }
+
+    // Finalize session writer
+    let finish_status = if matches!(outcome.finish, FinishReason::NoMoreToolCalls) {
+        "success"
+    } else {
+        "incomplete"
+    };
+    if let Some(sw) = session_writer {
+        match Arc::into_inner(sw) {
+            Some(mutex) => {
+                let mut writer = match mutex.lock() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("session: failed to lock writer: {e}");
+                        return Ok(());
+                    }
+                };
+                if let Err(e) = writer.finish(finish_status) {
+                    eprintln!("session: failed to finalize: {e}");
+                } else {
+                    eprintln!("session: saved {} message(s) to {}",
+                        writer.message_count(),
+                        writer.session_dir().display());
+                }
+            }
+            None => {
+                eprintln!("session: writer still has other references; cannot finalize");
+            }
+        }
     }
 
     if let Some(path) = transcript_out {
@@ -1422,6 +1552,7 @@ async fn repl(
         plan_first,
         mcp_config,
         hook_timing,
+        None,
         None,
     )
     .await?;
@@ -1794,6 +1925,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
@@ -1806,6 +1938,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -1823,6 +1956,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
         )
         .await;

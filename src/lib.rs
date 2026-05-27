@@ -33,6 +33,7 @@ pub mod transcript;
 pub use agent::PlanningMode;
 pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
 pub use agent::{PermissionDecision, PermissionHook};
+pub use agent::OnMessageFn;
 pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
@@ -56,6 +57,7 @@ pub use multi::{
 };
 pub use runner::AgentRunner;
 pub use session::SessionFile;
+pub use session::SessionWriter;
 pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
