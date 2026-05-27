@@ -502,8 +502,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Sessions { cmd } => match cmd {
             SessionCmd::List => {
-                let sessions = recursive::session::list_sessions(&config.workspace)?;
-                if sessions.is_empty() {
+                let old_sessions = recursive::session::list_sessions(&config.workspace)?;
+                let new_sessions = recursive::session::SessionReader::list_sessions(&config.workspace)?;
+                let total = old_sessions.len() + new_sessions.len();
+                if total == 0 {
                     println!(
                         "No sessions found in {}",
                         config
@@ -513,45 +515,85 @@ async fn main() -> anyhow::Result<()> {
                             .display()
                     );
                 } else {
-                    println!("Session files ({}):", sessions.len());
-                    for s in &sessions {
-                        println!("  {}", s.display());
+                    println!("Sessions ({}):", total);
+                    for s in &old_sessions {
+                        println!("  {}  (old format)", s.display());
+                    }
+                    for s in &new_sessions {
+                        println!("  {}  (JSONL)", s.display());
                     }
                 }
                 Ok(())
             }
             SessionCmd::Show { session } => {
                 let path = resolve_session_path(&config.workspace, &session)?;
-                let file = SessionFile::read_from(&path)
-                    .with_context(|| format!("reading session: {}", path.display()))?;
+                if path.is_dir() {
+                    // New JSONL session format (directory with transcript.jsonl + .meta.json)
+                    let meta = recursive::session::SessionReader::load_meta(&path)
+                        .with_context(|| format!("reading session meta: {}", path.display()))?;
+                    let entries = recursive::session::SessionReader::load_transcript(&path)
+                        .with_context(|| format!("reading session transcript: {}", path.display()))?;
 
-                println!("Session: {}", path.display());
-                println!("  schema_version:  {}", file.schema_version);
-                println!("  goal:            {}", file.goal);
-                println!("  model:           {}", file.model);
-                println!("  provider:        {}", file.provider);
-                println!("  tool_registry:   {}", file.tool_registry_hash);
-                println!("  steps_consumed:  {}", file.steps_consumed);
-                println!("  transcript_len:  {}", file.transcript.len());
-                println!();
-                println!("Transcript:");
-                for (i, msg) in file.transcript.iter().enumerate() {
-                    let role = match msg.role {
-                        recursive::Role::System => "system",
-                        recursive::Role::User => "user",
-                        recursive::Role::Assistant => "assistant",
-                        recursive::Role::Tool => "tool",
-                    };
-                    let preview: String = msg.content.chars().take(200).collect();
-                    let truncated = if msg.content.len() > 200 { "…" } else { "" };
-                    println!("  [{:>3}] {:>9}: {}{}", i, role, preview, truncated);
-                    if !msg.tool_calls.is_empty() {
-                        for tc in &msg.tool_calls {
-                            println!("         tool_call: {} ({})", tc.name, tc.id);
+                    println!("Session: {}", path.display());
+                    println!("  session_id:      {}", meta.session_id);
+                    println!("  goal:            {}", meta.goal);
+                    println!("  model:           {}", meta.model);
+                    println!("  provider:        {}", meta.provider);
+                    println!("  created_at:      {}", meta.created_at);
+                    println!("  updated_at:      {}", meta.updated_at);
+                    println!("  message_count:   {}", meta.message_count);
+                    println!("  status:          {}", meta.status);
+                    println!();
+                    println!("Transcript ({} entries):", entries.len());
+                    for (i, entry) in entries.iter().enumerate() {
+                        let preview: String = entry.content.chars().take(200).collect();
+                        let truncated = if entry.content.len() > 200 { "…" } else { "" };
+                        println!("  [{:>3}] {:>9}: {}{}", i, entry.role, preview, truncated);
+                        if !entry.tool_calls.is_empty() {
+                            for tc in &entry.tool_calls {
+                                println!("         tool_call: {} ({})", tc.name, tc.id);
+                            }
+                        }
+                        if let Some(ref rc) = entry.reasoning_content {
+                            let rp: String = rc.chars().take(100).collect();
+                            let rt = if rc.len() > 100 { "…" } else { "" };
+                            println!("         reasoning: {}{}", rp, rt);
                         }
                     }
+                    Ok(())
+                } else {
+                    // Old single-file session format (.json)
+                    let file = SessionFile::read_from(&path)
+                        .with_context(|| format!("reading session: {}", path.display()))?;
+
+                    println!("Session: {}", path.display());
+                    println!("  schema_version:  {}", file.schema_version);
+                    println!("  goal:            {}", file.goal);
+                    println!("  model:           {}", file.model);
+                    println!("  provider:        {}", file.provider);
+                    println!("  tool_registry:   {}", file.tool_registry_hash);
+                    println!("  steps_consumed:  {}", file.steps_consumed);
+                    println!("  transcript_len:  {}", file.transcript.len());
+                    println!();
+                    println!("Transcript:");
+                    for (i, msg) in file.transcript.iter().enumerate() {
+                        let role = match msg.role {
+                            recursive::Role::System => "system",
+                            recursive::Role::User => "user",
+                            recursive::Role::Assistant => "assistant",
+                            recursive::Role::Tool => "tool",
+                        };
+                        let preview: String = msg.content.chars().take(200).collect();
+                        let truncated = if msg.content.len() > 200 { "…" } else { "" };
+                        println!("  [{:>3}] {:>9}: {}{}", i, role, preview, truncated);
+                        if !msg.tool_calls.is_empty() {
+                            for tc in &msg.tool_calls {
+                                println!("         tool_call: {} ({})", tc.name, tc.id);
+                            }
+                        }
+                    }
+                    Ok(())
                 }
-                Ok(())
             }
             SessionCmd::Delete { session, force } => {
                 let path = resolve_session_path(&config.workspace, &session)?;
