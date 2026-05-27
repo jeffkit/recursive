@@ -408,7 +408,9 @@ impl Agent {
                 let pc = pending.remove(i);
                 let tool_start = std::time::Instant::now();
                 let span = tracing::info_span!("tool.exec", tool = %pc.name);
-                let result = span.in_scope(|| self.tools.invoke(&pc.name, pc.args.clone())).await;
+                let result = span
+                    .in_scope(|| self.tools.invoke(&pc.name, pc.args.clone()))
+                    .await;
                 let result = match result {
                     Ok(output) => output,
                     Err(err) => format!("ERROR: {err}"),
@@ -586,16 +588,16 @@ impl Agent {
                 };
                 self.hooks
                     .dispatch(HookEvent::SessionEnd { outcome: &outcome });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = step,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?outcome.finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(outcome);
+                tracing::info!(
+                    target: "recursive::agent",
+                    steps = step,
+                    tokens_in = total_usage.prompt_tokens,
+                    tokens_out = total_usage.completion_tokens,
+                    finish = ?outcome.finish,
+                    llm_latency_ms = self.total_llm_latency_ms,
+                    "agent.run.complete"
+                );
+                return Ok(outcome);
             }
 
             self.push_message(Message::assistant_with_tool_calls(

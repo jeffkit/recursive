@@ -17,13 +17,13 @@ use tokio::sync::mpsc;
 use tracing::Level;
 
 use recursive::config::load_project_context;
+use recursive::cost::CostTracker;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
 use recursive::OnMessageFn;
 use recursive::SessionFile;
 use recursive::SessionWriter;
-use recursive::cost::CostTracker;
 use recursive::{
     config::Config,
     llm::{
@@ -221,6 +221,14 @@ enum SessionCmd {
         /// Skip confirmation prompt.
         #[arg(long, short = 'f')]
         force: bool,
+    },
+    /// Export a session as portable JSON.
+    Export {
+        /// Session directory path or session ID.
+        session: String,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -504,7 +512,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Sessions { cmd } => match cmd {
             SessionCmd::List => {
                 let old_sessions = recursive::session::list_sessions(&config.workspace)?;
-                let new_sessions = recursive::session::SessionReader::list_sessions(&config.workspace)?;
+                let new_sessions =
+                    recursive::session::SessionReader::list_sessions(&config.workspace)?;
                 let total = old_sessions.len() + new_sessions.len();
                 if total == 0 {
                     println!(
@@ -533,7 +542,9 @@ async fn main() -> anyhow::Result<()> {
                     let meta = recursive::session::SessionReader::load_meta(&path)
                         .with_context(|| format!("reading session meta: {}", path.display()))?;
                     let entries = recursive::session::SessionReader::load_transcript(&path)
-                        .with_context(|| format!("reading session transcript: {}", path.display()))?;
+                        .with_context(|| {
+                            format!("reading session transcript: {}", path.display())
+                        })?;
 
                     println!("Session: {}", path.display());
                     println!("  session_id:      {}", meta.session_id);
@@ -623,6 +634,18 @@ async fn main() -> anyhow::Result<()> {
                     println!("Deleted session file: {}", path.display());
                 } else {
                     anyhow::bail!("Path does not exist: {}", path.display());
+                }
+                Ok(())
+            }
+            SessionCmd::Export { session, output } => {
+                let path = resolve_session_path(&config.workspace, &session)?;
+                let exported = recursive::session::ExportedTranscript::from_session_dir(&path)?;
+                let json = serde_json::to_string_pretty(&exported)?;
+                if let Some(out) = output {
+                    std::fs::write(&out, &json)?;
+                    println!("Exported to {}", out.display());
+                } else {
+                    println!("{}", json);
                 }
                 Ok(())
             }
