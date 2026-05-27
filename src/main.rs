@@ -113,11 +113,11 @@ struct Cli {
     #[arg(long, env = "RECURSIVE_SESSION_OUT")]
     session_out: Option<PathBuf>,
 
-    /// Enable live session recording via SessionWriter. Every message is
-    /// written to a JSONL file under .recursive/sessions/<slug>/<session-id>/.
-    /// The session directory path is printed to stderr on completion.
-    #[arg(long, env = "RECURSIVE_SESSION")]
-    session: bool,
+    /// Disable live session recording. By default every run is persisted
+    /// as JSONL under .recursive/sessions/<slug>/<session-id>/.
+    /// Set this flag (or RECURSIVE_NO_SESSION=1) to skip persistence.
+    #[arg(long = "no-session", env = "RECURSIVE_NO_SESSION")]
+    no_session: bool,
 
     /// Enable plan-first mode: agent proposes a plan, user confirms before execution.
     #[arg(long = "plan-first")]
@@ -381,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
-                cli.session,
+                !cli.no_session,
             )
             .await
         }
@@ -460,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.mcp_config,
                         external_pricing,
                         cli.hook_timing,
-                        cli.session,
+                        !cli.no_session,
                     )
                     .await
                 }
@@ -488,7 +488,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
-                cli.session,
+                !cli.no_session,
             )
             .await
         }
