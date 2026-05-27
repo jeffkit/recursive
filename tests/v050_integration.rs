@@ -6,7 +6,7 @@
 mod v050_integration {
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use recursive::http::{build_router, AppState, ToolInfo};
+    use recursive::http::{build_router, AppState, Metrics, ToolInfo};
     use recursive::llm::{mock::MockProvider, Completion};
     use recursive::multi::{default_roles, AgentPool, AgentRole, Pipeline};
     use recursive::{Config, LlmProvider};
@@ -54,6 +54,7 @@ mod v050_integration {
             provider: mock_provider(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         }
     }
 

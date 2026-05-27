@@ -377,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
                 event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
+                metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
             };
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;

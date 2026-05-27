@@ -26,6 +26,61 @@ use crate::message::Message;
 
 // ── Rate limiter ───────────────────────────────────────────────────────────
 
+/// Prometheus-compatible metrics collector using lock-free atomic counters.
+#[derive(Default)]
+pub struct Metrics {
+    pub requests_total: AtomicU64,
+    pub requests_active: AtomicU64,
+    pub agent_runs_total: AtomicU64,
+    pub agent_runs_success: AtomicU64,
+    pub agent_runs_failed: AtomicU64,
+    pub tokens_prompt_total: AtomicU64,
+    pub tokens_completion_total: AtomicU64,
+    pub agent_steps_total: AtomicU64,
+}
+
+/// GET /metrics — Prometheus exposition format.
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
+    let metrics = &state.metrics;
+    let requests_total = metrics.requests_total.load(Ordering::Relaxed);
+    let requests_active = metrics.requests_active.load(Ordering::Relaxed);
+    let agent_runs_total = metrics.agent_runs_total.load(Ordering::Relaxed);
+    let agent_runs_success = metrics.agent_runs_success.load(Ordering::Relaxed);
+    let agent_runs_failed = metrics.agent_runs_failed.load(Ordering::Relaxed);
+    let tokens_prompt_total = metrics.tokens_prompt_total.load(Ordering::Relaxed);
+    let tokens_completion_total = metrics.tokens_completion_total.load(Ordering::Relaxed);
+    let agent_steps_total = metrics.agent_steps_total.load(Ordering::Relaxed);
+
+    format!(
+        "# HELP recursive_requests_total Total HTTP requests\n\
+         # TYPE recursive_requests_total counter\n\
+         recursive_requests_total {requests_total}\n\
+         # HELP recursive_requests_active Currently active HTTP requests\n\
+         # TYPE recursive_requests_active gauge\n\
+         recursive_requests_active {requests_active}\n\
+         # HELP recursive_agent_runs_total Total agent runs\n\
+         # TYPE recursive_agent_runs_total counter\n\
+         recursive_agent_runs_total {agent_runs_total}\n\
+         # HELP recursive_agent_runs_success Successful agent runs\n\
+         # TYPE recursive_agent_runs_success counter\n\
+         recursive_agent_runs_success {agent_runs_success}\n\
+         # HELP recursive_agent_runs_failed Failed agent runs\n\
+         # TYPE recursive_agent_runs_failed counter\n\
+         recursive_agent_runs_failed {agent_runs_failed}\n\
+         # HELP recursive_tokens_prompt_total Total prompt tokens consumed\n\
+         # TYPE recursive_tokens_prompt_total counter\n\
+         recursive_tokens_prompt_total {tokens_prompt_total}\n\
+         # HELP recursive_tokens_completion_total Total completion tokens generated\n\
+         # TYPE recursive_tokens_completion_total counter\n\
+         recursive_tokens_completion_total {tokens_completion_total}\n\
+         # HELP recursive_agent_steps_total Total agent steps executed\n\
+         # TYPE recursive_agent_steps_total counter\n\
+         recursive_agent_steps_total {agent_steps_total}\n"
+    )
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// Token-bucket rate limiter keyed by client identifier (API key or remote IP).
 #[derive(Clone)]
 pub struct RateLimiter {
@@ -121,6 +176,19 @@ fn extract_client_key(req: &axum::extract::Request) -> String {
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| format!("ip:{}", info.ip()))
         .unwrap_or_else(|| "ip:unknown".to_string())
+}
+
+/// Middleware that increments request counters.
+async fn metrics_middleware(
+    State(metrics): State<Arc<Metrics>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    metrics.requests_active.fetch_add(1, Ordering::Relaxed);
+    let response = next.run(req).await;
+    metrics.requests_active.fetch_sub(1, Ordering::Relaxed);
+    response
 }
 
 /// Middleware that enforces rate limits on all API requests.
@@ -220,6 +288,7 @@ pub struct AppState {
     pub provider: Arc<dyn LlmProvider>,
     pub sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseEvent>>>>,
+    pub metrics: Arc<Metrics>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -288,6 +357,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/{id}/messages", post(send_session_message))
         .route("/sessions/{id}/events", get(session_events))
         .route("/openapi.json", get(openapi_spec))
+        .route("/metrics", get(metrics_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            metrics_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
@@ -692,6 +766,8 @@ async fn run_agent(
         })?;
 
     let outcome = agent.run(&body.goal).await.map_err(|e| {
+        state.metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
+        state.metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -700,6 +776,13 @@ async fn run_agent(
             }),
         )
     })?;
+
+    // Increment metrics
+    state.metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
+    state.metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
+    state.metrics.agent_steps_total.fetch_add(outcome.steps as u64, Ordering::Relaxed);
+    state.metrics.tokens_prompt_total.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
+    state.metrics.tokens_completion_total.fetch_add(outcome.total_usage.completion_tokens as u64, Ordering::Relaxed);
 
     // Serialize transcript messages to JSON values
     let messages: Vec<serde_json::Value> = outcome
