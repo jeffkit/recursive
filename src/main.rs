@@ -37,6 +37,9 @@ use recursive::{
     tools::{
         ForgetFact, RecallFact, RememberFact, UpdateFact,
     },
+    tools::{
+        EpisodicRecall,
+    },
     Agent, AgentRunner, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry,
     TranscriptFile,
 };
@@ -603,6 +606,8 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(RecallFact::new(root)))
         .register(Arc::new(ForgetFact::new(root)))
         .register(Arc::new(UpdateFact::new(root)));
+    registry = registry
+        .register(Arc::new(EpisodicRecall::new(root)));
     registry = registry
         .register(Arc::new(WorkingMemoryTool::new(root)))
         .register(Arc::new(ScratchpadGet::new(root)))

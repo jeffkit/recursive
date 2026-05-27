@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
 use crate::tools::facts::facts_summary;
+use crate::tools::episodic_recall::episodic_recall_summary;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -115,6 +116,7 @@ impl Config {
         let memory_block = memory_summary(&workspace, memory_summary_limit);
         let scratchpad_block = scratchpad_summary(&workspace);
         let facts_block = facts_summary(&workspace, memory_summary_limit);
+        let episodic_block = episodic_recall_summary(&workspace, memory_summary_limit);
         let system_prompt = if memory_block.is_empty() {
             system_prompt
         } else {
@@ -129,6 +131,11 @@ impl Config {
             system_prompt
         } else {
             format!("{}\n\n{}", system_prompt, facts_block)
+        };
+        let system_prompt = if episodic_block.is_empty() {
+            system_prompt
+        } else {
+            format!("{}\n\n{}", system_prompt, episodic_block)
         };
 
         Ok(Self {
