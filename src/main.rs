@@ -381,11 +381,16 @@ async fn main() -> anyhow::Result<()> {
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
-            axum::serve(listener, router).await?;
+            let shutdown = recursive::runner::shutdown_signal();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await?;
+            eprintln!("shutdown: HTTP server stopped gracefully");
             Ok(())
         }
         Cmd::Init => run_init().await,
         Cmd::Run { goal } => {
+            let shutdown = recursive::runner::shutdown_signal();
             run_once(
                 config,
                 goal.join(" "),
@@ -399,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                 external_pricing,
                 cli.hook_timing,
                 !cli.no_session,
+                shutdown,
             )
             .await
         }
@@ -416,6 +422,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Loop { goal } => {
+            let shutdown = recursive::runner::shutdown_signal();
             run_loop(
                 config,
                 goal.join(" "),
@@ -426,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.mcp_config,
                 external_pricing,
                 cli.hook_timing,
+                shutdown,
             )
             .await
         }
@@ -1431,6 +1439,7 @@ async fn run_loop(
     _mcp_config: Option<PathBuf>,
     _external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use std::sync::Mutex;
 
@@ -1499,6 +1508,9 @@ async fn run_loop(
     // Run the loop
     let mut runner = AgentRunner::new(agent);
     let outcomes = runner.run_loop(&goal, &wakeup_slot, None).await?;
+    if shutdown.is_cancelled() {
+        eprintln!("shutdown: received signal, loop exiting cleanly");
+    }
 
     // Print summary
     if json_mode {
@@ -1539,6 +1551,7 @@ async fn run_once(
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     session: bool,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     if let Err(msg) = config.validate_for_agent() {
         eprintln!("{msg}");
@@ -1631,6 +1644,9 @@ async fn run_once(
         }
     };
     drop(agent);
+    if shutdown.is_cancelled() {
+        eprintln!("shutdown: received signal, exiting cleanly after completing step");
+    }
     printer.await.ok();
     if !json_mode {
         if let Some(ref msg) = outcome.final_message {

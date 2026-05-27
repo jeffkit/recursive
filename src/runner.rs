@@ -12,6 +12,36 @@ use tokio::sync::Mutex;
 use crate::agent::{Agent, AgentOutcome, StepEvent};
 use crate::error::Result;
 use crate::tools::BackgroundJobManager;
+use tokio_util::sync::CancellationToken;
+
+/// Create a CancellationToken that triggers on SIGINT or SIGTERM.
+///
+/// Spawns a background task that waits for either Ctrl-C (SIGINT) or
+/// SIGTERM, then cancels the token. The caller can check
+/// `token.is_cancelled()` or await `token.cancelled()` to perform
+/// graceful shutdown.
+pub fn shutdown_signal() -> CancellationToken {
+    let token = CancellationToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
+        #[cfg(unix)]
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+        #[cfg(not(unix))]
+        ctrl_c.await.unwrap();
+
+        tracing::info!("shutdown signal received, finishing current step...");
+        t.cancel();
+    });
+    token
+}
 
 /// Manages an Agent across multiple conversation turns.
 ///
