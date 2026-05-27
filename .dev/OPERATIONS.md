@@ -132,22 +132,67 @@ Monitor `.dev/runs/<id>.log` for terminal markers:
 For each terminated run:
 
 1. Read observation: `.worktrees/<id>/.dev/observations/<tag>-<prov>-<ts>.md`
-2. If verdict = committed → merge:
+2. If verdict = committed → **code review before merge** (see §3.4.1).
+3. If review passes → merge:
    ```bash
    git merge self-improve/<id> -m "merge: goal-NN <tag> (<provider>)"
    ```
-3. Resolve conflicts if needed (common: `src/main.rs` CLI struct).
-4. Run `cargo test` — must be green.
-5. Commit the observation file to main:
+4. Resolve conflicts if needed (common: `src/main.rs` CLI struct).
+5. Run `cargo test` — must be green.
+6. Commit the observation file to main:
    ```bash
    git add .dev/observations/<tag>-<prov>-<ts>.md
    git commit -m "dev: observation — <tag> (<provider>)"
    ```
-6. Clean up:
+7. Clean up:
    ```bash
    git worktree remove .worktrees/<id>
    git branch -D self-improve/<id>
    ```
+
+#### 3.4.1 Code review checklist
+
+The executing agents (DeepSeek, MiniMax, etc.) have weaker code judgment
+than the orchestrator. Before merging, review the diff against these
+criteria:
+
+**Completeness** — did the agent fulfil the full goal scope?
+- Compare actual changes against every numbered section in the goal file.
+- Common failure: agent does the minimum to pass tests but skips entire
+  subsections of the spec. If >30% of scope is missing, do NOT merge;
+  file a follow-up goal or re-run.
+
+**Correctness** — are there logic bugs?
+- Check error paths: does it propagate errors or silently swallow them?
+- Check edge cases: empty inputs, oversized inputs, concurrent access.
+- Check the test assertions: do they actually verify the behaviour, or
+  just assert `true`?
+
+**Architectural fit** — does it match Recursive's conventions?
+- No `unwrap()` / `expect()` outside tests.
+- New public API uses `Result<T>` with proper error types.
+- Files touched match what the goal specified (no drive-by changes).
+- No new dependencies sneaked in without justification.
+
+**Style & maintainability**:
+- Functions are reasonably sized (< 80 lines preferred).
+- Naming follows existing conventions (snake_case, descriptive).
+- Comments explain "why", not "what".
+- No dead code or commented-out blocks left behind.
+
+**Test quality**:
+- Tests cover both happy path and error/edge cases.
+- Test names describe the scenario being tested.
+- No flaky patterns (time-dependent, env-var races, network calls).
+
+**Review outcome options**:
+- **Merge** — all good or only cosmetic issues (fix in next goal).
+- **Merge + note** — functional but incomplete; log what's missing for
+  a follow-up goal.
+- **Reject + re-run** — goal substantially unmet or has correctness bugs.
+  Amend the goal's "Notes for the agent" section with hints, then re-run.
+- **Reject + revise goal** — the goal spec itself was ambiguous or
+  infeasible; rewrite the goal before re-running.
 
 ### 3.5 Next iteration
 
