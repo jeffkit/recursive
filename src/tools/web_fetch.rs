@@ -248,7 +248,7 @@ impl Tool for WebFetch {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             let excerpt = if body.len() > 200 {
-                format!("{}...", &body[..200])
+                format!("{}...", crate::truncate_str(&body, 200))
             } else {
                 body
             };

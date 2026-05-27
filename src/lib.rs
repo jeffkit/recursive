@@ -65,3 +65,18 @@ pub use skills::{
 };
 pub use tools::{Tool, ToolRegistry};
 pub use transcript::{TranscriptFile, TranscriptMeta};
+
+/// Safely truncate a string to at most `max_bytes` bytes without splitting
+/// a multi-byte UTF-8 character. Returns the full string if it's already
+/// within the limit.
+#[inline]
+pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}

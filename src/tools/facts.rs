@@ -507,7 +507,7 @@ pub fn facts_summary(workspace: &std::path::Path, limit: usize) -> String {
             String::new()
         };
         let text_preview = if fact.text.len() > 120 {
-            format!("{}...", &fact.text[..117])
+            format!("{}...", crate::truncate_str(&fact.text, 117))
         } else {
             fact.text.clone()
         };

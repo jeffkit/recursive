@@ -181,7 +181,7 @@ impl Tool for EpisodicRecall {
                 };
                 let role_padded = format!("{:>9}", entry.role);
                 let content_preview = if entry.content.len() > 200 {
-                    format!("{}...", &entry.content[..197])
+                    format!("{}...", crate::truncate_str(&entry.content, 197))
                 } else {
                     entry.content.clone()
                 };
@@ -247,7 +247,7 @@ pub fn episodic_recall_summary(workspace: &std::path::Path, limit: usize) -> Str
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let goal_preview = if meta.goal.len() > 80 {
-            format!("{}...", &meta.goal[..77])
+            format!("{}...", crate::truncate_str(&meta.goal, 77))
         } else {
             meta.goal.clone()
         };

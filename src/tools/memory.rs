@@ -224,7 +224,7 @@ pub fn memory_summary(workspace: &std::path::Path, limit: usize) -> String {
         };
         // Truncate long text for the summary
         let text_preview = if note.text.len() > 120 {
-            format!("{}...", &note.text[..117])
+            format!("{}...", crate::truncate_str(&note.text, 117))
         } else {
             note.text.clone()
         };
@@ -539,7 +539,7 @@ pub fn scratchpad_summary(workspace: &std::path::Path) -> String {
     for entry in &pad.entries {
         // Truncate long values for the summary
         let value_preview = if entry.value.len() > 200 {
-            format!("{}...", &entry.value[..197])
+            format!("{}...", crate::truncate_str(&entry.value, 197))
         } else {
             entry.value.clone()
         };

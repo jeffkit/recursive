@@ -1793,7 +1793,11 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
                 name, output, step, ..
             } => {
                 let preview = if output.len() > 800 {
-                    format!("{}\n...[truncated]", &output[..800])
+                    let mut end = 800.min(output.len());
+                    while end > 0 && !output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}\n...[truncated]", &output[..end])
                 } else {
                     output
                 };

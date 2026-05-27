@@ -491,9 +491,9 @@ fn workspace_slug(workspace: &Path) -> String {
     let s = abs.to_string_lossy().replace('/', "-");
     // Strip leading dashes (from root slash)
     let s = s.trim_start_matches('-').to_string();
-    // Truncate to 80 chars
+    // Truncate to 80 chars (safe for multibyte)
     if s.len() > 80 {
-        s[..80].to_string()
+        crate::truncate_str(&s, 80).to_string()
     } else {
         s
     }
