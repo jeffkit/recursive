@@ -165,6 +165,24 @@ impl LlmProvider for OpenAiProvider {
 
                     if status.is_success() {
                         let text = resp.text().await?;
+                        // Guard: some providers (e.g. MiniMax) occasionally return
+                        // HTTP 200 with an empty body. Treat as transient and retry.
+                        if text.trim().is_empty() {
+                            if let Some(backoff) =
+                                self.retry.backoff_for(attempt, None, true)
+                            {
+                                tracing::warn!(
+                                    target: "recursive::llm",
+                                    attempt,
+                                    backoff_ms = backoff.as_millis(),
+                                    "HTTP 200 but empty body, retrying"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                attempt += 1;
+                                continue;
+                            }
+                            return Err(self.make_err("HTTP 200 but response body is empty"));
+                        }
                         let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
                             self.make_err(format!("failed to parse response: {e}; body: {text}"))
                         })?;
@@ -257,6 +275,23 @@ impl LlmProvider for OpenAiProvider {
 
                     if status.is_success() {
                         let text = resp.text().await?;
+                        // Guard: empty body on HTTP 200 (MiniMax transient failure)
+                        if text.trim().is_empty() {
+                            if let Some(backoff) =
+                                self.retry.backoff_for(attempt, None, true)
+                            {
+                                tracing::warn!(
+                                    target: "recursive::llm",
+                                    attempt,
+                                    backoff_ms = backoff.as_millis(),
+                                    "HTTP 200 but empty body (structured), retrying"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                attempt += 1;
+                                continue;
+                            }
+                            return Err(self.make_err("HTTP 200 but response body is empty"));
+                        }
                         let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
                             self.make_err(format!("failed to parse response: {e}; body: {text}"))
                         })?;
