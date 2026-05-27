@@ -20,28 +20,23 @@ use recursive::config::load_project_context;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
+use recursive::OnMessageFn;
 use recursive::SessionFile;
 use recursive::SessionWriter;
-use recursive::OnMessageFn;
 use recursive::{
     config::Config,
     llm::{
         load_pricing_from_yaml, pricing_for, AnthropicProvider, LlmProvider, ModelPricing,
         OpenAiProvider, TokenUsage,
     },
+    tools::EpisodicRecall,
     tools::{
         ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
-        RunSkillScript, ScheduleWakeup, SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch,
-        WriteFile,
-        ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
+        RunSkillScript, ScheduleWakeup, ScratchpadDelete, ScratchpadGet, ScratchpadList,
+        SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch, WorkingMemoryTool, WriteFile,
     },
-    tools::{
-        ForgetFact, RecallFact, RememberFact, UpdateFact,
-    },
-    tools::{
-        EpisodicRecall,
-    },
+    tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     Agent, AgentRunner, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry,
     TranscriptFile,
 };
@@ -575,8 +570,9 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 if path.is_dir() {
-                    std::fs::remove_dir_all(&path)
-                        .with_context(|| format!("removing session directory: {}", path.display()))?;
+                    std::fs::remove_dir_all(&path).with_context(|| {
+                        format!("removing session directory: {}", path.display())
+                    })?;
                     println!("Deleted session directory: {}", path.display());
                 } else if path.is_file() {
                     std::fs::remove_file(&path)
@@ -647,7 +643,11 @@ fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathB
     // Search the workspace session directory for a match
     let sessions_dir = workspace.join(".recursive").join("sessions");
     if !sessions_dir.is_dir() {
-        anyhow::bail!("Session not found: '{}'. No sessions directory exists at {}.", session, sessions_dir.display());
+        anyhow::bail!(
+            "Session not found: '{}'. No sessions directory exists at {}.",
+            session,
+            sessions_dir.display()
+        );
     }
 
     let lower = session.to_lowercase();
@@ -690,7 +690,10 @@ fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathB
     }
 
     match matches.len() {
-        0 => anyhow::bail!("Session not found: '{}'. Use 'recursive sessions list' to see available sessions.", session),
+        0 => anyhow::bail!(
+            "Session not found: '{}'. Use 'recursive sessions list' to see available sessions.",
+            session
+        ),
         1 => Ok(matches.into_iter().next().unwrap()),
         n => {
             eprintln!("Multiple sessions match '{}' ({}):", session, n);
@@ -764,8 +767,7 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(RecallFact::new(root)))
         .register(Arc::new(ForgetFact::new(root)))
         .register(Arc::new(UpdateFact::new(root)));
-    registry = registry
-        .register(Arc::new(EpisodicRecall::new(root)));
+    registry = registry.register(Arc::new(EpisodicRecall::new(root)));
     registry = registry
         .register(Arc::new(WorkingMemoryTool::new(root)))
         .register(Arc::new(ScratchpadGet::new(root)))
@@ -1195,7 +1197,12 @@ async fn run_resumed(
 
     // Create SessionWriter if --session is enabled
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
-        match SessionWriter::create(&config.workspace, &goal, &config.model, &config.provider_type) {
+        match SessionWriter::create(
+            &config.workspace,
+            &goal,
+            &config.model,
+            &config.provider_type,
+        ) {
             Ok(writer) => {
                 eprintln!("session: recording to {}", writer.session_dir().display());
                 Some(Arc::new(std::sync::Mutex::new(writer)))
@@ -1262,9 +1269,11 @@ async fn run_resumed(
                 if let Err(e) = writer.finish(finish_status) {
                     eprintln!("session: failed to finalize: {e}");
                 } else {
-                    eprintln!("session: saved {} message(s) to {}",
+                    eprintln!(
+                        "session: saved {} message(s) to {}",
                         writer.message_count(),
-                        writer.session_dir().display());
+                        writer.session_dir().display()
+                    );
                 }
             }
             None => {
@@ -1434,7 +1443,12 @@ async fn run_once(
 
     // Create SessionWriter if --session is enabled
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
-        match SessionWriter::create(&config.workspace, &goal, &config.model, &config.provider_type) {
+        match SessionWriter::create(
+            &config.workspace,
+            &goal,
+            &config.model,
+            &config.provider_type,
+        ) {
             Ok(writer) => {
                 eprintln!("session: recording to {}", writer.session_dir().display());
                 Some(Arc::new(std::sync::Mutex::new(writer)))
@@ -1530,9 +1544,11 @@ async fn run_once(
                 if let Err(e) = writer.finish(finish_status) {
                     eprintln!("session: failed to finalize: {e}");
                 } else {
-                    eprintln!("session: saved {} message(s) to {}",
+                    eprintln!(
+                        "session: saved {} message(s) to {}",
                         writer.message_count(),
-                        writer.session_dir().display());
+                        writer.session_dir().display()
+                    );
                 }
             }
             None => {

@@ -13,10 +13,11 @@ use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
 pub mod apply_patch;
+pub mod episodic_recall;
 pub mod estimate_tokens;
+pub mod facts;
 pub mod fs;
 pub mod load_skill;
-pub mod facts;
 pub mod memory;
 pub mod run_background;
 pub mod run_skill_script;
@@ -25,24 +26,23 @@ pub mod search;
 pub mod shell;
 pub mod sub_agent;
 pub mod transport;
-pub mod episodic_recall;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
 pub use apply_patch::ApplyPatch;
+pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
 pub use estimate_tokens::EstimateTokens;
+pub use facts::{
+    facts_path, facts_summary, load_facts, search_facts, Fact, FactStore, ForgetFact, RecallFact,
+    RememberFact, ScoredFact, UpdateFact,
+};
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use load_skill::LoadSkill;
-pub use episodic_recall::{EpisodicRecall, episodic_recall_summary};
-pub use memory::{Forget, Recall, Remember};
 pub use memory::{
-    Scratchpad, ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
-    load_scratchpad, scratchpad_path, scratchpad_summary,
+    load_scratchpad, scratchpad_path, scratchpad_summary, Scratchpad, ScratchpadDelete,
+    ScratchpadGet, ScratchpadList, WorkingMemoryTool,
 };
-pub use facts::{
-    Fact, FactStore, ForgetFact, RecallFact, RememberFact, UpdateFact,
-    facts_path, facts_summary, load_facts, search_facts, ScoredFact,
-};
+pub use memory::{Forget, Recall, Remember};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};

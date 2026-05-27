@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::tools::episodic_recall::episodic_recall_summary;
+use crate::tools::facts::facts_summary;
 use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
-use crate::tools::facts::facts_summary;
-use crate::tools::episodic_recall::episodic_recall_summary;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -112,30 +112,60 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
 
-        // Append memory summary to the system prompt
+        // Assemble system prompt with memory layers.
+        // Order: most stable first (user.md), most volatile last (memory_summary).
+        // This helps LLM prefix caching.
+        let mut layers: Vec<(String, String)> = Vec::new();
+
+        // Layer 1: User preferences (global, ~/.recursive/memory/user.md)
+        if let Some(user_memory) = load_user_memory() {
+            layers.push(("# User preferences".into(), user_memory));
+        }
+
+        // Layer 2: Project memory (workspace-local, agent-writable)
+        if let Some(project_memory) = load_project_memory(&workspace) {
+            layers.push(("# Project memory".into(), project_memory));
+        }
+
+        // Layer 3: Memory summary (volatile, changes each run)
         let memory_block = memory_summary(&workspace, memory_summary_limit);
+        if !memory_block.is_empty() {
+            layers.push(("# Memory summary".into(), memory_block));
+        }
+
+        // Layer 4: Scratchpad summary
         let scratchpad_block = scratchpad_summary(&workspace);
+        if !scratchpad_block.is_empty() {
+            layers.push(("# Scratchpad".into(), scratchpad_block));
+        }
+
+        // Layer 5: Facts summary
         let facts_block = facts_summary(&workspace, memory_summary_limit);
+        if !facts_block.is_empty() {
+            layers.push(("# Facts".into(), facts_block));
+        }
+
+        // Layer 6: Episodic recall summary
         let episodic_block = episodic_recall_summary(&workspace, memory_summary_limit);
-        let system_prompt = if memory_block.is_empty() {
+        if !episodic_block.is_empty() {
+            layers.push(("# Episodic recall".into(), episodic_block));
+        }
+
+        // Build the final system prompt: base prompt + layers
+        let system_prompt = if layers.is_empty() {
             system_prompt
         } else {
-            format!("{}\n\n{}", system_prompt, memory_block)
-        };
-        let system_prompt = if scratchpad_block.is_empty() {
-            system_prompt
-        } else {
-            format!("{}\n\n{}", system_prompt, scratchpad_block)
-        };
-        let system_prompt = if facts_block.is_empty() {
-            system_prompt
-        } else {
-            format!("{}\n\n{}", system_prompt, facts_block)
-        };
-        let system_prompt = if episodic_block.is_empty() {
-            system_prompt
-        } else {
-            format!("{}\n\n{}", system_prompt, episodic_block)
+            let mut result = system_prompt;
+            result.push_str("\n\n---\n\n");
+            for (i, (heading, content)) in layers.iter().enumerate() {
+                if i > 0 {
+                    result.push_str("\n\n");
+                }
+                result.push_str(heading);
+                result.push('\n');
+                result.push_str(content);
+            }
+            result
         };
 
         Ok(Self {
@@ -244,6 +274,42 @@ pub fn default_system_prompt() -> String {
 /// 16 KB is enough for a detailed project context without blowing
 /// the context window.
 const MAX_PROJECT_CONTEXT_SIZE: usize = 16 * 1024;
+
+/// Maximum size for memory files (user.md, project.md) in bytes.
+const MAX_MEMORY_FILE_SIZE: usize = 8 * 1024;
+
+/// Load user-global memory from ~/.recursive/memory/user.md.
+/// Returns None if the file doesn't exist. Caps at 8KB.
+pub fn load_user_memory() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".recursive/memory/user.md");
+    load_memory_file(&path)
+}
+
+/// Load project-local memory (agent-writable) from workspace/.recursive/memory/project.md.
+pub fn load_project_memory(workspace: &Path) -> Option<String> {
+    let path = workspace.join(".recursive/memory/project.md");
+    load_memory_file(&path)
+}
+
+/// Load a memory file with an 8KB cap.
+fn load_memory_file(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.is_empty() {
+        return None;
+    }
+    if content.len() > MAX_MEMORY_FILE_SIZE {
+        Some(format!(
+            "{}\n\n[…truncated at 8KB]",
+            &content[..MAX_MEMORY_FILE_SIZE]
+        ))
+    } else {
+        Some(content)
+    }
+}
 
 /// Load project context from AGENTS.md at workspace root.
 ///
@@ -432,5 +498,125 @@ mod tests {
         // No AGENTS.md file
         let content = load_project_context(tmp.path());
         assert!(content.is_none());
+    }
+
+    // --- Memory layer tests ---
+    //
+    // NOTE: Tests that set HOME are consolidated into ONE test to avoid
+    // races with parallel test execution (set_var is process-global).
+
+    #[test]
+    fn test_b_load_project_memory_returns_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&mem_dir).expect("create dirs");
+        let path = mem_dir.join("project.md");
+        std::fs::write(&path, "This project uses AGPL license").expect("write");
+
+        let content = load_project_memory(tmp.path());
+        assert!(content.is_some());
+        assert!(content.unwrap().contains("AGPL"));
+    }
+
+    #[test]
+    fn test_c_files_exceeding_8kb_are_truncated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&mem_dir).expect("create dirs");
+        let path = mem_dir.join("project.md");
+        // Write 10 KB of content
+        let large_content = "Hello world\n".repeat(800);
+        assert!(large_content.len() > 8192, "content must exceed 8KB");
+        std::fs::write(&path, &large_content).expect("write");
+
+        let content = load_project_memory(tmp.path());
+        assert!(content.is_some());
+        let c = content.unwrap();
+        // Should contain truncation marker
+        assert!(c.contains("truncated at 8KB"));
+        // Should not contain the full content
+        assert!(c.len() < large_content.len());
+    }
+
+    // Consolidated test for all HOME-dependent memory checks.
+    // These must be ONE test because set_var("HOME", ...) is process-global
+    // and parallel tests would race on it.
+    #[test]
+    fn memory_home_dependent_tests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+
+        // Test A: load_user_memory returns content
+        {
+            let mem_dir = tmp.path().join(".recursive/memory");
+            std::fs::create_dir_all(&mem_dir).expect("create dirs");
+            std::fs::write(mem_dir.join("user.md"), "I prefer Python over Rust").expect("write");
+
+            let content = load_user_memory();
+            assert!(content.is_some());
+            assert!(content.unwrap().contains("Python"));
+        }
+
+        // Test D: missing files return None
+        {
+            // Remove the user.md we just created
+            let mem_dir = tmp.path().join(".recursive/memory");
+            std::fs::remove_file(mem_dir.join("user.md")).expect("remove");
+
+            let user_mem = load_user_memory();
+            assert!(user_mem.is_none());
+
+            let project_mem = load_project_memory(tmp.path());
+            assert!(project_mem.is_none());
+        }
+
+        // Test E: system prompt assembly includes all available layers
+        {
+            let mem_dir = tmp.path().join(".recursive/memory");
+            std::fs::create_dir_all(&mem_dir).expect("create dirs");
+            std::fs::write(mem_dir.join("user.md"), "I like Rust").expect("write");
+            std::fs::write(mem_dir.join("project.md"), "MIT license").expect("write");
+
+            std::env::set_var("RECURSIVE_MODEL", "test-model");
+            std::env::set_var("RECURSIVE_API_KEY", "test-key");
+            std::env::set_var("RECURSIVE_WORKSPACE", tmp.path().to_str().unwrap());
+
+            let config = Config::from_env().unwrap();
+            let prompt = config.system_prompt;
+
+            assert!(prompt.contains("# User preferences"));
+            assert!(prompt.contains("I like Rust"));
+            assert!(prompt.contains("# Project memory"));
+            assert!(prompt.contains("MIT license"));
+            assert!(prompt.contains("You are Recursive"));
+        }
+
+        // Test F: no memory files behaves identically
+        {
+            let tmp2 = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("HOME", tmp2.path().to_str().unwrap());
+
+            std::env::set_var("RECURSIVE_MODEL", "test-model");
+            std::env::set_var("RECURSIVE_API_KEY", "test-key");
+            std::env::set_var("RECURSIVE_WORKSPACE", tmp2.path().to_str().unwrap());
+
+            let config = Config::from_env().unwrap();
+            let prompt = config.system_prompt;
+
+            assert!(prompt.contains("You are Recursive"));
+            assert!(!prompt.contains("# User preferences"));
+            assert!(!prompt.contains("# Project memory"));
+        }
+
+        // Restore HOME
+        if let Some(v) = original_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }
