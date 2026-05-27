@@ -15,6 +15,7 @@ pub mod config;
 pub mod config_file;
 pub mod cost;
 pub mod error;
+pub mod event;
 pub mod hooks;
 #[cfg(feature = "http")]
 pub mod http;
@@ -35,6 +36,7 @@ pub use agent::OnMessageFn;
 pub use agent::PlanningMode;
 pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
 pub use agent::{PermissionDecision, PermissionHook};
+pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
 pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
