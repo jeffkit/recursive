@@ -1,100 +1,71 @@
-# Goal 115 — Structured Tracing with span events
+# Goal 115 — Tool execution spans + run completion event
 
 **Roadmap**: Phase 15.1 — Observability (part 1/3)
 
 **Design principle check**:
-- Implemented as: `tracing` span events on LLM calls + tool executions
-- Builds on existing `tracing::info_span!` in agent.rs (step spans)
-- ❌ Does NOT branch inside `agent.rs::Agent::run`'s main loop logic
+- Implemented as: tracing span around tool dispatch + info event at run end
+- Builds on existing `tracing::info_span!("agent.step", step)` in agent.rs
+- Does NOT change the run loop logic, only adds instrumentation
 
 ## Why
 
-The agent already has basic tracing spans (one per step), but lacks
-structured timing data for the two slowest operations: LLM API calls
-and tool executions. Adding span events with duration and metadata
-enables the evaluation system to extract per-step latency breakdowns
-from logs, and helps debug "where did 30 seconds go?" during runs.
+Each agent step already has a tracing span, but we can't see how long
+individual tool calls take within a step, or get a structured summary
+at run completion. Adding these two pieces gives the evaluation system
+the timing data it needs.
 
 ## Scope (do exactly this, no more)
 
-### 1. Add LLM call span in `src/llm/openai.rs`
+### 1. Wrap tool execution in a span
 
-Wrap the HTTP request in a tracing span that records:
-- model name
-- token counts (on exit)
-- latency (automatic from span lifetime)
-
-```rust
-let _span = tracing::info_span!(
-    "llm.call",
-    model = %self.model,
-    tokens_in = tracing::field::Empty,
-    tokens_out = tracing::field::Empty,
-).entered();
-// ... after response ...
-_span.record("tokens_in", usage.prompt_tokens);
-_span.record("tokens_out", usage.completion_tokens);
-```
-
-Do the same for `src/llm/anthropic.rs` if the file has a similar
-request path.
-
-### 2. Add tool execution span in `src/agent.rs`
-
-In the tool dispatch section (where tools are called), wrap each
-tool call in a span:
+In `src/agent.rs`, find where tool calls are dispatched (the section
+that iterates over `tool_calls` and calls `self.tools.call(...)`).
+Wrap each tool call in a span:
 
 ```rust
-let _tool_span = tracing::info_span!(
-    "tool.exec",
-    tool = %tool_name,
-    status = tracing::field::Empty,
-).entered();
-// ... after execution ...
-_tool_span.record("status", if result.is_error { "error" } else { "ok" });
+let tool_span = tracing::info_span!("tool.exec", tool = %call.name);
+let _guard = tool_span.enter();
+// ... existing tool call code ...
+// After the call returns, the span auto-closes with duration
 ```
 
-### 3. Add a `tracing` event for run completion
+This is ~3 lines of change per call site.
 
-At the end of `Agent::run`, emit a structured event with the summary:
+### 2. Emit structured event at run completion
+
+At the end of `Agent::run()`, just before returning `Ok(outcome)`,
+emit a tracing event with the run summary:
 
 ```rust
 tracing::info!(
     steps = outcome.steps,
     tokens_in = outcome.total_usage.prompt_tokens,
     tokens_out = outcome.total_usage.completion_tokens,
-    finish = ?outcome.finish,
+    finish = %format!("{:?}", outcome.finish),
     llm_latency_ms = outcome.total_llm_latency_ms,
     "agent.run.complete"
 );
 ```
 
-### 4. Tests
+### 3. Tests
 
 - **Test A**: Agent run emits "agent.run.complete" event (use tracing-test)
-- **Test B**: Tool execution spans are created (verify span name)
-- **Test C**: LLM call spans record token counts
+- **Test B**: Tool execution creates "tool.exec" span (verify via logs)
 
 ## Acceptance
 
 - `cargo build` green.
 - `cargo test` green.
-- `cargo clippy --all-targets -- -D warnings` green.
-- Running with `RUST_LOG=info` shows structured span output including
-  `llm.call`, `tool.exec`, and `agent.run.complete`.
+- `cargo clippy --all-targets -- -D warnings` clean.
+- Running with `RUST_LOG=info` shows `tool.exec` spans with durations.
+- Only `src/agent.rs` is modified.
 
 ## Notes for the agent
 
-- `tracing` and `tracing-test` are already in Cargo.toml dependencies.
-- There are existing spans in agent.rs at line ~451: `tracing::info_span!("agent.step", step)`.
-  Build on that pattern — don't restructure.
-- The existing `RECURSIVE_TRACE_SPANS` env var (used by self-improve.sh)
-  relies on stderr output. New spans integrate with the standard `tracing`
-  subscriber, which is already configured in main.rs.
-- Keep changes minimal in agent.rs. The tool dispatch loop is around
-  line 480-520 — search for tool execution there.
-- In openai.rs, the HTTP call is in the `complete` method. That's
-  the right place for the LLM span.
-- Do NOT add new dependencies. `tracing` is already available.
-- Files to modify: `src/agent.rs`, `src/llm/openai.rs`, possibly
-  `src/llm/anthropic.rs`.
+- `tracing` is already imported in agent.rs: `use tracing::{debug, info, warn};`
+- Existing step spans are at line ~451: `tracing::info_span!("agent.step", step)`
+- The tool dispatch loop is in the section after the LLM call returns.
+  Search for `self.tools.call` or `tool_registry.call` to find it.
+- `tracing-test` is in dev-dependencies. Use `#[traced_test]` for test assertions.
+- Do NOT touch `src/llm/openai.rs` or any other file. Only `src/agent.rs`.
+- This should be a ~15 line change. Keep it minimal.
