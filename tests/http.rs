@@ -5,7 +5,7 @@ mod http_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use recursive::config::Config;
-    use recursive::http::{build_router, map_step_event, AppState, SseEvent, ToolInfo};
+    use recursive::http::{build_router, map_step_event, AppState, Metrics, SseEvent, ToolInfo};
     use recursive::llm::{Completion, MockProvider};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -69,6 +69,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -79,6 +80,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -153,6 +155,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         });
 
         let response = app
@@ -195,6 +198,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         };
         let app = build_router(state);
 
@@ -240,6 +244,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         };
         let app = build_router(state);
 
@@ -291,6 +296,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         };
         let app = build_router(state);
 
@@ -354,6 +360,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         };
         let app = build_router(state);
 
@@ -424,6 +431,7 @@ mod http_tests {
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
         };
         let app = build_router(state);
 
