@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod compact;
+pub mod cost;
 pub mod config;
 pub mod config_file;
 pub mod error;
