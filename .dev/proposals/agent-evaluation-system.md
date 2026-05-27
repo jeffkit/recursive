@@ -193,17 +193,21 @@ Phase 3 (later): Aggregation script + provider routing based on data
 Phase 4 (later): Review pipeline metrics + A/B testing review quality
 ```
 
-## Open Questions
+## Decisions (confirmed 2026-05-27)
 
-1. Should metrics be committed to git (auditable) or gitignored (noisy)?
-   → Suggest: committed, in `.dev/metrics/` (small YAML files, valuable history)
+1. **指标存储** → 提交到 git，`.dev/metrics/` 目录。整个 .dev 都是开发 raw data，无噪声顾虑。
 
-2. How to measure "correctness" objectively?
-   → Short term: orchestrator judgment (0-10 scale)
-   → Long term: count bugs found in follow-up goals that trace back to this code
+2. **质量评分** → 双打分（Review Agent + Orchestrator），用于校准 Review Agent。
+   - Review Agent 先打，Orchestrator 后打
+   - 记录 delta（两者差异），持续优化 review prompt
+   - 长期目标：Review Agent 可信度达到 >90% 后，Orchestrator 只抽检
 
-3. Should we A/B test review agents (e.g. DeepSeek reviews MiniMax's code)?
-   → Yes, eventually. Cross-provider review may catch different things.
+3. **Provider 自动路由** → 基于积累数据自动选 provider。
+   - 规则：S 复杂度 → flash, L 复杂度 → pro
+   - "flash 连续两次 no_changes" → 自动升级 pro
+   - 按 goal 类型（新模块 vs 重构 vs bug fix）匹配最佳 provider
 
-4. How granular? Per-run or per-goal?
-   → Both. Per-run for raw data, per-goal for decision-making.
+4. **Orchestrator 兜底** → 最终安全网。
+   - Review Agent 的假阴性（approve 了有 bug 的代码）→ Orchestrator 修复
+   - Review Agent 的真阳性（正确 reject）→ 记录为有效 review
+   - 所有修复行为回流为 review prompt 的训练数据
