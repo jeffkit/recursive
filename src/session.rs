@@ -210,6 +210,37 @@ pub struct SessionMeta {
     pub status: String,
 }
 
+/// A portable exported transcript for sharing and analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedTranscript {
+    pub version: u32,
+    pub session_id: String,
+    pub model: String,
+    pub goal: String,
+    pub created_at: String,
+    pub status: String,
+    pub messages: Vec<TranscriptEntry>,
+    pub message_count: u64,
+}
+
+impl ExportedTranscript {
+    /// Build an  from a session directory.
+    pub fn from_session_dir(session_dir: &Path) -> std::io::Result<Self> {
+        let meta = SessionReader::load_meta(session_dir)?;
+        let entries = SessionReader::load_transcript(session_dir)?;
+        Ok(Self {
+            version: 1,
+            session_id: meta.session_id,
+            model: meta.model,
+            goal: meta.goal,
+            created_at: meta.created_at,
+            status: meta.status,
+            messages: entries.clone(),
+            message_count: entries.len() as u64,
+        })
+    }
+}
+
 /// A single JSONL line representing one message in the transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {

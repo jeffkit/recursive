@@ -222,6 +222,14 @@ enum SessionCmd {
         #[arg(long, short = 'f')]
         force: bool,
     },
+    /// Export a session as portable JSON.
+    Export {
+        /// Session directory path or session ID.
+        session: String,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -626,6 +634,18 @@ async fn main() -> anyhow::Result<()> {
                     println!("Deleted session file: {}", path.display());
                 } else {
                     anyhow::bail!("Path does not exist: {}", path.display());
+                }
+                Ok(())
+            }
+            SessionCmd::Export { session, output } => {
+                let path = resolve_session_path(&config.workspace, &session)?;
+                let exported = recursive::session::ExportedTranscript::from_session_dir(&path)?;
+                let json = serde_json::to_string_pretty(&exported)?;
+                if let Some(out) = output {
+                    std::fs::write(&out, &json)?;
+                    println!("Exported to {}", out.display());
+                } else {
+                    println!("{}", json);
                 }
                 Ok(())
             }
