@@ -127,6 +127,7 @@ pub struct McpPromptMessage {
 // ---------------------------------------------------------------------------
 
 /// The underlying transport for an MCP client.
+#[allow(clippy::large_enum_variant)]
 enum McpTransport {
     /// Stdio subprocess transport.
     Stdio {
