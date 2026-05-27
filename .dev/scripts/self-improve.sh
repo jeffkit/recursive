@@ -505,6 +505,23 @@ EOF
 }
 
 if [[ "$AGENT_STATUS" -ne 0 ]]; then
+  # Distinguish infrastructure panics from normal agent failures.
+  # Panics (Rust's default exit code on panic is 101; signals add 128+N):
+  #   101 = Rust panic, 134 = SIGABRT, 139 = SIGSEGV, 137 = SIGKILL
+  # Normal agent failures (budget exceeded, stuck, etc.) exit with 1.
+  # On panic: preserve the worktree for diagnosis instead of hard-resetting.
+  if [[ "$AGENT_STATUS" -eq 101 ]] || [[ "$AGENT_STATUS" -ge 128 ]]; then
+    append_result_footer "panic-preserved" "agent panicked (exit ${AGENT_STATUS})"
+    emit_metrics "panic" "agent panicked (exit ${AGENT_STATUS})"
+    # Commit journal + metrics without resetting — preserve the code state
+    git add "$LOG" "$METRICS_FILE" 2>/dev/null || true
+    git commit --quiet -m "dev: journal — PANIC run ${TS} (${GOAL_TAG}: exit ${AGENT_STATUS})" 2>/dev/null || true
+    echo ""
+    echo "=== ⚠ PANIC preserved (exit ${AGENT_STATUS}); worktree left dirty for diagnosis ==="
+    echo "=== journaled to ${LOG} ==="
+    echo "=== inspect: git diff  |  fix: git reset --hard ${BASELINE_SHORT} ==="
+    exit 2  # distinct from rolled-back (1) and success (0)
+  fi
   verdict_and_exit "rolled-back" "agent exited with status ${AGENT_STATUS}"
 fi
 

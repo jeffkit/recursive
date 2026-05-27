@@ -20,16 +20,16 @@ v0.6+ goal: **make it an ecosystem** — plugins, persistence, observability, an
 
 ## Phase 14 — Persistence & State (Priority: Critical)
 
-Currently everything is in-memory. Production use requires durable state.
+Durable state for production use.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 14.1 | Session persistence (SQLite) | M | 🔴 |
-| 14.2 | Memory persistence (SQLite) | S | 🔴 |
-| 14.3 | Transcript export/import (JSON) | S | 🔴 |
+| 14.1 | Session persistence (JSONL) | M | ✅ Batch 35 (Goals 107-109) |
+| 14.2 | Memory persistence (4-layer system) | M | ✅ Batch 35-36 (Goals 110-113, 110b) |
+| 14.3 | Transcript export/import (JSON) | S | 🟡 Partial — sessions list/show enhanced, export CLI pending |
 | 14.4 | Agent checkpoint/resume | M | 🔴 |
 
-**Total**: ~2 batches
+**Total**: ~2 batches → 1.5 done
 
 ---
 
@@ -39,12 +39,12 @@ Understanding what agents do in production.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 15.1 | Structured logging (tracing spans per step) | S | 🔴 |
-| 15.2 | Metrics endpoint (Prometheus-compatible) | M | 🔴 |
-| 15.3 | Cost tracking dashboard (per-session, per-role) | M | 🔴 |
+| 15.1 | Structured logging (tracing spans per step) | S | ✅ Batch 36 (Goal 115) |
+| 15.2 | Metrics endpoint (Prometheus-compatible) | M | 🔴 → Batch 37 |
+| 15.3 | Cost tracking (per-session persistence) | M | ✅ Batch 36 (Goal 116) — wiring into CLI pending |
 | 15.4 | Replay viewer (web-based transcript replay) | M | 🔴 |
 
-**Total**: ~2 batches
+**Total**: ~2 batches → 1 done
 
 ---
 
@@ -69,10 +69,10 @@ Make it safe and reliable for real deployments.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 17.1 | Rate limiting (per-session, per-API-key) | S | 🔴 |
+| 17.1 | Rate limiting (per-session, per-API-key) | S | 🔴 → Batch 37 |
 | 17.2 | Authentication (API keys + JWT) | M | 🔴 |
 | 17.3 | Tool permission system (role-based allow/deny) | M | 🔴 |
-| 17.4 | Graceful shutdown + in-flight request draining | S | 🔴 |
+| 17.4 | Graceful shutdown + in-flight request draining | S | 🔴 → Batch 37 |
 | 17.5 | Docker packaging + health probes | S | 🔴 |
 
 **Total**: ~2 batches
@@ -114,15 +114,21 @@ Make Recursive accessible to a wider audience.
 ## Execution Order (Revised)
 
 ```
-Batch 35: Phase 14 (Persistence + Memory) — JSONL sessions + 4-layer memory
-           Goals: 107 (JSONL writer), 108 (wire agent), 109 (CLI commands)
-                  110 (Layer 0 context), 111 (Layer 1 scratchpad),
-                  112 (Layer 2 semantic), 113 (Layer 3 episodic)
-Batch 36: Phase 15 (Observability) — logging, metrics, cost tracking
-Batch 37: Phase 17 (Hardening) — auth, rate limiting, Docker
-Batch 38: Phase 16.1-16.2 (Plugins) — trait + manifest
-Batch 39: Phase 18 (Agent Patterns) — reflection, tool learning
-Batch 40+: Phase 19 (Ecosystem) — SDKs, installers, docs site
+Batch 35: Phase 14 (Persistence + Memory) — DONE
+           Goals: 107-109 (JSONL sessions), 110-113 (4-layer memory), 114 (self-review)
+Batch 36: Phase 14-15 (Complete + Observability start) — DONE
+           Goals: 110b (Layer 0 complete), 115 (tracing spans),
+                  116 (cost tracker), 117 (session CLI enhancements)
+           Meta: self-review ON by default, evaluation YAML emission,
+                 UTF-8 truncation bugfix
+Batch 37: Phase 15 + 17 (Observability + Hardening)
+           Goals: 118 (wire CostTracker), 119 (sessions export),
+                  120 (graceful shutdown), 121 (rate limiting),
+                  122 (Prometheus metrics endpoint)
+Batch 38: Phase 17 continued (Auth + Docker)
+Batch 39: Phase 16.1-16.2 (Plugins) — trait + manifest
+Batch 40: Phase 18 (Agent Patterns) — reflection, tool learning
+Batch 41+: Phase 19 (Ecosystem) — SDKs, installers, docs site
 ```
 
 ---
