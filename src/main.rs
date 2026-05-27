@@ -1494,7 +1494,9 @@ async fn run_loop(
         builder = builder.planning_mode(PlanningMode::PlanFirst);
     }
 
-    let agent = builder.build()?;
+    let mut agent = builder.build()?;
+    // Wire up graceful shutdown on SIGINT/SIGTERM.
+    agent.set_shutdown_token(recursive::runner::shutdown_signal());
 
     // Run the loop
     let mut runner = AgentRunner::new(agent);
@@ -1603,6 +1605,8 @@ async fn run_once(
         on_message,
     )
     .await?;
+    // Wire up graceful shutdown on SIGINT/SIGTERM.
+    agent.set_shutdown_token(recursive::runner::shutdown_signal());
     let tools = build_tools(&config).await;
     let tool_specs = tools.specs();
     let printer = if json_mode {
@@ -1861,6 +1865,8 @@ async fn repl(
         None,
     )
     .await?;
+    // Wire up graceful shutdown on SIGINT/SIGTERM.
+    agent.set_shutdown_token(recursive::runner::shutdown_signal());
     // Drop the initial rx (no events to print before first turn)
     drop(rx);
 

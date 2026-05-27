@@ -57,6 +57,7 @@ pub use multi::{
     TeamOrchestrator, TeamResult,
 };
 pub use runner::AgentRunner;
+pub use runner::shutdown_signal;
 pub use session::SessionFile;
 pub use session::SessionReader;
 pub use session::SessionWriter;

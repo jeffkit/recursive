@@ -23,6 +23,7 @@ use crate::agent::StepEvent;
 use crate::config::Config;
 use crate::llm::LlmProvider;
 use crate::message::Message;
+use crate::runner::shutdown_signal;
 
 // ── Rate limiter ───────────────────────────────────────────────────────────
 
@@ -691,6 +692,7 @@ async fn run_agent(
             )
         })?;
 
+    agent.set_shutdown_token(shutdown_signal());
     let outcome = agent.run(&body.goal).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -900,6 +902,7 @@ async fn send_session_message(
             )
         })?;
 
+    agent.set_shutdown_token(shutdown_signal());
     // Load existing transcript for multi-turn (only if there are prior messages)
     if !transcript.is_empty() {
         agent.set_transcript(transcript);

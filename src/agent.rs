@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::compact::Compactor;
@@ -172,6 +173,8 @@ pub enum FinishReason {
     TranscriptLimit { chars: usize, limit: usize },
     /// Agent proposed a plan (PlanFirst mode) and is waiting for confirmation.
     PlanPending,
+    /// Agent was cancelled by a shutdown signal (SIGINT/SIGTERM).
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +232,7 @@ pub struct Agent {
     plan_buffer: Option<Vec<ToolCall>>,
     plan_confirmed: bool,
     on_message: Option<OnMessageFn>,
+    shutdown_token: Option<CancellationToken>,
 }
 
 impl Agent {
@@ -273,6 +277,12 @@ impl Agent {
         self.emit(StepEvent::PlanRejected {
             reason: reason.into(),
         });
+    }
+
+    /// Set a cancellation token that will be checked between steps.
+    /// When the token is cancelled, the agent finishes with `FinishReason::Cancelled`.
+    pub fn set_shutdown_token(&mut self, token: CancellationToken) {
+        self.shutdown_token = Some(token);
     }
 
     /// Drive the loop until the model stops calling tools, or the budget is exhausted.
@@ -456,6 +466,35 @@ impl Agent {
         for step in 1..=self.max_steps {
             let step_span = tracing::info_span!("agent.step", step);
             let _guard = step_span.enter();
+
+            // Check for shutdown signal between steps.
+            if let Some(ref token) = self.shutdown_token {
+                if token.is_cancelled() {
+                    let finish = FinishReason::Cancelled;
+                    self.emit(StepEvent::Finished {
+                        reason: finish.clone(),
+                        steps: step,
+                    });
+                    tracing::info!(
+                        target: "recursive::agent",
+                        steps = step,
+                        tokens_in = total_usage.prompt_tokens,
+                        tokens_out = total_usage.completion_tokens,
+                        finish = ?finish,
+                        llm_latency_ms = self.total_llm_latency_ms,
+                        "agent.run.complete (cancelled)"
+                    );
+                    return Ok(AgentOutcome {
+                        final_message,
+                        transcript: std::mem::take(&mut self.transcript),
+                        steps: step,
+                        finish,
+                        total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
+                    });
+                }
+            }
+
             // Check transcript size limit before making the next LLM call.
             // First try trimming old tool results; fall back to hard stop.
             if let Some(limit) = self.max_transcript_chars {
@@ -912,6 +951,7 @@ pub struct AgentBuilder {
     hooks: HookRegistry,
     planning_mode: PlanningMode,
     on_message: Option<OnMessageFn>,
+    shutdown_token: Option<CancellationToken>,
 }
 
 impl AgentBuilder {
@@ -1055,6 +1095,11 @@ impl AgentBuilder {
         self.on_message = Some(f);
         self
     }
+    /// Attach a cancellation token for graceful shutdown on SIGINT/SIGTERM.
+    pub fn shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
+        self
+    }
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.ok_or_else(|| Error::Config {
             message: "agent: missing llm provider".into(),
@@ -1080,6 +1125,7 @@ impl AgentBuilder {
             plan_buffer: None,
             plan_confirmed: false,
             on_message: self.on_message,
+            shutdown_token: self.shutdown_token,
         })
     }
 }
@@ -2372,6 +2418,7 @@ mod tests {
             plan_buffer: Some(vec![]),
             plan_confirmed: false,
             on_message: None,
+            shutdown_token: None,
         };
         agent.confirm_plan();
         assert!(agent.plan_confirmed);
@@ -2395,6 +2442,7 @@ mod tests {
             plan_buffer: Some(vec![]),
             plan_confirmed: false,
             on_message: None,
+            shutdown_token: None,
         };
         agent.reject_plan("bad plan");
         assert!(agent.plan_buffer.is_none());
