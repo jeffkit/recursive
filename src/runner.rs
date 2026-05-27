@@ -182,10 +182,7 @@ impl AgentRunner {
             outcomes.push(outcome);
 
             // Priority 1: explicit wakeup
-            let wakeup = wakeup_slot
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take());
+            let wakeup = wakeup_slot.lock().ok().and_then(|mut slot| slot.take());
             if let Some(req) = wakeup {
                 tokio::time::sleep(req.delay).await;
                 next_goal = req.prompt;
@@ -196,10 +193,7 @@ impl AgentRunner {
             if let Some(ref mgr) = self.bg_manager {
                 if let Ok(mut mgr) = mgr.try_lock() {
                     if let Some((id, output)) = mgr.take_completed() {
-                        next_goal = format!(
-                            "Background job '{}' completed:\n{}",
-                            id, output
-                        );
+                        next_goal = format!("Background job '{}' completed:\n{}", id, output);
                         continue;
                     }
                 }
@@ -440,8 +434,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_event_loop_triggers_on_wakeup() {
-        use std::sync::Mutex as StdMutex;
         use crate::tools::WakeupSlot;
+        use std::sync::Mutex as StdMutex;
 
         let script = vec![
             Completion {
@@ -506,8 +500,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_event_loop_triggers_on_bg_completion() {
-        use std::sync::Mutex as StdMutex;
         use crate::tools::WakeupSlot;
+        use std::sync::Mutex as StdMutex;
 
         let script = vec![
             Completion {
@@ -548,7 +542,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcomes.len(), 2, "should have run 2 turns (initial + bg trigger)");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "should have run 2 turns (initial + bg trigger)"
+        );
         assert_eq!(runner.turns(), 2);
     }
 }

@@ -6,9 +6,9 @@
 mod v050_integration {
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use recursive::http::{AppState, ToolInfo, build_router};
-    use recursive::multi::{AgentPool, AgentRole, Pipeline, default_roles};
-    use recursive::llm::{Completion, mock::MockProvider};
+    use recursive::http::{build_router, AppState, ToolInfo};
+    use recursive::llm::{mock::MockProvider, Completion};
+    use recursive::multi::{default_roles, AgentPool, AgentRole, Pipeline};
     use recursive::{Config, LlmProvider};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -16,15 +16,13 @@ mod v050_integration {
     use tower::ServiceExt;
 
     fn mock_provider() -> Arc<dyn LlmProvider> {
-        Arc::new(MockProvider::new(vec![
-            Completion {
-                content: "I'll help you with that. Let me analyze the code.".to_string(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".to_string()),
-                usage: None,
-                reasoning_content: None,
-            },
-        ]))
+        Arc::new(MockProvider::new(vec![Completion {
+            content: "I'll help you with that. Let me analyze the code.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]))
     }
 
     fn test_config() -> Config {
@@ -46,13 +44,11 @@ mod v050_integration {
 
     fn test_app_state() -> AppState {
         AppState {
-            tools: vec![
-                ToolInfo {
-                    name: "read_file".into(),
-                    description: "Read a file".into(),
-                    parameters: serde_json::json!({}),
-                },
-            ],
+            tools: vec![ToolInfo {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({}),
+            }],
             config: test_config(),
             provider: mock_provider(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -67,14 +63,20 @@ mod v050_integration {
         let app = build_router(test_app_state());
 
         // Create session
-        let resp = app.clone().oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/sessions")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"system_prompt": "You are a helpful assistant"}"#))
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"system_prompt": "You are a helpful assistant"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 201);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -82,54 +84,73 @@ mod v050_integration {
         let session_id = session["id"].as_str().unwrap();
 
         // List sessions
-        let resp = app.clone().oneshot(
-            axum::http::Request::builder()
-                .uri("/sessions")
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert_eq!(sessions.len(), 1);
 
         // Send message
-        let resp = app.clone().oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(format!("/sessions/{session_id}/messages"))
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"content": "hello"}"#))
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content": "hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
 
         // Get session detail
-        let resp = app.clone().oneshot(
-            axum::http::Request::builder()
-                .uri(format!("/sessions/{session_id}"))
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
 
         // Delete session
-        let resp = app.clone().oneshot(
-            axum::http::Request::builder()
-                .method("DELETE")
-                .uri(format!("/sessions/{session_id}"))
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 204);
 
         // Verify deleted
-        let resp = app.oneshot(
-            axum::http::Request::builder()
-                .uri(format!("/sessions/{session_id}"))
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 404);
     }
 
@@ -148,11 +169,13 @@ mod v050_integration {
         assert_eq!(pool.role_count(), 3);
 
         // Write to shared memory
-        pool.memory().set(
-            "architecture".into(),
-            "modular with clear boundaries".into(),
-            "planner".into(),
-        ).await;
+        pool.memory()
+            .set(
+                "architecture".into(),
+                "modular with clear boundaries".into(),
+                "planner".into(),
+            )
+            .await;
 
         // Verify memory is accessible
         let entry = pool.memory().get("architecture").await.unwrap();
@@ -176,7 +199,8 @@ mod v050_integration {
                 reasoning_content: None,
             },
             Completion {
-                content: "Done! Created hello.rs with fn main() { println!(\"Hello!\"); }".to_string(),
+                content: "Done! Created hello.rs with fn main() { println!(\"Hello!\"); }"
+                    .to_string(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".to_string()),
                 usage: None,
@@ -200,7 +224,10 @@ mod v050_integration {
         });
 
         let pipeline = Pipeline::new(vec!["planner".into(), "coder".into()]);
-        let result = pipeline.execute(&pool, "build a hello world").await.unwrap();
+        let result = pipeline
+            .execute(&pool, "build a hello world")
+            .await
+            .unwrap();
 
         assert_eq!(result.stage_count(), 2);
         assert_eq!(result.stages[0].role, "planner");
@@ -215,8 +242,10 @@ mod v050_integration {
         let pool = AgentPool::new(provider, config);
 
         // Send task from planner to coder
-        pool.send_task("planner", "coder", "implement feature X").await;
-        pool.send_result("coder", "planner", "done, all tests pass").await;
+        pool.send_task("planner", "coder", "implement feature X")
+            .await;
+        pool.send_result("coder", "planner", "done, all tests pass")
+            .await;
 
         // Check inboxes
         let coder_inbox = pool.bus().inbox("coder").await;
@@ -238,12 +267,15 @@ mod v050_integration {
     async fn openapi_spec_is_valid_and_complete() {
         let app = build_router(test_app_state());
 
-        let resp = app.oneshot(
-            axum::http::Request::builder()
-                .uri("/openapi.json")
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), 200);
         let body = resp.into_body().collect().await.unwrap().to_bytes();

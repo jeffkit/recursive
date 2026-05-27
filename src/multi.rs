@@ -66,7 +66,10 @@ impl SharedMemory {
         }
         let mut lines = vec!["[Shared Memory]".to_string()];
         for entry in store.values() {
-            lines.push(format!("- {} = {} (by {})", entry.key, entry.value, entry.author));
+            lines.push(format!(
+                "- {} = {} (by {})",
+                entry.key, entry.value, entry.author
+            ));
         }
         lines.join("\n")
     }
@@ -402,11 +405,7 @@ impl TeamOrchestrator {
     }
 
     /// Run orchestration: lead plans delegations, specialists execute, lead synthesizes.
-    pub async fn run(
-        &self,
-        pool: &AgentPool,
-        goal: &str,
-    ) -> Result<TeamResult, crate::Error> {
+    pub async fn run(&self, pool: &AgentPool, goal: &str) -> Result<TeamResult, crate::Error> {
         // Phase 1: Ask lead to plan
         let delegation_prompt = format!(
             "{}\n\nAvailable specialists: {}\n\nTo delegate, use: DELEGATE:<role>:<task>\nWhen done, provide your final answer.",
@@ -414,7 +413,9 @@ impl TeamOrchestrator {
             self.available_roles.join(", ")
         );
 
-        let lead_outcome = pool.run_with_role(&self.lead_role, &delegation_prompt).await?;
+        let lead_outcome = pool
+            .run_with_role(&self.lead_role, &delegation_prompt)
+            .await?;
         let lead_response = lead_outcome
             .transcript
             .iter()
@@ -667,10 +668,7 @@ mod tests {
         });
 
         let outcome = pool.run_with_role("planner", "plan a task").await.unwrap();
-        assert_eq!(
-            outcome.finish,
-            crate::agent::FinishReason::NoMoreToolCalls
-        );
+        assert_eq!(outcome.finish, crate::agent::FinishReason::NoMoreToolCalls);
         assert!(outcome.final_message.unwrap().contains("Plan:"));
     }
 
@@ -806,12 +804,27 @@ mod tests {
     #[tokio::test]
     async fn message_bus_outbox() {
         let bus = MessageBus::new();
-        bus.send(make_msg("coder", "reviewer", "done coding", MessageType::Result))
-            .await;
-        bus.send(make_msg("coder", "planner", "need clarification", MessageType::Question))
-            .await;
-        bus.send(make_msg("planner", "coder", "here is the plan", MessageType::Task))
-            .await;
+        bus.send(make_msg(
+            "coder",
+            "reviewer",
+            "done coding",
+            MessageType::Result,
+        ))
+        .await;
+        bus.send(make_msg(
+            "coder",
+            "planner",
+            "need clarification",
+            MessageType::Question,
+        ))
+        .await;
+        bus.send(make_msg(
+            "planner",
+            "coder",
+            "here is the plan",
+            MessageType::Task,
+        ))
+        .await;
 
         let outbox = bus.outbox("coder").await;
         assert_eq!(outbox.len(), 2);
@@ -824,8 +837,13 @@ mod tests {
     #[tokio::test]
     async fn message_bus_broadcast_reaches_all() {
         let bus = MessageBus::new();
-        bus.send(make_msg("admin", "broadcast", "system update", MessageType::Broadcast))
-            .await;
+        bus.send(make_msg(
+            "admin",
+            "broadcast",
+            "system update",
+            MessageType::Broadcast,
+        ))
+        .await;
 
         let coder_inbox = bus.inbox("coder").await;
         let reviewer_inbox = bus.inbox("reviewer").await;
@@ -854,8 +872,10 @@ mod tests {
     #[tokio::test]
     async fn message_bus_history() {
         let bus = MessageBus::new();
-        bus.send(make_msg("a", "b", "msg1", MessageType::Task)).await;
-        bus.send(make_msg("b", "a", "msg2", MessageType::Result)).await;
+        bus.send(make_msg("a", "b", "msg1", MessageType::Task))
+            .await;
+        bus.send(make_msg("b", "a", "msg2", MessageType::Result))
+            .await;
         bus.send(make_msg("a", "broadcast", "msg3", MessageType::Broadcast))
             .await;
 
@@ -869,7 +889,8 @@ mod tests {
     #[tokio::test]
     async fn message_bus_clear() {
         let bus = MessageBus::new();
-        bus.send(make_msg("a", "b", "hello", MessageType::Task)).await;
+        bus.send(make_msg("a", "b", "hello", MessageType::Task))
+            .await;
         assert_eq!(bus.history().await.len(), 1);
 
         bus.clear().await;
@@ -883,7 +904,8 @@ mod tests {
         let pool = AgentPool::new(provider, test_config());
 
         pool.send_task("planner", "coder", "build module Y").await;
-        pool.send_result("coder", "planner", "module Y complete").await;
+        pool.send_result("coder", "planner", "module Y complete")
+            .await;
 
         let inbox = pool.bus().inbox("coder").await;
         assert_eq!(inbox.len(), 1);
@@ -985,7 +1007,9 @@ mod tests {
         let calls = mock_ref.calls();
         assert_eq!(calls.len(), 2);
         // The second call's user message should contain "draft text"
-        let second_call_user_msg = calls[1].iter().find(|m| m.role == crate::message::Role::User);
+        let second_call_user_msg = calls[1]
+            .iter()
+            .find(|m| m.role == crate::message::Role::User);
         assert!(second_call_user_msg.unwrap().content.contains("draft text"));
     }
 
@@ -1061,7 +1085,10 @@ mod tests {
     fn parse_delegations_extracts_role_and_task() {
         let text = "DELEGATE:coder:write hello";
         let result = parse_delegations(text);
-        assert_eq!(result, vec![("coder".to_string(), "write hello".to_string())]);
+        assert_eq!(
+            result,
+            vec![("coder".to_string(), "write hello".to_string())]
+        );
     }
 
     #[test]
@@ -1069,8 +1096,14 @@ mod tests {
         let text = "Here is my plan:\n- Think about it\nDELEGATE:coder:implement feature\nSome other text\nDELEGATE:reviewer:check code";
         let result = parse_delegations(text);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ("coder".to_string(), "implement feature".to_string()));
-        assert_eq!(result[1], ("reviewer".to_string(), "check code".to_string()));
+        assert_eq!(
+            result[0],
+            ("coder".to_string(), "implement feature".to_string())
+        );
+        assert_eq!(
+            result[1],
+            ("reviewer".to_string(), "check code".to_string())
+        );
     }
 
     #[test]
@@ -1108,14 +1141,17 @@ mod tests {
             allowed_tools: vec![],
         });
 
-        let orchestrator = TeamOrchestrator::new(
-            "lead".into(),
-            vec!["coder".into()],
-        );
-        let result = orchestrator.run(&pool, "What is the meaning of life?").await.unwrap();
+        let orchestrator = TeamOrchestrator::new("lead".into(), vec!["coder".into()]);
+        let result = orchestrator
+            .run(&pool, "What is the meaning of life?")
+            .await
+            .unwrap();
 
         assert!(result.delegations.is_empty());
-        assert_eq!(result.final_output, "I will handle this myself. The answer is 42.");
+        assert_eq!(
+            result.final_output,
+            "I will handle this myself. The answer is 42."
+        );
     }
 
     #[tokio::test]
@@ -1159,11 +1195,11 @@ mod tests {
             allowed_tools: vec![],
         });
 
-        let orchestrator = TeamOrchestrator::new(
-            "lead".into(),
-            vec!["coder".into()],
-        );
-        let result = orchestrator.run(&pool, "Create a hello world program").await.unwrap();
+        let orchestrator = TeamOrchestrator::new("lead".into(), vec!["coder".into()]);
+        let result = orchestrator
+            .run(&pool, "Create a hello world program")
+            .await
+            .unwrap();
 
         assert_eq!(result.delegations.len(), 1);
         assert_eq!(result.delegations[0].role, "coder");

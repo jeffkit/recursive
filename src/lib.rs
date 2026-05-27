@@ -15,13 +15,13 @@ pub mod config;
 pub mod config_file;
 pub mod error;
 pub mod hooks;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod llm;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
-#[cfg(feature = "http")]
-pub mod http;
 pub mod message;
 pub mod multi;
 pub mod runner;

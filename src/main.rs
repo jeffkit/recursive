@@ -315,30 +315,27 @@ async fn main() -> anyhow::Result<()> {
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
-            let provider: Arc<dyn recursive::llm::LlmProvider> =
-                match config.provider_type.as_str() {
-                    "anthropic" => {
-                        let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
-                            max_retries: config.retry_max,
-                            initial_backoff: Duration::from_secs(
-                                config.retry_initial_backoff_secs,
-                            ),
-                            max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-                        };
-                        let anthropic =
-                            AnthropicProvider::new(&config.api_base, api_key, &config.model)
-                                .with_temperature(config.temperature)
-                                .with_retry_policy(anthropic_retry);
-                        Arc::new(anthropic)
-                    }
-                    _ => {
-                        let openai =
-                            OpenAiProvider::new(&config.api_base, api_key, &config.model)
-                                .with_temperature(config.temperature)
-                                .with_retry_policy(retry);
-                        Arc::new(openai)
-                    }
-                };
+            let provider: Arc<dyn recursive::llm::LlmProvider> = match config.provider_type.as_str()
+            {
+                "anthropic" => {
+                    let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
+                        max_retries: config.retry_max,
+                        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+                    };
+                    let anthropic =
+                        AnthropicProvider::new(&config.api_base, api_key, &config.model)
+                            .with_temperature(config.temperature)
+                            .with_retry_policy(anthropic_retry);
+                    Arc::new(anthropic)
+                }
+                _ => {
+                    let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
+                        .with_temperature(config.temperature)
+                        .with_retry_policy(retry);
+                    Arc::new(openai)
+                }
+            };
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 config: config.clone(),

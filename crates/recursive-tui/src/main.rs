@@ -38,20 +38,24 @@ impl StyledMessage {
             Self::Assistant(text) => {
                 Line::from(format!("Agent: {text}")).style(Style::default().fg(Color::Cyan))
             }
-            Self::ToolCall(name) => Line::from(format!("  🔧 {name}"))
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
+            Self::ToolCall(name) => Line::from(format!("  🔧 {name}")).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
             Self::ToolResult { name, success } => {
                 let prefix = if *success { "  ✓" } else { "  ✗" };
                 let color = if *success { Color::Green } else { Color::Red };
                 Line::from(format!("{prefix} {name}"))
                     .style(Style::default().fg(color).add_modifier(Modifier::DIM))
             }
-            Self::System(text) => Line::from(text.clone())
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-            Self::Separator => {
-                Line::from("────────────────────────────────")
-                    .style(Style::default().fg(Color::DarkGray))
-            }
+            Self::System(text) => Line::from(text.clone()).style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Self::Separator => Line::from("────────────────────────────────")
+                .style(Style::default().fg(Color::DarkGray)),
         }
     }
 }
@@ -104,7 +108,8 @@ impl App {
         match client.get(&health_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 self.connected = true;
-                self.messages.push(StyledMessage::System("Connected to server.".into()));
+                self.messages
+                    .push(StyledMessage::System("Connected to server.".into()));
             }
             _ => {
                 self.connected = false;
@@ -126,9 +131,8 @@ impl App {
                 }
             }
             _ => {
-                self.messages.push(StyledMessage::System(
-                    "Failed to create session.".into(),
-                ));
+                self.messages
+                    .push(StyledMessage::System("Failed to create session.".into()));
             }
         }
     }
@@ -154,8 +158,7 @@ impl App {
                                 .no_proxy()
                                 .build()
                                 .unwrap_or_default();
-                            let url =
-                                format!("{base_url}/sessions/{session_id}/messages");
+                            let url = format!("{base_url}/sessions/{session_id}/messages");
                             match client
                                 .post(&url)
                                 .json(&serde_json::json!({"content": "approved"}))
@@ -163,18 +166,14 @@ impl App {
                                 .await
                             {
                                 Ok(resp) => {
-                                    if let Ok(body) =
-                                        resp.json::<serde_json::Value>().await
-                                    {
+                                    if let Ok(body) = resp.json::<serde_json::Value>().await {
                                         let content = body
                                             .get("content")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
                                             .to_string();
                                         if !content.is_empty() {
-                                            let _ = tx.send(
-                                                UiEvent::AssistantMessage { content },
-                                            );
+                                            let _ = tx.send(UiEvent::AssistantMessage { content });
                                         }
                                     }
                                 }
@@ -201,8 +200,7 @@ impl App {
                                 .no_proxy()
                                 .build()
                                 .unwrap_or_default();
-                            let url =
-                                format!("{base_url}/sessions/{session_id}/messages");
+                            let url = format!("{base_url}/sessions/{session_id}/messages");
                             match client
                                 .post(&url)
                                 .json(&serde_json::json!({"content": "rejected"}))
@@ -210,18 +208,14 @@ impl App {
                                 .await
                             {
                                 Ok(resp) => {
-                                    if let Ok(body) =
-                                        resp.json::<serde_json::Value>().await
-                                    {
+                                    if let Ok(body) = resp.json::<serde_json::Value>().await {
                                         let content = body
                                             .get("content")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
                                             .to_string();
                                         if !content.is_empty() {
-                                            let _ = tx.send(
-                                                UiEvent::AssistantMessage { content },
-                                            );
+                                            let _ = tx.send(UiEvent::AssistantMessage { content });
                                         }
                                     }
                                 }
@@ -271,9 +265,13 @@ impl App {
                             Ok(resp) => {
                                 if let Ok(body) = resp.json::<serde_json::Value>().await {
                                     // Check for tool calls in the response
-                                    if let Some(tools) = body.get("tool_calls").and_then(|v| v.as_array()) {
+                                    if let Some(tools) =
+                                        body.get("tool_calls").and_then(|v| v.as_array())
+                                    {
                                         for tool in tools {
-                                            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                                            if let Some(name) =
+                                                tool.get("name").and_then(|v| v.as_str())
+                                            {
                                                 let _ = tx.send(UiEvent::ToolCall {
                                                     name: name.to_string(),
                                                 });
@@ -281,7 +279,9 @@ impl App {
                                         }
                                     }
 
-                                    if let Some(results) = body.get("tool_results").and_then(|v| v.as_array()) {
+                                    if let Some(results) =
+                                        body.get("tool_results").and_then(|v| v.as_array())
+                                    {
                                         for result in results {
                                             let name = result
                                                 .get("name")
@@ -358,15 +358,14 @@ impl App {
                 self.messages.push(StyledMessage::ToolCall(name));
             }
             UiEvent::ToolResult { name, success } => {
-                self.messages.push(StyledMessage::ToolResult { name, success });
+                self.messages
+                    .push(StyledMessage::ToolResult { name, success });
             }
             UiEvent::AssistantMessage { content } => {
                 let first_line = content.lines().next().unwrap_or("");
                 let lower = first_line.to_lowercase();
                 if lower.starts_with("plan:") || lower.starts_with("## plan") {
-                    self.screen = AppScreen::PlanReview {
-                        plan_text: content,
-                    };
+                    self.screen = AppScreen::PlanReview { plan_text: content };
                 } else {
                     self.messages.push(StyledMessage::Assistant(content));
                     self.messages.push(StyledMessage::Separator);
@@ -391,18 +390,14 @@ fn render_splash(frame: &mut Frame) {
 
     let logo_lines = vec![
         Line::from(""),
-        Line::from("   ╱╲    Recursive Agent".to_string())
-            .style(Style::default().fg(Color::Cyan)),
+        Line::from("   ╱╲    Recursive Agent".to_string()).style(Style::default().fg(Color::Cyan)),
         Line::from("  ╱  ╲   ─────────────────".to_string())
             .style(Style::default().fg(Color::Cyan)),
-        Line::from(" ╱ ╱╲ ╲  v0.4.0".to_string())
-            .style(Style::default().fg(Color::White)),
-        Line::from(" ╲ ╲╱ ╱".to_string())
-            .style(Style::default().fg(Color::Cyan)),
+        Line::from(" ╱ ╱╲ ╲  v0.4.0".to_string()).style(Style::default().fg(Color::White)),
+        Line::from(" ╲ ╲╱ ╱".to_string()).style(Style::default().fg(Color::Cyan)),
         Line::from("  ╲  ╱   Self-improving AI agent".to_string())
             .style(Style::default().fg(Color::Cyan)),
-        Line::from("   ╲╱    in Rust".to_string())
-            .style(Style::default().fg(Color::Cyan)),
+        Line::from("   ╲╱    in Rust".to_string()).style(Style::default().fg(Color::Cyan)),
         Line::from(""),
         Line::from("  Press any key to continue...".to_string())
             .style(Style::default().fg(Color::DarkGray)),
@@ -454,8 +449,7 @@ fn render_plan_review(frame: &mut Frame, plan_text: &str) {
     frame.render_widget(status_bar, chunks[1]);
 
     // Empty bottom panel
-    let empty = Paragraph::new("")
-        .block(Block::default().borders(Borders::ALL));
+    let empty = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     frame.render_widget(empty, chunks[2]);
 }
 
@@ -496,8 +490,8 @@ fn ui(frame: &mut Frame, app: &App) {
     } else {
         " Not connected".to_string()
     };
-    let status_bar = Paragraph::new(status_text)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    let status_bar =
+        Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(status_bar, chunks[1]);
 
     // Input panel with visual cursor
@@ -517,12 +511,10 @@ async fn main() -> io::Result<()> {
     let mut app = App::new();
 
     loop {
-        terminal.draw(|frame| {
-            match &app.screen {
-                AppScreen::Splash => render_splash(frame),
-                AppScreen::Chat => ui(frame, &app),
-                AppScreen::PlanReview { plan_text } => render_plan_review(frame, plan_text),
-            }
+        terminal.draw(|frame| match &app.screen {
+            AppScreen::Splash => render_splash(frame),
+            AppScreen::Chat => ui(frame, &app),
+            AppScreen::PlanReview { plan_text } => render_plan_review(frame, plan_text),
         })?;
 
         tokio::select! {
@@ -598,7 +590,10 @@ mod tests {
         app.input = "hello".to_string();
         app.handle_key(KeyCode::Enter, &tx).await;
         assert!(app.input.is_empty());
-        assert!(app.messages.iter().any(|m| matches!(m, StyledMessage::User(t) if t.contains("hello"))));
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, StyledMessage::User(t) if t.contains("hello"))));
     }
 
     #[tokio::test]
@@ -806,7 +801,10 @@ mod tests {
         app.handle_ui_event(UiEvent::AssistantMessage {
             content: "response".into(),
         });
-        assert!(matches!(app.messages.last(), Some(StyledMessage::Separator)));
+        assert!(matches!(
+            app.messages.last(),
+            Some(StyledMessage::Separator)
+        ));
     }
 
     #[tokio::test]

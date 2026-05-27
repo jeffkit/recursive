@@ -620,9 +620,7 @@ fn generate_session_id() -> String {
 
 /// Format a SystemTime as a basic ISO-8601 string (without chrono).
 fn format_timestamp(t: SystemTime) -> String {
-    let dur = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+    let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs();
     // Basic formatting: seconds since epoch as a simple numeric timestamp
     // For a more human-readable format we do manual UTC conversion
@@ -735,10 +733,7 @@ async fn get_session(
 }
 
 /// DELETE /sessions/:id — remove a session.
-async fn delete_session(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> StatusCode {
+async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
     let mut sessions = state.sessions.write().await;
     if sessions.remove(&id).is_some() {
         StatusCode::NO_CONTENT
@@ -905,7 +900,10 @@ pub fn map_step_event(event: &StepEvent) -> Option<SseEvent> {
             step: *step,
         }),
         StepEvent::ToolResult {
-            name, output, step: _, ..
+            name,
+            output,
+            step: _,
+            ..
         } => {
             let success = !output.starts_with("ERROR: ");
             Some(SseEvent::ToolResult {

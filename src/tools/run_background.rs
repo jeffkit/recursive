@@ -126,17 +126,17 @@ impl BackgroundJobManager {
         })?;
         let job = self.jobs.remove(&id)?;
         let output = match &job.state {
-            JobState::Completed { stdout, stderr, exit_code } => {
-                format!(
-                    "exit code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-                )
+            JobState::Completed {
+                stdout,
+                stderr,
+                exit_code,
+            } => {
+                format!("exit code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}")
             }
             JobState::Failed { message } => {
                 format!("failed: {message}")
             }
-            JobState::TimedOut => {
-                "timed out".to_string()
-            }
+            JobState::TimedOut => "timed out".to_string(),
             JobState::Running => unreachable!(), // filtered above
         };
         Some((id, output))

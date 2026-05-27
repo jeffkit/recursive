@@ -4,9 +4,9 @@
 mod http_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use recursive::http::{AppState, SseEvent, ToolInfo, build_router, map_step_event};
-    use recursive::llm::{Completion, MockProvider};
     use recursive::config::Config;
+    use recursive::http::{build_router, map_step_event, AppState, SseEvent, ToolInfo};
+    use recursive::llm::{Completion, MockProvider};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -220,7 +220,10 @@ mod http_tests {
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(resp["status"], "success");
-        assert!(resp["finish_reason"].as_str().unwrap().contains("NoMoreToolCalls"));
+        assert!(resp["finish_reason"]
+            .as_str()
+            .unwrap()
+            .contains("NoMoreToolCalls"));
         assert!(resp["messages"].is_array());
         assert!(!resp["messages"].as_array().unwrap().is_empty());
         assert_eq!(resp["usage"]["total_steps"], 1);
@@ -448,7 +451,10 @@ mod http_tests {
 
         // Should hit budget exceeded at 2 steps
         assert_eq!(resp["status"], "success");
-        assert!(resp["finish_reason"].as_str().unwrap().contains("BudgetExceeded"));
+        assert!(resp["finish_reason"]
+            .as_str()
+            .unwrap()
+            .contains("BudgetExceeded"));
         assert_eq!(resp["usage"]["total_steps"], 2);
     }
 
@@ -1031,14 +1037,19 @@ mod http_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        let paths = spec["paths"].as_object().expect("paths should be an object");
+        let paths = spec["paths"]
+            .as_object()
+            .expect("paths should be an object");
 
         // All registered endpoints must be present
         assert!(paths.contains_key("/health"), "missing /health");
         assert!(paths.contains_key("/tools"), "missing /tools");
         assert!(paths.contains_key("/run"), "missing /run");
         assert!(paths.contains_key("/sessions"), "missing /sessions");
-        assert!(paths.contains_key("/sessions/{id}"), "missing /sessions/{{id}}");
+        assert!(
+            paths.contains_key("/sessions/{id}"),
+            "missing /sessions/{{id}}"
+        );
         assert!(
             paths.contains_key("/sessions/{id}/messages"),
             "missing /sessions/{{id}}/messages"
