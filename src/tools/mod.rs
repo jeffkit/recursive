@@ -25,6 +25,7 @@ pub mod search;
 pub mod shell;
 pub mod sub_agent;
 pub mod transport;
+pub mod episodic_recall;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
@@ -32,6 +33,7 @@ pub use apply_patch::ApplyPatch;
 pub use estimate_tokens::EstimateTokens;
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use load_skill::LoadSkill;
+pub use episodic_recall::{EpisodicRecall, episodic_recall_summary};
 pub use memory::{Forget, Recall, Remember};
 pub use memory::{
     Scratchpad, ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
