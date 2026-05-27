@@ -399,6 +399,60 @@ if ! cargo test --quiet >/dev/null 2>&1; then
   verdict_and_exit "rolled-back" "post-agent cargo test failed"
 fi
 
+# ---- Self-review pipeline (opt-in via RECURSIVE_SELF_REVIEW=1) -------------
+# Runs an independent review agent against the diff. If the review rejects,
+# feeds back issues for one revision round, then re-verifies.
+if [[ "${RECURSIVE_SELF_REVIEW:-0}" == "1" ]]; then
+  echo "[self-improve] running code review..."
+  REVIEW_JSON=$(.dev/scripts/review-changes.sh "$SELECTED_PROVIDER" 2>/dev/null || echo '{"verdict":"approve"}')
+  VERDICT=$(echo "$REVIEW_JSON" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('verdict','approve'))" 2>/dev/null || echo "approve")
+
+  if [[ "$VERDICT" == "request_changes" ]]; then
+    echo "[self-improve] review rejected, feeding back..."
+    # Extract issues as a bullet list
+    ISSUES=$(echo "$REVIEW_JSON" | python3 -c "
+import sys, json
+r = json.loads(sys.stdin.read())
+for i in r.get('issues', []):
+    print(f\"- [{i.get('severity','minor')}] {i.get('file','?')}: {i.get('description','?')}. Fix: {i.get('suggestion','?')}\")
+" 2>/dev/null || echo "Review found issues (could not parse details)")
+
+    REVISION_GOAL="The code reviewer found issues with your implementation. Please fix these:
+
+$ISSUES
+
+Original goal for reference:
+$(cat "$GOAL_SOURCE" 2>/dev/null || echo "$GOAL_BODY")
+
+Fix ONLY the issues listed above. Do not rewrite other code."
+
+    # Re-run in same worktree (up to 1 revision round)
+    set +e
+    "$BIN" --workspace . \
+      --system-prompt-file "$SYSPROMPT_FILE" \
+      --transcript-out "${TRANSCRIPT_OUT%.json}-revision.json" \
+      $PRICING_FLAG \
+      --log warn \
+      run "$REVISION_GOAL" 2>&1 | tee -a "$LOG"
+    REVISION_STATUS=${PIPESTATUS[0]}
+    set -e
+
+    if [[ "$REVISION_STATUS" -ne 0 ]]; then
+      echo "[self-improve] revision agent failed, flagging for orchestrator"
+      verdict_and_exit "rolled-back" "revision agent exited with status ${REVISION_STATUS}"
+    fi
+
+    # Re-verify after revision
+    if ! cargo test --quiet >/dev/null 2>&1; then
+      verdict_and_exit "rolled-back" "post-revision cargo test failed"
+    fi
+
+    echo "[self-improve] revision applied successfully"
+  else
+    echo "[self-improve] review approved"
+  fi
+fi
+
 # Decide whether a meaningful change happened. Journal files are this
 # script's own artifact, not agent output; they must not count toward
 # "the agent made changes". Without this filter, every run gets credited

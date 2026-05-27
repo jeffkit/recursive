@@ -133,6 +133,10 @@ For each terminated run:
 
 1. Read observation: `.worktrees/<id>/.dev/observations/<tag>-<prov>-<ts>.md`
 2. If verdict = committed → **code review before merge** (see §3.4.1).
+   If `RECURSIVE_SELF_REVIEW=1` was set, the agent already ran an
+   automated review pass inside `self-improve.sh` (see §3.4.2). The
+   orchestrator still does the final review — the automated pass is a
+   pre-filter that catches obvious issues before commit.
 3. If review passes → merge:
    ```bash
    git merge self-improve/<id> -m "merge: goal-NN <tag> (<provider>)"
@@ -193,6 +197,41 @@ criteria:
   Amend the goal's "Notes for the agent" section with hints, then re-run.
 - **Reject + revise goal** — the goal spec itself was ambiguous or
   infeasible; rewrite the goal before re-running.
+
+### 3.4.2 Automated review pipeline (RECURSIVE_SELF_REVIEW=1)
+
+When `RECURSIVE_SELF_REVIEW=1` is exported before launching
+`self-improve.sh`, the script runs an independent review agent
+(via `.dev/scripts/review-changes.sh`) against the diff **after**
+`cargo test` passes but **before** committing.
+
+**Flow:**
+1. Review agent inspects the diff and returns a JSON verdict
+   (`"approve"` or `"request_changes"`).
+2. If `request_changes`: issues are extracted and fed back to the
+   product agent as a revision goal. The agent gets one revision
+   round (same worktree, same provider).
+3. After revision, `cargo test` re-runs. If it fails, the run is
+   rolled back.
+4. If the revision agent itself fails (non-zero exit), the run is
+   rolled back — this prevents a broken revision from being committed.
+
+**Limitations:**
+- The review agent uses the same provider as the product agent (no
+  independent model). It catches formatting, missing tests, and
+  obvious logic gaps, but is not a substitute for human/orchestrator
+  review of architectural fit.
+- Only one revision round is attempted. If the revision still has
+  issues, the run commits as-is (the orchestrator catches it in §3.4.1).
+- The review agent's transcript is saved to
+  `.dev/journal/run-<ts>-revision.json` for debugging.
+
+**When to enable:**
+- For high-risk goals (touches core agent loop, concurrency, or
+  public API).
+- When the provider has a history of missing test coverage or
+  leaving dead code.
+- Default is off (`0`) to keep iteration fast for routine goals.
 
 ### 3.5 Next iteration
 
