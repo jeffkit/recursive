@@ -213,6 +213,19 @@ enum Cmd {
 enum SessionCmd {
     /// List all session files in the workspace's session directory.
     List,
+    /// Show details of a specific session (by path or session ID).
+    Show {
+        /// Path to the session JSON file, or a session ID to search for.
+        session: String,
+    },
+    /// Delete a session file or session directory.
+    Delete {
+        /// Path to the session JSON file, or a session ID to search for.
+        session: String,
+        /// Skip confirmation prompt.
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -512,6 +525,68 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            SessionCmd::Show { session } => {
+                let path = resolve_session_path(&config.workspace, &session)?;
+                let file = SessionFile::read_from(&path)
+                    .with_context(|| format!("reading session: {}", path.display()))?;
+
+                println!("Session: {}", path.display());
+                println!("  schema_version:  {}", file.schema_version);
+                println!("  goal:            {}", file.goal);
+                println!("  model:           {}", file.model);
+                println!("  provider:        {}", file.provider);
+                println!("  tool_registry:   {}", file.tool_registry_hash);
+                println!("  steps_consumed:  {}", file.steps_consumed);
+                println!("  transcript_len:  {}", file.transcript.len());
+                println!();
+                println!("Transcript:");
+                for (i, msg) in file.transcript.iter().enumerate() {
+                    let role = match msg.role {
+                        recursive::Role::System => "system",
+                        recursive::Role::User => "user",
+                        recursive::Role::Assistant => "assistant",
+                        recursive::Role::Tool => "tool",
+                    };
+                    let preview: String = msg.content.chars().take(200).collect();
+                    let truncated = if msg.content.len() > 200 { "…" } else { "" };
+                    println!("  [{:>3}] {:>9}: {}{}", i, role, preview, truncated);
+                    if !msg.tool_calls.is_empty() {
+                        for tc in &msg.tool_calls {
+                            println!("         tool_call: {} ({})", tc.name, tc.id);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SessionCmd::Delete { session, force } => {
+                let path = resolve_session_path(&config.workspace, &session)?;
+
+                if !force {
+                    eprint!("Delete session '{}'? [y/N] ", path.display());
+                    use std::io::Write;
+                    std::io::stderr().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let input = input.trim().to_lowercase();
+                    if input != "y" && input != "yes" {
+                        println!("Aborted.");
+                        return Ok(());
+                    }
+                }
+
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                        .with_context(|| format!("removing session directory: {}", path.display()))?;
+                    println!("Deleted session directory: {}", path.display());
+                } else if path.is_file() {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing session file: {}", path.display()))?;
+                    println!("Deleted session file: {}", path.display());
+                } else {
+                    anyhow::bail!("Path does not exist: {}", path.display());
+                }
+                Ok(())
+            }
         },
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show => {
@@ -552,6 +627,78 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// Resolve a session path from a user-provided string.
+///
+/// If the string is an existing file or directory path, return it as-is.
+/// Otherwise, search the workspace's session directory for a session whose
+/// filename or directory name contains the given string (case-insensitive).
+/// Returns an error if no match or multiple matches are found.
+fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(session);
+
+    // If it's an existing path, use it directly
+    if path.exists() {
+        return Ok(path);
+    }
+
+    // Search the workspace session directory for a match
+    let sessions_dir = workspace.join(".recursive").join("sessions");
+    if !sessions_dir.is_dir() {
+        anyhow::bail!("Session not found: '{}'. No sessions directory exists at {}.", session, sessions_dir.display());
+    }
+
+    let lower = session.to_lowercase();
+    let mut matches: Vec<PathBuf> = Vec::new();
+
+    // Search flat session files (old format: <timestamp>-<goal>.json)
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(name) = p.file_stem().and_then(|n| n.to_str()) {
+                    if name.to_lowercase().contains(&lower) {
+                        matches.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Search nested session directories (new JSONL format)
+    if let Ok(slug_entries) = std::fs::read_dir(&sessions_dir) {
+        for slug_entry in slug_entries.flatten() {
+            let slug_dir = slug_entry.path();
+            if !slug_dir.is_dir() {
+                continue;
+            }
+            if let Ok(session_entries) = std::fs::read_dir(&slug_dir) {
+                for session_entry in session_entries.flatten() {
+                    let p = session_entry.path();
+                    if p.is_dir() {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            if name.to_lowercase().contains(&lower) {
+                                matches.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => anyhow::bail!("Session not found: '{}'. Use 'recursive sessions list' to see available sessions.", session),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => {
+            eprintln!("Multiple sessions match '{}' ({}):", session, n);
+            for m in &matches {
+                eprintln!("  {}", m.display());
+            }
+            anyhow::bail!("Ambiguous session identifier. Use a more specific path or ID.");
+        }
     }
 }
 
