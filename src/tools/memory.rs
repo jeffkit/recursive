@@ -212,7 +212,10 @@ pub fn memory_summary(workspace: &std::path::Path, limit: usize) -> String {
         return String::new();
     }
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("# Memory (top {} most recent notes; use `recall` for more)", limit));
+    lines.push(format!(
+        "# Memory (top {} most recent notes; use `recall` for more)",
+        limit
+    ));
     // Most recent first
     let mut notes: Vec<&Note> = store.notes.iter().collect();
     notes.reverse();

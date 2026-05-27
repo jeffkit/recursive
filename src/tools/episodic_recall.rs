@@ -95,9 +95,7 @@ impl Tool for EpisodicRecall {
                 .iter()
                 .filter(|dir| {
                     // Match the session directory name exactly (or as a suffix)
-                    let dir_name = dir.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
+                    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     dir_name == sid.as_str() || dir_name.ends_with(sid.as_str())
                 })
                 .collect()
@@ -106,7 +104,10 @@ impl Tool for EpisodicRecall {
         };
 
         if sessions.is_empty() {
-            return Ok(format!("no sessions found matching '{}'", session_id.unwrap_or_default()));
+            return Ok(format!(
+                "no sessions found matching '{}'",
+                session_id.unwrap_or_default()
+            ));
         }
 
         let query_lower = query.to_lowercase();
@@ -138,7 +139,11 @@ impl Tool for EpisodicRecall {
                 // Search in tool_calls
                 for tc in &entry.tool_calls {
                     if tc.name.to_lowercase().contains(&query_lower)
-                        || tc.arguments.to_string().to_lowercase().contains(&query_lower)
+                        || tc
+                            .arguments
+                            .to_string()
+                            .to_lowercase()
+                            .contains(&query_lower)
                     {
                         match_indices.push(i);
                         break;
@@ -162,9 +167,14 @@ impl Tool for EpisodicRecall {
             results.push(format!("--- Session: {} ---", session_name));
 
             // Collect context windows around each match
-            let mut rendered_indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            let mut rendered_indices: std::collections::BTreeSet<usize> =
+                std::collections::BTreeSet::new();
             for &idx in &match_indices {
-                let start = if idx >= context_lines { idx - context_lines } else { 0 };
+                let start = if idx >= context_lines {
+                    idx - context_lines
+                } else {
+                    0
+                };
                 let end = (idx + context_lines + 1).min(entries.len());
                 for i in start..end {
                     rendered_indices.insert(i);
@@ -186,12 +196,16 @@ impl Tool for EpisodicRecall {
                     entry.content.clone()
                 };
                 let tool_info = if !entry.tool_calls.is_empty() {
-                    let names: Vec<&str> = entry.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+                    let names: Vec<&str> =
+                        entry.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
                     format!(" [tool_calls: {}]", names.join(", "))
                 } else {
                     String::new()
                 };
-                results.push(format!("{}[{}] {}{} {}", marker, entry.id, role_padded, tool_info, content_preview));
+                results.push(format!(
+                    "{}[{}] {}{} {}",
+                    marker, entry.id, role_padded, tool_info, content_preview
+                ));
             }
 
             results.push(String::new()); // blank line between sessions
@@ -209,7 +223,10 @@ impl Tool for EpisodicRecall {
             if line.starts_with(" >>> ") {
                 match_count += 1;
                 if match_count > limit {
-                    output_lines.push(format!("... (truncated, showing {}/{} matches)", limit, match_count));
+                    output_lines.push(format!(
+                        "... (truncated, showing {}/{} matches)",
+                        limit, match_count
+                    ));
                     break;
                 }
             }
@@ -233,7 +250,10 @@ pub fn episodic_recall_summary(workspace: &std::path::Path, limit: usize) -> Str
     }
 
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("# Recent Sessions (last {}; use `episodic_recall` to search)", limit));
+    lines.push(format!(
+        "# Recent Sessions (last {}; use `episodic_recall` to search)",
+        limit
+    ));
 
     // Sessions are sorted by name (timestamp-prefixed), so most recent are last
     let recent: Vec<&PathBuf> = sessions.iter().rev().take(limit).collect();
@@ -251,7 +271,10 @@ pub fn episodic_recall_summary(workspace: &std::path::Path, limit: usize) -> Str
         } else {
             meta.goal.clone()
         };
-        lines.push(format!("- {} ({} msgs, {}): {}", session_name, meta.message_count, meta.status, goal_preview));
+        lines.push(format!(
+            "- {} ({} msgs, {}): {}",
+            session_name, meta.message_count, meta.status, goal_preview
+        ));
     }
 
     lines.join("\n")
@@ -260,11 +283,15 @@ pub fn episodic_recall_summary(workspace: &std::path::Path, limit: usize) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionWriter;
     use crate::message::Message;
+    use crate::session::SessionWriter;
 
     /// Helper: create a temporary workspace and write some session data.
-    fn setup_session_with_messages(ws: &std::path::Path, goal: &str, messages: &[(&str, &str)]) -> String {
+    fn setup_session_with_messages(
+        ws: &std::path::Path,
+        goal: &str,
+        messages: &[(&str, &str)],
+    ) -> String {
         let mut writer = SessionWriter::create(ws, goal, "test-model", "test-provider").unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         for (role, content) in messages {
@@ -277,7 +304,12 @@ mod tests {
             writer.append(&msg).unwrap();
         }
         writer.finish("completed").unwrap();
-        session_dir.file_name().unwrap().to_str().unwrap().to_string()
+        session_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -285,13 +317,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
 
-        setup_session_with_messages(ws, "test goal", &[
-            ("system", "You are a helpful assistant."),
-            ("user", "Hello, how are you?"),
-            ("assistant", "I'm doing great, thanks!"),
-            ("user", "What is Rust?"),
-            ("assistant", "Rust is a systems programming language."),
-        ]);
+        setup_session_with_messages(
+            ws,
+            "test goal",
+            &[
+                ("system", "You are a helpful assistant."),
+                ("user", "Hello, how are you?"),
+                ("assistant", "I'm doing great, thanks!"),
+                ("user", "What is Rust?"),
+                ("assistant", "Rust is a systems programming language."),
+            ],
+        );
 
         let tool = EpisodicRecall::new(ws);
         let result = tokio::runtime::Runtime::new()
@@ -309,15 +345,19 @@ mod tests {
         let ws = tmp.path();
 
         // Create two sessions with different goals so we can distinguish them
-        let sid1 = setup_session_with_messages(ws, "first-session-unique-goal", &[
-            ("user", "Hello from session 1"),
-        ]);
+        let sid1 = setup_session_with_messages(
+            ws,
+            "first-session-unique-goal",
+            &[("user", "Hello from session 1")],
+        );
 
         // Sleep 1 second to ensure different timestamp in session_id
         std::thread::sleep(Duration::from_secs(1));
-        let sid2 = setup_session_with_messages(ws, "second-session-unique-goal", &[
-            ("user", "Hello from session 2"),
-        ]);
+        let sid2 = setup_session_with_messages(
+            ws,
+            "second-session-unique-goal",
+            &[("user", "Hello from session 2")],
+        );
 
         // Verify we got different session IDs
         assert_ne!(sid1, sid2, "session IDs should differ");
@@ -359,13 +399,18 @@ mod tests {
         assert_eq!(summary, "");
 
         // Create a session
-        setup_session_with_messages(ws, "fix the bug in parser", &[
-            ("user", "Please fix the parser bug"),
-        ]);
+        setup_session_with_messages(
+            ws,
+            "fix the bug in parser",
+            &[("user", "Please fix the parser bug")],
+        );
 
         let summary = episodic_recall_summary(ws, 5);
         assert!(!summary.is_empty(), "summary should not be empty");
-        assert!(summary.contains("fix the bug in parser"), "summary: {summary}");
+        assert!(
+            summary.contains("fix the bug in parser"),
+            "summary: {summary}"
+        );
         assert!(summary.contains("1 msgs"), "summary: {summary}");
     }
 }
