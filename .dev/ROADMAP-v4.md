@@ -111,10 +111,13 @@ Make Recursive accessible to a wider audience.
 
 ---
 
-## Execution Order (Suggested)
+## Execution Order (Revised)
 
 ```
-Batch 35: Phase 14 (Persistence) — SQLite state, export/import
+Batch 35: Phase 14 (Persistence + Memory) — JSONL sessions + 4-layer memory
+           Goals: 107 (JSONL writer), 108 (wire agent), 109 (CLI commands)
+                  110 (Layer 0 context), 111 (Layer 1 scratchpad),
+                  112 (Layer 2 semantic), 113 (Layer 3 episodic)
 Batch 36: Phase 15 (Observability) — logging, metrics, cost tracking
 Batch 37: Phase 17 (Hardening) — auth, rate limiting, Docker
 Batch 38: Phase 16.1-16.2 (Plugins) — trait + manifest
