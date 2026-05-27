@@ -1,0 +1,31 @@
+name: "Memory Scratchpad"
+description: "Verify agent can use scratchpad_set and data persists"
+sequential: true
+
+cases:
+  - name: "Run agent with scratchpad_set"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-03
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 10
+        run "Use the scratchpad_set tool to store the key 'test_color' with value 'blue'. Then use scratchpad_list to confirm it's stored. Do nothing else."
+    expect:
+      exitCode: 0
+
+  - name: "scratchpad.json has correct data"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-03/.recursive/scratchpad.json
+      exists: true
+      contains: "test_color"
+
+  - name: "Session recorded scratchpad_set call"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-03/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["scratchpad_set"]

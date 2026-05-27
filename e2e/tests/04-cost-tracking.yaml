@@ -1,0 +1,24 @@
+name: "Cost Tracking"
+description: "Verify cost.json is produced with valid token data"
+sequential: true
+
+cases:
+  - name: "Run agent (no tools, simple text)"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-04
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 5
+        run "Say hello. Do not use any tools."
+    expect:
+      exitCode: 0
+
+  - name: "Cost data is valid"
+    recursive-cost:
+      container: recursive-e2e
+      input: /workspace/test-04/.recursive/sessions
+      exists: true
+      minPromptTokens: 1

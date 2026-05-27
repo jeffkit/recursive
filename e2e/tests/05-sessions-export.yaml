@@ -1,0 +1,33 @@
+name: "Sessions Export CLI"
+description: "Verify sessions list and export commands work"
+sequential: true
+
+cases:
+  - name: "Run agent to create a session"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-05
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 5
+        run "Say 'test export' and stop."
+    expect:
+      exitCode: 0
+
+  - name: "sessions list works"
+    exec:
+      container: recursive-e2e
+      command: "recursive --workspace /workspace/test-05 sessions list"
+    expect:
+      exitCode: 0
+      output:
+        matches: "[Ss]ession"
+
+  - name: "Session is valid"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-05/.recursive/sessions
+      status: ["completed", "success"]
+      minMessages: 2

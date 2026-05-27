@@ -1,0 +1,27 @@
+name: "Session JSONL Persistence"
+description: "Verify session produces valid .meta.json + transcript.jsonl"
+sequential: true
+
+cases:
+  - name: "Run agent with list_dir tool"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-02
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 10
+        run "List the files in the workspace root using list_dir tool."
+    expect:
+      exitCode: 0
+
+  - name: "Session structure is valid"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-02/.recursive/sessions
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      hasToolCalls: ["list_dir"]
+      minMessages: 3
+      finalized: true

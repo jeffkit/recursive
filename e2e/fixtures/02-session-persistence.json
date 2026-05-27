@@ -1,0 +1,19 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "list_dir", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "list_dir",
+            "arguments": { "path": "." }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "list_dir", "hasToolResult": true },
+      "response": { "content": "The workspace root contains the listed files. Task complete." }
+    }
+  ]
+}

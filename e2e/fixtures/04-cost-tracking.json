@@ -1,0 +1,8 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "Say hello" },
+      "response": { "content": "Hello! I'm here to help. Is there anything you'd like me to do?" }
+    }
+  ]
+}

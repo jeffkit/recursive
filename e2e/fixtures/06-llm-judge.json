@@ -1,0 +1,32 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "greet.py", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [{
+          "name": "write_file",
+          "arguments": {
+            "path": "greet.py",
+            "contents": "def greet(name):\n    return f'Hello, {name}!'\n\nif __name__ == '__main__':\n    print(greet('World'))\n"
+          }
+        }]
+      }
+    },
+    {
+      "match": { "userMessage": "greet.py", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [{
+          "name": "write_file",
+          "arguments": {
+            "path": "README.md",
+            "contents": "# Greet\n\nA simple Python script that defines a `greet(name)` function returning a greeting string.\n\nUsage: `python greet.py`\n"
+          }
+        }]
+      }
+    },
+    {
+      "match": { "userMessage": "greet.py", "turnIndex": 2, "hasToolResult": true },
+      "response": { "content": "Done! I've created greet.py with a greet function and a README.md describing it." }
+    }
+  ]
+}

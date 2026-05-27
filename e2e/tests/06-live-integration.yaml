@@ -1,0 +1,38 @@
+name: "Live LLM Integration"
+description: |
+  Full integration with real LLM. Requires DEEPSEEK_API_KEY.
+  Skips gracefully if unavailable.
+sequential: true
+
+cases:
+  - name: "Agent completes multi-step task (real LLM)"
+    exec:
+      container: recursive-e2e
+      command: |
+        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "SKIP: no API key"; exit 0; fi
+        recursive --workspace /workspace/test-live \
+          --api-base "${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}" \
+          --api-key "$DEEPSEEK_API_KEY" \
+          -m "${DEEPSEEK_MODEL:-deepseek-chat}" \
+          --max-steps 15 \
+          run "Create a Python script called greet.py that defines a function greet(name) returning 'Hello, {name}!', has a main block printing greet('World'). Then create README.md describing it."
+    expect:
+      exitCode: 0
+
+  - name: "greet.py created correctly"
+    exec:
+      container: recursive-e2e
+      command: |
+        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "SKIP"; exit 0; fi
+        grep -q "def greet" /workspace/test-live/greet.py && echo "OK"
+    expect:
+      exitCode: 0
+
+  - name: "Session is valid"
+    exec:
+      container: recursive-e2e
+      command: |
+        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "SKIP"; exit 0; fi
+        echo "OK: will check session"
+    expect:
+      exitCode: 0

@@ -1,45 +1,33 @@
 name: "Basic Agent Tool Usage"
-description: |
-  Verify the agent can use write_file and read_file tools to complete a simple task.
-  Uses a scripted mock LLM that returns tool calls in a fixed sequence.
-
+description: "Verify agent uses write_file to create a file via mock LLM"
 sequential: true
 
-setup:
-  - name: "Prepare workspace"
-    request:
-      method: POST
-      path: /_mock/requests/clear
-
 cases:
-  - name: "Agent creates a file via write_file"
-    delay: 1s
-    request:
-      method: POST
-      path: /v1/chat/completions
-      headers:
-        content-type: application/json
-        authorization: "Bearer test-key-e2e"
-      body:
-        model: "deepseek-chat"
-        messages:
-          - role: system
-            content: "You are a helpful assistant with file tools."
-          - role: user
-            content: "Create a file called hello.txt with content 'world'"
+  - name: "Agent creates hello.txt via write_file"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-01
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 10
+        run "Create a file called hello.txt in the workspace root with exactly the content 'world'. Use write_file tool. Do NOT use any other tool after that."
     expect:
-      status: 200
-      body:
-        choices:
-          - message:
-              role: assistant
+      exitCode: 0
 
-  - name: "Verify mock received the request"
-    request:
-      method: GET
-      path: /_mock/requests
-    expect:
-      status: 200
-      body:
-        - method: POST
-          path: /v1/chat/completions
+  - name: "hello.txt exists with correct content"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-01/hello.txt
+      exists: true
+      contains: "world"
+
+  - name: "Session is valid and completed"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-01/.recursive/sessions
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      hasToolCalls: ["write_file"]
+      minMessages: 3

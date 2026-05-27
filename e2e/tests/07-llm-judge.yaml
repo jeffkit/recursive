@@ -1,0 +1,47 @@
+name: "LLM-as-Judge (Mock Agent + Real Judge)"
+description: |
+  Multi-step task with mock LLM. Validates file output and session structure.
+  LLM Judge step will be added when argusai registers it as a built-in plugin step.
+sequential: true
+
+cases:
+  - name: "Run multi-step agent task"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-judge
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 15
+        run "Create a Python script called greet.py that defines a function greet(name) returning 'Hello, {name}!', has a main block calling greet('World'), then create a README.md describing it."
+    expect:
+      exitCode: 0
+
+  - name: "greet.py exists with greet function"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-judge/greet.py
+      exists: true
+      contains: "def greet"
+
+  - name: "README.md exists"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-judge/README.md
+      exists: true
+
+  - name: "Session is complete with tool calls"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-judge/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["write_file"]
+      minMessages: 4
+
+  - name: "LLM Judge approves"
+    llm-judge:
+      container: recursive-e2e
+      input: /workspace/test-judge/.recursive/sessions
+      goal: "Create greet.py with greet(name) function + main block, then README.md"
+      minScore: 3

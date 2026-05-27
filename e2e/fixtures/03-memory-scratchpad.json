@@ -1,0 +1,30 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "scratchpad_set", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "scratchpad_set",
+            "arguments": { "key": "test_color", "value": "blue" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "scratchpad_set", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "scratchpad_list",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "scratchpad_set", "turnIndex": 2, "hasToolResult": true },
+      "response": { "content": "Done! I stored test_color=blue in the scratchpad and confirmed it's there." }
+    }
+  ]
+}

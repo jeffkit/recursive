@@ -1,0 +1,19 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "hello.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "hello.txt", "contents": "world" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "hello.txt", "hasToolResult": true },
+      "response": { "content": "Done! I've created hello.txt with the content 'world'." }
+    }
+  ]
+}

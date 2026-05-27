@@ -3,82 +3,60 @@ version: "1"
 project:
   name: recursive-agent
   description: "Recursive Agent E2E Integration Tests"
+  version: "0.6.0"
+
+plugins:
+  - ./plugins/dist/index.js
 
 service:
   build:
-    dockerfile: e2e/Dockerfile
-    context: .
+    dockerfile: Dockerfile
+    context: ..
     image: recursive:e2e
   container:
     name: recursive-e2e
+    ports:
+      - "8080:8080"
     environment:
-      RECURSIVE_API_BASE: http://llm-mock:8081/v1
-      RECURSIVE_API_KEY: test-key-e2e
-      RECURSIVE_MODEL: deepseek-chat
-      RECURSIVE_MAX_STEPS: "20"
+      RECURSIVE_API_BASE: http://aimock:4010/v1
+      RECURSIVE_API_KEY: mock-key
+      RECURSIVE_MODEL: mock-chat
       RUST_LOG: info
-    volumes:
-      - "workspace-vol:/workspace"
-    healthcheck:
-      path: ""
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      startPeriod: 5s
-
-  vars:
-    base_url: http://localhost:8080
 
 mocks:
-  llm-mock:
-    port: 8081
-    routes:
-      # Default catch-all for chat completions - returns a simple response
-      - method: POST
-        path: /v1/chat/completions
-        response:
-          status: 200
-          headers:
-            content-type: application/json
-          body:
-            id: "chatcmpl-test-001"
-            object: "chat.completion"
-            created: 1700000000
-            model: "deepseek-chat"
-            choices:
-              - index: 0
-                message:
-                  role: "assistant"
-                  content: "Task completed."
-                finish_reason: "stop"
-            usage:
-              prompt_tokens: 100
-              completion_tokens: 20
-              total_tokens: 120
+  aimock:
+    image: ghcr.io/copilotkit/aimock
+    port: 4010
+    volumes:
+      - "./fixtures:/fixtures"
+    args: "-f /fixtures -h 0.0.0.0"
 
 tests:
   suites:
-    - name: "Basic Agent Functionality"
+    - name: "Basic Agent Tools"
       id: basic
-      file: e2e/tests/01-basic-tools.yaml
+      file: tests/01-basic-tools.yaml
 
     - name: "Session Persistence"
       id: session
-      file: e2e/tests/02-session-persistence.yaml
+      file: tests/02-session-persistence.yaml
 
-    - name: "Memory System"
+    - name: "Memory Scratchpad"
       id: memory
-      file: e2e/tests/03-memory-scratchpad.yaml
+      file: tests/03-memory-scratchpad.yaml
 
     - name: "Cost Tracking"
       id: cost
-      file: e2e/tests/04-cost-tracking.yaml
+      file: tests/04-cost-tracking.yaml
 
     - name: "Sessions Export CLI"
       id: export
-      file: e2e/tests/05-sessions-export.yaml
+      file: tests/05-sessions-export.yaml
 
     - name: "Live LLM Integration"
       id: live
-      runner: shell
-      file: e2e/tests/06-live-integration.sh
+      file: tests/06-live-integration.yaml
+
+    - name: "LLM-as-Judge"
+      id: judge
+      file: tests/07-llm-judge.yaml
