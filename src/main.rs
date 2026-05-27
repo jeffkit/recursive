@@ -32,6 +32,7 @@ use recursive::{
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
         RunSkillScript, ScheduleWakeup, SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch,
         WriteFile,
+        ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
     },
     Agent, AgentRunner, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry,
     TranscriptFile,
@@ -594,6 +595,11 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(Remember::new(root)))
         .register(Arc::new(Recall::new(root)))
         .register(Arc::new(Forget::new(root)));
+    registry = registry
+        .register(Arc::new(WorkingMemoryTool::new(root)))
+        .register(Arc::new(ScratchpadGet::new(root)))
+        .register(Arc::new(ScratchpadDelete::new(root)))
+        .register(Arc::new(ScratchpadList::new(root)));
     let skills = discover_loaded_skills(config);
     if !skills.is_empty() {
         registry = registry.register(Arc::new(LoadSkill::new(skills.clone())));

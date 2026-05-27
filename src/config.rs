@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::tools::memory::memory_summary;
+use crate::tools::memory::scratchpad_summary;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -111,10 +112,16 @@ impl Config {
 
         // Append memory summary to the system prompt
         let memory_block = memory_summary(&workspace, memory_summary_limit);
+        let scratchpad_block = scratchpad_summary(&workspace);
         let system_prompt = if memory_block.is_empty() {
             system_prompt
         } else {
             format!("{}\n\n{}", system_prompt, memory_block)
+        };
+        let system_prompt = if scratchpad_block.is_empty() {
+            system_prompt
+        } else {
+            format!("{}\n\n{}", system_prompt, scratchpad_block)
         };
 
         Ok(Self {

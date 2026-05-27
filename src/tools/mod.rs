@@ -32,6 +32,10 @@ pub use estimate_tokens::EstimateTokens;
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use load_skill::LoadSkill;
 pub use memory::{Forget, Recall, Remember};
+pub use memory::{
+    Scratchpad, ScratchpadDelete, ScratchpadGet, ScratchpadList, WorkingMemoryTool,
+    load_scratchpad, scratchpad_path, scratchpad_summary,
+};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};

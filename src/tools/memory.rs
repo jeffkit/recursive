@@ -1,5 +1,10 @@
 //! Persistent memory tools: `remember`, `recall`, `forget`.
 //!
+//! Also provides a scratchpad (working memory) layer: `scratchpad_set`,
+//! `scratchpad_get`, `scratchpad_delete`, `scratchpad_list`. The scratchpad
+//! is stored in `<workspace>/.recursive/scratchpad.json` and its contents
+//! are injected into the system prompt as a summary.
+//!
 //! Notes are stored in `<workspace>/.recursive/memory.json` (or
 //! `~/.recursive/memory.json` if `RECURSIVE_MEMORY_GLOBAL=1`).
 //! Schema:
@@ -421,6 +426,340 @@ impl Tool for Forget {
         } else {
             Ok(format!("no such id: {id}"))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scratchpad (working memory)
+// ---------------------------------------------------------------------------
+
+/// A single scratchpad entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchpadEntry {
+    pub key: String,
+    pub value: String,
+}
+
+/// The on-disk scratchpad store.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Scratchpad {
+    pub entries: Vec<ScratchpadEntry>,
+}
+
+impl Scratchpad {
+    /// Load from a path, returning an empty scratchpad if the file doesn't exist.
+    fn load(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path).map_err(|e| Error::Tool {
+            name: "scratchpad".into(),
+            message: format!("failed to read scratchpad file: {e}"),
+        })?;
+        serde_json::from_str(&raw).map_err(|e| Error::Tool {
+            name: "scratchpad".into(),
+            message: format!("malformed scratchpad file: {e}"),
+        })
+    }
+
+    /// Save to disk, creating parent directories if needed.
+    fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
+                name: "scratchpad".into(),
+                message: format!("failed to create scratchpad directory: {e}"),
+            })?;
+        }
+        let raw = serde_json::to_string_pretty(self).map_err(|e| Error::Tool {
+            name: "scratchpad".into(),
+            message: format!("failed to serialize scratchpad: {e}"),
+        })?;
+        std::fs::write(path, raw).map_err(|e| Error::Tool {
+            name: "scratchpad".into(),
+            message: format!("failed to write scratchpad file: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Set a key-value pair (insert or update).
+    fn set(&mut self, key: String, value: String) {
+        // Replace existing entry with the same key, or add new one.
+        if let Some(existing) = self.entries.iter_mut().find(|e| e.key == key) {
+            existing.value = value;
+        } else {
+            self.entries.push(ScratchpadEntry { key, value });
+        }
+    }
+
+    /// Get the value for a key.
+    fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.as_str())
+    }
+
+    /// Delete an entry by key. Returns true if found.
+    fn delete(&mut self, key: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.key != key);
+        self.entries.len() < before
+    }
+
+    /// List all keys.
+    fn keys(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.key.as_str()).collect()
+    }
+}
+
+/// Determine the scratchpad file path.
+pub fn scratchpad_path(workspace: &std::path::Path) -> PathBuf {
+    workspace.join(".recursive").join("scratchpad.json")
+}
+
+/// Load the scratchpad from the workspace-relative path.
+pub fn load_scratchpad(workspace: &std::path::Path) -> Result<Scratchpad> {
+    let path = scratchpad_path(workspace);
+    Scratchpad::load(&path)
+}
+
+/// Build a scratchpad summary string for injection into the system prompt.
+/// Returns a formatted block of all key-value pairs, or empty string if
+/// the scratchpad is empty.
+pub fn scratchpad_summary(workspace: &std::path::Path) -> String {
+    let pad = match load_scratchpad(workspace) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    if pad.entries.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("# Working Memory (scratchpad)".to_string());
+    for entry in &pad.entries {
+        // Truncate long values for the summary
+        let value_preview = if entry.value.len() > 200 {
+            format!("{}...", &entry.value[..197])
+        } else {
+            entry.value.clone()
+        };
+        lines.push(format!("- {}: {}", entry.key, value_preview));
+    }
+    lines.join("\n")
+}
+
+/// Migrate old-format scratchpad data (if any) to the new format.
+/// Currently a no-op placeholder for future migration logic.
+pub fn migrate_scratchpad(_workspace: &std::path::Path) -> Result<()> {
+    // No old format to migrate from yet.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WorkingMemoryTool: exposes scratchpad operations as tools
+// ---------------------------------------------------------------------------
+
+pub struct WorkingMemoryTool {
+    workspace: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl WorkingMemoryTool {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            lock: Mutex::new(()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WorkingMemoryTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "scratchpad_set".into(),
+            description: "Store a value in working memory (scratchpad) under a key. Use this to remember intermediate results, decisions, or context across steps. The scratchpad contents are injected into the system prompt.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The key to store under"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value to store"
+                    }
+                },
+                "required": ["key", "value"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let key = arguments["key"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "scratchpad_set".into(),
+                message: "missing required parameter: key".to_string(),
+            })?
+            .to_string();
+        let value = arguments["value"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "scratchpad_set".into(),
+                message: "missing required parameter: value".to_string(),
+            })?
+            .to_string();
+
+        let _guard = self.lock.lock().unwrap();
+        let path = scratchpad_path(&self.workspace);
+        let mut pad = Scratchpad::load(&path)?;
+        pad.set(key.clone(), value);
+        pad.save(&path)?;
+        Ok(format!("scratchpad key '{key}' set"))
+    }
+}
+
+/// Helper: dispatch scratchpad operations based on the tool name.
+/// This is used by the multi-tool approach where one struct handles
+/// multiple tool names.
+pub struct ScratchpadGet {
+    workspace: PathBuf,
+}
+
+impl ScratchpadGet {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ScratchpadGet {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "scratchpad_get".into(),
+            description: "Retrieve a value from working memory (scratchpad) by key.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The key to retrieve"
+                    }
+                },
+                "required": ["key"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let key = arguments["key"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "scratchpad_get".into(),
+                message: "missing required parameter: key".to_string(),
+            })?
+            .to_string();
+
+        let path = scratchpad_path(&self.workspace);
+        let pad = Scratchpad::load(&path)?;
+        match pad.get(&key) {
+            Some(value) => Ok(format!("{}", value)),
+            None => Ok(format!("no such key: {key}")),
+        }
+    }
+}
+
+pub struct ScratchpadDelete {
+    workspace: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl ScratchpadDelete {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            lock: Mutex::new(()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ScratchpadDelete {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "scratchpad_delete".into(),
+            description: "Delete a key from working memory (scratchpad).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The key to delete"
+                    }
+                },
+                "required": ["key"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let key = arguments["key"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "scratchpad_delete".into(),
+                message: "missing required parameter: key".to_string(),
+            })?
+            .to_string();
+
+        let _guard = self.lock.lock().unwrap();
+        let path = scratchpad_path(&self.workspace);
+        let mut pad = Scratchpad::load(&path)?;
+        if pad.delete(&key) {
+            pad.save(&path)?;
+            Ok(format!("deleted key '{key}'"))
+        } else {
+            Ok(format!("no such key: {key}"))
+        }
+    }
+}
+
+pub struct ScratchpadList {
+    workspace: PathBuf,
+}
+
+impl ScratchpadList {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ScratchpadList {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "scratchpad_list".into(),
+            description: "List all keys currently stored in working memory (scratchpad).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        }
+    }
+
+    async fn execute(&self, _arguments: Value) -> Result<String> {
+        let path = scratchpad_path(&self.workspace);
+        let pad = Scratchpad::load(&path)?;
+        let keys = pad.keys();
+        if keys.is_empty() {
+            return Ok("scratchpad is empty".to_string());
+        }
+        Ok(keys.join("\n"))
     }
 }
 
