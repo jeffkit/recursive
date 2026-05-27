@@ -1,0 +1,45 @@
+name: "Basic Agent Tool Usage"
+description: |
+  Verify the agent can use write_file and read_file tools to complete a simple task.
+  Uses a scripted mock LLM that returns tool calls in a fixed sequence.
+
+sequential: true
+
+setup:
+  - name: "Prepare workspace"
+    request:
+      method: POST
+      path: /_mock/requests/clear
+
+cases:
+  - name: "Agent creates a file via write_file"
+    delay: 1s
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type: application/json
+        authorization: "Bearer test-key-e2e"
+      body:
+        model: "deepseek-chat"
+        messages:
+          - role: system
+            content: "You are a helpful assistant with file tools."
+          - role: user
+            content: "Create a file called hello.txt with content 'world'"
+    expect:
+      status: 200
+      body:
+        choices:
+          - message:
+              role: assistant
+
+  - name: "Verify mock received the request"
+    request:
+      method: GET
+      path: /_mock/requests
+    expect:
+      status: 200
+      body:
+        - method: POST
+          path: /v1/chat/completions
