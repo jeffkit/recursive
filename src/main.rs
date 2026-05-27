@@ -27,7 +27,6 @@ use recursive::{
         load_pricing_from_yaml, pricing_for, AnthropicProvider, LlmProvider, ModelPricing,
         OpenAiProvider, TokenUsage,
     },
-    tools::memory::memory_summary,
     tools::{
         ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
@@ -828,14 +827,6 @@ async fn build_agent(
             system_prompt, injection_block
         );
     }
-    // Inject memory summary (top 5 most recent notes) into the system prompt (top 5 most recent notes) into the system prompt
-    let memory_block = memory_summary(&config.workspace, 5);
-    let system_prompt = if memory_block.is_empty() {
-        system_prompt
-    } else {
-        format!("{}\n\n{}", system_prompt, memory_block)
-    };
-
     // When sub-agent is enabled, append a hint about its usage
     let system_prompt = if sub_agent_enabled {
         format!(
@@ -1751,6 +1742,7 @@ mod tests {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 1,
             shell_timeout_secs: 5,
+            memory_summary_limit: 5,
         }
     }
 

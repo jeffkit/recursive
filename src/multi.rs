@@ -584,6 +584,7 @@ mod tests {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            memory_summary_limit: 5,
         }
     }
 

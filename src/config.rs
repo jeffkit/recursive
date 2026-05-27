@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::tools::memory::memory_summary;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,6 +23,7 @@ pub struct Config {
     pub retry_initial_backoff_secs: u64,
     pub retry_max_backoff_secs: u64,
     pub shell_timeout_secs: u64,
+    pub memory_summary_limit: usize,
 }
 
 impl Config {
@@ -102,6 +104,19 @@ impl Config {
             .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
             .unwrap_or_else(|| "openai".into());
 
+        let memory_summary_limit = std::env::var("RECURSIVE_MEMORY_SUMMARY_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+
+        // Append memory summary to the system prompt
+        let memory_block = memory_summary(&workspace, memory_summary_limit);
+        let system_prompt = if memory_block.is_empty() {
+            system_prompt
+        } else {
+            format!("{}\n\n{}", system_prompt, memory_block)
+        };
+
         Ok(Self {
             workspace,
             api_base,
@@ -115,6 +130,7 @@ impl Config {
             retry_initial_backoff_secs,
             retry_max_backoff_secs,
             shell_timeout_secs,
+            memory_summary_limit,
         })
     }
 
@@ -286,6 +302,7 @@ mod tests {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            memory_summary_limit: 5,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
