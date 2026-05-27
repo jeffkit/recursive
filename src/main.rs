@@ -503,7 +503,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Sessions { cmd } => match cmd {
             SessionCmd::List => {
                 let old_sessions = recursive::session::list_sessions(&config.workspace)?;
-                let new_sessions = recursive::session::SessionReader::list_sessions(&config.workspace)?;
+                let new_sessions =
+                    recursive::session::SessionReader::list_sessions(&config.workspace)?;
                 let total = old_sessions.len() + new_sessions.len();
                 if total == 0 {
                     println!(
@@ -532,7 +533,9 @@ async fn main() -> anyhow::Result<()> {
                     let meta = recursive::session::SessionReader::load_meta(&path)
                         .with_context(|| format!("reading session meta: {}", path.display()))?;
                     let entries = recursive::session::SessionReader::load_transcript(&path)
-                        .with_context(|| format!("reading session transcript: {}", path.display()))?;
+                        .with_context(|| {
+                            format!("reading session transcript: {}", path.display())
+                        })?;
 
                     println!("Session: {}", path.display());
                     println!("  session_id:      {}", meta.session_id);
@@ -1512,6 +1515,22 @@ async fn run_once(
         }) as OnMessageFn
     });
 
+    // Create CostTracker if session recording is enabled
+    let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
+        session_writer.as_ref().and_then(|sw| {
+            let writer = sw.lock().ok()?;
+            let session_dir = writer.session_dir().to_path_buf();
+            Some(std::sync::Mutex::new(recursive::cost::CostTracker::new(
+                session_dir,
+                &config.model,
+                &config.provider_type,
+                &external_pricing,
+            )))
+        })
+    } else {
+        None
+    };
+
     let (mut agent, rx) = build_agent(
         &config,
         max_transcript_chars,
@@ -1553,6 +1572,22 @@ async fn run_once(
     };
     drop(agent);
     printer.await.ok();
+
+    // Record usage in CostTracker
+    if let Some(ref tracker) = cost_tracker {
+        let mut t = tracker.lock().unwrap();
+        t.record_usage(outcome.total_usage, outcome.total_llm_latency_ms);
+        if let Err(e) = t.finish() {
+            eprintln!("cost: failed to write cost.json: {e}");
+        } else {
+            eprintln!(
+                "cost: ${:.4} ({})",
+                t.cost_usd().unwrap_or(0.0),
+                config.model
+            );
+        }
+    }
+
     if !json_mode {
         if let Some(ref msg) = outcome.final_message {
             println!("\n=== final ===\n{msg}");
