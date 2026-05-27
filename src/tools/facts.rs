@@ -100,12 +100,10 @@ impl FactStore {
         }
         let mut out = String::new();
         for fact in &self.facts {
-            out.push_str(
-                &serde_json::to_string(fact).map_err(|e| Error::Tool {
-                    name: "facts".into(),
-                    message: format!("failed to serialize fact: {e}"),
-                })?,
-            );
+            out.push_str(&serde_json::to_string(fact).map_err(|e| Error::Tool {
+                name: "facts".into(),
+                message: format!("failed to serialize fact: {e}"),
+            })?);
             out.push('\n');
         }
         std::fs::write(path, out).map_err(|e| Error::Tool {
@@ -230,14 +228,13 @@ fn tokenize(text: &str) -> Vec<String> {
 
 /// Stop words to filter out.
 const STOP_WORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of",
-    "with", "by", "from", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
-    "may", "might", "shall", "can", "it", "its", "this", "that", "these", "those",
-    "i", "you", "he", "she", "we", "they", "not", "no", "nor", "so", "if", "then",
-    "than", "too", "very", "just", "about", "up", "out", "also", "more", "some",
-    "any", "each", "every", "all", "both", "few", "most", "other", "into", "over",
-    "such", "only", "own", "same", "as", "but", "not",
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+    "did", "will", "would", "could", "should", "may", "might", "shall", "can", "it", "its", "this",
+    "that", "these", "those", "i", "you", "he", "she", "we", "they", "not", "no", "nor", "so",
+    "if", "then", "than", "too", "very", "just", "about", "up", "out", "also", "more", "some",
+    "any", "each", "every", "all", "both", "few", "most", "other", "into", "over", "such", "only",
+    "own", "same", "as", "but", "not",
 ];
 
 /// Search facts by query text, returning scored results sorted by relevance.
@@ -249,7 +246,12 @@ const STOP_WORDS: &[&str] = &[
 /// - tag_match: 1.2 if any query term matches a tag, else 1.0
 /// - recency_boost: 1.0 + 0.1 / (days_since_created + 1)
 /// - popularity_boost: 1.0 + 0.05 * ln(access_count + 1)
-pub fn search_facts(facts: &[&Fact], query: &str, tag: Option<&str>, limit: usize) -> Vec<ScoredFact> {
+pub fn search_facts(
+    facts: &[&Fact],
+    query: &str,
+    tag: Option<&str>,
+    limit: usize,
+) -> Vec<ScoredFact> {
     let query_terms: Vec<String> = tokenize(query)
         .into_iter()
         .filter(|t| !STOP_WORDS.contains(&t.as_str()))
@@ -275,9 +277,9 @@ pub fn search_facts(facts: &[&Fact], query: &str, tag: Option<&str>, limit: usiz
             // At least one query term must appear in text or tags
             let text_lower = f.text.to_lowercase();
             let tag_text: String = f.tags.join(" ").to_lowercase();
-            query_terms.iter().any(|t| {
-                text_lower.contains(t) || tag_text.contains(t)
-            })
+            query_terms
+                .iter()
+                .any(|t| text_lower.contains(t) || tag_text.contains(t))
         })
         .map(|f| {
             let text_lower = f.text.to_lowercase();
@@ -319,7 +321,11 @@ pub fn search_facts(facts: &[&Fact], query: &str, tag: Option<&str>, limit: usiz
         .collect();
 
     // Sort by score descending
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
     scored
 }
@@ -463,12 +469,21 @@ pub fn facts_path(workspace: &std::path::Path, scope: &str) -> PathBuf {
     match scope {
         "global" => {
             if let Some(home) = std::env::var_os("HOME") {
-                PathBuf::from(home).join(".recursive").join("memory").join("facts.jsonl")
+                PathBuf::from(home)
+                    .join(".recursive")
+                    .join("memory")
+                    .join("facts.jsonl")
             } else {
-                workspace.join(".recursive").join("memory").join("facts.jsonl")
+                workspace
+                    .join(".recursive")
+                    .join("memory")
+                    .join("facts.jsonl")
             }
         }
-        _ => workspace.join(".recursive").join("memory").join("facts.jsonl"),
+        _ => workspace
+            .join(".recursive")
+            .join("memory")
+            .join("facts.jsonl"),
     }
 }
 
@@ -494,7 +509,10 @@ pub fn facts_summary(workspace: &std::path::Path, limit: usize) -> String {
     sorted.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed));
 
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("# Facts (top {} most recently accessed; use `recall` for more)", limit));
+    lines.push(format!(
+        "# Facts (top {} most recently accessed; use `recall` for more)",
+        limit
+    ));
     for fact in sorted.iter().take(limit) {
         let tags_str = if fact.tags.is_empty() {
             String::new()
@@ -511,7 +529,10 @@ pub fn facts_summary(workspace: &std::path::Path, limit: usize) -> String {
         } else {
             fact.text.clone()
         };
-        lines.push(format!("- {}{}{} {}", fact.id, tags_str, source_str, text_preview));
+        lines.push(format!(
+            "- {}{}{} {}",
+            fact.id, tags_str, source_str, text_preview
+        ));
     }
     lines.join("\n")
 }
@@ -686,9 +707,7 @@ impl Tool for RecallFact {
         let query = arguments["query"].as_str().unwrap_or("");
         let tag = arguments["tag"].as_str();
         let limit = arguments["limit"].as_i64().unwrap_or(10) as usize;
-        let scope = arguments["scope"]
-            .as_str()
-            .unwrap_or("workspace");
+        let scope = arguments["scope"].as_str().unwrap_or("workspace");
 
         let path = facts_path(&self.workspace, scope);
         let mut store = FactStore::load(&path)?;
@@ -791,9 +810,7 @@ impl Tool for ForgetFact {
             })?
             .to_string();
 
-        let scope = arguments["scope"]
-            .as_str()
-            .unwrap_or("workspace");
+        let scope = arguments["scope"].as_str().unwrap_or("workspace");
 
         let _guard = self.lock.lock().unwrap();
         let path = facts_path(&self.workspace, scope);
@@ -868,9 +885,7 @@ impl Tool for UpdateFact {
             })?
             .to_string();
 
-        let scope = arguments["scope"]
-            .as_str()
-            .unwrap_or("workspace");
+        let scope = arguments["scope"].as_str().unwrap_or("workspace");
 
         let _guard = self.lock.lock().unwrap();
         let path = facts_path(&self.workspace, scope);
@@ -1057,7 +1072,12 @@ mod tests {
         let path = facts_path(&ws, "workspace");
         let store = FactStore::load(&path).unwrap();
         let active = store.active_facts();
-        assert!(active.len() <= FACTS_CAP, "active facts: {} > cap {}", active.len(), FACTS_CAP);
+        assert!(
+            active.len() <= FACTS_CAP,
+            "active facts: {} > cap {}",
+            active.len(),
+            FACTS_CAP
+        );
     }
 
     #[test]
@@ -1161,7 +1181,11 @@ mod tests {
         assert_eq!(results.len(), 2, "should find 2 rust facts");
         // Both should have "rust" in them
         for r in &results {
-            assert!(r.fact.text.to_lowercase().contains("rust"), "fact: {}", r.fact.text);
+            assert!(
+                r.fact.text.to_lowercase().contains("rust"),
+                "fact: {}",
+                r.fact.text
+            );
         }
     }
 
@@ -1220,14 +1244,23 @@ mod tests {
 
     #[test]
     fn test_k_jaccard_similarity() {
-        let sim = jaccard_similarity("Rust uses Result for error handling", "Rust uses Result for error handling");
-        assert!((sim - 1.0).abs() < 0.01, "identical texts should have sim=1, got {sim}");
+        let sim = jaccard_similarity(
+            "Rust uses Result for error handling",
+            "Rust uses Result for error handling",
+        );
+        assert!(
+            (sim - 1.0).abs() < 0.01,
+            "identical texts should have sim=1, got {sim}"
+        );
 
         let sim = jaccard_similarity("Rust uses Result", "Python uses exceptions");
         assert!(sim < 0.5, "different texts should have low sim, got {sim}");
 
         let sim = jaccard_similarity("", "");
-        assert!((sim - 1.0).abs() < 0.01, "empty strings should have sim=1, got {sim}");
+        assert!(
+            (sim - 1.0).abs() < 0.01,
+            "empty strings should have sim=1, got {sim}"
+        );
     }
 
     #[test]

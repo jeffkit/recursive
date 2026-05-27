@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::tools::episodic_recall::episodic_recall_summary;
+use crate::tools::facts::facts_summary;
 use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
-use crate::tools::facts::facts_summary;
-use crate::tools::episodic_recall::episodic_recall_summary;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -112,30 +112,42 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
 
-        // Append memory summary to the system prompt
+        // Load memory context layers
+        let user_memory = load_user_memory();
+        let project_memory = load_project_memory(&workspace);
         let memory_block = memory_summary(&workspace, memory_summary_limit);
         let scratchpad_block = scratchpad_summary(&workspace);
         let facts_block = facts_summary(&workspace, memory_summary_limit);
         let episodic_block = episodic_recall_summary(&workspace, memory_summary_limit);
-        let system_prompt = if memory_block.is_empty() {
+
+        // Assemble system prompt with layers.
+        // Order: most stable first (user.md), most volatile last (memory_summary).
+        let mut layers: Vec<&str> = Vec::new();
+        if let Some(ref m) = user_memory {
+            layers.push("# User preferences\n");
+            layers.push(m);
+        }
+        if let Some(ref m) = project_memory {
+            layers.push("# Project memory\n");
+            layers.push(m);
+        }
+        if !memory_block.is_empty() {
+            layers.push(&memory_block);
+        }
+        if !scratchpad_block.is_empty() {
+            layers.push(&scratchpad_block);
+        }
+        if !facts_block.is_empty() {
+            layers.push(&facts_block);
+        }
+        if !episodic_block.is_empty() {
+            layers.push(&episodic_block);
+        }
+        let system_prompt = if layers.is_empty() {
             system_prompt
         } else {
-            format!("{}\n\n{}", system_prompt, memory_block)
-        };
-        let system_prompt = if scratchpad_block.is_empty() {
-            system_prompt
-        } else {
-            format!("{}\n\n{}", system_prompt, scratchpad_block)
-        };
-        let system_prompt = if facts_block.is_empty() {
-            system_prompt
-        } else {
-            format!("{}\n\n{}", system_prompt, facts_block)
-        };
-        let system_prompt = if episodic_block.is_empty() {
-            system_prompt
-        } else {
-            format!("{}\n\n{}", system_prompt, episodic_block)
+            let extra = layers.join("\n\n");
+            format!("{}\n\n---\n\n{}", system_prompt, extra)
         };
 
         Ok(Self {
@@ -244,6 +256,42 @@ pub fn default_system_prompt() -> String {
 /// 16 KB is enough for a detailed project context without blowing
 /// the context window.
 const MAX_PROJECT_CONTEXT_SIZE: usize = 16 * 1024;
+
+/// Maximum size for memory files (user.md, project.md) in bytes.
+const MAX_MEMORY_FILE_SIZE: usize = 8 * 1024;
+
+/// Load user-global memory from ~/.recursive/memory/user.md.
+/// Returns None if the file doesn't exist. Caps at 8KB.
+pub fn load_user_memory() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".recursive/memory/user.md");
+    load_memory_file(&path)
+}
+
+/// Load project-local memory (agent-writable) from workspace/.recursive/memory/project.md.
+pub fn load_project_memory(workspace: &Path) -> Option<String> {
+    let path = workspace.join(".recursive/memory/project.md");
+    load_memory_file(&path)
+}
+
+/// Load a memory file with an 8KB cap.
+fn load_memory_file(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.is_empty() {
+        return None;
+    }
+    if content.len() > MAX_MEMORY_FILE_SIZE {
+        Some(format!(
+            "{}\n\n[…truncated at 8KB]",
+            &content[..MAX_MEMORY_FILE_SIZE]
+        ))
+    } else {
+        Some(content)
+    }
+}
 
 /// Load project context from AGENTS.md at workspace root.
 ///
@@ -432,5 +480,111 @@ mod tests {
         // No AGENTS.md file
         let content = load_project_context(tmp.path());
         assert!(content.is_none());
+    }
+
+    // --- Memory layer tests ---
+
+    #[test]
+    fn test_d_load_user_memory_returns_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&mem_dir).expect("create dirs");
+        let path = mem_dir.join("user.md");
+        std::fs::write(&path, "I prefer Python over Rust").expect("write");
+
+        // Temporarily set HOME to our temp dir
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+
+        let content = load_user_memory();
+        assert!(content.is_some());
+        assert!(content.unwrap().contains("Python"));
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn test_e_load_project_memory_returns_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&mem_dir).expect("create dirs");
+        let path = mem_dir.join("project.md");
+        std::fs::write(&path, "This project uses Rust 2024 edition").expect("write");
+
+        let content = load_project_memory(tmp.path());
+        assert!(content.is_some());
+        assert!(content.unwrap().contains("Rust 2024"));
+    }
+
+    #[test]
+    fn test_f_memory_file_truncated_at_8kb() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("test_memory.md");
+        // Write 10 KB of content
+        let large = "x".repeat(10 * 1024);
+        std::fs::write(&path, &large).expect("write");
+
+        let content = load_memory_file(&path);
+        assert!(content.is_some());
+        let c = content.unwrap();
+        assert!(c.contains("truncated at 8KB"));
+        // Should be 8KB + truncation message
+        assert!(c.len() < 9 * 1024);
+    }
+
+    #[test]
+    fn test_g_missing_file_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nonexistent.md");
+        let content = load_memory_file(&path);
+        assert!(content.is_none());
+    }
+
+    #[test]
+    fn test_h_empty_file_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("empty.md");
+        std::fs::write(&path, "").expect("write");
+        let content = load_memory_file(&path);
+        assert!(content.is_none());
+    }
+
+    #[test]
+    fn test_i_system_prompt_assembly_includes_layers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Create user.md in a fake home
+        let home_dir = tmp.path().join("home");
+        let user_mem_dir = home_dir.join(".recursive/memory");
+        std::fs::create_dir_all(&user_mem_dir).expect("create dirs");
+        std::fs::write(user_mem_dir.join("user.md"), "User likes concise answers").expect("write");
+
+        // Create project.md in workspace
+        let ws_mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&ws_mem_dir).expect("create dirs");
+        std::fs::write(ws_mem_dir.join("project.md"), "Project uses Rust").expect("write");
+
+        // Temporarily set HOME
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home_dir);
+
+        // Load the layers
+        let user_mem = load_user_memory();
+        let proj_mem = load_project_memory(tmp.path());
+
+        assert!(user_mem.is_some());
+        assert!(proj_mem.is_some());
+        assert!(user_mem.unwrap().contains("concise"));
+        assert!(proj_mem.unwrap().contains("Rust"));
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }
