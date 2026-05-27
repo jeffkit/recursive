@@ -13,7 +13,6 @@ use crate::llm::ToolSpec;
 use crate::session::SessionReader;
 use crate::tools::Tool;
 
-use std::time::Duration;
 
 /// Episodic recall tool: search past session transcripts.
 pub struct EpisodicRecall {
@@ -170,11 +169,7 @@ impl Tool for EpisodicRecall {
             let mut rendered_indices: std::collections::BTreeSet<usize> =
                 std::collections::BTreeSet::new();
             for &idx in &match_indices {
-                let start = if idx >= context_lines {
-                    idx - context_lines
-                } else {
-                    0
-                };
+                let start = idx.saturating_sub(context_lines);
                 let end = (idx + context_lines + 1).min(entries.len());
                 for i in start..end {
                     rendered_indices.insert(i);
@@ -285,6 +280,7 @@ mod tests {
     use super::*;
     use crate::message::Message;
     use crate::session::SessionWriter;
+    use std::time::Duration;
 
     /// Helper: create a temporary workspace and write some session data.
     fn setup_session_with_messages(
