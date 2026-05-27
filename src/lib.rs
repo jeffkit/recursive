@@ -57,6 +57,7 @@ pub use multi::{
 };
 pub use runner::AgentRunner;
 pub use session::SessionFile;
+pub use session::SessionReader;
 pub use session::SessionWriter;
 pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
