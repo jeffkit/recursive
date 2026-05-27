@@ -1,0 +1,19 @@
+{
+  "name": "recursive-e2e-plugins",
+  "version": "0.1.0",
+  "description": "Recursive-specific assertion plugins for ArgusAI E2E testing",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "argusai-core": "file:../../../infra4agent/argusai/packages/core"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

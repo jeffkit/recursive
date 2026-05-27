@@ -29,3 +29,8 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+
+# E2E test infrastructure (generated)
+e2e/plugins/node_modules/
+e2e/plugins/dist/
+e2e/.argusai/
