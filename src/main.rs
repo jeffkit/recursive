@@ -23,6 +23,7 @@ use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skil
 use recursive::OnMessageFn;
 use recursive::SessionFile;
 use recursive::SessionWriter;
+use recursive::cost::CostTracker;
 use recursive::{
     config::Config,
     llm::{
@@ -1258,6 +1259,23 @@ async fn run_resumed(
         None
     };
 
+    // Create CostTracker if session recording is active
+    let cost_tracker: Option<std::sync::Mutex<CostTracker>> = if session {
+        if let Some(ref w) = session_writer {
+            let session_dir = w.lock().unwrap().session_dir().to_path_buf();
+            Some(std::sync::Mutex::new(CostTracker::new(
+                session_dir,
+                &config.model,
+                &config.provider_type,
+                &external_pricing,
+            )))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let on_message: Option<OnMessageFn> = session_writer.clone().map(|sw| {
         Box::new(move |msg: &recursive::message::Message| {
             if let Ok(mut writer) = sw.lock() {
@@ -1320,6 +1338,27 @@ async fn run_resumed(
             }
             None => {
                 eprintln!("session: writer still has other references; cannot finalize");
+            }
+        }
+    }
+
+    // Finalize cost tracker
+    if let Some(tracker) = cost_tracker {
+        match tracker.into_inner() {
+            Ok(mut t) => {
+                t.record_usage(outcome.total_usage, outcome.total_llm_latency_ms);
+                if let Err(e) = t.finish() {
+                    eprintln!("cost: failed to write cost.json: {e}");
+                } else {
+                    eprintln!(
+                        "cost: ${:.4} ({})",
+                        t.cost_usd().unwrap_or(0.0),
+                        config.model
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("cost: failed to lock cost tracker: {e}");
             }
         }
     }
@@ -1504,6 +1543,23 @@ async fn run_once(
         None
     };
 
+    // Create CostTracker if session recording is active
+    let cost_tracker: Option<std::sync::Mutex<CostTracker>> = if session {
+        if let Some(ref w) = session_writer {
+            let session_dir = w.lock().unwrap().session_dir().to_path_buf();
+            Some(std::sync::Mutex::new(CostTracker::new(
+                session_dir,
+                &config.model,
+                &config.provider_type,
+                &external_pricing,
+            )))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let on_message: Option<OnMessageFn> = session_writer.clone().map(|sw| {
         Box::new(move |msg: &recursive::message::Message| {
             if let Ok(mut writer) = sw.lock() {
@@ -1595,6 +1651,27 @@ async fn run_once(
             }
             None => {
                 eprintln!("session: writer still has other references; cannot finalize");
+            }
+        }
+    }
+
+    // Finalize cost tracker
+    if let Some(tracker) = cost_tracker {
+        match tracker.into_inner() {
+            Ok(mut t) => {
+                t.record_usage(outcome.total_usage, outcome.total_llm_latency_ms);
+                if let Err(e) = t.finish() {
+                    eprintln!("cost: failed to write cost.json: {e}");
+                } else {
+                    eprintln!(
+                        "cost: ${:.4} ({})",
+                        t.cost_usd().unwrap_or(0.0),
+                        config.model
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("cost: failed to lock cost tracker: {e}");
             }
         }
     }
