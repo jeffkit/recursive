@@ -182,39 +182,37 @@ impl CostTracker {
             );
             obj.insert(
                 "total_tokens".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(self.accumulated_usage.total_tokens),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.accumulated_usage.total_tokens,
+                )),
             );
             obj.insert(
                 "prompt_tokens".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(self.accumulated_usage.prompt_tokens),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.accumulated_usage.prompt_tokens,
+                )),
             );
             obj.insert(
                 "completion_tokens".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(self.accumulated_usage.completion_tokens),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.accumulated_usage.completion_tokens,
+                )),
             );
             obj.insert(
                 "cache_hit_tokens".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(self.accumulated_usage.cache_hit_tokens),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.accumulated_usage.cache_hit_tokens,
+                )),
             );
             obj.insert(
                 "cache_miss_tokens".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(self.accumulated_usage.cache_miss_tokens),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.accumulated_usage.cache_miss_tokens,
+                )),
             );
             obj.insert(
                 "total_llm_latency_ms".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(self.accumulated_latency_ms),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(self.accumulated_latency_ms)),
             );
         }
 
@@ -285,12 +283,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_new() {
         let dir = tempfile::tempdir().unwrap();
-        let tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
         assert_eq!(tracker.model, "deepseek-chat");
         assert_eq!(tracker.provider, "openai");
         assert!(tracker.pricing.is_some());
@@ -301,12 +294,8 @@ mod tests {
     #[test]
     fn test_cost_tracker_record_usage() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         let usage1 = TokenUsage {
             prompt_tokens: 100,
@@ -340,12 +329,8 @@ mod tests {
     #[test]
     fn test_cost_tracker_cost_usd() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         // deepseek-chat pricing: $0.27/M input, $1.10/M output
         let usage = TokenUsage {
@@ -416,12 +401,8 @@ mod tests {
     #[test]
     fn test_cost_tracker_write_cost_json() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         let usage = TokenUsage {
             prompt_tokens: 1000,
@@ -466,14 +447,14 @@ mod tests {
             "status": "active",
         });
         let meta_path = dir.path().join(".meta.json");
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&initial_meta).unwrap()).unwrap();
+        std::fs::write(
+            &meta_path,
+            serde_json::to_string_pretty(&initial_meta).unwrap(),
+        )
+        .unwrap();
 
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         let usage = TokenUsage {
             prompt_tokens: 500,
@@ -515,12 +496,8 @@ mod tests {
     #[test]
     fn test_cost_tracker_finish_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         let usage = TokenUsage {
             prompt_tokens: 100,
@@ -543,12 +520,8 @@ mod tests {
     #[test]
     fn test_cost_tracker_no_meta_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         let usage = TokenUsage {
             prompt_tokens: 100,
@@ -605,12 +578,8 @@ mod tests {
     #[test]
     fn test_cost_tracker_cache_hit_discount() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "deepseek-chat",
-            "openai",
-            &None,
-        );
+        let mut tracker =
+            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
 
         // deepseek-chat: $0.27/M input, $1.10/M output, $0.027/M cache hit
         let usage = TokenUsage {

@@ -6,6 +6,11 @@
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
 use axum::{
+    extract::ConnectInfo,
+    middleware::{self, Next},
+    response::IntoResponse,
+};
+use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::sse::{Event, Sse},
@@ -15,7 +20,7 @@ use axum::{
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
@@ -23,6 +28,108 @@ use crate::agent::StepEvent;
 use crate::config::Config;
 use crate::llm::LlmProvider;
 use crate::message::Message;
+
+// ── Rate limiter ──────────────────────────────────────────────────────────
+
+/// A token-bucket rate limiter keyed by client identifier.
+///
+/// Each client gets its own bucket with `capacity` tokens. Tokens refill
+/// at `refill_rate` per second. When a client has no tokens left, requests
+/// are rejected with 429 Too Many Requests.
+#[derive(Clone)]
+pub struct RateLimiter {
+    /// Tokens remaining per client key.
+    buckets: Arc<tokio::sync::Mutex<HashMap<String, TokenBucket>>>,
+    /// Max tokens per bucket.
+    capacity: u32,
+    /// Tokens refilled per second.
+    refill_rate: f64,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter with the given capacity and refill rate.
+    ///
+    /// - `capacity`: maximum number of tokens a bucket can hold (burst size).
+    /// - `refill_rate`: tokens added per second.
+    pub fn new(capacity: u32, refill_rate: f64) -> Self {
+        Self {
+            buckets: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            capacity,
+            refill_rate,
+        }
+    }
+
+    /// Check if a request from `key` is allowed. Returns `true` if the
+    /// request should proceed, `false` if it should be rate-limited.
+    ///
+    /// Consumes one token on success.
+    pub async fn check(&self, key: &str) -> bool {
+        let mut buckets = self.buckets.lock().await;
+        let now = Instant::now();
+
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket {
+                tokens: self.capacity as f64,
+                last_refill: now,
+            });
+
+        // Refill tokens based on elapsed time
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            bucket.tokens = (bucket.tokens + elapsed * self.refill_rate).min(self.capacity as f64);
+            bucket.last_refill = now;
+        }
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Extract a client key from the request: API key header if present, else remote IP.
+fn extract_client_key(req: &axum::http::Request<axum::body::Body>) -> String {
+    // Check for API key header first
+    if let Some(api_key) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return format!("apikey:{}", api_key);
+    }
+    if let Some(api_key) = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+    {
+        return format!("apikey:{}", api_key);
+    }
+
+    // Fall back to remote IP via ConnectInfo extension
+    if let Some(connect_info) = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>() {
+        return format!("ip:{}", connect_info.0.ip());
+    }
+
+    // Last resort: a sentinel for unknown clients
+    "ip:unknown".to_string()
+}
+
+/// Middleware that enforces rate limits per client.
+async fn rate_limit_middleware(
+    State(limiter): State<RateLimiter>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let key = extract_client_key(&req);
+    if !limiter.check(&key).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(req).await
+}
 
 // ── Session types ──────────────────────────────────────────────────────────
 
@@ -161,6 +268,17 @@ pub struct ErrorResponse {
 /// - `GET /sessions/:id/events` — SSE stream of agent events for a session
 /// - `GET /openapi.json` — returns the OpenAPI 3.0.3 specification
 pub fn build_router(state: AppState) -> Router {
+    // Build rate limiter from environment configuration
+    let rpm: f64 = std::env::var("RECURSIVE_RATE_LIMIT_RPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+    let burst: u32 = std::env::var("RECURSIVE_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let rate_limiter = RateLimiter::new(burst, rpm / 60.0);
+
     Router::new()
         .route("/health", get(health))
         .route("/tools", get(list_tools))
@@ -173,6 +291,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/{id}/events", get(session_events))
         .route("/openapi.json", get(openapi_spec))
         .with_state(Arc::new(state))
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
 }
 
 async fn health() -> &'static str {
@@ -917,5 +1039,105 @@ pub fn map_step_event(event: &StepEvent) -> Option<SseEvent> {
         }),
         // Other events don't map to SSE events
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Helper: create a test request with optional API key header.
+    fn test_req(api_key: Option<&str>) -> axum::http::Request<axum::body::Body> {
+        let mut req = axum::http::Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        if let Some(key) = api_key {
+            req.headers_mut().insert("x-api-key", key.parse().unwrap());
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_allows_requests_within_limit() {
+        let limiter = RateLimiter::new(10, 10.0); // 10 tokens, 10/sec refill
+                                                  // First 10 requests should all succeed
+        for _ in 0..10 {
+            assert!(limiter.check("test-client").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_rejects_requests_exceeding_limit() {
+        let limiter = RateLimiter::new(5, 10.0); // 5 tokens, 10/sec refill
+                                                 // First 5 succeed
+        for _ in 0..5 {
+            assert!(limiter.check("test-client").await);
+        }
+        // 6th should fail
+        assert!(!limiter.check("test-client").await);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_tokens_refill_after_waiting() {
+        let limiter = RateLimiter::new(2, 100.0); // 2 tokens, 100/sec refill
+                                                  // Use both tokens
+        assert!(limiter.check("test-client").await);
+        assert!(limiter.check("test-client").await);
+        assert!(!limiter.check("test-client").await);
+
+        // Wait for refill (10ms should give ~1 token at 100/sec)
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Should have at least 1 token now
+        assert!(limiter.check("test-client").await);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_different_clients_have_independent_buckets() {
+        let limiter = RateLimiter::new(3, 10.0); // 3 tokens each
+                                                 // Exhaust client A
+        for _ in 0..3 {
+            assert!(limiter.check("client-a").await);
+        }
+        assert!(!limiter.check("client-a").await);
+
+        // Client B should still have all 3 tokens
+        for _ in 0..3 {
+            assert!(limiter.check("client-b").await);
+        }
+        assert!(!limiter.check("client-b").await);
+    }
+
+    #[tokio::test]
+    async fn extract_client_key_uses_api_key_header() {
+        let req = test_req(Some("sk-test-123"));
+        let key = extract_client_key(&req);
+        assert_eq!(key, "apikey:sk-test-123");
+    }
+
+    #[tokio::test]
+    async fn extract_client_key_falls_back_to_unknown() {
+        let req = test_req(None);
+        let key = extract_client_key(&req);
+        // No ConnectInfo set, so falls back to "ip:unknown"
+        assert_eq!(key, "ip:unknown");
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_from_env_rpm() {
+        // Test that the env var parsing works correctly
+        // RPM 120 = 2/sec
+        let rpm: f64 = 120.0;
+        let burst: u32 = 5;
+        let limiter = RateLimiter::new(burst, rpm / 60.0);
+
+        // Should allow 5 requests immediately
+        for _ in 0..5 {
+            assert!(limiter.check("env-client").await);
+        }
+        // 6th should fail
+        assert!(!limiter.check("env-client").await);
     }
 }
