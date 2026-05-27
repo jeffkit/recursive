@@ -10,6 +10,7 @@
 //! `<workspace>/.recursive/sessions/` by convention.
 
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::llm::ToolSpec;
@@ -190,6 +191,307 @@ fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+// ---------------------------------------------------------------------------
+// JSONL session persistence (Goal 107)
+// ---------------------------------------------------------------------------
+
+/// Metadata for a JSONL session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub goal: String,
+    pub model: String,
+    pub provider: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: u64,
+    pub status: String,
+}
+
+/// A single JSONL line representing one message in the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<crate::llm::ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    pub timestamp: String,
+}
+
+/// Writer for appending messages to a JSONL session file.
+///
+/// Opens (or creates) a `.jsonl` file in append mode and writes one
+/// JSON object per line. A companion `.meta.json` file tracks session
+/// metadata and is updated on `finish()`.
+pub struct SessionWriter {
+    session_id: String,
+    session_dir: PathBuf,
+    writer: BufWriter<std::fs::File>,
+    message_count: u64,
+    created_at: String,
+    goal: String,
+    model: String,
+    provider: String,
+}
+
+impl SessionWriter {
+    /// Create a new session in the given workspace directory.
+    ///
+    /// The session directory is `<workspace>/.recursive/sessions/<workspace-slug>/<session-id>/`.
+    /// The `.jsonl` file and `.meta.json` are placed inside that directory.
+    pub fn create(
+        workspace: &Path,
+        goal: &str,
+        model: &str,
+        provider: &str,
+    ) -> std::io::Result<Self> {
+        let slug = workspace_slug(workspace);
+        let session_id = format!("{}-{}", chrono_lite_now(), slug);
+        let session_dir = workspace
+            .join(".recursive")
+            .join("sessions")
+            .join(&slug)
+            .join(&session_id);
+
+        std::fs::create_dir_all(&session_dir)?;
+
+        let jsonl_path = session_dir.join("transcript.jsonl");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)?;
+
+        let now = chrono_lite_now();
+        let meta = SessionMeta {
+            session_id: session_id.clone(),
+            goal: goal.to_string(),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            message_count: 0,
+            status: "active".to_string(),
+        };
+
+        // Write initial meta file
+        let meta_path = session_dir.join(".meta.json");
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&meta_path, meta_json)?;
+
+        Ok(Self {
+            session_id,
+            session_dir,
+            writer: BufWriter::new(file),
+            message_count: 0,
+            created_at: now,
+            goal: goal.to_string(),
+            model: model.to_string(),
+            provider: provider.to_string(),
+        })
+    }
+
+    /// Append a message to the JSONL file.
+    ///
+    /// Returns the assigned message ID (e.g. `msg_001`).
+    pub fn append(&mut self, msg: &Message) -> std::io::Result<String> {
+        self.message_count += 1;
+        let msg_id = format!("msg_{:03}", self.message_count);
+
+        let parent_id = if self.message_count > 1 {
+            Some(format!("msg_{:03}", self.message_count - 1))
+        } else {
+            None
+        };
+
+        let role_str = match msg.role {
+            crate::message::Role::System => "system",
+            crate::message::Role::User => "user",
+            crate::message::Role::Assistant => "assistant",
+            crate::message::Role::Tool => "tool",
+        };
+
+        let entry = TranscriptEntry {
+            id: msg_id,
+            parent_id,
+            role: role_str.to_string(),
+            content: msg.content.clone(),
+            tool_calls: msg.tool_calls.clone(),
+            tool_call_id: msg.tool_call_id.clone(),
+            reasoning_content: msg.reasoning_content.clone(),
+            timestamp: chrono_lite_now(),
+        };
+
+        let line = serde_json::to_string(&entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+
+        Ok(format!("msg_{:03}", self.message_count))
+    }
+
+    /// Finalise the session: flush the writer and update the meta file
+    /// with the final message count and status.
+    pub fn finish(mut self, status: &str) -> std::io::Result<()> {
+        self.writer.flush()?;
+
+        let meta = SessionMeta {
+            session_id: self.session_id,
+            goal: self.goal,
+            model: self.model,
+            provider: self.provider,
+            created_at: self.created_at,
+            updated_at: chrono_lite_now(),
+            message_count: self.message_count,
+            status: status.to_string(),
+        };
+
+        let meta_path = self.session_dir.join(".meta.json");
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&meta_path, meta_json)
+    }
+
+    /// Return the session ID.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Return the session directory path.
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+}
+
+/// Reader for loading sessions from JSONL files.
+pub struct SessionReader;
+
+impl SessionReader {
+    /// Load all transcript entries from a session directory.
+    pub fn load_transcript(session_dir: &Path) -> std::io::Result<Vec<TranscriptEntry>> {
+        let jsonl_path = session_dir.join("transcript.jsonl");
+        let file = std::fs::File::open(&jsonl_path)?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<TranscriptEntry>(&line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    // Skip corrupt lines gracefully
+                    eprintln!(
+                        "warning: skipping corrupt line in {}: {}",
+                        jsonl_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Load the session metadata from a session directory.
+    pub fn load_meta(session_dir: &Path) -> std::io::Result<SessionMeta> {
+        let meta_path = session_dir.join(".meta.json");
+        let bytes = std::fs::read(&meta_path)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// List all session directories for a given workspace.
+    ///
+    /// Returns a list of session directories sorted by name (which is
+    /// timestamp-prefixed, so chronological).
+    pub fn list_sessions(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let base = workspace.join(".recursive").join("sessions");
+        if !base.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut sessions = Vec::new();
+        // Iterate workspace slugs
+        for entry in std::fs::read_dir(&base)? {
+            let entry = entry?;
+            let slug_dir = entry.path();
+            if !slug_dir.is_dir() {
+                continue;
+            }
+            // Iterate session IDs within each slug
+            for session_entry in std::fs::read_dir(&slug_dir)? {
+                let session_entry = session_entry?;
+                let session_dir = session_entry.path();
+                if session_dir.is_dir() && session_dir.join(".meta.json").is_file() {
+                    sessions.push(session_dir);
+                }
+            }
+        }
+        sessions.sort();
+        Ok(sessions)
+    }
+
+    /// List all session directories across all workspaces under a base path.
+    pub fn list_all_sessions(base: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let sessions_dir = base.join(".recursive").join("sessions");
+        if !sessions_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut sessions = Vec::new();
+        for entry in std::fs::read_dir(&sessions_dir)? {
+            let entry = entry?;
+            let slug_dir = entry.path();
+            if !slug_dir.is_dir() {
+                continue;
+            }
+            for session_entry in std::fs::read_dir(&slug_dir)? {
+                let session_entry = session_entry?;
+                let session_dir = session_entry.path();
+                if session_dir.is_dir() && session_dir.join(".meta.json").is_file() {
+                    sessions.push(session_dir);
+                }
+            }
+        }
+        sessions.sort();
+        Ok(sessions)
+    }
+}
+
+/// Convert an absolute workspace path into a filesystem-safe slug.
+///
+/// - Replaces `/` with `-`
+/// - Strips leading `-` (from the root `/`)
+/// - Truncates to 80 characters
+fn workspace_slug(workspace: &Path) -> String {
+    let abs = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(workspace)
+    };
+
+    let s = abs.to_string_lossy().replace('/', "-");
+    // Strip leading dashes (from root slash)
+    let s = s.trim_start_matches('-').to_string();
+    // Truncate to 80 chars
+    if s.len() > 80 {
+        s[..80].to_string()
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -504,5 +806,163 @@ mod tests {
         assert!(path.starts_with(ws.join(".recursive").join("sessions")));
         // And should have .json extension
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
+    }
+
+    // -----------------------------------------------------------------------
+    // JSONL session tests (Goal 107)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_writer_creates_meta_and_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
+
+        let session_dir = writer.session_dir().to_path_buf();
+        assert!(session_dir.join("transcript.jsonl").is_file());
+        assert!(session_dir.join(".meta.json").is_file());
+
+        // Verify meta
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.goal, "test goal");
+        assert_eq!(meta.model, "gpt-4o");
+        assert_eq!(meta.provider, "openai");
+        assert_eq!(meta.message_count, 0);
+        assert_eq!(meta.status, "active");
+
+        writer.finish("completed").unwrap();
+
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.message_count, 0);
+        assert_eq!(meta.status, "completed");
+    }
+
+    #[test]
+    fn session_writer_appends_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "test", "gpt-4o", "openai").unwrap();
+
+        let id1 = writer.append(&Message::user("hello")).unwrap();
+        assert_eq!(id1, "msg_001");
+
+        let id2 = writer.append(&Message::assistant("hi there")).unwrap();
+        assert_eq!(id2, "msg_002");
+
+        let session_dir = writer.session_dir().to_path_buf();
+        writer.finish("completed").unwrap();
+
+        // Load and verify
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "msg_001");
+        assert_eq!(entries[0].parent_id, None);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].content, "hello");
+
+        assert_eq!(entries[1].id, "msg_002");
+        assert_eq!(entries[1].parent_id, Some("msg_001".to_string()));
+        assert_eq!(entries[1].role, "assistant");
+        assert_eq!(entries[1].content, "hi there");
+    }
+
+    #[test]
+    fn session_reader_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "round trip", "gpt-4o", "openai").unwrap();
+
+        writer.append(&Message::system("You are a bot.")).unwrap();
+        writer.append(&Message::user("do something")).unwrap();
+        writer.append(&Message::assistant("I will do it.")).unwrap();
+
+        let session_dir = writer.session_dir().to_path_buf();
+        writer.finish("completed").unwrap();
+
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].role, "system");
+        assert_eq!(entries[1].role, "user");
+        assert_eq!(entries[2].role, "assistant");
+    }
+
+    #[test]
+    fn session_writer_finish_updates_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "meta test", "gpt-4o", "openai").unwrap();
+        writer.append(&Message::user("msg1")).unwrap();
+        writer.append(&Message::assistant("msg2")).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        writer.finish("completed").unwrap();
+
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(meta.status, "completed");
+    }
+
+    #[test]
+    fn list_sessions_finds_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        // No sessions yet
+        let sessions = SessionReader::list_sessions(ws).unwrap();
+        assert!(sessions.is_empty());
+
+        // Create one session
+        let writer = SessionWriter::create(ws, "session1", "gpt-4o", "openai").unwrap();
+        let dir1 = writer.session_dir().to_path_buf();
+        drop(writer);
+
+        let sessions = SessionReader::list_sessions(ws).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0], dir1);
+    }
+
+    #[test]
+    fn crash_partial_line_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "crash test", "gpt-4o", "openai").unwrap();
+        writer.append(&Message::user("good line")).unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        writer.finish("crashed").unwrap();
+
+        // Append a corrupt line manually
+        use std::io::Write;
+        let jsonl_path = session_dir.join("transcript.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl_path)
+            .unwrap();
+        writeln!(f, "this is not json").unwrap();
+        drop(f);
+
+        // Should still load the good line
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "good line");
+    }
+
+    #[test]
+    fn workspace_slug_matches_expected() {
+        // Absolute path
+        let p = Path::new("/home/user/projects/my-app");
+        let slug = workspace_slug(p);
+        assert!(!slug.starts_with('-'));
+        assert!(slug.contains("home-user-projects-my-app"));
+        assert!(slug.len() <= 80);
+
+        // Relative path
+        let p = Path::new(".");
+        let slug = workspace_slug(p);
+        assert!(!slug.is_empty());
+        assert!(slug.len() <= 80);
     }
 }
