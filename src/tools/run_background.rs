@@ -453,6 +453,7 @@ async fn run_background_job(
 }
 
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -276,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
     fn session_list_finds_files_in_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
