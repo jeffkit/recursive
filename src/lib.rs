@@ -19,6 +19,7 @@ pub mod event;
 pub mod hooks;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod kernel;
 pub mod llm;
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -36,12 +37,13 @@ pub use agent::OnMessageFn;
 pub use agent::PlanningMode;
 pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
 pub use agent::{PermissionDecision, PermissionHook};
-pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
 pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
+pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
 pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
+pub use kernel::{AgentKernel, AgentKernelBuilder, SideEffect, TurnContext, TurnOutcome};
 pub use llm::openai::RetryPolicy;
 pub use llm::{pricing_for, Completion, LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec};
 #[cfg(feature = "mcp")]

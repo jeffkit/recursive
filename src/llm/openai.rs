@@ -168,9 +168,7 @@ impl LlmProvider for OpenAiProvider {
                         // Guard: some providers (e.g. MiniMax) occasionally return
                         // HTTP 200 with an empty body. Treat as transient and retry.
                         if text.trim().is_empty() {
-                            if let Some(backoff) =
-                                self.retry.backoff_for(attempt, None, true)
-                            {
+                            if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
                                 tracing::warn!(
                                     target: "recursive::llm",
                                     attempt,
@@ -277,9 +275,7 @@ impl LlmProvider for OpenAiProvider {
                         let text = resp.text().await?;
                         // Guard: empty body on HTTP 200 (MiniMax transient failure)
                         if text.trim().is_empty() {
-                            if let Some(backoff) =
-                                self.retry.backoff_for(attempt, None, true)
-                            {
+                            if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
                                 tracing::warn!(
                                     target: "recursive::llm",
                                     attempt,

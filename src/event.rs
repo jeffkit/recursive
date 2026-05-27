@@ -35,10 +35,7 @@ use crate::agent::StepEvent;
 #[non_exhaustive]
 pub enum AgentEvent {
     /// Model generated text without tool calls.
-    AssistantText {
-        text: String,
-        step: usize,
-    },
+    AssistantText { text: String, step: usize },
     /// Model requested to execute a tool.
     ToolCall {
         name: String,
@@ -47,10 +44,7 @@ pub enum AgentEvent {
         step: usize,
     },
     /// Time taken for the LLM request (excluding tool execution), in ms.
-    Latency {
-        step: usize,
-        llm_ms: u64,
-    },
+    Latency { step: usize, llm_ms: u64 },
     /// Result of executing a tool call.
     ToolResult {
         id: String,
@@ -65,10 +59,7 @@ pub enum AgentEvent {
         step: usize,
     },
     /// Partial token from streaming response (if streaming enabled).
-    PartialToken {
-        text: String,
-        step: usize,
-    },
+    PartialToken { text: String, step: usize },
     /// Transcript was compacted to fit size constraints.
     Compacted {
         removed: usize,
@@ -91,9 +82,7 @@ pub enum AgentEvent {
     /// Plan was confirmed, execution will proceed.
     PlanConfirmed,
     /// Plan was rejected with a reason.
-    PlanRejected {
-        reason: String,
-    },
+    PlanRejected { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -103,18 +92,14 @@ pub enum AgentEvent {
 impl From<StepEvent> for AgentEvent {
     fn from(ev: StepEvent) -> Self {
         match ev {
-            StepEvent::AssistantText { text, step } => {
-                AgentEvent::AssistantText { text, step }
-            }
+            StepEvent::AssistantText { text, step } => AgentEvent::AssistantText { text, step },
             StepEvent::ToolCall { call, step } => AgentEvent::ToolCall {
                 name: call.name,
                 id: call.id,
                 arguments: call.arguments.to_string(),
                 step,
             },
-            StepEvent::Latency { step, llm_ms } => {
-                AgentEvent::Latency { step, llm_ms }
-            }
+            StepEvent::Latency { step, llm_ms } => AgentEvent::Latency { step, llm_ms },
             StepEvent::ToolResult {
                 id,
                 name,
@@ -131,9 +116,7 @@ impl From<StepEvent> for AgentEvent {
                 output_tokens: usage.completion_tokens,
                 step,
             },
-            StepEvent::PartialToken { text, step } => {
-                AgentEvent::PartialToken { text, step }
-            }
+            StepEvent::PartialToken { text, step } => AgentEvent::PartialToken { text, step },
             StepEvent::Compacted {
                 removed,
                 kept,
@@ -145,12 +128,10 @@ impl From<StepEvent> for AgentEvent {
                 summary_chars,
                 step,
             },
-            StepEvent::Finished { reason: _, steps } => {
-                AgentEvent::TurnFinished {
-                    reason: "finished".into(),
-                    steps,
-                }
-            }
+            StepEvent::Finished { reason: _, steps } => AgentEvent::TurnFinished {
+                reason: "finished".into(),
+                steps,
+            },
             StepEvent::PlanProposed {
                 plan_text,
                 tool_calls,
@@ -168,9 +149,7 @@ impl From<StepEvent> for AgentEvent {
                     .collect(),
             },
             StepEvent::PlanConfirmed => AgentEvent::PlanConfirmed,
-            StepEvent::PlanRejected { reason } => {
-                AgentEvent::PlanRejected { reason }
-            }
+            StepEvent::PlanRejected { reason } => AgentEvent::PlanRejected { reason },
         }
     }
 }
@@ -347,7 +326,10 @@ mod tests {
         let (sink1, mut rx1) = ChannelSink::new();
         let (sink2, mut rx2) = ChannelSink::new();
 
-        let composite = CompositeSink::new(vec![Box::new(sink1) as Box<dyn EventSink>, Box::new(sink2) as Box<dyn EventSink>]);
+        let composite = CompositeSink::new(vec![
+            Box::new(sink1) as Box<dyn EventSink>,
+            Box::new(sink2) as Box<dyn EventSink>,
+        ]);
 
         let event = AgentEvent::PlanConfirmed;
         composite.emit(event.clone()).await;
@@ -428,7 +410,9 @@ mod tests {
 
         // Usage
         let se = StepEvent::Usage {
-            usage: crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 20,
+            usage: crate::llm::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
                 ..Default::default()
             },
             step: 5,

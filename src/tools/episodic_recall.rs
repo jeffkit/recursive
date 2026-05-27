@@ -13,7 +13,6 @@ use crate::llm::ToolSpec;
 use crate::session::SessionReader;
 use crate::tools::Tool;
 
-
 /// Episodic recall tool: search past session transcripts.
 pub struct EpisodicRecall {
     workspace: PathBuf,

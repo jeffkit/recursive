@@ -766,8 +766,14 @@ async fn run_agent(
         })?;
 
     let outcome = agent.run(&body.goal).await.map_err(|e| {
-        state.metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
-        state.metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .agent_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .agent_runs_failed
+            .fetch_add(1, Ordering::Relaxed);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -778,11 +784,26 @@ async fn run_agent(
     })?;
 
     // Increment metrics
-    state.metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
-    state.metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
-    state.metrics.agent_steps_total.fetch_add(outcome.steps as u64, Ordering::Relaxed);
-    state.metrics.tokens_prompt_total.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
-    state.metrics.tokens_completion_total.fetch_add(outcome.total_usage.completion_tokens as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .agent_runs_total
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .agent_runs_success
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .agent_steps_total
+        .fetch_add(outcome.steps as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .tokens_prompt_total
+        .fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
+    state.metrics.tokens_completion_total.fetch_add(
+        outcome.total_usage.completion_tokens as u64,
+        Ordering::Relaxed,
+    );
 
     // Serialize transcript messages to JSON values
     let messages: Vec<serde_json::Value> = outcome
