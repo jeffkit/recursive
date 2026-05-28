@@ -1,0 +1,54 @@
+# Anything that doesn't belong in the production container build context.
+# Mirrors .gitignore plus repository tooling that's irrelevant at build time.
+
+# Build artifacts
+target/
+**/target/
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Developer workflows / meta-process
+.dev/
+.github/
+.worktrees/
+
+# Per-workspace runtime state (memory, mcp cache, etc.)
+.recursive/
+
+# Editor / tool state
+.codebuddy/
+.cursor/
+.idea/
+.vscode/
+
+# Local env / secrets
+.env
+.env.*
+.envrc
+.envrc.local
+
+# Large fixture / test directories not needed at runtime
+e2e/
+tests/
+docs/
+examples/
+
+# Documentation noise — Markdown is never executed
+**/*.md
+!Cargo.toml
+
+# Redundant in image
+.dockerignore
+Dockerfile
+Dockerfile.*
+
+# OS junk
+**/.DS_Store
+**/Thumbs.db
+
+# Pre-built archives
+*.tar.gz
+*.zip
