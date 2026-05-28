@@ -232,8 +232,8 @@ fn normalise(p: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::permissions::PermissionsConfig;
+    use async_trait::async_trait;
 
     struct Echo;
 

@@ -63,9 +63,7 @@ impl PermissionsConfig {
         if !self.allow.is_empty() {
             let allowed = self.allow.iter().any(|p| matches_pattern(p, tool_name));
             if !allowed {
-                return Permission::Denied(format!(
-                    "tool `{tool_name}` is not in the allow list"
-                ));
+                return Permission::Denied(format!("tool `{tool_name}` is not in the allow list"));
             }
         }
 
@@ -80,7 +78,9 @@ impl PermissionsConfig {
         if matches!(self.check_static(tool_name), Permission::Denied(_)) {
             return false;
         }
-        self.interactive.iter().any(|p| matches_pattern(p, tool_name))
+        self.interactive
+            .iter()
+            .any(|p| matches_pattern(p, tool_name))
     }
 }
 

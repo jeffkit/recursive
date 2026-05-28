@@ -17,7 +17,6 @@ pub mod cost;
 pub mod error;
 pub mod event;
 pub mod hooks;
-pub mod permissions;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod kernel;
@@ -28,6 +27,7 @@ pub mod mcp;
 pub mod mcp_server;
 pub mod message;
 pub mod multi;
+pub mod permissions;
 pub mod runtime;
 pub mod session;
 pub mod skills;
