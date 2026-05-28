@@ -1,7 +1,7 @@
 //! schedule_wakeup tool — lets the agent request a timed re-invocation.
 //!
-//! The tool writes a `WakeupRequest` into a shared slot; the `AgentRunner`
-//! reads it after the turn completes and decides whether to sleep-then-loop.
+//! The tool writes a `WakeupRequest` into a shared slot; `AgentRuntime::run_loop`
+//! reads it after each turn completes and decides whether to sleep-then-loop.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

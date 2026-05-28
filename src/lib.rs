@@ -27,7 +27,6 @@ pub mod mcp;
 pub mod mcp_server;
 pub mod message;
 pub mod multi;
-pub mod runner;
 pub mod runtime;
 pub mod session;
 pub mod skills;
@@ -61,7 +60,6 @@ pub use multi::{
     MessageBus, MessageType, Pipeline, PipelineResult, SharedMemory, StageOutcome,
     TeamOrchestrator, TeamResult,
 };
-pub use runner::AgentRunner;
 pub use runtime::{AgentRuntime, AgentRuntimeBuilder, RuntimeOutcome};
 pub use session::SessionFile;
 pub use session::SessionReader;

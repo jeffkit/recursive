@@ -380,7 +380,7 @@ async fn main() -> anyhow::Result<()> {
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
-            let shutdown = recursive::runner::shutdown_signal();
+            let shutdown = shutdown_signal();
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move { shutdown.cancelled().await })
                 .await?;
@@ -389,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Init => run_init().await,
         Cmd::Run { goal } => {
-            let shutdown = recursive::runner::shutdown_signal();
+            let shutdown = shutdown_signal();
             run_once(
                 config,
                 goal.join(" "),
@@ -421,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Loop { goal } => {
-            let shutdown = recursive::runner::shutdown_signal();
+            let shutdown = shutdown_signal();
             run_loop(
                 config,
                 goal.join(" "),
@@ -776,6 +776,28 @@ fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathB
             anyhow::bail!("Ambiguous session identifier. Use a more specific path or ID.");
         }
     }
+}
+
+/// Returns a [`CancellationToken`] that fires on SIGINT (Ctrl+C) or SIGTERM.
+fn shutdown_signal() -> tokio_util::sync::CancellationToken {
+    let token = tokio_util::sync::CancellationToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+        #[cfg(unix)]
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+        #[cfg(not(unix))]
+        ctrl_c.await.unwrap();
+        t.cancel();
+    });
+    token
 }
 
 fn mask_key(key: Option<&str>) -> String {
