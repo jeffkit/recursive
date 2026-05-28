@@ -82,8 +82,11 @@ cases:
       exists: true
       contains: "turn-b"
 
-  # Scenario D: :clear (act inline — only checks stdout)
-  - name: "D: :clear command prints 'cleared'"
+  # Scenario D: :clear (act inline — REPL writes meta-info like
+  # "(conversation cleared)" to stderr by design, while stdout carries
+  # the agent's actual replies. Redirect stderr→stdout so ArgusAI's
+  # `output:` matcher (which only captures stdout) can see it.
+  - name: "D: :clear command prints 'cleared' (stderr merged via 2>&1)"
     exec:
       container: recursive-e2e
       command: >
@@ -91,7 +94,7 @@ cases:
         | recursive --workspace /workspace/test-repl-clear
         --api-base http://aimock:4010/v1
         --api-key mock-key -m mock-chat
-        repl
+        repl 2>&1
     expect:
       exitCode: 0
       output:
