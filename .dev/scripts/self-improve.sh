@@ -84,6 +84,17 @@ trap 'rm -f "$SYSPROMPT_FILE"' EXIT
   echo "You are Recursive, a Rust coding agent operating on your OWN source code."
   echo "Tools: read_file, write_file, list_dir, run_shell. Sandboxed to workspace."
   echo ""
+  # ---- Inject failure context from previous attempt (if any) -----------------
+  FAILURE_CTX_FILE="$DEV_DIR/runs/${GOAL_TAG}-failure-context.md"
+  if [[ -f "$FAILURE_CTX_FILE" ]]; then
+    echo "=== IMPORTANT: Previous attempt of this goal FAILED ==="
+    cat "$FAILURE_CTX_FILE"
+    echo ""
+    echo "=== END previous failure context ==="
+    echo ""
+    # Remove after injection so it's only used once
+    rm -f "$FAILURE_CTX_FILE"
+  fi
   echo "=== .dev/AGENTS.md (project contract) ==="
   cat "$DEV_DIR/AGENTS.md"
   echo ""
@@ -471,6 +482,30 @@ Goal:     ${GOAL_SOURCE}
       exit 0
       ;;
     rolled-back)
+      # ---- Save failure context for retry injection ---------------------------
+      # When a run fails, save the last 30 lines of agent output + the error
+      # reason into a .failure-context file. The next run of the same goal can
+      # inject this into the system prompt to avoid repeating the same mistake.
+      FAILURE_CTX_FILE="$DEV_DIR/runs/${GOAL_TAG}-failure-context.md"
+      {
+        echo "## Previous Attempt Failed"
+        echo ""
+        echo "- Provider: ${SELECTED_PROVIDER:-unknown}"
+        echo "- Model: ${RECURSIVE_MODEL:-unknown}"
+        echo "- Reason: ${detail}"
+        echo "- Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo ""
+        echo "### Last 30 lines of agent output:"
+        echo '```'
+        tail -30 "$LOG" 2>/dev/null || echo "(no log available)"
+        echo '```'
+        echo ""
+        echo "### Guidance for retry:"
+        echo "- Do NOT repeat the approach that caused this failure."
+        echo "- If the error was a compilation error, fix it before proceeding."
+        echo "- If output was truncated, use smaller patches (apply_patch, not write_file)."
+      } > "$FAILURE_CTX_FILE"
+
       git reset --hard "${BASELINE_HEAD}" --quiet
       # Re-create the journal entry post-reset (reset wiped it).
       mkdir -p "$DEV_DIR/journal"
@@ -493,6 +528,23 @@ EOF
       echo ""
       echo "=== ✗ rolled back to ${BASELINE_SHORT} (${detail}); journal committed ==="
       echo "=== journaled to ${LOG} ==="
+
+      # ---- DeepSeek flash → pro auto-fallback --------------------------------
+      # If the provider was 'deepseek' (flash) and RECURSIVE_DEEPSEEK_PRO_FALLBACK
+      # is enabled (default: 1), automatically retry with deepseek-pro.
+      DEEPSEEK_PRO_FALLBACK="${RECURSIVE_DEEPSEEK_PRO_FALLBACK:-1}"
+      if [[ "$DEEPSEEK_PRO_FALLBACK" == "1" ]] \
+         && [[ "${SELECTED_PROVIDER:-}" == "deepseek" ]] \
+         && [[ -z "${_RECURSIVE_IS_PRO_RETRY:-}" ]]; then
+        echo ""
+        echo "--- AUTO-FALLBACK: deepseek flash failed, retrying with deepseek-pro ---"
+        echo ""
+        export RECURSIVE_PROVIDER="deepseek-pro"
+        export _RECURSIVE_IS_PRO_RETRY=1
+        exec "$0" "$GOAL_SOURCE"
+        # exec replaces this process — below is unreachable
+      fi
+
       exit 1
       ;;
     skip-commit)
