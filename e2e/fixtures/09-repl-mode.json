@@ -1,0 +1,34 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "repl-a.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "repl-a.txt", "contents": "turn-a" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "repl-a.txt", "hasToolResult": true },
+      "response": { "content": "Done! Created repl-a.txt." }
+    },
+    {
+      "match": { "userMessage": "repl-b.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "repl-b.txt", "contents": "turn-b" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "repl-b.txt", "hasToolResult": true },
+      "response": { "content": "Done! Created repl-b.txt." }
+    }
+  ]
+}

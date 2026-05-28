@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     python3 \
     curl \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/recursive /usr/local/bin/recursive

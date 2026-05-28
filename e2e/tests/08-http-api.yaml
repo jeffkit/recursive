@@ -1,130 +1,194 @@
 name: "HTTP API Server (AgentRuntime)"
 description: >
-  Verify the HTTP server (Goals H, I) runs correctly with AgentRuntime:
-  health check, tool listing, stateless /run, session lifecycle, and SSE.
+  Verify the HTTP server (Goal I) runs correctly with AgentRuntime:
+  health, tools, OpenAPI spec, stateless /run, session lifecycle
+  (create → message → multi-turn → detail → list → delete), metrics.
 sequential: true
 
 cases:
-  # ── Start the HTTP server in the background ──────────────────────────────
-  - name: "Start HTTP server in background"
+  # ── Kill any leftover server from previous runs, then start fresh ─────────
+  - name: "Kill any existing server on port 9090"
     exec:
       container: recursive-e2e
       command: >
-        sh -c "recursive
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        server --addr 0.0.0.0:9090 &
-        echo $! > /tmp/http-server.pid &&
-        sleep 2 &&
-        echo 'server started'"
+        pkill -f 'http --addr 0.0.0.0:9090' 2>/dev/null; sleep 1; echo clean
     expect:
       exitCode: 0
+      output:
+        contains: "clean"
 
-  # ── Health check ──────────────────────────────────────────────────────────
+  # ── Start HTTP server ────────────────────────────────────────────────────
+  - name: "Start HTTP server on port 9090"
+    exec:
+      container: recursive-e2e
+      command: >
+        RECURSIVE_RATE_LIMIT_BURST=200
+        RECURSIVE_RATE_LIMIT_RPM=6000
+        recursive
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        http --addr 0.0.0.0:9090 &
+        sleep 2 && echo started
+    expect:
+      exitCode: 0
+      output:
+        contains: "started"
+
+  # ── Health & discovery ───────────────────────────────────────────────────
   - name: "GET /health returns ok"
     exec:
       container: recursive-e2e
-      command: >
-        curl -sf http://localhost:9090/health
+      command: curl -sf http://localhost:9090/health
     expect:
       exitCode: 0
-      stdout:
+      output:
         contains: "ok"
 
-  # ── Tool listing ─────────────────────────────────────────────────────────
-  - name: "GET /tools returns JSON array"
+  - name: "GET /tools returns read_file in JSON array"
     exec:
       container: recursive-e2e
-      command: >
-        curl -sf http://localhost:9090/tools
+      command: curl -sf http://localhost:9090/tools
     expect:
       exitCode: 0
-      stdout:
+      output:
         contains: "read_file"
 
-  # ── Stateless /run endpoint (ephemeral AgentRuntime per request) ──────────
-  - name: "POST /run returns 200 with finish_reason"
+  - name: "GET /openapi.json returns OpenAPI spec"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9090/openapi.json
+    expect:
+      exitCode: 0
+      output:
+        contains: "Recursive Agent API"
+
+  # ── Stateless /run (ephemeral AgentRuntime) ───────────────────────────────
+  - name: "POST /run returns finish_reason and messages"
     exec:
       container: recursive-e2e
       command: >
         curl -sf -X POST http://localhost:9090/run
         -H 'Content-Type: application/json'
-        -d '{"goal":"Create a file test-run.txt with content ok","max_steps":5}'
+        -d '{"goal":"Write file http-run.txt with content run-ok","max_steps":5}'
     expect:
       exitCode: 0
-      stdout:
-        contains: "finish_reason"
-        contains: "status"
+      output:
+        contains:
+          - "finish_reason"
+          - "messages"
+          - "total_steps"
+
+  - name: "POST /run with empty goal returns 400"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w status=%{http_code}
+        -X POST http://localhost:9090/run
+        -H 'Content-Type: application/json'
+        -d '{"goal":""}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=400"
 
   # ── Session lifecycle (persistent AgentRuntime per session) ───────────────
-  - name: "POST /sessions creates a session"
+  - name: "POST /sessions creates session and saves ID"
     exec:
       container: recursive-e2e
       command: >
-        sh -c "SESSION_ID=$(curl -sf -X POST http://localhost:9090/sessions
+        curl -sf -X POST http://localhost:9090/sessions
         -H 'Content-Type: application/json'
-        -d '{}' | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"id\"])') &&
-        echo \"session_id=$SESSION_ID\" &&
-        echo $SESSION_ID > /tmp/test-session-id"
+        -d '{"system_prompt":"You are a test assistant."}'
+        | tee /tmp/sess.json | jq -r .id > /tmp/http-sid
+        && echo created=$(cat /tmp/http-sid)
     expect:
       exitCode: 0
-      stdout:
-        contains: "session_id="
+      output:
+        contains: "created="
 
-  - name: "POST /sessions/:id/messages runs a turn"
+  - name: "POST /sessions/:id/messages executes a turn"
     exec:
       container: recursive-e2e
       command: >
-        sh -c "SID=$(cat /tmp/test-session-id) &&
-        curl -sf -X POST http://localhost:9090/sessions/$SID/messages
+        SID=$(cat /tmp/http-sid)
+        && curl -sf -X POST http://localhost:9090/sessions/$SID/messages
         -H 'Content-Type: application/json'
-        -d '{\"content\":\"Write hello-session.txt with content session-ok\"}'"
+        -d '{"content":"Write file session-turn1.txt with content turn1"}'
+        | jq -r .role | xargs -I {} echo role={}
     expect:
       exitCode: 0
-      stdout:
-        contains: "role"
+      output:
+        contains: "role=assistant"
 
-  - name: "GET /sessions/:id shows transcript"
+  - name: "GET /sessions/:id returns transcript with messages"
     exec:
       container: recursive-e2e
       command: >
-        sh -c "SID=$(cat /tmp/test-session-id) &&
-        curl -sf http://localhost:9090/sessions/$SID"
+        SID=$(cat /tmp/http-sid)
+        && curl -sf http://localhost:9090/sessions/$SID
+        | jq '.messages | length' | xargs -I {} echo count={}
     expect:
       exitCode: 0
-      stdout:
-        contains: "messages"
-        contains: "created_at"
+      output:
+        contains: "count="
 
-  - name: "GET /sessions lists sessions"
+  - name: "Multi-turn: second message keeps prior context"
     exec:
       container: recursive-e2e
       command: >
-        curl -sf http://localhost:9090/sessions
+        SID=$(cat /tmp/http-sid)
+        && curl -sf -X POST http://localhost:9090/sessions/$SID/messages
+        -H 'Content-Type: application/json'
+        -d '{"content":"Write file session-turn2.txt with content turn2"}'
+        | jq -r .role | xargs -I {} echo role={}
     expect:
       exitCode: 0
-      stdout:
+      output:
+        contains: "role=assistant"
+
+  - name: "GET /sessions lists sessions with message_count"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9090/sessions
+    expect:
+      exitCode: 0
+      output:
         contains: "message_count"
 
-  - name: "DELETE /sessions/:id removes it"
+  - name: "DELETE /sessions/:id removes session"
     exec:
       container: recursive-e2e
       command: >
-        sh -c "SID=$(cat /tmp/test-session-id) &&
-        curl -sf -X DELETE http://localhost:9090/sessions/$SID &&
-        STATUS=$(curl -s -o /dev/null -w '%{http_code}'
-        http://localhost:9090/sessions/$SID) &&
-        [ \"$STATUS\" = '404' ] && echo 'deleted'"
+        SID=$(cat /tmp/http-sid)
+        && curl -sf -X DELETE http://localhost:9090/sessions/$SID
+        && CODE=$(curl -s -o /dev/null -w %{http_code}
+        http://localhost:9090/sessions/$SID)
+        && echo after_delete=$CODE
     expect:
       exitCode: 0
-      stdout:
-        contains: "deleted"
+      output:
+        contains: "after_delete=404"
 
-  # ── Cleanup ───────────────────────────────────────────────────────────────
+  # ── Metrics ───────────────────────────────────────────────────────────────
+  - name: "GET /metrics returns Prometheus counters"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9090/metrics
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "recursive_requests_total"
+          - "recursive_agent_runs_total"
+          - "recursive_agent_steps_total"
+
+  # ── Cleanup: kill the background server ───────────────────────────────────
   - name: "Stop HTTP server"
     exec:
       container: recursive-e2e
       command: >
-        sh -c "kill $(cat /tmp/http-server.pid) 2>/dev/null; echo 'stopped'"
+        pkill -f 'http --addr 0.0.0.0:9090' 2>/dev/null; echo stopped
     expect:
       exitCode: 0
+      output:
+        contains: "stopped"

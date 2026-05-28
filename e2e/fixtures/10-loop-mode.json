@@ -1,0 +1,19 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "loop-result.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "loop-result.txt", "contents": "loop-done" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "loop-result.txt", "hasToolResult": true },
+      "response": { "content": "Loop task complete. No further wakeup needed." }
+    }
+  ]
+}

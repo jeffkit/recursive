@@ -1,0 +1,19 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "hook-test.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "hook-test.txt", "contents": "hook-ok" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "hook-test.txt", "hasToolResult": true },
+      "response": { "content": "Done! Created hook-test.txt." }
+    }
+  ]
+}

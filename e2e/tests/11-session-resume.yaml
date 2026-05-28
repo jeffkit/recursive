@@ -1,0 +1,48 @@
+name: "Session Resume (continue interrupted runs)"
+description: >
+  Verify recursive resume can continue a run that was interrupted due to
+  max-steps budget. Uses --session-out to capture state and resume later.
+sequential: true
+
+cases:
+  - name: "First run with max-steps 1 hits budget and writes session file"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-resume
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 1
+        --session-out /tmp/resume-session.json
+        run "Write file resume-task with content: step1 done. Then write resume-continuation."
+        ; echo exit=$?
+    expect:
+      exitCode: 0
+      output:
+        contains: "exit="
+
+  - name: "Session file was created with transcript"
+    file:
+      container: recursive-e2e
+      path: /tmp/resume-session.json
+      exists: true
+      contains: "transcript"
+
+  - name: "Resume from session file completes the run"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-resume
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 5
+        resume /tmp/resume-session.json
+    expect:
+      exitCode: 0
+
+  - name: "Session recorded with continuation"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-resume/.recursive/sessions
+      status: ["completed", "success"]
+      minMessages: 2

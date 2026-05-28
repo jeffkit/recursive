@@ -1,0 +1,49 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "http-run.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "http-run.txt", "contents": "run-ok" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "http-run.txt", "hasToolResult": true },
+      "response": { "content": "Done! I created http-run.txt with content run-ok." }
+    },
+    {
+      "match": { "userMessage": "session-turn1.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "session-turn1.txt", "contents": "turn1" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "session-turn1.txt", "hasToolResult": true },
+      "response": { "content": "Done! I created session-turn1.txt." }
+    },
+    {
+      "match": { "userMessage": "session-turn2.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "session-turn2.txt", "contents": "turn2" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "session-turn2.txt", "hasToolResult": true },
+      "response": { "content": "Done! I created session-turn2.txt." }
+    }
+  ]
+}

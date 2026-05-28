@@ -1,0 +1,34 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "resume-task", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "step1.txt", "contents": "step1" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "resume-task", "hasToolResult": true },
+      "response": { "content": "Created step1.txt." }
+    },
+    {
+      "match": { "userMessage": "resume-continuation", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "step2.txt", "contents": "step2" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "resume-continuation", "hasToolResult": true },
+      "response": { "content": "Created step2.txt. All done!" }
+    }
+  ]
+}

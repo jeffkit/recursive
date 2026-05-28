@@ -1,0 +1,39 @@
+name: "REPL Mode (multi-turn interactive)"
+description: >
+  Verify recursive repl accepts goals from piped stdin, executes each turn,
+  and exits cleanly when stdin closes (EOF). Tests the REPL loop's read
+  → run → print cycle without relying on transcript accumulation.
+sequential: true
+
+cases:
+  - name: "REPL accepts single goal via piped stdin"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf 'Write file repl-a.txt with content turn-a\n'
+        | recursive --workspace /workspace/test-repl
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 5
+        repl
+    expect:
+      exitCode: 0
+
+  - name: "repl-a.txt created by REPL turn"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-repl/repl-a.txt
+      exists: true
+      contains: "turn-a"
+
+  - name: "REPL exits 0 on :q command"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf ':q\n'
+        | recursive --workspace /workspace/test-repl
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        repl
+    expect:
+      exitCode: 0

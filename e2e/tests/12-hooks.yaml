@@ -1,0 +1,35 @@
+name: "Hooks Lifecycle (PreToolCall / PostToolCall)"
+description: >
+  Verify the hook system works end-to-end:
+  - --hook-timing flag enables ToolTimingHook (prints tool durations to stderr)
+  - Hooks don't block normal execution; file creation still succeeds.
+sequential: true
+
+cases:
+  - name: "Run agent with --hook-timing enabled"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-hooks
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 5
+        --hook-timing
+        run "Write file hook-test.txt with content hook-ok"
+    expect:
+      exitCode: 0
+
+  - name: "hook-test.txt created (tool executed despite hook)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-hooks/hook-test.txt
+      exists: true
+      contains: "hook-ok"
+
+  - name: "Session shows write_file tool call"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-hooks/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["write_file"]
+      minMessages: 2

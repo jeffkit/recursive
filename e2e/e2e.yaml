@@ -22,6 +22,8 @@ service:
       RECURSIVE_API_KEY: mock-key
       RECURSIVE_MODEL: mock-chat
       RUST_LOG: info
+      RECURSIVE_RATE_LIMIT_BURST: "200"
+      RECURSIVE_RATE_LIMIT_RPM: "6000"
 
 mocks:
   aimock:
@@ -68,3 +70,19 @@ tests:
     - name: "HTTP API Server (AgentRuntime)"
       id: http-api
       file: tests/08-http-api.yaml
+
+    - name: "REPL Mode (multi-turn interactive)"
+      id: repl
+      file: tests/09-repl-mode.yaml
+
+    - name: "Loop Mode (agent self-scheduling)"
+      id: loop
+      file: tests/10-loop-mode.yaml
+
+    - name: "Session Resume"
+      id: resume
+      file: tests/11-session-resume.yaml
+
+    - name: "Hooks Lifecycle"
+      id: hooks
+      file: tests/12-hooks.yaml
