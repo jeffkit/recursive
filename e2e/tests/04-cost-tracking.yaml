@@ -1,9 +1,17 @@
 name: "Cost Tracking"
-description: "Verify cost.json is produced with valid token data"
+description: "Verify cost.json is produced with valid token data."
 sequential: true
 
-cases:
-  - name: "Run agent (no tools, simple text)"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-04
+        mkdir -p /workspace/test-04
+        echo prepared
+
+  - name: "Run agent (act): say hello, no tools"
     exec:
       container: recursive-e2e
       command: >
@@ -13,12 +21,18 @@ cases:
         -m mock-chat
         --max-steps 5
         run "Say hello. Do not use any tools."
-    expect:
-      exitCode: 0
 
-  - name: "Cost data is valid"
+cases:
+  - name: "Cost data is valid (file exists, prompt tokens > 0)"
     recursive-cost:
       container: recursive-e2e
       input: /workspace/test-04/.recursive/sessions
       exists: true
       minPromptTokens: 1
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-04

@@ -1,9 +1,17 @@
 name: "Basic Agent Tool Usage"
-description: "Verify agent uses write_file to create a file via mock LLM"
+description: "Verify agent uses write_file to create a file via mock LLM."
 sequential: true
 
-cases:
-  - name: "Agent creates hello.txt via write_file"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-01
+        mkdir -p /workspace/test-01
+        echo prepared
+
+  - name: "Run agent (act): create hello.txt via write_file"
     exec:
       container: recursive-e2e
       command: >
@@ -13,17 +21,16 @@ cases:
         -m mock-chat
         --max-steps 10
         run "Create a file called hello.txt in the workspace root with exactly the content 'world'. Use write_file tool. Do NOT use any other tool after that."
-    expect:
-      exitCode: 0
 
-  - name: "hello.txt exists with correct content"
+cases:
+  - name: "hello.txt exists with content 'world'"
     file:
       container: recursive-e2e
       path: /workspace/test-01/hello.txt
       exists: true
       contains: "world"
 
-  - name: "Session is valid and completed"
+  - name: "Session is valid and recorded write_file"
     recursive-session:
       container: recursive-e2e
       input: /workspace/test-01/.recursive/sessions
@@ -31,3 +38,10 @@ cases:
       hasRoles: ["user", "assistant"]
       hasToolCalls: ["write_file"]
       minMessages: 3
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-01

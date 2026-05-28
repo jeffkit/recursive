@@ -1,12 +1,21 @@
 name: "Hooks Lifecycle (PreToolCall / PostToolCall)"
 description: >
   Verify the hook system works end-to-end:
-  - --hook-timing flag enables ToolTimingHook (prints tool durations to stderr)
-  - Hooks don't block normal execution; file creation still succeeds.
+  --hook-timing flag enables ToolTimingHook (prints tool durations to
+  stderr), and hooks don't block normal execution — file creation still
+  succeeds.
 sequential: true
 
-cases:
-  - name: "Run agent with --hook-timing enabled"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-hooks
+        mkdir -p /workspace/test-hooks
+        echo prepared
+
+  - name: "Run agent with --hook-timing (act)"
     exec:
       container: recursive-e2e
       command: >
@@ -16,20 +25,26 @@ cases:
         --max-steps 5
         --hook-timing
         run "Write file hook-test.txt with content hook-ok"
-    expect:
-      exitCode: 0
 
-  - name: "hook-test.txt created (tool executed despite hook)"
+cases:
+  - name: "hook-test.txt was created (hook did not block tool execution)"
     file:
       container: recursive-e2e
       path: /workspace/test-hooks/hook-test.txt
       exists: true
       contains: "hook-ok"
 
-  - name: "Session shows write_file tool call"
+  - name: "Session recorded write_file tool call"
     recursive-session:
       container: recursive-e2e
       input: /workspace/test-hooks/.recursive/sessions
       status: ["completed", "success"]
       hasToolCalls: ["write_file"]
       minMessages: 2
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-hooks

@@ -1,15 +1,29 @@
 name: "Live LLM Integration"
 description: |
   Full integration with real LLM. Requires DEEPSEEK_API_KEY.
-  Skips gracefully if unavailable.
+  Skips gracefully when the key is absent: case 1 (the act) exits 0 with a
+  SKIP marker, and the asserts also exit 0 silently. This preserves today's
+  behavior under sequential fail-fast — no engine-side strict-skip needed.
 sequential: true
 
-cases:
-  - name: "Agent completes multi-step task (real LLM)"
+setup:
+  - name: "Prepare workspace"
     exec:
       container: recursive-e2e
       command: |
-        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "SKIP: no API key"; exit 0; fi
+        rm -rf /workspace/test-live
+        mkdir -p /workspace/test-live
+        echo prepared
+
+cases:
+  - name: "Run agent (act): create greet.py + README.md against real LLM"
+    exec:
+      container: recursive-e2e
+      command: |
+        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+          echo "SKIP: no API key — downstream cases will no-op"
+          exit 0
+        fi
         recursive --workspace /workspace/test-live \
           --api-base "${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}" \
           --api-key "$DEEPSEEK_API_KEY" \
@@ -19,7 +33,7 @@ cases:
     expect:
       exitCode: 0
 
-  - name: "greet.py created correctly"
+  - name: "greet.py defines greet() (skipped silently when no API key)"
     exec:
       container: recursive-e2e
       command: |
@@ -28,11 +42,18 @@ cases:
     expect:
       exitCode: 0
 
-  - name: "Session is valid"
+  - name: "README.md exists (skipped silently when no API key)"
     exec:
       container: recursive-e2e
       command: |
         if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "SKIP"; exit 0; fi
-        echo "OK: will check session"
+        test -f /workspace/test-live/README.md && echo "OK"
     expect:
       exitCode: 0
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-live

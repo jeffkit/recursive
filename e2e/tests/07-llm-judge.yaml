@@ -1,11 +1,19 @@
 name: "LLM-as-Judge (Mock Agent + Real Judge)"
 description: |
-  Multi-step task with mock LLM. Validates file output and session structure.
-  LLM Judge step will be added when argusai registers it as a built-in plugin step.
+  Multi-step task with mock LLM. Validates file output, session structure,
+  and an LLM-judge verdict on whether the goal was met.
 sequential: true
 
-cases:
-  - name: "Run multi-step agent task"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-judge
+        mkdir -p /workspace/test-judge
+        echo prepared
+
+  - name: "Run agent (act): produce greet.py + README.md"
     exec:
       container: recursive-e2e
       command: >
@@ -15,9 +23,8 @@ cases:
         -m mock-chat
         --max-steps 15
         run "Create a Python script called greet.py that defines a function greet(name) returning 'Hello, {name}!', has a main block calling greet('World'), then create a README.md describing it."
-    expect:
-      exitCode: 0
 
+cases:
   - name: "greet.py exists with greet function"
     file:
       container: recursive-e2e
@@ -31,7 +38,7 @@ cases:
       path: /workspace/test-judge/README.md
       exists: true
 
-  - name: "Session is complete with tool calls"
+  - name: "Session is complete with write_file tool calls"
     recursive-session:
       container: recursive-e2e
       input: /workspace/test-judge/.recursive/sessions
@@ -39,9 +46,16 @@ cases:
       hasToolCalls: ["write_file"]
       minMessages: 4
 
-  - name: "LLM Judge approves"
+  - name: "LLM Judge approves (semantic)"
     llm-judge:
       container: recursive-e2e
       input: /workspace/test-judge/.recursive/sessions
       goal: "Create greet.py with greet(name) function + main block, then README.md"
       minScore: 3
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-judge

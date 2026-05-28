@@ -1,9 +1,17 @@
 name: "Session JSONL Persistence"
-description: "Verify session produces valid .meta.json + transcript.jsonl"
+description: "Verify session produces valid .meta.json + transcript.jsonl."
 sequential: true
 
-cases:
-  - name: "Run agent with list_dir tool"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-02
+        mkdir -p /workspace/test-02
+        echo prepared
+
+  - name: "Run agent (act): list_dir on workspace root"
     exec:
       container: recursive-e2e
       command: >
@@ -13,9 +21,8 @@ cases:
         -m mock-chat
         --max-steps 10
         run "List the files in the workspace root using list_dir tool."
-    expect:
-      exitCode: 0
 
+cases:
   - name: "Session structure is valid"
     recursive-session:
       container: recursive-e2e
@@ -25,3 +32,10 @@ cases:
       hasToolCalls: ["list_dir"]
       minMessages: 3
       finalized: true
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-02

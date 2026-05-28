@@ -1,9 +1,17 @@
 name: "Sessions Export CLI"
-description: "Verify sessions list and export commands work"
+description: "Verify `sessions list` command and the resulting session is valid."
 sequential: true
 
-cases:
-  - name: "Run agent to create a session"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-05
+        mkdir -p /workspace/test-05
+        echo prepared
+
+  - name: "Run agent (act): produce a minimal session"
     exec:
       container: recursive-e2e
       command: >
@@ -13,10 +21,9 @@ cases:
         -m mock-chat
         --max-steps 5
         run "Say 'test export' and stop."
-    expect:
-      exitCode: 0
 
-  - name: "sessions list works"
+cases:
+  - name: "`sessions list` succeeds and prints a session entry"
     exec:
       container: recursive-e2e
       command: "recursive --workspace /workspace/test-05 sessions list"
@@ -31,3 +38,10 @@ cases:
       input: /workspace/test-05/.recursive/sessions
       status: ["completed", "success"]
       minMessages: 2
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-05

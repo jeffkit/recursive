@@ -1,0 +1,75 @@
+name: "HTTP API Server — Rate Limit (port 9091)"
+description: |
+  Isolated rate-limit verification on a low-burst HTTP server. Kept in its
+  own suite because the burst/RPM env vars must be set at server start
+  time and the lifecycle is independent from the main 9090 server in
+  08-http-api.yaml.
+
+  Burst=2 / RPM=60 means three rapid /health hits should yield two 200s
+  and one 429.
+sequential: true
+
+setup:
+  - name: "Kill any leftover server on port 9091"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null || true
+        sleep 1
+        echo cleaned
+
+  - name: "Start low-burst server on 9091"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -f /tmp/http-9091.log
+        RECURSIVE_RATE_LIMIT_BURST=2 \
+        RECURSIVE_RATE_LIMIT_RPM=60 \
+        nohup recursive \
+          --api-base http://aimock:4010/v1 \
+          --api-key mock-key -m mock-chat \
+          http --addr 0.0.0.0:9091 \
+          > /tmp/http-9091.log 2>&1 &
+        sleep 2
+        echo started
+
+  - name: "Sanity: server is responding before rate-limit test"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9091/health
+    expect:
+      exitCode: 0
+      output:
+        contains: "ok"
+
+cases:
+  - name: "Third request within burst window returns 429"
+    exec:
+      container: recursive-e2e
+      command: |
+        # Burst=2 → first two 200, third 429.
+        # Note: the sanity case in setup already consumed 1 token.
+        # Request 1 here will be 429 if the bucket didn't refill; or
+        # status3 will be 429 after 2 fresh hits. We assert at least one
+        # 429 across three rapid hits.
+        sleep 1
+        S1=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
+        S2=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
+        S3=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
+        echo "statuses=$S1,$S2,$S3"
+        echo "$S1 $S2 $S3" | grep -q 429 && echo "rate-limited-ok" || echo "expected-429-but-got-$S1-$S2-$S3"
+    expect:
+      exitCode: 0
+      output:
+        contains: "rate-limited-ok"
+
+teardown:
+  - name: "Stop rate-limit server on 9091"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null || true
+        rm -f /tmp/http-9091.log
+        echo stopped

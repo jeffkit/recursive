@@ -1,44 +1,40 @@
 name: "REPL Mode (multi-turn interactive)"
-description: >
+description: |
   Verify recursive repl accepts goals from piped stdin, executes each turn,
-  and exits cleanly when stdin closes (EOF). Tests the REPL loop's read
-  → run → print cycle without relying on transcript accumulation.
+  and exits cleanly when stdin closes (EOF). Each scenario gets its OWN
+  workspace to eliminate cross-case pollution (the previous version reused
+  /workspace/test-repl across cases 1, 5, 7 — files from case 1 would leak
+  into the :clear and empty-line scenarios).
+
+  Scenarios:
+    A. Single-turn REPL (workspace test-repl-single)
+    B. :q quit command (workspace test-repl-quit, no goal)
+    C. Multi-turn context (workspace test-repl-multi)
+    D. :clear command output (workspace test-repl-clear)
+    E. Empty-line tolerance (workspace test-repl-empty)
 sequential: true
 
-cases:
-  - name: "REPL accepts single goal via piped stdin"
+setup:
+  - name: "Prepare per-scenario workspaces (clean slate each)"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-repl-{single,quit,multi,clear,empty}
+        mkdir -p /workspace/test-repl-{single,quit,multi,clear,empty}
+        echo prepared
+
+  - name: "Scenario A (act): single goal via piped stdin"
     exec:
       container: recursive-e2e
       command: >
         printf 'Write file repl-a.txt with content turn-a\n'
-        | recursive --workspace /workspace/test-repl
+        | recursive --workspace /workspace/test-repl-single
         --api-base http://aimock:4010/v1
         --api-key mock-key -m mock-chat
         --max-steps 5
         repl
-    expect:
-      exitCode: 0
 
-  - name: "repl-a.txt created by REPL turn"
-    file:
-      container: recursive-e2e
-      path: /workspace/test-repl/repl-a.txt
-      exists: true
-      contains: "turn-a"
-
-  - name: "REPL exits 0 on :q command"
-    exec:
-      container: recursive-e2e
-      command: >
-        printf ':q\n'
-        | recursive --workspace /workspace/test-repl
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        repl
-    expect:
-      exitCode: 0
-
-  - name: "REPL maintains context across multiple goals in one session"
+  - name: "Scenario C (act): multi-turn — write repl-a.txt then repl-b.txt"
     exec:
       container: recursive-e2e
       command: >
@@ -48,29 +44,51 @@ cases:
         --api-key mock-key -m mock-chat
         --max-steps 5
         repl
+
+cases:
+  # Scenario A asserts
+  - name: "A: repl-a.txt created with turn-a"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-repl-single/repl-a.txt
+      exists: true
+      contains: "turn-a"
+
+  # Scenario B: :q quit (act inline — no fixture to assert separately)
+  - name: "B: REPL exits 0 on :q command"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf ':q\n'
+        | recursive --workspace /workspace/test-repl-quit
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        repl
     expect:
       exitCode: 0
 
-  - name: "repl-a.txt created in REPL turn 1"
+  # Scenario C asserts
+  - name: "C: repl-a.txt created in turn 1"
     file:
       container: recursive-e2e
       path: /workspace/test-repl-multi/repl-a.txt
       exists: true
       contains: "turn-a"
 
-  - name: "repl-b.txt created in REPL turn 2"
+  - name: "C: repl-b.txt created in turn 2"
     file:
       container: recursive-e2e
       path: /workspace/test-repl-multi/repl-b.txt
       exists: true
       contains: "turn-b"
 
-  - name: "REPL :clear command resets transcript and prints confirmation"
+  # Scenario D: :clear (act inline — only checks stdout)
+  - name: "D: :clear command prints 'cleared'"
     exec:
       container: recursive-e2e
       command: >
         printf ':clear\n:q\n'
-        | recursive --workspace /workspace/test-repl
+        | recursive --workspace /workspace/test-repl-clear
         --api-base http://aimock:4010/v1
         --api-key mock-key -m mock-chat
         repl
@@ -79,14 +97,22 @@ cases:
       output:
         contains: "cleared"
 
-  - name: "REPL skips empty lines without error"
+  # Scenario E: empty-line tolerance (act inline)
+  - name: "E: empty lines do not cause REPL errors"
     exec:
       container: recursive-e2e
       command: >
         printf '\n\n:q\n'
-        | recursive --workspace /workspace/test-repl
+        | recursive --workspace /workspace/test-repl-empty
         --api-base http://aimock:4010/v1
         --api-key mock-key -m mock-chat
         repl
     expect:
       exitCode: 0
+
+teardown:
+  - name: "Clean per-scenario workspaces"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-repl-{single,quit,multi,clear,empty}

@@ -1,9 +1,24 @@
 name: "Self-Improve Smoke Gate"
-description: "Minimal deterministic tests proving the new binary works as an agent. Run in replay mode (no API key needed). Must pass before any goal commit."
+description: >
+  Minimal deterministic tests proving the new binary works as an agent.
+  Run in replay mode (no API key needed). Must pass before any goal commit.
+
+  Two scenarios in one suite (separated only because they exercise different
+  tools — write_file vs read_file). Under sequential fail-fast, if scenario 1
+  fails the second scenario will be skipped.
 sequential: true
 
-cases:
-  - name: "Binary starts and completes a goal"
+setup:
+  - name: "Prepare both smoke workspaces"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/smoke-01 /workspace/smoke-02
+        mkdir -p /workspace/smoke-01 /workspace/smoke-02
+        echo 'test content' > /workspace/smoke-02/input.txt
+        echo prepared
+
+  - name: "Run write_file scenario (smoke-01)"
     exec:
       container: recursive-e2e
       command: >
@@ -11,10 +26,25 @@ cases:
         --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
         --max-steps 5
         run "Create a file called smoke.txt with content 'ok'"
-    expect:
-      exitCode: 0
 
-  - name: "write_file tool was used"
+  - name: "Run read_file scenario (smoke-02)"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/smoke-02
+        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --max-steps 5
+        run "Read the file input.txt and tell me what it contains"
+
+cases:
+  - name: "smoke-01: write_file produced smoke.txt with 'ok'"
+    file:
+      container: recursive-e2e
+      path: /workspace/smoke-01/smoke.txt
+      exists: true
+      contains: "ok"
+
+  - name: "smoke-01: session recorded write_file tool call"
     recursive-session:
       container: recursive-e2e
       input: /workspace/smoke-01/.recursive/sessions
@@ -23,28 +53,16 @@ cases:
       hasToolCalls: ["write_file"]
       minMessages: 3
 
-  - name: "File was actually created"
-    file:
-      container: recursive-e2e
-      path: /workspace/smoke-01/smoke.txt
-      exists: true
-      contains: "ok"
-
-  - name: "Binary handles read_file tool"
-    exec:
-      container: recursive-e2e
-      command: >
-        sh -c "mkdir -p /workspace/smoke-02 && echo 'test content' > /workspace/smoke-02/input.txt &&
-        recursive --workspace /workspace/smoke-02
-        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
-        --max-steps 5
-        run 'Read the file input.txt and tell me what it contains'"
-    expect:
-      exitCode: 0
-
-  - name: "read_file session valid"
+  - name: "smoke-02: session recorded read_file tool call"
     recursive-session:
       container: recursive-e2e
       input: /workspace/smoke-02/.recursive/sessions
       status: ["completed", "success"]
       hasToolCalls: ["read_file"]
+
+teardown:
+  - name: "Clean smoke workspaces"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/smoke-01 /workspace/smoke-02

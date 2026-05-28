@@ -1,9 +1,17 @@
 name: "Memory Scratchpad"
-description: "Verify agent can use scratchpad_set and data persists"
+description: "Verify agent can use scratchpad_set and data persists."
 sequential: true
 
-cases:
-  - name: "Run agent with scratchpad_set"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-03
+        mkdir -p /workspace/test-03
+        echo prepared
+
+  - name: "Run agent (act): scratchpad_set + scratchpad_list"
     exec:
       container: recursive-e2e
       command: >
@@ -13,10 +21,9 @@ cases:
         -m mock-chat
         --max-steps 10
         run "Use the scratchpad_set tool to store the key 'test_color' with value 'blue'. Then use scratchpad_list to confirm it's stored. Do nothing else."
-    expect:
-      exitCode: 0
 
-  - name: "scratchpad.json has correct data"
+cases:
+  - name: "scratchpad.json contains the stored key"
     file:
       container: recursive-e2e
       path: /workspace/test-03/.recursive/scratchpad.json
@@ -29,3 +36,10 @@ cases:
       input: /workspace/test-03/.recursive/sessions
       status: ["completed", "success"]
       hasToolCalls: ["scratchpad_set"]
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-03

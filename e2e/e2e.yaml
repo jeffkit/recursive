@@ -71,6 +71,10 @@ tests:
       id: http-api
       file: tests/08-http-api.yaml
 
+    - name: "HTTP API Rate Limit"
+      id: http-rate-limit
+      file: tests/08b-http-rate-limit.yaml
+
     - name: "REPL Mode (multi-turn interactive)"
       id: repl
       file: tests/09-repl-mode.yaml

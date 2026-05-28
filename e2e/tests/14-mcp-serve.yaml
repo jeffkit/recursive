@@ -1,21 +1,23 @@
 name: "MCP Stdio Server (recursive serve)"
-description: >
-  Verify recursive serve exposes the agent's tools as an MCP stdio server via JSON-RPC 2.0.
-  Tests the initialize handshake, tools/list discovery, tools/call file creation,
-  and unknown method error handling.
+description: |
+  Verify `recursive serve` exposes the agent's tools as an MCP stdio server
+  via JSON-RPC 2.0. Each scenario spawns a fresh process and starts with
+  the `initialize` handshake — that's an MCP protocol requirement, not a
+  test smell, since the server has no persistent state across stdio
+  invocations. Setup only prepares the workspace.
 sequential: true
 
-cases:
-  - name: "Setup: create workspace for MCP serve tests"
+setup:
+  - name: "Prepare workspace"
     exec:
       container: recursive-e2e
-      command: "mkdir -p /workspace/test-mcp && echo ready"
-    expect:
-      exitCode: 0
-      output:
-        contains: "ready"
+      command: |
+        rm -rf /workspace/test-mcp
+        mkdir -p /workspace/test-mcp
+        echo prepared
 
-  - name: "MCP serve: initialize returns server info and protocol version"
+cases:
+  - name: "initialize handshake returns server info + protocol version"
     exec:
       container: recursive-e2e
       command: >
@@ -28,7 +30,7 @@ cases:
           - "recursive-agent"
           - "protocolVersion"
 
-  - name: "MCP serve: tools/list returns agent tools including write_file"
+  - name: "tools/list returns write_file, apply_patch, read_file"
     exec:
       container: recursive-e2e
       command: >
@@ -42,7 +44,7 @@ cases:
           - "apply_patch"
           - "read_file"
 
-  - name: "MCP serve: tools/call write_file creates a file"
+  - name: "tools/call write_file (act): RPC response acknowledges path"
     exec:
       container: recursive-e2e
       command: >
@@ -53,14 +55,14 @@ cases:
       output:
         contains: "mcp-test.txt"
 
-  - name: "MCP serve: file was actually written to workspace"
+  - name: "tools/call wrote the actual file to workspace (assert)"
     file:
       container: recursive-e2e
       path: /workspace/test-mcp/mcp-test.txt
       exists: true
       contains: "mcp-ok"
 
-  - name: "MCP serve: resources/list returns empty array"
+  - name: "resources/list returns a resources array"
     exec:
       container: recursive-e2e
       command: >
@@ -71,7 +73,7 @@ cases:
       output:
         contains: "resources"
 
-  - name: "MCP serve: unknown method returns JSON-RPC error"
+  - name: "unknown method returns a JSON-RPC error envelope"
     exec:
       container: recursive-e2e
       command: >
@@ -81,3 +83,10 @@ cases:
       exitCode: 0
       output:
         contains: "error"
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-mcp

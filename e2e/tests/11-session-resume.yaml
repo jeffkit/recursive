@@ -1,11 +1,25 @@
 name: "Session Resume (continue interrupted runs)"
-description: >
-  Verify recursive resume can continue a run that was interrupted due to
-  max-steps budget. Uses --session-out to capture state and resume later.
+description: |
+  Verify `recursive resume` can continue a run that was interrupted due to
+  max-steps budget. Uses --session-out to capture state in /tmp.
+
+  /tmp/resume-session.json is the cross-case fixture: it's produced in
+  setup (the "first run") and consumed by the "resume" act. We can't lift
+  it into ArgusAI variables because `save:` does not capture exec stdout —
+  this is a known engine limitation, not a test smell.
 sequential: true
 
-cases:
-  - name: "First run with max-steps 1 hits budget and writes session file"
+setup:
+  - name: "Prepare workspace + clear stale session file"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-resume
+        rm -f /tmp/resume-session.json
+        mkdir -p /workspace/test-resume
+        echo prepared
+
+  - name: "First run with max-steps 1 (act-fixture): writes /tmp/resume-session.json"
     exec:
       container: recursive-e2e
       command: >
@@ -16,19 +30,15 @@ cases:
         --session-out /tmp/resume-session.json
         run "Write file resume-task with content: step1 done. Then write resume-continuation."
         ; echo exit=$?
-    expect:
-      exitCode: 0
-      output:
-        contains: "exit="
 
-  - name: "Session file was created with transcript"
+  - name: "Sanity: session fixture file exists with transcript"
     file:
       container: recursive-e2e
       path: /tmp/resume-session.json
       exists: true
       contains: "transcript"
 
-  - name: "Resume from session file completes the run"
+  - name: "Resume from session file (act)"
     exec:
       container: recursive-e2e
       command: >
@@ -37,12 +47,20 @@ cases:
         --api-key mock-key -m mock-chat
         --max-steps 5
         resume /tmp/resume-session.json
-    expect:
-      exitCode: 0
 
-  - name: "Session recorded with continuation"
+cases:
+  - name: "Resumed run produced a valid completed session"
     recursive-session:
       container: recursive-e2e
       input: /workspace/test-resume/.recursive/sessions
       status: ["completed", "success"]
       minMessages: 2
+
+teardown:
+  - name: "Clean workspace + remove fixture session file"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-resume
+        rm -f /tmp/resume-session.json

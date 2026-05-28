@@ -1,11 +1,20 @@
 name: "Loop Mode (agent self-scheduling)"
 description: >
-  Verify recursive loop runs the agent with the ScheduleWakeup tool available.
-  The agent completes its goal and exits without scheduling a wakeup.
+  Verify `recursive loop` runs the agent with the ScheduleWakeup tool
+  available. The agent completes its goal and exits without scheduling a
+  wakeup.
 sequential: true
 
-cases:
-  - name: "Loop mode runs and completes goal"
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-loop
+        mkdir -p /workspace/test-loop
+        echo prepared
+
+  - name: "Run loop mode (act)"
     exec:
       container: recursive-e2e
       command: >
@@ -14,22 +23,18 @@ cases:
         --api-key mock-key -m mock-chat
         --max-steps 5
         loop Write file loop-result.txt with content loop-done
-    expect:
-      exitCode: 0
 
-  - name: "loop-result.txt created by agent"
+cases:
+  - name: "loop-result.txt was produced by the loop run"
     file:
       container: recursive-e2e
       path: /workspace/test-loop/loop-result.txt
       exists: true
       contains: "loop-done"
 
-  - name: "Loop workspace directory created"
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
     exec:
       container: recursive-e2e
-      command: >
-        test -d /workspace/test-loop && echo exists || echo missing
-    expect:
-      exitCode: 0
-      output:
-        contains: "exists"
+      command: rm -rf /workspace/test-loop
