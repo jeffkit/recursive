@@ -1,0 +1,21 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "patch-me.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "apply_patch",
+            "arguments": {
+              "patch": "*** Begin Patch\n*** Update File: patch-me.txt\n@@\n line one\n-line two\n+line TWO\n line three\n*** End Patch"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "patch-me.txt", "hasToolResult": true },
+      "response": { "content": "Done! I changed 'line two' to 'line TWO' in patch-me.txt using apply_patch." }
+    }
+  ]
+}

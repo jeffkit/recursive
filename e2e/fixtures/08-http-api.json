@@ -44,6 +44,21 @@
     {
       "match": { "userMessage": "session-turn2.txt", "hasToolResult": true },
       "response": { "content": "Done! I created session-turn2.txt." }
+    },
+    {
+      "match": { "userMessage": "sse-test.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "sse-test.txt", "contents": "sse-ok" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "sse-test.txt", "hasToolResult": true },
+      "response": { "content": "Done! I created sse-test.txt with content sse-ok." }
     }
   ]
 }

@@ -86,3 +86,11 @@ tests:
     - name: "Hooks Lifecycle"
       id: hooks
       file: tests/12-hooks.yaml
+
+    - name: "apply_patch Tool"
+      id: apply-patch
+      file: tests/13-apply-patch.yaml
+
+    - name: "MCP Stdio Server"
+      id: mcp-serve
+      file: tests/14-mcp-serve.yaml

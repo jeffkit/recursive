@@ -37,3 +37,56 @@ cases:
         repl
     expect:
       exitCode: 0
+
+  - name: "REPL maintains context across multiple goals in one session"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf 'Write file repl-a.txt with content turn-a\nWrite file repl-b.txt with content turn-b\n:q\n'
+        | recursive --workspace /workspace/test-repl-multi
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 5
+        repl
+    expect:
+      exitCode: 0
+
+  - name: "repl-a.txt created in REPL turn 1"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-repl-multi/repl-a.txt
+      exists: true
+      contains: "turn-a"
+
+  - name: "repl-b.txt created in REPL turn 2"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-repl-multi/repl-b.txt
+      exists: true
+      contains: "turn-b"
+
+  - name: "REPL :clear command resets transcript and prints confirmation"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf ':clear\n:q\n'
+        | recursive --workspace /workspace/test-repl
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        repl
+    expect:
+      exitCode: 0
+      output:
+        contains: "cleared"
+
+  - name: "REPL skips empty lines without error"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '\n\n:q\n'
+        | recursive --workspace /workspace/test-repl
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        repl
+    expect:
+      exitCode: 0

@@ -1,0 +1,83 @@
+name: "MCP Stdio Server (recursive serve)"
+description: >
+  Verify recursive serve exposes the agent's tools as an MCP stdio server via JSON-RPC 2.0.
+  Tests the initialize handshake, tools/list discovery, tools/call file creation,
+  and unknown method error handling.
+sequential: true
+
+cases:
+  - name: "Setup: create workspace for MCP serve tests"
+    exec:
+      container: recursive-e2e
+      command: "mkdir -p /workspace/test-mcp && echo ready"
+    expect:
+      exitCode: 0
+      output:
+        contains: "ready"
+
+  - name: "MCP serve: initialize returns server info and protocol version"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n'
+        | recursive serve --workspace /workspace/test-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "recursive-agent"
+          - "protocolVersion"
+
+  - name: "MCP serve: tools/list returns agent tools including write_file"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+        | recursive serve --workspace /workspace/test-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "write_file"
+          - "apply_patch"
+          - "read_file"
+
+  - name: "MCP serve: tools/call write_file creates a file"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"mcp-test.txt","contents":"mcp-ok"}}}\n'
+        | recursive serve --workspace /workspace/test-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "mcp-test.txt"
+
+  - name: "MCP serve: file was actually written to workspace"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-mcp/mcp-test.txt
+      exists: true
+      contains: "mcp-ok"
+
+  - name: "MCP serve: resources/list returns empty array"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}}\n'
+        | recursive serve --workspace /workspace/test-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "resources"
+
+  - name: "MCP serve: unknown method returns JSON-RPC error"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"unknown/nonexistent","params":{}}\n'
+        | recursive serve --workspace /workspace/test-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "error"

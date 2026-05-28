@@ -62,6 +62,42 @@ cases:
       output:
         contains: "Recursive Agent API"
 
+  # ── Error cases: non-existent session ────────────────────────────────────
+  - name: "GET /sessions/:id returns 404 for non-existent session"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:9090/sessions/nonexistent-session-id-xyz
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=404"
+
+  - name: "POST /sessions/:id/messages returns 404 for non-existent session"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9090/sessions/nonexistent-session-id-xyz/messages
+        -H 'Content-Type: application/json'
+        -d '{"content":"hello"}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=404"
+
+  - name: "GET /sessions/:id/events returns 404 for non-existent session"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:9090/sessions/nonexistent-session-id-xyz/events
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=404"
+
   # ── Stateless /run (ephemeral AgentRuntime) ───────────────────────────────
   - name: "POST /run returns finish_reason and messages"
     exec:
@@ -146,6 +182,54 @@ cases:
       output:
         contains: "role=assistant"
 
+  # ── SSE streaming events ─────────────────────────────────────────────────
+  - name: "Create SSE test session"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf -X POST http://localhost:9090/sessions
+        -H 'Content-Type: application/json'
+        -d '{"system_prompt":"You are a test assistant."}'
+        | jq -r .id > /tmp/sse-sid
+        && echo "created=$(cat /tmp/sse-sid)"
+    expect:
+      exitCode: 0
+      output:
+        contains: "created="
+
+  - name: "SSE endpoint delivers done event when a session run completes"
+    exec:
+      container: recursive-e2e
+      command: |
+        SSE_SID=$(cat /tmp/sse-sid)
+        curl -s -N "http://localhost:9090/sessions/$SSE_SID/events" \
+          > /tmp/sse-events.txt 2>/dev/null &
+        SSE_PID=$!
+        sleep 0.5
+        curl -sf -X POST "http://localhost:9090/sessions/$SSE_SID/messages" \
+          -H 'Content-Type: application/json' \
+          -d '{"content":"Write file sse-test.txt with content sse-ok"}' \
+          > /dev/null
+        sleep 0.5
+        kill $SSE_PID 2>/dev/null; wait $SSE_PID 2>/dev/null
+        grep -q "done" /tmp/sse-events.txt && echo "sse-received" || echo "sse-missing"
+    expect:
+      exitCode: 0
+      output:
+        contains: "sse-received"
+
+  - name: "Clean up SSE test session"
+    exec:
+      container: recursive-e2e
+      command: >
+        SSE_SID=$(cat /tmp/sse-sid)
+        && curl -sf -X DELETE http://localhost:9090/sessions/$SSE_SID
+        && echo cleaned
+    expect:
+      exitCode: 0
+      output:
+        contains: "cleaned"
+
   - name: "GET /sessions lists sessions with message_count"
     exec:
       container: recursive-e2e
@@ -188,6 +272,48 @@ cases:
       container: recursive-e2e
       command: >
         pkill -f 'http --addr 0.0.0.0:9090' 2>/dev/null; echo stopped
+    expect:
+      exitCode: 0
+      output:
+        contains: "stopped"
+
+  # ── Rate limiting (separate server with low burst on port 9091) ───────────
+  - name: "Start low-burst server on port 9091 for rate limit test"
+    exec:
+      container: recursive-e2e
+      command: >
+        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null;
+        RECURSIVE_RATE_LIMIT_BURST=2
+        RECURSIVE_RATE_LIMIT_RPM=60
+        recursive
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        http --addr 0.0.0.0:9091 &
+        sleep 2 && echo started
+    expect:
+      exitCode: 0
+      output:
+        contains: "started"
+
+  - name: "Rate limiter returns 429 after burst is exhausted"
+    exec:
+      container: recursive-e2e
+      command: |
+        curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9091/health
+        curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9091/health
+        STATUS3=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
+        echo "third_request=$STATUS3"
+        [ "$STATUS3" = "429" ] && echo "rate-limited-ok" || echo "expected-429-got-$STATUS3"
+    expect:
+      exitCode: 0
+      output:
+        contains: "rate-limited-ok"
+
+  - name: "Stop rate limit test server"
+    exec:
+      container: recursive-e2e
+      command: >
+        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null; echo stopped
     expect:
       exitCode: 0
       output:

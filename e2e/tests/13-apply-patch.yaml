@@ -1,0 +1,55 @@
+name: "apply_patch Tool"
+description: >
+  Verify agent uses apply_patch to modify an existing file in-place.
+  Tests the primary edit tool tracked by the self-improve loop (apply_patch:write_file ratio).
+sequential: true
+
+cases:
+  - name: "Create base file for patching"
+    exec:
+      container: recursive-e2e
+      command: |
+        mkdir -p /workspace/test-patch
+        printf 'line one\nline two\nline three\n' > /workspace/test-patch/patch-me.txt
+        echo created
+    expect:
+      exitCode: 0
+      output:
+        contains: "created"
+
+  - name: "Agent modifies file using apply_patch"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-patch
+        --api-base http://aimock:4010/v1
+        --api-key mock-key
+        -m mock-chat
+        --max-steps 5
+        run "Modify file patch-me.txt: change 'line two' to 'line TWO' using apply_patch"
+    expect:
+      exitCode: 0
+
+  - name: "patch-me.txt contains the patched content"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-patch/patch-me.txt
+      exists: true
+      contains: "line TWO"
+
+  - name: "Original lines not in the patch are preserved"
+    exec:
+      container: recursive-e2e
+      command: >
+        grep -c "line one" /workspace/test-patch/patch-me.txt
+        && grep -c "line three" /workspace/test-patch/patch-me.txt
+    expect:
+      exitCode: 0
+
+  - name: "Session records apply_patch tool call"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-patch/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["apply_patch"]
+      minMessages: 3
