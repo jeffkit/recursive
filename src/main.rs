@@ -785,9 +785,8 @@ fn shutdown_signal() -> tokio_util::sync::CancellationToken {
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         #[cfg(unix)]
         tokio::select! {
             _ = ctrl_c => {},

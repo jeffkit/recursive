@@ -64,3 +64,7 @@ tests:
     - name: "LLM-as-Judge"
       id: judge
       file: tests/07-llm-judge.yaml
+
+    - name: "HTTP API Server (AgentRuntime)"
+      id: http-api
+      file: tests/08-http-api.yaml

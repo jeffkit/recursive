@@ -1,0 +1,130 @@
+name: "HTTP API Server (AgentRuntime)"
+description: >
+  Verify the HTTP server (Goals H, I) runs correctly with AgentRuntime:
+  health check, tool listing, stateless /run, session lifecycle, and SSE.
+sequential: true
+
+cases:
+  # ── Start the HTTP server in the background ──────────────────────────────
+  - name: "Start HTTP server in background"
+    exec:
+      container: recursive-e2e
+      command: >
+        sh -c "recursive
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        server --addr 0.0.0.0:9090 &
+        echo $! > /tmp/http-server.pid &&
+        sleep 2 &&
+        echo 'server started'"
+    expect:
+      exitCode: 0
+
+  # ── Health check ──────────────────────────────────────────────────────────
+  - name: "GET /health returns ok"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf http://localhost:9090/health
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "ok"
+
+  # ── Tool listing ─────────────────────────────────────────────────────────
+  - name: "GET /tools returns JSON array"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf http://localhost:9090/tools
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "read_file"
+
+  # ── Stateless /run endpoint (ephemeral AgentRuntime per request) ──────────
+  - name: "POST /run returns 200 with finish_reason"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf -X POST http://localhost:9090/run
+        -H 'Content-Type: application/json'
+        -d '{"goal":"Create a file test-run.txt with content ok","max_steps":5}'
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "finish_reason"
+        contains: "status"
+
+  # ── Session lifecycle (persistent AgentRuntime per session) ───────────────
+  - name: "POST /sessions creates a session"
+    exec:
+      container: recursive-e2e
+      command: >
+        sh -c "SESSION_ID=$(curl -sf -X POST http://localhost:9090/sessions
+        -H 'Content-Type: application/json'
+        -d '{}' | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"id\"])') &&
+        echo \"session_id=$SESSION_ID\" &&
+        echo $SESSION_ID > /tmp/test-session-id"
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "session_id="
+
+  - name: "POST /sessions/:id/messages runs a turn"
+    exec:
+      container: recursive-e2e
+      command: >
+        sh -c "SID=$(cat /tmp/test-session-id) &&
+        curl -sf -X POST http://localhost:9090/sessions/$SID/messages
+        -H 'Content-Type: application/json'
+        -d '{\"content\":\"Write hello-session.txt with content session-ok\"}'"
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "role"
+
+  - name: "GET /sessions/:id shows transcript"
+    exec:
+      container: recursive-e2e
+      command: >
+        sh -c "SID=$(cat /tmp/test-session-id) &&
+        curl -sf http://localhost:9090/sessions/$SID"
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "messages"
+        contains: "created_at"
+
+  - name: "GET /sessions lists sessions"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf http://localhost:9090/sessions
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "message_count"
+
+  - name: "DELETE /sessions/:id removes it"
+    exec:
+      container: recursive-e2e
+      command: >
+        sh -c "SID=$(cat /tmp/test-session-id) &&
+        curl -sf -X DELETE http://localhost:9090/sessions/$SID &&
+        STATUS=$(curl -s -o /dev/null -w '%{http_code}'
+        http://localhost:9090/sessions/$SID) &&
+        [ \"$STATUS\" = '404' ] && echo 'deleted'"
+    expect:
+      exitCode: 0
+      stdout:
+        contains: "deleted"
+
+  # ── Cleanup ───────────────────────────────────────────────────────────────
+  - name: "Stop HTTP server"
+    exec:
+      container: recursive-e2e
+      command: >
+        sh -c "kill $(cat /tmp/http-server.pid) 2>/dev/null; echo 'stopped'"
+    expect:
+      exitCode: 0

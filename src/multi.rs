@@ -687,7 +687,10 @@ mod tests {
         });
 
         let outcome = pool.run_with_role("planner", "plan a task").await.unwrap();
-        assert_eq!(outcome.finish_reason, crate::agent::FinishReason::NoMoreToolCalls);
+        assert_eq!(
+            outcome.finish_reason,
+            crate::agent::FinishReason::NoMoreToolCalls
+        );
         assert!(outcome.final_text.unwrap().contains("Plan:"));
     }
 
@@ -785,7 +788,10 @@ mod tests {
             .await;
 
         let outcome = pool.run_with_role("worker", "continue work").await.unwrap();
-        assert_eq!(outcome.finish_reason, crate::agent::FinishReason::NoMoreToolCalls);
+        assert_eq!(
+            outcome.finish_reason,
+            crate::agent::FinishReason::NoMoreToolCalls
+        );
         // The run succeeded with memory context injected — no error means integration works
         assert!(outcome.final_text.is_some());
     }

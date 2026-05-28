@@ -949,7 +949,10 @@ mod http_tests {
     async fn map_agent_event_returns_none_for_unrelated() {
         use recursive::AgentEvent;
 
-        let event = AgentEvent::Latency { step: 1, llm_ms: 500 };
+        let event = AgentEvent::Latency {
+            step: 1,
+            llm_ms: 500,
+        };
         assert!(map_agent_event(&event).is_none());
 
         let event = AgentEvent::AssistantText {

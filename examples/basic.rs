@@ -1,8 +1,8 @@
 //! Basic agent example: create a runtime with a mock LLM, run it, and inspect
 //! the outcome. No API key required — uses `MockProvider` for offline testing.
 
-use recursive::runtime::AgentRuntime;
 use recursive::llm::{Completion, MockProvider};
+use recursive::runtime::AgentRuntime;
 use std::sync::Arc;
 
 #[tokio::main]
