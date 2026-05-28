@@ -1,6 +1,10 @@
 //! Multi-agent orchestration: agent pool, role definitions, and message bus.
 
-use crate::{Agent, AgentOutcome, Config, LlmProvider};
+use crate::agent::{AgentOutcome, PlanningMode};
+use crate::event::NullSink;
+use crate::kernel::{AgentKernel, TurnContext};
+use crate::message::Message;
+use crate::{Config, LlmProvider};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -283,13 +287,34 @@ impl AgentPool {
             format!("{}\n\n{}", role.system_prompt, memory_ctx)
         };
 
-        let mut agent = Agent::builder()
+        let kernel = AgentKernel::builder()
             .llm(self.provider.clone())
-            .system_prompt(system_prompt)
             .max_steps(role.max_steps)
             .build()?;
 
-        agent.run(goal).await
+        let ctx = TurnContext {
+            messages: vec![
+                Message::system(system_prompt),
+                Message::user(goal.to_string()),
+            ],
+            event_sink: Box::new(NullSink),
+            tool_specs: kernel.tools().specs(),
+            streaming: false,
+            permission_hook: None,
+            planning_mode: PlanningMode::default(),
+        };
+
+        let outcome = kernel.run(ctx).await?;
+
+        // Convert TurnOutcome to AgentOutcome for backward compatibility
+        Ok(AgentOutcome {
+            final_message: outcome.final_text,
+            transcript: outcome.new_messages,
+            steps: outcome.steps,
+            finish: outcome.finish_reason,
+            total_usage: outcome.usage,
+            total_llm_latency_ms: outcome.llm_latency_ms,
+        })
     }
 
     /// Send a task message from one agent role to another.
