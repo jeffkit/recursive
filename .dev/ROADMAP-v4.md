@@ -26,10 +26,10 @@ Durable state for production use.
 |----|---------|--------|--------|
 | 14.1 | Session persistence (JSONL) | M | ✅ Batch 35 (Goals 107-109) |
 | 14.2 | Memory persistence (4-layer system) | M | ✅ Batch 35-36 (Goals 110-113, 110b) |
-| 14.3 | Transcript export/import (JSON) | S | 🟡 Partial — sessions list/show enhanced, export CLI pending |
+| 14.3 | Transcript export/import (JSON) | S | ✅ Batch 37 (Goal 119 — `sessions export` shipped, e2da6c1) |
 | 14.4 | Agent checkpoint/resume | M | 🔴 |
 
-**Total**: ~2 batches → 1.5 done
+**Total**: ~2 batches → 2 done
 
 ---
 
@@ -41,10 +41,10 @@ Understanding what agents do in production.
 |----|---------|--------|--------|
 | 15.1 | Structured logging (tracing spans per step) | S | ✅ Batch 36 (Goal 115) |
 | 15.2 | Metrics endpoint (Prometheus-compatible) | M | 🔴 → Batch 37 |
-| 15.3 | Cost tracking (per-session persistence) | M | ✅ Batch 36 (Goal 116) — wiring into CLI pending |
+| 15.3 | Cost tracking (per-session persistence) | M | ✅ Batch 36-37 (Goal 116 + wired in main.rs via Goal H, 190b6e16) |
 | 15.4 | Replay viewer (web-based transcript replay) | M | 🔴 |
 
-**Total**: ~2 batches → 1 done
+**Total**: ~2 batches → 2 done (15.1, 15.3); 15.2 + 15.4 remain
 
 ---
 
