@@ -1,7 +1,8 @@
 {
   "fixtures": [
     {
-      "match": { "userMessage": "repl-a.txt", "hasToolResult": false },
+      "_comment": "Single-turn scenario A and turn 1 of multi-turn scenario C: first LLM call before any tool runs.",
+      "match": { "userMessage": "repl-a.txt", "turnIndex": 0 },
       "response": {
         "toolCalls": [
           {
@@ -12,11 +13,13 @@
       }
     },
     {
-      "match": { "userMessage": "repl-a.txt", "hasToolResult": true },
+      "_comment": "Single-turn scenario A and turn 1 of multi-turn scenario C: follow-up LLM call after tool result.",
+      "match": { "userMessage": "repl-a.txt", "turnIndex": 1 },
       "response": { "content": "Done! Created repl-a.txt." }
     },
     {
-      "match": { "userMessage": "repl-b.txt", "hasToolResult": false },
+      "_comment": "Multi-turn scenario C, turn 2: first LLM call. assistant_count==2 (tool-call from turn 1 + final reply from turn 1). hasToolResult would be true here (transcript carries turn 1's tool message), so we use turnIndex instead.",
+      "match": { "userMessage": "repl-b.txt", "turnIndex": 2 },
       "response": {
         "toolCalls": [
           {
@@ -27,7 +30,8 @@
       }
     },
     {
-      "match": { "userMessage": "repl-b.txt", "hasToolResult": true },
+      "_comment": "Multi-turn scenario C, turn 2: follow-up after tool result.",
+      "match": { "userMessage": "repl-b.txt", "turnIndex": 3 },
       "response": { "content": "Done! Created repl-b.txt." }
     }
   ]
