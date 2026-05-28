@@ -32,6 +32,7 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod transcript;
+pub mod runtime;
 
 pub use agent::OnMessageFn;
 pub use agent::PlanningMode;
@@ -70,6 +71,7 @@ pub use skills::{
 };
 pub use tools::{Tool, ToolRegistry};
 pub use transcript::{TranscriptFile, TranscriptMeta};
+pub use runtime::{AgentRuntime, AgentRuntimeBuilder, RuntimeOutcome};
 
 /// Safely truncate a string to at most `max_bytes` bytes without splitting
 /// a multi-byte UTF-8 character. Returns the full string if it's already

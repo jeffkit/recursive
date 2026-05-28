@@ -136,6 +136,21 @@ pub struct AgentKernel {
     pub(crate) hooks: HookRegistry,
 }
 
+impl std::fmt::Debug for AgentKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tools_count = self.tools.names().len();
+        let hooks_count = self.hooks.len();
+        f.debug_struct("AgentKernel")
+            .field("llm", &"<LlmProvider>")
+            .field("tools_count", &tools_count)
+            .field("max_steps", &self.max_steps)
+            .field("max_transcript_chars", &self.max_transcript_chars)
+            .field("compactor", &self.compactor)
+            .field("hooks_count", &hooks_count)
+            .finish()
+    }
+}
+
 impl AgentKernel {
     /// Create a new builder for `AgentKernel`.
     pub fn builder() -> AgentKernelBuilder {
@@ -231,6 +246,21 @@ pub struct AgentKernelBuilder {
     max_transcript_chars: Option<usize>,
     compactor: Option<Compactor>,
     hooks: Option<HookRegistry>,
+}
+
+impl std::fmt::Debug for AgentKernelBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tools_desc = self.tools.as_ref().map(|t| t.names().len());
+        let hooks_desc = self.hooks.as_ref().map(|h| h.len());
+        f.debug_struct("AgentKernelBuilder")
+            .field("llm", &self.llm.as_ref().map(|_| "<LlmProvider>"))
+            .field("tools", &tools_desc)
+            .field("max_steps", &self.max_steps)
+            .field("max_transcript_chars", &self.max_transcript_chars)
+            .field("compactor", &self.compactor)
+            .field("hooks", &hooks_desc)
+            .finish()
+    }
 }
 
 impl AgentKernelBuilder {
