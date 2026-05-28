@@ -20,6 +20,10 @@ pub struct MockProvider {
     /// Queue of pre-baked JSON responses for `complete_structured`.
     structured_responses: Mutex<Vec<Result<serde_json::Value>>>,
     calls: Mutex<Vec<Vec<Message>>>,
+    /// Optional notifier — `notify_one()`'d after every `complete()` call,
+    /// before returning. Used by tests that need to deterministically race
+    /// some side action (e.g. cancellation) against agent progress.
+    on_complete: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl MockProvider {
@@ -35,7 +39,17 @@ impl MockProvider {
             scripted: Mutex::new(scripted),
             calls: Mutex::new(Vec::new()),
             structured_responses: Mutex::new(Vec::new()),
+            on_complete: None,
         }
+    }
+
+    /// Attach a notifier that fires once per `complete()` call, after the
+    /// completion is dequeued and immediately before it is returned. Tests
+    /// use this to deterministically synchronise external side-effects
+    /// (e.g. cancellation) with agent progress, avoiding wall-clock sleeps.
+    pub fn with_on_complete(mut self, notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        self.on_complete = Some(notify);
+        self
     }
 
     /// Snapshot of the transcripts the agent has sent to this provider.
@@ -67,7 +81,12 @@ impl LlmProvider for MockProvider {
                     message: "MockProvider: no scripted completions left".into(),
                 });
             }
-            Ok(queue.remove(0))
+            let completion = queue.remove(0);
+            drop(queue);
+            if let Some(ref notify) = self.on_complete {
+                notify.notify_one();
+            }
+            Ok(completion)
         }
         .instrument(span)
         .await

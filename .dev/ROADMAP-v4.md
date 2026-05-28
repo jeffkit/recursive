@@ -72,7 +72,7 @@ Make it safe and reliable for real deployments.
 | 17.1 | Rate limiting (per-session, per-API-key) | S | 🔴 → Batch 37 |
 | 17.2 | Authentication (API keys + JWT) | M | 🟡 Partial — API keys shipped (Goal 135); JWT pending (g136) |
 | 17.3 | Tool permission system (role-based allow/deny) | M | 🔴 |
-| 17.4 | Graceful shutdown + in-flight request draining | S | 🔴 → Batch 37 |
+| 17.4 | Graceful shutdown + in-flight request draining | S | ✅ Batch 38 (Goal 120 signal handling + Goal 137 wired token through kernel/runtime) |
 | 17.5 | Docker packaging + health probes | S | 🔴 |
 
 **Total**: ~2 batches

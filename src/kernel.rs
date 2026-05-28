@@ -155,6 +155,11 @@ pub struct AgentKernel {
     pub(crate) compactor: Option<Compactor>,
     /// Hook registry for lifecycle hooks.
     pub(crate) hooks: HookRegistry,
+    /// Optional cancellation token for graceful shutdown. When the token
+    /// is cancelled, the kernel's step loop terminates with
+    /// [`FinishReason::Cancelled`](crate::agent::FinishReason::Cancelled)
+    /// at the next step boundary.
+    pub(crate) shutdown_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -188,6 +193,14 @@ impl AgentKernel {
         &self.tools
     }
 
+    /// Access the cancellation token, if one was configured.
+    ///
+    /// Useful for tests verifying that token propagation through
+    /// `with_tools` (and other clones) preserves the handle.
+    pub fn shutdown_token(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        self.shutdown_token.as_ref()
+    }
+
     /// Create a new kernel with a different tool registry (same LLM, same config).
     /// Useful for Multi-Agent scenarios where sub-agents get restricted tool subsets.
     pub fn with_tools(&self, tools: ToolRegistry) -> Self {
@@ -198,6 +211,7 @@ impl AgentKernel {
             max_transcript_chars: self.max_transcript_chars,
             compactor: self.compactor.clone(),
             hooks: self.hooks.clone(),
+            shutdown_token: self.shutdown_token.clone(),
         }
     }
 
@@ -247,6 +261,7 @@ impl AgentKernel {
             total_llm_latency_ms: 0,
             plan_buffer: ctx.plan_buffer,
             plan_confirmed: ctx.plan_confirmed,
+            shutdown_token: self.shutdown_token.clone(),
         };
 
         let inner = core.run_inner().await?;
@@ -290,6 +305,7 @@ pub struct AgentKernelBuilder {
     max_transcript_chars: Option<usize>,
     compactor: Option<Compactor>,
     hooks: Option<HookRegistry>,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -344,6 +360,15 @@ impl AgentKernelBuilder {
         self
     }
 
+    /// Set the cancellation token for graceful shutdown. When the token
+    /// is cancelled, the kernel's step loop terminates with
+    /// [`FinishReason::Cancelled`](crate::agent::FinishReason::Cancelled)
+    /// at the next step boundary.
+    pub fn shutdown_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
+        self
+    }
+
     /// Build the `AgentKernel`, or return an error if required fields are missing.
     pub fn build(self) -> crate::error::Result<AgentKernel> {
         let llm = self.llm.ok_or_else(|| crate::error::Error::Config {
@@ -359,6 +384,7 @@ impl AgentKernelBuilder {
             max_transcript_chars: self.max_transcript_chars,
             compactor: self.compactor,
             hooks,
+            shutdown_token: self.shutdown_token,
         })
     }
 }

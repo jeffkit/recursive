@@ -473,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
                             file.messages().len()
                         )
                     })?;
+                    let shutdown = shutdown_signal();
                     run_resumed(
                         config,
                         seed.to_vec(),
@@ -486,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
                         external_pricing,
                         cli.hook_timing,
                         !cli.no_session,
+                        shutdown,
                     )
                     .await
                 }
@@ -501,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|msg| anyhow::anyhow!("{}", msg))?;
             let goal = session_file.goal.clone();
             let seed = session_file.into_transcript();
+            let shutdown = shutdown_signal();
             run_resumed(
                 config,
                 seed,
@@ -514,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
                 external_pricing,
                 cli.hook_timing,
                 !cli.no_session,
+                shutdown,
             )
             .await
         }
@@ -986,6 +990,7 @@ async fn build_runtime(
     hook_timing: bool,
     goal: Option<&str>,
     event_sink: Option<Arc<dyn EventSink>>,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<AgentRuntime> {
     let api_key = config.require_api_key()?;
     let provider_type = &config.provider_type;
@@ -1110,6 +1115,9 @@ async fn build_runtime(
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
     }
+    if let Some(token) = shutdown_token {
+        builder = builder.shutdown_token(token);
+    }
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
     }
@@ -1188,11 +1196,17 @@ fn print_usage(
 }
 
 fn print_finish_note(finish: &FinishReason) {
-    if let FinishReason::TranscriptLimit { chars, limit } = finish {
-        eprintln!(
-            "note: stopped because transcript reached {} chars (limit {})",
-            chars, limit
-        );
+    match finish {
+        FinishReason::TranscriptLimit { chars, limit } => {
+            eprintln!(
+                "note: stopped because transcript reached {} chars (limit {})",
+                chars, limit
+            );
+        }
+        FinishReason::Cancelled => {
+            eprintln!("shutdown: agent stopped at next step boundary after signal");
+        }
+        _ => {}
     }
 }
 
@@ -1250,6 +1264,11 @@ fn save_session(
 /// Return Err iff the finish reason should propagate as a non-zero binary
 /// exit code so that self-improve.sh's auto-resume gate fires. The
 /// transcript has already been saved by the caller before this is called.
+///
+/// `Cancelled` is intentionally **not** an error: shutdown via SIGINT
+/// or SIGTERM is user-initiated, the saved transcript is intact, and
+/// self-improve.sh must NOT auto-resume something the user explicitly
+/// stopped. The fall-through `_ => Ok(())` covers it.
 fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
     match finish {
         FinishReason::BudgetExceeded => {
@@ -1317,6 +1336,7 @@ async fn run_resumed(
     external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     session: bool,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
 
@@ -1365,6 +1385,7 @@ async fn run_resumed(
         hook_timing,
         Some(&goal),
         Some(Arc::new(sink)),
+        Some(shutdown.clone()),
     )
     .await?;
 
@@ -1501,7 +1522,8 @@ async fn run_loop(
         .tools(tools)
         .system_prompt(&config.system_prompt)
         .max_steps(config.max_steps)
-        .streaming(stream);
+        .streaming(stream)
+        .shutdown_token(shutdown.clone());
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
     }
@@ -1518,9 +1540,10 @@ async fn run_loop(
 
     let outcomes = runtime.run_loop(&goal, &wakeup_slot).await?;
 
-    if shutdown.is_cancelled() {
-        eprintln!("shutdown: received signal, loop exiting cleanly");
-    }
+    // Cancellation now reflected in each outcome's finish_reason
+    // (FinishReason::Cancelled). Historical `if shutdown.is_cancelled()`
+    // print here was redundant once g137 wired the token through.
+    let _ = &shutdown;
 
     if json_mode {
         let summary: Vec<_> = outcomes
@@ -1610,6 +1633,7 @@ async fn run_once(
         hook_timing,
         Some(&goal),
         Some(Arc::new(sink)),
+        Some(shutdown.clone()),
     )
     .await?;
 
@@ -1655,9 +1679,12 @@ async fn run_once(
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
 
-    if shutdown.is_cancelled() {
-        eprintln!("shutdown: received signal, exiting cleanly after completing step");
-    }
+    // Cancellation is now visible via outcome.finish_reason ==
+    // FinishReason::Cancelled; print_finish_note below renders it.
+    // The historical `if shutdown.is_cancelled() { eprintln!... }`
+    // here was redundant once g137 wired the token into the kernel.
+    let _ = &shutdown;
+
     printer.await.ok();
 
     if !json_mode {
@@ -1845,6 +1872,7 @@ async fn repl(
         plan_first,
         mcp_config,
         hook_timing,
+        None,
         None,
         None,
     )
@@ -2215,6 +2243,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
@@ -2227,6 +2256,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -2245,6 +2275,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
             None,
         )

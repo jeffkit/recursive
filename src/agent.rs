@@ -286,6 +286,10 @@ pub(crate) struct RunCore<'a> {
     pub(crate) total_llm_latency_ms: u64,
     pub(crate) plan_buffer: Option<Vec<ToolCall>>,
     pub(crate) plan_confirmed: bool,
+    /// Optional cancellation token. When cancelled, the step loop
+    /// terminates at the next step boundary with
+    /// [`FinishReason::Cancelled`].
+    pub(crate) shutdown_token: Option<CancellationToken>,
 }
 
 impl<'a> RunCore<'a> {
@@ -554,6 +558,44 @@ impl<'a> RunCore<'a> {
         for step in 1..=self.max_steps {
             let step_span = tracing::info_span!("agent.step", step);
             let _guard = step_span.enter();
+
+            // ---- shutdown cancellation -------------------------------------------
+            // Termination check, parallel to the BudgetExceeded /
+            // TranscriptLimit blocks below. If a CancellationToken was
+            // configured (via AgentRuntimeBuilder::shutdown_token / etc.)
+            // and it fired between steps, finish cleanly with
+            // FinishReason::Cancelled. Reports `step - 1` because the
+            // current step's LLM call has not been started yet — the
+            // last fully-completed step is the previous one.
+            if let Some(ref token) = self.shutdown_token {
+                if token.is_cancelled() {
+                    let finished_steps = step.saturating_sub(1);
+                    let finish = FinishReason::Cancelled;
+                    self.emit(StepEvent::Finished {
+                        reason: finish.clone(),
+                        steps: finished_steps,
+                    });
+                    tracing::info!(
+                        target: "recursive::agent",
+                        steps = finished_steps,
+                        tokens_in = total_usage.prompt_tokens,
+                        tokens_out = total_usage.completion_tokens,
+                        finish = ?finish,
+                        llm_latency_ms = self.total_llm_latency_ms,
+                        "agent.run.complete"
+                    );
+                    return Ok(RunInnerOutcome {
+                        messages: self.messages,
+                        final_message,
+                        finish_reason: finish,
+                        total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
+                        steps: finished_steps,
+                        plan_buffer: self.plan_buffer,
+                        plan_confirmed: self.plan_confirmed,
+                    });
+                }
+            }
 
             // ---- transcript budget ------------------------------------------------
             if let Some(limit) = self.max_transcript_chars {
@@ -1054,6 +1096,7 @@ impl Agent {
             total_llm_latency_ms: self.total_llm_latency_ms,
             plan_buffer: self.plan_buffer.take(),
             plan_confirmed: self.plan_confirmed,
+            shutdown_token: self.shutdown_token.clone(),
         };
 
         let inner = core.run_inner().await?;

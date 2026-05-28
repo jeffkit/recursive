@@ -463,6 +463,16 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set the cancellation token for graceful shutdown. When the token
+    /// is cancelled, the runtime's underlying kernel terminates the
+    /// step loop with
+    /// [`FinishReason::Cancelled`](crate::agent::FinishReason::Cancelled)
+    /// at the next step boundary.
+    pub fn shutdown_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.kernel_builder = self.kernel_builder.shutdown_token(token);
+        self
+    }
+
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.

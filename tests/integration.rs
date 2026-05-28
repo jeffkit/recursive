@@ -703,3 +703,255 @@ async fn tool_transport_explicit() {
         Some("transport test complete")
     );
 }
+
+// ============================================================================
+// Goal-137: Graceful shutdown — CancellationToken plumbed through
+// AgentRuntime → AgentKernel → RunCore. Verifies that
+// FinishReason::Cancelled is reachable, that the loop exits at the next
+// step boundary, and that absent token = no behavior change.
+// ============================================================================
+
+mod shutdown {
+    use recursive::agent::FinishReason;
+    use recursive::hooks::{Hook, HookAction, HookEvent};
+    use recursive::kernel::AgentKernel;
+    use recursive::llm::{Completion, MockProvider, ToolCall};
+    use recursive::runtime::AgentRuntimeBuilder;
+    use recursive::tools::ToolRegistry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    fn final_completion(text: &str) -> Completion {
+        Completion {
+            content: text.into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_call_completion(name: &str, args: serde_json::Value) -> Completion {
+        Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("c-{}", name),
+                name: name.into(),
+                arguments: args,
+            }],
+            finish_reason: None,
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn build_runtime_with_token(
+        provider: Arc<MockProvider>,
+        token: Option<CancellationToken>,
+    ) -> recursive::runtime::AgentRuntime {
+        let mut builder = AgentRuntimeBuilder::new()
+            .llm(provider)
+            .tools(ToolRegistry::local())
+            .system_prompt("you are a test agent")
+            .max_steps(20);
+        if let Some(t) = token {
+            builder = builder.shutdown_token(t);
+        }
+        builder.build().expect("runtime build")
+    }
+
+    /// Test A — token cancelled before any step starts → outcome is
+    /// FinishReason::Cancelled with steps == 0.
+    #[tokio::test]
+    async fn cancellation_before_first_step_returns_cancelled_at_step_zero() {
+        let provider = Arc::new(MockProvider::new(vec![final_completion("never reached")]));
+        let token = CancellationToken::new();
+        token.cancel(); // cancel BEFORE the run starts
+
+        let mut runtime = build_runtime_with_token(provider.clone(), Some(token));
+        let outcome = runtime.run("anything").await.expect("runtime.run");
+
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "expected Cancelled, got {:?}",
+            outcome.finish_reason
+        );
+        assert_eq!(outcome.steps, 0, "no steps should have completed");
+        assert_eq!(
+            provider.calls().len(),
+            0,
+            "MockProvider should not have been called"
+        );
+    }
+
+    /// Test B — cancellation observed after the first LLM call returns
+    /// a non-final completion. Loop exits with Cancelled at the next
+    /// step boundary; steps < total scripted completions.
+    ///
+    /// Uses multi-threaded runtime so the canceller task and the agent
+    /// task can make progress concurrently. The canceller registers its
+    /// `notified()` listener BEFORE we hand the runtime to `agent.run()`,
+    /// so the very first `notify_one()` in `MockProvider::complete()`
+    /// always wakes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_run_terminates_loop() {
+        // Script: 5 LLM responses. First 4 request `__noop__` with
+        // *distinct* args each time (otherwise anti-stuck detection in
+        // agent.rs:807 fires after 3 identical-key error results, which
+        // would mask FinishReason::Cancelled). 5th is a final response.
+        // We cancel after the 1st call.
+        let mut script = Vec::new();
+        for i in 0..4 {
+            script.push(tool_call_completion(
+                "__noop__",
+                serde_json::json!({ "tag": format!("call-{i}") }),
+            ));
+        }
+        script.push(final_completion("would-be-final"));
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(MockProvider::new(script).with_on_complete(notify.clone()));
+
+        let token = CancellationToken::new();
+
+        // Pre-register the listener BEFORE spawning the agent so we never
+        // miss the first notify_one(). `Notify::notified()` is permit-based
+        // — calling it later would still work for the first signal, but
+        // pre-registering removes any timing assumption.
+        let listener_started = Arc::new(tokio::sync::Notify::new());
+        let canceller = {
+            let token = token.clone();
+            let notify = notify.clone();
+            let listener_started = listener_started.clone();
+            tokio::spawn(async move {
+                let listener = notify.notified();
+                tokio::pin!(listener);
+                // Tell the test we're armed; runtime.run can start now.
+                listener_started.notify_one();
+                listener.await; // wait for first MockProvider::complete()
+                token.cancel();
+            })
+        };
+        // Wait until the canceller is parked on `notified()` before
+        // kicking off the agent — otherwise the first complete() can fire
+        // before we've registered, dropping the permit on the floor.
+        listener_started.notified().await;
+
+        let mut runtime = build_runtime_with_token(provider.clone(), Some(token));
+        let outcome = runtime.run("kick off").await.expect("runtime.run");
+        canceller.await.ok();
+
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "expected Cancelled, got {:?}",
+            outcome.finish_reason
+        );
+        // At least one LLM call happened (we waited on the notify);
+        // strictly fewer than the full script ran.
+        assert!(
+            !provider.calls().is_empty(),
+            "expected at least one LLM call before cancellation"
+        );
+        assert!(
+            provider.calls().len() < 5,
+            "expected fewer than the scripted 5 calls; got {}",
+            provider.calls().len()
+        );
+    }
+
+    /// Test C — without a token, the loop runs to natural completion;
+    /// guards against the cancellation check becoming unconditional.
+    #[tokio::test]
+    async fn no_token_means_no_cancellation_check() {
+        let provider = Arc::new(MockProvider::new(vec![final_completion("done")]));
+        let mut runtime = build_runtime_with_token(provider, None);
+        let outcome = runtime.run("hi").await.expect("runtime.run");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls),
+            "expected NoMoreToolCalls, got {:?}",
+            outcome.finish_reason
+        );
+    }
+
+    /// Test D — `with_tools` propagates the shutdown token to the cloned
+    /// kernel (multi-agent sub-agent semantics).
+    #[tokio::test]
+    async fn kernel_with_tools_propagates_shutdown_token() {
+        let provider = Arc::new(MockProvider::new(vec![final_completion("ok")]));
+        let token = CancellationToken::new();
+        let kernel = AgentKernel::builder()
+            .llm(provider)
+            .tools(ToolRegistry::local())
+            .max_steps(5)
+            .shutdown_token(token.clone())
+            .build()
+            .expect("kernel build");
+
+        let cloned = kernel.with_tools(ToolRegistry::local());
+
+        // Cancel via the original token.
+        token.cancel();
+
+        // The cloned kernel's shutdown_token must observe the cancellation
+        // (proves it shares the same Arc-backed handle).
+        assert!(
+            cloned
+                .shutdown_token()
+                .map(|t| t.is_cancelled())
+                .unwrap_or(false),
+            "cloned kernel should see cancellation through propagated token"
+        );
+    }
+
+    /// Test E — Cancelled does NOT dispatch SessionEnd hooks.
+    /// (Existing agent.rs gating intentionally lists only NoMoreToolCalls
+    /// / Stuck / BudgetExceeded; cancellation is user-initiated and
+    /// callers may not want hook side-effects on it.)
+    ///
+    /// NOTE: this test exercises hook dispatch via the deprecated `Agent`
+    /// path because that is where SessionEnd dispatch lives. The kernel
+    /// path (via AgentRuntime/AgentKernel) does not currently dispatch
+    /// SessionEnd at all (also a pre-existing gap, out of g137 scope).
+    /// What we assert here: when the legacy `Agent::run` path returns
+    /// with FinishReason::Cancelled, no SessionEnd hook fires.
+    #[tokio::test]
+    async fn cancelled_does_not_dispatch_session_end_hook() {
+        struct CountingHook {
+            session_end_count: AtomicUsize,
+        }
+        impl Hook for CountingHook {
+            fn on_event(&self, event: HookEvent) -> HookAction {
+                if matches!(event, HookEvent::SessionEnd { .. }) {
+                    self.session_end_count.fetch_add(1, Ordering::Relaxed);
+                }
+                HookAction::Continue
+            }
+        }
+
+        let counter = Arc::new(CountingHook {
+            session_end_count: AtomicUsize::new(0),
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![final_completion("never")]));
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let mut agent = recursive::Agent::builder()
+            .llm(provider)
+            .tools(ToolRegistry::local())
+            .system_prompt("test")
+            .hook(counter.clone())
+            .shutdown_token(token)
+            .build()
+            .expect("agent build");
+
+        let outcome = agent.run("ignored").await.expect("run");
+        assert!(matches!(outcome.finish, FinishReason::Cancelled));
+        assert_eq!(
+            counter.session_end_count.load(Ordering::Relaxed),
+            0,
+            "SessionEnd must not fire on Cancelled"
+        );
+    }
+}
