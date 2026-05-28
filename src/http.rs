@@ -82,6 +82,121 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// ── Authentication (API keys) ──────────────────────────────────────────────
+
+/// API key authentication for the HTTP server.
+///
+/// Configured from `RECURSIVE_HTTP_AUTH_KEYS`, a comma-separated list of
+/// keys the server will accept in the `X-API-Key` request header. An empty
+/// key set (the default) disables auth entirely — every route is reachable
+/// without credentials. This preserves zero-config behavior and keeps the
+/// public default backward-compatible.
+///
+/// Distinct from `RECURSIVE_API_KEY` (singular): that variable holds the
+/// **outbound** credential the agent uses to talk to its LLM provider.
+/// `RECURSIVE_HTTP_AUTH_KEYS` (plural) holds the **inbound** credentials
+/// the HTTP server accepts from clients. The names are deliberately
+/// dissimilar to avoid confusion at the operator's shell.
+///
+/// `/health` and `/metrics` are always exempt (k8s liveness probes and
+/// Prometheus scrapers must work unauthenticated).
+#[derive(Clone, Default)]
+pub struct AuthConfig {
+    keys: Arc<Vec<String>>,
+}
+
+impl AuthConfig {
+    /// Build an `AuthConfig` from an explicit key list. Pass an empty
+    /// vec to disable auth.
+    pub fn new(keys: Vec<String>) -> Self {
+        Self {
+            keys: Arc::new(keys),
+        }
+    }
+
+    /// Constant-time check whether `presented` is in the configured set.
+    ///
+    /// Returns `true` if auth is disabled (empty key set). Endpoints
+    /// must rely on the middleware layering, not this method, for the
+    /// "auth disabled" semantics — see [`auth_middleware`].
+    ///
+    /// The loop runs over **every** configured key regardless of an
+    /// early match, to keep the comparison constant-time and avoid
+    /// leaking key-set membership timing.
+    pub fn is_valid(&self, presented: &str) -> bool {
+        if self.keys.is_empty() {
+            return true;
+        }
+        let mut found = false;
+        let presented_bytes = presented.as_bytes();
+        for k in self.keys.iter() {
+            let k_bytes = k.as_bytes();
+            if k_bytes.len() != presented_bytes.len() {
+                continue;
+            }
+            let mut diff: u8 = 0;
+            for (a, b) in k_bytes.iter().zip(presented_bytes.iter()) {
+                diff |= a ^ b;
+            }
+            if diff == 0 {
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// Whether auth is enabled (non-empty key set).
+    pub fn is_enabled(&self) -> bool {
+        !self.keys.is_empty()
+    }
+}
+
+/// Build `AuthConfig` from the `RECURSIVE_HTTP_AUTH_KEYS` env var
+/// (comma-separated). Returns the default (empty / disabled) if the
+/// variable is unset, empty, or contains only whitespace.
+fn auth_config_from_env() -> AuthConfig {
+    let raw = std::env::var("RECURSIVE_HTTP_AUTH_KEYS").unwrap_or_default();
+    let keys: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    AuthConfig::new(keys)
+}
+
+/// Axum middleware: enforce API key auth on requests.
+///
+/// Layered after the router so that all routes pass through it, but
+/// `/health` and `/metrics` are explicitly exempted to keep liveness
+/// probes and metrics scraping reachable without credentials.
+///
+/// When auth is disabled (empty key set), the middleware is a no-op
+/// pass-through — preserving back-compat zero-config behavior.
+async fn auth_middleware(
+    State(auth): State<AuthConfig>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !auth.is_enabled() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path();
+    if path == "/health" || path == "/metrics" {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if presented.is_empty() || !auth.is_valid(presented) {
+        let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
+        *resp.status_mut() = StatusCode::UNAUTHORIZED;
+        return resp;
+    }
+    next.run(req).await
+}
+
 /// Token-bucket rate limiter keyed by client identifier (API key or remote IP).
 #[derive(Clone)]
 pub struct RateLimiter {
@@ -353,7 +468,19 @@ pub struct ErrorResponse {
 /// - `DELETE /sessions/:id` — remove a session
 /// - `GET /sessions/:id/events` — SSE stream of agent events for a session
 /// - `GET /openapi.json` — returns the OpenAPI 3.0.3 specification
+///
+/// Auth is sourced from the `RECURSIVE_HTTP_AUTH_KEYS` env var. For tests
+/// that need a deterministic auth state (no env-var races across parallel
+/// test threads), use [`build_router_with_auth`] instead.
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_auth(state, auth_config_from_env())
+}
+
+/// Build the HTTP router with an explicit `AuthConfig`.
+///
+/// Tests use this to inject a known auth state without touching
+/// process-global env vars. Production code paths use [`build_router`].
+pub fn build_router_with_auth(state: AppState, auth: AuthConfig) -> Router {
     let limiter = rate_limiter_from_env();
 
     Router::new()
@@ -376,6 +503,7 @@ pub fn build_router(state: AppState) -> Router {
             limiter,
             rate_limit_middleware,
         ))
+        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .with_state(Arc::new(state))
 }
 

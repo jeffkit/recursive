@@ -5,7 +5,10 @@ mod http_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use recursive::config::Config;
-    use recursive::http::{build_router, map_agent_event, AppState, Metrics, SseEvent, ToolInfo};
+    use recursive::http::{
+        build_router, build_router_with_auth, map_agent_event, AppState, AuthConfig, Metrics,
+        SseEvent, ToolInfo,
+    };
     use recursive::llm::{Completion, MockProvider};
     use recursive::tools::ToolRegistry;
     use std::collections::HashMap;
@@ -1173,5 +1176,130 @@ mod http_tests {
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("recursive_agent_runs_total 7"));
         assert!(text.contains("recursive_tokens_prompt_total 12345"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Auth middleware (Goal 135) — API key authentication via X-API-Key.
+    // Tests use build_router_with_auth() to inject a deterministic AuthConfig
+    // and avoid env-var races (parallel cargo test threads share process env).
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn auth_disabled_passes_through() {
+        // AuthConfig::default() == empty key set == auth disabled.
+        let app = build_router_with_auth(sample_state(), AuthConfig::default());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_missing_header() {
+        let app = build_router_with_auth(sample_state(), AuthConfig::new(vec!["secret".into()]));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 401);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"unauthorized");
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_accepts_valid_key() {
+        let app = build_router_with_auth(sample_state(), AuthConfig::new(vec!["secret".into()]));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("X-API-Key", "secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_wrong_key() {
+        let app = build_router_with_auth(sample_state(), AuthConfig::new(vec!["secret".into()]));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("X-API-Key", "bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn auth_health_and_metrics_are_exempt() {
+        // Even with auth enabled, /health and /metrics must answer
+        // unauthenticated (k8s liveness + Prometheus scraping).
+        let auth = AuthConfig::new(vec!["secret".into()]);
+        let app = build_router_with_auth(sample_state(), auth);
+
+        for uri in ["/health", "/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                200,
+                "expected {uri} to be exempt from auth"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_config_is_valid_unit() {
+        // Empty config: any input (including empty string) returns true.
+        let empty = AuthConfig::default();
+        assert!(empty.is_valid(""));
+        assert!(empty.is_valid("anything"));
+        assert!(!empty.is_enabled());
+
+        // Populated config:
+        let cfg = AuthConfig::new(vec!["alpha".into(), "beta".into()]);
+        assert!(cfg.is_enabled());
+        assert!(cfg.is_valid("alpha"));
+        assert!(cfg.is_valid("beta"));
+        assert!(!cfg.is_valid("alphA")); // wrong case
+        assert!(!cfg.is_valid("alph")); // length-1 short
+        assert!(!cfg.is_valid("alphax")); // length+1 long
+        assert!(!cfg.is_valid("")); // empty rejected
+        assert!(!cfg.is_valid("gamma")); // unrelated
     }
 }
