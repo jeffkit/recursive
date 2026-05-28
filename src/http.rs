@@ -103,21 +103,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Default)]
 pub struct AuthConfig {
     keys: Arc<Vec<String>>,
+    jwt: Option<JwtConfig>,
 }
 
 impl AuthConfig {
     /// Build an `AuthConfig` from an explicit key list. Pass an empty
-    /// vec to disable auth.
+    /// vec to disable API-key auth (a JWT verifier may still be
+    /// attached via [`AuthConfig::with_jwt`]).
     pub fn new(keys: Vec<String>) -> Self {
         Self {
             keys: Arc::new(keys),
+            jwt: None,
         }
     }
 
-    /// Constant-time check whether `presented` is in the configured set.
+    /// Attach a JWT verifier. Call after [`AuthConfig::new`] to get
+    /// "X-API-Key OR Bearer JWT" semantics — either valid credential
+    /// type lets a request through. Without this call the behavior
+    /// is X-API-Key-only (the original g135 behavior).
+    pub fn with_jwt(mut self, jwt: JwtConfig) -> Self {
+        self.jwt = Some(jwt);
+        self
+    }
+
+    /// Constant-time check whether `presented` is in the configured
+    /// API-key set.
     ///
-    /// Returns `true` if auth is disabled (empty key set). Endpoints
-    /// must rely on the middleware layering, not this method, for the
+    /// Returns `true` if no API keys are configured. Endpoints must
+    /// rely on the middleware layering, not this method, for the
     /// "auth disabled" semantics — see [`auth_middleware`].
     ///
     /// The loop runs over **every** configured key regardless of an
@@ -145,15 +158,75 @@ impl AuthConfig {
         found
     }
 
-    /// Whether auth is enabled (non-empty key set).
+    /// Whether ANY auth modality is enabled — non-empty API key set
+    /// OR a JWT verifier attached. When this returns `false`, the
+    /// middleware is a pass-through.
     pub fn is_enabled(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.is_empty() || self.jwt.is_some()
     }
 }
 
-/// Build `AuthConfig` from the `RECURSIVE_HTTP_AUTH_KEYS` env var
-/// (comma-separated). Returns the default (empty / disabled) if the
-/// variable is unset, empty, or contains only whitespace.
+/// JWT bearer token verification config.
+///
+/// Verify-only: this server validates tokens minted elsewhere; it does
+/// not issue them. HS256 (HMAC-SHA256 with a shared secret) is the
+/// only supported algorithm in this revision — keeps secret management
+/// simple (one env var). RSA/ECDSA can be added later if a deployment
+/// needs JWKS-driven key rotation.
+///
+/// Configured from:
+/// - `RECURSIVE_HTTP_AUTH_JWT_SECRET` — HMAC secret bytes (UTF-8). Empty
+///   or unset disables JWT auth.
+/// - `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` — optional `aud` claim that
+///   tokens must contain. Unset = audience claim ignored (still valid
+///   JWT spec, just less strict).
+///
+/// `exp` claim is always required (RFC 7519 says optional; we make it
+/// mandatory to prevent unbounded-validity tokens).
+#[derive(Clone)]
+pub struct JwtConfig {
+    decoding_key: jsonwebtoken::DecodingKey,
+    validation: jsonwebtoken::Validation,
+}
+
+impl JwtConfig {
+    /// Build an HS256 verifier. Returns `None` if `secret` is empty
+    /// (parallels `AuthConfig`'s "empty = disabled" pattern).
+    ///
+    /// `audience` is optional: `Some("my-app")` requires tokens carry
+    /// `"aud": "my-app"`; `None` skips audience checking entirely.
+    pub fn hs256(secret: &str, audience: Option<String>) -> Option<Self> {
+        if secret.is_empty() {
+            return None;
+        }
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.set_required_spec_claims(&["exp"]);
+        if let Some(aud) = audience {
+            validation.set_audience(&[aud]);
+        } else {
+            validation.validate_aud = false;
+        }
+        Some(Self {
+            decoding_key: jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            validation,
+        })
+    }
+
+    /// Verify a token. Returns true iff signature, exp, and (when
+    /// configured) audience all check out.
+    pub fn is_valid(&self, token: &str) -> bool {
+        jsonwebtoken::decode::<serde_json::Value>(token, &self.decoding_key, &self.validation)
+            .is_ok()
+    }
+}
+
+/// Build `AuthConfig` from env vars:
+///
+/// - `RECURSIVE_HTTP_AUTH_KEYS` — comma-separated API keys (g135).
+/// - `RECURSIVE_HTTP_AUTH_JWT_SECRET` — HMAC secret for JWT (g136).
+/// - `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` — optional `aud` claim.
+///
+/// All unset = auth disabled (back-compat zero-config default).
 fn auth_config_from_env() -> AuthConfig {
     let raw = std::env::var("RECURSIVE_HTTP_AUTH_KEYS").unwrap_or_default();
     let keys: Vec<String> = raw
@@ -161,17 +234,30 @@ fn auth_config_from_env() -> AuthConfig {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    AuthConfig::new(keys)
+    let mut config = AuthConfig::new(keys);
+    let jwt_secret = std::env::var("RECURSIVE_HTTP_AUTH_JWT_SECRET").unwrap_or_default();
+    let jwt_audience = std::env::var("RECURSIVE_HTTP_AUTH_JWT_AUDIENCE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(jwt) = JwtConfig::hs256(&jwt_secret, jwt_audience) {
+        config = config.with_jwt(jwt);
+    }
+    config
 }
 
-/// Axum middleware: enforce API key auth on requests.
+/// Axum middleware: enforce auth on requests.
+///
+/// Tries `X-API-Key` first (cheap); falls back to
+/// `Authorization: Bearer <jwt>`. Either valid credential lets the
+/// request through.
 ///
 /// Layered after the router so that all routes pass through it, but
 /// `/health` and `/metrics` are explicitly exempted to keep liveness
 /// probes and metrics scraping reachable without credentials.
 ///
-/// When auth is disabled (empty key set), the middleware is a no-op
-/// pass-through — preserving back-compat zero-config behavior.
+/// When auth is disabled (no API keys AND no JWT verifier
+/// configured), the middleware is a no-op pass-through — preserving
+/// back-compat zero-config behavior.
 async fn auth_middleware(
     State(auth): State<AuthConfig>,
     req: axum::extract::Request,
@@ -184,17 +270,31 @@ async fn auth_middleware(
     if path == "/health" || path == "/metrics" {
         return next.run(req).await;
     }
-    let presented = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if presented.is_empty() || !auth.is_valid(presented) {
-        let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
-        *resp.status_mut() = StatusCode::UNAUTHORIZED;
-        return resp;
+    // Try X-API-Key first (cheaper than JWT verify).
+    if !auth.keys.is_empty() {
+        if let Some(presented) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+            if auth.is_valid(presented) {
+                return next.run(req).await;
+            }
+        }
     }
-    next.run(req).await
+    // Then try Authorization: Bearer <jwt>.
+    if let Some(ref jwt) = auth.jwt {
+        if let Some(authz) = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(token) = authz.strip_prefix("Bearer ") {
+                if jwt.is_valid(token) {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+    let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp
 }
 
 /// Token-bucket rate limiter keyed by client identifier (API key or remote IP).

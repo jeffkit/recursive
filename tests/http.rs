@@ -7,7 +7,7 @@ mod http_tests {
     use recursive::config::Config;
     use recursive::http::{
         build_router, build_router_with_auth, build_router_with_auth_and_rate_limit,
-        map_agent_event, AppState, AuthConfig, Metrics, RateLimiter, SseEvent, ToolInfo,
+        map_agent_event, AppState, AuthConfig, JwtConfig, Metrics, RateLimiter, SseEvent, ToolInfo,
     };
     use recursive::llm::{Completion, MockProvider};
     use recursive::tools::ToolRegistry;
@@ -1414,6 +1414,245 @@ mod http_tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), 200, "request #{} should pass", i + 1);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // JWT bearer token auth (Goal 136). Verify-only — these tests mint
+    // tokens at runtime using the same jsonwebtoken crate the server
+    // uses to verify them. AuthConfig::with_jwt attaches a JwtConfig
+    // alongside (or instead of) API keys; auth_middleware accepts
+    // either credential type.
+    // ------------------------------------------------------------------------
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn mint_token(secret: &str, exp_offset_secs: i64, audience: Option<&str>) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let exp = (now_secs() as i64) + exp_offset_secs;
+        let mut claims = serde_json::json!({ "exp": exp, "sub": "test-user" });
+        if let Some(aud) = audience {
+            claims["aud"] = serde_json::Value::String(aud.into());
+        }
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("mint jwt")
+    }
+
+    fn router_with_jwt_only(secret: &str, audience: Option<&str>) -> axum::Router {
+        let jwt = JwtConfig::hs256(secret, audience.map(|s| s.to_string())).unwrap();
+        let auth = AuthConfig::new(Vec::new()).with_jwt(jwt);
+        build_router_with_auth(sample_state(), auth)
+    }
+
+    #[tokio::test]
+    async fn jwt_disabled_legacy_keys_only() {
+        // No JWT verifier configured — bearer header is meaningless;
+        // only X-API-Key works.
+        let auth = AuthConfig::new(vec!["legacy-key".into()]);
+        let app = build_router_with_auth(sample_state(), auth);
+
+        // Bearer token in header is rejected — JWT not enabled.
+        let token = mint_token("any-secret", 60, None);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+
+        // X-API-Key still works.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("X-API-Key", "legacy-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn jwt_valid_token_accepted() {
+        let secret = "test-secret-12345";
+        let app = router_with_jwt_only(secret, None);
+
+        let token = mint_token(secret, 60, None);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn jwt_expired_token_rejected() {
+        let secret = "test-secret-12345";
+        let app = router_with_jwt_only(secret, None);
+
+        // 5 minutes in the past — well outside jsonwebtoken's default
+        // 60-second clock-skew leeway.
+        let token = mint_token(secret, -300, None);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn jwt_wrong_signature_rejected() {
+        let app = router_with_jwt_only("server-secret", None);
+        // Token minted with a different secret
+        let token = mint_token("attacker-secret", 60, None);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn jwt_audience_mismatch_rejected() {
+        let secret = "test-secret-12345";
+        let app = router_with_jwt_only(secret, Some("expected-aud"));
+        // Token has aud="other"
+        let token = mint_token(secret, 60, Some("other-aud"));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn jwt_audience_match_accepted() {
+        let secret = "test-secret-12345";
+        let app = router_with_jwt_only(secret, Some("expected-aud"));
+        let token = mint_token(secret, 60, Some("expected-aud"));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn jwt_or_api_key_either_works() {
+        let secret = "test-secret-12345";
+        let jwt = JwtConfig::hs256(secret, None).unwrap();
+        let auth = AuthConfig::new(vec!["legacy-key".into()]).with_jwt(jwt);
+        let app = build_router_with_auth(sample_state(), auth);
+
+        // No credentials → 401
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+
+        // Valid X-API-Key → 200
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("X-API-Key", "legacy-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Valid JWT → 200
+        let token = mint_token(secret, 60, None);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn jwt_health_metrics_remain_exempt() {
+        let app = router_with_jwt_only("test-secret-12345", None);
+
+        for uri in ["/health", "/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                200,
+                "{uri} should be exempt from JWT auth"
+            );
         }
     }
 }
