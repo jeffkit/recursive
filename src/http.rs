@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::llm::LlmProvider;
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
+use crate::tools::ToolRegistry;
 
 // ── Rate limiter ───────────────────────────────────────────────────────────
 
@@ -287,6 +288,10 @@ pub enum SseEvent {
 #[derive(Clone)]
 pub struct AppState {
     pub tools: Vec<ToolInfo>,
+    /// Live tool registry used to construct per-request and per-session
+    /// AgentRuntimes. Without this, runtimes get an empty registry and
+    /// every tool_call from the LLM resolves to "tool not found".
+    pub tool_registry: ToolRegistry,
     pub config: Config,
     pub provider: Arc<dyn LlmProvider>,
     /// Session state keyed by session ID.
@@ -756,6 +761,7 @@ async fn run_agent(
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
+        .tools(state.tool_registry.clone())
         .system_prompt(system_prompt)
         .max_steps(max_steps)
         .build()
@@ -912,6 +918,7 @@ async fn create_session(
 
     let runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
+        .tools(state.tool_registry.clone())
         .system_prompt(system_prompt)
         .max_steps(state.config.max_steps)
         .build()

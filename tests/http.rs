@@ -7,6 +7,7 @@ mod http_tests {
     use recursive::config::Config;
     use recursive::http::{build_router, map_agent_event, AppState, Metrics, SseEvent, ToolInfo};
     use recursive::llm::{Completion, MockProvider};
+    use recursive::tools::ToolRegistry;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -66,6 +67,7 @@ mod http_tests {
                 },
             ],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -77,6 +79,7 @@ mod http_tests {
         AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -152,6 +155,7 @@ mod http_tests {
         let app = build_router(AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -195,6 +199,7 @@ mod http_tests {
         let state = AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -241,6 +246,7 @@ mod http_tests {
         let state = AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -293,6 +299,7 @@ mod http_tests {
         let state = AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -357,6 +364,7 @@ mod http_tests {
         let state = AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -428,6 +436,7 @@ mod http_tests {
         let state = AppState {
             tools: vec![],
             config: mock_config(),
+            tool_registry: ToolRegistry::local(),
             provider,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),

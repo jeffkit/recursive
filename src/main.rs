@@ -367,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let state = recursive::http::AppState {
                 tools: tool_infos,
+                tool_registry: tools,
                 config: config.clone(),
                 provider,
                 sessions: std::sync::Arc::new(tokio::sync::RwLock::new(

@@ -9,6 +9,7 @@ mod v050_integration {
     use recursive::http::{build_router, AppState, Metrics, ToolInfo};
     use recursive::llm::{mock::MockProvider, Completion};
     use recursive::multi::{default_roles, AgentPool, AgentRole, Pipeline};
+    use recursive::tools::ToolRegistry;
     use recursive::{Config, LlmProvider};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -51,6 +52,7 @@ mod v050_integration {
                 parameters: serde_json::json!({}),
             }],
             config: test_config(),
+            tool_registry: ToolRegistry::local(),
             provider: mock_provider(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
