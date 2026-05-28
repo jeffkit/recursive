@@ -13,9 +13,12 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::agent::{Agent, FinishReason, PermissionHook};
+use crate::agent::{FinishReason, PermissionHook, PlanningMode};
 use crate::error::{Error, Result};
+use crate::event::NullSink;
+use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
+use crate::message::Message;
 use crate::tools::{Tool, ToolRegistry};
 
 /// The sub-agent tool.
@@ -148,27 +151,35 @@ impl Tool for SubAgent {
         );
         sub_registry = sub_registry.register(Arc::new(child_sub));
 
-        // Build and run the sub-agent
-        let builder = Agent::builder()
+        // Build and run the sub-agent using AgentKernel (stateless, single-turn)
+        let kernel = AgentKernel::builder()
             .llm(self.provider.clone())
             .tools(sub_registry)
-            .system_prompt("You are a focused sub-agent. Complete the given task using the available tools. Be concise.")
-            .max_steps(max_steps);
+            .max_steps(max_steps)
+            .build()
+            .map_err(|e| Error::Tool {
+                name: "sub_agent".into(),
+                message: format!("failed to build sub-agent kernel: {e}"),
+            })?;
 
-        // Inherit the parent's permission hook, if any
-        let builder = builder.permission_hook_opt(self.permission_hook.clone());
+        let ctx = TurnContext {
+            messages: vec![
+                Message::system("You are a focused sub-agent. Complete the given task using the available tools. Be concise.".to_string()),
+                Message::user(prompt.to_string()),
+            ],
+            event_sink: Box::new(NullSink),
+            tool_specs: kernel.tools().specs(),
+            streaming: false,
+            permission_hook: self.permission_hook.clone(),
+            planning_mode: PlanningMode::default(),
+        };
 
-        let mut agent = builder.build().map_err(|e| Error::Tool {
-            name: "sub_agent".into(),
-            message: format!("failed to build sub-agent: {e}"),
-        })?;
-
-        let outcome = agent.run(prompt).await.map_err(|e| Error::Tool {
+        let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
             name: "sub_agent".into(),
             message: format!("sub-agent failed: {e}"),
         })?;
 
-        let finish_label = match &outcome.finish {
+        let finish_label = match &outcome.finish_reason {
             FinishReason::NoMoreToolCalls => "NoMoreToolCalls",
             FinishReason::BudgetExceeded => "BudgetExceeded",
             FinishReason::ProviderStop(r) => r,
@@ -178,7 +189,7 @@ impl Tool for SubAgent {
         };
 
         let final_text = outcome
-            .final_message
+            .final_text
             .unwrap_or_else(|| "(no final message)".to_string());
 
         Ok(format!(
