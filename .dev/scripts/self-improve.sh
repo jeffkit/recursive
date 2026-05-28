@@ -306,6 +306,18 @@ if [[ "$AGENT_STATUS" -ne 0 ]] \
       --resume-from "$RESUME_FROM" "$GOAL_BODY" 2>&1 | tee -a "$LOG"
     AGENT_STATUS=${PIPESTATUS[0]}
     set -e
+
+    # After auto-resume: if cargo test passes AND there are src changes,
+    # treat as success regardless of agent exit code. The agent may exit
+    # non-zero (BudgetExceeded again, or ProviderStop) but the code it
+    # produced before that is still valuable.
+    if [[ "$AGENT_STATUS" -ne 0 ]] && git diff --quiet HEAD -- src/ 2>/dev/null; then
+      : # No src changes — nothing to save, let normal failure path handle it
+    elif [[ "$AGENT_STATUS" -ne 0 ]] && cargo test --quiet >/dev/null 2>&1; then
+      echo ""
+      echo "--- AUTO-RESUME: agent exited non-zero but cargo test passes; treating as success ---"
+      AGENT_STATUS=0
+    fi
   fi
 fi
 
