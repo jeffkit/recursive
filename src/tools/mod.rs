@@ -11,6 +11,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::permissions::{Permission, PermissionsConfig};
 
 pub mod apply_patch;
 pub mod episodic_recall;
@@ -74,6 +75,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     transport: Arc<dyn ToolTransport>,
+    permissions: Option<PermissionsConfig>,
 }
 
 impl ToolRegistry {
@@ -81,6 +83,7 @@ impl ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             transport,
+            permissions: None,
         }
     }
 
@@ -99,7 +102,14 @@ impl ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             transport: self.transport.clone(),
+            permissions: self.permissions.clone(),
         }
+    }
+
+    /// Set the permissions configuration for this registry.
+    pub fn with_permissions(mut self, permissions: PermissionsConfig) -> Self {
+        self.permissions = Some(permissions);
+        self
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
@@ -135,6 +145,16 @@ impl ToolRegistry {
     }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
+        // Static permission check before any tool execution
+        if let Some(ref config) = self.permissions {
+            match config.check_static(name) {
+                Permission::Denied(_reason) => {
+                    return Err(Error::PermissionDenied { name: name.into() });
+                }
+                Permission::Allowed => {}
+            }
+        }
+
         let args_size = arguments.to_string().len();
         let span = tracing::info_span!("tool.execute", name = %name, args_size);
         async move {
@@ -213,6 +233,7 @@ fn normalise(p: &std::path::Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use crate::permissions::PermissionsConfig;
 
     struct Echo;
 
@@ -257,5 +278,22 @@ mod tests {
         let resolved = resolve_within(std::path::Path::new("."), "src/lib.rs").unwrap();
         assert!(resolved.starts_with(&cwd));
         assert!(resolved.ends_with("src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_permission_deny_blocks_invoke() {
+        let config = PermissionsConfig {
+            allow: vec!["echo".into()],
+            deny: vec!["echo".into()],
+            interactive: vec![],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .register(Arc::new(Echo));
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg":"hi"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PermissionDenied { .. }));
     }
 }

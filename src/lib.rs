@@ -17,6 +17,7 @@ pub mod cost;
 pub mod error;
 pub mod event;
 pub mod hooks;
+pub mod permissions;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod kernel;
