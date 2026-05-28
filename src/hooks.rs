@@ -120,7 +120,7 @@ pub trait Hook: Send + Sync {
 /// hook returns `HookAction::Skip` or `HookAction::Error` from a `PreToolCall`
 /// event, the first non-`Continue` action is returned and remaining hooks
 /// are not called for that event.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct HookRegistry {
     hooks: Vec<Arc<dyn Hook>>,
 }
