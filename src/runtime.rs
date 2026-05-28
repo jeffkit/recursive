@@ -20,16 +20,18 @@
 //! println!("{}", outcome.final_text.unwrap_or_default());
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::checkpoint::{CheckpointId, ShadowRepo};
+use crate::checkpoint_log::{CheckpointLogWriter, CheckpointRecord, TouchedVia};
 use crate::error::Result;
 use crate::event::{EventSink, NullSink};
 use crate::hooks::HookRegistry;
 use crate::kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 use crate::llm::{LlmProvider, TokenUsage};
 use crate::message::Message;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, TouchedFiles};
 use crate::Compactor;
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -53,6 +55,9 @@ pub struct RuntimeOutcome {
     pub steps: usize,
     /// Measured LLM latency for this turn (milliseconds).
     pub llm_latency_ms: u64,
+    /// Checkpoint id captured at the end of this turn (if checkpointing
+    /// is enabled and the runtime is bound to a session).
+    pub checkpoint_id: Option<CheckpointId>,
 }
 
 impl From<TurnOutcome> for RuntimeOutcome {
@@ -63,6 +68,7 @@ impl From<TurnOutcome> for RuntimeOutcome {
             total_usage: t.usage,
             steps: t.steps,
             llm_latency_ms: t.llm_latency_ms,
+            checkpoint_id: None,
         }
     }
 }
@@ -96,6 +102,21 @@ pub struct AgentRuntime {
     planning_mode: PlanningMode,
     /// Optional compactor for cross-turn transcript summarization.
     compactor: Option<Compactor>,
+    /// Shadow git repo for per-turn workspace snapshots. `None` if
+    /// checkpoints are disabled (e.g. git unavailable, or the caller
+    /// chose not to wire it up).
+    shadow: Option<Arc<ShadowRepo>>,
+    /// Session id used as the checkpoint chain ref. Required for
+    /// checkpoints; without it `shadow` is ignored.
+    session_id: Option<String>,
+    /// 0-indexed turn counter, used to label checkpoint records.
+    turn_index: usize,
+    /// Append-only writer for `checkpoints.jsonl`.
+    checkpoint_writer: Option<CheckpointLogWriter>,
+    /// Touched-files collector shared with the tool registry. One
+    /// instance lives for the runtime's lifetime; it's cleared at
+    /// the start of every turn.
+    touched_files: Option<Arc<Mutex<TouchedFiles>>>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -126,8 +147,21 @@ impl AgentRuntime {
     /// [`TurnContext`], delegates to the kernel, appends the kernel's
     /// new messages to the transcript, and returns a [`RuntimeOutcome`].
     pub async fn run(&mut self, user_text: impl Into<String>) -> Result<RuntimeOutcome> {
+        let user_text = user_text.into();
+
+        // ── Checkpoint: pre-turn snapshot ──────────────────────────────
+        let started_at = unix_now();
+        let pre_id = self.snapshot_pre_turn(&user_text);
+        // Reset touched-files collector for this turn (after pre-snapshot
+        // so any stale state from prior turn is cleared).
+        if let Some(slot) = &self.touched_files {
+            if let Ok(mut t) = slot.lock() {
+                *t = TouchedFiles::new();
+            }
+        }
+
         // Append user message
-        self.transcript.push(Message::user(user_text.into()));
+        self.transcript.push(Message::user(user_text.clone()));
 
         // Cross-turn compaction: summarize old messages if transcript is too large.
         // This is the Wrapper's responsibility — the kernel only does intra-turn trim.
@@ -197,7 +231,15 @@ impl AgentRuntime {
         // Append new messages to transcript
         self.transcript.extend(turn_outcome.new_messages.clone());
 
-        Ok(turn_outcome.into())
+        // ── Checkpoint: post-turn snapshot + record ────────────────────
+        let mut outcome: RuntimeOutcome = turn_outcome.into();
+        let post_id = self.snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
+        outcome.checkpoint_id = post_id;
+
+        // Advance turn counter only if we actually ran a turn (we did).
+        self.turn_index += 1;
+
+        Ok(outcome)
     }
 
     /// Return a reference to the accumulated transcript.
@@ -321,6 +363,157 @@ impl AgentRuntime {
             break;
         }
         Ok(outcomes)
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Checkpoint helpers
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Bind this runtime to a checkpoint chain. Subsequent calls to
+    /// `run()` will snapshot before and after each turn under
+    /// `refs/sessions/<session_id>/HEAD` and append a record to
+    /// `checkpoint_log_path` (a `checkpoints.jsonl` file).
+    ///
+    /// `touched_slot` is the same collector previously installed on
+    /// the [`ToolRegistry`] via `with_touched_files`. If no collector
+    /// is provided, file-attribution falls back to "shell-diff" for
+    /// every turn.
+    pub fn enable_checkpoints(
+        &mut self,
+        shadow: Arc<ShadowRepo>,
+        session_id: impl Into<String>,
+        log_path: std::path::PathBuf,
+        touched_slot: Option<Arc<Mutex<TouchedFiles>>>,
+    ) -> Result<()> {
+        let writer = CheckpointLogWriter::open(&log_path)?;
+        self.shadow = Some(shadow);
+        self.session_id = Some(session_id.into());
+        self.checkpoint_writer = Some(writer);
+        self.touched_files = touched_slot;
+        Ok(())
+    }
+
+    /// Whether checkpoint snapshots are active.
+    pub fn checkpoints_enabled(&self) -> bool {
+        self.shadow.is_some() && self.session_id.is_some()
+    }
+
+    /// Returns the 0-indexed counter that will be assigned to the
+    /// *next* turn (i.e. the count of turns already executed).
+    pub fn turn_index(&self) -> usize {
+        self.turn_index
+    }
+
+    /// Take a snapshot just before a turn begins. Errors are logged
+    /// as warnings and swallowed so that a checkpoint failure cannot
+    /// brick a run.
+    fn snapshot_pre_turn(&self, user_text: &str) -> Option<CheckpointId> {
+        let (repo, sid) = match (self.shadow.as_ref(), self.session_id.as_ref()) {
+            (Some(r), Some(s)) => (r, s),
+            _ => return None,
+        };
+        let label = format!(
+            "turn {} pre: {}",
+            self.turn_index,
+            truncate_label(user_text)
+        );
+        match repo.snapshot_for_session(sid, &label) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("checkpoint pre-snapshot failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Take a snapshot at the end of a turn, compute the touched-file
+    /// set, and append a `CheckpointRecord` to the log.
+    fn snapshot_post_turn(
+        &self,
+        user_text: &str,
+        pre: Option<&CheckpointId>,
+        started_at: i64,
+    ) -> Option<CheckpointId> {
+        let (repo, sid) = match (self.shadow.as_ref(), self.session_id.as_ref()) {
+            (Some(r), Some(s)) => (r, s),
+            _ => return None,
+        };
+
+        let label = format!(
+            "turn {} post: {}",
+            self.turn_index,
+            truncate_label(user_text)
+        );
+        let post = match repo.snapshot_for_session(sid, &label) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("checkpoint post-snapshot failed: {e}");
+                return None;
+            }
+        };
+
+        // Determine touched files.
+        let (mut paths, saw_shell) = match &self.touched_files {
+            Some(slot) => match slot.lock() {
+                Ok(t) => (t.paths_sorted(), t.saw_shell),
+                Err(_) => (vec![], false),
+            },
+            None => (vec![], true), // No collector → conservative fallback.
+        };
+
+        let mut via = TouchedVia::Structured;
+        if saw_shell {
+            via = TouchedVia::ShellDiff;
+            // Fall back to diffing pre vs post and unioning with structured paths.
+            if let Some(pre_id) = pre {
+                if let Ok(diff_paths) = repo.changed_paths(pre_id, &post) {
+                    let mut set: std::collections::HashSet<String> = paths.into_iter().collect();
+                    for p in diff_paths {
+                        set.insert(p);
+                    }
+                    let mut v: Vec<String> = set.into_iter().collect();
+                    v.sort();
+                    paths = v;
+                }
+            }
+        }
+
+        // Append record.
+        if let Some(writer) = &self.checkpoint_writer {
+            let rec = CheckpointRecord {
+                turn: self.turn_index,
+                pre: pre.cloned(),
+                post: post.clone(),
+                touched_files: paths,
+                touched_via: via,
+                started_at,
+                finished_at: unix_now(),
+            };
+            if let Err(e) = writer.append(&rec) {
+                tracing::warn!("checkpoint log append failed: {e}");
+            }
+        }
+
+        Some(post)
+    }
+}
+
+/// Current Unix timestamp in seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Truncate a turn label to keep checkpoint commit messages readable.
+fn truncate_label(s: &str) -> String {
+    const MAX: usize = 120;
+    let trimmed: String = s.lines().next().unwrap_or("").chars().take(MAX).collect();
+    if trimmed.len() < s.len() {
+        format!("{trimmed}…")
+    } else {
+        trimmed
     }
 }
 
@@ -495,6 +688,11 @@ impl AgentRuntimeBuilder {
             permission_hook: self.permission_hook,
             planning_mode: self.planning_mode,
             compactor: self.compactor,
+            shadow: None,
+            session_id: None,
+            turn_index: 0,
+            checkpoint_writer: None,
+            touched_files: None,
         })
     }
 }
@@ -728,5 +926,184 @@ mod tests {
         let out = rt.run("test").await.unwrap();
         assert_eq!(out.finish_reason, FinishReason::NoMoreToolCalls);
         assert_eq!(rt.transcript().len(), 2);
+    }
+
+    // ── checkpoint integration ────────────────────────────────────────
+
+    fn has_git() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshots_at_turn_boundaries() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seed.txt"), "v0").unwrap();
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "ok".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "ok2".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+
+        let shadow = Arc::new(crate::ShadowRepo::open(dir.path()).unwrap());
+        let log_path = dir.path().join("checkpoints.jsonl");
+        rt.enable_checkpoints(shadow.clone(), "sess", log_path.clone(), None)
+            .unwrap();
+
+        let o1 = rt.run("turn 0").await.unwrap();
+        assert!(o1.checkpoint_id.is_some());
+        let o2 = rt.run("turn 1").await.unwrap();
+        assert!(o2.checkpoint_id.is_some());
+        assert_ne!(o1.checkpoint_id, o2.checkpoint_id);
+
+        let recs = crate::read_checkpoint_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].turn, 0);
+        assert_eq!(recs[1].turn, 1);
+        // pre exists for both turns (post-snapshot may or may not differ).
+        assert!(recs[0].pre.is_some());
+        assert!(recs[1].pre.is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_records_touched_files_for_write_file() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Provider plans one write_file then ends.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "writing".into(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path": "out.txt", "contents": "hello"}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let touched = Arc::new(Mutex::new(TouchedFiles::new()));
+        let tools = ToolRegistry::local()
+            .register(Arc::new(crate::tools::WriteFile::new(dir.path())))
+            .with_touched_files(touched.clone());
+
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .build()
+            .unwrap();
+        let shadow = Arc::new(crate::ShadowRepo::open(dir.path()).unwrap());
+        let log_path = dir.path().join("checkpoints.jsonl");
+        rt.enable_checkpoints(shadow, "sess", log_path.clone(), Some(touched))
+            .unwrap();
+
+        let _ = rt.run("please write").await.unwrap();
+
+        let recs = crate::read_checkpoint_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].touched_files, vec!["out.txt".to_string()]);
+        assert_eq!(recs[0].touched_via, crate::TouchedVia::Structured);
+    }
+
+    #[tokio::test]
+    async fn runtime_falls_back_to_diff_for_run_shell() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "shelling".into(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "c1".into(),
+                    name: "run_shell".into(),
+                    arguments: json!({"command": "echo created > made.txt"}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let touched = Arc::new(Mutex::new(TouchedFiles::new()));
+        let tools = ToolRegistry::local()
+            .register(Arc::new(crate::tools::RunShell::new(dir.path())))
+            .with_touched_files(touched.clone());
+
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .build()
+            .unwrap();
+        let shadow = Arc::new(crate::ShadowRepo::open(dir.path()).unwrap());
+        let log_path = dir.path().join("checkpoints.jsonl");
+        rt.enable_checkpoints(shadow, "sess", log_path.clone(), Some(touched))
+            .unwrap();
+
+        let _ = rt.run("please make a file").await.unwrap();
+
+        let recs = crate::read_checkpoint_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].touched_via, crate::TouchedVia::ShellDiff);
+        // The shell created made.txt which should be in the diff.
+        assert!(
+            recs[0].touched_files.iter().any(|p| p == "made.txt"),
+            "expected made.txt in touched_files, got {:?}",
+            recs[0].touched_files
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_works_when_checkpoints_disabled() {
+        // No call to enable_checkpoints → outcome.checkpoint_id is None,
+        // no log file created.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let out = rt.run("hi").await.unwrap();
+        assert!(out.checkpoint_id.is_none());
+        assert!(!rt.checkpoints_enabled());
     }
 }

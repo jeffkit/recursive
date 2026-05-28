@@ -228,6 +228,25 @@ enum SessionCmd {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Rewind a session to the start of turn N, restoring only files
+    /// this session touched in turns >= N. Sibling sessions' files are
+    /// untouched. Conflicts (a touched file modified externally since
+    /// our last snapshot) abort unless --force is given.
+    Rewind {
+        /// Session directory path or session ID.
+        session: String,
+        /// Turn index to rewind to. The start state of this turn is
+        /// what gets restored; the turn itself and all later turns
+        /// are dropped.
+        #[arg(long)]
+        to_turn: usize,
+        /// Skip conflict detection and overwrite externally-modified files.
+        #[arg(long)]
+        force: bool,
+        /// Print the plan but don't apply it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -661,6 +680,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            SessionCmd::Rewind {
+                session,
+                to_turn,
+                force,
+                dry_run,
+            } => cmd_session_rewind(&config.workspace, &session, to_turn, force, dry_run),
         },
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show => {
@@ -783,6 +808,70 @@ fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathB
     }
 }
 
+/// Implementation of `recursive sessions rewind`.
+fn cmd_session_rewind(
+    workspace: &Path,
+    session: &str,
+    to_turn: usize,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let session_path = resolve_session_path(workspace, session)?;
+    // The session path returned by resolve_session_path is the session
+    // directory under .recursive/sessions/<slug>/<sid>/. The
+    // checkpoints log lives inside it.
+    if !session_path.is_dir() {
+        anyhow::bail!(
+            "Rewind requires a JSONL session directory; got file: {}",
+            session_path.display()
+        );
+    }
+    let log_path = session_path.join("checkpoints.jsonl");
+    if !log_path.exists() {
+        anyhow::bail!(
+            "No checkpoints.jsonl in {}. \
+             This session predates checkpointing or had it disabled.",
+            session_path.display()
+        );
+    }
+
+    let plan = recursive::plan_rewind(&log_path, to_turn)?;
+
+    println!("Rewind plan:");
+    println!("  target checkpoint: {}", plan.target);
+    println!("  turns to drop:     {:?}", plan.turns_to_drop);
+    println!("  files to restore:  {} path(s)", plan.touched_paths.len());
+    for p in &plan.touched_paths {
+        println!("    - {p}");
+    }
+    if dry_run {
+        println!("(--dry-run: not applied)");
+        return Ok(());
+    }
+
+    let repo = recursive::ShadowRepo::open(workspace).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot open shadow repo at {}/.recursive/shadow-git: {e}",
+            workspace.display()
+        )
+    })?;
+
+    let result = recursive::apply_rewind(&repo, &log_path, &plan, force)?;
+    println!(
+        "Rewind applied: {} restored, {} deleted, {} unchanged. {} turn(s) dropped from log.",
+        result.stats.restored,
+        result.stats.deleted,
+        result.stats.unchanged,
+        result.dropped_turns.len()
+    );
+    println!(
+        "NOTE: transcript.jsonl is not truncated automatically yet. \
+         To start a fresh chat from this checkpoint, the transcript will need \
+         to be replayed up to turn {to_turn}."
+    );
+    Ok(())
+}
+
 /// Returns a [`CancellationToken`] that fires on SIGINT (Ctrl+C) or SIGTERM.
 fn shutdown_signal() -> tokio_util::sync::CancellationToken {
     let token = tokio_util::sync::CancellationToken::new();
@@ -881,6 +970,9 @@ async fn build_tools(config: &Config) -> ToolRegistry {
             Duration::from_secs(config.shell_timeout_secs),
         )));
     }
+    // Note: read-only checkpoint tools (checkpoint_list / checkpoint_diff)
+    // are registered by the runtime when a session id is known, since
+    // they must be scoped to the current session's checkpoint chain.
     if let Some(perms) = resolve_tool_permissions() {
         registry = registry.with_permissions(perms);
     }

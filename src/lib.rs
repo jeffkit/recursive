@@ -10,6 +10,8 @@
 //! `Tool` or `LlmProvider`, never by editing the loop.
 
 pub mod agent;
+pub mod checkpoint;
+pub mod checkpoint_log;
 pub mod compact;
 pub mod config;
 pub mod config_file;
@@ -28,6 +30,7 @@ pub mod mcp_server;
 pub mod message;
 pub mod multi;
 pub mod permissions;
+pub mod rewind;
 pub mod runtime;
 pub mod session;
 pub mod skills;
@@ -39,6 +42,11 @@ pub use agent::{FinishReason, PermissionDecision, PermissionHook};
 // Legacy API — kept for backward compatibility; new code should use AgentRuntime.
 #[allow(deprecated)]
 pub use agent::{Agent, AgentOutcome, OnMessageFn, StepEvent};
+pub use checkpoint::{CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};
+pub use checkpoint_log::{
+    read_log as read_checkpoint_log, truncate_to_turn as truncate_checkpoint_log,
+    CheckpointLogWriter, CheckpointRecord, TouchedVia,
+};
 pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
@@ -62,6 +70,10 @@ pub use multi::{
     MessageBus, MessageType, Pipeline, PipelineResult, SharedMemory, StageOutcome,
     TeamOrchestrator, TeamResult,
 };
+pub use rewind::{
+    apply_rewind, checkpoint_log_path, detect_conflicts, plan_rewind, ConflictReport, RewindPlan,
+    RewindResult,
+};
 pub use runtime::{AgentRuntime, AgentRuntimeBuilder, RuntimeOutcome};
 pub use session::SessionFile;
 pub use session::SessionReader;
@@ -70,7 +82,7 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
-pub use tools::{Tool, ToolRegistry};
+pub use tools::{Tool, ToolRegistry, TouchedFiles};
 pub use transcript::{TranscriptFile, TranscriptMeta};
 
 /// Safely truncate a string to at most `max_bytes` bytes without splitting

@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
@@ -14,6 +14,7 @@ use crate::llm::ToolSpec;
 use crate::permissions::{Permission, PermissionsConfig};
 
 pub mod apply_patch;
+pub mod checkpoint;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
@@ -31,6 +32,7 @@ pub mod transport;
 pub mod web_fetch;
 
 pub use apply_patch::ApplyPatch;
+pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
 pub use estimate_tokens::EstimateTokens;
 pub use facts::{
@@ -76,6 +78,70 @@ pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     transport: Arc<dyn ToolTransport>,
     permissions: Option<PermissionsConfig>,
+    touched: Option<Arc<Mutex<TouchedFiles>>>,
+}
+
+/// Observer that records files touched by structured filesystem tools
+/// during a single agent turn. Owned by `AgentRuntime` and reset at
+/// every turn boundary; passed by `Arc<Mutex<...>>` to the
+/// `ToolRegistry` so tool dispatch can record `path` arguments.
+#[derive(Debug, Default, Clone)]
+pub struct TouchedFiles {
+    /// Workspace-relative file paths recorded from `write_file`,
+    /// `apply_patch`, etc.
+    pub paths: HashSet<String>,
+    /// True if the agent invoked `run_shell` this turn — runtime will
+    /// use a pre/post snapshot diff to attribute file changes.
+    pub saw_shell: bool,
+}
+
+impl TouchedFiles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && !self.saw_shell
+    }
+    pub fn paths_sorted(&self) -> Vec<String> {
+        let mut v: Vec<_> = self.paths.iter().cloned().collect();
+        v.sort();
+        v
+    }
+}
+
+/// Inspect tool arguments for known fs tools and record their paths
+/// on the shared `TouchedFiles` collector.
+fn record_touched(name: &str, args: &Value, slot: &Mutex<TouchedFiles>) {
+    let Ok(mut t) = slot.lock() else {
+        return;
+    };
+    match name {
+        "write_file" => {
+            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                t.paths.insert(p.to_string());
+            }
+        }
+        "apply_patch" => {
+            // V4A patch headers carry the file paths. The agent passes
+            // the patch as a single string under "patch" or "input".
+            let body = args
+                .get("patch")
+                .or_else(|| args.get("input"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            for line in body.lines() {
+                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        t.paths.insert(rest.trim().to_string());
+                    }
+                }
+            }
+        }
+        "run_shell" => {
+            t.saw_shell = true;
+        }
+        _ => {}
+    }
 }
 
 impl ToolRegistry {
@@ -84,6 +150,7 @@ impl ToolRegistry {
             tools: BTreeMap::new(),
             transport,
             permissions: None,
+            touched: None,
         }
     }
 
@@ -103,6 +170,7 @@ impl ToolRegistry {
             tools: BTreeMap::new(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
+            touched: self.touched.clone(),
         }
     }
 
@@ -110,6 +178,20 @@ impl ToolRegistry {
     pub fn with_permissions(mut self, permissions: PermissionsConfig) -> Self {
         self.permissions = Some(permissions);
         self
+    }
+
+    /// Attach a [`TouchedFiles`] collector. Tool invocations on
+    /// structured filesystem tools will record their path arguments
+    /// onto the shared collector. Used by `AgentRuntime` to assemble
+    /// per-turn checkpoint metadata.
+    pub fn with_touched_files(mut self, slot: Arc<Mutex<TouchedFiles>>) -> Self {
+        self.touched = Some(slot);
+        self
+    }
+
+    /// Detach any previously attached collector.
+    pub fn clear_touched_files(&mut self) {
+        self.touched = None;
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
@@ -153,6 +235,11 @@ impl ToolRegistry {
                 }
                 Permission::Allowed => {}
             }
+        }
+
+        // Record touched files for the active turn (if a collector is attached).
+        if let Some(slot) = &self.touched {
+            record_touched(name, &arguments, slot);
         }
 
         let args_size = arguments.to_string().len();
