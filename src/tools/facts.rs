@@ -1192,6 +1192,14 @@ mod tests {
     #[test]
     fn test_i_scope_isolation() {
         let (_tmp, ws) = tmp_workspace();
+
+        // Override HOME to the temp dir so global-scope facts land in a
+        // writable location (macOS security policy may block writes to
+        // ~/.recursive/memory/ in test environments).
+        let home = ws.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+
         let remember = RememberFact::new(&ws);
         let recall = RecallFact::new(&ws);
 
