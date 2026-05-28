@@ -849,6 +849,7 @@ impl Agent {
     /// Execute a set of tool calls, returning (id, name, output, args) for each.
     /// Read-only calls are batched and executed in parallel; write calls run
     /// sequentially to preserve ordering guarantees.
+    #[allow(dead_code)]
     async fn execute_tool_calls(
         &mut self,
         calls: &[ToolCall],
@@ -1077,6 +1078,7 @@ impl Agent {
     /// replaces the content with [`TRIM_PLACEHOLDER`]. Stops as soon as the total
     /// character count is below `limit`. Emits an `AssistantText` event (reusing the
     /// existing variant) to surface that trimming happened.
+    #[allow(dead_code)]
     async fn maybe_compact(&mut self, step: usize) -> Result<()> {
         let compactor = match &self.compactor {
             Some(c) => c,
@@ -1138,6 +1140,7 @@ impl Agent {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn maybe_trim_transcript(&mut self, limit: usize, step: usize) {
         let mut chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
         if chars < limit {
