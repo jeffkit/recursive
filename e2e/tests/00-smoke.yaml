@@ -34,7 +34,7 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        sh -c "echo 'test content' > /workspace/smoke-02/input.txt &&
+        sh -c "mkdir -p /workspace/smoke-02 && echo 'test content' > /workspace/smoke-02/input.txt &&
         recursive --workspace /workspace/smoke-02
         --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
         --max-steps 5
