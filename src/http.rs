@@ -219,7 +219,12 @@ impl RateLimiter {
     ///
     /// - `capacity`: maximum number of tokens (burst size).
     /// - `refill_rate`: tokens added per second.
-    fn new(capacity: u32, refill_rate: f64) -> Self {
+    ///
+    /// External callers (tests, custom embedders) can construct a
+    /// `RateLimiter` directly and inject it via
+    /// [`build_router_with_auth_and_rate_limit`] when env-driven
+    /// configuration is undesirable.
+    pub fn new(capacity: u32, refill_rate: f64) -> Self {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             capacity,
@@ -480,9 +485,26 @@ pub fn build_router(state: AppState) -> Router {
 ///
 /// Tests use this to inject a known auth state without touching
 /// process-global env vars. Production code paths use [`build_router`].
+///
+/// The rate limiter is sourced from env (`rate_limiter_from_env`).
+/// Tests that need deterministic rate-limit behavior should use
+/// [`build_router_with_auth_and_rate_limit`] instead.
 pub fn build_router_with_auth(state: AppState, auth: AuthConfig) -> Router {
-    let limiter = rate_limiter_from_env();
+    build_router_with_auth_and_rate_limit(state, auth, rate_limiter_from_env())
+}
 
+/// Build the HTTP router with an explicit `AuthConfig` AND an explicit
+/// `RateLimiter`.
+///
+/// This is the lowest-level constructor — both of the layered
+/// middleware states are caller-supplied. Production code paths
+/// invoke [`build_router`] (env-driven on both); tests that need
+/// race-free rate-limit assertions use this directly.
+pub fn build_router_with_auth_and_rate_limit(
+    state: AppState,
+    auth: AuthConfig,
+    limiter: RateLimiter,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/tools", get(list_tools))

@@ -6,8 +6,8 @@ mod http_tests {
     use http_body_util::BodyExt;
     use recursive::config::Config;
     use recursive::http::{
-        build_router, build_router_with_auth, map_agent_event, AppState, AuthConfig, Metrics,
-        SseEvent, ToolInfo,
+        build_router, build_router_with_auth, build_router_with_auth_and_rate_limit,
+        map_agent_event, AppState, AuthConfig, Metrics, RateLimiter, SseEvent, ToolInfo,
     };
     use recursive::llm::{Completion, MockProvider};
     use recursive::tools::ToolRegistry;
@@ -1301,5 +1301,119 @@ mod http_tests {
         assert!(!cfg.is_valid("alphax")); // length+1 long
         assert!(!cfg.is_valid("")); // empty rejected
         assert!(!cfg.is_valid("gamma")); // unrelated
+    }
+
+    // ------------------------------------------------------------------------
+    // Rate limiter (Goal 139) — token-bucket integration tests through the
+    // axum middleware stack. Uses build_router_with_auth_and_rate_limit to
+    // inject a deterministic limiter without env-var races. Lower-level
+    // unit tests of RateLimiter::check / extract_client_key live inside
+    // src/http.rs and are not duplicated here.
+    // ------------------------------------------------------------------------
+
+    fn router_with_limiter(limiter: RateLimiter) -> axum::Router {
+        build_router_with_auth_and_rate_limit(sample_state(), AuthConfig::default(), limiter)
+    }
+
+    #[tokio::test]
+    async fn rate_limit_first_request_succeeds() {
+        // capacity=2 with very slow refill; first hit should always pass.
+        let app = router_with_limiter(RateLimiter::new(2, 0.001));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_burst_allowed_then_429() {
+        // capacity=2: first 2 requests within burst → 200; third → 429.
+        // Refill rate is tiny (0.001/s ≈ 1 token per 16 minutes) so the
+        // bucket cannot replenish during test runtime.
+        let app = router_with_limiter(RateLimiter::new(2, 0.001));
+
+        for i in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/tools")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "request #{} should succeed", i + 1);
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429, "third request should be rate-limited");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"rate limit exceeded");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_different_clients_have_independent_buckets() {
+        // capacity=1 per client. Two clients distinguished by X-API-Key.
+        // Client A's second hit should be 429 (its bucket is exhausted),
+        // while Client B's first hit is still 200 (its bucket is full).
+        let app = router_with_limiter(RateLimiter::new(1, 0.001));
+
+        let req = |key: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri("/tools")
+                        .header("X-API-Key", key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(req("alpha").await, 200, "alpha first hit");
+        assert_eq!(req("beta").await, 200, "beta first hit");
+        assert_eq!(req("alpha").await, 429, "alpha second hit (exhausted)");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_does_not_block_below_threshold() {
+        // High capacity: 5 sequential hits should all pass.
+        let app = router_with_limiter(RateLimiter::new(100, 0.001));
+
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/tools")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "request #{} should pass", i + 1);
+        }
     }
 }
