@@ -24,6 +24,10 @@ pub struct MockProvider {
     /// before returning. Used by tests that need to deterministically race
     /// some side action (e.g. cancellation) against agent progress.
     on_complete: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Optional synchronous hook — invoked after every `complete()` call,
+    /// before returning. Prefer this over `on_complete` when the side
+    /// effect must happen before the agent continues (e.g. cancellation).
+    on_complete_fn: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl MockProvider {
@@ -40,6 +44,7 @@ impl MockProvider {
             calls: Mutex::new(Vec::new()),
             structured_responses: Mutex::new(Vec::new()),
             on_complete: None,
+            on_complete_fn: None,
         }
     }
 
@@ -49,6 +54,16 @@ impl MockProvider {
     /// (e.g. cancellation) with agent progress, avoiding wall-clock sleeps.
     pub fn with_on_complete(mut self, notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
         self.on_complete = Some(notify);
+        self
+    }
+
+    /// Attach a synchronous hook that runs once per `complete()` call, after
+    /// the completion is dequeued and immediately before it is returned.
+    pub fn with_on_complete_fn<F>(mut self, hook: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_complete_fn = Some(std::sync::Arc::new(hook));
         self
     }
 
@@ -83,6 +98,9 @@ impl LlmProvider for MockProvider {
             }
             let completion = queue.remove(0);
             drop(queue);
+            if let Some(ref hook) = self.on_complete_fn {
+                hook();
+            }
             if let Some(ref notify) = self.on_complete {
                 notify.notify_one();
             }

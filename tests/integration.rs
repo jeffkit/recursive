@@ -789,11 +789,8 @@ mod shutdown {
     /// a non-final completion. Loop exits with Cancelled at the next
     /// step boundary; steps < total scripted completions.
     ///
-    /// Uses multi-threaded runtime so the canceller task and the agent
-    /// task can make progress concurrently. The canceller registers its
-    /// `notified()` listener BEFORE we hand the runtime to `agent.run()`,
-    /// so the very first `notify_one()` in `MockProvider::complete()`
-    /// always wakes it.
+    /// Cancellation is triggered synchronously inside `MockProvider::complete()`
+    /// so the token is set before the agent continues to tool execution.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_during_run_terminates_loop() {
         // Script: 5 LLM responses. First 4 request `__noop__` with
@@ -810,37 +807,14 @@ mod shutdown {
         }
         script.push(final_completion("would-be-final"));
 
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let provider = Arc::new(MockProvider::new(script).with_on_complete(notify.clone()));
-
         let token = CancellationToken::new();
-
-        // Pre-register the listener BEFORE spawning the agent so we never
-        // miss the first notify_one(). `Notify::notified()` is permit-based
-        // — calling it later would still work for the first signal, but
-        // pre-registering removes any timing assumption.
-        let listener_started = Arc::new(tokio::sync::Notify::new());
-        let canceller = {
-            let token = token.clone();
-            let notify = notify.clone();
-            let listener_started = listener_started.clone();
-            tokio::spawn(async move {
-                let listener = notify.notified();
-                tokio::pin!(listener);
-                // Tell the test we're armed; runtime.run can start now.
-                listener_started.notify_one();
-                listener.await; // wait for first MockProvider::complete()
-                token.cancel();
-            })
-        };
-        // Wait until the canceller is parked on `notified()` before
-        // kicking off the agent — otherwise the first complete() can fire
-        // before we've registered, dropping the permit on the floor.
-        listener_started.notified().await;
+        let token_for_hook = token.clone();
+        let provider = Arc::new(MockProvider::new(script).with_on_complete_fn(move || {
+            token_for_hook.cancel();
+        }));
 
         let mut runtime = build_runtime_with_token(provider.clone(), Some(token));
         let outcome = runtime.run("kick off").await.expect("runtime.run");
-        canceller.await.ok();
 
         assert!(
             matches!(outcome.finish_reason, FinishReason::Cancelled),
