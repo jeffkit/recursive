@@ -82,8 +82,12 @@ pub struct AgentRuntime {
     kernel: AgentKernel,
     /// Accumulated conversation transcript.
     transcript: Vec<Message>,
-    /// Event sink for streaming events (defaults to [`NullSink`]).
-    event_sink: Box<dyn EventSink>,
+    /// Event sink for streaming events (Arc for sharing with forwarder task).
+    event_sink: Arc<dyn EventSink>,
+    /// Pending plan tool calls buffered by the kernel (plan-first mode).
+    pending_plan_calls: Option<Vec<crate::llm::ToolCall>>,
+    /// Whether the user confirmed the pending plan.
+    plan_confirmed: bool,
     /// Whether to request streaming responses from the LLM.
     streaming: bool,
     /// Optional permission hook for tool-call interception.
@@ -101,7 +105,10 @@ impl std::fmt::Debug for AgentRuntime {
             .field("transcript", &self.transcript)
             .field("event_sink", &"<EventSink>")
             .field("streaming", &self.streaming)
-            .field("permission_hook", &self.permission_hook.as_ref().map(|_| "<hook>"))
+            .field(
+                "permission_hook",
+                &self.permission_hook.as_ref().map(|_| "<hook>"),
+            )
             .field("planning_mode", &self.planning_mode)
             .finish()
     }
@@ -126,11 +133,16 @@ impl AgentRuntime {
         // This is the Wrapper's responsibility — the kernel only does intra-turn trim.
         if let Some(ref compactor) = self.compactor {
             let chars = Compactor::estimate_chars(&self.transcript);
-            if chars >= compactor.threshold_chars && self.transcript.len() >= compactor.keep_recent_n + 2 {
-                let summary_msg = compactor.compact(self.kernel.llm().as_ref(), &self.transcript).await?;
+            if chars >= compactor.threshold_chars
+                && self.transcript.len() >= compactor.keep_recent_n + 2
+            {
+                let summary_msg = compactor
+                    .compact(self.kernel.llm().as_ref(), &self.transcript)
+                    .await?;
                 let keep = compactor.keep_recent_n;
                 let mut split = self.transcript.len().saturating_sub(keep);
-                while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool) {
+                while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool)
+                {
                     split -= 1;
                 }
                 self.transcript.drain(..split);
@@ -138,11 +150,24 @@ impl AgentRuntime {
             }
         }
 
-        // Build turn context
+        // Create channel for step events and spawn forwarder to EventSink
+        let (step_tx, mut step_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::agent::StepEvent>();
+        let sink = self.event_sink.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = step_rx.recv().await {
+                sink.emit(ev.into()).await;
+            }
+        });
+
+        // Build turn context with step events channel
         let ctx = TurnContext {
             messages: self.transcript.clone(),
             tool_specs: self.kernel.tools().specs(),
-            event_sink: Box::new(NullSink), // TODO: wire the stored EventSink in a future goal
+            event_sink: None, // Not used directly; events go through step_events_tx
+            step_events_tx: Some(step_tx.clone()),
+            plan_confirmed: self.plan_confirmed,
+            plan_buffer: self.pending_plan_calls.clone(),
             streaming: self.streaming,
             permission_hook: self.permission_hook.clone(),
             planning_mode: self.planning_mode.clone(),
@@ -150,6 +175,24 @@ impl AgentRuntime {
 
         // Execute turn
         let turn_outcome = self.kernel.run(ctx).await?;
+
+        // Drop the sender to signal the forwarder to stop, then wait for it
+        drop(step_tx);
+        forwarder.await.ok();
+
+        // Handle plan confirmation state
+        if turn_outcome.finish_reason == crate::agent::FinishReason::PlanPending {
+            // Store pending plan calls from the kernel's response
+            self.pending_plan_calls = turn_outcome.plan_buffer.clone();
+        }
+
+        // Reset plan confirmation state after the turn
+        let was_confirmed = self.plan_confirmed;
+        self.plan_confirmed = false;
+        if was_confirmed {
+            // If plan was confirmed, clear the pending calls
+            self.pending_plan_calls = None;
+        }
 
         // Append new messages to transcript
         self.transcript.extend(turn_outcome.new_messages.clone());
@@ -175,6 +218,30 @@ impl AgentRuntime {
     /// Return the event sink currently in use.
     pub fn event_sink(&self) -> &dyn EventSink {
         self.event_sink.as_ref()
+    }
+
+    /// Set a new event sink (useful for REPL mode between turns).
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = sink;
+    }
+
+    /// Confirm the pending plan, allowing execution to proceed on the next run.
+    pub fn confirm_plan(&mut self) {
+        self.plan_confirmed = true;
+    }
+
+    /// Reject the pending plan with a reason.
+    ///
+    /// This injects a tool error message into the transcript to inform the agent
+    /// that the plan was rejected.
+    pub fn reject_plan(&mut self, reason: &str) {
+        // Clear pending plan calls
+        self.pending_plan_calls = None;
+        self.plan_confirmed = false;
+
+        // Inject a user message with the rejection into the transcript
+        let rejection_msg = Message::user(format!("Plan rejected: {}", reason));
+        self.transcript.push(rejection_msg);
     }
 
     /// Run a loop: execute turns until the agent stops scheduling wakeups.
@@ -274,7 +341,7 @@ pub struct AgentRuntimeBuilder {
     streaming: bool,
     permission_hook: Option<PermissionHook>,
     planning_mode: PlanningMode,
-    saved_event_sink: Option<Box<dyn EventSink>>,
+    saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
 }
 
@@ -285,9 +352,15 @@ impl std::fmt::Debug for AgentRuntimeBuilder {
             .field("system_prompt", &self.system_prompt)
             .field("seed", &self.seed)
             .field("streaming", &self.streaming)
-            .field("permission_hook", &self.permission_hook.as_ref().map(|_| "<hook>"))
+            .field(
+                "permission_hook",
+                &self.permission_hook.as_ref().map(|_| "<hook>"),
+            )
             .field("planning_mode", &self.planning_mode)
-            .field("event_sink", &self.saved_event_sink.as_ref().map(|_| "<EventSink>"))
+            .field(
+                "event_sink",
+                &self.saved_event_sink.as_ref().map(|_| "<EventSink>"),
+            )
             .finish()
     }
 }
@@ -385,7 +458,7 @@ impl AgentRuntimeBuilder {
     }
 
     /// Set the event sink for streaming events (optional, defaults to [`NullSink`]).
-    pub fn event_sink(mut self, sink: Box<dyn EventSink>) -> Self {
+    pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.saved_event_sink = Some(sink);
         self
     }
@@ -405,7 +478,9 @@ impl AgentRuntimeBuilder {
         Ok(AgentRuntime {
             kernel,
             transcript,
-            event_sink: self.saved_event_sink.unwrap_or_else(|| Box::new(NullSink)),
+            event_sink: self.saved_event_sink.unwrap_or_else(|| Arc::new(NullSink)),
+            pending_plan_calls: None,
+            plan_confirmed: false,
             streaming: self.streaming,
             permission_hook: self.permission_hook,
             planning_mode: self.planning_mode,

@@ -43,7 +43,16 @@ pub struct TurnContext {
     pub messages: Vec<Message>,
 
     /// Where to emit real-time events during execution.
-    pub event_sink: Box<dyn EventSink>,
+    pub event_sink: Option<Box<dyn EventSink>>,
+
+    /// Channel to send step events to the runtime's EventSink forwarder.
+    pub step_events_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::StepEvent>>,
+
+    /// Whether the user confirmed a pending plan.
+    pub plan_confirmed: bool,
+
+    /// Buffered tool calls from a proposed plan (when user confirms).
+    pub plan_buffer: Option<Vec<crate::llm::ToolCall>>,
 
     /// Tool specifications to advertise to the LLM.
     pub tool_specs: Vec<ToolSpec>,
@@ -88,6 +97,12 @@ pub struct TurnOutcome {
 
     /// Side effects the Wrapper should adopt (background jobs, scheduled tasks).
     pub side_effects: Vec<SideEffect>,
+
+    /// Buffered tool calls from a proposed plan (when plan is pending).
+    pub plan_buffer: Option<Vec<crate::llm::ToolCall>>,
+
+    /// Whether the plan was confirmed by the user.
+    pub plan_confirmed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +215,7 @@ impl AgentKernel {
             tools: self.tools.clone(),
             max_steps: self.max_steps,
             max_transcript_chars: self.max_transcript_chars,
-            events: None, // TODO: bridge EventSink → mpsc in a future goal
+            events: ctx.step_events_tx,
             streaming: ctx.streaming,
             compactor: self.compactor.clone(),
             permission_hook: ctx.permission_hook,
@@ -208,8 +223,8 @@ impl AgentKernel {
             planning_mode: ctx.planning_mode,
             on_message: &None,
             total_llm_latency_ms: 0,
-            plan_buffer: None,
-            plan_confirmed: false,
+            plan_buffer: ctx.plan_buffer,
+            plan_confirmed: ctx.plan_confirmed,
         };
 
         let inner = core.run_inner().await?;
@@ -229,6 +244,8 @@ impl AgentKernel {
             llm_latency_ms: inner.total_llm_latency_ms,
             steps: inner.steps,
             side_effects: Vec::new(),
+            plan_buffer: inner.plan_buffer,
+            plan_confirmed: inner.plan_confirmed,
         })
     }
 }
@@ -423,6 +440,8 @@ mod tests {
             llm_latency_ms: 0,
             steps: 0,
             side_effects: vec![],
+            plan_buffer: None,
+            plan_confirmed: false,
         };
         assert!(outcome.new_messages.is_empty());
         assert!(outcome.final_text.is_none());

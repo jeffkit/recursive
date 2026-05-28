@@ -332,9 +332,7 @@ impl<'a> RunCore<'a> {
             return Ok(());
         }
 
-        let summary_msg = compactor
-            .compact(self.llm.as_ref(), &self.messages)
-            .await?;
+        let summary_msg = compactor.compact(self.llm.as_ref(), &self.messages).await?;
         let summary_chars = summary_msg.content.len();
 
         let keep = compactor.keep_recent_n;
