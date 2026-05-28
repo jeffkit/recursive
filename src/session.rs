@@ -128,7 +128,7 @@ fn hash_tool_specs(specs: &[ToolSpec]) -> String {
 /// Default session output path for a given workspace.
 /// Returns `<workspace>/.recursive/sessions/<timestamp>-<goal-prefix>.json`.
 pub fn default_session_path(workspace: &Path, goal: &str) -> PathBuf {
-    let ts = chrono_lite_now();
+    let ts = filesystem_safe_timestamp();
     // Sanitise the goal prefix for use in a filename
     let prefix: String = goal
         .chars()
@@ -162,6 +162,12 @@ pub fn list_sessions(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     sessions.sort();
     Ok(sessions)
+}
+
+/// RFC3339 timestamp safe for use in path components on all platforms.
+/// Colons in the time portion are replaced with hyphens (Windows forbids `:`).
+fn filesystem_safe_timestamp() -> String {
+    chrono_lite_now().replace(':', "-")
 }
 
 // Tiny RFC3339-ish timestamp without pulling in `chrono`. Format:
@@ -286,7 +292,7 @@ impl SessionWriter {
         provider: &str,
     ) -> std::io::Result<Self> {
         let slug = workspace_slug(workspace);
-        let session_id = format!("{}-{}", chrono_lite_now(), slug);
+        let session_id = format!("{}-{}", filesystem_safe_timestamp(), slug);
         let session_dir = workspace
             .join(".recursive")
             .join("sessions")
@@ -519,8 +525,16 @@ fn workspace_slug(workspace: &Path) -> String {
         std::env::current_dir().unwrap_or_default().join(workspace)
     };
 
-    let s = abs.to_string_lossy().replace('/', "-");
-    // Strip leading dashes (from root slash)
+    let s: String = abs
+        .to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    // Strip leading dashes (from root slash / drive letter)
     let s = s.trim_start_matches('-').to_string();
     // Truncate to 80 chars (safe for multibyte)
     if s.len() > 80 {
@@ -812,7 +826,7 @@ mod tests {
         let filename = path.file_stem().unwrap().to_str().unwrap();
 
         // The filename format is "{timestamp}-{sanitized_goal}".
-        // The timestamp is fixed-format (YYYY-MM-DDTHH:MM:SSZ) and contains colons.
+        // The timestamp is filesystem-safe (colons replaced with hyphens).
         // We verify the goal-derived suffix: strip the timestamp prefix
         // (everything up to and including the "Z-" separator).
         let goal_suffix = filename
@@ -984,6 +998,13 @@ mod tests {
         let entries = SessionReader::load_transcript(&session_dir).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "good line");
+    }
+
+    #[test]
+    fn filesystem_safe_timestamp_has_no_colons() {
+        let ts = filesystem_safe_timestamp();
+        assert!(!ts.contains(':'));
+        assert!(ts.ends_with('Z'));
     }
 
     #[test]
