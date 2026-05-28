@@ -2,6 +2,8 @@
 //!
 //! Verifies that the kernel can actually drive a coding-style task to
 //! completion using only its public API, with no network and no real LLM.
+// Allow deprecated Agent usage until test is migrated.
+#![allow(deprecated)]
 
 use std::sync::Arc;
 

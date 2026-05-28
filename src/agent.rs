@@ -1,4 +1,6 @@
 //! Agent loop. The whole kernel.
+// Internal module — suppress deprecated warnings for types defined here.
+#![allow(deprecated)]
 //!
 //! Tiny on purpose: receive a goal, ask the model what to do, run any tool
 //! calls, feed results back, repeat until the model stops requesting tools
@@ -48,6 +50,14 @@ pub enum PermissionDecision {
 pub type PermissionHook = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
 
 /// Optional callback fired whenever a message is appended to the transcript.
+///
+/// # Deprecated
+/// Use [`AgentRuntime`](crate::runtime::AgentRuntime) with an
+/// [`EventSink`](crate::event::EventSink) instead.
+#[deprecated(
+    since = "0.5.0",
+    note = "Use AgentRuntime with an EventSink instead of OnMessageFn callbacks."
+)]
 pub type OnMessageFn = Box<dyn Fn(&Message) + Send + Sync>;
 
 const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
@@ -62,6 +72,17 @@ pub enum PlanningMode {
     PlanFirst,
 }
 
+/// Low-level agent step events.
+///
+/// # Deprecated
+/// Use [`AgentEvent`](crate::event::AgentEvent) instead.  `StepEvent` is an
+/// internal implementation detail bridged to `AgentEvent` by the kernel layer;
+/// external code should subscribe to events via the
+/// [`EventSink`](crate::event::EventSink) API and receive `AgentEvent` values.
+#[deprecated(
+    since = "0.5.0",
+    note = "Use AgentEvent (crate::event::AgentEvent) instead."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -174,6 +195,16 @@ pub enum FinishReason {
     PlanPending,
 }
 
+/// The outcome of a single [`Agent::run()`] call.
+///
+/// # Deprecated
+/// Use [`AgentRuntime`](crate::runtime::AgentRuntime) and its
+/// [`RuntimeOutcome`](crate::runtime::RuntimeOutcome) instead.  `Agent` is a
+/// legacy wrapper; new code should call `AgentRuntime::run()`.
+#[deprecated(
+    since = "0.5.0",
+    note = "Use AgentRuntime::run() which returns RuntimeOutcome."
+)]
 #[derive(Debug, Clone)]
 pub struct AgentOutcome {
     pub final_message: Option<String>,
@@ -186,33 +217,20 @@ pub struct AgentOutcome {
 
 /// The ReAct loop: ask LLM, execute tools, repeat.
 ///
-/// `Agent` orchestrates the interaction between an LLM provider, a tool registry,
-/// and a transcript. It drives a loop until the model stops calling tools or the
-/// budget (steps or transcript size) is exceeded.
-///
-/// # Usage
+/// # Deprecated
+/// Use [`AgentRuntime`](crate::runtime::AgentRuntime) instead.  `Agent` is a
+/// legacy type kept for backward compatibility.  New code should build and run
+/// an `AgentRuntime`:
 ///
 /// ```ignore
-/// let agent = Agent::builder()
-///     .llm(Arc::new(provider))
-///     .tools(registry)
+/// let mut runtime = AgentRuntime::builder()
+///     .llm(provider)
 ///     .system_prompt("You are a helpful assistant")
 ///     .max_steps(32)
 ///     .build()?;
-///
-/// let outcome = agent.run("Help me debug this file").await?;
+/// let outcome = runtime.run("Help me debug this file").await?;
 /// ```
-///
-/// # Events
-///
-/// The agent emits `StepEvent`s through an optional channel, allowing UI layers
-/// to observe progress without coupling to internals. See `StepEvent` for variants.
-///
-/// # Isolation
-///
-/// Each `Agent::run()` call is independent. The transcript is maintained across
-/// steps within a single run but cleared between runs. Use `seed_transcript()` to
-/// carry state between runs if needed.
+#[deprecated(since = "0.5.0", note = "Use AgentRuntime instead of Agent.")]
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: ToolRegistry,

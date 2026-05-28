@@ -1,4 +1,6 @@
 //! Lifecycle hooks for the agent loop.
+// Uses AgentOutcome for the SessionEnd hook; allow deprecated type.
+#![allow(deprecated)]
 //!
 //! Hooks are callbacks invoked at well-defined points during an agent run.
 //! They allow consumers to observe, log, gate, or transform behaviour without

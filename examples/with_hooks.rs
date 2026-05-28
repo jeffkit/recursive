@@ -1,9 +1,11 @@
 //! Agent with lifecycle hooks: observe and log agent events.
 //! Uses `MockProvider` so no API key is needed.
+// HookEvent::SessionEnd still carries AgentOutcome (legacy); allow deprecated.
+#![allow(deprecated)]
 
-use recursive::agent::Agent;
 use recursive::hooks::{Hook, HookAction, HookEvent, HookRegistry};
 use recursive::llm::{Completion, MockProvider};
+use recursive::runtime::AgentRuntime;
 use std::sync::Arc;
 
 /// A simple hook that logs every event to stdout.
@@ -47,7 +49,6 @@ impl Hook for LoggingHook {
 
 #[tokio::main]
 async fn main() {
-    // Register the logging hook.
     let mut hooks = HookRegistry::new();
     hooks.register(Arc::new(LoggingHook));
 
@@ -59,14 +60,14 @@ async fn main() {
         reasoning_content: None,
     }]));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(provider)
         .system_prompt("You are a helpful assistant.")
         .max_steps(5)
-        .hook(Arc::new(LoggingHook))
+        .hooks(hooks)
         .build()
-        .expect("failed to build agent");
+        .expect("failed to build runtime");
 
-    let outcome = agent.run("Say hello").await.expect("agent run failed");
-    println!("\nFinal message: {:?}", outcome.final_message);
+    let outcome = runtime.run("Say hello").await.expect("agent run failed");
+    println!("\nFinal message: {:?}", outcome.final_text);
 }

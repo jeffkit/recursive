@@ -1,4 +1,6 @@
 //! Event-sink abstraction for consuming agent lifecycle events.
+// This module bridges StepEvent → AgentEvent; allow use of the deprecated type.
+#![allow(deprecated)]
 //!
 //! This module defines [`AgentEvent`] (a serialisable, non-exhaustive enum of
 //! agent lifecycle events), the [`EventSink`] trait (the abstract consumer),

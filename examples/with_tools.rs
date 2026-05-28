@@ -2,8 +2,8 @@
 //! Uses `MockProvider` so no API key is needed.
 
 use async_trait::async_trait;
-use recursive::agent::Agent;
 use recursive::llm::{Completion, MockProvider, ToolCall, ToolSpec};
+use recursive::runtime::AgentRuntime;
 use recursive::tools::{Tool, ToolRegistry};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -60,22 +60,22 @@ async fn main() {
         },
     ]));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(provider)
         .tools(tools)
         .system_prompt("You are a friendly assistant.")
         .max_steps(5)
         .build()
-        .expect("failed to build agent");
+        .expect("failed to build runtime");
 
-    let outcome = agent.run("Greet Alice").await.expect("agent run failed");
+    let outcome = runtime.run("Greet Alice").await.expect("agent run failed");
 
-    println!("Final message: {:?}", outcome.final_message);
+    println!("Final message: {:?}", outcome.final_text);
     println!("Steps taken: {}", outcome.steps);
-    println!("Finish reason: {:?}", outcome.finish);
+    println!("Finish reason: {:?}", outcome.finish_reason);
 
     // Show the tool result from the transcript.
-    for msg in &outcome.transcript {
+    for msg in runtime.transcript() {
         if msg.role == recursive::message::Role::Tool {
             println!("Tool result: {}", msg.content);
         }

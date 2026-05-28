@@ -1,4 +1,6 @@
 //! Cost tracking for agent runs.
+// Uses OnMessageFn for the cost callback helper; allow deprecated type.
+#![allow(deprecated)]
 //!
 //! `CostTracker` observes messages flowing through the agent and accumulates
 //! token usage and cost data. It writes a `cost.json` file into the session

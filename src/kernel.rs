@@ -1,4 +1,6 @@
 //! Turn-level types for the Agent Run Kernel architecture.
+// kernel::run bridges StepEvent → AgentEvent internally; allow deprecated type.
+#![allow(deprecated)]
 //!
 //! This module defines the input/output contract for a single turn of
 //! agent execution:
@@ -24,7 +26,7 @@ use std::time::Duration;
 
 use crate::agent::{FinishReason, PermissionHook, PlanningMode};
 use crate::compact::Compactor;
-use crate::event::EventSink;
+use crate::event::{AgentEvent, EventSink};
 use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, TokenUsage, ToolSpec};
 use crate::message::Message;
@@ -45,8 +47,11 @@ pub struct TurnContext {
     /// Where to emit real-time events during execution.
     pub event_sink: Option<Box<dyn EventSink>>,
 
-    /// Channel to send step events to the runtime's EventSink forwarder.
-    pub step_events_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::StepEvent>>,
+    /// Channel to send agent events to the caller (runtime or test harness).
+    ///
+    /// The kernel bridges its internal [`StepEvent`] stream to [`AgentEvent`]
+    /// before forwarding here, so callers see a clean public API.
+    pub step_events_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 
     /// Whether the user confirmed a pending plan.
     pub plan_confirmed: bool,
@@ -206,9 +211,25 @@ impl AgentKernel {
     /// All cross-turn concerns (transcript accumulation, compaction, persistence)
     /// are the Wrapper's responsibility.
     pub async fn run(&self, ctx: TurnContext) -> crate::error::Result<TurnOutcome> {
-        use crate::agent::RunCore;
+        use crate::agent::{RunCore, StepEvent};
+        use tokio::sync::mpsc;
 
         let input_len = ctx.messages.len();
+
+        // Bridge: create an internal StepEvent channel for RunCore.
+        // If the caller provided an AgentEvent channel, spawn a converter task.
+        let (core_events_tx, bridge_handle) = match ctx.step_events_tx {
+            Some(ae_tx) => {
+                let (step_tx, mut step_rx) = mpsc::unbounded_channel::<StepEvent>();
+                let handle = tokio::spawn(async move {
+                    while let Some(ev) = step_rx.recv().await {
+                        let _ = ae_tx.send(ev.into());
+                    }
+                });
+                (Some(step_tx), Some(handle))
+            }
+            None => (None, None),
+        };
 
         let core = RunCore {
             messages: ctx.messages,
@@ -216,7 +237,7 @@ impl AgentKernel {
             tools: self.tools.clone(),
             max_steps: self.max_steps,
             max_transcript_chars: self.max_transcript_chars,
-            events: ctx.step_events_tx,
+            events: core_events_tx,
             streaming: ctx.streaming,
             compactor: self.compactor.clone(),
             permission_hook: ctx.permission_hook,
@@ -229,6 +250,11 @@ impl AgentKernel {
         };
 
         let inner = core.run_inner().await?;
+
+        // Wait for the bridge to finish forwarding any remaining events.
+        if let Some(handle) = bridge_handle {
+            handle.await.ok();
+        }
 
         // Extract only the messages produced during this turn
         let new_messages = if inner.messages.len() > input_len {

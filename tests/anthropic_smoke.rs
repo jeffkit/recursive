@@ -3,6 +3,8 @@
 //! Verifies that the AnthropicProvider plumbing works end-to-end with a
 //! mock HTTP server, exercising the full request/response cycle including
 //! tool calls and tool results.
+// Allow deprecated Agent usage until test is migrated.
+#![allow(deprecated)]
 
 use std::sync::Arc;
 

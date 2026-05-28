@@ -1,7 +1,7 @@
-//! Basic agent example: create an agent with a mock LLM, run it, and inspect
+//! Basic agent example: create a runtime with a mock LLM, run it, and inspect
 //! the outcome. No API key required — uses `MockProvider` for offline testing.
 
-use recursive::agent::Agent;
+use recursive::runtime::AgentRuntime;
 use recursive::llm::{Completion, MockProvider};
 use std::sync::Arc;
 
@@ -16,19 +16,19 @@ async fn main() {
         reasoning_content: None,
     }]));
 
-    // Build the agent with the mock provider.
-    let mut agent = Agent::builder()
+    // Build the runtime with the mock provider.
+    let mut runtime = AgentRuntime::builder()
         .llm(provider)
         .system_prompt("You are a helpful assistant.")
         .max_steps(5)
         .build()
-        .expect("failed to build agent");
+        .expect("failed to build runtime");
 
     // Run the agent with a goal.
-    let outcome = agent.run("Say hello").await.expect("agent run failed");
+    let outcome = runtime.run("Say hello").await.expect("agent run failed");
 
-    println!("Final message: {:?}", outcome.final_message);
+    println!("Final message: {:?}", outcome.final_text);
     println!("Steps taken: {}", outcome.steps);
-    println!("Finish reason: {:?}", outcome.finish);
-    println!("Transcript messages: {}", outcome.transcript.len());
+    println!("Finish reason: {:?}", outcome.finish_reason);
+    println!("Transcript messages: {}", runtime.transcript().len());
 }

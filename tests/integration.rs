@@ -3,6 +3,8 @@
 //!
 //! These tests use `MockProvider` with scripted responses and `tempfile`
 //! for filesystem isolation. They verify that the public API works correctly
+// Allow deprecated Agent/AgentOutcome until tests are fully migrated.
+#![allow(deprecated)]
 //! when all subsystems are wired together.
 
 use std::sync::Arc;

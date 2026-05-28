@@ -150,22 +150,22 @@ impl AgentRuntime {
             }
         }
 
-        // Create channel for step events and spawn forwarder to EventSink
-        let (step_tx, mut step_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::agent::StepEvent>();
+        // Create AgentEvent channel; kernel converts StepEvent → AgentEvent internally.
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::event::AgentEvent>();
         let sink = self.event_sink.clone();
         let forwarder = tokio::spawn(async move {
-            while let Some(ev) = step_rx.recv().await {
-                sink.emit(ev.into()).await;
+            while let Some(ev) = event_rx.recv().await {
+                sink.emit(ev).await;
             }
         });
 
-        // Build turn context with step events channel
+        // Build turn context with the AgentEvent channel.
         let ctx = TurnContext {
             messages: self.transcript.clone(),
             tool_specs: self.kernel.tools().specs(),
-            event_sink: None, // Not used directly; events go through step_events_tx
-            step_events_tx: Some(step_tx.clone()),
+            event_sink: None,
+            step_events_tx: Some(event_tx.clone()),
             plan_confirmed: self.plan_confirmed,
             plan_buffer: self.pending_plan_calls.clone(),
             streaming: self.streaming,
@@ -176,8 +176,8 @@ impl AgentRuntime {
         // Execute turn
         let turn_outcome = self.kernel.run(ctx).await?;
 
-        // Drop the sender to signal the forwarder to stop, then wait for it
-        drop(step_tx);
+        // Drop the sender to signal the forwarder to stop, then wait for it.
+        drop(event_tx);
         forwarder.await.ok();
 
         // Handle plan confirmation state

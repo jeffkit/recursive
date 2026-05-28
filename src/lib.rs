@@ -33,10 +33,11 @@ pub mod skills;
 pub mod tools;
 pub mod transcript;
 
-pub use agent::OnMessageFn;
 pub use agent::PlanningMode;
-pub use agent::{Agent, AgentOutcome, FinishReason, StepEvent};
-pub use agent::{PermissionDecision, PermissionHook};
+pub use agent::{FinishReason, PermissionDecision, PermissionHook};
+// Legacy API — kept for backward compatibility; new code should use AgentRuntime.
+#[allow(deprecated)]
+pub use agent::{Agent, AgentOutcome, OnMessageFn, StepEvent};
 pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
