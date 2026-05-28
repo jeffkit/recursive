@@ -19,10 +19,10 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::agent::StepEvent;
 use crate::config::Config;
+use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::llm::LlmProvider;
-use crate::message::Message;
+use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
 
 // ── Rate limiter ───────────────────────────────────────────────────────────
 
@@ -209,12 +209,15 @@ async fn rate_limit_middleware(
 // ── Session types ──────────────────────────────────────────────────────────
 
 /// Internal session state (not directly serialized to clients).
-#[derive(Clone)]
+///
+/// The [`AgentRuntime`] owns the transcript; this struct adds HTTP-layer
+/// metadata (id, created_at) and the broadcast channel for SSE clients.
 pub struct SessionState {
     pub id: String,
     pub created_at: String,
-    pub transcript: Vec<Message>,
-    pub system_prompt: String,
+    /// Runtime is wrapped in a per-session Mutex so concurrent HTTP requests
+    /// for the same session are serialized without blocking the global lock.
+    pub runtime: Arc<tokio::sync::Mutex<AgentRuntime>>,
 }
 
 /// Serialized session info for list/detail endpoints.
@@ -286,7 +289,9 @@ pub struct AppState {
     pub tools: Vec<ToolInfo>,
     pub config: Config,
     pub provider: Arc<dyn LlmProvider>,
+    /// Session state keyed by session ID.
     pub sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+    /// Per-session SSE broadcast channels.
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseEvent>>>>,
     pub metrics: Arc<Metrics>,
 }
@@ -749,8 +754,7 @@ async fn run_agent(
         .system_prompt
         .unwrap_or_else(|| state.config.system_prompt.clone());
 
-    // Build and run the agent
-    let mut agent = crate::Agent::builder()
+    let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
         .system_prompt(system_prompt)
         .max_steps(max_steps)
@@ -760,12 +764,12 @@ async fn run_agent(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     status: "error".into(),
-                    error: format!("failed to build agent: {e}"),
+                    error: format!("failed to build runtime: {e}"),
                 }),
             )
         })?;
 
-    let outcome = agent.run(&body.goal).await.map_err(|e| {
+    let outcome = runtime.run(&body.goal).await.map_err(|e| {
         state
             .metrics
             .agent_runs_total
@@ -806,13 +810,13 @@ async fn run_agent(
     );
 
     // Serialize transcript messages to JSON values
-    let messages: Vec<serde_json::Value> = outcome
-        .transcript
+    let messages: Vec<serde_json::Value> = runtime
+        .transcript()
         .iter()
         .filter_map(|msg| serde_json::to_value(msg).ok())
         .collect();
 
-    let finish_reason = format!("{:?}", outcome.finish);
+    let finish_reason = format!("{:?}", outcome.finish_reason);
 
     Ok(Json(RunResponse {
         status: "success".into(),
@@ -899,39 +903,62 @@ fn is_leap(y: u64) -> bool {
 async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionRequest>,
-) -> (StatusCode, Json<CreateSessionResponse>) {
+) -> Result<(StatusCode, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
     let system_prompt = body
         .system_prompt
         .unwrap_or_else(|| state.config.system_prompt.clone());
 
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(state.provider.clone())
+        .system_prompt(system_prompt)
+        .max_steps(state.config.max_steps)
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: format!("failed to build session runtime: {e}"),
+                }),
+            )
+        })?;
+
     let session = SessionState {
         id: id.clone(),
         created_at: created_at.clone(),
-        transcript: Vec::new(),
-        system_prompt,
+        runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
     };
 
     state.sessions.write().await.insert(id.clone(), session);
 
-    (
+    Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse { id, created_at }),
-    )
+    ))
 }
 
 /// GET /sessions — list all sessions.
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionInfo>> {
     let sessions = state.sessions.read().await;
-    let infos: Vec<SessionInfo> = sessions
-        .values()
-        .map(|s| SessionInfo {
+    let mut infos = Vec::with_capacity(sessions.len());
+    for s in sessions.values() {
+        // Exclude the system-prompt message from the user-visible count.
+        let message_count = s
+            .runtime
+            .lock()
+            .await
+            .transcript()
+            .iter()
+            .filter(|m| m.role != crate::message::Role::System)
+            .count();
+        infos.push(SessionInfo {
             id: s.id.clone(),
             created_at: s.created_at.clone(),
-            message_count: s.transcript.len(),
-        })
-        .collect();
+            message_count,
+        });
+    }
     Json(infos)
 }
 
@@ -942,9 +969,10 @@ async fn get_session(
 ) -> Result<Json<SessionDetailResponse>, StatusCode> {
     let sessions = state.sessions.read().await;
     let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let runtime = session.runtime.lock().await;
 
-    let messages: Vec<serde_json::Value> = session
-        .transcript
+    let messages: Vec<serde_json::Value> = runtime
+        .transcript()
         .iter()
         .filter_map(|msg| serde_json::to_value(msg).ok())
         .collect();
@@ -972,44 +1000,23 @@ async fn send_session_message(
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Read session state
-    let (system_prompt, transcript) = {
+    // Get the session's runtime (Arc clone is cheap; the Mutex is per-session).
+    let runtime_arc = {
         let sessions = state.sessions.read().await;
-        let session = sessions.get(&id).ok_or((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                status: "error".into(),
-                error: "session not found".into(),
-            }),
-        ))?;
-        (session.system_prompt.clone(), session.transcript.clone())
-    };
-
-    // Set up event forwarding: mpsc from agent -> broadcast for SSE clients
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Build agent with session context and event sender
-    let mut agent = crate::Agent::builder()
-        .llm(state.provider.clone())
-        .system_prompt(system_prompt)
-        .events(event_tx)
-        .build()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
+        sessions
+            .get(&id)
+            .ok_or((
+                StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
                     status: "error".into(),
-                    error: format!("failed to build agent: {e}"),
+                    error: "session not found".into(),
                 }),
-            )
-        })?;
+            ))?
+            .runtime
+            .clone()
+    };
 
-    // Load existing transcript for multi-turn (only if there are prior messages)
-    if !transcript.is_empty() {
-        agent.set_transcript(transcript);
-    }
-
-    // Ensure broadcast channel exists for this session
+    // Ensure broadcast channel exists for this session before we lock the runtime.
     let broadcast_tx = {
         let mut channels = state.event_channels.write().await;
         let tx = channels.entry(id.clone()).or_insert_with(|| {
@@ -1019,17 +1026,30 @@ async fn send_session_message(
         tx.clone()
     };
 
-    // Spawn a task to forward StepEvents from mpsc to broadcast channel
+    // Lock the runtime for this turn (serializes concurrent requests per session).
+    let mut runtime = runtime_arc.lock().await;
+
+    // Wire a ChannelSink so events are forwarded to SSE subscribers.
+    let (sink, mut event_rx) = ChannelSink::new();
+    runtime.set_event_sink(Arc::new(sink));
+
+    // Spawn a forwarder: AgentEvent → SseEvent → broadcast channel.
     let forward_handle = tokio::spawn(async move {
-        while let Some(step_event) = event_rx.recv().await {
-            if let Some(sse_event) = map_step_event(&step_event) {
+        while let Some(agent_event) = event_rx.recv().await {
+            if let Some(sse_event) = map_agent_event(&agent_event) {
                 let _ = broadcast_tx.send(sse_event);
             }
         }
     });
 
-    // Run agent with the new message
-    let outcome = agent.run(&body.content).await.map_err(|e| {
+    // Run the agent turn (transcript is managed internally by AgentRuntime).
+    let run_result = runtime.run(&body.content).await;
+
+    // Disconnect the sink so the forwarder drains and exits.
+    runtime.set_event_sink(Arc::new(NullSink));
+    let _ = forward_handle.await;
+
+    let _outcome = run_result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1039,29 +1059,14 @@ async fn send_session_message(
         )
     })?;
 
-    // Drop the event sender so the forwarder task can finish
-    agent.set_events(None);
-    drop(agent);
-
-    // Wait for the forwarder to finish draining events
-    let _ = forward_handle.await;
-
-    // Extract the last assistant message
-    let last_assistant = outcome
-        .transcript
+    // Extract the last assistant message from the runtime's transcript.
+    let last_assistant = runtime
+        .transcript()
         .iter()
         .rev()
         .find(|m| m.role == crate::message::Role::Assistant)
         .map(|m| m.content.clone())
         .unwrap_or_default();
-
-    // Store updated transcript back into session
-    {
-        let mut sessions = state.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.transcript = outcome.transcript;
-        }
-    }
 
     Ok(Json(SessionMessageResponse {
         role: "assistant".into(),
@@ -1113,33 +1118,27 @@ async fn session_events(
 
 // ── Event mapping ────────────────────────────────────────────────────────
 
-/// Map an agent `StepEvent` to an `SseEvent` for broadcasting.
+/// Map an [`AgentEvent`] to an [`SseEvent`] for broadcasting to SSE clients.
 ///
-/// Returns `None` for events that don't have an SSE equivalent (e.g., latency,
-/// partial tokens, usage stats).
-pub fn map_step_event(event: &StepEvent) -> Option<SseEvent> {
+/// Returns `None` for events that have no SSE equivalent (latency, tokens, etc.).
+pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
     match event {
-        StepEvent::ToolCall { call, step } => Some(SseEvent::ToolCall {
-            name: call.name.clone(),
+        AgentEvent::ToolCall { name, step, .. } => Some(SseEvent::ToolCall {
+            name: name.clone(),
             step: *step,
         }),
-        StepEvent::ToolResult {
-            name,
-            output,
-            step: _,
-            ..
-        } => {
+        AgentEvent::ToolResult { name, output, .. } => {
             let success = !output.starts_with("ERROR: ");
             Some(SseEvent::ToolResult {
                 name: name.clone(),
                 success,
             })
         }
-        StepEvent::Finished { reason, steps } => Some(SseEvent::Done {
-            finish_reason: format!("{:?}", reason),
+        AgentEvent::TurnFinished { reason, steps } => Some(SseEvent::Done {
+            finish_reason: reason.clone(),
             total_steps: *steps,
         }),
-        // Other events don't map to SSE events
+        // AssistantText, Latency, Usage, Compacted, Plan* don't have SSE equivalents.
         _ => None,
     }
 }

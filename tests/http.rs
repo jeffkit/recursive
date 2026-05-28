@@ -5,7 +5,7 @@ mod http_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use recursive::config::Config;
-    use recursive::http::{build_router, map_step_event, AppState, Metrics, SseEvent, ToolInfo};
+    use recursive::http::{build_router, map_agent_event, AppState, Metrics, SseEvent, ToolInfo};
     use recursive::llm::{Completion, MockProvider};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -868,19 +868,16 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn map_step_event_tool_call() {
-        use recursive::llm::ToolCall as LlmToolCall;
-        use recursive::StepEvent;
+    async fn map_agent_event_tool_call() {
+        use recursive::AgentEvent;
 
-        let step_event = StepEvent::ToolCall {
-            call: LlmToolCall {
-                id: "call_1".into(),
-                name: "write_file".into(),
-                arguments: serde_json::json!({"path": "/tmp/test"}),
-            },
+        let event = AgentEvent::ToolCall {
+            name: "write_file".into(),
+            id: "call_1".into(),
+            arguments: r#"{"path": "/tmp/test"}"#.into(),
             step: 2,
         };
-        let sse = map_step_event(&step_event).unwrap();
+        let sse = map_agent_event(&event).unwrap();
         assert_eq!(
             sse,
             SseEvent::ToolCall {
@@ -891,16 +888,16 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn map_step_event_tool_result_success() {
-        use recursive::StepEvent;
+    async fn map_agent_event_tool_result_success() {
+        use recursive::AgentEvent;
 
-        let step_event = StepEvent::ToolResult {
+        let event = AgentEvent::ToolResult {
             id: "call_1".into(),
             name: "read_file".into(),
             output: "file contents here".into(),
             step: 1,
         };
-        let sse = map_step_event(&step_event).unwrap();
+        let sse = map_agent_event(&event).unwrap();
         assert_eq!(
             sse,
             SseEvent::ToolResult {
@@ -911,16 +908,16 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn map_step_event_tool_result_error() {
-        use recursive::StepEvent;
+    async fn map_agent_event_tool_result_error() {
+        use recursive::AgentEvent;
 
-        let step_event = StepEvent::ToolResult {
+        let event = AgentEvent::ToolResult {
             id: "call_2".into(),
             name: "write_file".into(),
             output: "ERROR: permission denied".into(),
             step: 3,
         };
-        let sse = map_step_event(&step_event).unwrap();
+        let sse = map_agent_event(&event).unwrap();
         assert_eq!(
             sse,
             SseEvent::ToolResult {
@@ -931,15 +928,14 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn map_step_event_finished() {
-        use recursive::FinishReason;
-        use recursive::StepEvent;
+    async fn map_agent_event_turn_finished() {
+        use recursive::AgentEvent;
 
-        let step_event = StepEvent::Finished {
-            reason: FinishReason::NoMoreToolCalls,
+        let event = AgentEvent::TurnFinished {
+            reason: "NoMoreToolCalls".into(),
             steps: 5,
         };
-        let sse = map_step_event(&step_event).unwrap();
+        let sse = map_agent_event(&event).unwrap();
         assert_eq!(
             sse,
             SseEvent::Done {
@@ -950,20 +946,17 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn map_step_event_returns_none_for_unrelated() {
-        use recursive::StepEvent;
+    async fn map_agent_event_returns_none_for_unrelated() {
+        use recursive::AgentEvent;
 
-        let step_event = StepEvent::Latency {
-            step: 1,
-            llm_ms: 500,
-        };
-        assert!(map_step_event(&step_event).is_none());
+        let event = AgentEvent::Latency { step: 1, llm_ms: 500 };
+        assert!(map_agent_event(&event).is_none());
 
-        let step_event = StepEvent::PartialToken {
+        let event = AgentEvent::AssistantText {
             text: "hello".into(),
             step: 1,
         };
-        assert!(map_step_event(&step_event).is_none());
+        assert!(map_agent_event(&event).is_none());
     }
 
     #[tokio::test]
