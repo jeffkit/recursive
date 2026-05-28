@@ -647,6 +647,27 @@ Please fix the compilation/test errors. Do NOT start over — fix the specific i
   fi
 fi
 
+# ---- Format check (cargo fmt) -----------------------------------------------
+# Defence in depth #2: enforce `cargo fmt --all -- --check` so that goals
+# don't accumulate formatting debt across runs (g133 leaked unformatted code
+# to main; orchestrator-notes-20260528T072202Z.md flagged this gap).
+#
+# Disable with RECURSIVE_FMT_CHECK=0 only if a goal genuinely needs to land
+# unformatted code (rare — almost certainly a bug in the agent's edit).
+if [[ "${RECURSIVE_FMT_CHECK:-1}" == "1" ]] \
+   && ! cargo fmt --all -- --check >/tmp/cargo-fmt-errors.log 2>&1; then
+  {
+    echo ""
+    echo "--- FMT-CHECK: cargo fmt --all -- --check FAILED ---"
+    tail -40 /tmp/cargo-fmt-errors.log
+    echo ""
+    echo "Run \`cargo fmt --all\` locally to fix, or set RECURSIVE_FMT_CHECK=0"
+    echo "if this is intentional (with a journal note explaining why)."
+    echo ""
+  } | tee -a "$LOG"
+  verdict_and_exit "rolled-back" "post-agent cargo fmt --check failed"
+fi
+
 # ---- E2E Smoke Gate ----------------------------------------------------------
 # Verify the newly-built binary actually works as an agent (not just compiles).
 # Uses ArgusAI replay mode with fixtures — deterministic, no API key needed.

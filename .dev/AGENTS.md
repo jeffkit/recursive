@@ -157,6 +157,13 @@ tests/
    All four must be green before you stop. `-D warnings` means even a
    clippy *warning* will fail the build.
 
+   **`cargo fmt --all` is enforced as a hard gate by `self-improve.sh`**
+   (since g141): if `cargo fmt --all -- --check` is non-zero after your
+   edits, the wrapper rolls the run back. Running `cargo fmt --all`
+   in-place is sufficient — the wrapper re-checks via `--check`. Only
+   set `RECURSIVE_FMT_CHECK=0` if you have a documented reason in the
+   journal entry.
+
    **Verify behavior through `cargo test`, never through `cargo run | jq`.**
    On a fresh worktree, `cargo run` first does a full `cargo build`, whose
    "Compiling …" / "Finished …" lines spill onto stderr *and sometimes
