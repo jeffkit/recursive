@@ -18,6 +18,10 @@ pub fn config_file_path() -> Option<PathBuf> {
 pub struct FileConfig {
     pub provider: Option<ProviderSection>,
     pub agent: Option<AgentSection>,
+    /// Optional `[permissions]` section. When present, restricts which
+    /// tools the agent may invoke. Schema mirrors
+    /// [`crate::permissions::PermissionsConfig`]. See g140.
+    pub permissions: Option<PermissionsSection>,
 }
 
 /// [provider] section.
@@ -36,6 +40,19 @@ pub struct AgentSection {
     pub max_steps: Option<usize>,
     pub temperature: Option<f64>,
     pub shell_timeout_secs: Option<u64>,
+}
+
+/// [permissions] section. Wire-compatible with
+/// [`crate::permissions::PermissionsConfig`] but lives here so config
+/// loading does not couple to that crate.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct PermissionsSection {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub interactive: Vec<String>,
 }
 
 impl FileConfig {

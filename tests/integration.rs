@@ -955,3 +955,139 @@ mod shutdown {
         );
     }
 }
+
+// ============================================================================
+// Goal-140: Tool permission system wiring. g133 shipped
+// PermissionsConfig + ToolRegistry::with_permissions; this verifies
+// that, when a config is attached, ToolRegistry::invoke enforces it.
+// ============================================================================
+
+mod permissions {
+    use recursive::error::Error;
+    use recursive::permissions::PermissionsConfig;
+    use recursive::tools::{
+        BackgroundJobManager, LocalTransport, ReadFile, RunBackground, RunShell, ToolRegistry,
+        WriteFile,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn registry_with(perms: PermissionsConfig) -> (ToolRegistry, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let bg = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
+        let registry = ToolRegistry::new(Arc::new(LocalTransport))
+            .register(Arc::new(ReadFile::new(&root)))
+            .register(Arc::new(WriteFile::new(&root)))
+            .register(Arc::new(RunShell::new(&root)))
+            .register(Arc::new(RunBackground::new(&root, bg)))
+            .with_permissions(perms);
+        (registry, tmp)
+    }
+
+    /// Test A — explicit deny blocks invocation; the registry returns
+    /// `Error::PermissionDenied` (which becomes an "ERROR: ..." tool
+    /// result message at the agent loop level).
+    #[tokio::test]
+    async fn permissions_deny_blocks_invoke() {
+        let perms = PermissionsConfig {
+            allow: vec![],
+            deny: vec!["run_shell".into()],
+            interactive: vec![],
+        };
+        let (registry, _tmp) = registry_with(perms);
+        let result = registry
+            .invoke("run_shell", json!({ "command": "echo hi" }))
+            .await;
+        match result {
+            Err(Error::PermissionDenied { name }) => assert_eq!(name, "run_shell"),
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    /// Test B — non-empty allow list rejects unlisted tools.
+    #[tokio::test]
+    async fn permissions_allow_filter_blocks_unlisted() {
+        let perms = PermissionsConfig {
+            allow: vec!["read_file".into()],
+            deny: vec![],
+            interactive: vec![],
+        };
+        let (registry, _tmp) = registry_with(perms);
+        let result = registry
+            .invoke("write_file", json!({ "path": "x.txt", "content": "y" }))
+            .await;
+        assert!(
+            matches!(result, Err(Error::PermissionDenied { .. })),
+            "expected PermissionDenied for write_file under allow=[read_file]"
+        );
+    }
+
+    /// Test C — glob patterns match multiple tools.
+    #[tokio::test]
+    async fn permissions_glob_pattern_matches() {
+        let perms = PermissionsConfig {
+            allow: vec![],
+            deny: vec!["run_*".into()],
+            interactive: vec![],
+        };
+        let (registry, _tmp) = registry_with(perms);
+
+        for tool in ["run_shell", "run_background"] {
+            let result = registry.invoke(tool, json!({})).await;
+            assert!(
+                matches!(result, Err(Error::PermissionDenied { .. })),
+                "expected {tool} to be denied by run_*"
+            );
+        }
+
+        // read_file is unrelated — it should not be rejected by the
+        // permission layer (it may still fail for other reasons, e.g.
+        // a missing path argument; we only assert it's not
+        // PermissionDenied).
+        let result = registry
+            .invoke("read_file", json!({ "path": "doesnotexist.txt" }))
+            .await;
+        assert!(
+            !matches!(result, Err(Error::PermissionDenied { .. })),
+            "read_file must not be denied by run_* pattern"
+        );
+    }
+
+    /// Test D — registry without a permissions config allows
+    /// everything. Without this assertion a future refactor could
+    /// silently flip the default to deny-by-default.
+    #[tokio::test]
+    async fn permissions_no_config_allows_everything() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let registry =
+            ToolRegistry::new(Arc::new(LocalTransport)).register(Arc::new(WriteFile::new(&root)));
+        let result = registry
+            .invoke("write_file", json!({ "path": "ok.txt", "content": "ok" }))
+            .await;
+        assert!(
+            !matches!(result, Err(Error::PermissionDenied { .. })),
+            "no-permissions registry must not return PermissionDenied"
+        );
+    }
+
+    /// Test E — `[permissions]` section parses from a config.toml-style
+    /// TOML blob via FileConfig.
+    #[test]
+    fn permissions_section_parses_from_toml() {
+        let toml_text = r#"
+[permissions]
+allow = ["read_file", "list_dir"]
+deny = ["run_*"]
+interactive = ["write_file"]
+"#;
+        let cfg: recursive::config_file::FileConfig =
+            toml::from_str(toml_text).expect("parse config.toml");
+        let section = cfg.permissions.expect("permissions section present");
+        assert_eq!(section.allow, vec!["read_file", "list_dir"]);
+        assert_eq!(section.deny, vec!["run_*"]);
+        assert_eq!(section.interactive, vec!["write_file"]);
+    }
+}

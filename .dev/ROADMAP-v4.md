@@ -71,7 +71,7 @@ Make it safe and reliable for real deployments.
 |----|---------|--------|--------|
 | 17.1 | Rate limiting (per-session, per-API-key) | S | ✅ Batch 38 (Goal 121 implementation 1d7a53d + Goal 139 integration tests) |
 | 17.2 | Authentication (API keys + JWT) | M | ✅ Batch 38 (Goal 135 API keys + Goal 136 JWT HS256 verify-only) |
-| 17.3 | Tool permission system (role-based allow/deny) | M | 🔴 |
+| 17.3 | Tool permission system (role-based allow/deny) | M | 🟡 Partial — allow/deny patterns shipped (Goal 133 + Goal 140 wired into config.toml + env); role-based per-caller permissions deferred |
 | 17.4 | Graceful shutdown + in-flight request draining | S | ✅ Batch 38 (Goal 120 signal handling + Goal 137 wired token through kernel/runtime) |
 | 17.5 | Docker packaging + health probes | S | ✅ Batch 38 (Goal 138 — Dockerfile + .dockerignore + ghcr.io workflow; /health auth-exempt suffices for k8s probes) |
 

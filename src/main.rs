@@ -881,7 +881,49 @@ async fn build_tools(config: &Config) -> ToolRegistry {
             Duration::from_secs(config.shell_timeout_secs),
         )));
     }
+    if let Some(perms) = resolve_tool_permissions() {
+        registry = registry.with_permissions(perms);
+    }
     registry
+}
+
+/// Resolve the active tool-permission configuration.
+///
+/// Resolution order:
+///   1. `RECURSIVE_TOOL_PERMISSIONS_FILE=<path>` env — TOML file
+///      whose top-level keys are `allow`, `deny`, `interactive`
+///      (matches [`recursive::permissions::PermissionsConfig`] verbatim).
+///   2. `~/.recursive/config.toml`'s `[permissions]` section.
+///   3. None — every tool allowed (back-compat default).
+///
+/// Errors during file read or TOML parse are logged to stderr and
+/// treated as "no permissions config" — a malformed file should not
+/// brick the CLI for unrelated commands.
+fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfig> {
+    if let Ok(path) = std::env::var("RECURSIVE_TOOL_PERMISSIONS_FILE") {
+        if !path.is_empty() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    match toml::from_str::<recursive::permissions::PermissionsConfig>(&content) {
+                        Ok(perms) => return Some(perms),
+                        Err(e) => {
+                            eprintln!("permissions: failed to parse {path}: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("permissions: failed to read {path}: {e}");
+                }
+            }
+        }
+    }
+    let file_config = recursive::config_file::FileConfig::load().ok().flatten()?;
+    let section = file_config.permissions?;
+    Some(recursive::permissions::PermissionsConfig {
+        allow: section.allow,
+        deny: section.deny,
+        interactive: section.interactive,
+    })
 }
 
 /// Register MCP tools from a config file into the registry.
