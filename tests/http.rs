@@ -1065,4 +1065,104 @@ mod http_tests {
         );
         assert!(paths.contains_key("/openapi.json"), "missing /openapi.json");
     }
+
+    // ------------------------------------------------------------------------
+    // /metrics endpoint (Goal 134) — covers the Prometheus exposition format,
+    // the auto-incrementing middleware, and the round-trip from atomic store
+    // back into the rendered response body. Counter implementation lives in
+    // src/http.rs (Goal 122 / commit 01792b7).
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn metrics_returns_prometheus_format() {
+        let app = build_router(sample_state());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        // Must contain HELP/TYPE preambles for at least one counter and one gauge.
+        assert!(text.contains("# HELP recursive_requests_total"));
+        assert!(text.contains("# TYPE recursive_requests_total counter"));
+        assert!(text.contains("# TYPE recursive_requests_active gauge"));
+
+        // Must list every metric name from the Metrics struct.
+        for name in [
+            "recursive_requests_total",
+            "recursive_requests_active",
+            "recursive_agent_runs_total",
+            "recursive_agent_runs_success",
+            "recursive_agent_runs_failed",
+            "recursive_tokens_prompt_total",
+            "recursive_tokens_completion_total",
+            "recursive_agent_steps_total",
+        ] {
+            assert!(text.contains(name), "missing metric: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_middleware_increments_requests_total() {
+        let state = sample_state();
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        // Hit two non-/metrics endpoints to drive the middleware.
+        for uri in ["/health", "/tools"] {
+            let _ = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let n = metrics
+            .requests_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(n >= 2, "expected requests_total >= 2, got {n}");
+    }
+
+    #[tokio::test]
+    async fn metrics_counter_values_render() {
+        let state = sample_state();
+        state
+            .metrics
+            .agent_runs_total
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .tokens_prompt_total
+            .store(12345, std::sync::atomic::Ordering::Relaxed);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("recursive_agent_runs_total 7"));
+        assert!(text.contains("recursive_tokens_prompt_total 12345"));
+    }
 }

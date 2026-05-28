@@ -40,11 +40,11 @@ Understanding what agents do in production.
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
 | 15.1 | Structured logging (tracing spans per step) | S | ✅ Batch 36 (Goal 115) |
-| 15.2 | Metrics endpoint (Prometheus-compatible) | M | 🔴 → Batch 37 |
+| 15.2 | Metrics endpoint (Prometheus-compatible) | M | ✅ Batch 37-38 (Goal 122 implementation, 01792b7; Goal 134 test coverage) |
 | 15.3 | Cost tracking (per-session persistence) | M | ✅ Batch 36-37 (Goal 116 + wired in main.rs via Goal H, 190b6e16) |
 | 15.4 | Replay viewer (web-based transcript replay) | M | 🔴 |
 
-**Total**: ~2 batches → 2 done (15.1, 15.3); 15.2 + 15.4 remain
+**Total**: ~2 batches → 3 done (15.1, 15.2, 15.3); 15.4 remains
 
 ---
 
