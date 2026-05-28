@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::compact::Compactor;
 use crate::event::EventSink;
+use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, TokenUsage, ToolSpec};
 use crate::message::Message;
 use crate::tools::ToolRegistry;
@@ -126,6 +128,12 @@ pub struct AgentKernel {
     pub(crate) tools: ToolRegistry,
     /// Maximum number of LLM calls per turn.
     pub(crate) max_steps: usize,
+    /// Maximum transcript characters before trimming (None = no limit).
+    pub(crate) max_transcript_chars: Option<usize>,
+    /// Optional compactor for summarising old messages.
+    pub(crate) compactor: Option<Compactor>,
+    /// Hook registry for lifecycle hooks.
+    pub(crate) hooks: HookRegistry,
 }
 
 impl AgentKernel {
@@ -151,7 +159,62 @@ impl AgentKernel {
             llm: self.llm.clone(),
             tools,
             max_steps: self.max_steps,
+            max_transcript_chars: self.max_transcript_chars,
+            compactor: self.compactor.clone(),
+            hooks: self.hooks.clone(),
         }
+    }
+
+    /// Execute one turn of the ReAct loop.
+    ///
+    /// Takes a [`TurnContext`] prepared by the Wrapper and returns a
+    /// [`TurnOutcome`] containing only the new messages produced during
+    /// this turn, plus usage stats and finish reason.
+    ///
+    /// The Kernel is stateless: it does not retain any state between calls.
+    /// All cross-turn concerns (transcript accumulation, compaction, persistence)
+    /// are the Wrapper's responsibility.
+    pub async fn run(&self, ctx: TurnContext) -> crate::error::Result<TurnOutcome> {
+        use crate::agent::RunCore;
+
+        let input_len = ctx.messages.len();
+
+        let core = RunCore {
+            messages: ctx.messages,
+            llm: self.llm.clone(),
+            tools: self.tools.clone(),
+            max_steps: self.max_steps,
+            max_transcript_chars: self.max_transcript_chars,
+            events: None, // TODO: bridge EventSink → mpsc in a future goal
+            streaming: ctx.streaming,
+            compactor: self.compactor.clone(),
+            permission_hook: ctx.permission_hook,
+            hooks: &self.hooks,
+            planning_mode: ctx.planning_mode,
+            on_message: &None,
+            total_llm_latency_ms: 0,
+            plan_buffer: None,
+            plan_confirmed: false,
+        };
+
+        let inner = core.run_inner().await?;
+
+        // Extract only the messages produced during this turn
+        let new_messages = if inner.messages.len() > input_len {
+            inner.messages[input_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok(TurnOutcome {
+            new_messages,
+            final_text: inner.final_message,
+            finish_reason: inner.finish_reason,
+            usage: inner.total_usage,
+            llm_latency_ms: inner.total_llm_latency_ms,
+            steps: inner.steps,
+            side_effects: Vec::new(),
+        })
     }
 }
 
@@ -165,6 +228,9 @@ pub struct AgentKernelBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
     tools: Option<ToolRegistry>,
     max_steps: Option<usize>,
+    max_transcript_chars: Option<usize>,
+    compactor: Option<Compactor>,
+    hooks: Option<HookRegistry>,
 }
 
 impl AgentKernelBuilder {
@@ -186,6 +252,24 @@ impl AgentKernelBuilder {
         self
     }
 
+    /// Set the maximum transcript characters before trimming.
+    pub fn max_transcript_chars(mut self, n: usize) -> Self {
+        self.max_transcript_chars = Some(n);
+        self
+    }
+
+    /// Set the compactor for summarising old messages.
+    pub fn compactor(mut self, compactor: Compactor) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
+    /// Set the hook registry.
+    pub fn hooks(mut self, hooks: HookRegistry) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
     /// Build the `AgentKernel`, or return an error if required fields are missing.
     pub fn build(self) -> crate::error::Result<AgentKernel> {
         let llm = self.llm.ok_or_else(|| crate::error::Error::Config {
@@ -193,10 +277,14 @@ impl AgentKernelBuilder {
         })?;
         let tools = self.tools.unwrap_or_else(ToolRegistry::local);
         let max_steps = self.max_steps.unwrap_or(32);
+        let hooks = self.hooks.unwrap_or_default();
         Ok(AgentKernel {
             llm,
             tools,
             max_steps,
+            max_transcript_chars: self.max_transcript_chars,
+            compactor: self.compactor,
+            hooks,
         })
     }
 }

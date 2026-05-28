@@ -232,15 +232,15 @@ pub struct Agent {
 }
 
 /// Outcome returned by the stateless [`run_inner`] loop.
-struct RunInnerOutcome {
-    messages: Vec<Message>,
-    final_message: Option<String>,
-    finish_reason: FinishReason,
-    total_usage: TokenUsage,
-    total_llm_latency_ms: u64,
-    steps: usize,
-    plan_buffer: Option<Vec<ToolCall>>,
-    plan_confirmed: bool,
+pub(crate) struct RunInnerOutcome {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) final_message: Option<String>,
+    pub(crate) finish_reason: FinishReason,
+    pub(crate) total_usage: TokenUsage,
+    pub(crate) total_llm_latency_ms: u64,
+    pub(crate) steps: usize,
+    pub(crate) plan_buffer: Option<Vec<ToolCall>>,
+    pub(crate) plan_confirmed: bool,
 }
 
 /// Private core holding all state needed for one run of the ReAct loop.
@@ -248,22 +248,22 @@ struct RunInnerOutcome {
 /// Borrows immutable config from the parent [`Agent`]; owns the mutable
 /// transcript and plan state.  `run_inner()` consumes `self` so the
 /// loop cannot accidentally leave stale state behind.
-struct RunCore<'a> {
-    messages: Vec<Message>,
-    llm: Arc<dyn LlmProvider>,
-    tools: ToolRegistry,
-    max_steps: usize,
-    max_transcript_chars: Option<usize>,
-    events: Option<mpsc::UnboundedSender<StepEvent>>,
-    streaming: bool,
-    compactor: Option<Compactor>,
-    permission_hook: Option<PermissionHook>,
-    hooks: &'a HookRegistry,
-    planning_mode: PlanningMode,
-    on_message: &'a Option<OnMessageFn>,
-    total_llm_latency_ms: u64,
-    plan_buffer: Option<Vec<ToolCall>>,
-    plan_confirmed: bool,
+pub(crate) struct RunCore<'a> {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) llm: Arc<dyn LlmProvider>,
+    pub(crate) tools: ToolRegistry,
+    pub(crate) max_steps: usize,
+    pub(crate) max_transcript_chars: Option<usize>,
+    pub(crate) events: Option<mpsc::UnboundedSender<StepEvent>>,
+    pub(crate) streaming: bool,
+    pub(crate) compactor: Option<Compactor>,
+    pub(crate) permission_hook: Option<PermissionHook>,
+    pub(crate) hooks: &'a HookRegistry,
+    pub(crate) planning_mode: PlanningMode,
+    pub(crate) on_message: &'a Option<OnMessageFn>,
+    pub(crate) total_llm_latency_ms: u64,
+    pub(crate) plan_buffer: Option<Vec<ToolCall>>,
+    pub(crate) plan_confirmed: bool,
 }
 
 impl<'a> RunCore<'a> {
@@ -522,7 +522,7 @@ impl<'a> RunCore<'a> {
 
     /// Stateless core ReAct loop.  Consumes `self` and returns a
     /// [`RunInnerOutcome`] that the wrapper integrates into the parent agent.
-    async fn run_inner(mut self) -> Result<RunInnerOutcome> {
+    pub(crate) async fn run_inner(mut self) -> Result<RunInnerOutcome> {
         let specs = self.tools.specs();
 
         let mut final_message: Option<String> = None;
