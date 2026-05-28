@@ -231,6 +231,576 @@ pub struct Agent {
     on_message: Option<OnMessageFn>,
 }
 
+/// Outcome returned by the stateless [`run_inner`] loop.
+struct RunInnerOutcome {
+    messages: Vec<Message>,
+    final_message: Option<String>,
+    finish_reason: FinishReason,
+    total_usage: TokenUsage,
+    total_llm_latency_ms: u64,
+    steps: usize,
+    plan_buffer: Option<Vec<ToolCall>>,
+    plan_confirmed: bool,
+}
+
+/// Private core holding all state needed for one run of the ReAct loop.
+///
+/// Borrows immutable config from the parent [`Agent`]; owns the mutable
+/// transcript and plan state.  `run_inner()` consumes `self` so the
+/// loop cannot accidentally leave stale state behind.
+struct RunCore<'a> {
+    messages: Vec<Message>,
+    llm: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    max_steps: usize,
+    max_transcript_chars: Option<usize>,
+    events: Option<mpsc::UnboundedSender<StepEvent>>,
+    streaming: bool,
+    compactor: Option<Compactor>,
+    permission_hook: Option<PermissionHook>,
+    hooks: &'a HookRegistry,
+    planning_mode: PlanningMode,
+    on_message: &'a Option<OnMessageFn>,
+    total_llm_latency_ms: u64,
+    plan_buffer: Option<Vec<ToolCall>>,
+    plan_confirmed: bool,
+}
+
+impl<'a> RunCore<'a> {
+    fn emit(&self, event: StepEvent) {
+        if let Some(ref tx) = self.events {
+            let _ = tx.send(event);
+        }
+    }
+
+    fn push_message(&mut self, msg: Message) {
+        if let Some(ref cb) = self.on_message {
+            cb(&msg);
+        }
+        self.messages.push(msg);
+    }
+
+    /// Trim old tool results to fit the transcript under `limit` chars.
+    fn maybe_trim_transcript(&mut self, limit: usize, step: usize) {
+        let mut chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        if chars < limit {
+            return;
+        }
+
+        let mut trimmed_count: usize = 0;
+        let placeholder_len = TRIM_PLACEHOLDER.len();
+
+        for msg in self.messages.iter_mut().skip(1) {
+            if msg.role == crate::message::Role::Tool && msg.content.len() > 200 {
+                let old_len = msg.content.len();
+                msg.content = TRIM_PLACEHOLDER.to_string();
+                trimmed_count += 1;
+                chars = chars
+                    .saturating_sub(old_len)
+                    .saturating_add(placeholder_len);
+                if chars < limit {
+                    break;
+                }
+            }
+        }
+
+        if trimmed_count > 0 {
+            let note = format!(
+                "[trimmed {} old tool result{} to fit budget]",
+                trimmed_count,
+                if trimmed_count == 1 { "" } else { "s" }
+            );
+            self.emit(StepEvent::AssistantText { text: note, step });
+        }
+    }
+
+    /// Compact the transcript if a [`Compactor`] is configured and the
+    /// character budget is exceeded.
+    async fn maybe_compact(&mut self, step: usize) -> Result<()> {
+        let compactor = match &self.compactor {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let chars = Compactor::estimate_chars(&self.messages);
+        if chars < compactor.threshold_chars {
+            return Ok(());
+        }
+
+        let min_messages = compactor.keep_recent_n + 2;
+        if self.messages.len() < min_messages {
+            return Ok(());
+        }
+
+        let summary_msg = compactor
+            .compact(self.llm.as_ref(), &self.messages)
+            .await?;
+        let summary_chars = summary_msg.content.len();
+
+        let keep = compactor.keep_recent_n;
+        let mut split = self.messages.len().saturating_sub(keep);
+
+        // Invariant: every `Role::Tool` message must be immediately preceded by
+        // an `Role::Assistant` message containing the matching `tool_calls`.
+        while split > 0 && matches!(self.messages[split].role, crate::message::Role::Tool) {
+            split -= 1;
+        }
+
+        let removed = split;
+        let kept = self.messages.len() - split;
+
+        self.messages.drain(..split);
+        self.messages.insert(0, summary_msg);
+
+        self.hooks.dispatch(HookEvent::PostCompact {
+            removed,
+            summary_chars,
+        });
+
+        self.emit(StepEvent::Compacted {
+            removed,
+            kept,
+            summary_chars,
+            step,
+        });
+
+        Ok(())
+    }
+
+    /// Execute a set of tool calls, returning `(id, name, output, args)` for each.
+    /// Read-only calls are batched and executed in parallel; write calls run
+    /// sequentially to preserve ordering guarantees.
+    async fn execute_tool_calls(
+        &self,
+        calls: &[ToolCall],
+    ) -> Vec<(String, String, String, serde_json::Value)> {
+        let mut results: Vec<(String, String, String, serde_json::Value)> = Vec::new();
+
+        struct PendingCall {
+            id: String,
+            name: String,
+            args: serde_json::Value,
+        }
+        let mut pending: Vec<PendingCall> = Vec::new();
+
+        for call in calls {
+            let effective_args = if let Some(ref hook) = self.permission_hook {
+                match hook(&call.name, &call.arguments) {
+                    PermissionDecision::Allow => call.arguments.clone(),
+                    PermissionDecision::Deny(reason) => {
+                        let result = format!("ERROR: {reason}");
+                        results.push((
+                            call.id.clone(),
+                            call.name.clone(),
+                            result,
+                            call.arguments.clone(),
+                        ));
+                        continue;
+                    }
+                    PermissionDecision::Transform(new_args) => new_args,
+                }
+            } else {
+                call.arguments.clone()
+            };
+
+            let hook_action = self.hooks.dispatch(HookEvent::PreToolCall {
+                name: &call.name,
+                args: &effective_args,
+            });
+            match hook_action {
+                HookAction::Skip => {
+                    let result = "ERROR: tool call skipped by hook".to_string();
+                    results.push((
+                        call.id.clone(),
+                        call.name.clone(),
+                        result,
+                        call.arguments.clone(),
+                    ));
+                    continue;
+                }
+                HookAction::Error(msg) => {
+                    let result = format!("ERROR: {msg}");
+                    results.push((
+                        call.id.clone(),
+                        call.name.clone(),
+                        result,
+                        call.arguments.clone(),
+                    ));
+                    continue;
+                }
+                HookAction::Continue => {}
+            }
+
+            pending.push(PendingCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args: effective_args,
+            });
+        }
+
+        let mut i = 0;
+        while i < pending.len() {
+            if self.tools.is_readonly(&pending[i].name) {
+                let batch_start = i;
+                while i < pending.len() && self.tools.is_readonly(&pending[i].name) {
+                    i += 1;
+                }
+                let batch: Vec<PendingCall> = pending.drain(batch_start..i).collect();
+                i = batch_start;
+
+                let mut join_set = tokio::task::JoinSet::new();
+                for pc in &batch {
+                    let name = pc.name.clone();
+                    let args = pc.args.clone();
+                    let tools = self.tools.clone();
+                    join_set.spawn(async move {
+                        let tool_start = std::time::Instant::now();
+                        let span = tracing::info_span!("tool.exec", tool = %name);
+                        let result = span.in_scope(|| tools.invoke(&name, args)).await;
+                        let result = match result {
+                            Ok(output) => output,
+                            Err(err) => format!("ERROR: {err}"),
+                        };
+                        let duration_ms = tool_start.elapsed().as_millis() as u64;
+                        (name, result, duration_ms)
+                    });
+                }
+
+                let mut batch_results: Vec<(String, String, u64)> = Vec::new();
+                while let Some(res) = join_set.join_next().await {
+                    let (name, result, duration_ms) = res.unwrap();
+                    batch_results.push((name, result, duration_ms));
+                }
+
+                for pc in &batch {
+                    let (_, result, duration_ms) = batch_results
+                        .iter()
+                        .find(|(n, _, _)| n == &pc.name)
+                        .unwrap();
+                    results.push((
+                        pc.id.clone(),
+                        pc.name.clone(),
+                        result.clone(),
+                        pc.args.clone(),
+                    ));
+                    self.hooks.dispatch(HookEvent::PostToolCall {
+                        name: &pc.name,
+                        args: &pc.args,
+                        result,
+                        duration_ms: *duration_ms,
+                    });
+                }
+            } else {
+                let pc = pending.remove(i);
+                let tool_start = std::time::Instant::now();
+                let span = tracing::info_span!("tool.exec", tool = %pc.name);
+                let result = span
+                    .in_scope(|| self.tools.invoke(&pc.name, pc.args.clone()))
+                    .await;
+                let result = match result {
+                    Ok(output) => output,
+                    Err(err) => format!("ERROR: {err}"),
+                };
+                let duration_ms = tool_start.elapsed().as_millis() as u64;
+                results.push((
+                    pc.id.clone(),
+                    pc.name.clone(),
+                    result.clone(),
+                    pc.args.clone(),
+                ));
+                self.hooks.dispatch(HookEvent::PostToolCall {
+                    name: &pc.name,
+                    args: &pc.args,
+                    result: &result,
+                    duration_ms,
+                });
+            }
+        }
+
+        results
+    }
+
+    /// Stateless core ReAct loop.  Consumes `self` and returns a
+    /// [`RunInnerOutcome`] that the wrapper integrates into the parent agent.
+    async fn run_inner(mut self) -> Result<RunInnerOutcome> {
+        let specs = self.tools.specs();
+
+        let mut final_message: Option<String> = None;
+        let mut last_call_key: Option<(String, String)> = None;
+        let mut consecutive_errors: usize = 0;
+        let mut total_usage = TokenUsage::default();
+        self.total_llm_latency_ms = 0;
+
+        for step in 1..=self.max_steps {
+            let step_span = tracing::info_span!("agent.step", step);
+            let _guard = step_span.enter();
+
+            // ---- transcript budget ------------------------------------------------
+            if let Some(limit) = self.max_transcript_chars {
+                self.maybe_trim_transcript(limit, step);
+                let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+                if chars >= limit {
+                    let finish = FinishReason::TranscriptLimit { chars, limit };
+                    self.emit(StepEvent::Finished {
+                        reason: finish.clone(),
+                        steps: step,
+                    });
+                    tracing::info!(
+                        target: "recursive::agent",
+                        steps = step,
+                        tokens_in = total_usage.prompt_tokens,
+                        tokens_out = total_usage.completion_tokens,
+                        finish = ?finish,
+                        llm_latency_ms = self.total_llm_latency_ms,
+                        "agent.run.complete"
+                    );
+                    return Ok(RunInnerOutcome {
+                        messages: self.messages,
+                        final_message,
+                        finish_reason: finish,
+                        total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
+                        steps: step,
+                        plan_buffer: self.plan_buffer,
+                        plan_confirmed: self.plan_confirmed,
+                    });
+                }
+            }
+
+            // ---- compaction -------------------------------------------------------
+            self.hooks.dispatch(HookEvent::PreCompact {
+                transcript_len: self.messages.iter().map(|m| m.content.len()).sum(),
+            });
+            self.maybe_compact(step).await?;
+
+            // ---- plan-confirmed execution -----------------------------------------
+            if self.plan_confirmed {
+                self.plan_confirmed = false;
+                if let Some(calls) = self.plan_buffer.take() {
+                    let results = self.execute_tool_calls(&calls).await;
+                    for (id, name, output, _args) in results {
+                        self.emit(StepEvent::ToolResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: output.clone(),
+                            step,
+                        });
+                        self.push_message(Message::tool_result(id, output));
+                    }
+                    continue;
+                }
+            }
+
+            // ---- LLM call ---------------------------------------------------------
+            debug!(target: "recursive::agent", step, "calling llm");
+            let start = std::time::Instant::now();
+            let completion: Completion = if self.streaming {
+                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+                let stream_tx: Option<StreamSender> = Some(delta_tx);
+                let events_tx = self.events.clone();
+                tokio::spawn(async move {
+                    while let Some(text) = delta_rx.recv().await {
+                        if let Some(ref tx) = events_tx {
+                            let _ = tx.send(StepEvent::PartialToken { text, step });
+                        }
+                    }
+                });
+                self.llm.stream(&self.messages, &specs, stream_tx).await?
+            } else {
+                self.llm.complete(&self.messages, &specs).await?
+            };
+            let llm_ms = start.elapsed().as_millis() as u64;
+            self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
+            self.emit(StepEvent::Latency { step, llm_ms });
+
+            if let Some(u) = completion.usage {
+                total_usage = total_usage.accumulate(u);
+                self.emit(StepEvent::Usage { usage: u, step });
+            }
+
+            if !completion.content.is_empty() {
+                self.emit(StepEvent::AssistantText {
+                    text: completion.content.clone(),
+                    step,
+                });
+                final_message = Some(completion.content.clone());
+            }
+
+            // ---- no tool calls → finish -------------------------------------------
+            if completion.tool_calls.is_empty() {
+                if matches!(completion.finish_reason.as_deref(), Some("length")) {
+                    self.emit(StepEvent::Finished {
+                        reason: FinishReason::ProviderStop("length".into()),
+                        steps: step,
+                    });
+                    return Err(Error::ProviderTruncated("length".into()));
+                }
+
+                self.push_message(Message::assistant(completion.content.clone()));
+                if completion.reasoning_content.is_some() {
+                    if let Some(msg) = self.messages.last_mut() {
+                        msg.reasoning_content = completion.reasoning_content.clone();
+                    }
+                }
+                let finish = match completion.finish_reason {
+                    Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
+                    _ => FinishReason::NoMoreToolCalls,
+                };
+                self.emit(StepEvent::Finished {
+                    reason: finish.clone(),
+                    steps: step,
+                });
+                let outcome = RunInnerOutcome {
+                    messages: self.messages,
+                    final_message,
+                    finish_reason: finish,
+                    total_usage,
+                    total_llm_latency_ms: self.total_llm_latency_ms,
+                    steps: step,
+                    plan_buffer: self.plan_buffer,
+                    plan_confirmed: self.plan_confirmed,
+                };
+                return Ok(outcome);
+            }
+
+            self.push_message(Message::assistant_with_tool_calls(
+                completion.content.clone(),
+                completion.tool_calls.clone(),
+            ));
+            if completion.reasoning_content.is_some() {
+                if let Some(msg) = self.messages.last_mut() {
+                    msg.reasoning_content = completion.reasoning_content.clone();
+                }
+            }
+
+            for call in &completion.tool_calls {
+                self.emit(StepEvent::ToolCall {
+                    call: call.clone(),
+                    step,
+                });
+            }
+
+            // ---- planning mode ----------------------------------------------------
+            if self.planning_mode == PlanningMode::PlanFirst && self.plan_buffer.is_none() {
+                self.plan_buffer = Some(completion.tool_calls.clone());
+
+                let plan_text = completion
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
+                        format!("  - {}({})", tc.name, args_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let plan_text = format!(
+                    "The agent proposes the following steps:\n{}\n\nConfirm or reject this plan.",
+                    plan_text
+                );
+
+                self.emit(StepEvent::PlanProposed {
+                    plan_text: plan_text.clone(),
+                    tool_calls: completion.tool_calls.clone(),
+                });
+
+                tracing::info!(
+                    target: "recursive::agent",
+                    steps = step,
+                    tokens_in = 0usize,
+                    tokens_out = 0usize,
+                    finish = ?FinishReason::PlanPending,
+                    llm_latency_ms = self.total_llm_latency_ms,
+                    "agent.run.complete"
+                );
+                return Ok(RunInnerOutcome {
+                    messages: self.messages,
+                    final_message: Some(plan_text),
+                    finish_reason: FinishReason::PlanPending,
+                    total_usage: TokenUsage::default(),
+                    total_llm_latency_ms: self.total_llm_latency_ms,
+                    steps: step,
+                    plan_buffer: self.plan_buffer,
+                    plan_confirmed: self.plan_confirmed,
+                });
+            }
+
+            // ---- tool execution ---------------------------------------------------
+            let results = self.execute_tool_calls(&completion.tool_calls).await;
+
+            for (id, name, result, args) in &results {
+                self.emit(StepEvent::ToolResult {
+                    id: id.clone(),
+                    name: name.clone(),
+                    output: result.clone(),
+                    step,
+                });
+
+                let call_key = (
+                    name.clone(),
+                    serde_json::to_string(args).unwrap_or_default(),
+                );
+                let is_error = result.starts_with("ERROR:");
+
+                if is_error {
+                    if last_call_key == Some(call_key.clone()) {
+                        consecutive_errors += 1;
+                    } else {
+                        consecutive_errors = 1;
+                    }
+                } else {
+                    consecutive_errors = 0;
+                }
+
+                last_call_key = Some(call_key);
+
+                if consecutive_errors >= STUCK_THRESHOLD {
+                    let repeated_call = name.clone();
+                    let repeats = consecutive_errors;
+                    let finish = FinishReason::Stuck {
+                        repeated_call,
+                        repeats,
+                    };
+                    self.emit(StepEvent::Finished {
+                        reason: finish.clone(),
+                        steps: step,
+                    });
+                    let outcome = RunInnerOutcome {
+                        messages: self.messages,
+                        final_message,
+                        finish_reason: finish,
+                        total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
+                        steps: step,
+                        plan_buffer: self.plan_buffer,
+                        plan_confirmed: self.plan_confirmed,
+                    };
+                    return Ok(outcome);
+                }
+
+                self.push_message(Message::tool_result(id.clone(), result.clone()));
+            }
+        }
+
+        warn!(target: "recursive::agent", "step budget exceeded");
+        let finish = FinishReason::BudgetExceeded;
+        self.emit(StepEvent::Finished {
+            reason: finish.clone(),
+            steps: self.max_steps,
+        });
+        let outcome = RunInnerOutcome {
+            messages: self.messages,
+            final_message,
+            finish_reason: finish,
+            total_usage,
+            total_llm_latency_ms: self.total_llm_latency_ms,
+            steps: self.max_steps,
+            plan_buffer: self.plan_buffer,
+            plan_confirmed: self.plan_confirmed,
+        };
+        Ok(outcome)
+    }
+}
+
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
@@ -441,322 +1011,62 @@ impl Agent {
         self.push_message(Message::user(goal.clone()));
         self.hooks.dispatch(HookEvent::SessionStart { goal: &goal });
 
-        let mut final_message: Option<String> = None;
-        let specs = self.tools.specs();
+        let core = RunCore {
+            messages: std::mem::take(&mut self.transcript),
+            llm: self.llm.clone(),
+            tools: self.tools.clone(),
+            max_steps: self.max_steps,
+            max_transcript_chars: self.max_transcript_chars,
+            events: self.events.clone(),
+            streaming: self.streaming,
+            compactor: self.compactor.clone(),
+            permission_hook: self.permission_hook.clone(),
+            hooks: &self.hooks,
+            planning_mode: self.planning_mode.clone(),
+            on_message: &self.on_message,
+            total_llm_latency_ms: self.total_llm_latency_ms,
+            plan_buffer: self.plan_buffer.take(),
+            plan_confirmed: self.plan_confirmed,
+        };
 
-        // Tracking for anti-stuck heuristic
-        let mut last_call_key: Option<(String, String)> = None;
-        let mut consecutive_errors: usize = 0;
+        let inner = core.run_inner().await?;
 
-        // Accumulate token usage across all LLM calls
-        let mut total_usage = TokenUsage::default();
-        // Reset latency accumulator at start of run
-        self.total_llm_latency_ms = 0;
+        // Restore mutable state from the stateless run.
+        self.transcript = inner.messages;
+        self.total_llm_latency_ms = inner.total_llm_latency_ms;
+        self.plan_buffer = inner.plan_buffer;
+        self.plan_confirmed = inner.plan_confirmed;
 
-        for step in 1..=self.max_steps {
-            let step_span = tracing::info_span!("agent.step", step);
-            let _guard = step_span.enter();
-            // Check transcript size limit before making the next LLM call.
-            // First try trimming old tool results; fall back to hard stop.
-            if let Some(limit) = self.max_transcript_chars {
-                self.maybe_trim_transcript(limit, step);
-                let chars: usize = self.transcript.iter().map(|m| m.content.len()).sum();
-                if chars >= limit {
-                    let finish = FinishReason::TranscriptLimit { chars, limit };
-                    self.emit(StepEvent::Finished {
-                        reason: finish.clone(),
-                        steps: step,
-                    });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = step,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(AgentOutcome {
-                        final_message,
-                        transcript: std::mem::take(&mut self.transcript),
-                        steps: step,
-                        finish,
-                        total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                    });
-                }
-            }
+        let outcome = AgentOutcome {
+            final_message: inner.final_message,
+            transcript: self.transcript.clone(),
+            steps: inner.steps,
+            finish: inner.finish_reason,
+            total_usage: inner.total_usage,
+            total_llm_latency_ms: inner.total_llm_latency_ms,
+        };
 
-            // Optionally compact the transcript if it exceeds the threshold.
-            self.hooks.dispatch(HookEvent::PreCompact {
-                transcript_len: self.transcript.iter().map(|m| m.content.len()).sum(),
-            });
-            self.maybe_compact(step).await?;
-
-            // If a plan was confirmed, execute the buffered calls without
-            // calling the LLM again.
-            if self.plan_confirmed {
-                self.plan_confirmed = false;
-                if let Some(calls) = self.plan_buffer.take() {
-                    let results = self.execute_tool_calls(&calls, step).await;
-                    for (id, name, output, _args) in results {
-                        self.emit(StepEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            output: output.clone(),
-                            step,
-                        });
-                        self.push_message(Message::tool_result(id, output));
-                    }
-                    continue;
-                }
-            }
-
-            debug!(target: "recursive::agent", step, "calling llm");
-            let start = std::time::Instant::now();
-            let completion: Completion = if self.streaming {
-                // Create a channel for streaming deltas
-                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
-                let stream_tx: Option<StreamSender> = Some(delta_tx);
-                // Spawn a task to forward deltas as PartialToken events
-                let events_tx = self.events.clone();
-                tokio::spawn(async move {
-                    while let Some(text) = delta_rx.recv().await {
-                        if let Some(ref tx) = events_tx {
-                            let _ = tx.send(StepEvent::PartialToken { text, step });
-                        }
-                    }
-                });
-                self.llm.stream(&self.transcript, &specs, stream_tx).await?
-            } else {
-                self.llm.complete(&self.transcript, &specs).await?
-            };
-            let llm_ms = start.elapsed().as_millis() as u64;
-            self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
-            self.emit(StepEvent::Latency { step, llm_ms });
-
-            // Accumulate usage from this completion
-            if let Some(u) = completion.usage {
-                total_usage = total_usage.accumulate(u);
-                self.emit(StepEvent::Usage { usage: u, step });
-            }
-
-            if !completion.content.is_empty() {
-                self.emit(StepEvent::AssistantText {
-                    text: completion.content.clone(),
-                    step,
-                });
-                final_message = Some(completion.content.clone());
-            }
-
-            if completion.tool_calls.is_empty() {
-                // Treat a length-limit truncation as a real failure: the model
-                // didn't decide to stop, the server cut it off, so any "result"
-                // here is partial. Surfacing this as an error lets wrappers
-                // (CLI, self-improve scripts, etc.) react instead of silently
-                // believing the run succeeded.
-                if matches!(completion.finish_reason.as_deref(), Some("length")) {
-                    self.emit(StepEvent::Finished {
-                        reason: FinishReason::ProviderStop("length".into()),
-                        steps: step,
-                    });
-                    return Err(Error::ProviderTruncated("length".into()));
-                }
-
-                self.push_message(Message::assistant(completion.content.clone()));
-                // Preserve reasoning_content for DeepSeek thinking mode
-                if completion.reasoning_content.is_some() {
-                    if let Some(msg) = self.transcript.last_mut() {
-                        msg.reasoning_content = completion.reasoning_content.clone();
-                    }
-                }
-                let finish = match completion.finish_reason {
-                    Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
-                    _ => FinishReason::NoMoreToolCalls,
-                };
-                self.emit(StepEvent::Finished {
-                    reason: finish.clone(),
-                    steps: step,
-                });
-                let outcome = AgentOutcome {
-                    final_message,
-                    transcript: std::mem::take(&mut self.transcript),
-                    steps: step,
-                    finish,
-                    total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                };
+        // Dispatch SessionEnd for terminal outcomes.
+        match &outcome.finish {
+            FinishReason::NoMoreToolCalls
+            | FinishReason::Stuck { .. }
+            | FinishReason::BudgetExceeded => {
                 self.hooks
                     .dispatch(HookEvent::SessionEnd { outcome: &outcome });
-                tracing::info!(
-                    target: "recursive::agent",
-                    steps = step,
-                    tokens_in = total_usage.prompt_tokens,
-                    tokens_out = total_usage.completion_tokens,
-                    finish = ?outcome.finish,
-                    llm_latency_ms = self.total_llm_latency_ms,
-                    "agent.run.complete"
-                );
-                return Ok(outcome);
             }
-
-            self.push_message(Message::assistant_with_tool_calls(
-                completion.content.clone(),
-                completion.tool_calls.clone(),
-            ));
-            // Preserve reasoning_content for DeepSeek thinking mode
-            if completion.reasoning_content.is_some() {
-                if let Some(msg) = self.transcript.last_mut() {
-                    msg.reasoning_content = completion.reasoning_content.clone();
-                }
-            }
-
-            // Phase 1: emit ToolCall events for all calls
-            for call in &completion.tool_calls {
-                self.emit(StepEvent::ToolCall {
-                    call: call.clone(),
-                    step,
-                });
-            }
-
-            // Planning mode: if PlanFirst and we haven't buffered these calls yet,
-            // buffer them and wait for external confirmation/rejection.
-            if self.planning_mode == PlanningMode::PlanFirst && self.plan_buffer.is_none() {
-                self.plan_buffer = Some(completion.tool_calls.clone());
-
-                // Build a human-readable plan description from the tool calls
-                let plan_text = completion
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                        format!("  - {}({})", tc.name, args_str)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let plan_text = format!(
-                    "The agent proposes the following steps:\n{}\n\nConfirm or reject this plan.",
-                    plan_text
-                );
-
-                self.emit(StepEvent::PlanProposed {
-                    plan_text: plan_text.clone(),
-                    tool_calls: completion.tool_calls.clone(),
-                });
-
-                // Return PlanPending so the caller can decide via confirm_plan()/reject_plan()
-                tracing::info!(
-                    target: "recursive::agent",
-                    steps = step,
-                    tokens_in = 0usize,
-                    tokens_out = 0usize,
-                    finish = ?FinishReason::PlanPending,
-                    llm_latency_ms = self.total_llm_latency_ms,
-                    "agent.run.complete"
-                );
-                return Ok(AgentOutcome {
-                    final_message: Some(plan_text),
-                    transcript: std::mem::take(&mut self.transcript),
-                    steps: step,
-                    finish: FinishReason::PlanPending,
-                    total_usage: TokenUsage::default(),
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                });
-            }
-
-            // Phase 2: separate read-only and write calls, then execute.
-            // Read-only calls run in parallel; write calls run sequentially
-            // to preserve ordering guarantees.
-            let results = self.execute_tool_calls(&completion.tool_calls, step).await;
-
-            // Phase 3: emit results and push to transcript (preserving original order)
-            for (id, name, result, args) in &results {
-                self.emit(StepEvent::ToolResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    output: result.clone(),
-                    step,
-                });
-
-                // Anti-stuck heuristic: track identical failing calls
-                let call_key = (
-                    name.clone(),
-                    serde_json::to_string(args).unwrap_or_default(),
-                );
-                let is_error = result.starts_with("ERROR:");
-
-                if is_error {
-                    if last_call_key == Some(call_key.clone()) {
-                        consecutive_errors += 1;
-                    } else {
-                        consecutive_errors = 1;
-                    }
-                } else {
-                    consecutive_errors = 0;
-                }
-
-                last_call_key = Some(call_key);
-
-                // Check if stuck threshold reached
-                if consecutive_errors >= STUCK_THRESHOLD {
-                    let repeated_call = name.clone();
-                    let repeats = consecutive_errors;
-                    let finish = FinishReason::Stuck {
-                        repeated_call,
-                        repeats,
-                    };
-                    self.emit(StepEvent::Finished {
-                        reason: finish.clone(),
-                        steps: step,
-                    });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = step,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(AgentOutcome {
-                        final_message,
-                        transcript: std::mem::take(&mut self.transcript),
-                        steps: step,
-                        finish,
-                        total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                    });
-                }
-
-                self.push_message(Message::tool_result(id.clone(), result.clone()));
-            }
+            _ => {}
         }
 
-        warn!(target: "recursive::agent", "step budget exceeded");
-        let finish = FinishReason::BudgetExceeded;
-        self.emit(StepEvent::Finished {
-            reason: finish.clone(),
-            steps: self.max_steps,
-        });
-        let outcome = AgentOutcome {
-            final_message,
-            transcript: std::mem::take(&mut self.transcript),
-            steps: self.max_steps,
-            finish,
-            total_usage,
-            total_llm_latency_ms: self.total_llm_latency_ms,
-        };
-        self.hooks
-            .dispatch(HookEvent::SessionEnd { outcome: &outcome });
         tracing::info!(
             target: "recursive::agent",
-            steps = self.max_steps,
-            tokens_in = total_usage.prompt_tokens,
-            tokens_out = total_usage.completion_tokens,
+            steps = outcome.steps,
+            tokens_in = outcome.total_usage.prompt_tokens,
+            tokens_out = outcome.total_usage.completion_tokens,
             finish = ?outcome.finish,
-            llm_latency_ms = self.total_llm_latency_ms,
+            llm_latency_ms = outcome.total_llm_latency_ms,
             "agent.run.complete"
         );
+
         Ok(outcome)
     }
 
