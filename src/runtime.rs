@@ -176,6 +176,85 @@ impl AgentRuntime {
     pub fn event_sink(&self) -> &dyn EventSink {
         self.event_sink.as_ref()
     }
+
+    /// Run a loop: execute turns until the agent stops scheduling wakeups.
+    ///
+    /// Between turns, sleeps for the requested `delay`. If the agent doesn't
+    /// call `schedule_wakeup` during a turn, the loop ends.
+    ///
+    /// The `wakeup_slot` should be the same slot registered with the
+    /// `ScheduleWakeup` tool in the agent's tool registry.
+    pub async fn run_loop(
+        &mut self,
+        initial_goal: impl Into<String>,
+        wakeup_slot: &crate::tools::WakeupSlot,
+    ) -> Result<Vec<RuntimeOutcome>> {
+        let mut outcomes = Vec::new();
+        let mut next_goal = initial_goal.into();
+
+        loop {
+            let outcome = self.run(&next_goal).await?;
+            outcomes.push(outcome);
+
+            // Check if the agent scheduled a wakeup
+            let wakeup = wakeup_slot.lock().ok().and_then(|mut slot| slot.take());
+
+            match wakeup {
+                Some(req) => {
+                    tokio::time::sleep(req.delay).await;
+                    next_goal = req.prompt;
+                }
+                None => break,
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Run a loop with background job awareness.
+    ///
+    /// After each turn, checks both:
+    /// 1. The `WakeupSlot` for an explicit wakeup request
+    /// 2. The `BackgroundJobManager` for completed jobs
+    ///
+    /// If a background job completed, its output is injected as the next turn's
+    /// goal. If a wakeup was scheduled, the runtime sleeps for the requested
+    /// delay then continues. If neither is present, the loop ends.
+    pub async fn run_event_loop(
+        &mut self,
+        initial_goal: impl Into<String>,
+        wakeup_slot: &crate::tools::WakeupSlot,
+        bg_manager: Option<&tokio::sync::Mutex<crate::tools::BackgroundJobManager>>,
+    ) -> Result<Vec<RuntimeOutcome>> {
+        let mut outcomes = Vec::new();
+        let mut next_goal = initial_goal.into();
+
+        loop {
+            let outcome = self.run(&next_goal).await?;
+            outcomes.push(outcome);
+
+            // Priority 1: explicit wakeup
+            let wakeup = wakeup_slot.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(req) = wakeup {
+                tokio::time::sleep(req.delay).await;
+                next_goal = req.prompt;
+                continue;
+            }
+
+            // Priority 2: background job completed
+            if let Some(mgr) = bg_manager {
+                if let Ok(mut mgr) = mgr.try_lock() {
+                    if let Some((id, output)) = mgr.take_completed() {
+                        next_goal = format!("Background job '{}' completed:\n{}", id, output);
+                        continue;
+                    }
+                }
+            }
+
+            // Nothing to do → loop ends
+            break;
+        }
+        Ok(outcomes)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
