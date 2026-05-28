@@ -1,0 +1,38 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "smoke.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "smoke.txt", "contents": "ok" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "smoke.txt", "hasToolResult": true },
+      "response": {
+        "content": "Done! I've created smoke.txt with the content 'ok'."
+      }
+    },
+    {
+      "match": { "userMessage": "input.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "read_file",
+            "arguments": { "path": "input.txt" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "input.txt", "hasToolResult": true },
+      "response": {
+        "content": "The file input.txt contains: 'test content'"
+      }
+    }
+  ]
+}

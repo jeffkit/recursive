@@ -594,6 +594,28 @@ if ! cargo test --quiet >/dev/null 2>&1; then
   verdict_and_exit "rolled-back" "post-agent cargo test failed"
 fi
 
+# ---- E2E Smoke Gate ----------------------------------------------------------
+# Verify the newly-built binary actually works as an agent (not just compiles).
+# Uses ArgusAI replay mode with fixtures — deterministic, no API key needed.
+# Disable with RECURSIVE_SMOKE_TEST=0 for debugging or when Docker is unavailable.
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
+   && command -v argusai >/dev/null 2>&1 \
+   && [[ -f "e2e/e2e.yaml" ]]; then
+  echo "[self-improve] running E2E smoke gate..."
+  # Rebuild binary from modified src (agent was running the OLD binary;
+  # we need to test the NEW binary that includes this goal's changes)
+  cargo build -q 2>/dev/null
+
+  if argusai -c e2e/e2e.yaml run -s smoke --quiet 2>&1 | tail -5; then
+    echo "[self-improve] E2E smoke: PASSED ✓"
+  else
+    echo "[self-improve] E2E smoke: FAILED ✗"
+    verdict_and_exit "rolled-back" "E2E smoke test failed (new binary broken)"
+  fi
+elif [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]; then
+  echo "[self-improve] WARN: E2E smoke skipped (argusai not found or e2e/e2e.yaml missing)"
+fi
+
 # ---- Self-review pipeline (default ON since batch 36) ----------------------
 # Runs an independent review agent against the diff. If the review rejects,
 # feeds back issues for one revision round, then re-verifies.

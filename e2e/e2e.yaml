@@ -33,6 +33,10 @@ mocks:
 
 tests:
   suites:
+    - name: "Smoke Gate (self-improve)"
+      id: smoke
+      file: tests/00-smoke.yaml
+
     - name: "Basic Agent Tools"
       id: basic
       file: tests/01-basic-tools.yaml
