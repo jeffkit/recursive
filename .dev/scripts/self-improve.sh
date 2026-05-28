@@ -590,8 +590,61 @@ if [[ "$AGENT_STATUS" -ne 0 ]]; then
 fi
 
 # Defence in depth: re-run cargo test from outside the agent's transcript.
-if ! cargo test --quiet >/dev/null 2>&1; then
-  verdict_and_exit "rolled-back" "post-agent cargo test failed"
+if ! cargo test --quiet 2>/tmp/cargo-test-errors.log; then
+  # ---- Resume-based retry on test failure ------------------------------------
+  # Instead of immediate rollback, give the agent one chance to fix its own
+  # mistakes by resuming the conversation with the test error as context.
+  # This is more effective than starting fresh because the agent retains its
+  # full understanding of the codebase changes it made.
+  if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
+     && [[ -f "$TRANSCRIPT_OUT" ]] \
+     && [[ -z "${_RECURSIVE_RESUME_ATTEMPTED:-}" ]] \
+     && command -v jq >/dev/null 2>&1; then
+    export _RECURSIVE_RESUME_ATTEMPTED=1
+    RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
+    if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
+      # Build the fix prompt with actual error output
+      TEST_ERRORS="$(tail -40 /tmp/cargo-test-errors.log)"
+      FIX_PROMPT="Your code changes caused cargo test to FAIL. Here are the errors:
+
+\`\`\`
+${TEST_ERRORS}
+\`\`\`
+
+Please fix the compilation/test errors. Do NOT start over — fix the specific issues above."
+
+      RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-fix.json"
+      {
+        echo ""
+        echo "--- RESUME-FIX: cargo test failed, resuming agent to fix errors ---"
+        echo ""
+      } | tee -a "$LOG"
+
+      set +e
+      "$BIN" --workspace . \
+        --system-prompt-file "$SYSPROMPT_FILE" \
+        --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+        $PRICING_FLAG \
+        --log warn \
+        replay "$TRANSCRIPT_OUT" \
+        --resume-from "$RESUME_FROM" "$FIX_PROMPT" 2>&1 | tee -a "$LOG"
+      FIX_STATUS=${PIPESTATUS[0]}
+      set -e
+
+      # Re-check cargo test after the fix attempt
+      if [[ "$FIX_STATUS" -eq 0 ]] && cargo test --quiet >/dev/null 2>&1; then
+        echo "[self-improve] RESUME-FIX: tests pass after fix ✓"
+        # Continue to smoke gate / review as normal
+      else
+        echo "[self-improve] RESUME-FIX: still failing after fix attempt"
+        verdict_and_exit "rolled-back" "post-agent cargo test failed (resume-fix also failed)"
+      fi
+    else
+      verdict_and_exit "rolled-back" "post-agent cargo test failed"
+    fi
+  else
+    verdict_and_exit "rolled-back" "post-agent cargo test failed"
+  fi
 fi
 
 # ---- E2E Smoke Gate ----------------------------------------------------------
