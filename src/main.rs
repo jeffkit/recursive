@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::Level;
 
 use recursive::config::load_project_context;
+use recursive::cost::CostTracker;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
