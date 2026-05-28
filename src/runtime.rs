@@ -90,6 +90,8 @@ pub struct AgentRuntime {
     permission_hook: Option<PermissionHook>,
     /// Planning mode (immediate vs plan-first).
     planning_mode: PlanningMode,
+    /// Optional compactor for cross-turn transcript summarization.
+    compactor: Option<Compactor>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -119,6 +121,22 @@ impl AgentRuntime {
     pub async fn run(&mut self, user_text: impl Into<String>) -> Result<RuntimeOutcome> {
         // Append user message
         self.transcript.push(Message::user(user_text.into()));
+
+        // Cross-turn compaction: summarize old messages if transcript is too large.
+        // This is the Wrapper's responsibility — the kernel only does intra-turn trim.
+        if let Some(ref compactor) = self.compactor {
+            let chars = Compactor::estimate_chars(&self.transcript);
+            if chars >= compactor.threshold_chars && self.transcript.len() >= compactor.keep_recent_n + 2 {
+                let summary_msg = compactor.compact(self.kernel.llm().as_ref(), &self.transcript).await?;
+                let keep = compactor.keep_recent_n;
+                let mut split = self.transcript.len().saturating_sub(keep);
+                while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool) {
+                    split -= 1;
+                }
+                self.transcript.drain(..split);
+                self.transcript.insert(0, summary_msg);
+            }
+        }
 
         // Build turn context
         let ctx = TurnContext {
@@ -178,6 +196,7 @@ pub struct AgentRuntimeBuilder {
     permission_hook: Option<PermissionHook>,
     planning_mode: PlanningMode,
     saved_event_sink: Option<Box<dyn EventSink>>,
+    compactor: Option<Compactor>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -211,6 +230,7 @@ impl AgentRuntimeBuilder {
             permission_hook: None,
             planning_mode: PlanningMode::Immediate,
             saved_event_sink: None,
+            compactor: None,
         }
     }
 
@@ -248,7 +268,7 @@ impl AgentRuntimeBuilder {
 
     /// Set an optional compactor for summarising old messages.
     pub fn compactor(mut self, compactor: Compactor) -> Self {
-        self.kernel_builder = self.kernel_builder.compactor(compactor);
+        self.compactor = Some(compactor);
         self
     }
 
@@ -310,6 +330,7 @@ impl AgentRuntimeBuilder {
             streaming: self.streaming,
             permission_hook: self.permission_hook,
             planning_mode: self.planning_mode,
+            compactor: self.compactor,
         })
     }
 }
