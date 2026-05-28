@@ -1,8 +1,8 @@
 //! Multi-agent orchestration: agent pool, role definitions, and message bus.
 
-use crate::agent::{AgentOutcome, PlanningMode};
+use crate::agent::PlanningMode;
 use crate::event::NullSink;
-use crate::kernel::{AgentKernel, TurnContext};
+use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::{Config, LlmProvider};
 use std::collections::HashMap;
@@ -272,7 +272,7 @@ impl AgentPool {
         &self,
         role_name: &str,
         goal: &str,
-    ) -> Result<AgentOutcome, crate::Error> {
+    ) -> Result<TurnOutcome, crate::Error> {
         let role = self
             .roles
             .get(role_name)
@@ -307,17 +307,7 @@ impl AgentPool {
             planning_mode: PlanningMode::default(),
         };
 
-        let outcome = kernel.run(ctx).await?;
-
-        // Convert TurnOutcome to AgentOutcome for backward compatibility
-        Ok(AgentOutcome {
-            final_message: outcome.final_text,
-            transcript: outcome.new_messages,
-            steps: outcome.steps,
-            finish: outcome.finish_reason,
-            total_usage: outcome.usage,
-            total_llm_latency_ms: outcome.llm_latency_ms,
-        })
+        kernel.run(ctx).await
     }
 
     /// Send a task message from one agent role to another.
@@ -372,7 +362,7 @@ impl Pipeline {
             let outcome = pool.run_with_role(role_name, &current_input).await?;
 
             let output = outcome
-                .transcript
+                .new_messages
                 .iter()
                 .rev()
                 .find(|m| m.role == crate::message::Role::Assistant)
@@ -445,7 +435,7 @@ impl TeamOrchestrator {
             .run_with_role(&self.lead_role, &delegation_prompt)
             .await?;
         let lead_response = lead_outcome
-            .transcript
+            .new_messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
@@ -461,7 +451,7 @@ impl TeamOrchestrator {
                 match pool.run_with_role(role, task).await {
                     Ok(outcome) => {
                         let result = outcome
-                            .transcript
+                            .new_messages
                             .iter()
                             .rev()
                             .find(|m| m.role == crate::message::Role::Assistant)
@@ -512,7 +502,7 @@ impl TeamOrchestrator {
                 .run_with_role(&self.lead_role, &synthesis_prompt)
                 .await?;
             synthesis
-                .transcript
+                .new_messages
                 .iter()
                 .rev()
                 .find(|m| m.role == crate::message::Role::Assistant)
@@ -697,8 +687,8 @@ mod tests {
         });
 
         let outcome = pool.run_with_role("planner", "plan a task").await.unwrap();
-        assert_eq!(outcome.finish, crate::agent::FinishReason::NoMoreToolCalls);
-        assert!(outcome.final_message.unwrap().contains("Plan:"));
+        assert_eq!(outcome.finish_reason, crate::agent::FinishReason::NoMoreToolCalls);
+        assert!(outcome.final_text.unwrap().contains("Plan:"));
     }
 
     #[test]
@@ -795,9 +785,9 @@ mod tests {
             .await;
 
         let outcome = pool.run_with_role("worker", "continue work").await.unwrap();
-        assert_eq!(outcome.finish, crate::agent::FinishReason::NoMoreToolCalls);
+        assert_eq!(outcome.finish_reason, crate::agent::FinishReason::NoMoreToolCalls);
         // The run succeeded with memory context injected — no error means integration works
-        assert!(outcome.final_message.is_some());
+        assert!(outcome.final_text.is_some());
     }
 
     // --- MessageBus tests ---

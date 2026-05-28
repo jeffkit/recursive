@@ -75,6 +75,7 @@ pub struct TurnContext {
 ///
 /// Returned to the Wrapper, which appends new_messages to its transcript,
 /// persists them, handles side effects, and tracks costs.
+#[derive(Debug)]
 pub struct TurnOutcome {
     /// All messages produced during this turn (assistant responses + tool results).
     /// Does NOT include the input messages — only what the kernel generated.
