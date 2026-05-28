@@ -17,11 +17,9 @@ use tokio::sync::mpsc;
 use tracing::Level;
 
 use recursive::config::load_project_context;
-use recursive::cost::CostTracker;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
-use recursive::OnMessageFn;
 use recursive::SessionFile;
 use recursive::SessionWriter;
 use recursive::{
@@ -38,8 +36,8 @@ use recursive::{
         SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
-    Agent, AgentRunner, FinishReason, PlanningMode, RetryPolicy, StepEvent, ToolRegistry,
-    TranscriptFile,
+    AgentEvent, AgentRuntime, AgentRuntimeBuilder, ChannelSink, EventSink, FinishReason, NullSink,
+    PlanningMode, RetryPolicy, ToolRegistry, TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -954,9 +952,9 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
-/// Build an agent, optionally registering MCP tools from a config file.
+/// Build an [`AgentRuntime`], optionally registering MCP tools from a config file.
 #[allow(clippy::too_many_arguments)]
-async fn build_agent(
+async fn build_runtime(
     config: &Config,
     max_transcript_chars: Option<usize>,
     seed: Vec<recursive::message::Message>,
@@ -965,28 +963,17 @@ async fn build_agent(
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     goal: Option<&str>,
-    on_message: Option<recursive::OnMessageFn>,
-) -> anyhow::Result<(Agent, mpsc::UnboundedReceiver<StepEvent>)> {
+    event_sink: Option<Arc<dyn EventSink>>,
+) -> anyhow::Result<AgentRuntime> {
     let api_key = config.require_api_key()?;
-    // Provider selector: `openai` (default) uses the OpenAI-compatible adapter,
-    // `anthropic` switches to the Anthropic Messages API adapter.
     let provider_type = &config.provider_type;
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let mut openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
-        .with_temperature(config.temperature)
-        .with_retry_policy(retry);
-    if stream {
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
-        openai = openai.with_stream_tx(tx);
-    }
     let provider: Arc<dyn LlmProvider> = match provider_type.as_str() {
         "anthropic" => {
-            // AnthropicProvider has its own RetryPolicy type; mirror the same
-            // values from the shared Config so behavior is consistent.
             let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
                 max_retries: config.retry_max,
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
@@ -997,12 +984,16 @@ async fn build_agent(
                 .with_retry_policy(anthropic_retry);
             Arc::new(anthropic)
         }
-        _ => Arc::new(openai),
+        _ => {
+            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
+                .with_temperature(config.temperature)
+                .with_retry_policy(retry);
+            Arc::new(openai)
+        }
     };
     let mut tools = build_tools(config).await;
     register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
 
-    // Conditionally register sub-agent tool (opt-in via env var)
     let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1");
     if sub_agent_enabled {
         let max_depth: usize = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
@@ -1021,8 +1012,6 @@ async fn build_agent(
     }
 
     let skills = discover_loaded_skills(config);
-
-    // Load project context from AGENTS.md if present
     let project_context = load_project_context(&config.workspace);
     let mut system_prompt = match (&project_context, skills.is_empty()) {
         (Some(ctx), true) => {
@@ -1042,7 +1031,6 @@ async fn build_agent(
         (None, true) => config.system_prompt.clone(),
         (None, false) => format!("{}\n{}", config.system_prompt, skill_index(&skills)),
     };
-    // Inject auto-loaded skill bodies (Always + Trigger matching goal)
     let injected = skills_for_injection(&skills, goal.unwrap_or(""));
     if !injected.is_empty() {
         let mut injection_block = String::new();
@@ -1082,7 +1070,6 @@ async fn build_agent(
             system_prompt, injection_block
         );
     }
-    // When sub-agent is enabled, append a hint about its usage
     let system_prompt = if sub_agent_enabled {
         format!(
             "{}\n\nWhen you need to do focused research or scan files without polluting your main context, use the `sub_agent` tool. It spawns a fresh agent with its own transcript and a restricted tool set (read-only by default).",
@@ -1092,23 +1079,18 @@ async fn build_agent(
         system_prompt
     };
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let mut builder = Agent::builder()
+    let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
         .system_prompt(&system_prompt)
         .max_steps(config.max_steps)
-        .events(tx);
+        .streaming(stream);
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
     }
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
     }
-    // Optional Compactor wiring. Default off; set
-    // RECURSIVE_COMPACT_THRESHOLD=<chars> to enable. When the transcript
-    // grows past `chars` characters, the agent asks the model to
-    // summarize older messages, freeing context budget.
     if let Ok(threshold) = std::env::var("RECURSIVE_COMPACT_THRESHOLD") {
         if let Ok(n) = threshold.parse::<usize>() {
             if n > 0 {
@@ -1117,17 +1099,18 @@ async fn build_agent(
         }
     }
     if hook_timing {
-        builder = builder.hook(Arc::new(recursive::hooks::ToolTimingHook::new()));
+        use recursive::hooks::HookRegistry;
+        let mut hooks = HookRegistry::new();
+        hooks.register(Arc::new(recursive::hooks::ToolTimingHook::new()));
+        builder = builder.hooks(hooks);
     }
-    builder = builder.streaming(stream);
     if plan_first {
         builder = builder.planning_mode(PlanningMode::PlanFirst);
     }
-    if let Some(cb) = on_message {
-        builder = builder.on_message(cb);
+    if let Some(sink) = event_sink {
+        builder = builder.event_sink(sink);
     }
-    let agent = builder.build()?;
-    Ok((agent, rx))
+    builder.build().map_err(Into::into)
 }
 
 /// Get pricing for a model: external pricing takes precedence, then falls back
@@ -1217,7 +1200,8 @@ fn save_transcript(
 
 /// Save a session file for non-success finishes.
 fn save_session(
-    outcome: &recursive::AgentOutcome,
+    transcript: &[recursive::message::Message],
+    steps: usize,
     goal: String,
     model: &str,
     provider: &str,
@@ -1229,13 +1213,13 @@ fn save_session(
         model.to_string(),
         provider.to_string(),
         tool_specs,
-        outcome.steps,
-        outcome.transcript.clone(),
+        steps,
+        transcript.to_vec(),
     );
     session.write_to(path)?;
     eprintln!(
         "session: wrote {} messages to {}",
-        outcome.transcript.len(),
+        transcript.len(),
         path.display()
     );
     Ok(())
@@ -1250,6 +1234,50 @@ fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
             anyhow::bail!("agent exceeded step budget ({steps})")
         }
         _ => Ok(()),
+    }
+}
+
+fn finalize_session_writer(
+    session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
+    status: &str,
+) {
+    let Some(sw) = session_writer else { return };
+    match Arc::into_inner(sw) {
+        Some(mutex) => match mutex.lock() {
+            Ok(mut w) => {
+                if let Err(e) = w.finish(status) {
+                    eprintln!("session: failed to finalize: {e}");
+                } else {
+                    eprintln!(
+                        "session: saved {} message(s) to {}",
+                        w.message_count(),
+                        w.session_dir().display()
+                    );
+                }
+            }
+            Err(e) => eprintln!("session: failed to lock writer: {e}"),
+        },
+        None => eprintln!("session: writer still has other references; cannot finalize"),
+    }
+}
+
+fn finalize_cost_tracker(
+    cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>>,
+    usage: recursive::llm::TokenUsage,
+    llm_latency_ms: u64,
+    model: &str,
+) {
+    let Some(tracker) = cost_tracker else { return };
+    match tracker.into_inner() {
+        Ok(mut t) => {
+            t.record_usage(usage, llm_latency_ms);
+            if let Err(e) = t.finish() {
+                eprintln!("cost: failed to write cost.json: {e}");
+            } else {
+                eprintln!("cost: ${:.4} ({})", t.cost_usd().unwrap_or(0.0), model);
+            }
+        }
+        Err(e) => eprintln!("cost: failed to lock cost tracker: {e}"),
     }
 }
 
@@ -1270,7 +1298,6 @@ async fn run_resumed(
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
 
-    // Create SessionWriter if --session is enabled
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
         match SessionWriter::create(
             &config.workspace,
@@ -1291,32 +1318,22 @@ async fn run_resumed(
         None
     };
 
-    // Create CostTracker if session recording is active
-    let cost_tracker: Option<std::sync::Mutex<CostTracker>> = if session {
-        if let Some(ref w) = session_writer {
+    let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
+        session_writer.as_ref().map(|w| {
             let session_dir = w.lock().unwrap().session_dir().to_path_buf();
-            Some(std::sync::Mutex::new(CostTracker::new(
+            std::sync::Mutex::new(recursive::cost::CostTracker::new(
                 session_dir,
                 &config.model,
                 &config.provider_type,
                 &external_pricing,
-            )))
-        } else {
-            None
-        }
+            ))
+        })
     } else {
         None
     };
 
-    let on_message: Option<OnMessageFn> = session_writer.clone().map(|sw| {
-        Box::new(move |msg: &recursive::message::Message| {
-            if let Ok(mut writer) = sw.lock() {
-                let _ = writer.append(msg);
-            }
-        }) as OnMessageFn
-    });
-
-    let (mut agent, rx) = build_agent(
+    let (sink, event_rx) = ChannelSink::new();
+    let mut runtime = build_runtime(
         &config,
         max_transcript_chars,
         seed,
@@ -1325,98 +1342,71 @@ async fn run_resumed(
         mcp_config,
         hook_timing,
         Some(&goal),
-        on_message,
+        Some(Arc::new(sink)),
     )
     .await?;
-    let tools = build_tools(&config).await;
-    let tool_specs = tools.specs();
+
+    let tool_specs = runtime.kernel().tools().specs();
+    let pre_transcript_len = runtime.transcript().len();
+
     if !json_mode {
         eprintln!("resuming from {seed_len} seeded message(s)");
     }
     let printer = if json_mode {
-        tokio::spawn(stream_events_json(rx))
+        tokio::spawn(stream_events_json(event_rx))
     } else {
-        tokio::spawn(stream_events(rx))
+        tokio::spawn(stream_events(event_rx))
     };
-    let outcome = agent.run(goal.clone()).await?;
-    drop(agent);
+
+    let outcome = runtime.run(goal.clone()).await?;
+
+    if let Some(ref sw) = session_writer {
+        if let Ok(mut w) = sw.lock() {
+            for msg in runtime.transcript().iter().skip(pre_transcript_len) {
+                let _ = w.append(msg);
+            }
+        }
+    }
+
+    let transcript = runtime.transcript().to_vec();
+    drop(runtime);
     printer.await.ok();
 
-    // Finalize session writer
-    let finish_status = if matches!(outcome.finish, FinishReason::NoMoreToolCalls) {
-        "success"
-    } else {
-        "incomplete"
-    };
-    if let Some(sw) = session_writer {
-        match Arc::into_inner(sw) {
-            Some(mutex) => {
-                let mut writer = match mutex.lock() {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!("session: failed to lock writer: {e}");
-                        return Ok(());
-                    }
-                };
-                if let Err(e) = writer.finish(finish_status) {
-                    eprintln!("session: failed to finalize: {e}");
-                } else {
-                    eprintln!(
-                        "session: saved {} message(s) to {}",
-                        writer.message_count(),
-                        writer.session_dir().display()
-                    );
-                }
-            }
-            None => {
-                eprintln!("session: writer still has other references; cannot finalize");
-            }
-        }
-    }
-
-    // Finalize cost tracker
-    if let Some(tracker) = cost_tracker {
-        match tracker.into_inner() {
-            Ok(mut t) => {
-                t.record_usage(outcome.total_usage, outcome.total_llm_latency_ms);
-                if let Err(e) = t.finish() {
-                    eprintln!("cost: failed to write cost.json: {e}");
-                } else {
-                    eprintln!(
-                        "cost: ${:.4} ({})",
-                        t.cost_usd().unwrap_or(0.0),
-                        config.model
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("cost: failed to lock cost tracker: {e}");
-            }
-        }
-    }
-
     if !json_mode {
-        if let Some(ref msg) = outcome.final_message {
+        if let Some(ref msg) = outcome.final_text {
             println!("\n=== final ===\n{msg}");
         }
         print_usage(
             outcome.total_usage,
             &config.model,
-            outcome.total_llm_latency_ms,
+            outcome.llm_latency_ms,
             outcome.steps,
             &external_pricing,
         );
-        print_finish_note(&outcome.finish);
+        print_finish_note(&outcome.finish_reason);
     }
+
+    let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
+        "success"
+    } else {
+        "incomplete"
+    };
+    finalize_session_writer(session_writer, finish_status);
+    finalize_cost_tracker(
+        cost_tracker,
+        outcome.total_usage,
+        outcome.llm_latency_ms,
+        &config.model,
+    );
+
     if let Some(path) = transcript_out {
-        save_transcript(&outcome.transcript, outcome.steps, &config.model, &path)?;
+        save_transcript(&transcript, outcome.steps, &config.model, &path)?;
     }
-    // Save session file for non-success finishes
     if let Some(path) = session_out {
-        let is_success = matches!(outcome.finish, FinishReason::NoMoreToolCalls);
-        if !is_success {
+        if !matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
             save_session(
-                &outcome,
+                &transcript,
+                outcome.steps,
                 goal,
                 &config.model,
                 &config.provider_type,
@@ -1425,7 +1415,7 @@ async fn run_resumed(
             )?;
         }
     }
-    exit_for_finish(&outcome.finish, outcome.steps)
+    exit_for_finish(&outcome.finish_reason, outcome.steps)
 }
 
 /// Run the agent in loop mode: agent self-schedules wakeups until it stops.
@@ -1437,7 +1427,7 @@ async fn run_loop(
     json_mode: bool,
     stream: bool,
     plan_first: bool,
-    _mcp_config: Option<PathBuf>,
+    mcp_config: Option<PathBuf>,
     _external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1449,15 +1439,15 @@ async fn run_loop(
         std::process::exit(1);
     }
 
-    // Create the shared wakeup slot
     let wakeup_slot: WakeupSlot = Arc::new(Mutex::new(None));
-    let wakeup_slot_clone = wakeup_slot.clone();
 
-    // Build tools with ScheduleWakeup registered
+    // Build tools with ScheduleWakeup registered; must happen before build_runtime
+    // so the slot is shared between the tool and the runtime loop.
     let mut tools = build_tools(&config).await;
-    tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot_clone)));
+    register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
+    tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot.clone())));
 
-    // Build the LLM provider
+    // Build LLM provider
     let api_key = config.require_api_key()?;
     let retry = RetryPolicy {
         max_retries: config.retry_max,
@@ -1484,43 +1474,38 @@ async fn run_loop(
         }
     };
 
-    // Build the agent
-    let mut builder = Agent::builder()
+    let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
         .system_prompt(&config.system_prompt)
-        .max_steps(config.max_steps);
-
+        .max_steps(config.max_steps)
+        .streaming(stream);
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
     }
     if hook_timing {
-        builder = builder.hook(Arc::new(recursive::hooks::ToolTimingHook::new()));
-    }
-    if stream {
-        builder = builder.streaming(true);
+        use recursive::hooks::HookRegistry;
+        let mut hooks = HookRegistry::new();
+        hooks.register(Arc::new(recursive::hooks::ToolTimingHook::new()));
+        builder = builder.hooks(hooks);
     }
     if plan_first {
         builder = builder.planning_mode(PlanningMode::PlanFirst);
     }
+    let mut runtime = builder.build().map_err(Into::<anyhow::Error>::into)?;
 
-    let agent = builder.build()?;
+    let outcomes = runtime.run_loop(&goal, &wakeup_slot).await?;
 
-    // Run the loop
-    let mut runner = AgentRunner::new(agent);
-    let outcomes = runner.run_loop(&goal, &wakeup_slot, None).await?;
     if shutdown.is_cancelled() {
         eprintln!("shutdown: received signal, loop exiting cleanly");
     }
 
-    // Print summary
     if json_mode {
-        // For JSON mode, just output a simple summary
         let summary: Vec<_> = outcomes
             .iter()
             .map(|o| {
                 serde_json::json!({
-                    "finish": format!("{:?}", o.finish),
+                    "finish": format!("{:?}", o.finish_reason),
                     "steps": o.steps,
                 })
             })
@@ -1530,9 +1515,8 @@ async fn run_loop(
         eprintln!("Loop completed: {} turn(s)", outcomes.len());
     }
 
-    // Use the finish reason from the last outcome
     if let Some(last) = outcomes.last() {
-        let _ = exit_for_finish(&last.finish, last.steps);
+        let _ = exit_for_finish(&last.finish_reason, last.steps);
     }
 
     Ok(())
@@ -1559,7 +1543,6 @@ async fn run_once(
         std::process::exit(1);
     }
 
-    // Create SessionWriter if --session is enabled
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
         match SessionWriter::create(
             &config.workspace,
@@ -1580,32 +1563,22 @@ async fn run_once(
         None
     };
 
-    // Create CostTracker if session recording is active
-    let cost_tracker: Option<std::sync::Mutex<CostTracker>> = if session {
-        if let Some(ref w) = session_writer {
+    let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
+        session_writer.as_ref().map(|w| {
             let session_dir = w.lock().unwrap().session_dir().to_path_buf();
-            Some(std::sync::Mutex::new(CostTracker::new(
+            std::sync::Mutex::new(recursive::cost::CostTracker::new(
                 session_dir,
                 &config.model,
                 &config.provider_type,
                 &external_pricing,
-            )))
-        } else {
-            None
-        }
+            ))
+        })
     } else {
         None
     };
 
-    let on_message: Option<OnMessageFn> = session_writer.clone().map(|sw| {
-        Box::new(move |msg: &recursive::message::Message| {
-            if let Ok(mut writer) = sw.lock() {
-                let _ = writer.append(msg);
-            }
-        }) as OnMessageFn
-    });
-
-    let (mut agent, rx) = build_agent(
+    let (sink, event_rx) = ChannelSink::new();
+    let mut runtime = build_runtime(
         &config,
         max_transcript_chars,
         Vec::new(),
@@ -1613,118 +1586,93 @@ async fn run_once(
         plan_first,
         mcp_config,
         hook_timing,
-        None,
-        on_message,
+        Some(&goal),
+        Some(Arc::new(sink)),
     )
     .await?;
-    let tools = build_tools(&config).await;
-    let tool_specs = tools.specs();
+
+    let tool_specs = runtime.kernel().tools().specs();
+    let pre_transcript_len = runtime.transcript().len();
+
     let printer = if json_mode {
-        tokio::spawn(stream_events_json(rx))
+        tokio::spawn(stream_events_json(event_rx))
     } else {
-        tokio::spawn(stream_events(rx))
+        tokio::spawn(stream_events(event_rx))
     };
+
     let outcome = loop {
-        let outcome = agent.run(goal.clone()).await?;
-        if !matches!(outcome.finish, FinishReason::PlanPending) {
-            break outcome;
+        let o = runtime.run(goal.clone()).await?;
+        if !matches!(o.finish_reason, FinishReason::PlanPending) {
+            break o;
         }
-        let plan_text = outcome.final_message.as_deref().unwrap_or("(no plan)");
+        let plan_text = o.final_text.as_deref().unwrap_or("(no plan)");
         eprintln!("\n=== Proposed Plan ===\n{plan_text}");
         eprint!("Confirm plan? [Y/n] ");
         use std::io::Write;
         let _ = std::io::stderr().flush();
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input.is_empty() || input == "y" || input == "yes" {
-            agent.confirm_plan();
+        let trimmed = input.trim().to_lowercase();
+        if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
+            runtime.confirm_plan();
         } else {
-            agent.reject_plan("User rejected the plan");
-            break outcome;
+            runtime.reject_plan("User rejected the plan");
+            break o;
         }
     };
-    drop(agent);
+
+    // Write new messages to session (all messages appended since build_runtime)
+    if let Some(ref sw) = session_writer {
+        if let Ok(mut w) = sw.lock() {
+            for msg in runtime.transcript().iter().skip(pre_transcript_len) {
+                let _ = w.append(msg);
+            }
+        }
+    }
+
+    let transcript = runtime.transcript().to_vec();
+    drop(runtime);
+
     if shutdown.is_cancelled() {
         eprintln!("shutdown: received signal, exiting cleanly after completing step");
     }
     printer.await.ok();
+
     if !json_mode {
-        if let Some(ref msg) = outcome.final_message {
+        if let Some(ref msg) = outcome.final_text {
             println!("\n=== final ===\n{msg}");
         }
         print_usage(
             outcome.total_usage,
             &config.model,
-            outcome.total_llm_latency_ms,
+            outcome.llm_latency_ms,
             outcome.steps,
             &external_pricing,
         );
-        print_finish_note(&outcome.finish);
+        print_finish_note(&outcome.finish_reason);
     }
 
-    // Finalize session writer
-    let finish_status = if matches!(outcome.finish, FinishReason::NoMoreToolCalls) {
+    let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
         "success"
     } else {
         "incomplete"
     };
-    if let Some(sw) = session_writer {
-        match Arc::into_inner(sw) {
-            Some(mutex) => {
-                let mut writer = match mutex.lock() {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!("session: failed to lock writer: {e}");
-                        return Ok(());
-                    }
-                };
-                if let Err(e) = writer.finish(finish_status) {
-                    eprintln!("session: failed to finalize: {e}");
-                } else {
-                    eprintln!(
-                        "session: saved {} message(s) to {}",
-                        writer.message_count(),
-                        writer.session_dir().display()
-                    );
-                }
-            }
-            None => {
-                eprintln!("session: writer still has other references; cannot finalize");
-            }
-        }
-    }
-
-    // Finalize cost tracker
-    if let Some(tracker) = cost_tracker {
-        match tracker.into_inner() {
-            Ok(mut t) => {
-                t.record_usage(outcome.total_usage, outcome.total_llm_latency_ms);
-                if let Err(e) = t.finish() {
-                    eprintln!("cost: failed to write cost.json: {e}");
-                } else {
-                    eprintln!(
-                        "cost: ${:.4} ({})",
-                        t.cost_usd().unwrap_or(0.0),
-                        config.model
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("cost: failed to lock cost tracker: {e}");
-            }
-        }
-    }
+    finalize_session_writer(session_writer, finish_status);
+    finalize_cost_tracker(
+        cost_tracker,
+        outcome.total_usage,
+        outcome.llm_latency_ms,
+        &config.model,
+    );
 
     if let Some(path) = transcript_out {
-        save_transcript(&outcome.transcript, outcome.steps, &config.model, &path)?;
+        save_transcript(&transcript, outcome.steps, &config.model, &path)?;
     }
-    // Save session file for non-success finishes
     if let Some(path) = session_out {
-        let is_success = matches!(outcome.finish, FinishReason::NoMoreToolCalls);
-        if !is_success {
+        if !matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
             save_session(
-                &outcome,
+                &transcript,
+                outcome.steps,
                 goal,
                 &config.model,
                 &config.provider_type,
@@ -1733,7 +1681,7 @@ async fn run_once(
             )?;
         }
     }
-    exit_for_finish(&outcome.finish, outcome.steps)
+    exit_for_finish(&outcome.finish_reason, outcome.steps)
 }
 
 /// Interactive setup wizard: walk the user through provider/model/key config.
@@ -1865,8 +1813,9 @@ async fn repl(
         );
     }
 
-    // Build agent ONCE — MCP servers are spawned here and stay alive.
-    let (mut agent, rx) = build_agent(
+    // Build runtime ONCE — MCP servers are spawned here and stay alive.
+    // Start with NullSink; we swap in a fresh ChannelSink per turn.
+    let mut runtime = build_runtime(
         &config,
         max_transcript_chars,
         Vec::new(),
@@ -1878,8 +1827,6 @@ async fn repl(
         None,
     )
     .await?;
-    // Drop the initial rx (no events to print before first turn)
-    drop(rx);
 
     let mut total_turns = 0usize;
     let stdin = BufReader::new(tokio::io::stdin());
@@ -1900,7 +1847,7 @@ async fn repl(
             break;
         }
         if goal == ":clear" {
-            agent.set_transcript(Vec::new());
+            runtime.set_transcript(Vec::new());
             total_turns = 0;
             if !json_mode {
                 eprintln!("(conversation cleared)");
@@ -1908,39 +1855,37 @@ async fn repl(
             continue;
         }
 
-        // Create a fresh events channel for this turn
-        let (tx, rx) = mpsc::unbounded_channel();
-        agent.set_events(Some(tx));
+        // Fresh ChannelSink per turn; swap back to NullSink when done.
+        let (sink, event_rx) = ChannelSink::new();
+        runtime.set_event_sink(Arc::new(sink));
 
         let printer = if json_mode {
-            tokio::spawn(stream_events_json(rx))
+            tokio::spawn(stream_events_json(event_rx))
         } else {
-            tokio::spawn(stream_events_repl(rx))
+            tokio::spawn(stream_events_repl(event_rx))
         };
 
-        match agent.run(goal.to_string()).await {
+        match runtime.run(goal.to_string()).await {
             Ok(outcome) => {
-                // Close the events channel so the printer task finishes
-                agent.set_events(None);
+                // Reset to NullSink so the channel is dropped and printer finishes
+                runtime.set_event_sink(Arc::new(NullSink));
                 printer.await.ok();
 
                 if !json_mode {
                     print_usage(
                         outcome.total_usage,
                         &config.model,
-                        outcome.total_llm_latency_ms,
+                        outcome.llm_latency_ms,
                         outcome.steps,
                         &external_pricing,
                     );
-                    print_finish_note(&outcome.finish);
+                    print_finish_note(&outcome.finish_reason);
                 }
 
-                // Restore transcript for next turn (run() takes it via mem::take)
-                agent.set_transcript(outcome.transcript);
                 total_turns += 1;
             }
             Err(e) => {
-                agent.set_events(None);
+                runtime.set_event_sink(Arc::new(NullSink));
                 printer.await.ok();
                 eprintln!("error: {e}");
             }
@@ -1952,20 +1897,25 @@ async fn repl(
     Ok(())
 }
 
-async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
+async fn stream_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
-        #[allow(clippy::collapsible_match)]
         match ev {
-            StepEvent::AssistantText { text, step } => {
-                if !text.trim().is_empty() {
-                    println!("[step {step}] assistant: {text}");
-                }
+            AgentEvent::AssistantText { ref text, step } if !text.trim().is_empty() => {
+                println!("[step {step}] assistant: {text}");
             }
-            StepEvent::ToolCall { call, step } => {
-                println!("[step {step}] -> {} {}", call.name, call.arguments);
+            AgentEvent::ToolCall {
+                ref name,
+                ref arguments,
+                step,
+                ..
+            } => {
+                println!("[step {step}] -> {name} {arguments}");
             }
-            StepEvent::ToolResult {
-                name, output, step, ..
+            AgentEvent::ToolResult {
+                ref name,
+                ref output,
+                step,
+                ..
             } => {
                 let preview = if output.len() > 800 {
                     let mut end = 800.min(output.len());
@@ -1974,19 +1924,17 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
                     }
                     format!("{}\n...[truncated]", &output[..end])
                 } else {
-                    output
+                    output.clone()
                 };
                 println!("[step {step}] <- {name}\n{preview}");
             }
-            StepEvent::Finished { reason, steps } => {
-                println!("[done after {steps} steps] reason: {:?}", reason);
+            AgentEvent::TurnFinished { ref reason, steps } => {
+                println!("[done after {steps} steps] reason: {reason}");
             }
-            StepEvent::Usage { .. } => {}
-            StepEvent::Latency { step, llm_ms } => {
+            AgentEvent::Latency { step, llm_ms } => {
                 println!("[step {step}] llm latency: {llm_ms}ms");
             }
-            StepEvent::PartialToken { .. } => {}
-            StepEvent::Compacted {
+            AgentEvent::Compacted {
                 removed,
                 kept,
                 summary_chars,
@@ -1996,13 +1944,13 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
                     "[step {step}] compacted {removed} msgs -> {kept} kept + {summary_chars}-char summary"
                 );
             }
-            StepEvent::PlanProposed { plan_text, .. } => {
+            AgentEvent::PlanProposed { ref plan_text, .. } => {
                 println!("[plan] proposed: {plan_text}");
             }
-            StepEvent::PlanConfirmed => {
+            AgentEvent::PlanConfirmed => {
                 println!("[plan] confirmed");
             }
-            StepEvent::PlanRejected { reason } => {
+            AgentEvent::PlanRejected { ref reason } => {
                 println!("[plan] rejected: {reason}");
             }
             _ => {}
@@ -2012,28 +1960,21 @@ async fn stream_events(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
 
 /// REPL-specific event handler: clean output without step prefixes on assistant text.
 /// Tool calls are shown briefly; assistant text is printed directly.
-async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
+async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
-            StepEvent::AssistantText { ref text, .. } if !text.trim().is_empty() => {
+            AgentEvent::AssistantText { ref text, .. } if !text.trim().is_empty() => {
                 println!("{text}");
             }
-            StepEvent::AssistantText { .. } => {}
-            StepEvent::ToolCall { call, .. } => {
-                eprintln!("  ↳ {}", call.name);
+            AgentEvent::ToolCall { ref name, .. } => {
+                eprintln!("  ↳ {name}");
             }
-            StepEvent::ToolResult { .. } => {}
-            StepEvent::Finished { .. } => {}
-            StepEvent::Usage { .. } => {}
-            StepEvent::Latency { .. } => {}
-            StepEvent::PartialToken { .. } => {}
-            StepEvent::Compacted { .. } => {}
             _ => {}
         }
     }
 }
 
-async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<StepEvent>) {
+async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         if let Ok(line) = serde_json::to_string(&ev) {
             println!("{line}");
@@ -2227,10 +2168,10 @@ mod tests {
     // panicked because `then(false)` returns None. This made every
     // `recursive run` (default: stream=false) panic at startup, which
     // in turn broke all parallel-self-improve.sh launches in batch 13.
-    /// Smoke test for `build_agent` across the matrix of stream flag and
+    /// Smoke test for `build_runtime` across the matrix of stream flag and
     /// provider selector. Consolidated into ONE test per AGENTS.md guidance
     /// because the anthropic branch reads `RECURSIVE_PROVIDER_TYPE` from the
-    /// process env — running it in parallel with other build-agent tests
+    /// process env — running it in parallel with other build-runtime tests
     /// would race on that global. Asserts:
     ///   - stream=false / openai (default)  → ok (regresses 92d257e bug)
     ///   - stream=true  / openai            → ok (regresses streaming-merge bug)
@@ -2238,11 +2179,11 @@ mod tests {
     /// The anthropic branch sets+restores the env var to keep the test
     /// hermetic for any tests that come after it.
     #[tokio::test]
-    async fn build_agent_construction_smoke() {
+    async fn build_runtime_construction_smoke() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
 
-        let r1 = build_agent(
+        let r1 = build_runtime(
             &cfg,
             None,
             Vec::new(),
@@ -2256,7 +2197,7 @@ mod tests {
         .await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
 
-        let r2 = build_agent(
+        let r2 = build_runtime(
             &cfg,
             None,
             Vec::new(),
@@ -2274,7 +2215,7 @@ mod tests {
         std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
         let mut cfg_anthropic = dummy_config(tmp.path());
         cfg_anthropic.provider_type = "anthropic".into();
-        let r3 = build_agent(
+        let r3 = build_runtime(
             &cfg_anthropic,
             None,
             Vec::new(),
