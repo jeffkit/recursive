@@ -24,12 +24,13 @@ setup:
         sleep 1
         echo cleaned
 
-  - name: "Reset state files (sid, sse-sid, sse-events, sess.json)"
+  - name: "Reset state files (sid, sse-sid, sse-events, sess.json) + workspace artifacts"
     ignoreError: true
     exec:
       container: recursive-e2e
       command: |
         rm -f /tmp/http-sid /tmp/sse-sid /tmp/sse-events.txt /tmp/sess.json /tmp/http-9090.log
+        rm -f /workspace/http-run.txt /workspace/session-turn1.txt /workspace/session-turn2.txt /workspace/sse-test.txt
         echo reset
 
   - name: "Start HTTP server in background on 9090"
@@ -127,6 +128,13 @@ cases:
           - "messages"
           - "total_steps"
 
+  - name: "POST /run actually wrote http-run.txt to workspace (defends against tool-not-found regression)"
+    file:
+      container: recursive-e2e
+      path: /workspace/http-run.txt
+      exists: true
+      contains: "run-ok"
+
   - name: "POST /run with empty goal returns 400"
     exec:
       container: recursive-e2e
@@ -169,6 +177,13 @@ cases:
       output:
         contains: "role=assistant"
 
+  - name: "Session turn 1 actually wrote session-turn1.txt"
+    file:
+      container: recursive-e2e
+      path: /workspace/session-turn1.txt
+      exists: true
+      contains: "turn1"
+
   - name: "GET /sessions/:id returns transcript with messages"
     exec:
       container: recursive-e2e
@@ -194,6 +209,13 @@ cases:
       exitCode: 0
       output:
         contains: "role=assistant"
+
+  - name: "Session turn 2 actually wrote session-turn2.txt (cross-turn tool-call regression check)"
+    file:
+      container: recursive-e2e
+      path: /workspace/session-turn2.txt
+      exists: true
+      contains: "turn2"
 
   # ── SSE streaming (in-container curl, kept conservative) ──
   - name: "POST /sessions (act): create dedicated SSE session"
@@ -232,6 +254,13 @@ cases:
       exitCode: 0
       output:
         contains: "sse-received"
+
+  - name: "SSE turn actually wrote sse-test.txt to workspace"
+    file:
+      container: recursive-e2e
+      path: /workspace/sse-test.txt
+      exists: true
+      contains: "sse-ok"
 
   - name: "DELETE /sessions/:id removes the SSE session"
     exec:
@@ -290,8 +319,10 @@ teardown:
         pkill -f 'http --addr 0.0.0.0:9090' 2>/dev/null || true
         echo stopped
 
-  - name: "Remove state fixtures"
+  - name: "Remove state fixtures and workspace artifacts"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -f /tmp/http-sid /tmp/sse-sid /tmp/sse-events.txt /tmp/sess.json /tmp/http-9090.log
+      command: |
+        rm -f /tmp/http-sid /tmp/sse-sid /tmp/sse-events.txt /tmp/sess.json /tmp/http-9090.log
+        rm -f /workspace/http-run.txt /workspace/session-turn1.txt /workspace/session-turn2.txt /workspace/sse-test.txt

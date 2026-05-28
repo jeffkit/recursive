@@ -38,6 +38,18 @@ setup:
       exists: true
       contains: "transcript"
 
+  - name: "Clear workspace .recursive/sessions before resume"
+    # The first-run also wrote an "incomplete" session to
+    # /workspace/test-resume/.recursive/sessions/. Without this step, the
+    # plugin's findSessionDir() (which returns the first directory it finds
+    # via readdirSync alphabetical order) would pick the older incomplete
+    # session and fail status=[completed,success] even though the resume
+    # itself succeeded. Removing the directory ensures only the resume's
+    # session ends up there.
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-resume/.recursive/sessions && echo cleared
+
   - name: "Resume from session file (act)"
     exec:
       container: recursive-e2e

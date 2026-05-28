@@ -1,7 +1,8 @@
 {
   "fixtures": [
     {
-      "match": { "userMessage": "http-run.txt", "hasToolResult": false },
+      "_comment": "Stateless POST /run: single-turn agent run for http-run.txt — first LLM call (no tool result yet).",
+      "match": { "userMessage": "http-run.txt", "turnIndex": 0 },
       "response": {
         "toolCalls": [
           {
@@ -12,11 +13,14 @@
       }
     },
     {
-      "match": { "userMessage": "http-run.txt", "hasToolResult": true },
+      "_comment": "Stateless POST /run: follow-up after tool result.",
+      "match": { "userMessage": "http-run.txt", "turnIndex": 1 },
       "response": { "content": "Done! I created http-run.txt with content run-ok." }
     },
+
     {
-      "match": { "userMessage": "session-turn1.txt", "hasToolResult": false },
+      "_comment": "Persistent session, turn 1: first LLM call — assistantCount=0 (clean transcript).",
+      "match": { "userMessage": "session-turn1.txt", "turnIndex": 0 },
       "response": {
         "toolCalls": [
           {
@@ -27,11 +31,14 @@
       }
     },
     {
-      "match": { "userMessage": "session-turn1.txt", "hasToolResult": true },
+      "_comment": "Persistent session, turn 1: follow-up after tool result — assistantCount=1.",
+      "match": { "userMessage": "session-turn1.txt", "turnIndex": 1 },
       "response": { "content": "Done! I created session-turn1.txt." }
     },
+
     {
-      "match": { "userMessage": "session-turn2.txt", "hasToolResult": false },
+      "_comment": "Persistent session, turn 2: first LLM call. assistantCount=2 (turn 1 left tool-call assistant + final-reply assistant). hasToolResult would be true here (turn 1's tool message lingers in transcript), so we use turnIndex.",
+      "match": { "userMessage": "session-turn2.txt", "turnIndex": 2 },
       "response": {
         "toolCalls": [
           {
@@ -42,11 +49,14 @@
       }
     },
     {
-      "match": { "userMessage": "session-turn2.txt", "hasToolResult": true },
+      "_comment": "Persistent session, turn 2: follow-up — assistantCount=3.",
+      "match": { "userMessage": "session-turn2.txt", "turnIndex": 3 },
       "response": { "content": "Done! I created session-turn2.txt." }
     },
+
     {
-      "match": { "userMessage": "sse-test.txt", "hasToolResult": false },
+      "_comment": "SSE test uses a dedicated fresh session — single turn, assistantCount 0/1.",
+      "match": { "userMessage": "sse-test.txt", "turnIndex": 0 },
       "response": {
         "toolCalls": [
           {
@@ -57,7 +67,7 @@
       }
     },
     {
-      "match": { "userMessage": "sse-test.txt", "hasToolResult": true },
+      "match": { "userMessage": "sse-test.txt", "turnIndex": 1 },
       "response": { "content": "Done! I created sse-test.txt with content sse-ok." }
     }
   ]
