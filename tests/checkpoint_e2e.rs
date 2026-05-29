@@ -17,6 +17,43 @@ use recursive::{
 };
 use serde_json::json;
 
+/// Process-wide lock for tests that mutate `RECURSIVE_HOME`. Without
+/// this, parallel tests would race on the env var and on the
+/// directories under it.
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Per-test override for `RECURSIVE_HOME`. Without this, the real
+/// `~/.recursive` would be polluted (sessions, shadow-git) on every
+/// e2e run. Returns a guard that restores the previous value on drop.
+struct HomeOverride {
+    prev: Option<std::ffi::OsString>,
+    _guard: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeOverride {
+    fn new() -> Self {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RECURSIVE_HOME");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("RECURSIVE_HOME", dir.path());
+        Self {
+            prev,
+            _guard: dir,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+            None => std::env::remove_var("RECURSIVE_HOME"),
+        }
+    }
+}
+
 fn has_git() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
@@ -51,6 +88,7 @@ async fn rewind_undoes_turn_and_restores_files_and_transcript() {
         eprintln!("git not available; skipping");
         return;
     }
+    let _home = HomeOverride::new();
     let dir = tempfile::tempdir().unwrap();
 
     // Turn 0: agent writes a.txt then ends.
@@ -160,6 +198,7 @@ async fn rewind_does_not_touch_other_workspace_files() {
     if !has_git() {
         return;
     }
+    let _home = HomeOverride::new();
     let dir = tempfile::tempdir().unwrap();
 
     // Pre-existing untouched file.

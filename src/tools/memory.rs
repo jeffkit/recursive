@@ -515,9 +515,12 @@ impl Scratchpad {
     }
 }
 
-/// Determine the scratchpad file path.
+/// Determine the scratchpad file path. Lives under the per-user data
+/// dir so it doesn't pollute the project tree:
+/// `~/.recursive/workspaces/<ws-hash>/scratchpad.json`.
 pub fn scratchpad_path(workspace: &std::path::Path) -> PathBuf {
-    workspace.join(".recursive").join("scratchpad.json")
+    crate::paths::user_scratchpad_path(workspace)
+        .unwrap_or_else(|_| workspace.join(".recursive").join("scratchpad.json"))
 }
 
 /// Load the scratchpad from the workspace-relative path.

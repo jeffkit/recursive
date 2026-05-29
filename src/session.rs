@@ -126,7 +126,7 @@ fn hash_tool_specs(specs: &[ToolSpec]) -> String {
 }
 
 /// Default session output path for a given workspace.
-/// Returns `<workspace>/.recursive/sessions/<timestamp>-<goal-prefix>.json`.
+/// Returns `~/.recursive/workspaces/<ws-hash>/sessions/<timestamp>-<goal-prefix>.json`.
 pub fn default_session_path(workspace: &Path, goal: &str) -> PathBuf {
     let ts = filesystem_safe_timestamp();
     // Sanitise the goal prefix for use in a filename
@@ -140,15 +140,17 @@ pub fn default_session_path(workspace: &Path, goal: &str) -> PathBuf {
     } else {
         prefix
     };
-    workspace
-        .join(".recursive")
-        .join("sessions")
-        .join(format!("{}-{}.json", ts, prefix))
+    let dir = crate::paths::user_sessions_dir(workspace)
+        .unwrap_or_else(|_| workspace.join(".recursive").join("sessions"));
+    dir.join(format!("{}-{}.json", ts, prefix))
 }
 
 /// List all session files in a workspace's session directory.
 pub fn list_sessions(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let dir = workspace.join(".recursive").join("sessions");
+    let dir = match crate::paths::user_sessions_dir(workspace) {
+        Ok(d) => d,
+        Err(_) => workspace.join(".recursive").join("sessions"),
+    };
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -293,11 +295,11 @@ impl SessionWriter {
     ) -> std::io::Result<Self> {
         let slug = workspace_slug(workspace);
         let session_id = format!("{}-{}", filesystem_safe_timestamp(), slug);
-        let session_dir = workspace
-            .join(".recursive")
-            .join("sessions")
-            .join(&slug)
-            .join(&session_id);
+        // Sessions live under the per-user data dir, not the project,
+        // so they don't pollute the user's `git status`.
+        let sessions_root = crate::paths::user_sessions_dir(workspace)
+            .map_err(|e| std::io::Error::other(format!("user_sessions_dir: {e}")))?;
+        let session_dir = sessions_root.join(&slug).join(&session_id);
 
         std::fs::create_dir_all(&session_dir)?;
 
@@ -556,7 +558,10 @@ impl SessionReader {
     /// Returns a list of session directories sorted by name (which is
     /// timestamp-prefixed, so chronological).
     pub fn list_sessions(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
-        let base = workspace.join(".recursive").join("sessions");
+        let base = match crate::paths::user_sessions_dir(workspace) {
+            Ok(d) => d,
+            Err(_) => workspace.join(".recursive").join("sessions"),
+        };
         if !base.is_dir() {
             return Ok(Vec::new());
         }
@@ -948,8 +953,15 @@ mod tests {
         assert!(!goal_suffix.contains('™'));
         assert!(!goal_suffix.contains('—'));
 
-        // The path should still be under the sessions directory
-        assert!(path.starts_with(ws.join(".recursive").join("sessions")));
+        // The path should still end inside a sessions/ directory
+        // (now lives under the user data dir, not the workspace).
+        let parent = path.parent().expect("session path has parent");
+        assert_eq!(
+            parent.file_name().and_then(|n| n.to_str()),
+            Some("sessions"),
+            "expected sessions dir as parent, got {}",
+            path.display()
+        );
         // And should have .json extension
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
     }

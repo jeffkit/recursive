@@ -201,6 +201,14 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         goal: Vec<String>,
     },
+    /// Migrate legacy in-tree state (sessions, shadow-git, scratchpad)
+    /// from `<workspace>/.recursive/` to the per-user data dir at
+    /// `~/.recursive/workspaces/<hash>/`.
+    Migrate {
+        /// Show what would be moved without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -327,6 +335,22 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+
+    // Warn about legacy in-tree state for commands that interact with
+    // the workspace. The Migrate command itself shouldn't double-warn.
+    if !matches!(effective_cmd, Cmd::Migrate { .. }) {
+        let legacy = recursive::legacy_paths_in_workspace(&config.workspace);
+        if !legacy.is_empty() {
+            eprintln!(
+                "warning: legacy in-tree state detected at {}/.recursive/:",
+                config.workspace.display()
+            );
+            for p in &legacy {
+                eprintln!("    {}", p.display());
+            }
+            eprintln!("hint:    run `recursive migrate` to move it under ~/.recursive");
+        }
+    }
 
     match effective_cmd {
         Cmd::Tools => {
@@ -547,14 +571,9 @@ async fn main() -> anyhow::Result<()> {
                     recursive::session::SessionReader::list_sessions(&config.workspace)?;
                 let total = old_sessions.len() + new_sessions.len();
                 if total == 0 {
-                    println!(
-                        "No sessions found in {}",
-                        config
-                            .workspace
-                            .join(".recursive")
-                            .join("sessions")
-                            .display()
-                    );
+                    let sessions_root = recursive::user_sessions_dir(&config.workspace)
+                        .unwrap_or_else(|_| config.workspace.join(".recursive").join("sessions"));
+                    println!("No sessions found in {}", sessions_root.display());
                 } else {
                     println!("Sessions ({}):", total);
                     for s in &old_sessions {
@@ -726,7 +745,44 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        Cmd::Migrate { dry_run } => cmd_migrate(&config.workspace, dry_run),
     }
+}
+
+fn cmd_migrate(workspace: &Path, dry_run: bool) -> anyhow::Result<()> {
+    let report = recursive::migrate_workspace(workspace, dry_run)?;
+    if report.already_clean {
+        println!(
+            "Workspace {} has no legacy in-tree state. Nothing to migrate.",
+            workspace.display()
+        );
+        return Ok(());
+    }
+    let prefix = if dry_run { "(dry-run) " } else { "" };
+    if !report.moved.is_empty() {
+        println!("{prefix}Moved:");
+        for (src, dst) in &report.moved {
+            println!("  {} -> {}", src.display(), dst.display());
+        }
+    }
+    if !report.skipped.is_empty() {
+        println!("{prefix}Skipped (destination already exists):");
+        for (src, dst) in &report.skipped {
+            println!(
+                "  {} stays put; {} already has data",
+                src.display(),
+                dst.display()
+            );
+        }
+        eprintln!(
+            "warning: some items were not migrated. Inspect the destinations and \
+             merge manually if needed."
+        );
+    }
+    if report.removed_empty_dotrecursive {
+        println!("{prefix}Removed empty <workspace>/.recursive/");
+    }
+    Ok(())
 }
 
 /// Resolve a session path from a user-provided string.
@@ -743,47 +799,62 @@ fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathB
         return Ok(path);
     }
 
-    // Search the workspace session directory for a match
-    let sessions_dir = workspace.join(".recursive").join("sessions");
-    if !sessions_dir.is_dir() {
+    // Search both the new (user data dir) and legacy (in-tree) session
+    // directories so users with un-migrated state can still address
+    // their old sessions.
+    let new_dir = recursive::user_sessions_dir(workspace).ok();
+    let legacy_dir = workspace.join(".recursive").join("sessions");
+    let search_dirs: Vec<PathBuf> = new_dir
+        .into_iter()
+        .chain(if legacy_dir.is_dir() {
+            Some(legacy_dir.clone())
+        } else {
+            None
+        })
+        .filter(|d| d.is_dir())
+        .collect();
+
+    if search_dirs.is_empty() {
         anyhow::bail!(
-            "Session not found: '{}'. No sessions directory exists at {}.",
+            "Session not found: '{}'. No sessions directory exists (looked in user data dir and {}).",
             session,
-            sessions_dir.display()
+            legacy_dir.display()
         );
     }
 
     let lower = session.to_lowercase();
     let mut matches: Vec<PathBuf> = Vec::new();
 
-    // Search flat session files (old format: <timestamp>-<goal>.json)
-    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() {
-                if let Some(name) = p.file_stem().and_then(|n| n.to_str()) {
-                    if name.to_lowercase().contains(&lower) {
-                        matches.push(p);
+    for sessions_dir in &search_dirs {
+        // Search flat session files (old format: <timestamp>-<goal>.json)
+        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    if let Some(name) = p.file_stem().and_then(|n| n.to_str()) {
+                        if name.to_lowercase().contains(&lower) {
+                            matches.push(p);
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Search nested session directories (new JSONL format)
-    if let Ok(slug_entries) = std::fs::read_dir(&sessions_dir) {
-        for slug_entry in slug_entries.flatten() {
-            let slug_dir = slug_entry.path();
-            if !slug_dir.is_dir() {
-                continue;
-            }
-            if let Ok(session_entries) = std::fs::read_dir(&slug_dir) {
-                for session_entry in session_entries.flatten() {
-                    let p = session_entry.path();
-                    if p.is_dir() {
-                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                            if name.to_lowercase().contains(&lower) {
-                                matches.push(p);
+        // Search nested session directories (new JSONL format)
+        if let Ok(slug_entries) = std::fs::read_dir(sessions_dir) {
+            for slug_entry in slug_entries.flatten() {
+                let slug_dir = slug_entry.path();
+                if !slug_dir.is_dir() {
+                    continue;
+                }
+                if let Ok(session_entries) = std::fs::read_dir(&slug_dir) {
+                    for session_entry in session_entries.flatten() {
+                        let p = session_entry.path();
+                        if p.is_dir() {
+                            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                                if name.to_lowercase().contains(&lower) {
+                                    matches.push(p);
+                                }
                             }
                         }
                     }

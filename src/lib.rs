@@ -28,7 +28,9 @@ pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
 pub mod message;
+pub mod migrate;
 pub mod multi;
+pub mod paths;
 pub mod permissions;
 pub mod rewind;
 pub mod runtime;
@@ -65,10 +67,15 @@ pub use mcp::{
 #[cfg(feature = "mcp")]
 pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
+pub use migrate::{migrate_workspace, MigrateReport};
 pub use multi::{
     parse_delegations, AgentMessage, AgentPool, AgentRole, DelegationResult, MemoryEntry,
     MessageBus, MessageType, Pipeline, PipelineResult, SharedMemory, StageOutcome,
     TeamOrchestrator, TeamResult,
+};
+pub use paths::{
+    legacy_paths_in_workspace, user_data_dir, user_scratchpad_path, user_sessions_dir,
+    user_shadow_git_dir, user_workspace_dir, workspace_hash,
 };
 pub use rewind::{
     apply_rewind, checkpoint_log_path, detect_conflicts, plan_rewind, ConflictReport, RewindPlan,

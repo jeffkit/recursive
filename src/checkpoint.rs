@@ -74,7 +74,7 @@ impl ShadowRepo {
             name: "checkpoint".into(),
             message: format!("cannot canonicalize workspace: {e}"),
         })?;
-        let shadow_dir = workspace.join(".recursive").join("shadow-git");
+        let shadow_dir = crate::paths::user_shadow_git_dir(&workspace)?;
 
         if !shadow_dir.exists() {
             std::fs::create_dir_all(&shadow_dir).map_err(|e| Error::Tool {
