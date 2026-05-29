@@ -1,0 +1,23 @@
+//! Top-level rendering dispatch.
+//!
+//! The single entry point [`render`] picks a screen renderer based on
+//! the current [`AppScreen`]. Each renderer lives in its own
+//! sub-module so future iterations can extend layouts without bloating
+//! the chat view.
+
+use ratatui::Frame;
+
+use crate::app::{App, AppScreen};
+
+pub mod chat;
+pub mod plan_review;
+pub mod splash;
+
+/// Render the current screen onto `frame`.
+pub fn render(frame: &mut Frame, app: &App) {
+    match &app.screen {
+        AppScreen::Splash => splash::render(frame),
+        AppScreen::Chat => chat::render(frame, app),
+        AppScreen::PlanReview { plan_text } => plan_review::render(frame, plan_text),
+    }
+}
