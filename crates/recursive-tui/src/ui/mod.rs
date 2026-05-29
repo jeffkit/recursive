@@ -10,8 +10,10 @@ use ratatui::Frame;
 use crate::app::{App, AppScreen};
 
 pub mod chat;
+pub mod command_menu;
 pub mod diff;
 pub mod input;
+pub mod modal;
 pub mod plan_review;
 pub mod spinner;
 pub mod splash;

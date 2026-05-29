@@ -480,6 +480,29 @@ fn strip_history_prefix(raw: &str) -> (InputMode, &str) {
     }
 }
 
+/// Static fallback list of tools shown by `/tools` when the TUI is
+/// running in offline mode (no runtime to query). Mirrors the set
+/// `backend::build_default_tools` registers.
+pub fn default_offline_tool_catalog() -> Vec<(String, String)> {
+    vec![
+        ("read_file".into(), "Read a file from the workspace".into()),
+        ("write_file".into(), "Write a file to the workspace".into()),
+        ("apply_patch".into(), "Apply a V4A patch to a file".into()),
+        (
+            "list_dir".into(),
+            "List a directory under the workspace".into(),
+        ),
+        (
+            "run_shell".into(),
+            "Run a shell command in the workspace".into(),
+        ),
+        (
+            "search_files".into(),
+            "Search files for a regex pattern".into(),
+        ),
+    ]
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Top-level App
 // ──────────────────────────────────────────────────────────────────────
@@ -501,6 +524,25 @@ pub struct App {
     pub pricing: HashMap<&'static str, (f64, f64)>,
     pub model_name: String,
     pub spinner_frame: usize,
+    /// Goal-146: stack of overlay modals. The topmost (last) modal
+    /// receives keys; an empty stack means chat keys are active.
+    pub modals: Vec<crate::ui::modal::Modal>,
+    /// Goal-146: registry of `/`-prefixed slash commands. Lazily
+    /// initialised in [`App::new`] with [`CommandRegistry::default_set`].
+    pub commands: crate::commands::CommandRegistry,
+    /// Goal-146: list of tools the runtime has registered. Populated
+    /// by `main.rs` from `Backend::tool_specs()` after the worker
+    /// boots, and read by the `/tools` command. Defaults to a static
+    /// list when running offline.
+    pub tool_catalog: Vec<(String, String)>,
+    /// Goal-146: cursor / selected index into the command-menu
+    /// completion popup. `None` means the user hasn't navigated
+    /// (Enter executes the literal buffer).
+    pub command_menu_selected: Option<usize>,
+    /// Goal-146: planning-mode flag mirrored on the UI side. Reflects
+    /// the latest `/plan on|off` invocation. Used to render an
+    /// indicator and to seed `/status`.
+    pub planning_mode_on: bool,
 }
 
 impl App {
@@ -523,6 +565,11 @@ impl App {
             pricing: default_pricing_table(),
             model_name: detect_model_name(),
             spinner_frame: 0,
+            modals: Vec::new(),
+            commands: crate::commands::CommandRegistry::default_set(),
+            tool_catalog: default_offline_tool_catalog(),
+            command_menu_selected: None,
+            planning_mode_on: false,
         }
     }
 
@@ -545,6 +592,15 @@ impl App {
     /// Process one key event. Returns an optional [`UserAction`] that
     /// the caller must forward to the backend worker.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        // ── Modal stack ──────────────────────────────────────────────
+        // Goal-146: when any modal is on the stack, it owns the key
+        // events. Modals never produce UserActions on their own (the
+        // y-confirm path only mutates AppState).
+        if !self.modals.is_empty() {
+            self.handle_modal_key(key);
+            return None;
+        }
+
         // ── PlanReview screen ────────────────────────────────────────
         if let AppScreen::PlanReview { ref plan_text } = self.screen {
             let plan_text = plan_text.clone();
@@ -604,6 +660,16 @@ impl App {
         if key.code == KeyCode::BackTab {
             self.prompt.mode = self.prompt.mode.cycle_next();
             return None;
+        }
+
+        // ── Command-menu navigation (Goal 146) ───────────────────────
+        // Intercept Up/Down/Tab/Enter when the user is composing a
+        // slash command so the popup behaves like an autocomplete
+        // menu rather than scrolling the transcript / submitting.
+        if self.prompt.mode == InputMode::Command {
+            if let Some(action) = self.handle_command_menu_key(key) {
+                return action;
+            }
         }
 
         // ── Chat screen ──────────────────────────────────────────────
@@ -771,17 +837,50 @@ impl App {
                 self.scroll_to_bottom();
                 None
             }
-            InputMode::Command => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!("(commands not yet implemented: /{body})"),
-                });
-                self.scroll_to_bottom();
-                None
-            }
+            InputMode::Command => self.dispatch_slash_command(&body),
         };
 
         self.prompt.record_submission(prefixed);
+        self.command_menu_selected = None;
         action
+    }
+
+    /// Parse `body` (without the leading `/`) as `name + args`, look
+    /// it up in [`App::commands`], and run the handler. Returns an
+    /// optional [`UserAction`] for the dispatcher.
+    fn dispatch_slash_command(&mut self, body: &str) -> Option<UserAction> {
+        use crate::commands::{CommandHandler, CommandOutcome};
+
+        let mut parts = body.split_whitespace();
+        let name = parts.next().unwrap_or("");
+        let args: Vec<String> = parts.map(String::from).collect();
+
+        // Clone the registry to avoid borrowing self while invoking
+        // the handler (which takes &mut self).
+        let registry = self.commands.clone();
+        let Some(spec) = registry.lookup(name) else {
+            self.push_error(format!("Unknown command: /{name}. Try /help."));
+            return None;
+        };
+
+        match &spec.handler {
+            CommandHandler::Sync(f) => {
+                match f(self, &args) {
+                    CommandOutcome::Done => {}
+                    CommandOutcome::Error(msg) => self.push_error(msg),
+                    CommandOutcome::OpenModal(modal) => self.modals.push(modal),
+                }
+                None
+            }
+            CommandHandler::Async(f) => {
+                let actions = f(self, &args);
+                // The dispatcher only carries one UserAction back to
+                // the caller; queue the rest into App for later. In
+                // practice every async command returns 0 or 1 actions
+                // today.
+                actions.into_iter().next()
+            }
+        }
     }
 
     /// Apply an event coming from the backend worker.
@@ -895,6 +994,159 @@ impl App {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+    }
+
+    /// Push a System block onto the transcript and scroll to bottom.
+    /// Public so [`crate::commands`] handlers can use it directly.
+    pub fn push_system(&mut self, text: impl Into<String>) {
+        self.blocks
+            .push(TranscriptBlock::System { text: text.into() });
+        self.scroll_to_bottom();
+    }
+
+    /// Push an Error block onto the transcript and scroll to bottom.
+    pub fn push_error(&mut self, text: impl Into<String>) {
+        self.blocks
+            .push(TranscriptBlock::Error { text: text.into() });
+        self.scroll_to_bottom();
+    }
+
+    /// Reset the transcript to a single fresh welcome block and zero
+    /// out per-session usage. Called by `/clear`.
+    pub fn reset_transcript(&mut self) {
+        self.blocks.clear();
+        self.blocks.push(TranscriptBlock::System {
+            text: "Conversation cleared.".into(),
+        });
+        self.usage = UsageStats::default();
+        self.turn_count = 0;
+        self.pending_latency_ms = None;
+        self.scroll_to_bottom();
+    }
+
+    /// Handle a key in command-completion-menu context. Returns
+    /// `Some(action)` (with `action` itself optional) if the key was
+    /// consumed; the outer `None` means "fall through to the regular
+    /// chat key path".
+    pub fn handle_command_menu_key(&mut self, key: KeyEvent) -> Option<Option<UserAction>> {
+        use crate::ui::command_menu;
+        let matches_count = self.commands.search(&self.prompt.buffer).len();
+
+        match key.code {
+            KeyCode::Up => {
+                match self.command_menu_selected {
+                    None => return None,
+                    Some(0) => self.command_menu_selected = None,
+                    Some(n) => self.command_menu_selected = Some(n - 1),
+                }
+                Some(None)
+            }
+            KeyCode::Down => {
+                if matches_count == 0 {
+                    return None;
+                }
+                let next = match self.command_menu_selected {
+                    None => 0,
+                    Some(n) if n + 1 < matches_count.min(command_menu::MAX_VISIBLE) => n + 1,
+                    Some(n) => n,
+                };
+                self.command_menu_selected = Some(next);
+                Some(None)
+            }
+            KeyCode::Tab => {
+                let registry = self.commands.clone();
+                let matches = registry.search(&self.prompt.buffer);
+                if let Some(target) =
+                    command_menu::tab_completion_target(&self.prompt.buffer, &matches)
+                {
+                    self.prompt.buffer = target;
+                    self.prompt.cursor = self.prompt.buffer.len();
+                    self.command_menu_selected = None;
+                }
+                Some(None)
+            }
+            KeyCode::Enter => {
+                // If a menu item is selected, execute it; otherwise
+                // fall through to the regular submit path so the
+                // user's literal buffer is dispatched.
+                if let Some(idx) = self.command_menu_selected {
+                    let registry = self.commands.clone();
+                    let matches = registry.search(&self.prompt.buffer);
+                    if let Some(spec) = matches.get(idx) {
+                        let chosen = spec.name.to_string();
+                        self.prompt.buffer = chosen;
+                        self.prompt.cursor = self.prompt.buffer.len();
+                    }
+                    self.command_menu_selected = None;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle a key event when at least one modal is on the stack.
+    /// Returns `true` if the key was consumed by the modal layer
+    /// (so the caller should skip the chat key path).
+    pub fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
+        use crate::ui::modal::{ConfirmAction, Modal};
+        let Some(top) = self.modals.last_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.modals.pop();
+            }
+            KeyCode::Char('q') => {
+                self.modals.pop();
+            }
+            KeyCode::Char('y') => {
+                if let Modal::Confirm { on_yes, .. } = top.clone() {
+                    self.modals.pop();
+                    match on_yes {
+                        ConfirmAction::Exit => {
+                            self.should_quit = true;
+                        }
+                        ConfirmAction::Clear => {
+                            self.reset_transcript();
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                if matches!(top, Modal::Confirm { .. }) {
+                    self.modals.pop();
+                }
+            }
+            KeyCode::Enter => {
+                if let Modal::Confirm { on_yes, .. } = top.clone() {
+                    self.modals.pop();
+                    match on_yes {
+                        ConfirmAction::Exit => self.should_quit = true,
+                        ConfirmAction::Clear => self.reset_transcript(),
+                    }
+                } else {
+                    // Enter on non-confirm modals just dismisses.
+                    self.modals.pop();
+                }
+            }
+            KeyCode::Up => {
+                if let Modal::Journal { selected, .. } = top {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Modal::Journal { entries, selected } = top {
+                    if *selected + 1 < entries.len() {
+                        *selected += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn start_turn(&mut self) {
@@ -1874,7 +2126,9 @@ mod prompt_input_tests {
     }
 
     #[test]
-    fn submit_in_command_mode_appends_placeholder() {
+    fn submit_in_command_mode_dispatches_to_registry() {
+        // Goal-146 replaces the old placeholder System block with the
+        // actual command dispatcher. /help opens the Help modal.
         let mut app = fresh_app();
         let _ = app.handle_key(k(KeyCode::Char('/')));
         for c in "help".chars() {
@@ -1882,8 +2136,11 @@ mod prompt_input_tests {
         }
         let action = app.handle_key(k(KeyCode::Enter));
         assert!(action.is_none());
-        assert!(app.blocks.iter().any(|b| matches!(b,
-            TranscriptBlock::System { text } if text.contains("not yet implemented"))));
+        // /help pushed a Help modal onto the stack.
+        assert_eq!(app.modals.last(), Some(&crate::ui::modal::Modal::Help));
+        // Buffer was reset.
+        assert!(app.prompt.buffer.is_empty());
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
     }
 
     // ── prompt_input::submit_clears_buffer_and_resets_mode ──────────

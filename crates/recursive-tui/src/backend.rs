@@ -134,6 +134,7 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
 }
 
 /// Outcome of attempting to construct a runtime from the environment.
+#[allow(clippy::large_enum_variant)]
 enum RuntimeBuild {
     Ready(AgentRuntime),
     /// No usable LLM provider; the worker enters offline mode and
@@ -296,6 +297,32 @@ async fn worker_loop(
                 if let RuntimeBuild::Ready(rt) = &mut state {
                     rt.reject_plan(&reason);
                 }
+            }
+            UserAction::Compact => match &mut state {
+                RuntimeBuild::Ready(rt) => {
+                    if let Err(e) = rt.compact_now().await {
+                        let _ = event_tx.send(UiEvent::Error {
+                            message: format!("compact failed: {e}"),
+                        });
+                    }
+                }
+                RuntimeBuild::Offline { .. } => {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: "compact unavailable in offline mode".into(),
+                    });
+                }
+            },
+            UserAction::SetPlanningMode(on) => {
+                if let RuntimeBuild::Ready(rt) = &mut state {
+                    let mode = if on {
+                        recursive::PlanningMode::PlanFirst
+                    } else {
+                        recursive::PlanningMode::Immediate
+                    };
+                    rt.set_planning_mode(mode);
+                }
+                // Offline mode is allowed: the App-side System block
+                // already echoed the new state to the user.
             }
         }
     }

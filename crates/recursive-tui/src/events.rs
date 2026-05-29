@@ -70,6 +70,14 @@ pub enum UserAction {
     ConfirmPlan,
     /// Reject the pending plan with a free-form reason.
     RejectPlan(String),
+    /// Goal-146: trigger a transcript compaction pass via
+    /// [`AgentRuntime::compact_now`]. The worker pushes a
+    /// `Compacted` event when summarisation succeeds.
+    Compact,
+    /// Goal-146: flip the runtime's planning mode. `true` enables
+    /// plan-first mode, `false` reverts to immediate execution.
+    /// The worker echoes a `System` block confirming the new state.
+    SetPlanningMode(bool),
     /// Tear down the worker and exit the runtime.
     Shutdown,
 }

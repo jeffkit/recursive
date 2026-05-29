@@ -272,6 +272,40 @@ impl AgentRuntime {
         self.plan_confirmed = true;
     }
 
+    /// Force a compaction pass right now, regardless of the
+    /// configured threshold. Useful for TUI / API surfaces that
+    /// expose a manual "/compact" command.
+    ///
+    /// No-op (returns `Ok(())`) when no compactor is configured or
+    /// when the transcript is too small to compact (fewer than
+    /// `keep_recent_n + 2` messages).
+    pub async fn compact_now(&mut self) -> Result<()> {
+        let Some(ref compactor) = self.compactor else {
+            return Ok(());
+        };
+        if self.transcript.len() < compactor.keep_recent_n + 2 {
+            return Ok(());
+        }
+        let summary_msg = compactor
+            .compact(self.kernel.llm().as_ref(), &self.transcript)
+            .await?;
+        let keep = compactor.keep_recent_n;
+        let mut split = self.transcript.len().saturating_sub(keep);
+        while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool) {
+            split -= 1;
+        }
+        self.transcript.drain(..split);
+        self.transcript.insert(0, summary_msg);
+        Ok(())
+    }
+
+    /// Update the planning mode in place. Allows the TUI's
+    /// `/plan on|off` command to flip plan-first vs immediate
+    /// without rebuilding the runtime.
+    pub fn set_planning_mode(&mut self, mode: PlanningMode) {
+        self.planning_mode = mode;
+    }
+
     /// Reject the pending plan with a reason.
     ///
     /// This injects a tool error message into the transcript to inform the agent
@@ -1150,5 +1184,90 @@ mod tests {
         let out = rt.run("hi").await.unwrap();
         assert!(out.checkpoint_id.is_none());
         assert!(!rt.checkpoints_enabled());
+    }
+
+    // ── compact_now / set_planning_mode (Goal 146) ────────────────────
+
+    #[tokio::test]
+    async fn compact_now_invokes_compactor() {
+        // Provider used (a) to answer two normal turns, (b) to answer
+        // the compactor's "summarize" call.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first reply".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "second reply".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "compacted summary".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        // Threshold = MAX so the auto-compaction in `run` never fires;
+        // keep_recent_n=1 so we only need 3 messages before compact_now
+        // has work to do.
+        let compactor = crate::compact::Compactor::new(usize::MAX).keep_recent_n(1);
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+        rt.run("turn 1").await.unwrap();
+        rt.run("turn 2").await.unwrap();
+        let len_before = rt.transcript().len();
+        assert!(len_before >= 3, "expected ≥3 messages, got {len_before}");
+
+        rt.compact_now().await.unwrap();
+        // The compactor replaces older messages with one summary
+        // system message plus keep_recent_n=1 verbatim message.
+        assert_eq!(rt.transcript().len(), 2);
+        assert_eq!(rt.transcript()[0].role, crate::message::Role::System);
+        assert!(rt.transcript()[0].content.starts_with("[compacted:"));
+    }
+
+    #[tokio::test]
+    async fn compact_now_is_noop_without_compactor() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "x".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.run("hi").await.unwrap();
+        let before = rt.transcript().len();
+        rt.compact_now().await.unwrap();
+        assert_eq!(rt.transcript().len(), before);
+    }
+
+    #[tokio::test]
+    async fn set_planning_mode_updates_field() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        // Default is Immediate.
+        assert_eq!(rt.planning_mode, PlanningMode::Immediate);
+        rt.set_planning_mode(PlanningMode::PlanFirst);
+        assert_eq!(rt.planning_mode, PlanningMode::PlanFirst);
+        rt.set_planning_mode(PlanningMode::Immediate);
+        assert_eq!(rt.planning_mode, PlanningMode::Immediate);
     }
 }

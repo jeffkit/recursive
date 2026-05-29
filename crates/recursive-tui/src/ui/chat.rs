@@ -19,7 +19,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::ui::{input, spinner, status, transcript};
+use crate::ui::{command_menu, input, modal, spinner, status, transcript};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let input_total = input::total_height(app);
@@ -63,4 +63,13 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Input panel + footer hint.
     input::render(frame, chunks[2], app);
+
+    // Goal-146: floating slash-command popup, drawn after the input
+    // box so it overlays the messages panel.
+    command_menu::render(frame, chunks[2], app);
+
+    // Goal-146: modals are last so they cover everything else.
+    if !app.modals.is_empty() {
+        modal::render(frame, app);
+    }
 }
