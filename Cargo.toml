@@ -34,6 +34,15 @@ name = "recursive"
 path = "src/main.rs"
 required-features = ["cli"]
 
+# Mock MCP server used by the integration tests in `src/mcp.rs`.
+# Built with `cargo test`; tests locate it via `CARGO_BIN_EXE_mock_mcp_server`.
+[[bin]]
+name = "mock_mcp_server"
+path = "tests/bin/mock_mcp_server.rs"
+test = false
+doc = false
+bench = false
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "io-std", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
