@@ -27,9 +27,9 @@ Durable state for production use.
 | 14.1 | Session persistence (JSONL) | M | ✅ Batch 35 (Goals 107-109) |
 | 14.2 | Memory persistence (4-layer system) | M | ✅ Batch 35-36 (Goals 110-113, 110b) |
 | 14.3 | Transcript export/import (JSON) | S | ✅ Batch 37 (Goal 119 — `sessions export` shipped, e2da6c1) |
-| 14.4 | Agent checkpoint/resume | M | 🔴 |
+| 14.4 | Agent checkpoint/resume | M | ✅ Goal 141 — per-turn, per-session shadow git checkpoints + `recursive sessions rewind` (commits 70afa9e, 38336ab); follow-up Goal 142 relocates state to `~/.recursive/workspaces/<hash>/` (d5c7804) |
 
-**Total**: ~2 batches → 2 done
+**Total**: ~2 batches → 4 done
 
 ---
 
@@ -48,18 +48,26 @@ Understanding what agents do in production.
 
 ---
 
-## Phase 16 — Plugin System (Priority: High)
+## Phase 16 — Plugin System (Priority: deferred)
 
-Allow third-party tool/provider extensions without forking.
+Originally framed as the way to add third-party tools and providers
+without forking. Re-evaluated 2026-05-29: most of what plugins would
+solve is already covered by adjacent mechanisms — **MCP servers**
+ship arbitrary tools without touching the agent binary, and any LLM
+gateway that speaks the OpenAI or Anthropic API is transparently
+usable as a provider. A native plugin system buys little on top of
+those, while adding meaningful complexity (ABI compatibility, dynamic
+loading, sandboxing).
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 16.1 | Plugin trait + dynamic loading (dylib/.so) | L | 🔴 |
-| 16.2 | Plugin manifest (TOML) + discovery | S | 🔴 |
-| 16.3 | Plugin registry (list/install from URL) | M | 🔴 |
-| 16.4 | Sandboxed plugin execution (WASM runtime) | L | 🔴 |
+| 16.1 | Plugin trait + dynamic loading (dylib/.so) | L | ⏸ deferred — MCP covers the tool-extension case |
+| 16.2 | Plugin manifest (TOML) + discovery | S | ⏸ deferred |
+| 16.3 | Plugin registry (list/install from URL) | M | ⏸ deferred |
+| 16.4 | Sandboxed plugin execution (WASM runtime) | L | ⏸ deferred |
 
-**Total**: ~3 batches
+Re-open if a real use case appears that MCP + OpenAI/Anthropic-shaped
+gateways genuinely cannot serve.
 
 ---
 
@@ -71,7 +79,7 @@ Make it safe and reliable for real deployments.
 |----|---------|--------|--------|
 | 17.1 | Rate limiting (per-session, per-API-key) | S | ✅ Batch 38 (Goal 121 implementation 1d7a53d + Goal 139 integration tests) |
 | 17.2 | Authentication (API keys + JWT) | M | ✅ Batch 38 (Goal 135 API keys + Goal 136 JWT HS256 verify-only) |
-| 17.3 | Tool permission system (role-based allow/deny) | M | 🟡 Partial — allow/deny patterns shipped (Goal 133 + Goal 140 wired into config.toml + env); role-based per-caller permissions deferred |
+| 17.3 | Tool permission system | M | ✅ Allow/deny patterns shipped (Goal 133 + Goal 140, wired into config.toml + env). Per-caller / role-based permissions remain a SaaS-only concern and are intentionally deferred until the project takes that direction. |
 | 17.4 | Graceful shutdown + in-flight request draining | S | ✅ Batch 38 (Goal 120 signal handling + Goal 137 wired token through kernel/runtime) |
 | 17.5 | Docker packaging + health probes | S | ✅ Batch 38 (Goal 138 — Dockerfile + .dockerignore + ghcr.io workflow; /health auth-exempt suffices for k8s probes) |
 
@@ -126,8 +134,14 @@ Batch 37: Phase 15 + 17 (Observability + Hardening)
                   120 (graceful shutdown), 121 (rate limiting),
                   122 (Prometheus metrics endpoint)
 Batch 38: Phase 17 continued (Auth + Docker)
-Batch 39: Phase 16.1-16.2 (Plugins) — trait + manifest
-Batch 40: Phase 18 (Agent Patterns) — reflection, tool learning
+Batch 39: Phase 14.4 (Checkpoint/Rewind)
+           Goals: 141 (per-turn shadow git checkpoints + rewind CLI)
+                  142 (relocate workspace state to ~/.recursive)
+Batch 40: Phase 18 (Agent Patterns) — reflection, tool learning,
+                                       hierarchical planning, consensus
+                                       (Phase 16 plugins deferred —
+                                        MCP + OpenAI/Anthropic-shaped
+                                        gateways cover the use case)
 Batch 41+: Phase 19 (Ecosystem) — SDKs, installers, docs site
 ```
 
