@@ -5,8 +5,15 @@
 //! (typed messages, plan confirmations, shutdown) into the worker via
 //! `action_tx` and the worker pushes [`UiEvent`]s back via `event_rx`.
 //!
-//! When no LLM provider is configured (no `RECURSIVE_API_KEY`/
-//! `OPENAI_API_KEY` and `RECURSIVE_TUI_MOCK` is unset), the worker
+//! Provider configuration follows the same priority chain the CLI
+//! uses (`recursive::config::Config::from_env()`):
+//!
+//! 1. env vars (`RECURSIVE_API_KEY` / `OPENAI_API_KEY`,
+//!    `RECURSIVE_API_BASE`, `RECURSIVE_MODEL`, ...)
+//! 2. `~/.recursive/config.toml` (written by `recursive config set ...`)
+//! 3. hardcoded defaults
+//!
+//! When no API key can be resolved through any of these, the worker
 //! still spins up — every `SendMessage` is answered with a
 //! `UiEvent::Error` describing the missing config. This keeps the
 //! TUI itself bootable for layout/keybinding work even without
@@ -167,43 +174,45 @@ enum RuntimeBuild {
 
 /// Build the runtime that backs this worker.
 ///
-/// Order of resolution:
-///   1. `RECURSIVE_TUI_MOCK=1` → an empty mock provider (mostly
-///      useful for tests; the integration test wires a richer mock
-///      via the `recursive-agent/test-utils` feature).
-///   2. `RECURSIVE_API_KEY` / `OPENAI_API_KEY` set → real provider.
-///   3. Otherwise → offline mode.
+/// Delegates to [`recursive::config::Config::from_env`] so the TUI
+/// honours the same priority chain as the CLI:
+///
+/// 1. env vars (`RECURSIVE_API_KEY` / `OPENAI_API_KEY`,
+///    `RECURSIVE_API_BASE`, `RECURSIVE_MODEL`, ...)
+/// 2. `~/.recursive/config.toml`
+/// 3. hardcoded defaults
+///
+/// If `Config::from_env` fails (malformed `config.toml`) or yields
+/// no API key, the worker enters offline mode with a helpful reason.
 fn build_runtime() -> RuntimeBuild {
-    let workspace: PathBuf = std::env::var("RECURSIVE_WORKSPACE")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let config = match recursive::config::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            return RuntimeBuild::Offline {
+                reason: format!("failed to load configuration: {e}"),
+            };
+        }
+    };
 
-    let api_key = std::env::var("RECURSIVE_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .ok();
+    let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => {
+            return RuntimeBuild::Offline {
+                reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
+                         OPENAI_API_KEY, or run `recursive config set \
+                         provider.api_key <KEY>` to populate \
+                         ~/.recursive/config.toml."
+                    .to_string(),
+            };
+        }
+    };
 
-    if api_key.is_none() {
-        return RuntimeBuild::Offline {
-            reason: "no LLM provider configured (set OPENAI_API_KEY or RECURSIVE_API_KEY)"
-                .to_string(),
-        };
-    }
+    let provider: Arc<dyn LlmProvider> = Arc::new(
+        recursive::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)
+            .with_temperature(config.temperature),
+    );
 
-    let api_key = api_key.unwrap();
-    let api_base = std::env::var("RECURSIVE_API_BASE")
-        .or_else(|_| std::env::var("OPENAI_API_BASE"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = std::env::var("RECURSIVE_MODEL")
-        .or_else(|_| std::env::var("OPENAI_MODEL"))
-        .unwrap_or_else(|_| "gpt-4o-mini".into());
-
-    let provider: Arc<dyn LlmProvider> = Arc::new(recursive::llm::OpenAiProvider::new(
-        &api_base, api_key, &model,
-    ));
-
-    let tools = build_default_tools(&workspace);
+    let tools = build_default_tools(&config.workspace);
 
     match AgentRuntimeBuilder::new()
         .llm(provider)
@@ -439,16 +448,25 @@ async fn run_bash_command(
 mod tests {
     use super::*;
 
-    /// Without `RECURSIVE_API_KEY` / `OPENAI_API_KEY`, sending a
-    /// message produces a graceful `UiEvent::Error` rather than a
-    /// panic.
+    /// Without `RECURSIVE_API_KEY` / `OPENAI_API_KEY` and without a
+    /// `~/.recursive/config.toml`, sending a message produces a
+    /// graceful `UiEvent::Error` rather than a panic.
     ///
-    /// This test mutates process-global env vars; we keep all env
-    /// touches inside one test to avoid races with other tests in
-    /// this crate (cf. lesson 17 in `.dev/AGENTS.md`).
+    /// Also covers the Goal-149 case where a populated config file
+    /// _does_ provide an API key — the worker must build the runtime
+    /// successfully and not enter offline mode.
+    ///
+    /// Both checks live in one test on purpose: env mutations
+    /// (`HOME` / `RECURSIVE_API_KEY` / `OPENAI_API_KEY`) are
+    /// process-global. We hold the `PinnedHome` lock for the whole
+    /// body so other tests can't observe a torn-down state
+    /// (cf. lesson 17 in `.dev/AGENTS.md`).
     #[tokio::test]
-    async fn offline_mode_returns_error_without_panic() {
-        // Snapshot and clear any keys the user happens to have set.
+    async fn offline_mode_and_config_file_resolution() {
+        // ── Part A: empty HOME, no env vars → offline ──────────────
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedHome::new(empty_home.path());
+
         let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
         let prev_openai = std::env::var("OPENAI_API_KEY").ok();
         std::env::remove_var("RECURSIVE_API_KEY");
@@ -460,14 +478,19 @@ mod tests {
             .send(UserAction::SendMessage("hi".into()))
             .unwrap();
 
-        // Drain events until we see the offline Error (a
-        // TurnFinished may precede or follow it).
         let mut got_error = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
                 Ok(Some(UiEvent::Error { message })) => {
-                    assert!(message.contains("no LLM provider configured"));
+                    assert!(
+                        message.contains("no LLM provider configured"),
+                        "expected offline reason, got {message:?}"
+                    );
+                    assert!(
+                        message.contains("recursive config set"),
+                        "offline reason should mention CLI config helper, got {message:?}"
+                    );
                     got_error = true;
                     break;
                 }
@@ -476,18 +499,41 @@ mod tests {
                 Err(_) => continue,
             }
         }
-
         let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(got_error, "expected an offline-mode UiEvent::Error");
+        drop(backend);
 
-        // Restore environment.
+        // ── Part B: write a config.toml under HOME, expect Ready ───
+        let cfg_dir = empty_home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"[provider]
+api_key = "sk-test-from-config"
+api_base = "https://api.example.invalid"
+model = "test-model-from-config"
+type = "openai"
+"#,
+        )
+        .expect("write config");
+
+        // Env still cleared from Part A — config.toml is the only
+        // source of credentials.
+        let build = build_runtime();
+        match build {
+            RuntimeBuild::Ready(_) => {} // pass
+            RuntimeBuild::Offline { reason } => {
+                panic!("expected Ready when config.toml has api_key, got Offline: {reason}");
+            }
+        }
+
+        // ── Restore env ────────────────────────────────────────────
         if let Some(v) = prev_recursive {
             std::env::set_var("RECURSIVE_API_KEY", v);
         }
         if let Some(v) = prev_openai {
             std::env::set_var("OPENAI_API_KEY", v);
         }
-
-        assert!(got_error, "expected an offline-mode UiEvent::Error");
     }
 
     #[test]
