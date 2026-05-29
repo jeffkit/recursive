@@ -12,10 +12,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use recursive::error::{Error, Result};
 use recursive::mcp::{McpClient, McpServer, McpTool, McpToolSpec};
+
+/// Read timeout for tests. Has to cover:
+/// 1. The genuine "server is hung" case (`timeout` mock mode) — we want
+///    this to give up well before the 10s production default.
+/// 2. The cold-start cost of spawning the mock binary in parallel with
+///    16 other tests on a busy CI box. Empirically 500ms is too tight
+///    on macOS when many test harness threads compete; 2s is a safe
+///    middle ground that still cuts the timeout test from ~10s to ~2s.
+const TEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Spawn the pure-Rust mock MCP server binary in the given behavior mode.
 async fn spawn_mock(mode: &str) -> Result<McpClient> {
@@ -25,7 +35,7 @@ async fn spawn_mock(mode: &str) -> Result<McpClient> {
         args: vec![mode.to_string()],
         url: None,
     };
-    McpClient::spawn(&server).await
+    McpClient::spawn_with_timeout(&server, TEST_READ_TIMEOUT).await
 }
 
 // ---------------------------------------------------------------------------

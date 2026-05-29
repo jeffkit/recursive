@@ -170,7 +170,17 @@ pub struct McpClient {
     capabilities: ServerCapabilities,
     /// Name of the MCP server (for error reporting).
     server_name: String,
+    /// How long to wait for a single line of stdio output before
+    /// declaring the server hung. Defaults to
+    /// [`DEFAULT_STDIO_READ_TIMEOUT`]; tests use a shorter value to
+    /// keep the suite fast.
+    read_timeout: Duration,
 }
+
+/// Default timeout for reading a single JSON-RPC line from a stdio
+/// MCP server. Generous on purpose — real servers can pause briefly
+/// during large tool runs without being broken.
+pub const DEFAULT_STDIO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capabilities advertised by an MCP server during the initialize handshake.
 #[derive(Debug, Clone, Default)]
@@ -206,15 +216,24 @@ impl McpClient {
     ///
     /// If `server.url` is set, uses HTTP+SSE transport. Otherwise uses stdio.
     pub async fn spawn(server: &McpServer) -> Result<Self> {
+        Self::spawn_with_timeout(server, DEFAULT_STDIO_READ_TIMEOUT).await
+    }
+
+    /// Like [`spawn`], but with a custom stdio read timeout. Tests use
+    /// a short value (e.g. 500ms) to keep the suite fast; production
+    /// callers should stick to [`spawn`].
+    pub async fn spawn_with_timeout(server: &McpServer, read_timeout: Duration) -> Result<Self> {
         if let Some(url) = &server.url {
+            // HTTP+SSE has its own internal timeouts that are independent
+            // of stdio handshake behavior; keep its existing semantics.
             Self::spawn_http_sse(server, url).await
         } else {
-            Self::spawn_stdio(server).await
+            Self::spawn_stdio(server, read_timeout).await
         }
     }
 
     /// Spawn via stdio subprocess.
-    async fn spawn_stdio(server: &McpServer) -> Result<Self> {
+    async fn spawn_stdio(server: &McpServer, read_timeout: Duration) -> Result<Self> {
         let mut child = Command::new(&server.command)
             .args(&server.args)
             .stdin(std::process::Stdio::piped())
@@ -245,6 +264,7 @@ impl McpClient {
             next_id: 1,
             capabilities: ServerCapabilities::default(),
             server_name: server.name.clone(),
+            read_timeout,
         };
 
         client.do_initialize(&server.name).await?;
@@ -341,6 +361,9 @@ impl McpClient {
             next_id: 1,
             capabilities: ServerCapabilities::default(),
             server_name: server.name.clone(),
+            // SSE transport reads its own stream with internal timeouts;
+            // this field is unused for HTTP+SSE but must be set.
+            read_timeout: DEFAULT_STDIO_READ_TIMEOUT,
         };
 
         client.do_initialize(&server.name).await?;
@@ -736,7 +759,8 @@ impl McpClient {
     async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
         match &mut self.transport {
             McpTransport::Stdio { reader, .. } => {
-                Self::read_stdio_response(reader, expected_id, &self.server_name).await
+                Self::read_stdio_response(reader, expected_id, &self.server_name, self.read_timeout)
+                    .await
             }
             McpTransport::HttpSse {
                 client,
@@ -762,6 +786,7 @@ impl McpClient {
         reader: &mut BufReader<ChildStdout>,
         expected_id: u64,
         server_name: &str,
+        read_timeout: Duration,
     ) -> Result<Value> {
         let mut line_buf = String::new();
 
@@ -769,7 +794,7 @@ impl McpClient {
             line_buf.clear();
 
             let read_future = reader.read_line(&mut line_buf);
-            match timeout(Duration::from_secs(10), read_future).await {
+            match timeout(read_timeout, read_future).await {
                 Ok(Ok(0)) => {
                     return Err(Error::Mcp {
                         server: server_name.to_string(),

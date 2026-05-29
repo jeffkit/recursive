@@ -75,7 +75,19 @@ impl ShadowRepo {
             message: format!("cannot canonicalize workspace: {e}"),
         })?;
         let shadow_dir = crate::paths::user_shadow_git_dir(&workspace)?;
+        Self::open_at(workspace, shadow_dir)
+    }
 
+    /// Open or create a shadow repo with an explicit `shadow_dir`,
+    /// bypassing `paths::user_data_dir()` resolution.
+    ///
+    /// Used by tests so they don't have to mutate `RECURSIVE_HOME`
+    /// (and thus don't need the cross-module env lock), letting
+    /// checkpoint tests run in parallel. Production callers should
+    /// stick to [`open`].
+    pub fn open_at(workspace: impl Into<PathBuf>, shadow_dir: impl Into<PathBuf>) -> Result<Self> {
+        let workspace = workspace.into();
+        let shadow_dir = shadow_dir.into();
         if !shadow_dir.exists() {
             std::fs::create_dir_all(&shadow_dir).map_err(|e| Error::Tool {
                 name: "checkpoint".into(),
@@ -596,20 +608,41 @@ fn validate_session_id(sid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::IsolatedWorkspace;
     use std::fs;
+    use tempfile::TempDir;
 
     fn has_git() -> bool {
         Command::new("git").arg("--version").output().is_ok()
     }
 
-    /// Test workspace bundle. See [`IsolatedWorkspace`] for the why:
-    /// without it, checkpoint tests race with any other test that
-    /// briefly mutates `RECURSIVE_HOME` or `HOME`, because
-    /// `ShadowRepo::open` resolves its shadow-git directory through
-    /// `paths::user_data_dir()`.
-    fn ws() -> IsolatedWorkspace {
-        IsolatedWorkspace::new()
+    /// Test workspace bundle: a workspace tempdir + a sibling tempdir
+    /// to use as the shadow-git directory. Tests pass `ws.shadow_dir()`
+    /// to `ShadowRepo::open_at` so they bypass `paths::user_data_dir()`
+    /// entirely — no env mutation, no global lock, full parallelism.
+    struct TestWs {
+        workspace: TempDir,
+        shadow: TempDir,
+    }
+
+    impl TestWs {
+        fn path(&self) -> &std::path::Path {
+            self.workspace.path()
+        }
+        fn shadow_dir(&self) -> std::path::PathBuf {
+            self.shadow.path().join("shadow-git")
+        }
+        /// Convenience for tests that previously called
+        /// `ShadowRepo::open(w.path())`.
+        fn open_repo(&self) -> Result<ShadowRepo> {
+            ShadowRepo::open_at(self.path(), self.shadow_dir())
+        }
+    }
+
+    fn ws() -> TestWs {
+        TestWs {
+            workspace: tempfile::tempdir().expect("workspace tempdir"),
+            shadow: tempfile::tempdir().expect("shadow tempdir"),
+        }
     }
 
     #[test]
@@ -618,7 +651,7 @@ mod tests {
             return;
         }
         let w = ws();
-        let r = ShadowRepo::open(w.path()).expect("open");
+        let r = w.open_repo().expect("open");
         assert!(r.shadow_dir.exists());
         assert!(r.shadow_dir.join("HEAD").exists());
     }
@@ -649,7 +682,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("a.txt"), "from-A").unwrap();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let id_a1 = r.snapshot_for_session("sessA", "A turn 0").unwrap();
 
         fs::write(w.path().join("a.txt"), "from-B").unwrap();
@@ -670,7 +703,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("same.txt"), "identical content").unwrap();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let _ = r.snapshot_for_session("a", "A").unwrap();
         let _ = r.snapshot_for_session("b", "B").unwrap();
 
@@ -699,7 +732,7 @@ mod tests {
         fs::write(&x, "x-orig").unwrap();
         fs::write(&y, "y-orig").unwrap();
 
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let cp = r.snapshot_for_session("s", "init").unwrap();
 
         fs::write(&x, "x-modified").unwrap();
@@ -723,7 +756,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("keeper.txt"), "k").unwrap();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let cp = r.snapshot_for_session("s", "before-new").unwrap();
 
         let nf = w.path().join("new.txt");
@@ -741,7 +774,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("a.txt"), "exists").unwrap();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let cp = r.snapshot_for_session("s", "init").unwrap();
         assert_eq!(
             r.read_file_at(&cp, "a.txt").unwrap(),
@@ -757,7 +790,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("a.txt"), "1").unwrap();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let c1 = r.snapshot_for_session("s", "v1").unwrap();
         fs::write(w.path().join("a.txt"), "2").unwrap();
         fs::write(w.path().join("b.txt"), "new").unwrap();
@@ -775,7 +808,7 @@ mod tests {
             return;
         }
         let w = ws();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         assert!(r.list_for_session("never").unwrap().is_empty());
     }
 
@@ -791,7 +824,7 @@ mod tests {
             "gitdir: /elsewhere/.git/worktrees/foo\n",
         )
         .unwrap();
-        let r = ShadowRepo::open(w.path()).expect("open with worktree");
+        let r = w.open_repo().expect("open with worktree");
         // Snapshots still work.
         fs::write(w.path().join("a.txt"), "hi").unwrap();
         let _ = r.snapshot_for_session("s", "wt").unwrap();
@@ -808,7 +841,7 @@ mod tests {
         // can happen under load.
         let w = ws();
         fs::write(w.path().join("a.txt"), "v1").unwrap();
-        let r = ShadowRepo::open(w.path()).unwrap();
+        let r = w.open_repo().unwrap();
         let _ = r.snapshot_for_session("alpha", "1").unwrap();
         // Tmp index should be cleaned up after each call.
         assert!(!r.shadow_dir.join("tmp-index-alpha").exists());

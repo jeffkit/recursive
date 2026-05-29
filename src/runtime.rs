@@ -958,12 +958,36 @@ mod tests {
             .is_ok()
     }
 
+    /// Workspace tempdir + sibling shadow tempdir, both alive together.
+    /// Tests open `ShadowRepo::open_at(...)` against `shadow_dir()` to
+    /// avoid touching `paths::user_data_dir()` and the global env lock.
+    struct ShadowWs {
+        workspace: tempfile::TempDir,
+        shadow: tempfile::TempDir,
+    }
+
+    impl ShadowWs {
+        fn path(&self) -> &std::path::Path {
+            self.workspace.path()
+        }
+        fn shadow_dir(&self) -> std::path::PathBuf {
+            self.shadow.path().join("shadow-git")
+        }
+    }
+
+    fn shadow_ws() -> ShadowWs {
+        ShadowWs {
+            workspace: tempfile::tempdir().expect("workspace tempdir"),
+            shadow: tempfile::tempdir().expect("shadow tempdir"),
+        }
+    }
+
     #[tokio::test]
     async fn runtime_snapshots_at_turn_boundaries() {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         std::fs::write(dir.path().join("seed.txt"), "v0").unwrap();
 
         let llm = Arc::new(MockProvider::new(vec![
@@ -984,7 +1008,7 @@ mod tests {
         ]));
         let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
 
-        let shadow = Arc::new(crate::ShadowRepo::open(dir.path()).unwrap());
+        let shadow = Arc::new(crate::ShadowRepo::open_at(dir.path(), dir.shadow_dir()).unwrap());
         let log_path = dir.path().join("checkpoints.jsonl");
         rt.enable_checkpoints(shadow.clone(), "sess", log_path.clone(), None)
             .unwrap();
@@ -1009,7 +1033,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         // Provider plans one write_file then ends.
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -1042,7 +1066,7 @@ mod tests {
             .tools(tools)
             .build()
             .unwrap();
-        let shadow = Arc::new(crate::ShadowRepo::open(dir.path()).unwrap());
+        let shadow = Arc::new(crate::ShadowRepo::open_at(dir.path(), dir.shadow_dir()).unwrap());
         let log_path = dir.path().join("checkpoints.jsonl");
         rt.enable_checkpoints(shadow, "sess", log_path.clone(), Some(touched))
             .unwrap();
@@ -1060,7 +1084,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -1093,7 +1117,7 @@ mod tests {
             .tools(tools)
             .build()
             .unwrap();
-        let shadow = Arc::new(crate::ShadowRepo::open(dir.path()).unwrap());
+        let shadow = Arc::new(crate::ShadowRepo::open_at(dir.path(), dir.shadow_dir()).unwrap());
         let log_path = dir.path().join("checkpoints.jsonl");
         rt.enable_checkpoints(shadow, "sess", log_path.clone(), Some(touched))
             .unwrap();

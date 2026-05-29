@@ -181,9 +181,35 @@ mod tests {
     use crate::checkpoint_log::{CheckpointLogWriter, CheckpointRecord, TouchedVia};
     use std::fs;
     use std::process::Command;
+    use tempfile::TempDir;
 
     fn has_git() -> bool {
         Command::new("git").arg("--version").output().is_ok()
+    }
+
+    /// Workspace tempdir + sibling shadow tempdir. The pair is passed
+    /// to `ShadowRepo::open_at` so tests don't need the global env
+    /// lock and can run in parallel. `dir.path()` returns the
+    /// workspace; `shadow_dir(&dir)` returns the shadow path.
+    struct ShadowWs {
+        workspace: TempDir,
+        shadow: TempDir,
+    }
+
+    impl ShadowWs {
+        fn path(&self) -> &Path {
+            self.workspace.path()
+        }
+        fn open_repo(&self) -> Result<ShadowRepo> {
+            ShadowRepo::open_at(self.path(), self.shadow.path().join("shadow-git"))
+        }
+    }
+
+    fn shadow_ws() -> ShadowWs {
+        ShadowWs {
+            workspace: tempfile::tempdir().expect("workspace tempdir"),
+            shadow: tempfile::tempdir().expect("shadow tempdir"),
+        }
     }
 
     fn write_log(path: &Path, records: &[CheckpointRecord]) {
@@ -255,9 +281,9 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         fs::write(dir.path().join("a.txt"), "v0").unwrap();
-        let repo = ShadowRepo::open(dir.path()).unwrap();
+        let repo = dir.open_repo().unwrap();
         let pre = repo.snapshot_for_session("s", "pre").unwrap();
         fs::write(dir.path().join("a.txt"), "v1").unwrap();
         let post = repo.snapshot_for_session("s", "post").unwrap();
@@ -280,11 +306,11 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         let log = dir.path().join("c.jsonl");
         let target_path = dir.path().join("file.txt");
         fs::write(&target_path, "before").unwrap();
-        let repo = ShadowRepo::open(dir.path()).unwrap();
+        let repo = dir.open_repo().unwrap();
         let pre = repo.snapshot_for_session("s", "t0 pre").unwrap();
         fs::write(&target_path, "after").unwrap();
         let post = repo.snapshot_for_session("s", "t0 post").unwrap();
@@ -314,11 +340,11 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         let log = dir.path().join("c.jsonl");
         let f = dir.path().join("file.txt");
         fs::write(&f, "v0").unwrap();
-        let repo = ShadowRepo::open(dir.path()).unwrap();
+        let repo = dir.open_repo().unwrap();
         let pre = repo.snapshot_for_session("s", "pre").unwrap();
         fs::write(&f, "v1").unwrap();
         let post = repo.snapshot_for_session("s", "post").unwrap();
@@ -349,11 +375,11 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         let log = dir.path().join("c.jsonl");
         let f = dir.path().join("file.txt");
         fs::write(&f, "v0").unwrap();
-        let repo = ShadowRepo::open(dir.path()).unwrap();
+        let repo = dir.open_repo().unwrap();
         let pre = repo.snapshot_for_session("s", "pre").unwrap();
         fs::write(&f, "v1").unwrap();
         let post = repo.snapshot_for_session("s", "post").unwrap();
@@ -382,13 +408,13 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = crate::test_util::IsolatedWorkspace::new();
+        let dir = shadow_ws();
         let log_a = dir.path().join("a.jsonl");
         let mine = dir.path().join("mine.txt");
         let theirs = dir.path().join("theirs.txt");
         fs::write(&mine, "mine-v0").unwrap();
         fs::write(&theirs, "theirs-v0").unwrap();
-        let repo = ShadowRepo::open(dir.path()).unwrap();
+        let repo = dir.open_repo().unwrap();
 
         let pre_a = repo.snapshot_for_session("a", "pre").unwrap();
         // A modifies its own file.

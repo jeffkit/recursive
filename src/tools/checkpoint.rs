@@ -149,9 +149,33 @@ pub fn build_checkpoint_tools(
             return None;
         }
     };
+    build_checkpoint_tools_inner(repo, session_id.into())
+}
+
+/// Like [`build_checkpoint_tools`], but with an explicit `shadow_dir`,
+/// for tests that want to bypass `paths::user_data_dir()` resolution.
+pub fn build_checkpoint_tools_at(
+    workspace: impl Into<std::path::PathBuf>,
+    shadow_dir: impl Into<std::path::PathBuf>,
+    session_id: impl Into<String>,
+) -> Option<(CheckpointList, CheckpointDiff, Arc<Mutex<ShadowRepo>>)> {
+    let repo = match ShadowRepo::open_at(workspace, shadow_dir) {
+        Ok(r) => Arc::new(Mutex::new(r)),
+        Err(e) => {
+            tracing::warn!("checkpoint tools unavailable: {e}");
+            return None;
+        }
+    };
+    build_checkpoint_tools_inner(repo, session_id.into())
+}
+
+fn build_checkpoint_tools_inner(
+    repo: Arc<Mutex<ShadowRepo>>,
+    session_id: String,
+) -> Option<(CheckpointList, CheckpointDiff, Arc<Mutex<ShadowRepo>>)> {
     let ctx = CheckpointToolCtx {
         repo: Arc::clone(&repo),
-        session_id: session_id.into(),
+        session_id,
     };
     Some((
         CheckpointList::new(ctx.clone()),
@@ -165,16 +189,37 @@ pub fn build_checkpoint_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::IsolatedWorkspace;
     use std::fs;
     use std::process::Command;
+    use tempfile::TempDir;
 
     fn has_git() -> bool {
         Command::new("git").arg("--version").output().is_ok()
     }
 
-    fn ws() -> IsolatedWorkspace {
-        IsolatedWorkspace::new()
+    /// Test workspace bundle: workspace tempdir + sibling shadow tempdir.
+    /// Tests use `build_checkpoint_tools_at` to bypass `paths::user_data_dir()`,
+    /// avoiding any need to mutate `RECURSIVE_HOME` (and thus the global
+    /// env lock). This lets the suite run fully in parallel.
+    struct TestWs {
+        workspace: TempDir,
+        shadow: TempDir,
+    }
+
+    impl TestWs {
+        fn path(&self) -> &std::path::Path {
+            self.workspace.path()
+        }
+        fn shadow_dir(&self) -> std::path::PathBuf {
+            self.shadow.path().join("shadow-git")
+        }
+    }
+
+    fn ws() -> TestWs {
+        TestWs {
+            workspace: tempfile::tempdir().expect("workspace tempdir"),
+            shadow: tempfile::tempdir().expect("shadow tempdir"),
+        }
     }
 
     #[tokio::test]
@@ -184,7 +229,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("a.txt"), "hi").unwrap();
-        let (list, _, repo) = build_checkpoint_tools(w.path(), "alpha").unwrap();
+        let (list, _, repo) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "alpha").unwrap();
         repo.lock()
             .unwrap()
             .snapshot_for_session("alpha", "t0")
@@ -200,7 +245,8 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("a.txt"), "hi").unwrap();
-        let (list_a, _, repo) = build_checkpoint_tools(w.path(), "alpha").unwrap();
+        let (list_a, _, repo) =
+            build_checkpoint_tools_at(w.path(), w.shadow_dir(), "alpha").unwrap();
         repo.lock()
             .unwrap()
             .snapshot_for_session("alpha", "tA")
@@ -224,7 +270,7 @@ mod tests {
         }
         let w = ws();
         fs::write(w.path().join("a.txt"), "x").unwrap();
-        let (_, diff, repo) = build_checkpoint_tools(w.path(), "s").unwrap();
+        let (_, diff, repo) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
         let id = repo
             .lock()
             .unwrap()
