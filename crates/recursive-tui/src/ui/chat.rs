@@ -1,13 +1,20 @@
-//! Chat screen renderer.
+//! Chat screen renderer (block-aware).
 //!
-//! Lays out the messages panel, status bar, and input panel. This is
-//! a verbatim port of the pre-revamp `ui()` function — visuals must
-//! stay byte-for-byte identical in goal-143.
+//! Goal-144 redraws the messages panel using
+//! [`crate::ui::transcript::render_blocks`] (one block per logical
+//! transcript entry, separated by blank lines) and replaces the old
+//! single-line status bar with the rich
+//! [`crate::ui::status::render`] formatter.
+//!
+//! While a turn is running the spinner from
+//! [`crate::ui::spinner::format_line`] is appended after the last
+//! block.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
+use crate::ui::{spinner, status, transcript};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -19,38 +26,36 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel with styled lines and scroll support
-    let lines: Vec<Line> = app.messages.iter().map(|m| m.to_line()).collect();
+    // Messages panel.
+    let mut lines = transcript::render_blocks(&app.blocks, &app.usage);
+    if app.turn.running {
+        let elapsed = app
+            .turn
+            .started_at
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled(
+            spinner::format_line(app.spinner_frame, app.turn.spinner_verb, elapsed),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+
     let total_lines = lines.len() as u16;
-    // The visible area is the chunk height minus 2 for borders
     let visible_lines = chunks[0].height.saturating_sub(2);
-    // Clamp scroll_offset so we don't scroll past the content
     let max_scroll = total_lines.saturating_sub(visible_lines);
-    // scroll_offset=0 means "at bottom"; convert to ratatui scroll (from top)
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+
     let messages = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" Messages "))
         .wrap(Wrap { trim: false })
         .scroll((effective_scroll, 0));
     frame.render_widget(messages, chunks[0]);
 
-    // Status bar
-    let status_text = if app.connected {
-        let session_display = app
-            .session_id
-            .as_ref()
-            .map(|id| &id[..id.len().min(8)])
-            .unwrap_or("none");
-        let msg_count = app.messages.len();
-        format!(" Connected | Session: {session_display} | Messages: {msg_count}")
-    } else {
-        " Not connected".to_string()
-    };
-    let status_bar =
-        Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
-    frame.render_widget(status_bar, chunks[1]);
+    // Status bar.
+    status::render(frame, chunks[1], app);
 
-    // Input panel with visual cursor
+    // Input panel.
     let display_input = format!("{}▌", app.input);
     let input = Paragraph::new(display_input)
         .block(Block::default().borders(Borders::ALL).title(" Input "));

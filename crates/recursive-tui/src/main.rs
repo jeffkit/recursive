@@ -29,6 +29,8 @@ async fn main() -> io::Result<()> {
 
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
+        // Advance the spinner one frame per draw tick (~50ms).
+        app.spinner_frame = app.spinner_frame.wrapping_add(1);
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -37,7 +39,7 @@ async fn main() -> io::Result<()> {
                         if key.kind == KeyEventKind::Press {
                             if app.screen == AppScreen::Splash {
                                 app.screen = AppScreen::Chat;
-                            } else if let Some(action) = keymap::dispatch(&mut app, key.code) {
+                            } else if let Some(action) = keymap::dispatch(&mut app, key) {
                                 let _ = backend.action_tx.send(action);
                             }
                         }

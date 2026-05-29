@@ -66,9 +66,14 @@ impl Backend {
 }
 
 /// EventSink implementation that funnels [`AgentEvent`]s into a
-/// [`UiEvent`] channel. Only the four variants the pre-revamp TUI
-/// already consumed are forwarded; the rest are silently dropped
-/// until later goals widen the surface.
+/// [`UiEvent`] channel.
+///
+/// Goal-144 broadens the mapping from goal-143's four variants to
+/// seven: streaming `PartialToken`, finalised `AssistantText`,
+/// id-paired `ToolCall`/`ToolResult` (with success inferred from the
+/// `ERROR: ` prefix the kernel uses for failures — see
+/// `src/http.rs:1388`), token `Usage`, request `Latency`, transcript
+/// `Compacted` notifications and `TurnFinished` for spinner reset.
 struct TuiEventSink {
     tx: mpsc::UnboundedSender<UiEvent>,
 }
@@ -76,29 +81,53 @@ struct TuiEventSink {
 #[async_trait]
 impl EventSink for TuiEventSink {
     async fn emit(&self, event: AgentEvent) {
-        let mapped = match event {
-            AgentEvent::AssistantText { text, .. } => {
-                Some(UiEvent::AssistantMessage { content: text })
-            }
-            AgentEvent::ToolCall { name, .. } => Some(UiEvent::ToolCall { name }),
-            AgentEvent::ToolResult { name, .. } => {
-                // The kernel does not currently surface success/failure
-                // distinctly through `ToolResult`. Treat every reported
-                // result as success; failures normally arrive via
-                // `Error` events on the runtime.
-                Some(UiEvent::ToolResult {
-                    name,
-                    success: true,
-                })
-            }
-            // The remaining variants (Latency, Usage, PartialToken,
-            // Compacted, TurnFinished, PlanProposed, PlanConfirmed,
-            // PlanRejected) are intentionally dropped in step 1.
-            _ => None,
-        };
+        let mapped = map_agent_event(event);
         if let Some(ev) = mapped {
             let _ = self.tx.send(ev);
         }
+    }
+}
+
+/// Pure mapping helper exposed for tests.
+pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
+    match event {
+        AgentEvent::PartialToken { text, .. } => Some(UiEvent::AssistantPartial { text }),
+        AgentEvent::AssistantText { text, .. } => Some(UiEvent::AssistantMessage { content: text }),
+        AgentEvent::ToolCall {
+            id,
+            name,
+            arguments,
+            ..
+        } => Some(UiEvent::ToolCall {
+            id,
+            name,
+            arguments,
+        }),
+        AgentEvent::ToolResult {
+            id, name, output, ..
+        } => {
+            let success = !output.starts_with("ERROR: ");
+            Some(UiEvent::ToolResult {
+                id,
+                name,
+                output,
+                success,
+            })
+        }
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => Some(UiEvent::Usage {
+            input_tokens: input_tokens as u64,
+            output_tokens: output_tokens as u64,
+        }),
+        AgentEvent::Latency { llm_ms, .. } => Some(UiEvent::Latency { llm_ms }),
+        AgentEvent::Compacted { removed, kept, .. } => Some(UiEvent::Compacted { removed, kept }),
+        AgentEvent::TurnFinished { .. } => Some(UiEvent::TurnFinished),
+        // PlanProposed / PlanConfirmed / PlanRejected are intentionally
+        // dropped here — Goal 147 will consume them.
+        _ => None,
     }
 }
 
@@ -208,11 +237,16 @@ async fn worker_loop(
                             message: e.to_string(),
                         });
                     }
+                    // Always poke the UI to clear its spinner, even if
+                    // the runtime didn't emit `TurnFinished` on its own
+                    // (e.g. offline transitions, error short-circuit).
+                    let _ = event_tx.send(UiEvent::TurnFinished);
                 }
                 RuntimeBuild::Offline { reason } => {
                     let _ = event_tx.send(UiEvent::Error {
                         message: reason.clone(),
                     });
+                    let _ = event_tx.send(UiEvent::TurnFinished);
                 }
             },
             UserAction::ConfirmPlan => {
@@ -223,6 +257,7 @@ async fn worker_loop(
                             message: e.to_string(),
                         });
                     }
+                    let _ = event_tx.send(UiEvent::TurnFinished);
                 }
             }
             UserAction::RejectPlan(reason) => {
@@ -259,10 +294,22 @@ mod tests {
             .send(UserAction::SendMessage("hi".into()))
             .unwrap();
 
-        let evt = tokio::time::timeout(Duration::from_secs(2), backend.event_rx.recv())
-            .await
-            .expect("event timeout")
-            .expect("channel closed");
+        // Drain events until we see the offline Error (a
+        // TurnFinished may precede or follow it).
+        let mut got_error = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
+                Ok(Some(UiEvent::Error { message })) => {
+                    assert!(message.contains("no LLM provider configured"));
+                    got_error = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
 
         let _ = backend.action_tx.send(UserAction::Shutdown);
 
@@ -274,11 +321,73 @@ mod tests {
             std::env::set_var("OPENAI_API_KEY", v);
         }
 
-        match evt {
-            UiEvent::Error { message } => {
-                assert!(message.contains("no LLM provider configured"));
-            }
-            other => panic!("expected Error event, got {other:?}"),
+        assert!(got_error, "expected an offline-mode UiEvent::Error");
+    }
+
+    #[test]
+    fn map_partial_token_to_assistant_partial() {
+        let ev = AgentEvent::PartialToken {
+            text: "hel".into(),
+            step: 0,
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::AssistantPartial { text: "hel".into() })
+        );
+    }
+
+    #[test]
+    fn map_assistant_text_to_assistant_message() {
+        let ev = AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 0,
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::AssistantMessage {
+                content: "hi".into()
+            })
+        );
+    }
+
+    #[test]
+    fn map_tool_result_error_prefix_marks_failure() {
+        let ev = AgentEvent::ToolResult {
+            id: "1".into(),
+            name: "read_file".into(),
+            output: "ERROR: missing".into(),
+            step: 0,
+        };
+        let mapped = map_agent_event(ev).unwrap();
+        match mapped {
+            UiEvent::ToolResult { success, .. } => assert!(!success),
+            other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_compacted_event() {
+        let ev = AgentEvent::Compacted {
+            removed: 5,
+            kept: 2,
+            summary_chars: 800,
+            step: 0,
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::Compacted {
+                removed: 5,
+                kept: 2
+            })
+        );
+    }
+
+    #[test]
+    fn map_plan_proposed_is_dropped() {
+        let ev = AgentEvent::PlanProposed {
+            plan_text: "p".into(),
+            tool_calls: vec![],
+        };
+        assert!(map_agent_event(ev).is_none());
     }
 }

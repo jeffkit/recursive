@@ -10,8 +10,12 @@ use ratatui::Frame;
 use crate::app::{App, AppScreen};
 
 pub mod chat;
+pub mod diff;
 pub mod plan_review;
+pub mod spinner;
 pub mod splash;
+pub mod status;
+pub mod transcript;
 
 /// Render the current screen onto `frame`.
 pub fn render(frame: &mut Frame, app: &App) {

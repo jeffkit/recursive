@@ -6,19 +6,46 @@
 //! [`crate::backend::Backend`] worker dispatches them onto the
 //! `AgentRuntime`.
 //!
-//! This step (goal-143) only mirrors the four event variants the
-//! pre-revamp TUI already consumed; later goals will widen the surface
-//! to cover all 11 [`recursive::AgentEvent`] variants.
+//! Goal-144 widens this surface from goal-143's four variants to
+//! consume seven extra `AgentEvent` flavours: streaming partial
+//! tokens, completed assistant text, token usage, latency, transcript
+//! compaction and id-paired tool call/result events.
 
 /// Events bubbled up from the backend worker into the UI loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiEvent {
-    /// Model asked for a tool to run.
-    ToolCall { name: String },
-    /// Tool finished executing.
-    ToolResult { name: String, success: bool },
-    /// Model produced a final assistant message.
+    /// A streamed partial token chunk to append to the in-flight
+    /// assistant message.
+    AssistantPartial { text: String },
+    /// A completed assistant message (non-streaming providers, or the
+    /// final flush after `PartialToken` chunks).
     AssistantMessage { content: String },
+    /// Model requested to execute a tool. Carries the call id so the
+    /// matching [`UiEvent::ToolResult`] can pair up.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    /// Tool finished executing. `id` matches the originating
+    /// [`UiEvent::ToolCall`].
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        success: bool,
+    },
+    /// Token usage for the latest LLM call.
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    /// Latency (ms) of the latest LLM call.
+    Latency { llm_ms: u64 },
+    /// Transcript compaction notification.
+    Compacted { removed: usize, kept: usize },
+    /// Marks the end of a turn so the UI can stop the spinner.
+    TurnFinished,
     /// A non-fatal error worth surfacing to the user.
     Error { message: String },
 }
