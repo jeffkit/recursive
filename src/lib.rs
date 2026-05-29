@@ -93,6 +93,9 @@ pub use skills::{
 pub use tools::{Tool, ToolRegistry, TouchedFiles};
 pub use transcript::{TranscriptFile, TranscriptMeta};
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_util;
+
 /// Safely truncate a string to at most `max_bytes` bytes without splitting
 /// a multi-byte UTF-8 character. Returns the full string if it's already
 /// within the limit.

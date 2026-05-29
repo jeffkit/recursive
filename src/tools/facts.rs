@@ -1195,10 +1195,12 @@ mod tests {
 
         // Override HOME to the temp dir so global-scope facts land in a
         // writable location (macOS security policy may block writes to
-        // ~/.recursive/memory/ in test environments).
+        // ~/.recursive/memory/ in test environments). The guard holds
+        // the cross-module env lock and restores HOME on drop, so this
+        // test no longer pollutes parallel tests that read $HOME.
         let home = ws.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("HOME", &home);
+        let _g = crate::test_util::PinnedHome::new(&home);
 
         let remember = RememberFact::new(&ws);
         let recall = RecallFact::new(&ws);

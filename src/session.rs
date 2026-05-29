@@ -731,7 +731,7 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn session_list_finds_files_in_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         // No sessions dir yet
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn read_from_nonexistent_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let bogus_path = tmp.path().join("does_not_exist.json");
 
         let result = SessionFile::read_from(&bogus_path);
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn default_session_path_sanitizes_special_chars() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         // Goal with spaces, slashes, unicode, and other special chars
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn session_writer_creates_meta_and_jsonl() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
@@ -998,7 +998,7 @@ mod tests {
 
     #[test]
     fn session_writer_appends_lines() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "test", "gpt-4o", "openai").unwrap();
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn session_reader_round_trips() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "round trip", "gpt-4o", "openai").unwrap();
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn session_writer_finish_updates_meta() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "meta test", "gpt-4o", "openai").unwrap();
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn list_sessions_finds_sessions() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         // No sessions yet
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn crash_partial_line_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "crash test", "gpt-4o", "openai").unwrap();
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn truncate_transcript_to_turn_drops_at_user_boundary() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
         // Sequence: system, user(turn 0), assistant, user(turn 1),
         // assistant, user(turn 2), assistant.
@@ -1168,7 +1168,7 @@ mod tests {
 
     #[test]
     fn truncate_transcript_to_zero_drops_all_turns_keeps_system() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
         w.append(&Message::system("sys".to_string())).unwrap();
         w.append(&Message::user("u0".to_string())).unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
 
     #[test]
     fn truncate_transcript_missing_file_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         // No session created → no transcript.jsonl. Should not panic.
         let stats = truncate_transcript_to_turn(dir.path(), 5).unwrap();
         assert_eq!(stats.kept, 0);

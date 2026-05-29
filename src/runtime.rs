@@ -963,7 +963,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         std::fs::write(dir.path().join("seed.txt"), "v0").unwrap();
 
         let llm = Arc::new(MockProvider::new(vec![
@@ -1009,7 +1009,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         // Provider plans one write_file then ends.
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
@@ -1060,7 +1060,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
 
         let llm = Arc::new(MockProvider::new(vec![
             Completion {

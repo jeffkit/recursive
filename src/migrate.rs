@@ -125,20 +125,12 @@ fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_util::PinnedRecursiveHome;
 
     fn with_home<F: FnOnce()>(f: F) {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RECURSIVE_HOME");
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("RECURSIVE_HOME", home.path());
+        let _g = PinnedRecursiveHome::new(home.path());
         f();
-        match prev {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
-        }
     }
 
     #[test]

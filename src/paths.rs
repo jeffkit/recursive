@@ -125,24 +125,12 @@ pub fn legacy_paths_in_workspace(workspace: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests that mutate `RECURSIVE_HOME` must run sequentially —
-    /// the env var is process-global. This mutex serialises them.
-    /// (Marked `#[allow(dead_code)]` because some test runners may
-    /// not exercise every test that takes the lock.)
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_util::PinnedRecursiveHome;
 
     #[test]
     fn user_data_dir_honors_env_override() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var_os("RECURSIVE_HOME");
-        std::env::set_var("RECURSIVE_HOME", "/tmp/recursive-test-fixed");
+        let _g = PinnedRecursiveHome::new("/tmp/recursive-test-fixed");
         assert_eq!(user_data_dir(), PathBuf::from("/tmp/recursive-test-fixed"));
-        match prev {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
-        }
     }
 
     #[test]
@@ -161,10 +149,8 @@ mod tests {
 
     #[test]
     fn user_workspace_dir_writes_path_txt() {
-        let _g = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("RECURSIVE_HOME");
-        std::env::set_var("RECURSIVE_HOME", home.path());
+        let _g = PinnedRecursiveHome::new(home.path());
 
         let workspace = tempfile::tempdir().unwrap();
         let ws_dir = user_workspace_dir(workspace.path()).unwrap();
@@ -175,11 +161,6 @@ mod tests {
         // Marker should resolve to the canonical workspace path.
         let abs = workspace.path().canonicalize().unwrap();
         assert_eq!(contents, abs.display().to_string());
-
-        match prev {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
-        }
     }
 
     #[test]

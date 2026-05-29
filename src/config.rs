@@ -542,13 +542,13 @@ mod tests {
 
     // Consolidated test for all HOME-dependent memory checks.
     // These must be ONE test because set_var("HOME", ...) is process-global
-    // and parallel tests would race on it.
+    // and parallel tests would race on it. The PinnedHome guard holds the
+    // cross-module env lock for the whole body, so other tests that read
+    // HOME (e.g. facts, migrate, paths) cannot observe a torn-down state.
     #[test]
     fn memory_home_dependent_tests() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().to_str().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", home);
+        let _g = crate::test_util::PinnedHome::new(tmp.path());
 
         // Test A: load_user_memory returns content
         {
@@ -595,7 +595,10 @@ mod tests {
             assert!(prompt.contains("You are Recursive"));
         }
 
-        // Test F: no memory files behaves identically
+        // Test F: no memory files behaves identically. We re-pin HOME to
+        // a fresh tempdir for this case; the previous PinnedHome guard
+        // still holds the env lock, so we mutate HOME directly and the
+        // outer guard will restore it on drop.
         {
             let tmp2 = tempfile::tempdir().expect("tempdir");
             std::env::set_var("HOME", tmp2.path().to_str().unwrap());
@@ -610,13 +613,6 @@ mod tests {
             assert!(prompt.contains("You are Recursive"));
             assert!(!prompt.contains("# User preferences"));
             assert!(!prompt.contains("# Project memory"));
-        }
-
-        // Restore HOME
-        if let Some(v) = original_home {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
         }
     }
 }

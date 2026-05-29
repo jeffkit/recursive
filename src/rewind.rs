@@ -255,7 +255,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         fs::write(dir.path().join("a.txt"), "v0").unwrap();
         let repo = ShadowRepo::open(dir.path()).unwrap();
         let pre = repo.snapshot_for_session("s", "pre").unwrap();
@@ -280,7 +280,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         let log = dir.path().join("c.jsonl");
         let target_path = dir.path().join("file.txt");
         fs::write(&target_path, "before").unwrap();
@@ -314,7 +314,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         let log = dir.path().join("c.jsonl");
         let f = dir.path().join("file.txt");
         fs::write(&f, "v0").unwrap();
@@ -349,7 +349,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         let log = dir.path().join("c.jsonl");
         let f = dir.path().join("file.txt");
         fs::write(&f, "v0").unwrap();
@@ -382,7 +382,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::IsolatedWorkspace::new();
         let log_a = dir.path().join("a.jsonl");
         let mine = dir.path().join("mine.txt");
         let theirs = dir.path().join("theirs.txt");

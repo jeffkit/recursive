@@ -165,6 +165,7 @@ pub fn build_checkpoint_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::IsolatedWorkspace;
     use std::fs;
     use std::process::Command;
 
@@ -172,12 +173,16 @@ mod tests {
         Command::new("git").arg("--version").output().is_ok()
     }
 
+    fn ws() -> IsolatedWorkspace {
+        IsolatedWorkspace::new()
+    }
+
     #[tokio::test]
     async fn list_tool_shows_session_checkpoints() {
         if !has_git() {
             return;
         }
-        let w = tempfile::tempdir().unwrap();
+        let w = ws();
         fs::write(w.path().join("a.txt"), "hi").unwrap();
         let (list, _, repo) = build_checkpoint_tools(w.path(), "alpha").unwrap();
         repo.lock()
@@ -193,7 +198,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let w = tempfile::tempdir().unwrap();
+        let w = ws();
         fs::write(w.path().join("a.txt"), "hi").unwrap();
         let (list_a, _, repo) = build_checkpoint_tools(w.path(), "alpha").unwrap();
         repo.lock()
@@ -217,7 +222,7 @@ mod tests {
         if !has_git() {
             return;
         }
-        let w = tempfile::tempdir().unwrap();
+        let w = ws();
         fs::write(w.path().join("a.txt"), "x").unwrap();
         let (_, diff, repo) = build_checkpoint_tools(w.path(), "s").unwrap();
         let id = repo

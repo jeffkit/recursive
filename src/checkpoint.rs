@@ -596,15 +596,20 @@ fn validate_session_id(sid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::IsolatedWorkspace;
     use std::fs;
-    use tempfile::TempDir;
 
     fn has_git() -> bool {
         Command::new("git").arg("--version").output().is_ok()
     }
 
-    fn ws() -> TempDir {
-        tempfile::tempdir().expect("tempdir")
+    /// Test workspace bundle. See [`IsolatedWorkspace`] for the why:
+    /// without it, checkpoint tests race with any other test that
+    /// briefly mutates `RECURSIVE_HOME` or `HOME`, because
+    /// `ShadowRepo::open` resolves its shadow-git directory through
+    /// `paths::user_data_dir()`.
+    fn ws() -> IsolatedWorkspace {
+        IsolatedWorkspace::new()
     }
 
     #[test]

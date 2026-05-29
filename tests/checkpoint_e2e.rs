@@ -10,6 +10,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use recursive::llm::{Completion, MockProvider, ToolCall};
+use recursive::test_util::PinnedRecursiveHome;
 use recursive::tools::{TouchedFiles, WriteFile};
 use recursive::{
     apply_rewind, plan_rewind, truncate_transcript_to_turn, AgentRuntime, SessionWriter,
@@ -17,39 +18,27 @@ use recursive::{
 };
 use serde_json::json;
 
-/// Process-wide lock for tests that mutate `RECURSIVE_HOME`. Without
-/// this, parallel tests would race on the env var and on the
-/// directories under it.
-static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Per-test override for `RECURSIVE_HOME`. Without this, the real
 /// `~/.recursive` would be polluted (sessions, shadow-git) on every
-/// e2e run. Returns a guard that restores the previous value on drop.
+/// e2e run. Wraps a [`PinnedRecursiveHome`] guard from the cross-module
+/// `test_util` so that this test serialises against unit tests that
+/// also touch `HOME`/`RECURSIVE_HOME` (e.g. `paths::tests`,
+/// `migrate::tests`, `config::memory_home_dependent_tests`,
+/// `tools::facts::test_i_scope_isolation`). The shared lock is the
+/// only thing that prevents cross-binary env races inside one cargo
+/// test process.
 struct HomeOverride {
-    prev: Option<std::ffi::OsString>,
-    _guard: tempfile::TempDir,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+    _pin: PinnedRecursiveHome,
 }
 
 impl HomeOverride {
     fn new() -> Self {
-        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RECURSIVE_HOME");
         let dir = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("RECURSIVE_HOME", dir.path());
+        let pin = PinnedRecursiveHome::new(dir.path());
         Self {
-            prev,
-            _guard: dir,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for HomeOverride {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
+            _dir: dir,
+            _pin: pin,
         }
     }
 }

@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_a_episodic_recall_finds_messages() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         setup_session_with_messages(
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_b_episodic_recall_with_session_filter() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         // Create two sessions with different goals so we can distinguish them
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_c_episodic_recall_empty_when_no_sessions() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         let tool = EpisodicRecall::new(ws);
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_d_episodic_recall_summary() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_util::IsolatedWorkspace::new();
         let ws = tmp.path();
 
         // No sessions yet
