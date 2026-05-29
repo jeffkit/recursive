@@ -31,10 +31,10 @@ pub fn body_lines(hunks: &[DiffHunk]) -> Vec<Line<'static>> {
             let (sigil, color) = match dl.kind {
                 DiffLineKind::Add => ("+", Color::Green),
                 DiffLineKind::Remove => ("-", Color::Red),
-                DiffLineKind::Context => (" ", Color::DarkGray),
+                DiffLineKind::Context => (" ", Color::Gray),
             };
             out.push(Line::from(vec![
-                Span::styled("    │ ".to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled("    │ ".to_string(), Style::default().fg(Color::Gray)),
                 Span::styled(sigil.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(dl.text.clone(), Style::default().fg(color)),
@@ -48,11 +48,11 @@ pub fn body_lines(hunks: &[DiffHunk]) -> Vec<Line<'static>> {
 /// path summary.
 pub fn empty_stub_line(path: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("    │ ".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled("    │ ".to_string(), Style::default().fg(Color::Gray)),
         Span::styled(
             format!("Updated {path}"),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
         ),
     ])
@@ -90,7 +90,7 @@ mod tests {
         assert!(span_style_colors(&lines[0]).contains(&Color::Green));
         assert!(span_style_colors(&lines[1]).contains(&Color::Red));
         // context line: at least one DarkGray span (the gutter)
-        assert!(span_style_colors(&lines[2]).contains(&Color::DarkGray));
+        assert!(span_style_colors(&lines[2]).contains(&Color::Gray));
     }
 
     #[test]

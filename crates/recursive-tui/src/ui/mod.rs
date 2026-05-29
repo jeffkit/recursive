@@ -16,6 +16,7 @@ pub mod chat;
 pub mod command_menu;
 pub mod diff;
 pub mod input;
+pub mod markdown;
 pub mod modal;
 pub mod spinner;
 pub mod splash;

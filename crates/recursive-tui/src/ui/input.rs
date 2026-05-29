@@ -110,8 +110,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.set_cursor_position(Position { x: cx, y: cy });
 
     // Footer hint.
-    let hint = Paragraph::new(footer_hint(mode))
-        .style(Style::default().fg(Color::DarkGray).bg(Color::Reset));
+    let hint =
+        Paragraph::new(footer_hint(mode)).style(Style::default().fg(Color::Gray).bg(Color::Reset));
     frame.render_widget(hint, hint_area);
 }
 

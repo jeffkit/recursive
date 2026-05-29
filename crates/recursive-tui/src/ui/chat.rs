@@ -47,16 +47,43 @@ pub fn render(frame: &mut Frame, app: &App) {
         )]));
     }
 
-    let total_lines = lines.len() as u16;
-    let visible_lines = chunks[0].height.saturating_sub(2);
-    let max_scroll = total_lines.saturating_sub(visible_lines);
+    let messages_area = chunks[0];
+    let inner_width = messages_area.width.saturating_sub(2); // borders
+    let visible_rows = messages_area.height.saturating_sub(2);
+
+    // Compute the *visual* (post-wrap) row count for proper scroll
+    // capping. Counting `lines.len()` (logical rows) under-counts when
+    // long messages wrap, which silently caps `scroll_offset` and
+    // prevents scrolling all the way to the top of long transcripts.
+    //
+    // ratatui 0.29's `Paragraph::line_count` is unstable, so we
+    // approximate with `Line::width()` (public, unicode-aware) divided
+    // by the inner width and rounded up. Empty lines still count as 1.
+    let total_rows: u16 = if inner_width == 0 {
+        lines.len() as u16
+    } else {
+        let w = inner_width as usize;
+        let sum: usize = lines
+            .iter()
+            .map(|l| {
+                let lw = l.width();
+                if lw == 0 {
+                    1
+                } else {
+                    lw.div_ceil(w)
+                }
+            })
+            .sum();
+        sum.try_into().unwrap_or(u16::MAX)
+    };
+    let max_scroll = total_rows.saturating_sub(visible_rows);
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
 
-    let messages = Paragraph::new(lines)
+    let messages_widget = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" Messages "))
         .wrap(Wrap { trim: false })
         .scroll((effective_scroll, 0));
-    frame.render_widget(messages, chunks[0]);
+    frame.render_widget(messages_widget, messages_area);
 
     // Status bar.
     status::render(frame, chunks[1], app);

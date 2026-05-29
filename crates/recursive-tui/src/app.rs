@@ -213,11 +213,29 @@ pub fn default_pricing_table() -> HashMap<&'static str, (f64, f64)> {
     m
 }
 
-/// Return the model name to display in the status bar based on env vars.
+/// Return the model name to display in the status bar.
+///
+/// Honours the same priority chain `Backend::build_runtime` does:
+/// `RECURSIVE_MODEL` / `OPENAI_MODEL` env vars, then
+/// `~/.recursive/config.toml`'s `[provider].model`, then the
+/// hardcoded `gpt-4o-mini` default. Without this fallback the
+/// status bar would show "gpt-4o-mini" even when the runtime is
+/// actually talking to DeepSeek/etc.
 pub fn detect_model_name() -> String {
-    std::env::var("RECURSIVE_MODEL")
-        .or_else(|_| std::env::var("OPENAI_MODEL"))
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string())
+    if let Ok(m) = std::env::var("RECURSIVE_MODEL") {
+        return m;
+    }
+    if let Ok(m) = std::env::var("OPENAI_MODEL") {
+        return m;
+    }
+    if let Ok(Some(cfg)) = recursive::config_file::FileConfig::load() {
+        if let Some(m) = cfg.provider.and_then(|p| p.model) {
+            if !m.is_empty() {
+                return m;
+            }
+        }
+    }
+    "gpt-4o-mini".to_string()
 }
 
 /// Compute estimated cost in USD given accumulated tokens and a
@@ -1799,6 +1817,50 @@ mod tests {
         assert!(p.contains_key("gpt-4o"));
         assert!(p.contains_key("glm-4-plus"));
         assert!(p.contains_key("claude-sonnet"));
+    }
+
+    /// Goal-150: status bar must read `~/.recursive/config.toml` when
+    /// no env var is set, otherwise it lies about the model the
+    /// runtime is actually using.
+    ///
+    /// Both checks share one test body so they share the `PinnedHome`
+    /// lock (HOME mutation is process-global; cf. lesson 17).
+    #[test]
+    fn detect_model_name_falls_back_to_config_file() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedHome::new(home.path());
+
+        // Snapshot env so we can clear / restore.
+        let prev_recursive_model = std::env::var("RECURSIVE_MODEL").ok();
+        let prev_openai_model = std::env::var("OPENAI_MODEL").ok();
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("OPENAI_MODEL");
+
+        // Part A: no env, no config.toml → hardcoded default
+        assert_eq!(detect_model_name(), "gpt-4o-mini");
+
+        // Part B: write a config.toml under HOME → that wins
+        let cfg_dir = home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[provider]\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .expect("write");
+        assert_eq!(detect_model_name(), "deepseek-v4-flash");
+
+        // Part C: env var overrides config.toml
+        std::env::set_var("RECURSIVE_MODEL", "from-env");
+        assert_eq!(detect_model_name(), "from-env");
+
+        // Restore env.
+        std::env::remove_var("RECURSIVE_MODEL");
+        if let Some(v) = prev_recursive_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        }
+        if let Some(v) = prev_openai_model {
+            std::env::set_var("OPENAI_MODEL", v);
+        }
     }
 
     #[test]

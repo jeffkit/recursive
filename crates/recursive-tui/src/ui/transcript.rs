@@ -8,7 +8,7 @@
 use ratatui::prelude::*;
 
 use crate::app::{TranscriptBlock, UsageStats};
-use crate::ui::diff;
+use crate::ui::{diff, markdown};
 
 /// Convert the entire transcript into a flat `Vec<Line>` with one
 /// blank line between adjacent blocks. Folded ToolResult blocks
@@ -53,25 +53,26 @@ pub fn render_block(block: &TranscriptBlock) -> Vec<Line<'static>> {
 // ── User ──────────────────────────────────────────────────────────────
 
 fn render_user(text: &str) -> Vec<Line<'static>> {
+    let gutter_style = Style::default().fg(Color::Gray);
     let mut out = vec![Line::from(vec![
-        Span::styled("▎ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("▎ ", Style::default().fg(Color::LightBlue)),
         Span::styled(
             "You".to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(Color::LightBlue)
                 .add_modifier(Modifier::BOLD),
         ),
     ])];
     for line in text.lines() {
         out.push(Line::from(vec![
-            Span::styled("│  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("│  ", gutter_style),
             Span::styled(line.to_string(), Style::default().fg(Color::White)),
         ]));
     }
     if text.is_empty() {
         out.push(Line::from(vec![Span::styled(
             "│  ".to_string(),
-            Style::default().fg(Color::DarkGray),
+            gutter_style,
         )]));
     }
     out
@@ -80,12 +81,13 @@ fn render_user(text: &str) -> Vec<Line<'static>> {
 // ── Assistant ─────────────────────────────────────────────────────────
 
 fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec<Line<'static>> {
+    let gutter_style = Style::default().fg(Color::Gray);
     let mut header = vec![
-        Span::styled("▎ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("▎ ", Style::default().fg(Color::LightCyan)),
         Span::styled(
             "Agent".to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -93,7 +95,7 @@ fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec
         header.push(Span::raw("  "));
         header.push(Span::styled(
             format!("⏱ {:.1}s", ms as f64 / 1000.0),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
     }
     if streaming {
@@ -101,21 +103,24 @@ fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec
         header.push(Span::styled(
             "…streaming".to_string(),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
         ));
     }
     let mut out = vec![Line::from(header)];
+    let mut md_state = markdown::MdState::default();
     for line in text.lines() {
-        out.push(Line::from(vec![
-            Span::styled("│  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(line.to_string(), Style::default().fg(Color::Cyan)),
-        ]));
+        let rendered = markdown::render_inline(line, Color::White, md_state);
+        md_state = rendered.state;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(rendered.spans.len() + 1);
+        spans.push(Span::styled("│  ", gutter_style));
+        spans.extend(rendered.spans);
+        out.push(Line::from(spans));
     }
     if text.is_empty() {
         out.push(Line::from(vec![Span::styled(
             "│  ".to_string(),
-            Style::default().fg(Color::DarkGray),
+            gutter_style,
         )]));
     }
     out
@@ -137,9 +142,7 @@ fn render_tool_call(name: &str, args_preview: &str) -> Vec<Line<'static>> {
         Span::raw("  "),
         Span::styled(
             args_preview.to_string(),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         ),
     ])]
 }
@@ -170,7 +173,7 @@ fn render_tool_result(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(format!("({size})"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("({size})"), Style::default().fg(Color::Gray)),
     ])];
 
     let collected: Vec<&str> = output.lines().collect();
@@ -184,17 +187,17 @@ fn render_tool_result(
     };
     for line in visible {
         out.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("    │ ", Style::default().fg(Color::Gray)),
             Span::styled((*line).to_string(), Style::default().fg(body_color)),
         ]));
     }
     if !expanded && n > 6 {
         out.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("    │ ", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(Color::Gray)
                     .add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -229,12 +232,12 @@ fn render_diff(path: &str, hunks: &[crate::app::DiffHunk]) -> Vec<Line<'static>>
 fn render_compacted(removed: usize, kept: usize) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::raw("  "),
-        Span::styled("⊕", Style::default().fg(Color::DarkGray)),
+        Span::styled("⊕", Style::default().fg(Color::Gray)),
         Span::raw(" "),
         Span::styled(
             format!("Conversation compacted: {removed} messages → {kept} summary"),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
         ),
     ])]
@@ -244,7 +247,7 @@ fn render_system(text: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![Span::styled(
         text.to_string(),
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(Color::Gray)
             .add_modifier(Modifier::ITALIC),
     )])]
 }
