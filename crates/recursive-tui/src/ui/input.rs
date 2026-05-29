@@ -156,15 +156,17 @@ pub fn cursor_visual_position(buffer: &str, cursor: usize) -> (u16, u16) {
 pub fn footer_hint(mode: InputMode) -> String {
     match mode {
         InputMode::Prompt => {
-            "⏎ submit  shift+tab mode  ↑↓ history  shift/alt+enter newline  esc clear".into()
+            "⏎ submit  shift+tab mode  ↑↓ history  pgup/pgdn scroll  esc clear".into()
         }
         InputMode::Bash => {
-            "⏎ run shell  shift+tab mode  ↑↓ history  shift/alt+enter newline  esc clear".into()
+            "⏎ run shell  shift+tab mode  ↑↓ history  pgup/pgdn scroll  esc clear".into()
         }
         InputMode::Note => {
-            "⏎ save note  shift+tab mode  ↑↓ history  shift/alt+enter newline  esc clear".into()
+            "⏎ save note  shift+tab mode  ↑↓ history  pgup/pgdn scroll  esc clear".into()
         }
-        InputMode::Command => "⏎ run command  tab autocomplete  ↑↓ history  esc clear".into(),
+        InputMode::Command => {
+            "⏎ run command  tab autocomplete  ↑↓ history  pgup/pgdn scroll  esc clear".into()
+        }
     }
 }
 

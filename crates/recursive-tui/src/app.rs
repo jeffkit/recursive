@@ -723,19 +723,26 @@ impl App {
                 self.prompt.history_next();
                 None
             }
-            KeyCode::Up if self.prompt.buffer.is_empty() => {
+            // Transcript scrolling. ↑/↓ alone are reserved for history
+            // / cursor movement — once the user has any history, plain
+            // ↑/↓ would always be claimed by `should_walk_history_*`,
+            // making transcript scroll unreachable. Use Shift+↑/↓ for
+            // single-line scroll and PgUp/PgDn for paged scroll
+            // (active regardless of buffer state, since they have no
+            // editing semantics).
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 None
             }
-            KeyCode::Down if self.prompt.buffer.is_empty() => {
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 None
             }
-            KeyCode::PageUp if self.prompt.buffer.is_empty() => {
+            KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
                 None
             }
-            KeyCode::PageDown if self.prompt.buffer.is_empty() => {
+            KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 None
             }
@@ -1578,6 +1585,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
     // ── construction ────────────────────────────────────────────────
 
     #[test]
@@ -1941,8 +1952,13 @@ mod tests {
         assert_eq!(app.input(), "hell");
     }
 
+    /// Plain ↑ never scrolls — even with empty buffer it walks
+    /// history once any has been recorded; with no history it's a
+    /// no-op. Transcript scrolling is reserved for Shift+↑/↓ and
+    /// PgUp/PgDn (Goal 150 fix: history was always shadowing
+    /// scroll, leaving the transcript stuck at bottom).
     #[test]
-    fn scroll_up_increases_offset() {
+    fn plain_up_does_not_scroll_transcript() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         for i in 0..30 {
@@ -1951,19 +1967,34 @@ mod tests {
             });
         }
         let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.scroll_offset, 0);
+        let _ = app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn shift_up_increases_scroll_offset() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        for i in 0..30 {
+            app.blocks.push(TranscriptBlock::System {
+                text: format!("msg {i}"),
+            });
+        }
+        let _ = app.handle_key(shift(KeyCode::Up));
         assert_eq!(app.scroll_offset, 1);
-        let _ = app.handle_key(key(KeyCode::Up));
+        let _ = app.handle_key(shift(KeyCode::Up));
         assert_eq!(app.scroll_offset, 2);
     }
 
     #[test]
-    fn scroll_down_stops_at_zero() {
+    fn shift_down_stops_at_zero() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.scroll_offset = 2;
-        let _ = app.handle_key(key(KeyCode::Down));
-        let _ = app.handle_key(key(KeyCode::Down));
-        let _ = app.handle_key(key(KeyCode::Down));
+        let _ = app.handle_key(shift(KeyCode::Down));
+        let _ = app.handle_key(shift(KeyCode::Down));
+        let _ = app.handle_key(shift(KeyCode::Down));
         assert_eq!(app.scroll_offset, 0);
     }
 
@@ -1984,13 +2015,16 @@ mod tests {
         assert_eq!(app.scroll_offset, 5);
     }
 
+    /// PgUp/PgDn now work regardless of buffer state — they have no
+    /// editing semantics, so claiming them for transcript scroll is
+    /// safe. (Goal 150 relaxed the previous "buffer empty" guard.)
     #[test]
-    fn scroll_keys_ignored_when_input_not_empty() {
+    fn page_up_scrolls_even_when_buffer_not_empty() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.set_input("typing");
-        let _ = app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.scroll_offset, 0);
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll_offset, 10);
     }
 
     #[test]
