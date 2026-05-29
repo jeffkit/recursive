@@ -536,6 +536,11 @@ fn git_cmd() -> Command {
     cmd.env("HOME", std::env::temp_dir());
     cmd.env("GIT_PAGER", "cat");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Force English locale so stderr-message matching (e.g. for the
+    // "path not in tree" case in `read_file_at`) is stable across
+    // user environments that have a localized git installation.
+    cmd.env("LC_ALL", "C");
+    cmd.env("LANG", "C");
     cmd
 }
 
