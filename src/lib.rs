@@ -85,7 +85,10 @@ pub use runtime::{AgentRuntime, AgentRuntimeBuilder, RuntimeOutcome};
 pub use session::SessionFile;
 pub use session::SessionReader;
 pub use session::SessionWriter;
-pub use session::{truncate_transcript_to_turn, TruncateStats};
+pub use session::{
+    entry_to_message, truncate_transcript_to_turn, SessionLock, SessionMeta, TranscriptEntry,
+    TruncateStats,
+};
 pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,

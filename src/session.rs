@@ -109,7 +109,12 @@ impl SessionFile {
 /// The hash is computed over a deterministic JSON representation of the
 /// specs, sorted by tool name. This ensures that the same set of tools
 /// always produces the same hash, regardless of registration order.
-fn hash_tool_specs(specs: &[ToolSpec]) -> String {
+///
+/// Used by both [`SessionFile`] (legacy `.json` resume) and the
+/// JSONL session meta's `tool_registry_hash` field (g151) so that
+/// `recursive resume` can refuse to load a session whose tool
+/// inventory has drifted.
+pub fn hash_tool_specs(specs: &[ToolSpec]) -> String {
     use std::collections::BTreeMap;
 
     let mut map: BTreeMap<String, serde_json::Value> = BTreeMap::new();

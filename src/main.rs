@@ -179,11 +179,21 @@ enum Cmd {
         #[arg(long)]
         head: Option<usize>,
     },
-    /// Resume a run from a saved session file.
+    /// Resume a run from a saved session.
+    ///
+    /// **Goal 151**: prefer specifying a session ID (or substring)
+    /// recorded under `~/.recursive/.../sessions/`. Without an
+    /// argument, the most-recent active or interrupted session in
+    /// the current workspace is resumed.
     Resume {
-        /// Path to the session JSON file (as written by --session-out).
-        #[arg(required = true)]
-        session: PathBuf,
+        /// Session ID or unique substring. If omitted, resumes the
+        /// most-recent active/interrupted session in this workspace.
+        session: Option<String>,
+        /// Escape hatch: resume from an explicit JSONL session
+        /// directory path (not a legacy `.json` file). Mutually
+        /// exclusive with the positional argument.
+        #[arg(long, conflicts_with = "session")]
+        from_file: Option<PathBuf>,
     },
     /// List or inspect saved sessions.
     Sessions {
@@ -255,6 +265,13 @@ enum SessionCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Convert a legacy `.json` session file (written by
+    /// `--session-out`) into the JSONL session directory format
+    /// so it can be resumed by ID. One-shot migration utility.
+    MigrateLegacy {
+        /// Path to the legacy `.json` session file.
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -276,6 +293,15 @@ enum ConfigCmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.log)?;
+
+    if cli.session_out.is_some() {
+        eprintln!(
+            "warning: --session-out writes the legacy .json format, which is no longer\n\
+             used for resume. Your session is automatically being persisted as JSONL\n\
+             under the user data dir; use `recursive resume <id>` to resume.\n\
+             This flag will be removed in a future release."
+        );
+    }
 
     let mut config = Config::from_env().context("loading config")?;
     if let Some(ws) = cli.workspace {
@@ -531,26 +557,17 @@ async fn main() -> anyhow::Result<()> {
                         cli.hook_timing,
                         !cli.no_session,
                         shutdown,
+                        None, // existing_writer — legacy --resume-from creates a fresh session
                     )
                     .await
                 }
             }
         }
-        Cmd::Resume { session } => {
-            let session_file = SessionFile::read_from(&session)
-                .with_context(|| format!("reading session file: {}", session.display()))?;
-            let tools = build_tools(&config).await;
-            let specs = tools.specs();
-            session_file
-                .validate_tool_registry(&specs)
-                .map_err(|msg| anyhow::anyhow!("{}", msg))?;
-            let goal = session_file.goal.clone();
-            let seed = session_file.into_transcript();
-            let shutdown = shutdown_signal();
-            run_resumed(
+        Cmd::Resume { session, from_file } => {
+            cmd_resume(
                 config,
-                seed,
-                goal,
+                session,
+                from_file,
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,
@@ -560,7 +577,6 @@ async fn main() -> anyhow::Result<()> {
                 external_pricing,
                 cli.hook_timing,
                 !cli.no_session,
-                shutdown,
             )
             .await
         }
@@ -705,6 +721,9 @@ async fn main() -> anyhow::Result<()> {
                 force,
                 dry_run,
             } => cmd_session_rewind(&config.workspace, &session, to_turn, force, dry_run),
+            SessionCmd::MigrateLegacy { path } => {
+                cmd_session_migrate_legacy(&config.workspace, &path)
+            }
         },
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show => {
@@ -877,6 +896,52 @@ fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathB
             anyhow::bail!("Ambiguous session identifier. Use a more specific path or ID.");
         }
     }
+}
+
+/// Implementation of `recursive sessions migrate-legacy`.
+///
+/// Reads a legacy single-file `.json` session (as written by
+/// `--session-out`) and emits an equivalent JSONL session
+/// directory under the user data dir, preserving the original
+/// `tool_registry_hash`. The migrated session can then be resumed
+/// by ID via `recursive resume <id>`.
+fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!("legacy session file does not exist: {}", path.display());
+    }
+    let legacy = SessionFile::read_from(path)
+        .with_context(|| format!("reading legacy session: {}", path.display()))?;
+
+    // Open a fresh JSONL session, then patch in the carried-over hash.
+    let mut writer =
+        SessionWriter::create(workspace, &legacy.goal, &legacy.model, &legacy.provider)
+            .with_context(|| "creating new JSONL session for migration")?;
+
+    // Replay the legacy transcript through `append` (no filter —
+    // we keep system messages for round-trip fidelity).
+    for msg in legacy.messages() {
+        writer.append(msg)?;
+    }
+    let session_dir = writer.session_dir().to_path_buf();
+    writer.finish("interrupted").ok();
+    drop(writer);
+
+    // Patch `.meta.json` to carry over the legacy `tool_registry_hash`.
+    let meta_path = session_dir.join(".meta.json");
+    let bytes = std::fs::read(&meta_path)?;
+    let mut meta: recursive::session::SessionMeta = serde_json::from_slice(&bytes)?;
+    meta.tool_registry_hash = Some(legacy.tool_registry_hash.clone());
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+
+    println!("Migrated to: {}", session_dir.display());
+    println!(
+        "Resume with: recursive resume {}",
+        session_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<id>"),
+    );
+    Ok(())
 }
 
 /// Implementation of `recursive sessions rewind`.
@@ -1544,6 +1609,168 @@ fn finalize_cost_tracker(
     }
 }
 
+/// Resolve a `Cmd::Resume` invocation into a session directory and
+/// load its seed transcript. Returns the session_dir alongside the
+/// data needed to drive `run_resumed`.
+///
+/// Dispatch order:
+/// 1. `from_file` is set → must point at a JSONL session directory
+///    (a legacy `.json` is rejected with a migrate-legacy hint).
+/// 2. `session` is set → if it looks like a legacy `.json` path
+///    (ends with `.json`, or is an existing file), reject with the
+///    migrate hint. Otherwise resolve as ID/substring.
+/// 3. Neither → pick the most-recent active/interrupted session in
+///    the workspace via `list_sessions_sorted_by_updated_at`.
+fn resolve_resume_target(
+    workspace: &Path,
+    session: Option<String>,
+    from_file: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = from_file {
+        if path.extension().and_then(|e| e.to_str()) == Some("json") || path.is_file() {
+            anyhow::bail!(legacy_resume_error(&path));
+        }
+        if !path.is_dir() {
+            anyhow::bail!(
+                "--from-file: {} is not a JSONL session directory",
+                path.display()
+            );
+        }
+        return Ok(path);
+    }
+
+    if let Some(s) = session {
+        // Legacy detection: `.json` extension or a real file path.
+        let candidate = PathBuf::from(&s);
+        if s.ends_with(".json") || candidate.is_file() {
+            anyhow::bail!(legacy_resume_error(&candidate));
+        }
+        let resolved = resolve_session_path(workspace, &s)?;
+        if resolved.is_file() {
+            // resolve_session_path can return a stray .json under
+            // the sessions tree.
+            anyhow::bail!(legacy_resume_error(&resolved));
+        }
+        return Ok(resolved);
+    }
+
+    // No arg → most-recent shortcut.
+    let sorted = recursive::session::SessionReader::list_sessions_sorted_by_updated_at(workspace)
+        .with_context(|| {
+        format!(
+            "scanning sessions for the workspace at {}",
+            workspace.display()
+        )
+    })?;
+    let pick = sorted
+        .into_iter()
+        .find(|(_, m)| matches!(m.status.as_str(), "active" | "interrupted"));
+    match pick {
+        Some((dir, _meta)) => Ok(dir),
+        None => anyhow::bail!(
+            "no active or interrupted session found in {}. \
+             Run `recursive sessions list` to see what's available.",
+            workspace.display()
+        ),
+    }
+}
+
+fn legacy_resume_error(path: &Path) -> String {
+    format!(
+        "legacy .json sessions are no longer resumable directly: {}\n\
+         Run `recursive sessions migrate-legacy {}` to convert it to the JSONL\n\
+         format, then `recursive resume <id>`.",
+        path.display(),
+        path.display()
+    )
+}
+
+/// `recursive resume` command: dispatches based on which of
+/// (positional `session`, `--from-file`, neither) was provided,
+/// validates the tool-registry hash, then opens the existing
+/// session for appending and resumes the run.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_resume(
+    config: Config,
+    session: Option<String>,
+    from_file: Option<PathBuf>,
+    max_transcript_chars: Option<usize>,
+    transcript_out: Option<PathBuf>,
+    session_out: Option<PathBuf>,
+    json_mode: bool,
+    plan_first: bool,
+    mcp_config: Option<PathBuf>,
+    external_pricing: Option<HashMap<String, ModelPricing>>,
+    hook_timing: bool,
+    session_recording: bool,
+) -> anyhow::Result<()> {
+    let session_dir = resolve_resume_target(&config.workspace, session, from_file)?;
+    eprintln!("session: resuming from {}", session_dir.display());
+
+    // Load meta and validate the tool-registry hash up front (before
+    // building the runtime). If the hash mismatches, abort with the
+    // same error string the legacy SessionFile path used.
+    let meta = recursive::session::SessionReader::load_meta(&session_dir)
+        .with_context(|| format!("reading .meta.json for session {}", session_dir.display()))?;
+    let tools = build_tools(&config).await;
+    let specs = tools.specs();
+    let current_hash = recursive::session::hash_tool_specs(&specs);
+    match &meta.tool_registry_hash {
+        Some(stored) if stored != &current_hash => {
+            anyhow::bail!(
+                "tool registry hash mismatch: session has '{stored}', current is \
+                 '{current_hash}'. Tools have changed since the session was saved; \
+                 cannot resume."
+            );
+        }
+        Some(_) => {} // matches → continue
+        None => {
+            eprintln!(
+                "warning: session {} has no tool_registry_hash recorded \
+                 (pre-g151 record); resuming without validation.",
+                session_dir.display()
+            );
+        }
+    }
+
+    // Open the existing session for appending. Acquires the
+    // SessionLock — refusing if another resume is already in flight.
+    let writer = if session_recording {
+        match SessionWriter::open_existing(&session_dir) {
+            Ok(w) => Some(Arc::new(std::sync::Mutex::new(w))),
+            Err(e) => {
+                anyhow::bail!("cannot open session {}: {e}", session_dir.display());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Load the seeded transcript (everything that's already on disk).
+    let seed = recursive::session::SessionReader::load_messages(&session_dir)
+        .with_context(|| format!("loading transcript for session {}", session_dir.display()))?;
+    let goal = meta.goal.clone();
+
+    let shutdown = shutdown_signal();
+    run_resumed(
+        config,
+        seed,
+        goal,
+        max_transcript_chars,
+        transcript_out,
+        session_out,
+        json_mode,
+        plan_first,
+        mcp_config,
+        external_pricing,
+        hook_timing,
+        false, // session_recording — we already opened the writer below
+        shutdown,
+        writer,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_resumed(
     config: Config,
@@ -1559,28 +1786,42 @@ async fn run_resumed(
     hook_timing: bool,
     session: bool,
     shutdown: tokio_util::sync::CancellationToken,
+    // Goal 151: when resuming an existing JSONL session by ID, the
+    // caller has already opened a `SessionWriter::open_existing`
+    // for the session_dir. Pass it in so we don't create a fresh
+    // session directory and so msg_NNN numbering continues.
+    // `None` means "create a new session writer if `session` is
+    // true" (the legacy `--resume-from <transcript.json>` path).
+    existing_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
 
-    let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
-        match SessionWriter::create(
-            &config.workspace,
-            &goal,
-            &config.model,
-            &config.provider_type,
-        ) {
-            Ok(writer) => {
-                eprintln!("session: recording to {}", writer.session_dir().display());
-                Some(Arc::new(std::sync::Mutex::new(writer)))
+    let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> =
+        if let Some(w) = existing_writer {
+            eprintln!(
+                "session: appending to {}",
+                w.lock().unwrap().session_dir().display()
+            );
+            Some(w)
+        } else if session {
+            match SessionWriter::create(
+                &config.workspace,
+                &goal,
+                &config.model,
+                &config.provider_type,
+            ) {
+                Ok(writer) => {
+                    eprintln!("session: recording to {}", writer.session_dir().display());
+                    Some(Arc::new(std::sync::Mutex::new(writer)))
+                }
+                Err(e) => {
+                    eprintln!("session: failed to create session writer: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("session: failed to create session writer: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
         session_writer.as_ref().map(|w| {
