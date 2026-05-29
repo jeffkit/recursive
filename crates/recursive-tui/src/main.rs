@@ -7,6 +7,7 @@
 use std::io;
 use std::time::Duration;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEvent, MouseEventKind};
 use crossterm::{
     event::{self, Event, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -22,6 +23,13 @@ use recursive_tui::{keymap, ui};
 async fn main() -> io::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    // Capture mouse events so trackpad / wheel scroll drives the
+    // transcript pane instead of the terminal's (empty) alt-screen
+    // scrollback. Trade-off: text selection now requires holding
+    // Option on macOS / Shift on most other terminals to fall back
+    // to the terminal's own selection. This matches fake-cc and
+    // Claude Code TUI behaviour.
+    io::stdout().execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut backend = Backend::spawn();
@@ -35,14 +43,16 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 while event::poll(Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Press {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
                             if app.screen == AppScreen::Splash {
                                 app.screen = AppScreen::Chat;
                             } else if let Some(action) = keymap::dispatch(&mut app, key) {
                                 let _ = backend.action_tx.send(action);
                             }
                         }
+                        Event::Mouse(mev) => handle_mouse(&mut app, mev),
+                        _ => {}
                     }
                 }
             }
@@ -62,7 +72,30 @@ async fn main() -> io::Result<()> {
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
 
+    let _ = io::stdout().execute(DisableMouseCapture);
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+/// Map mouse / trackpad scroll events onto the transcript scroll
+/// offset. We only react to wheel events; clicks and motion are
+/// intentionally ignored (no clickable widgets yet).
+///
+/// Speed: 3 lines per wheel tick, matching what most terminals
+/// emit per physical "notch" of a real wheel and what feels right
+/// for two-finger trackpad scrolling on macOS.
+fn handle_mouse(app: &mut App, ev: MouseEvent) {
+    if app.screen != AppScreen::Chat {
+        return;
+    }
+    match ev.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        _ => {}
+    }
 }

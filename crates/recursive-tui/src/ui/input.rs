@@ -143,12 +143,18 @@ fn input_box_title(mode: InputMode) -> &'static str {
 /// The input renderer pads non-first lines with two spaces in place
 /// of the indicator to keep columns visually aligned, so per-line
 /// content always starts at the same x. We therefore only have to
-/// count `\n`s and chars on the active line.
+/// count `\n`s for the row, and the **display width** of the
+/// preceding chars on the active line for the column. Using
+/// `chars().count()` undercounts CJK / emoji / fullwidth glyphs
+/// (each takes 2 columns in a terminal), which made the cursor
+/// land in the middle of the previous double-width char rather
+/// than after it.
 pub fn cursor_visual_position(buffer: &str, cursor: usize) -> (u16, u16) {
+    use unicode_width::UnicodeWidthStr;
     let head = &buffer[..cursor.min(buffer.len())];
     let row = head.matches('\n').count() as u16;
     let line_start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let col = head[line_start..].chars().count() as u16;
+    let col = UnicodeWidthStr::width(&head[line_start..]) as u16;
     (col, row)
 }
 
@@ -156,16 +162,16 @@ pub fn cursor_visual_position(buffer: &str, cursor: usize) -> (u16, u16) {
 pub fn footer_hint(mode: InputMode) -> String {
     match mode {
         InputMode::Prompt => {
-            "⏎ submit  shift+tab mode  ↑↓ history  ctrl+b/f scroll  esc clear".into()
+            "⏎ submit  shift+tab mode  ↑↓ history  ctrl+b/f or wheel scroll  esc clear".into()
         }
         InputMode::Bash => {
-            "⏎ run shell  shift+tab mode  ↑↓ history  ctrl+b/f scroll  esc clear".into()
+            "⏎ run shell  shift+tab mode  ↑↓ history  ctrl+b/f or wheel scroll  esc clear".into()
         }
         InputMode::Note => {
-            "⏎ save note  shift+tab mode  ↑↓ history  ctrl+b/f scroll  esc clear".into()
+            "⏎ save note  shift+tab mode  ↑↓ history  ctrl+b/f or wheel scroll  esc clear".into()
         }
         InputMode::Command => {
-            "⏎ run command  tab autocomplete  ↑↓ history  ctrl+b/f scroll  esc clear".into()
+            "⏎ run command  tab autocomplete  ↑↓ history  ctrl+b/f or wheel scroll".into()
         }
     }
 }
@@ -230,6 +236,30 @@ mod tests {
         assert_eq!(cursor_visual_position(buf, 3), (0, 1));
         // Cursor at byte 0
         assert_eq!(cursor_visual_position(buf, 0), (0, 0));
+    }
+
+    /// Goal-150 follow-up: CJK / fullwidth chars take two terminal
+    /// columns each; `chars().count()` (the previous implementation)
+    /// undercounted them and left the cursor visually inside the
+    /// preceding glyph rather than after it.
+    #[test]
+    fn cursor_visual_position_counts_double_width_chars() {
+        let buf = "你好";
+        // Two Chinese chars = 6 bytes (3 each), 4 visual columns.
+        assert_eq!(buf.len(), 6);
+        // Cursor after the first char (byte 3): col=2 (one CJK glyph).
+        assert_eq!(cursor_visual_position(buf, 3), (2, 0));
+        // Cursor at the end (byte 6): col=4 (two CJK glyphs).
+        assert_eq!(cursor_visual_position(buf, buf.len()), (4, 0));
+    }
+
+    #[test]
+    fn cursor_visual_position_mixed_ascii_and_cjk() {
+        // "ab了" — 'a' + 'b' (1 col each) + '了' (2 cols) = 4 cols.
+        let buf = "ab了";
+        assert_eq!(cursor_visual_position(buf, buf.len()), (4, 0));
+        // After "ab" (byte 2): col=2.
+        assert_eq!(cursor_visual_position(buf, 2), (2, 0));
     }
 
     #[test]
