@@ -1655,4 +1655,249 @@ mod http_tests {
             );
         }
     }
+
+    // ── /agui endpoint tests ──────────────────────────────────────────────
+
+    /// Drain an SSE response body into a Vec<agui_protocol::Event> by
+    /// feeding all body bytes through the protocol's SseParser.
+    async fn collect_agui_events(
+        response: axum::http::Response<Body>,
+    ) -> Vec<agui_protocol::Event> {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mut parser = agui_protocol::SseParser::new();
+        parser.feed(&bytes)
+    }
+
+    fn agui_request_body(messages: serde_json::Value, context: serde_json::Value) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "threadId": "t-test",
+            "runId": "r-test",
+            "messages": messages,
+            "tools": [],
+            "context": context,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agui_endpoint_streams_run_started_and_finished() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hello from mock".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let body = agui_request_body(
+            serde_json::json!([
+                {"id": "u1", "role": "user", "content": "say hello"}
+            ]),
+            serde_json::json!([]),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header missing")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.contains("text/event-stream"),
+            "Expected text/event-stream, got: {content_type}",
+        );
+
+        let events = collect_agui_events(response).await;
+        assert!(!events.is_empty(), "expected at least one AG-UI event");
+
+        // First event must be RunStarted with the supplied ids.
+        match &events[0] {
+            agui_protocol::Event::RunStarted(rs) => {
+                assert_eq!(rs.thread_id, "t-test");
+                assert_eq!(rs.run_id, "r-test");
+            }
+            other => panic!("expected RunStarted first, got {other:?}"),
+        }
+
+        // Last event must be RunFinished.
+        match events.last().unwrap() {
+            agui_protocol::Event::RunFinished(rf) => {
+                assert_eq!(rf.thread_id, "t-test");
+                assert_eq!(rf.run_id, "r-test");
+            }
+            other => panic!("expected RunFinished last, got {other:?}"),
+        }
+
+        // Between them, we must see Start/Content/End for the assistant
+        // text and they must be in that order.
+        let positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                agui_protocol::Event::TextMessageStart(_)
+                | agui_protocol::Event::TextMessageContent(_)
+                | agui_protocol::Event::TextMessageEnd(_) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            positions.len() >= 3,
+            "expected Start/Content/End, got events: {events:?}"
+        );
+        match &events[positions[0]] {
+            agui_protocol::Event::TextMessageStart(_) => {}
+            other => panic!("expected TextMessageStart first, got {other:?}"),
+        }
+        let mut saw_content = false;
+        for &i in &positions[1..positions.len() - 1] {
+            if let agui_protocol::Event::TextMessageContent(c) = &events[i] {
+                if c.delta.contains("hello from mock") {
+                    saw_content = true;
+                }
+            }
+        }
+        assert!(
+            saw_content,
+            "expected a TextMessageContent carrying the assistant text"
+        );
+        match &events[*positions.last().unwrap()] {
+            agui_protocol::Event::TextMessageEnd(_) => {}
+            other => panic!("expected TextMessageEnd last, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agui_endpoint_rejects_empty_messages_and_context() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let body = agui_request_body(serde_json::json!([]), serde_json::json!([]));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn agui_endpoint_emits_tool_call_events() {
+        use recursive::llm::ToolCall;
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "calling a tool".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "unknown_tool".into(),
+                    arguments: serde_json::json!({"foo": "bar"}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "all done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let body = agui_request_body(
+            serde_json::json!([
+                {"id": "u1", "role": "user", "content": "go"}
+            ]),
+            serde_json::json!([]),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let events = collect_agui_events(response).await;
+
+        // Locate the four tool events and RunFinished.
+        let mut idx_start = None;
+        let mut idx_args = None;
+        let mut idx_end = None;
+        let mut idx_result = None;
+        let mut idx_finished = None;
+        for (i, ev) in events.iter().enumerate() {
+            match ev {
+                agui_protocol::Event::ToolCallStart(s) if s.tool_call_id == "call-1" => {
+                    idx_start.get_or_insert(i);
+                }
+                agui_protocol::Event::ToolCallArgs(a) if a.tool_call_id == "call-1" => {
+                    idx_args.get_or_insert(i);
+                }
+                agui_protocol::Event::ToolCallEnd(e) if e.tool_call_id == "call-1" => {
+                    idx_end.get_or_insert(i);
+                }
+                agui_protocol::Event::ToolCallResult(r) if r.tool_call_id == "call-1" => {
+                    idx_result.get_or_insert(i);
+                }
+                agui_protocol::Event::RunFinished(_) => {
+                    idx_finished.get_or_insert(i);
+                }
+                _ => {}
+            }
+        }
+
+        let s = idx_start.expect("missing ToolCallStart");
+        let a = idx_args.expect("missing ToolCallArgs");
+        let e = idx_end.expect("missing ToolCallEnd");
+        let r = idx_result.expect("missing ToolCallResult");
+        let f = idx_finished.expect("missing RunFinished");
+
+        assert!(
+            s < a && a < e && e < r && r < f,
+            "tool events out of order: start={s} args={a} end={e} result={r} finished={f}; events={events:?}"
+        );
+
+        // The args delta should contain the JSON arguments.
+        if let agui_protocol::Event::ToolCallArgs(args) = &events[a] {
+            assert!(
+                args.delta.contains("foo") && args.delta.contains("bar"),
+                "args delta missing arguments: {}",
+                args.delta
+            );
+        }
+    }
 }

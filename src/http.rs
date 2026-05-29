@@ -615,6 +615,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}", axum::routing::delete(delete_session))
         .route("/sessions/{id}/messages", post(send_session_message))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/agui", post(agui_run))
         .route("/openapi.json", get(openapi_spec))
         .route("/metrics", get(metrics_handler))
         .layer(axum::middleware::from_fn_with_state(
@@ -867,6 +868,35 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             }
                         },
                         "404": { "description": "Session not found" }
+                    }
+                }
+            },
+            "/agui": {
+                "post": {
+                    "summary": "Run an AG-UI agent",
+                    "description": "Drive a recursive agent run via the AG-UI protocol \
+                        (https://docs.ag-ui.com). Body is an AG-UI RunAgentInput; the \
+                        response is an SSE stream of AG-UI events (RunStarted, \
+                        TextMessageStart/Content/End, ToolCall*, RunFinished, ...).",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "type": "object" },
+                                "description": "AG-UI RunAgentInput payload"
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "AG-UI SSE event stream",
+                            "content": {
+                                "text/event-stream": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        },
+                        "400": { "description": "Invalid AG-UI RunAgentInput" }
                     }
                 }
             },
@@ -1400,6 +1430,305 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
     }
 }
 
+// ── AG-UI endpoint ───────────────────────────────────────────────────────
+
+/// State machine that the AG-UI converter uses to coordinate
+/// `TextMessageStart/Content/End` framing across multiple AgentEvents.
+///
+/// We open a TextMessage on the first `AssistantText`/`PartialToken` we see
+/// after every "neutral" point (run start, after `TextMessageEnd`, after
+/// tool-call events) and close it explicitly when we emit a fully-formed
+/// `AssistantText`, when a `ToolCall` arrives, or when the run finishes.
+#[derive(Default)]
+struct AguiConverter {
+    /// `Some(message_id)` when a TextMessageStart has been emitted but no
+    /// TextMessageEnd yet. Used as the `messageId` for streaming
+    /// `PartialToken` deltas and as the `parentMessageId` for tool calls.
+    open_message_id: Option<String>,
+    /// Last fully-emitted (or currently-open) assistant message id. Used as
+    /// the `parent_message_id` on ToolCallStart even after the message has
+    /// been closed, so a client can attribute the tool call back to the
+    /// triggering assistant turn.
+    last_assistant_message_id: Option<String>,
+}
+
+impl AguiConverter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Translate one [`AgentEvent`] into zero or more AG-UI events,
+    /// updating internal framing state as a side effect.
+    fn convert(&mut self, ev: &AgentEvent) -> Vec<agui_protocol::Event> {
+        use agui_protocol as ag;
+        let mut out = Vec::new();
+        match ev {
+            AgentEvent::AssistantText { text, .. } => {
+                // Close any in-flight streamed message first.
+                if let Some(id) = self.open_message_id.take() {
+                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                        message_id: id,
+                        base: ag::BaseEvent::default(),
+                    }));
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
+                    message_id: id.clone(),
+                    role: Some("assistant".into()),
+                    base: ag::BaseEvent::default(),
+                }));
+                out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                    message_id: id.clone(),
+                    delta: text.clone(),
+                    base: ag::BaseEvent::default(),
+                }));
+                out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                    message_id: id.clone(),
+                    base: ag::BaseEvent::default(),
+                }));
+                self.last_assistant_message_id = Some(id);
+                self.open_message_id = None;
+            }
+            AgentEvent::PartialToken { text, .. } => {
+                let id = if let Some(id) = self.open_message_id.clone() {
+                    id
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
+                        message_id: id.clone(),
+                        role: Some("assistant".into()),
+                        base: ag::BaseEvent::default(),
+                    }));
+                    self.open_message_id = Some(id.clone());
+                    self.last_assistant_message_id = Some(id.clone());
+                    id
+                };
+                out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                    message_id: id,
+                    delta: text.clone(),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
+                // Close any in-flight streamed assistant message first; the
+                // assistant turn is "done" the moment a tool call lands.
+                if let Some(open) = self.open_message_id.take() {
+                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                        message_id: open,
+                        base: ag::BaseEvent::default(),
+                    }));
+                }
+                out.push(ag::Event::ToolCallStart(ag::ToolCallStart {
+                    tool_call_id: id.clone(),
+                    tool_call_name: name.clone(),
+                    parent_message_id: self.last_assistant_message_id.clone(),
+                    base: ag::BaseEvent::default(),
+                }));
+                out.push(ag::Event::ToolCallArgs(ag::ToolCallArgs {
+                    tool_call_id: id.clone(),
+                    delta: arguments.clone(),
+                    base: ag::BaseEvent::default(),
+                }));
+                out.push(ag::Event::ToolCallEnd(ag::ToolCallEnd {
+                    tool_call_id: id.clone(),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::ToolResult { id, output, .. } => {
+                // AG-UI requires a `messageId` on ToolCallResult; reuse the
+                // most recent assistant message id as the conversational
+                // anchor (mirrors what OpenAI's tool message shape does).
+                let message_id = self
+                    .last_assistant_message_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                out.push(ag::Event::ToolCallResult(ag::ToolCallResult {
+                    tool_call_id: id.clone(),
+                    message_id,
+                    content: output.clone(),
+                    role: Some("tool".into()),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::TurnFinished { .. } => {
+                // Close any in-flight streamed message before signalling
+                // run completion to the client.
+                if let Some(open) = self.open_message_id.take() {
+                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                        message_id: open,
+                        base: ag::BaseEvent::default(),
+                    }));
+                }
+                // Actual RunFinished is emitted by the caller (it knows
+                // the thread/run ids); we just flush state here.
+            }
+            // TODO(g141, g140): map permission_request / checkpoint_post /
+            // heartbeat / file_artifact onto Custom events here.
+            // Other variants (Latency, Usage, Compacted, PlanProposed,
+            // PlanConfirmed, PlanRejected) have no AG-UI standard
+            // equivalent and are intentionally dropped.
+            _ => {}
+        }
+        out
+    }
+}
+
+/// Stateless wrapper: maps a single [`AgentEvent`] to AG-UI events
+/// using a fresh converter. Useful in tests; production code uses
+/// [`AguiConverter::convert`] directly so framing state survives
+/// across the whole run.
+#[cfg(test)]
+fn agui_events_for(ev: &AgentEvent) -> Vec<agui_protocol::Event> {
+    AguiConverter::new().convert(ev)
+}
+
+/// POST /agui — drive an agent run via the AG-UI protocol and stream
+/// AG-UI events back as SSE.
+async fn agui_run(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    use agui_protocol as ag;
+
+    // Parse the body into a typed RunAgentInput. We accept Json<Value>
+    // up top so we can return a clean 400 with a helpful message
+    // instead of axum's default 422 on shape errors.
+    let input: ag::RunAgentInput = serde_json::from_value(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: format!("invalid AG-UI RunAgentInput: {e}"),
+            }),
+        )
+    })?;
+
+    // Derive the user goal: prefer the last user message, else fall back
+    // to the first context item value.
+    let goal = input
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone())
+        .or_else(|| input.context.first().map(|c| c.value.clone()))
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: "RunAgentInput must contain at least one user \
+                            message or a non-empty context item"
+                        .into(),
+                }),
+            )
+        })?;
+
+    let mut runtime = AgentRuntimeBuilder::new()
+        .llm(state.provider.clone())
+        .tools(state.tool_registry.clone())
+        .system_prompt(state.config.system_prompt.clone())
+        .max_steps(state.config.max_steps)
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: format!("failed to build runtime: {e}"),
+                }),
+            )
+        })?;
+
+    let (sink, mut event_rx) = ChannelSink::new();
+    runtime.set_event_sink(Arc::new(sink));
+
+    // Channel that carries fully-converted AG-UI Events to the SSE stream.
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<ag::Event>();
+    let thread_id = input.thread_id.clone();
+    let run_id = input.run_id.clone();
+
+    // Emit RunStarted up front so clients can render the run shell
+    // before the first model token arrives.
+    let _ = sse_tx.send(ag::Event::RunStarted(ag::RunStarted {
+        thread_id: thread_id.clone(),
+        run_id: run_id.clone(),
+        base: ag::BaseEvent::default(),
+    }));
+
+    // Converter task: forward AgentEvents → AG-UI Events. Owns the
+    // AguiConverter so framing state survives across the whole run.
+    let conv_thread = thread_id.clone();
+    let conv_run = run_id.clone();
+    let conv_tx = sse_tx.clone();
+    let converter_handle = tokio::spawn(async move {
+        let mut conv = AguiConverter::new();
+        while let Some(agent_event) = event_rx.recv().await {
+            for ev in conv.convert(&agent_event) {
+                if conv_tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        }
+        // The mpsc closes when the runtime drops its sink; emit
+        // RunFinished as the very last event.
+        let _ = conv_tx.send(ag::Event::RunFinished(ag::RunFinished {
+            thread_id: conv_thread,
+            run_id: conv_run,
+            result: None,
+            base: ag::BaseEvent::default(),
+        }));
+    });
+
+    // Drive the agent on a background task so the response stream can
+    // flush bytes to the client incrementally.
+    let metrics = state.metrics.clone();
+    tokio::spawn(async move {
+        let outcome = runtime.run(&goal).await;
+        // Replace the sink so the converter task's recv() sees a closed
+        // channel and exits cleanly.
+        runtime.set_event_sink(Arc::new(NullSink));
+        match outcome {
+            Ok(o) => {
+                metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
+                metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .agent_steps_total
+                    .fetch_add(o.steps as u64, Ordering::Relaxed);
+                metrics
+                    .tokens_prompt_total
+                    .fetch_add(o.total_usage.prompt_tokens as u64, Ordering::Relaxed);
+                metrics
+                    .tokens_completion_total
+                    .fetch_add(o.total_usage.completion_tokens as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
+                metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Hold converter_handle so it isn't dropped; let it complete
+        // naturally via the closed channel.
+        let _ = converter_handle.await;
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx).map(|ev| {
+        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+        Ok::<_, Infallible>(Event::default().data(data))
+    });
+
+    Ok(Sse::new(stream))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1505,5 +1834,19 @@ mod tests {
             assert!(limiter.check("default-client").await);
         }
         assert!(!limiter.check("default-client").await, "burst exceeded");
+    }
+
+    #[test]
+    fn agui_events_for_assistant_text_emits_start_content_end() {
+        use agui_protocol as ag;
+        let ev = AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 0,
+        };
+        let out = agui_events_for(&ev);
+        assert_eq!(out.len(), 3, "got {out:?}");
+        assert!(matches!(out[0], ag::Event::TextMessageStart(_)));
+        assert!(matches!(out[1], ag::Event::TextMessageContent(_)));
+        assert!(matches!(out[2], ag::Event::TextMessageEnd(_)));
     }
 }

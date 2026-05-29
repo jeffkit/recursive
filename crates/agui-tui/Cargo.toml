@@ -1,0 +1,32 @@
+[package]
+name = "agui-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Generic terminal UI for any AG-UI–compatible agent."
+license = "MIT"
+repository = "https://github.com/jeffkit/recursive"
+
+[lib]
+name = "agui_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agui-tui"
+path = "src/main.rs"
+
+[dependencies]
+agui-protocol = { path = "../agui-protocol" }
+agui-client = { path = "../agui-client" }
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+clap = { version = "4", features = ["derive", "env"] }
+url = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }

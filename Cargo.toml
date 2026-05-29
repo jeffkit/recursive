@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/recursive-tui"]
+members = [
+    "crates/recursive-tui",
+    "crates/agui-protocol",
+    "crates/agui-client",
+    "crates/agui-tui",
+]
 
 [package]
 name = "recursive-agent"
@@ -23,7 +28,7 @@ test-utils = ["dep:tempfile"]
 mcp = ["dep:futures-util"]
 web_fetch = []
 anthropic = []
-http = ["dep:axum", "dep:tower-http", "dep:tokio-stream", "dep:futures-util", "dep:jsonwebtoken"]
+http = ["dep:axum", "dep:tower-http", "dep:tokio-stream", "dep:futures-util", "dep:jsonwebtoken", "dep:agui-protocol", "dep:uuid"]
 
 [lib]
 name = "recursive"
@@ -66,6 +71,8 @@ tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 jsonwebtoken = { version = "9", optional = true }
 tempfile = { version = "3", optional = true }
+agui-protocol = { path = "crates/agui-protocol", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
@@ -75,6 +82,9 @@ recursive-agent = { path = ".", features = ["test-utils"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken = "9"
+agui-client = { path = "crates/agui-client" }
+agui-protocol = { path = "crates/agui-protocol" }
+url = "2"
 
 [profile.dev]
 opt-level = 0

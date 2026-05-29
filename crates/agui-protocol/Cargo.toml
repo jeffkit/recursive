@@ -1,0 +1,16 @@
+[package]
+name = "agui-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "AG-UI protocol types, serde definitions, and SSE parser. Transport-independent."
+license = "MIT"
+repository = "https://github.com/jeffkit/recursive"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1"
