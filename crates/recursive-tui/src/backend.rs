@@ -13,7 +13,7 @@
 //! credentials.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,15 @@ use crate::events::{UiEvent, UserAction};
 pub struct Backend {
     pub action_tx: mpsc::UnboundedSender<UserAction>,
     pub event_rx: mpsc::UnboundedReceiver<UiEvent>,
+    /// Goal-147: shared cancel flag the worker watches via
+    /// [`wait_for_cancel`]. The UI flips this to `true` when the
+    /// user presses Ctrl+C / Esc during a running turn; the
+    /// `tokio::select!` around `runtime.run` returns immediately and
+    /// the worker resets the flag before accepting the next action.
+    ///
+    /// Exposed publicly so integration tests in this crate can
+    /// inspect / mutate it without going through the action channel.
+    pub cancel_flag: Arc<AtomicBool>,
     _worker: JoinHandle<()>,
 }
 
@@ -56,12 +65,14 @@ impl Backend {
     fn spawn_with_state(state: RuntimeBuild) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
 
-        let worker = tokio::spawn(worker_loop(state, action_rx, event_tx));
+        let worker = tokio::spawn(worker_loop(state, action_rx, event_tx, cancel_flag.clone()));
 
         Self {
             action_tx,
             event_rx,
+            cancel_flag,
             _worker: worker,
         }
     }
@@ -127,8 +138,17 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         AgentEvent::Latency { llm_ms, .. } => Some(UiEvent::Latency { llm_ms }),
         AgentEvent::Compacted { removed, kept, .. } => Some(UiEvent::Compacted { removed, kept }),
         AgentEvent::TurnFinished { .. } => Some(UiEvent::TurnFinished),
-        // PlanProposed / PlanConfirmed / PlanRejected are intentionally
-        // dropped here — Goal 147 will consume them.
+        // Goal-147: forward the structured plan-mode protocol to the
+        // UI. The UI opens / closes a `Modal::PlanReview` in response.
+        AgentEvent::PlanProposed {
+            plan_text,
+            tool_calls,
+        } => Some(UiEvent::PlanProposed {
+            plan_text,
+            tool_calls,
+        }),
+        AgentEvent::PlanConfirmed => Some(UiEvent::PlanConfirmed),
+        AgentEvent::PlanRejected { reason } => Some(UiEvent::PlanRejected { reason }),
         _ => None,
     }
 }
@@ -242,6 +262,7 @@ async fn worker_loop(
     mut state: RuntimeBuild,
     mut action_rx: mpsc::UnboundedReceiver<UserAction>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
+    cancel_flag: Arc<AtomicBool>,
 ) {
     // Install our event sink once when the runtime is ready. The sink
     // is reused across turns; runtime.run() drains it per turn
@@ -262,15 +283,33 @@ async fn worker_loop(
             UserAction::Shutdown => break,
             UserAction::SendMessage(text) => match &mut state {
                 RuntimeBuild::Ready(rt) => {
-                    if let Err(e) = rt.run(text).await {
+                    // Goal-147: pre-flight reset of cancel_flag so a
+                    // stale Interrupt from before the turn doesn't
+                    // immediately abort us.
+                    cancel_flag.store(false, Ordering::SeqCst);
+
+                    let cancel_for_select = cancel_flag.clone();
+                    let result: Result<(), recursive::Error> = tokio::select! {
+                        r = rt.run(text) => r.map(|_| ()),
+                        _ = wait_for_cancel(cancel_for_select) => {
+                            let _ = event_tx.send(UiEvent::Error {
+                                message: "interrupted".into(),
+                            });
+                            Ok(())
+                        }
+                    };
+
+                    if let Err(e) = result {
                         let _ = event_tx.send(UiEvent::Error {
                             message: e.to_string(),
                         });
                     }
                     // Always poke the UI to clear its spinner, even if
                     // the runtime didn't emit `TurnFinished` on its own
-                    // (e.g. offline transitions, error short-circuit).
+                    // (e.g. offline transitions, error short-circuit,
+                    // interrupt).
                     let _ = event_tx.send(UiEvent::TurnFinished);
+                    cancel_flag.store(false, Ordering::SeqCst);
                 }
                 RuntimeBuild::Offline { reason } => {
                     let _ = event_tx.send(UiEvent::Error {
@@ -285,12 +324,24 @@ async fn worker_loop(
             UserAction::ConfirmPlan => {
                 if let RuntimeBuild::Ready(rt) = &mut state {
                     rt.confirm_plan();
-                    if let Err(e) = rt.run("").await {
+                    cancel_flag.store(false, Ordering::SeqCst);
+                    let cancel_for_select = cancel_flag.clone();
+                    let result: Result<(), recursive::Error> = tokio::select! {
+                        r = rt.run("") => r.map(|_| ()),
+                        _ = wait_for_cancel(cancel_for_select) => {
+                            let _ = event_tx.send(UiEvent::Error {
+                                message: "interrupted".into(),
+                            });
+                            Ok(())
+                        }
+                    };
+                    if let Err(e) = result {
                         let _ = event_tx.send(UiEvent::Error {
                             message: e.to_string(),
                         });
                     }
                     let _ = event_tx.send(UiEvent::TurnFinished);
+                    cancel_flag.store(false, Ordering::SeqCst);
                 }
             }
             UserAction::RejectPlan(reason) => {
@@ -324,7 +375,27 @@ async fn worker_loop(
                 // Offline mode is allowed: the App-side System block
                 // already echoed the new state to the user.
             }
+            UserAction::Interrupt => {
+                // Goal-147: flip the flag and let the in-flight
+                // tokio::select! arm in `SendMessage` / `ConfirmPlan`
+                // wake up via wait_for_cancel.
+                cancel_flag.store(true, Ordering::SeqCst);
+            }
         }
+    }
+}
+
+/// Goal-147: poll the cancel flag every 100ms until it flips to
+/// `true`. This is the simplest possible implementation; the
+/// alternative (a `tokio::sync::Notify` per turn) wires more cleanly
+/// but adds a moving part — atomic+poll is fine for a 1-Hz user
+/// gesture.
+pub async fn wait_for_cancel(flag: Arc<AtomicBool>) {
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -478,12 +549,42 @@ mod tests {
     }
 
     #[test]
-    fn map_plan_proposed_is_dropped() {
+    fn map_plan_proposed_is_forwarded() {
+        // Goal-147: PlanProposed used to be dropped; it now flows
+        // through to the UI as a `UiEvent::PlanProposed`.
         let ev = AgentEvent::PlanProposed {
             plan_text: "p".into(),
             tool_calls: vec![],
         };
-        assert!(map_agent_event(ev).is_none());
+        match map_agent_event(ev) {
+            Some(UiEvent::PlanProposed {
+                plan_text,
+                tool_calls,
+            }) => {
+                assert_eq!(plan_text, "p");
+                assert!(tool_calls.is_empty());
+            }
+            other => panic!("expected PlanProposed forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_plan_confirmed_is_forwarded() {
+        let mapped = map_agent_event(AgentEvent::PlanConfirmed);
+        assert_eq!(mapped, Some(UiEvent::PlanConfirmed));
+    }
+
+    #[test]
+    fn map_plan_rejected_is_forwarded() {
+        let mapped = map_agent_event(AgentEvent::PlanRejected {
+            reason: "user rejected".into(),
+        });
+        assert_eq!(
+            mapped,
+            Some(UiEvent::PlanRejected {
+                reason: "user rejected".into(),
+            })
+        );
     }
 
     /// Goal-145: a `UserAction::RunShell` must dispatch the
@@ -557,5 +658,62 @@ mod tests {
             panic!("expected ToolCall, got {call:?}");
         }
         let _ = rx.recv().await; // consume the ToolResult
+    }
+
+    /// Goal-147: an `Interrupt` action sets the cancel flag so the
+    /// worker's `tokio::select!` arm can wake up and abort the turn.
+    /// We assert the public flag flips without asserting on the
+    /// turn outcome (the worker may be in offline mode here).
+    #[tokio::test]
+    async fn interrupt_action_sets_cancel_flag() {
+        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let backend = Backend::spawn();
+        assert!(!backend.cancel_flag.load(Ordering::SeqCst));
+        backend.action_tx.send(UserAction::Interrupt).unwrap();
+
+        // Spin until the worker observes the action (it processes
+        // actions one at a time, so a brief poll is enough).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if backend.cancel_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            backend.cancel_flag.load(Ordering::SeqCst),
+            "Interrupt should set cancel_flag"
+        );
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+
+        if let Some(v) = prev_recursive {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        }
+        if let Some(v) = prev_openai {
+            std::env::set_var("OPENAI_API_KEY", v);
+        }
+    }
+
+    /// Goal-147 §"Notes for the agent": the `wait_for_cancel` poll
+    /// returns within ~100ms when the flag is already true. This is
+    /// the kernel of the interrupt mechanism; we assert it directly
+    /// rather than spinning up a full backend with a long-running
+    /// MockProvider, which is fragile under workspace sandboxing.
+    #[tokio::test]
+    async fn run_with_cancel_flag_true_returns_quickly() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let started = std::time::Instant::now();
+        let timed =
+            tokio::time::timeout(Duration::from_millis(500), wait_for_cancel(flag.clone())).await;
+        let elapsed = started.elapsed();
+        assert!(timed.is_ok(), "wait_for_cancel didn't return in time");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "wait_for_cancel was too slow: {elapsed:?}"
+        );
     }
 }

@@ -37,10 +37,9 @@ pub enum ConfirmAction {
 /// All modal flavours the TUI knows how to render.
 ///
 /// Goal 146 ships Help / CostDetail / ModelInfo / ToolList / Journal
-/// / Confirm. PlanReview is intentionally *not* added here — the
-/// existing top-level [`crate::app::AppScreen::PlanReview`] is the
-/// authoritative plan-confirmation UI; Step 5 (Goal 147) will fold
-/// it in.
+/// / Confirm. Goal 147 folds the Plan-mode confirmation into the
+/// modal stack as `Modal::PlanReview`, replacing the dedicated
+/// `AppScreen::PlanReview` (now removed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
     Help,
@@ -57,6 +56,18 @@ pub enum Modal {
         prompt: String,
         on_yes: ConfirmAction,
     },
+    /// Goal-147: structured plan-mode confirmation. `tool_calls`
+    /// carries the pending tool calls as JSON values (see
+    /// [`AgentEvent::PlanProposed`]). `edited_text` is reserved for
+    /// future inline editing — Goal 147 only uses the `e` key to
+    /// copy the plan into the prompt buffer and dismiss, so this
+    /// field is currently always `None` but kept for forward
+    /// compatibility per the goal's field schema.
+    PlanReview {
+        plan_text: String,
+        tool_calls: Vec<serde_json::Value>,
+        edited_text: Option<String>,
+    },
 }
 
 impl Modal {
@@ -69,6 +80,7 @@ impl Modal {
             Modal::ToolList { .. } => " Tools ",
             Modal::Journal { .. } => " Journal ",
             Modal::Confirm { .. } => " Confirm ",
+            Modal::PlanReview { .. } => " Plan Proposal ",
         }
     }
 }
@@ -98,6 +110,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::ToolList { entries } => render_tool_body(entries),
         Modal::Journal { entries, selected } => render_journal_body(entries, *selected),
         Modal::Confirm { prompt, .. } => render_confirm_body(prompt),
+        Modal::PlanReview {
+            plan_text,
+            tool_calls,
+            ..
+        } => render_plan_review(plan_text, tool_calls),
     };
 
     let block = Block::default()
@@ -363,6 +380,108 @@ fn render_confirm_body(prompt: &str) -> Vec<Line<'static>> {
         Style::default().fg(Color::DarkGray),
     )));
     out
+}
+
+/// Goal-147: render the body of a [`Modal::PlanReview`].
+///
+/// Layout, mirroring the goal §1 ASCII sketch:
+///
+/// ```text
+/// Plan Proposal
+///
+/// <plan_text multi-line, white>
+///
+/// Pending tools (N):
+///   • name(arguments_preview)
+///   • …
+///
+/// [y/Enter] Approve  [n/Esc] Reject  [e] Edit
+/// ```
+///
+/// `tool_calls` is the JSON-shaped payload from
+/// `AgentEvent::PlanProposed.tool_calls`. Each entry should have
+/// `name` (string), optional `id` (string), and `arguments` (JSON).
+/// We tolerate missing fields and render a best-effort preview.
+pub fn render_plan_review(plan_text: &str, tool_calls: &[serde_json::Value]) -> Vec<Line<'static>> {
+    let header = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(Color::White);
+    let key = Style::default().fg(Color::Cyan);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut out = Vec::new();
+    out.push(Line::from(Span::styled(
+        "Plan Proposal".to_string(),
+        header,
+    )));
+    out.push(Line::raw(""));
+    for raw in plan_text.lines() {
+        out.push(Line::from(Span::styled(raw.to_string(), body)));
+    }
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        format!("Pending tools ({}):", tool_calls.len()),
+        header,
+    )));
+    if tool_calls.is_empty() {
+        out.push(Line::from(Span::styled("  (none)".to_string(), dim)));
+    } else {
+        for tc in tool_calls {
+            let name = tc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            let args = tc
+                .get("arguments")
+                .map(plan_review_args_preview)
+                .unwrap_or_default();
+            out.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(name.to_string(), key),
+                Span::styled(format!("({args})"), body),
+            ]));
+        }
+    }
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "[y/Enter] Approve  [n/Esc] Reject  [e] Edit".to_string(),
+        dim,
+    )));
+    out
+}
+
+/// Format a single tool's `arguments` JSON value as a short preview
+/// inside the PlanReview tool list. Strings get quoted-and-clamped,
+/// objects get a `key=value` reduction (up to two keys), other JSON
+/// values render via their `to_string()`.
+fn plan_review_args_preview(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => format!("\"{}\"", short(s, 40)),
+        Value::Object(map) => {
+            let mut parts = Vec::new();
+            for (k, v) in map.iter().take(2) {
+                let v_str = match v {
+                    Value::String(s) => format!("\"{}\"", short(s, 24)),
+                    other => short(&other.to_string(), 24),
+                };
+                parts.push(format!("{k}={v_str}"));
+            }
+            short(&parts.join(", "), 60)
+        }
+        Value::Null => String::new(),
+        other => short(&other.to_string(), 60),
+    }
+}
+
+fn short(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
 }
 
 fn short_desc(desc: &str, max: usize) -> String {

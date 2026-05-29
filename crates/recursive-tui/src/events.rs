@@ -48,6 +48,25 @@ pub enum UiEvent {
     TurnFinished,
     /// A non-fatal error worth surfacing to the user.
     Error { message: String },
+    /// Goal-147: structured plan proposal from the runtime
+    /// (`AgentEvent::PlanProposed`). The UI opens a `Modal::PlanReview`
+    /// over the chat screen and freezes input until the user
+    /// approves / rejects / edits.
+    ///
+    /// `tool_calls` carries the pending tool calls as JSON values
+    /// — each one has `name`, `id`, and `arguments` fields, mirroring
+    /// the kernel's serialised `StepEvent::PlanProposed` payload.
+    PlanProposed {
+        plan_text: String,
+        tool_calls: Vec<serde_json::Value>,
+    },
+    /// Goal-147: the runtime accepted the plan and resumed execution.
+    /// Closes any open `Modal::PlanReview` and pushes a System block.
+    PlanConfirmed,
+    /// Goal-147: the runtime rejected (or had its plan rejected) with
+    /// a free-form `reason`. Same UI handling as `PlanConfirmed` plus
+    /// the reason in the System block.
+    PlanRejected { reason: String },
 }
 
 /// Actions originating from key events that the backend worker must
@@ -78,6 +97,13 @@ pub enum UserAction {
     /// plan-first mode, `false` reverts to immediate execution.
     /// The worker echoes a `System` block confirming the new state.
     SetPlanningMode(bool),
+    /// Goal-147: signal the worker to abort the in-flight turn.
+    /// The worker flips its `cancel_flag`, and any `tokio::select!`
+    /// waiting on `wait_for_cancel` returns immediately. The runtime
+    /// is *not* cancelled mid-HTTP-request (reqwest doesn't support
+    /// that); on the next tool-call boundary the next turn will
+    /// surface as a `UiEvent::Error { message: "interrupted" }`.
+    Interrupt,
     /// Tear down the worker and exit the runtime.
     Shutdown,
 }

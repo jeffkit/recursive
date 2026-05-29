@@ -20,11 +20,15 @@ use crate::events::{UiEvent, UserAction};
 // ──────────────────────────────────────────────────────────────────────
 
 /// Which top-level screen is currently rendered.
+///
+/// Goal 147 removed the `PlanReview` variant — the plan-mode
+/// confirmation now lives on the modal stack as
+/// [`crate::ui::modal::Modal::PlanReview`], so we are down to two
+/// screens: the brief splash and the chat surface.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppScreen {
     Splash,
     Chat,
-    PlanReview { plan_text: String },
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -158,6 +162,37 @@ impl TurnState {
         self.started_at = None;
         self.spinner_verb = "Thinking";
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Double-press tracker (Goal 147)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Default window for double-press detection (Esc / Ctrl+C). The
+/// runtime can override this via the `RECURSIVE_TUI_DOUBLE_MS` env
+/// var — see [`double_press_window`].
+pub const DOUBLE_PRESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Resolve the active double-press window. Reads
+/// `RECURSIVE_TUI_DOUBLE_MS` once per call (cheap; this is hit only on
+/// keypress) and falls back to [`DOUBLE_PRESS_WINDOW`] on parse
+/// failure.
+pub fn double_press_window() -> std::time::Duration {
+    std::env::var("RECURSIVE_TUI_DOUBLE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DOUBLE_PRESS_WINDOW)
+}
+
+/// Tracks when the user last pressed Esc / Ctrl+C. Goal 147 maps a
+/// "double press within window" to a stronger action (real exit on
+/// the second Ctrl+C) while a single press triggers the
+/// context-dependent path (interrupt / clear buffer / pop modal).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DoublePressTracker {
+    pub last_esc_at: Option<Instant>,
+    pub last_ctrl_c_at: Option<Instant>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -543,6 +578,11 @@ pub struct App {
     /// the latest `/plan on|off` invocation. Used to render an
     /// indicator and to seed `/status`.
     pub planning_mode_on: bool,
+    /// Goal-147: tracks the most recent Esc / Ctrl+C presses so the
+    /// second press within [`double_press_window`] can promote a soft
+    /// action (interrupt / clear) into a real exit. See
+    /// [`App::handle_key`].
+    pub double_press: DoublePressTracker,
 }
 
 impl App {
@@ -570,6 +610,7 @@ impl App {
             tool_catalog: default_offline_tool_catalog(),
             command_menu_selected: None,
             planning_mode_on: false,
+            double_press: DoublePressTracker::default(),
         }
     }
 
@@ -592,47 +633,21 @@ impl App {
     /// Process one key event. Returns an optional [`UserAction`] that
     /// the caller must forward to the backend worker.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UserAction> {
-        // ── Modal stack ──────────────────────────────────────────────
-        // Goal-146: when any modal is on the stack, it owns the key
-        // events. Modals never produce UserActions on their own (the
-        // y-confirm path only mutates AppState).
-        if !self.modals.is_empty() {
-            self.handle_modal_key(key);
-            return None;
+        // ── Ctrl+C: highest priority, double-press promotes to exit
+        // (Goal 147 §5). Modals + buffer + turn state all decide what
+        // the *first* press does; the second press inside the window
+        // always quits.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return self.handle_ctrl_c();
         }
 
-        // ── PlanReview screen ────────────────────────────────────────
-        if let AppScreen::PlanReview { ref plan_text } = self.screen {
-            let plan_text = plan_text.clone();
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
-                    self.blocks.push(TranscriptBlock::System {
-                        text: "Plan approved".into(),
-                    });
-                    self.blocks.push(TranscriptBlock::Assistant {
-                        text: plan_text,
-                        streaming: false,
-                        latency_ms: None,
-                    });
-                    self.screen = AppScreen::Chat;
-                    self.scroll_to_bottom();
-                    return Some(UserAction::ConfirmPlan);
-                }
-                KeyCode::Esc | KeyCode::Char('n') => {
-                    self.blocks.push(TranscriptBlock::System {
-                        text: "Plan rejected".into(),
-                    });
-                    self.screen = AppScreen::Chat;
-                    self.scroll_to_bottom();
-                    return Some(UserAction::RejectPlan(String::new()));
-                }
-                KeyCode::Char('e') => {
-                    self.set_input(plan_text);
-                    self.screen = AppScreen::Chat;
-                    return None;
-                }
-                _ => return None,
-            }
+        // ── Modal stack ──────────────────────────────────────────────
+        // Goal-146: when any modal is on the stack, it owns the key
+        // events. Modals may produce UserActions (Goal-147 added the
+        // PlanReview y/n/Esc paths that send ConfirmPlan / RejectPlan
+        // to the backend).
+        if !self.modals.is_empty() {
+            return self.handle_modal_key_action(key);
         }
 
         // ── Ctrl+E: contextual ───────────────────────────────────────
@@ -745,21 +760,101 @@ impl App {
                 self.prompt.move_end();
                 None
             }
-            KeyCode::Esc => {
-                if self.prompt.buffer.is_empty() && self.prompt.mode == InputMode::Prompt {
-                    self.should_quit = true;
-                } else {
-                    // Non-empty buffer or non-Prompt mode: clear it
-                    // rather than quitting — matches fake-cc.
-                    self.prompt.buffer.clear();
-                    self.prompt.cursor = 0;
-                    self.prompt.mode = InputMode::Prompt;
-                    self.prompt.history_idx = None;
-                }
-                None
-            }
+            KeyCode::Esc => self.handle_esc(),
             _ => None,
         }
+    }
+
+    /// Goal-147: dispatch the Esc key when no modal is active.
+    ///
+    /// Order of resolution:
+    ///   1. Buffer non-empty → clear it and reset to Prompt mode.
+    ///   2. A turn is running → emit `UserAction::Interrupt`, push a
+    ///      System block, and start the double-press window.
+    ///   3. Otherwise → no-op. **Esc never quits** from the chat
+    ///      screen (Goal 147). Quitting is owned by `Ctrl+C×2`,
+    ///      `Ctrl+D`, `/exit`, or `q` inside a modal.
+    ///
+    /// The double-press window is tracked but unused for Esc — Esc
+    /// has no escalation path; we update the timestamp anyway so
+    /// future enhancements can read it without re-plumbing.
+    fn handle_esc(&mut self) -> Option<UserAction> {
+        let now = Instant::now();
+        let _within_window = self
+            .double_press
+            .last_esc_at
+            .map(|t| now.duration_since(t) <= double_press_window())
+            .unwrap_or(false);
+        self.double_press.last_esc_at = Some(now);
+
+        // Step 1: non-empty buffer or non-Prompt mode → clear.
+        if !self.prompt.buffer.is_empty() || self.prompt.mode != InputMode::Prompt {
+            self.prompt.buffer.clear();
+            self.prompt.cursor = 0;
+            self.prompt.mode = InputMode::Prompt;
+            self.prompt.history_idx = None;
+            return None;
+        }
+
+        // Step 2: in-flight turn → interrupt.
+        if self.turn.running {
+            self.push_system("Interrupting… (press Ctrl+C again to exit)");
+            return Some(UserAction::Interrupt);
+        }
+
+        // Step 3: idle and empty — explicitly no-op (do **not** quit).
+        None
+    }
+
+    /// Goal-147: dispatch Ctrl+C with double-press semantics.
+    ///
+    /// Order of resolution:
+    ///   1. Two presses inside [`double_press_window`] → real exit.
+    ///   2. Modal active → pop the topmost modal (single-press path).
+    ///   3. Buffer non-empty → clear it.
+    ///   4. Turn running → `UserAction::Interrupt` + System block.
+    ///   5. Idle and empty → arm the "press again to exit" hint.
+    fn handle_ctrl_c(&mut self) -> Option<UserAction> {
+        let now = Instant::now();
+        let within_window = self
+            .double_press
+            .last_ctrl_c_at
+            .map(|t| now.duration_since(t) <= double_press_window())
+            .unwrap_or(false);
+
+        if within_window {
+            // Second press inside the window → exit.
+            self.should_quit = true;
+            self.double_press.last_ctrl_c_at = None;
+            return None;
+        }
+
+        self.double_press.last_ctrl_c_at = Some(now);
+
+        // Step 2: pop a modal.
+        if !self.modals.is_empty() {
+            self.modals.pop();
+            return None;
+        }
+
+        // Step 3: clear buffer.
+        if !self.prompt.buffer.is_empty() || self.prompt.mode != InputMode::Prompt {
+            self.prompt.buffer.clear();
+            self.prompt.cursor = 0;
+            self.prompt.mode = InputMode::Prompt;
+            self.prompt.history_idx = None;
+            return None;
+        }
+
+        // Step 4: interrupt the running turn.
+        if self.turn.running {
+            self.push_system("Interrupting… (press Ctrl+C again to exit)");
+            return Some(UserAction::Interrupt);
+        }
+
+        // Step 5: idle, empty → arm the second press.
+        self.push_system("Press Ctrl+C again to exit");
+        None
     }
 
     /// History walk on Up should fire when (a) we are already
@@ -890,13 +985,12 @@ impl App {
                 self.append_streaming_assistant(&text);
             }
             UiEvent::AssistantMessage { content } => {
-                let first_line = content.lines().next().unwrap_or("");
-                let lower = first_line.to_lowercase();
-                if lower.starts_with("plan:") || lower.starts_with("## plan") {
-                    self.screen = AppScreen::PlanReview { plan_text: content };
-                } else {
-                    self.finalise_streaming_assistant(content);
-                }
+                // Goal-147: the legacy `"plan:"` / `"## plan"` text
+                // sniff is gone — plan-mode now arrives through the
+                // structured `UiEvent::PlanProposed` channel. Any
+                // assistant text that looks like a plan prefix is now
+                // just displayed as-is.
+                self.finalise_streaming_assistant(content);
             }
             UiEvent::ToolCall {
                 id,
@@ -988,8 +1082,49 @@ impl App {
                     text: format!("Error: {message}"),
                 });
             }
+            UiEvent::PlanProposed {
+                plan_text,
+                tool_calls,
+            } => {
+                // Goal-147: open the PlanReview modal and announce
+                // the proposal in the transcript so the user sees a
+                // historical record after the modal is dismissed.
+                self.modals.push(crate::ui::modal::Modal::PlanReview {
+                    plan_text,
+                    tool_calls,
+                    edited_text: None,
+                });
+                self.blocks.push(TranscriptBlock::System {
+                    text: "Plan proposed, awaiting approval…".into(),
+                });
+            }
+            UiEvent::PlanConfirmed => {
+                self.close_plan_review_modal();
+                self.blocks.push(TranscriptBlock::System {
+                    text: "Plan approved".into(),
+                });
+            }
+            UiEvent::PlanRejected { reason } => {
+                self.close_plan_review_modal();
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Plan rejected: {reason}"),
+                });
+            }
         }
         self.scroll_to_bottom();
+    }
+
+    /// If the topmost modal is a `PlanReview`, pop it. No-op
+    /// otherwise — the runtime may emit `PlanConfirmed` after the
+    /// user already dismissed the modal manually, in which case we
+    /// only want to push the System block.
+    fn close_plan_review_modal(&mut self) {
+        if matches!(
+            self.modals.last(),
+            Some(crate::ui::modal::Modal::PlanReview { .. })
+        ) {
+            self.modals.pop();
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -1079,6 +1214,59 @@ impl App {
                     }
                     self.command_menu_selected = None;
                 }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle a key event when at least one modal is on the stack.
+    /// Returns `Some(action)` if the modal layer wants to forward a
+    /// [`UserAction`] to the backend (currently only the PlanReview
+    /// modal does this). The outer key dispatcher should not also
+    /// process this key against the chat layer.
+    pub fn handle_modal_key_action(&mut self, key: KeyEvent) -> Option<UserAction> {
+        use crate::ui::modal::Modal;
+
+        // Goal-147: PlanReview modal owns y / n / e / Enter / Esc and
+        // *bypasses* the generic confirm logic.
+        if let Some(Modal::PlanReview { .. }) = self.modals.last() {
+            return self.handle_plan_review_key(key);
+        }
+
+        // Generic modal dispatch (Goal 146).
+        self.handle_modal_key(key);
+        None
+    }
+
+    /// Goal-147: dispatch a key against an active `Modal::PlanReview`.
+    ///
+    /// * `y` / `Enter` → emit `UserAction::ConfirmPlan`. The modal is
+    ///   **not** popped here — we wait for the runtime's
+    ///   `PlanConfirmed` event so the visible state matches the
+    ///   server-side decision.
+    /// * `n` / `Esc` → pop the modal immediately and emit
+    ///   `UserAction::RejectPlan("user rejected")`. Goal §8 forbids
+    ///   collecting a free-form reason here.
+    /// * `e` → copy the plan text into the prompt buffer (Prompt
+    ///   mode), close the modal, and let the user edit/resend
+    ///   normally.
+    /// * Any other key is consumed but ignored, keeping plan-mode
+    ///   focus.
+    fn handle_plan_review_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        use crate::ui::modal::Modal;
+
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => Some(UserAction::ConfirmPlan),
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.modals.pop();
+                Some(UserAction::RejectPlan("user rejected".into()))
+            }
+            KeyCode::Char('e') => {
+                if let Some(Modal::PlanReview { plan_text, .. }) = self.modals.last().cloned() {
+                    self.set_input(plan_text);
+                }
+                self.modals.pop();
                 None
             }
             _ => None,
@@ -1664,14 +1852,6 @@ mod tests {
     }
 
     #[test]
-    fn esc_sets_should_quit_when_buffer_empty() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        let _ = app.handle_key(key(KeyCode::Esc));
-        assert!(app.should_quit);
-    }
-
-    #[test]
     fn esc_clears_buffer_without_quitting() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
@@ -1775,76 +1955,208 @@ mod tests {
         ));
     }
 
-    // ── Plan Mode ──────────────────────────────────────────────────
+    // ── Plan Mode (Goal 147) ───────────────────────────────────────
 
     #[test]
-    fn plan_message_triggers_plan_review() {
+    fn plan_proposed_event_opens_plan_review_modal() {
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "## Plan\n1. Do thing A".into(),
+        app.handle_ui_event(UiEvent::PlanProposed {
+            plan_text: "1. read_file\n2. apply_patch".into(),
+            tool_calls: vec![serde_json::json!({
+                "name": "read_file",
+                "id": "1",
+                "arguments": { "path": "src/foo.rs" }
+            })],
         });
-        assert!(matches!(app.screen, AppScreen::PlanReview { .. }));
+        assert!(matches!(app.modals.last(), Some(Modal::PlanReview { .. })));
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::System { text } if text.contains("Plan proposed"))));
     }
 
     #[test]
-    fn plan_message_with_plan_colon_triggers_review() {
+    fn plan_confirmed_closes_modal_and_pushes_system_block() {
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "Plan: refactor".into(),
+        app.modals.push(Modal::PlanReview {
+            plan_text: "do".into(),
+            tool_calls: vec![],
+            edited_text: None,
         });
-        assert!(matches!(app.screen, AppScreen::PlanReview { .. }));
-    }
-
-    #[test]
-    fn non_plan_message_stays_in_chat() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "Hello, I can help.".into(),
-        });
-        assert_eq!(app.screen, AppScreen::Chat);
-    }
-
-    #[test]
-    fn plan_approve_returns_to_chat() {
-        let mut app = App::new();
-        app.screen = AppScreen::PlanReview {
-            plan_text: "## Plan\nDo X".into(),
-        };
-        let action = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, AppScreen::Chat);
-        assert!(matches!(action, Some(UserAction::ConfirmPlan)));
+        app.handle_ui_event(UiEvent::PlanConfirmed);
+        assert!(app.modals.is_empty());
         assert!(app
             .blocks
             .iter()
             .any(|b| matches!(b, TranscriptBlock::System { text } if text == "Plan approved")));
-        assert!(app.blocks.iter().any(
-            |b| matches!(b, TranscriptBlock::Assistant { text, .. } if text == "## Plan\nDo X")
-        ));
     }
 
     #[test]
-    fn plan_reject_returns_to_chat() {
+    fn plan_rejected_pushes_system_block_with_reason() {
+        use crate::ui::modal::Modal;
         let mut app = App::new();
-        app.screen = AppScreen::PlanReview {
-            plan_text: "Plan: do".into(),
-        };
-        let action = app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, AppScreen::Chat);
-        assert!(matches!(action, Some(UserAction::RejectPlan(_))));
+        app.screen = AppScreen::Chat;
+        app.modals.push(Modal::PlanReview {
+            plan_text: "do".into(),
+            tool_calls: vec![],
+            edited_text: None,
+        });
+        app.handle_ui_event(UiEvent::PlanRejected {
+            reason: "user rejected".into(),
+        });
+        assert!(app.modals.is_empty());
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::System { text } if text == "Plan rejected: user rejected")));
     }
 
     #[test]
-    fn plan_edit_prefills_input() {
+    fn plan_review_y_dispatches_confirm_plan_action() {
+        use crate::ui::modal::Modal;
         let mut app = App::new();
-        app.screen = AppScreen::PlanReview {
-            plan_text: "edit me".into(),
-        };
+        app.screen = AppScreen::Chat;
+        app.modals.push(Modal::PlanReview {
+            plan_text: "do".into(),
+            tool_calls: vec![],
+            edited_text: None,
+        });
+        let action = app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(action, Some(UserAction::ConfirmPlan)));
+        // Goal §3: do **not** pop the modal until the runtime
+        // confirms the plan; the modal stays so the user sees the
+        // pending state.
+        assert!(matches!(app.modals.last(), Some(Modal::PlanReview { .. })));
+    }
+
+    #[test]
+    fn plan_review_n_dispatches_reject_plan_action() {
+        use crate::ui::modal::Modal;
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.modals.push(Modal::PlanReview {
+            plan_text: "do".into(),
+            tool_calls: vec![],
+            edited_text: None,
+        });
+        let action = app.handle_key(key(KeyCode::Char('n')));
+        match action {
+            Some(UserAction::RejectPlan(reason)) => assert_eq!(reason, "user rejected"),
+            other => panic!("expected RejectPlan, got {other:?}"),
+        }
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn plan_review_e_copies_text_to_input_and_closes_modal() {
+        use crate::ui::modal::Modal;
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.modals.push(Modal::PlanReview {
+            plan_text: "edit me please".into(),
+            tool_calls: vec![],
+            edited_text: None,
+        });
         let action = app.handle_key(key(KeyCode::Char('e')));
-        assert_eq!(app.input(), "edit me");
         assert!(action.is_none());
+        assert_eq!(app.input(), "edit me please");
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert!(app.modals.is_empty());
+    }
+
+    /// Goal §5: Esc closes the topmost modal rather than quitting.
+    #[test]
+    fn esc_first_press_closes_modal_not_quits() {
+        use crate::ui::modal::Modal;
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.modals.push(Modal::Help);
+        let _ = app.handle_key(key(KeyCode::Esc));
+        assert!(app.modals.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    /// Goal §5: with no modal but a non-empty buffer, Esc clears the
+    /// buffer and does not quit, even on a single press.
+    #[test]
+    fn esc_first_press_clears_input_when_modal_empty_and_buffer_set() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("partial");
+        let _ = app.handle_key(key(KeyCode::Esc));
+        assert!(!app.should_quit);
+        assert!(app.input().is_empty());
+    }
+
+    /// Goal §5: Esc does **not** quit even on a second press inside
+    /// the double-press window. (Quitting is owned exclusively by
+    /// Ctrl+C×2 and the explicit `/exit` / `q-in-modal` paths.)
+    #[test]
+    fn esc_does_not_quit_after_double_press_when_idle() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        let _ = app.handle_key(key(KeyCode::Esc));
+        let _ = app.handle_key(key(KeyCode::Esc));
+        assert!(!app.should_quit);
+    }
+
+    /// Goal §5: Ctrl+C during a running turn dispatches an Interrupt
+    /// action and writes a System block.
+    #[test]
+    fn ctrl_c_first_press_during_turn_dispatches_interrupt() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.turn.start();
+        let action = app.handle_key(ctrl('c'));
+        assert!(matches!(action, Some(UserAction::Interrupt)));
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::System { text } if text.contains("Interrupting"))));
+        assert!(!app.should_quit);
+    }
+
+    /// Goal §5: Ctrl+C while idle pushes a "press again to exit"
+    /// hint, then a second press inside the window quits.
+    #[test]
+    fn ctrl_c_first_press_idle_pushes_warning_then_exits_on_second() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        let _ = app.handle_key(ctrl('c'));
+        assert!(!app.should_quit);
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::System { text } if text.contains("Press Ctrl+C again"))));
+        let _ = app.handle_key(ctrl('c'));
+        assert!(app.should_quit);
+    }
+
+    /// Goal §5: Ctrl+C×2 inside the window quits regardless of the
+    /// soft action the first press kicked off (interrupt / clear /
+    /// modal-pop).
+    #[test]
+    fn ctrl_c_double_press_within_window_quits() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.turn.start();
+        let _ = app.handle_key(ctrl('c'));
+        // Second press almost-instantly: must quit.
+        let _ = app.handle_key(ctrl('c'));
+        assert!(app.should_quit);
+    }
+
+    /// Goal §5: a Ctrl+C press outside the double-press window
+    /// resets the counter, so the *next* press starts a fresh round
+    /// of soft actions instead of immediately quitting.
+    #[test]
+    fn ctrl_c_outside_window_resets_counter() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        // Backdate last_ctrl_c_at so the next press is "outside".
+        app.double_press.last_ctrl_c_at = Some(Instant::now() - Duration::from_secs(60));
+        let action = app.handle_key(ctrl('c'));
+        // First press fresh round: idle + empty → arms the warning.
+        assert!(action.is_none());
+        assert!(!app.should_quit);
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::System { text } if text.contains("Press Ctrl+C again"))));
     }
 
     // ── verb / patch parser ────────────────────────────────────────
