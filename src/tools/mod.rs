@@ -194,6 +194,11 @@ impl ToolRegistry {
         self.touched = None;
     }
 
+    /// Return the currently attached touched-files collector, if any.
+    pub fn touched_files(&self) -> Option<Arc<Mutex<TouchedFiles>>> {
+        self.touched.clone()
+    }
+
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.spec().name;
         self.tools.insert(name, tool);

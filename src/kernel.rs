@@ -193,6 +193,15 @@ impl AgentKernel {
         &self.tools
     }
 
+    /// Mutable access to the tool registry.
+    ///
+    /// Used by [`AgentRuntime::enable_checkpoints`] to register
+    /// session-scoped read-only tools (`checkpoint_list`,
+    /// `checkpoint_diff`) once the session id is known.
+    pub fn tools_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.tools
+    }
+
     /// Access the cancellation token, if one was configured.
     ///
     /// Useful for tests verifying that token propagation through

@@ -415,6 +415,102 @@ impl SessionWriter {
     }
 }
 
+/// Truncate `transcript.jsonl` (and the session's `.meta.json`
+/// `message_count`) so that only the messages from turns
+/// `0..cutoff_turn` survive.
+///
+/// "Turn N" is defined as the N-th non-system, non-tool user message
+/// in the transcript (0-indexed). The system prompt (if any) and any
+/// seed messages preceding the first user turn are always preserved.
+///
+/// Used by `recursive sessions rewind --to-turn N` to keep transcript
+/// state in sync with the workspace state restored from a checkpoint.
+pub fn truncate_transcript_to_turn(
+    session_dir: &Path,
+    cutoff_turn: usize,
+) -> std::io::Result<TruncateStats> {
+    let jsonl_path = session_dir.join("transcript.jsonl");
+    if !jsonl_path.exists() {
+        return Ok(TruncateStats {
+            kept: 0,
+            dropped: 0,
+        });
+    }
+
+    // Stream-read so we don't load the whole transcript into memory.
+    let file = std::fs::File::open(&jsonl_path)?;
+    let reader = std::io::BufReader::new(file);
+
+    let tmp_path = jsonl_path.with_extension("jsonl.rewind-tmp");
+    let tmp = std::fs::File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(tmp);
+
+    let mut user_seen = 0usize;
+    let mut kept = 0u64;
+    let mut dropped = 0u64;
+    let mut stop = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if stop {
+            dropped += 1;
+            continue;
+        }
+
+        // Peek role without full deserialisation.
+        let role = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|v| v.get("role").and_then(|r| r.as_str()).map(str::to_string));
+
+        let is_turn_boundary = matches!(role.as_deref(), Some("user"));
+        if is_turn_boundary {
+            if user_seen >= cutoff_turn {
+                // This user message starts the turn we're rewinding;
+                // drop it and everything after.
+                stop = true;
+                dropped += 1;
+                continue;
+            }
+            user_seen += 1;
+        }
+
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
+        kept += 1;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    std::fs::rename(&tmp_path, &jsonl_path)?;
+
+    // Update .meta.json message_count if present.
+    let meta_path = session_dir.join(".meta.json");
+    if meta_path.exists() {
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            if let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) {
+                meta.message_count = kept;
+                meta.updated_at = chrono_lite_now();
+                if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                    let _ = std::fs::write(&meta_path, json);
+                }
+            }
+        }
+    }
+
+    Ok(TruncateStats { kept, dropped })
+}
+
+/// Stats returned by [`truncate_transcript_to_turn`].
+#[derive(Debug, Clone, Copy)]
+pub struct TruncateStats {
+    pub kept: u64,
+    pub dropped: u64,
+}
+
 /// Reader for loading sessions from JSONL files.
 pub struct SessionReader;
 
@@ -1021,5 +1117,68 @@ mod tests {
         let slug = workspace_slug(p);
         assert!(!slug.is_empty());
         assert!(slug.len() <= 80);
+    }
+
+    #[test]
+    fn truncate_transcript_to_turn_drops_at_user_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
+        // Sequence: system, user(turn 0), assistant, user(turn 1),
+        // assistant, user(turn 2), assistant.
+        w.append(&Message::system("sys".to_string())).unwrap();
+        w.append(&Message::user("u0".to_string())).unwrap();
+        w.append(&Message::assistant("a0".to_string())).unwrap();
+        w.append(&Message::user("u1".to_string())).unwrap();
+        w.append(&Message::assistant("a1".to_string())).unwrap();
+        w.append(&Message::user("u2".to_string())).unwrap();
+        w.append(&Message::assistant("a2".to_string())).unwrap();
+        w.finish("done").unwrap();
+
+        let session_dir = w.session_dir().to_path_buf();
+
+        // Rewind to turn 1 → keep system + u0 + a0; drop u1 onwards.
+        let stats = truncate_transcript_to_turn(&session_dir, 1).unwrap();
+        assert_eq!(stats.kept, 3);
+        assert_eq!(stats.dropped, 4);
+
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].role, "system");
+        assert_eq!(entries[1].role, "user");
+        assert_eq!(entries[1].content, "u0");
+        assert_eq!(entries[2].role, "assistant");
+        assert_eq!(entries[2].content, "a0");
+
+        // Meta should reflect the new count.
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.message_count, 3);
+    }
+
+    #[test]
+    fn truncate_transcript_to_zero_drops_all_turns_keeps_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
+        w.append(&Message::system("sys".to_string())).unwrap();
+        w.append(&Message::user("u0".to_string())).unwrap();
+        w.append(&Message::assistant("a0".to_string())).unwrap();
+        w.finish("done").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        let stats = truncate_transcript_to_turn(&session_dir, 0).unwrap();
+        assert_eq!(stats.kept, 1, "system message should remain");
+        assert_eq!(stats.dropped, 2);
+
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "system");
+    }
+
+    #[test]
+    fn truncate_transcript_missing_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        // No session created → no transcript.jsonl. Should not panic.
+        let stats = truncate_transcript_to_turn(dir.path(), 5).unwrap();
+        assert_eq!(stats.kept, 0);
+        assert_eq!(stats.dropped, 0);
     }
 }

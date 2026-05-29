@@ -55,6 +55,21 @@ If sub-agent is enabled (`RECURSIVE_SUBAGENT_ENABLED=1`):
   agent loop with restricted tools. Use for "summarize what AGENTS.md
   says about X" without polluting the main transcript.
 
+If checkpointing is enabled (default when `git` is on PATH):
+
+- `checkpoint_list` — list this session's per-turn workspace
+  snapshots, newest first. Each turn produces one entry whose id
+  you can pass to `checkpoint_diff`.
+- `checkpoint_diff` — show a unified diff between two checkpoints
+  in this session, or between a checkpoint and the current
+  workspace. Useful for "what did I change in turn N?" self-checks.
+
+You **cannot** create or restore checkpoints from inside the agent.
+Snapshots are taken automatically by the runtime around every turn,
+and rewinds happen out-of-band via
+`recursive sessions rewind <session-id> --to-turn N`. Treat the
+checkpoint chain as read-only telemetry about your own footprint.
+
 ## Don't surprise the orchestrator
 
 - Each self-improve cycle has a step budget (default 200, hard cap

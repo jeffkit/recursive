@@ -378,6 +378,12 @@ impl AgentRuntime {
     /// the [`ToolRegistry`] via `with_touched_files`. If no collector
     /// is provided, file-attribution falls back to "shell-diff" for
     /// every turn.
+    ///
+    /// Side effect: registers the read-only `checkpoint_list` and
+    /// `checkpoint_diff` tools, scoped to this session, onto the
+    /// kernel's tool registry — so the agent can introspect its own
+    /// checkpoint chain (but cannot save or restore; those are
+    /// orchestration concerns).
     pub fn enable_checkpoints(
         &mut self,
         shadow: Arc<ShadowRepo>,
@@ -386,8 +392,23 @@ impl AgentRuntime {
         touched_slot: Option<Arc<Mutex<TouchedFiles>>>,
     ) -> Result<()> {
         let writer = CheckpointLogWriter::open(&log_path)?;
+        let session_id = session_id.into();
+
+        // Register session-scoped read-only checkpoint tools onto the
+        // kernel's registry. The shadow repo is shared via
+        // Arc<Mutex<ShadowRepo>> so the tools and the runtime see the
+        // same checkpoint chain.
+        let tool_repo = Arc::new(Mutex::new(ShadowRepo::clone(&shadow)));
+        let ctx = crate::tools::CheckpointToolCtx {
+            repo: tool_repo,
+            session_id: session_id.clone(),
+        };
+        let tools = self.kernel.tools_mut();
+        tools.register_mut(Arc::new(crate::tools::CheckpointList::new(ctx.clone())));
+        tools.register_mut(Arc::new(crate::tools::CheckpointDiff::new(ctx)));
+
         self.shadow = Some(shadow);
-        self.session_id = Some(session_id.into());
+        self.session_id = Some(session_id);
         self.checkpoint_writer = Some(writer);
         self.touched_files = touched_slot;
         Ok(())

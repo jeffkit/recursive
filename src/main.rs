@@ -864,11 +864,20 @@ fn cmd_session_rewind(
         result.stats.unchanged,
         result.dropped_turns.len()
     );
-    println!(
-        "NOTE: transcript.jsonl is not truncated automatically yet. \
-         To start a fresh chat from this checkpoint, the transcript will need \
-         to be replayed up to turn {to_turn}."
-    );
+
+    // Also truncate transcript.jsonl so the conversation state matches
+    // the restored workspace state.
+    match recursive::truncate_transcript_to_turn(&session_path, to_turn) {
+        Ok(stats) => {
+            println!(
+                "Transcript truncated: {} message(s) kept, {} dropped.",
+                stats.kept, stats.dropped
+            );
+        }
+        Err(e) => {
+            eprintln!("warning: transcript truncation failed: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -1154,6 +1163,14 @@ async fn build_runtime(
     };
     let mut tools = build_tools(config).await;
     register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
+
+    // Always attach a TouchedFiles collector so AgentRuntime can record
+    // per-turn file touches when checkpoints are enabled later via
+    // enable_checkpoints(). When checkpoints are disabled this is a
+    // no-op observer.
+    tools = tools.with_touched_files(Arc::new(std::sync::Mutex::new(
+        recursive::TouchedFiles::new(),
+    )));
 
     let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1");
     if sub_agent_enabled {
@@ -1523,6 +1540,26 @@ async fn run_resumed(
     )
     .await?;
 
+    // Wire up per-turn checkpoints (resume path).
+    if let Some(ref sw) = session_writer {
+        match recursive::ShadowRepo::open(&config.workspace) {
+            Ok(repo) => {
+                let session_id = sw.lock().unwrap().session_id().to_string();
+                let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
+                let log_path = session_dir.join("checkpoints.jsonl");
+                let touched = runtime.kernel().tools().touched_files();
+                if let Err(e) =
+                    runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
+                {
+                    eprintln!("checkpoint: failed to enable, continuing without: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("checkpoint: shadow repo unavailable, continuing without: {e}");
+            }
+        }
+    }
+
     let tool_specs = runtime.kernel().tools().specs();
     let pre_transcript_len = runtime.transcript().len();
 
@@ -1770,6 +1807,30 @@ async fn run_once(
         Some(shutdown.clone()),
     )
     .await?;
+
+    // Wire up per-turn checkpoints when a session is active and git is
+    // available. The shadow repo is shared across all sessions in this
+    // workspace; each session advances its own ref chain.
+    if let Some(ref sw) = session_writer {
+        match recursive::ShadowRepo::open(&config.workspace) {
+            Ok(repo) => {
+                let session_id = sw.lock().unwrap().session_id().to_string();
+                let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
+                let log_path = session_dir.join("checkpoints.jsonl");
+                let touched = runtime.kernel().tools().touched_files();
+                if let Err(e) =
+                    runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
+                {
+                    eprintln!("checkpoint: failed to enable, continuing without: {e}");
+                } else {
+                    eprintln!("checkpoint: per-turn snapshots active");
+                }
+            }
+            Err(e) => {
+                eprintln!("checkpoint: shadow repo unavailable, continuing without: {e}");
+            }
+        }
+    }
 
     let tool_specs = runtime.kernel().tools().specs();
     let pre_transcript_len = runtime.transcript().len();

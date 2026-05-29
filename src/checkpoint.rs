@@ -551,10 +551,24 @@ fn short_sha(full: &str) -> String {
 }
 
 fn session_ref(sid: &str) -> String {
-    format!("refs/sessions/{sid}/HEAD")
+    format!("refs/sessions/{}/HEAD", sanitize_for_refname(sid))
+}
+
+/// Encode a session id into a git refname-safe segment. Git refnames
+/// disallow consecutive dots (`..`), leading/trailing dots, `.lock`
+/// suffixes, and a few control characters. For our purposes (we
+/// already pre-validate via [`validate_session_id`]) we just collapse
+/// any `.` into `-`, which is always safe and deterministic.
+fn sanitize_for_refname(sid: &str) -> String {
+    sid.replace('.', "-")
 }
 
 fn validate_session_id(sid: &str) -> Result<()> {
+    // Allow alphanumerics + `-` `_` `.`. The `.` is permitted because
+    // real session ids include the workspace slug, which on macOS may
+    // contain `.tmpXXX` segments from `/var/folders/...`. We still
+    // reject path separators, `..`, and leading-dot to keep the id
+    // safe for use as a git ref component.
     if sid.is_empty()
         || sid.contains('/')
         || sid.contains('\\')
@@ -562,11 +576,11 @@ fn validate_session_id(sid: &str) -> Result<()> {
         || sid.starts_with('.')
         || !sid
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(Error::BadToolArgs {
             name: "checkpoint".into(),
-            message: format!("invalid session_id `{sid}` (must be alphanumeric/-/_)"),
+            message: format!("invalid session_id `{sid}` (must be alphanumeric/-/_/.)"),
         });
     }
     Ok(())
@@ -608,6 +622,14 @@ mod tests {
         assert!(validate_session_id("ok-1").is_ok());
         assert!(validate_session_id("ok_2").is_ok());
         assert!(validate_session_id("AbCdef123").is_ok());
+        // Real-world session ids contain `.` from macOS tmpdirs.
+        assert!(validate_session_id("2026-05-29T00-09-56Z-var-folders-T-.tmpAbc").is_ok());
+    }
+
+    #[test]
+    fn sanitize_for_refname_collapses_dots() {
+        assert_eq!(sanitize_for_refname("a.b.c"), "a-b-c");
+        assert_eq!(sanitize_for_refname("plain"), "plain");
     }
 
     #[test]
