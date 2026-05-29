@@ -13,6 +13,7 @@
 //! credentials.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use recursive::tools::{
 use recursive::{
     AgentEvent, AgentRuntime, AgentRuntimeBuilder, EventSink, LlmProvider, ToolRegistry,
 };
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -211,6 +213,28 @@ fn build_default_tools(root: &std::path::Path) -> ToolRegistry {
         .register(Arc::new(SearchFiles::new(root)))
 }
 
+/// Build a standalone `ToolRegistry` containing only `run_shell`,
+/// rooted at the workspace. Used by [`worker_loop`] to service the
+/// Goal-145 `UserAction::RunShell` requests **without** going through
+/// the agent runtime — bash mode bypasses the LLM entirely and must
+/// keep working even in offline mode.
+fn build_bash_registry(root: &std::path::Path) -> ToolRegistry {
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    ToolRegistry::new(transport).register(Arc::new(
+        RunShell::new(root).with_timeout(Duration::from_secs(300)),
+    ))
+}
+
+/// Resolve the workspace root the same way [`build_runtime`] does,
+/// for the bash-mode registry.
+fn resolve_workspace_root() -> PathBuf {
+    std::env::var("RECURSIVE_WORKSPACE")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Long-lived worker loop. Consumes [`UserAction`]s from the UI and
 /// drives the [`AgentRuntime`].
 async fn worker_loop(
@@ -226,6 +250,11 @@ async fn worker_loop(
             tx: event_tx.clone(),
         }));
     }
+
+    // Goal-145: a dedicated registry for `!`-prefixed bash commands.
+    // Built once and reused; works regardless of runtime readiness.
+    let bash_registry = build_bash_registry(&resolve_workspace_root());
+    let bash_seq = AtomicU64::new(0);
 
     while let Some(action) = action_rx.recv().await {
         match action {
@@ -249,6 +278,9 @@ async fn worker_loop(
                     let _ = event_tx.send(UiEvent::TurnFinished);
                 }
             },
+            UserAction::RunShell(cmd) => {
+                run_bash_command(&bash_registry, &bash_seq, cmd, &event_tx).await;
+            }
             UserAction::ConfirmPlan => {
                 if let RuntimeBuild::Ready(rt) = &mut state {
                     rt.confirm_plan();
@@ -267,6 +299,42 @@ async fn worker_loop(
             }
         }
     }
+}
+
+/// Dispatch one `!`-prefixed bash command directly via the standalone
+/// bash registry and stream the result back as `ToolCall` +
+/// `ToolResult` events. The command does **not** enter the runtime
+/// transcript and does **not** count as an LLM turn.
+async fn run_bash_command(
+    registry: &ToolRegistry,
+    seq: &AtomicU64,
+    cmd: String,
+    event_tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    let n = seq.fetch_add(1, Ordering::Relaxed);
+    let id = format!("ui-bash-{n}");
+    let arguments = json!({ "command": cmd });
+    let arguments_str = arguments.to_string();
+
+    // Surface the call up-front so the spinner verb / preview render
+    // immediately, even on slow commands.
+    let _ = event_tx.send(UiEvent::ToolCall {
+        id: id.clone(),
+        name: "run_shell".into(),
+        arguments: arguments_str,
+    });
+
+    let (output, success) = match registry.invoke("run_shell", arguments).await {
+        Ok(out) => (out, true),
+        Err(e) => (format!("ERROR: {e}"), false),
+    };
+
+    let _ = event_tx.send(UiEvent::ToolResult {
+        id,
+        name: "run_shell".into(),
+        output,
+        success,
+    });
 }
 
 #[cfg(test)]
@@ -389,5 +457,78 @@ mod tests {
             tool_calls: vec![],
         };
         assert!(map_agent_event(ev).is_none());
+    }
+
+    /// Goal-145: a `UserAction::RunShell` must dispatch the
+    /// `run_shell` tool directly and emit a paired
+    /// `ToolCall` + `ToolResult` regardless of LLM availability.
+    /// We exercise this without spawning a real `Backend` (which
+    /// would require workspace-rooting and env juggling) by
+    /// driving `run_bash_command` directly.
+    #[tokio::test]
+    async fn run_shell_action_dispatches_tool_and_emits_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = build_bash_registry(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let seq = AtomicU64::new(0);
+        run_bash_command(&registry, &seq, "echo bash-mode-works".into(), &tx).await;
+
+        // First event: ToolCall.
+        let call = rx.recv().await.expect("ToolCall event");
+        match call {
+            UiEvent::ToolCall {
+                ref name,
+                ref id,
+                ref arguments,
+            } => {
+                assert_eq!(name, "run_shell");
+                assert!(id.starts_with("ui-bash-"));
+                assert!(
+                    arguments.contains("echo bash-mode-works"),
+                    "arguments missing command: {arguments}"
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        // Second event: ToolResult.
+        let res = rx.recv().await.expect("ToolResult event");
+        match res {
+            UiEvent::ToolResult {
+                ref name,
+                ref output,
+                success,
+                ..
+            } => {
+                assert_eq!(name, "run_shell");
+                assert!(success, "shell command should succeed");
+                assert!(
+                    output.contains("bash-mode-works"),
+                    "output missing stdout: {output}"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// Bash mode survives offline mode: there is no LLM call, only a
+    /// direct `ToolRegistry::invoke`.
+    #[tokio::test]
+    async fn run_shell_action_works_when_runtime_offline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = build_bash_registry(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let seq = AtomicU64::new(42);
+        run_bash_command(&registry, &seq, "echo offline".into(), &tx).await;
+
+        // The first event should carry id ui-bash-42 (we seeded the
+        // counter to verify the sequence is honoured).
+        let call = rx.recv().await.expect("ToolCall event");
+        if let UiEvent::ToolCall { id, .. } = call {
+            assert_eq!(id, "ui-bash-42");
+        } else {
+            panic!("expected ToolCall, got {call:?}");
+        }
+        let _ = rx.recv().await; // consume the ToolResult
     }
 }

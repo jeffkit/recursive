@@ -199,11 +199,294 @@ pub fn estimate_cost(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// PromptInput (Goal 145)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Which input mode the PromptInput is currently in.
+///
+/// Goal-145: the input box is mode-aware, with auto-detection from the
+/// first character (`!`/`#`/`/`) and explicit cycling via Shift+Tab.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputMode {
+    /// Default mode — submit goes to the LLM as a user message.
+    Prompt,
+    /// `!`-prefixed; submit dispatches `run_shell` directly,
+    /// bypassing the LLM and the runtime transcript.
+    Bash,
+    /// `#`-prefixed; submit appends a `System` block locally only,
+    /// nothing is sent to the backend.
+    Note,
+    /// `/`-prefixed; submit will eventually invoke a slash-command
+    /// (Goal 146). For Step 3 we render a placeholder System block.
+    Command,
+}
+
+impl InputMode {
+    /// Indicator character for the left of the input box.
+    pub fn indicator(self) -> char {
+        match self {
+            InputMode::Prompt => '❯',
+            InputMode::Bash => '!',
+            InputMode::Note => '#',
+            InputMode::Command => '/',
+        }
+    }
+
+    /// Mode prefix used when storing entries in the history ring so
+    /// that recalling them later restores the originating mode.
+    pub fn history_prefix(self) -> &'static str {
+        match self {
+            InputMode::Prompt => "",
+            InputMode::Bash => "!",
+            InputMode::Note => "#",
+            InputMode::Command => "/",
+        }
+    }
+
+    /// Cycle Prompt → Bash → Note → Prompt. Skips `Command` because
+    /// the slash-command mode can only be reached by typing `/` —
+    /// matches fake-cc's behaviour.
+    pub fn cycle_next(self) -> InputMode {
+        match self {
+            InputMode::Prompt => InputMode::Bash,
+            InputMode::Bash => InputMode::Note,
+            InputMode::Note => InputMode::Prompt,
+            // Cycling out of Command goes to Prompt (defensive).
+            InputMode::Command => InputMode::Prompt,
+        }
+    }
+}
+
+/// Maximum number of history entries to retain in the ringbuffer.
+pub const HISTORY_CAPACITY: usize = 200;
+
+/// Mutable state of the multi-mode prompt input.
+///
+/// Owns the editing buffer, byte-cursor, in-session history, and a
+/// stash slot for the user's draft when they walk back through
+/// history. Rendering is in [`crate::ui::input`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptInputState {
+    pub mode: InputMode,
+    pub buffer: String,
+    /// Byte offset into [`buffer`]. Always at a char boundary.
+    pub cursor: usize,
+    /// Submitted entries, oldest first. Capped at
+    /// [`HISTORY_CAPACITY`].
+    pub history: Vec<String>,
+    /// Position when navigating history. `None` means "live draft".
+    pub history_idx: Option<usize>,
+    /// Stash slot: when the user starts walking history, the current
+    /// buffer is preserved here and restored when they walk past the
+    /// end.
+    pub draft: String,
+    /// Stash for the current mode while walking history. Restored
+    /// alongside `draft`.
+    pub draft_mode: InputMode,
+}
+
+impl Default for PromptInputState {
+    fn default() -> Self {
+        Self {
+            mode: InputMode::Prompt,
+            buffer: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            history_idx: None,
+            draft: String::new(),
+            draft_mode: InputMode::Prompt,
+        }
+    }
+}
+
+impl PromptInputState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a single character at the cursor. Updates `cursor` to
+    /// stay just past the inserted char.
+    pub fn insert_char(&mut self, ch: char) {
+        self.buffer.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+        self.history_idx = None;
+    }
+
+    /// Delete the character to the left of the cursor (Backspace).
+    /// Returns `true` if a char was deleted.
+    pub fn backspace(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        let prev = self.buffer[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.buffer.drain(prev..self.cursor);
+        self.cursor = prev;
+        self.history_idx = None;
+        true
+    }
+
+    /// Delete the character at the cursor (Delete key).
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let after = self.buffer[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| self.cursor + i)
+            .unwrap_or(self.buffer.len());
+        self.buffer.drain(self.cursor..after);
+        self.history_idx = None;
+    }
+
+    /// Move cursor one char left.
+    pub fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor = self.buffer[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    /// Move cursor one char right.
+    pub fn move_right(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let step = self.buffer[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        self.cursor = (self.cursor + step).min(self.buffer.len());
+    }
+
+    /// Move to start of the current visual line (delimited by `\n`).
+    pub fn move_home(&mut self) {
+        self.cursor = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+    }
+
+    /// Move to end of the current visual line.
+    pub fn move_end(&mut self) {
+        self.cursor = self.buffer[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.buffer.len());
+    }
+
+    /// True when the cursor sits on the **first** visual line.
+    pub fn cursor_on_first_line(&self) -> bool {
+        !self.buffer[..self.cursor].contains('\n')
+    }
+
+    /// True when the cursor sits on the **last** visual line.
+    pub fn cursor_on_last_line(&self) -> bool {
+        !self.buffer[self.cursor..].contains('\n')
+    }
+
+    /// Begin a history walk: stash the current buffer + mode and
+    /// load the last entry. No-op when history is empty.
+    fn enter_history_walk(&mut self) {
+        if self.history_idx.is_none() {
+            self.draft = self.buffer.clone();
+            self.draft_mode = self.mode;
+            self.history_idx = Some(self.history.len());
+        }
+    }
+
+    /// Walk history one step back (older). Returns `true` if state
+    /// changed.
+    pub fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        self.enter_history_walk();
+        let idx = self.history_idx.unwrap_or(self.history.len());
+        if idx == 0 {
+            return false;
+        }
+        let new_idx = idx - 1;
+        self.load_history(new_idx);
+        true
+    }
+
+    /// Walk history one step forward (newer). Restores the draft
+    /// when stepping past the most-recent entry. Returns `true` if
+    /// state changed.
+    pub fn history_next(&mut self) -> bool {
+        let Some(idx) = self.history_idx else {
+            return false;
+        };
+        let next = idx + 1;
+        if next >= self.history.len() {
+            // Past the newest entry: restore live draft.
+            self.buffer = std::mem::take(&mut self.draft);
+            self.cursor = self.buffer.len();
+            self.mode = self.draft_mode;
+            self.history_idx = None;
+        } else {
+            self.load_history(next);
+        }
+        true
+    }
+
+    fn load_history(&mut self, idx: usize) {
+        let raw = &self.history[idx];
+        let (mode, body) = strip_history_prefix(raw);
+        self.mode = mode;
+        self.buffer = body.to_string();
+        self.cursor = self.buffer.len();
+        self.history_idx = Some(idx);
+    }
+
+    /// Push the just-submitted entry onto the history ring (with
+    /// mode prefix) and reset transient state.
+    pub fn record_submission(&mut self, prefixed: String) {
+        if !prefixed.is_empty() {
+            self.history.push(prefixed);
+            if self.history.len() > HISTORY_CAPACITY {
+                let overflow = self.history.len() - HISTORY_CAPACITY;
+                self.history.drain(0..overflow);
+            }
+        }
+        self.buffer.clear();
+        self.cursor = 0;
+        self.mode = InputMode::Prompt;
+        self.history_idx = None;
+        self.draft.clear();
+        self.draft_mode = InputMode::Prompt;
+    }
+}
+
+fn strip_history_prefix(raw: &str) -> (InputMode, &str) {
+    if let Some(rest) = raw.strip_prefix('!') {
+        (InputMode::Bash, rest)
+    } else if let Some(rest) = raw.strip_prefix('#') {
+        (InputMode::Note, rest)
+    } else if let Some(rest) = raw.strip_prefix('/') {
+        (InputMode::Command, rest)
+    } else {
+        (InputMode::Prompt, raw)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Top-level App
 // ──────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    pub input: String,
+    /// Multi-mode input state (Goal 145).
+    pub prompt: PromptInputState,
     pub blocks: Vec<TranscriptBlock>,
     pub should_quit: bool,
     pub session_id: Option<String>,
@@ -223,7 +506,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            input: String::new(),
+            prompt: PromptInputState::new(),
             blocks: vec![TranscriptBlock::System {
                 text: "Welcome to Recursive TUI. Type a message and press Enter.".into(),
             }],
@@ -241,6 +524,22 @@ impl App {
             model_name: detect_model_name(),
             spinner_frame: 0,
         }
+    }
+
+    /// Backwards-compat shim for legacy code paths that still expect
+    /// a single `input` string. Reads the prompt buffer.
+    pub fn input(&self) -> &str {
+        &self.prompt.buffer
+    }
+
+    /// Replace the prompt buffer (used by PlanReview's `e`-edit path
+    /// and a handful of unit tests). Resets cursor to end and mode to
+    /// Prompt.
+    pub fn set_input<S: Into<String>>(&mut self, value: S) {
+        self.prompt.buffer = value.into();
+        self.prompt.cursor = self.prompt.buffer.len();
+        self.prompt.mode = InputMode::Prompt;
+        self.prompt.history_idx = None;
     }
 
     /// Process one key event. Returns an optional [`UserAction`] that
@@ -272,7 +571,7 @@ impl App {
                     return Some(UserAction::RejectPlan(String::new()));
                 }
                 KeyCode::Char('e') => {
-                    self.input = plan_text;
+                    self.set_input(plan_text);
                     self.screen = AppScreen::Chat;
                     return None;
                 }
@@ -280,61 +579,209 @@ impl App {
             }
         }
 
-        // ── Ctrl+E: toggle the most recent ToolResult / Diff block ──
+        // ── Ctrl+E: contextual ───────────────────────────────────────
+        // When the input buffer is non-empty, Ctrl+E behaves as
+        // "move to end-of-line" inside the input. When the buffer
+        // is empty, Ctrl+E falls back to Goal-144's "expand the
+        // most recent ToolResult" behaviour. This is the conflict
+        // resolution the goal calls for in §10.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-            self.toggle_last_expandable();
+            if self.prompt.buffer.is_empty() {
+                self.toggle_last_expandable();
+            } else {
+                self.prompt.move_end();
+            }
+            return None;
+        }
+
+        // ── Ctrl+A: line-start in the input box ──────────────────────
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+            self.prompt.move_home();
+            return None;
+        }
+
+        // ── Shift+Tab: cycle modes ───────────────────────────────────
+        if key.code == KeyCode::BackTab {
+            self.prompt.mode = self.prompt.mode.cycle_next();
             return None;
         }
 
         // ── Chat screen ──────────────────────────────────────────────
         match key.code {
-            KeyCode::Enter => {
-                if !self.input.is_empty() {
-                    let msg = self.input.clone();
-                    self.blocks
-                        .push(TranscriptBlock::User { text: msg.clone() });
-                    self.input.clear();
-                    self.scroll_to_bottom();
-                    self.start_turn();
-                    Some(UserAction::SendMessage(msg))
-                } else {
-                    None
-                }
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.prompt.insert_char('\n');
+                None
             }
-            KeyCode::Up if self.input.is_empty() => {
+            KeyCode::Enter => self.submit_prompt(),
+            KeyCode::Up if self.should_walk_history_up() => {
+                self.prompt.history_prev();
+                None
+            }
+            KeyCode::Down if self.should_walk_history_down() => {
+                self.prompt.history_next();
+                None
+            }
+            KeyCode::Up if self.prompt.buffer.is_empty() => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 None
             }
-            KeyCode::Down if self.input.is_empty() => {
+            KeyCode::Down if self.prompt.buffer.is_empty() => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 None
             }
-            KeyCode::PageUp if self.input.is_empty() => {
+            KeyCode::PageUp if self.prompt.buffer.is_empty() => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
                 None
             }
-            KeyCode::PageDown if self.input.is_empty() => {
+            KeyCode::PageDown if self.prompt.buffer.is_empty() => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 None
             }
-            KeyCode::Char('q') if self.input.is_empty() => {
+            KeyCode::Char('q') if self.prompt.buffer.is_empty() => {
                 self.should_quit = true;
                 None
             }
             KeyCode::Char(c) => {
-                self.input.push(c);
+                self.handle_char_input(c);
                 None
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                if self.prompt.buffer.is_empty() && self.prompt.mode != InputMode::Prompt {
+                    // Empty buffer in a non-Prompt mode: drop back to
+                    // Prompt rather than no-op. This is how the user
+                    // exits a mode they entered by accident.
+                    self.prompt.mode = InputMode::Prompt;
+                } else {
+                    self.prompt.backspace();
+                }
+                None
+            }
+            KeyCode::Delete => {
+                self.prompt.delete_forward();
+                None
+            }
+            KeyCode::Left => {
+                self.prompt.move_left();
+                None
+            }
+            KeyCode::Right => {
+                self.prompt.move_right();
+                None
+            }
+            KeyCode::Home => {
+                self.prompt.move_home();
+                None
+            }
+            KeyCode::End => {
+                self.prompt.move_end();
                 None
             }
             KeyCode::Esc => {
-                self.should_quit = true;
+                if self.prompt.buffer.is_empty() && self.prompt.mode == InputMode::Prompt {
+                    self.should_quit = true;
+                } else {
+                    // Non-empty buffer or non-Prompt mode: clear it
+                    // rather than quitting — matches fake-cc.
+                    self.prompt.buffer.clear();
+                    self.prompt.cursor = 0;
+                    self.prompt.mode = InputMode::Prompt;
+                    self.prompt.history_idx = None;
+                }
                 None
             }
             _ => None,
         }
+    }
+
+    /// History walk on Up should fire when (a) we are already
+    /// walking (history_idx is Some) — so consecutive ↑ keep
+    /// stepping back — or (b) the buffer is empty (entry point per
+    /// goal §5).
+    fn should_walk_history_up(&self) -> bool {
+        if self.prompt.history.is_empty() {
+            return false;
+        }
+        self.prompt.history_idx.is_some() || self.prompt.buffer.is_empty()
+    }
+
+    fn should_walk_history_down(&self) -> bool {
+        self.prompt.history_idx.is_some()
+    }
+
+    fn handle_char_input(&mut self, c: char) {
+        // Auto-detect mode from the first character when the buffer
+        // is empty. The prefix character itself is consumed (used as
+        // the mode marker, not stored).
+        if self.prompt.buffer.is_empty() && self.prompt.mode == InputMode::Prompt {
+            match c {
+                '!' => {
+                    self.prompt.mode = InputMode::Bash;
+                    return;
+                }
+                '#' => {
+                    self.prompt.mode = InputMode::Note;
+                    return;
+                }
+                '/' => {
+                    self.prompt.mode = InputMode::Command;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.prompt.insert_char(c);
+    }
+
+    /// Dispatch the current buffer based on the active mode. Returns
+    /// the [`UserAction`] (if any) the caller must forward to the
+    /// backend worker. Always resets the prompt to a clean state.
+    fn submit_prompt(&mut self) -> Option<UserAction> {
+        if self.prompt.buffer.is_empty() {
+            // Don't submit empty prompts. Stay where we are — but if
+            // the user is in a non-Prompt mode with nothing typed, do
+            // nothing rather than spamming a no-op System block.
+            return None;
+        }
+        let mode = self.prompt.mode;
+        let body = self.prompt.buffer.clone();
+        let prefixed = format!("{}{}", mode.history_prefix(), body);
+
+        let action = match mode {
+            InputMode::Prompt => {
+                self.blocks
+                    .push(TranscriptBlock::User { text: body.clone() });
+                self.scroll_to_bottom();
+                self.start_turn();
+                Some(UserAction::SendMessage(body))
+            }
+            InputMode::Bash => {
+                self.blocks.push(TranscriptBlock::User {
+                    text: format!("!{body}"),
+                });
+                self.scroll_to_bottom();
+                Some(UserAction::RunShell(body))
+            }
+            InputMode::Note => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("# {body}"),
+                });
+                self.scroll_to_bottom();
+                None
+            }
+            InputMode::Command => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("(commands not yet implemented: /{body})"),
+                });
+                self.scroll_to_bottom();
+                None
+            }
+        };
+
+        self.prompt.record_submission(prefixed);
+        action
     }
 
     /// Apply an event coming from the backend worker.
@@ -678,7 +1125,7 @@ mod tests {
     #[test]
     fn app_new_creates_empty_state() {
         let app = App::new();
-        assert!(app.input.is_empty());
+        assert!(app.input().is_empty());
         assert!(!app.blocks.is_empty());
         assert!(!app.should_quit);
     }
@@ -934,9 +1381,9 @@ mod tests {
     fn enter_moves_input_to_blocks() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.input = "hello".to_string();
+        app.set_input("hello");
         let action = app.handle_key(key(KeyCode::Enter));
-        assert!(app.input.is_empty());
+        assert!(app.input().is_empty());
         assert!(app
             .blocks
             .iter()
@@ -948,7 +1395,7 @@ mod tests {
     fn enter_starts_a_turn() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.input = "hi".to_string();
+        app.set_input("hi");
         let _ = app.handle_key(key(KeyCode::Enter));
         assert!(app.turn.running);
         assert_eq!(app.turn_count, 1);
@@ -958,18 +1405,28 @@ mod tests {
     fn turn_finished_stops_turn() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.input = "hi".into();
+        app.set_input("hi");
         let _ = app.handle_key(key(KeyCode::Enter));
         app.handle_ui_event(UiEvent::TurnFinished);
         assert!(!app.turn.running);
     }
 
     #[test]
-    fn esc_sets_should_quit() {
+    fn esc_sets_should_quit_when_buffer_empty() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         let _ = app.handle_key(key(KeyCode::Esc));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_clears_buffer_without_quitting() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("partial");
+        let _ = app.handle_key(key(KeyCode::Esc));
+        assert!(!app.should_quit);
+        assert!(app.input().is_empty());
     }
 
     #[test]
@@ -978,16 +1435,16 @@ mod tests {
         app.screen = AppScreen::Chat;
         let _ = app.handle_key(key(KeyCode::Char('h')));
         let _ = app.handle_key(key(KeyCode::Char('i')));
-        assert_eq!(app.input, "hi");
+        assert_eq!(app.input(), "hi");
     }
 
     #[test]
     fn backspace_removes_last_char() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.input = "hello".to_string();
+        app.set_input("hello");
         let _ = app.handle_key(key(KeyCode::Backspace));
-        assert_eq!(app.input, "hell");
+        assert_eq!(app.input(), "hell");
     }
 
     #[test]
@@ -1037,7 +1494,7 @@ mod tests {
     fn scroll_keys_ignored_when_input_not_empty() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.input = "typing".to_string();
+        app.set_input("typing");
         let _ = app.handle_key(key(KeyCode::Up));
         assert_eq!(app.scroll_offset, 0);
     }
@@ -1134,7 +1591,7 @@ mod tests {
             plan_text: "edit me".into(),
         };
         let action = app.handle_key(key(KeyCode::Char('e')));
-        assert_eq!(app.input, "edit me");
+        assert_eq!(app.input(), "edit me");
         assert!(action.is_none());
     }
 
@@ -1160,5 +1617,356 @@ mod tests {
             .collect();
         assert!(kinds.contains(&DiffLineKind::Add));
         assert!(kinds.contains(&DiffLineKind::Remove));
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PromptInput tests (Goal 145)
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prompt_input_tests {
+    use super::*;
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn fresh_app() -> App {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app
+    }
+
+    // ── prompt_input::shift_tab_cycles_modes ────────────────────────
+
+    #[test]
+    fn shift_tab_cycles_modes() {
+        let mut app = fresh_app();
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        let _ = app.handle_key(k(KeyCode::BackTab));
+        assert_eq!(app.prompt.mode, InputMode::Bash);
+        let _ = app.handle_key(k(KeyCode::BackTab));
+        assert_eq!(app.prompt.mode, InputMode::Note);
+        let _ = app.handle_key(k(KeyCode::BackTab));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+    }
+
+    // ── prompt_input::leading_<x>_enters_<mode>_when_buffer_empty ──
+
+    #[test]
+    fn leading_bang_enters_bash_mode_when_buffer_empty() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('!')));
+        assert_eq!(app.prompt.mode, InputMode::Bash);
+        // The `!` is consumed as the mode marker, not stored.
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    #[test]
+    fn leading_hash_enters_note_mode() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('#')));
+        assert_eq!(app.prompt.mode, InputMode::Note);
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    #[test]
+    fn leading_slash_enters_command_mode() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('/')));
+        assert_eq!(app.prompt.mode, InputMode::Command);
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    #[test]
+    fn leading_bang_after_existing_text_is_just_a_char() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('h')));
+        let _ = app.handle_key(k(KeyCode::Char('!')));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert_eq!(app.prompt.buffer, "h!");
+    }
+
+    // ── prompt_input::backspace_on_empty_exits_to_prompt_mode ───────
+
+    #[test]
+    fn backspace_on_empty_exits_to_prompt_mode() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('!')));
+        assert_eq!(app.prompt.mode, InputMode::Bash);
+        let _ = app.handle_key(k(KeyCode::Backspace));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+    }
+
+    // ── prompt_input::cursor_left_right_moves_within_buffer ─────────
+
+    #[test]
+    fn cursor_left_right_moves_within_buffer() {
+        let mut app = fresh_app();
+        for c in "abc".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        assert_eq!(app.prompt.cursor, 3);
+        let _ = app.handle_key(k(KeyCode::Left));
+        assert_eq!(app.prompt.cursor, 2);
+        let _ = app.handle_key(k(KeyCode::Left));
+        assert_eq!(app.prompt.cursor, 1);
+        let _ = app.handle_key(k(KeyCode::Right));
+        assert_eq!(app.prompt.cursor, 2);
+    }
+
+    #[test]
+    fn cursor_handles_multibyte_chars() {
+        let mut app = fresh_app();
+        for c in "你好".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        // Each Chinese char is 3 bytes in UTF-8.
+        assert_eq!(app.prompt.cursor, 6);
+        let _ = app.handle_key(k(KeyCode::Left));
+        assert_eq!(app.prompt.cursor, 3);
+        let _ = app.handle_key(k(KeyCode::Backspace));
+        assert_eq!(app.prompt.buffer, "好");
+    }
+
+    #[test]
+    fn insert_at_cursor_not_just_end() {
+        let mut app = fresh_app();
+        for c in "ac".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        let _ = app.handle_key(k(KeyCode::Left));
+        let _ = app.handle_key(k(KeyCode::Char('b')));
+        assert_eq!(app.prompt.buffer, "abc");
+    }
+
+    // ── prompt_input::shift_enter_inserts_newline_at_cursor ─────────
+
+    #[test]
+    fn shift_enter_inserts_newline_at_cursor() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('a')));
+        let _ = app.handle_key(shift(KeyCode::Enter));
+        let _ = app.handle_key(k(KeyCode::Char('b')));
+        assert_eq!(app.prompt.buffer, "a\nb");
+    }
+
+    #[test]
+    fn alt_enter_also_inserts_newline() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('a')));
+        let _ = app.handle_key(alt(KeyCode::Enter));
+        let _ = app.handle_key(k(KeyCode::Char('b')));
+        assert_eq!(app.prompt.buffer, "a\nb");
+    }
+
+    // ── prompt_input::history_up_down_navigates_records ─────────────
+
+    #[test]
+    fn history_up_down_navigates_records() {
+        let mut app = fresh_app();
+        // Submit two messages.
+        app.set_input("first");
+        let _ = app.handle_key(k(KeyCode::Enter));
+        app.set_input("second");
+        let _ = app.handle_key(k(KeyCode::Enter));
+        assert_eq!(app.prompt.history.len(), 2);
+
+        let _ = app.handle_key(k(KeyCode::Up));
+        assert_eq!(app.prompt.buffer, "second");
+        let _ = app.handle_key(k(KeyCode::Up));
+        assert_eq!(app.prompt.buffer, "first");
+        let _ = app.handle_key(k(KeyCode::Down));
+        assert_eq!(app.prompt.buffer, "second");
+        let _ = app.handle_key(k(KeyCode::Down));
+        // Past newest → restored draft (empty here).
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    // ── prompt_input::history_up_saves_draft_and_restores_on_overflow ─
+
+    #[test]
+    fn history_up_saves_draft_and_restores_on_overflow() {
+        let mut app = fresh_app();
+        app.set_input("alpha");
+        let _ = app.handle_key(k(KeyCode::Enter));
+        // Type some draft, then walk history. Note: history walk
+        // only triggers when buffer is empty (per goal §5).
+        let _ = app.handle_key(k(KeyCode::Up));
+        assert_eq!(app.prompt.buffer, "alpha");
+        let _ = app.handle_key(k(KeyCode::Down));
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    #[test]
+    fn history_preserves_mode_prefix() {
+        let mut app = fresh_app();
+        // Submit a bash command.
+        let _ = app.handle_key(k(KeyCode::Char('!')));
+        for c in "echo hi".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        let _ = app.handle_key(k(KeyCode::Enter));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        // Walk back: should restore Bash mode.
+        let _ = app.handle_key(k(KeyCode::Up));
+        assert_eq!(app.prompt.mode, InputMode::Bash);
+        assert_eq!(app.prompt.buffer, "echo hi");
+    }
+
+    #[test]
+    fn history_capacity_truncates_oldest() {
+        let mut app = fresh_app();
+        for i in 0..(HISTORY_CAPACITY + 5) {
+            app.set_input(format!("msg{i}"));
+            let _ = app.handle_key(k(KeyCode::Enter));
+        }
+        assert_eq!(app.prompt.history.len(), HISTORY_CAPACITY);
+        // The earliest entries should have been dropped.
+        assert!(!app.prompt.history.iter().any(|h| h == "msg0"));
+    }
+
+    // ── prompt_input::submit_in_bash_mode_dispatches_run_shell ──────
+
+    #[test]
+    fn submit_in_bash_mode_dispatches_run_shell() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('!')));
+        for c in "ls".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(k(KeyCode::Enter));
+        assert!(matches!(action, Some(UserAction::RunShell(s)) if s == "ls"));
+        assert!(app.prompt.buffer.is_empty());
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+    }
+
+    // ── prompt_input::submit_in_note_mode_appends_system_block ──────
+
+    #[test]
+    fn submit_in_note_mode_appends_system_block() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('#')));
+        for c in "remember this".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(k(KeyCode::Enter));
+        // No backend action: notes are local-only.
+        assert!(action.is_none());
+        assert!(app
+            .blocks
+            .iter()
+            .any(|b| matches!(b, TranscriptBlock::System { text }
+                if text.contains("remember this"))));
+    }
+
+    #[test]
+    fn submit_in_command_mode_appends_placeholder() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('/')));
+        for c in "help".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(k(KeyCode::Enter));
+        assert!(action.is_none());
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::System { text } if text.contains("not yet implemented"))));
+    }
+
+    // ── prompt_input::submit_clears_buffer_and_resets_mode ──────────
+
+    #[test]
+    fn submit_clears_buffer_and_resets_mode() {
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('!')));
+        let _ = app.handle_key(k(KeyCode::Char('x')));
+        let _ = app.handle_key(k(KeyCode::Enter));
+        assert!(app.prompt.buffer.is_empty());
+        assert_eq!(app.prompt.cursor, 0);
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert!(app.prompt.history_idx.is_none());
+    }
+
+    // ── home / end on multi-line ────────────────────────────────────
+
+    #[test]
+    fn home_end_target_current_line_only() {
+        let mut app = fresh_app();
+        app.set_input("ab\ncd");
+        // cursor is at end (5).
+        app.prompt.cursor = 4; // between c and d
+        let _ = app.handle_key(k(KeyCode::Home));
+        assert_eq!(app.prompt.cursor, 3); // start of "cd"
+        let _ = app.handle_key(k(KeyCode::End));
+        assert_eq!(app.prompt.cursor, 5); // end of buffer
+    }
+
+    // ── ctrl+e disambiguation (goal §10) ────────────────────────────
+
+    #[test]
+    fn ctrl_e_with_empty_buffer_toggles_tool_result() {
+        let mut app = fresh_app();
+        app.handle_ui_event(UiEvent::ToolResult {
+            id: "1".into(),
+            name: "read_file".into(),
+            output: "ok".into(),
+            success: true,
+        });
+        let _ = app.handle_key(ctrl('e'));
+        match app.blocks.last() {
+            Some(TranscriptBlock::ToolResult { expanded, .. }) => assert!(*expanded),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_e_with_text_moves_to_end_of_line() {
+        let mut app = fresh_app();
+        app.set_input("hello");
+        app.prompt.cursor = 1;
+        let _ = app.handle_key(ctrl('e'));
+        assert_eq!(app.prompt.cursor, 5);
+    }
+
+    #[test]
+    fn ctrl_a_moves_to_line_start() {
+        let mut app = fresh_app();
+        app.set_input("hello");
+        let _ = app.handle_key(ctrl('a'));
+        assert_eq!(app.prompt.cursor, 0);
+    }
+
+    // ── exhaustively cover history's empty-on-down case ─────────────
+
+    #[test]
+    fn history_down_with_no_walk_in_progress_is_noop() {
+        let mut app = fresh_app();
+        // Down on empty, no history → falls through to scroll path.
+        let _ = app.handle_key(k(KeyCode::Down));
+        assert!(app.prompt.history_idx.is_none());
+    }
+
+    // ── strip_history_prefix utility ────────────────────────────────
+
+    #[test]
+    fn strip_history_prefix_recognises_all_modes() {
+        assert_eq!(strip_history_prefix("!ls").0, InputMode::Bash);
+        assert_eq!(strip_history_prefix("#note").0, InputMode::Note);
+        assert_eq!(strip_history_prefix("/cmd").0, InputMode::Command);
+        assert_eq!(strip_history_prefix("hello").0, InputMode::Prompt);
+        assert_eq!(strip_history_prefix("!ls").1, "ls");
     }
 }

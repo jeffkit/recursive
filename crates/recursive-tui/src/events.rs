@@ -56,6 +56,16 @@ pub enum UiEvent {
 pub enum UserAction {
     /// Send a user message and run one turn.
     SendMessage(String),
+    /// Run a shell command directly via the runtime's tool registry,
+    /// bypassing the LLM. The command is dispatched to the
+    /// `run_shell` tool and its result surfaces as a
+    /// [`UiEvent::ToolCall`] + [`UiEvent::ToolResult`] pair, but is
+    /// **not** appended to the runtime transcript.
+    ///
+    /// Goal-145: this powers the `!`-prefixed bash mode of the
+    /// PromptInput so users get a quick scratch shell without
+    /// polluting the agent dialogue.
+    RunShell(String),
     /// Confirm the pending plan and resume execution.
     ConfirmPlan,
     /// Reject the pending plan with a free-form reason.

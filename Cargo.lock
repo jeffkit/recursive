@@ -1472,6 +1472,7 @@ dependencies = [
  "recursive-agent",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

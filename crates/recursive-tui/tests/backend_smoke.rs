@@ -134,3 +134,122 @@ async fn streaming_partial_tokens_are_forwarded() {
     assert!(saw_turn_finished, "expected a TurnFinished poke");
     let _ = saw_partial; // observed when the race happens to favour us
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Goal 145 — multi-mode PromptInput integration
+// ──────────────────────────────────────────────────────────────────────
+
+/// `!echo hi` Enter must surface a paired `ToolCall` + `ToolResult`
+/// containing "hi" in the output, and must NOT touch the LLM provider.
+#[tokio::test]
+async fn bash_mode_dispatches_run_shell_without_calling_llm() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let llm_observer = llm.clone();
+
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(llm)
+        .build()
+        .expect("runtime build");
+
+    let mut backend = Backend::spawn_with_runtime(runtime);
+
+    backend
+        .action_tx
+        .send(UserAction::RunShell("echo hi".into()))
+        .expect("send");
+
+    let mut saw_call = false;
+    let mut saw_result = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
+            Ok(Some(UiEvent::ToolCall { name, .. })) if name == "run_shell" => {
+                saw_call = true;
+            }
+            Ok(Some(UiEvent::ToolResult {
+                name,
+                output,
+                success,
+                ..
+            })) if name == "run_shell" => {
+                assert!(success, "run_shell should succeed");
+                assert!(
+                    output.contains("hi"),
+                    "expected output to contain 'hi': {output}"
+                );
+                saw_result = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    let _ = backend.action_tx.send(UserAction::Shutdown);
+
+    assert!(saw_call, "expected a ToolCall event for run_shell");
+    assert!(saw_result, "expected a ToolResult event for run_shell");
+    assert!(
+        llm_observer.calls().is_empty(),
+        "bash mode must not invoke the LLM provider: got {} calls",
+        llm_observer.calls().len()
+    );
+}
+
+/// `# my note` Enter must NOT reach the backend at all — the System
+/// block is appended locally inside `App::handle_key` and never
+/// becomes a `UserAction`. We assert the negative: forwarding nothing
+/// to the worker still leaves the LLM untouched.
+///
+/// (We assert the App's local-only behaviour at unit-test level in
+/// `app::prompt_input_tests::submit_in_note_mode_appends_system_block`.)
+#[tokio::test]
+async fn note_mode_does_not_reach_provider() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use recursive_tui::app::{App, AppScreen, TranscriptBlock};
+    use recursive_tui::keymap;
+
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let llm_observer = llm.clone();
+
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(llm)
+        .build()
+        .expect("runtime build");
+
+    let backend = Backend::spawn_with_runtime(runtime);
+
+    let mut app = App::new();
+    app.screen = AppScreen::Chat;
+
+    // User types '#', then 'my note', then Enter.
+    let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+    let action = keymap::dispatch(&mut app, press('#'));
+    assert!(action.is_none());
+    for c in "my note".chars() {
+        let act = keymap::dispatch(&mut app, press(c));
+        assert!(act.is_none());
+    }
+    let action = keymap::dispatch(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    // Note submit produces no UserAction.
+    assert!(
+        action.is_none(),
+        "note mode must not produce a backend action"
+    );
+
+    // Local System block was appended.
+    assert!(app.blocks.iter().any(|b| matches!(b,
+        TranscriptBlock::System { text } if text.contains("my note"))));
+
+    // Wait long enough that any (incorrect) async dispatch would
+    // arrive, then verify the LLM was never called.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        llm_observer.calls().is_empty(),
+        "note mode must not invoke the LLM provider: got {} calls",
+        llm_observer.calls().len()
+    );
+
+    let _ = backend.action_tx.send(UserAction::Shutdown);
+}

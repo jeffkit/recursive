@@ -37,7 +37,7 @@ mod tests {
     fn dispatch_routes_chat_enter_to_send_message() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.input = "ping".into();
+        app.set_input("ping");
         let action = dispatch(&mut app, k(KeyCode::Enter));
         assert!(matches!(action, Some(UserAction::SendMessage(s)) if s == "ping"));
     }
@@ -48,7 +48,7 @@ mod tests {
         app.screen = AppScreen::Chat;
         let action = dispatch(&mut app, k(KeyCode::Char('a')));
         assert!(action.is_none());
-        assert_eq!(app.input, "a");
+        assert_eq!(app.input(), "a");
     }
 
     #[test]
