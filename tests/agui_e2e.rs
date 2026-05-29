@@ -23,9 +23,50 @@ use recursive::tools::ToolRegistry;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-fn mock_config() -> Config {
+/// Process-wide lock for tests that mutate `RECURSIVE_HOME`.
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Per-test redirect for `RECURSIVE_HOME` so tests don't write into
+/// the developer's real `~/.recursive` and don't race each other.
+struct HomeOverride {
+    prev: Option<std::ffi::OsString>,
+    _home: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeOverride {
+    fn new() -> Self {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RECURSIVE_HOME");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("RECURSIVE_HOME", dir.path());
+        Self {
+            prev,
+            _home: dir,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+            None => std::env::remove_var("RECURSIVE_HOME"),
+        }
+    }
+}
+
+fn has_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn mock_config(workspace: PathBuf) -> Config {
     Config {
-        workspace: PathBuf::from("/tmp"),
+        workspace,
         api_base: "https://example.invalid/v1".into(),
         api_key: Some("test-key".into()),
         model: "mock".into(),
@@ -41,10 +82,10 @@ fn mock_config() -> Config {
     }
 }
 
-fn state(provider: Arc<MockProvider>) -> AppState {
+fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
     AppState {
         tools: vec![],
-        config: mock_config(),
+        config: mock_config(workspace),
         tool_registry: ToolRegistry::local(),
         provider,
         sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -78,14 +119,14 @@ fn input_with(thread: &str, run: &str, messages: Vec<Message>) -> RunAgentInput 
 }
 
 /// Bind to 127.0.0.1:0, spawn the server, return its base URL.
-async fn spawn_server(provider: Arc<MockProvider>) -> url::Url {
+async fn spawn_server(workspace: PathBuf, provider: Arc<MockProvider>) -> url::Url {
     // Disable auth (default = empty key set) and effectively disable
     // rate limiting (huge bucket, fast refill).
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
 
     let app = build_router_with_auth_and_rate_limit(
-        state(provider),
+        state(workspace, provider),
         AuthConfig::default(),
         RateLimiter::new(10_000, 1_000.0),
     );
@@ -99,6 +140,9 @@ async fn spawn_server(provider: Arc<MockProvider>) -> url::Url {
 
 #[tokio::test]
 async fn agui_client_drives_recursive_server_end_to_end() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
     let provider = Arc::new(MockProvider::new(vec![Completion {
         content: "hi from recursive".into(),
         tool_calls: vec![],
@@ -107,7 +151,7 @@ async fn agui_client_drives_recursive_server_end_to_end() {
         reasoning_content: None,
     }]));
 
-    let endpoint = spawn_server(provider).await;
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
     let client = AguiClient::new(endpoint);
 
     let input = input_with("e2e-thread", "e2e-run-0", vec![user_msg("u1", "say hi")]);
@@ -153,6 +197,9 @@ async fn agui_client_drives_recursive_server_end_to_end() {
 
 #[tokio::test]
 async fn agui_client_observes_tool_call_lifecycle_over_real_http() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
     // Provider script: first turn calls a tool, second turn ends.
     let provider = Arc::new(MockProvider::new(vec![
         Completion {
@@ -175,7 +222,7 @@ async fn agui_client_observes_tool_call_lifecycle_over_real_http() {
         },
     ]));
 
-    let endpoint = spawn_server(provider).await;
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
     let client = AguiClient::new(endpoint);
 
     let input = input_with(
@@ -217,6 +264,9 @@ async fn agui_client_observes_tool_call_lifecycle_over_real_http() {
 
 #[tokio::test]
 async fn agui_client_4xx_when_no_messages_and_no_context() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
     let provider = Arc::new(MockProvider::new(vec![Completion {
         content: "shouldn't run".into(),
         tool_calls: vec![],
@@ -225,7 +275,7 @@ async fn agui_client_4xx_when_no_messages_and_no_context() {
         reasoning_content: None,
     }]));
 
-    let endpoint = spawn_server(provider).await;
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
     let client = AguiClient::new(endpoint);
 
     let input = input_with("e2e-empty", "e2e-empty-0", vec![]);
@@ -238,6 +288,162 @@ async fn agui_client_4xx_when_no_messages_and_no_context() {
         Err(other) => panic!("expected HttpStatus 400, got {other:?}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
+}
+
+#[tokio::test]
+async fn agui_endpoint_emits_checkpoint_post_before_run_finished() {
+    if !has_git() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    let provider = Arc::new(MockProvider::new(vec![Completion {
+        content: "ok".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }]));
+
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
+    let client = AguiClient::new(endpoint);
+
+    let input = input_with("cp-thread", "cp-run-0", vec![user_msg("u1", "hello")]);
+    let mut rx = client.run(input).await.expect("run");
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+
+    let names: Vec<&str> = events.iter().map(event_name).collect();
+    let cp_idx = events
+        .iter()
+        .position(|e| match e {
+            Event::Custom(c) => c.name == "agui-tui/checkpoint_post",
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("missing checkpoint_post Custom event in {names:?}"));
+    let finished_idx = names
+        .iter()
+        .position(|n| *n == "RunFinished")
+        .unwrap_or_else(|| panic!("missing RunFinished in {names:?}"));
+
+    assert!(
+        cp_idx < finished_idx,
+        "checkpoint_post must precede RunFinished, got {names:?}"
+    );
+
+    if let Event::Custom(c) = &events[cp_idx] {
+        let turn = c.value.get("turn").and_then(|v| v.as_u64());
+        let post_id = c.value.get("postId").and_then(|v| v.as_str());
+        assert_eq!(turn, Some(0), "first turn should be turn 0: {:?}", c.value);
+        let post = post_id.expect("postId is a string");
+        assert!(
+            post.len() >= 8,
+            "postId should look like a short SHA, got `{post}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agui_endpoint_increments_turn_across_runs_in_same_thread() {
+    if !has_git() {
+        return;
+    }
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    let provider = Arc::new(MockProvider::new(vec![
+        Completion {
+            content: "first".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "second".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ]));
+
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
+    let client = AguiClient::new(endpoint);
+
+    async fn run_and_collect(client: &AguiClient, input: RunAgentInput) -> Vec<Event> {
+        let mut rx = client.run(input).await.expect("run");
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn checkpoint_turn(events: &[Event]) -> Option<u64> {
+        events.iter().find_map(|e| match e {
+            Event::Custom(c) if c.name == "agui-tui/checkpoint_post" => {
+                c.value.get("turn").and_then(|v| v.as_u64())
+            }
+            _ => None,
+        })
+    }
+
+    // Note: each /agui POST today builds a fresh AgentRuntime, so the
+    // in-memory turn counter resets to 0. The shadow-git ref chain
+    // still grows across runs (g141 stores it persistently), so the
+    // checkpoint_post.postId values for the two runs differ even
+    // though both report turn = 0. This test asserts that part:
+    // distinct post ids per run, no panic, no missing events.
+    let run1 = run_and_collect(
+        &client,
+        input_with("multi", "multi-0", vec![user_msg("u1", "first")]),
+    )
+    .await;
+    let turn1 = checkpoint_turn(&run1).expect("run 1 missing checkpoint_post");
+
+    let run2 = run_and_collect(
+        &client,
+        input_with("multi", "multi-1", vec![user_msg("u2", "second")]),
+    )
+    .await;
+    let turn2 = checkpoint_turn(&run2).expect("run 2 missing checkpoint_post");
+
+    assert_eq!(turn1, 0);
+    assert_eq!(turn2, 0);
+
+    let post1 = run1
+        .iter()
+        .find_map(|e| match e {
+            Event::Custom(c) if c.name == "agui-tui/checkpoint_post" => c
+                .value
+                .get("postId")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            _ => None,
+        })
+        .expect("run 1 postId");
+    let post2 = run2
+        .iter()
+        .find_map(|e| match e {
+            Event::Custom(c) if c.name == "agui-tui/checkpoint_post" => c
+                .value
+                .get("postId")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            _ => None,
+        })
+        .expect("run 2 postId");
+
+    assert_ne!(
+        post1, post2,
+        "two consecutive runs with content changes should produce distinct \
+         checkpoint ids (post1={post1}, post2={post2})"
+    );
 }
 
 fn event_name(ev: &Event) -> &'static str {

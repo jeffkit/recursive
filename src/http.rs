@@ -1649,6 +1649,28 @@ async fn agui_run(
             )
         })?;
 
+    // Wire per-turn workspace checkpoints. The AG-UI thread is the
+    // natural session boundary, so we use a sanitised version of the
+    // thread_id as the checkpoint chain id. Failures (no git on PATH,
+    // bad workspace path, etc.) only log a warning — the run still
+    // proceeds without checkpoints.
+    if let Ok(repo) = crate::ShadowRepo::open(&state.config.workspace) {
+        let session_id = sanitize_thread_id_for_session(&input.thread_id);
+        if let Ok(session_dir) = crate::user_sessions_dir(&state.config.workspace) {
+            let log_dir = session_dir.join(format!("agui-{session_id}"));
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log_path = log_dir.join("checkpoints.jsonl");
+            let touched = runtime.kernel().tools().touched_files();
+            if let Err(e) =
+                runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
+            {
+                tracing::warn!("agui: enable_checkpoints failed, continuing without: {e}");
+            }
+        }
+    } else {
+        tracing::debug!("agui: shadow git unavailable, no per-turn checkpoints");
+    }
+
     let (sink, mut event_rx) = ChannelSink::new();
     runtime.set_event_sink(Arc::new(sink));
 
@@ -1667,8 +1689,8 @@ async fn agui_run(
 
     // Converter task: forward AgentEvents → AG-UI Events. Owns the
     // AguiConverter so framing state survives across the whole run.
-    let conv_thread = thread_id.clone();
-    let conv_run = run_id.clone();
+    // It does NOT emit RunFinished — the driver task does that after
+    // it can also surface the optional checkpoint_post Custom event.
     let conv_tx = sse_tx.clone();
     let converter_handle = tokio::spawn(async move {
         let mut conv = AguiConverter::new();
@@ -1679,24 +1701,33 @@ async fn agui_run(
                 }
             }
         }
-        // The mpsc closes when the runtime drops its sink; emit
-        // RunFinished as the very last event.
-        let _ = conv_tx.send(ag::Event::RunFinished(ag::RunFinished {
-            thread_id: conv_thread,
-            run_id: conv_run,
-            result: None,
-            base: ag::BaseEvent::default(),
-        }));
     });
 
     // Drive the agent on a background task so the response stream can
-    // flush bytes to the client incrementally.
+    // flush bytes to the client incrementally. Order of events emitted
+    // by the driver after run() returns:
+    //   1. Wait for the converter to drain all AgentEvents.
+    //   2. If a checkpoint id was produced, emit
+    //      Custom("agui-tui/checkpoint_post").
+    //   3. Emit RunFinished — always last.
     let metrics = state.metrics.clone();
+    let drv_thread = thread_id.clone();
+    let drv_run = run_id.clone();
     tokio::spawn(async move {
         let outcome = runtime.run(&goal).await;
         // Replace the sink so the converter task's recv() sees a closed
         // channel and exits cleanly.
         runtime.set_event_sink(Arc::new(NullSink));
+
+        // Snapshot what we need from the outcome before metrics consume it.
+        let (checkpoint_id, finished_turn): (Option<String>, Option<usize>) = match &outcome {
+            Ok(o) => (
+                o.checkpoint_id.as_ref().map(|c| c.0.clone()),
+                runtime.turn_index().checked_sub(1),
+            ),
+            Err(_) => (None, None),
+        };
+
         match outcome {
             Ok(o) => {
                 metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
@@ -1716,9 +1747,29 @@ async fn agui_run(
                 metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Hold converter_handle so it isn't dropped; let it complete
-        // naturally via the closed channel.
+
+        // Wait for the converter task to translate the last AgentEvent
+        // before we emit anything else, so checkpoint_post and
+        // RunFinished are guaranteed to arrive last.
         let _ = converter_handle.await;
+
+        if let (Some(cp), Some(turn)) = (checkpoint_id, finished_turn) {
+            let _ = sse_tx.send(ag::Event::Custom(ag::Custom {
+                name: "agui-tui/checkpoint_post".into(),
+                value: serde_json::json!({
+                    "turn": turn,
+                    "postId": cp,
+                }),
+                base: ag::BaseEvent::default(),
+            }));
+        }
+
+        let _ = sse_tx.send(ag::Event::RunFinished(ag::RunFinished {
+            thread_id: drv_thread,
+            run_id: drv_run,
+            result: None,
+            base: ag::BaseEvent::default(),
+        }));
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx).map(|ev| {
@@ -1727,6 +1778,35 @@ async fn agui_run(
     });
 
     Ok(Sse::new(stream))
+}
+
+/// Map an arbitrary AG-UI thread id onto a checkpoint session id that
+/// satisfies `validate_session_id` in the checkpoint module
+/// (alphanumerics + `-` `_` `.`, no leading dot, no `..`, no path
+/// separators). Disallowed chars become `-`.
+fn sanitize_thread_id_for_session(thread: &str) -> String {
+    let mut out: String = thread
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Drop a leading dot so we don't produce a hidden dir.
+    while out.starts_with('.') {
+        out.replace_range(..1, "-");
+    }
+    // Collapse `..` so we don't produce ref-traversal sequences.
+    while out.contains("..") {
+        out = out.replace("..", "-.");
+    }
+    if out.is_empty() {
+        out.push_str("default");
+    }
+    out
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
