@@ -689,6 +689,22 @@ impl App {
             return None;
         }
 
+        // ── Ctrl+B / Ctrl+F: transcript paged scroll ─────────────────
+        // Terminal-independent fallbacks for PgUp/PgDn. Some macOS
+        // terminals don't deliver a true PageUp keycode (they map
+        // fn+↑ to ESC sequences crossterm doesn't surface as PageUp)
+        // and don't preserve the SHIFT modifier on Shift+↑. Plain
+        // Ctrl+letter codes are the most portable scroll keys we
+        // can offer.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+            self.scroll_offset = self.scroll_offset.saturating_add(10);
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            self.scroll_offset = self.scroll_offset.saturating_sub(10);
+            return None;
+        }
+
         // ── Shift+Tab: cycle modes ───────────────────────────────────
         if key.code == KeyCode::BackTab {
             self.prompt.mode = self.prompt.mode.cycle_next();
@@ -715,21 +731,13 @@ impl App {
                 None
             }
             KeyCode::Enter => self.submit_prompt(),
-            KeyCode::Up if self.should_walk_history_up() => {
-                self.prompt.history_prev();
-                None
-            }
-            KeyCode::Down if self.should_walk_history_down() => {
-                self.prompt.history_next();
-                None
-            }
-            // Transcript scrolling. ↑/↓ alone are reserved for history
-            // / cursor movement — once the user has any history, plain
-            // ↑/↓ would always be claimed by `should_walk_history_*`,
-            // making transcript scroll unreachable. Use Shift+↑/↓ for
-            // single-line scroll and PgUp/PgDn for paged scroll
-            // (active regardless of buffer state, since they have no
-            // editing semantics).
+            // Transcript scrolling — checked **before** history walk
+            // because Shift+↑/↓ should win even when the buffer is
+            // empty and history exists (otherwise the
+            // `should_walk_history_*` guard would silently consume
+            // the keypress for history navigation). Goal 150 follow-
+            // up: user reported scroll keys still drove the input
+            // box, root cause was this ordering.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 None
@@ -744,6 +752,14 @@ impl App {
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                None
+            }
+            KeyCode::Up if self.should_walk_history_up() => {
+                self.prompt.history_prev();
+                None
+            }
+            KeyCode::Down if self.should_walk_history_down() => {
+                self.prompt.history_next();
                 None
             }
             KeyCode::Char('q') if self.prompt.buffer.is_empty() => {
@@ -1136,7 +1152,14 @@ impl App {
                 });
             }
         }
-        self.scroll_to_bottom();
+        // Sticky-scroll: when the user is already at the bottom
+        // (scroll_offset == 0), keep them pinned as new content
+        // arrives. If they've explicitly scrolled up (Shift+↑ /
+        // PgUp set scroll_offset > 0), preserve their position so
+        // streaming tokens don't yank them back down mid-read.
+        if self.scroll_offset == 0 {
+            self.scroll_to_bottom();
+        }
     }
 
     /// If the topmost modal is a `PlanReview`, pop it. No-op
@@ -2027,11 +2050,64 @@ mod tests {
         assert_eq!(app.scroll_offset, 10);
     }
 
+    /// Goal 150 follow-up: terminal-independent scroll fallbacks.
+    /// macOS Terminal often strips SHIFT from arrow keys, so
+    /// Shift+↑/↓ reaches us as plain Up/Down (which fires history
+    /// walk). Ctrl+B / Ctrl+F bypass that — they're plain ASCII
+    /// control codes every terminal forwards verbatim.
     #[test]
-    fn new_message_resets_scroll_to_bottom() {
+    fn ctrl_b_and_ctrl_f_scroll_transcript() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.scroll_offset = 5;
+        // Buffer is empty → without our explicit handler, Ctrl+B
+        // could be claimed by some other readline-style binding.
+        let _ = app.handle_key(ctrl('b'));
+        assert_eq!(app.scroll_offset, 10);
+        let _ = app.handle_key(ctrl('b'));
+        assert_eq!(app.scroll_offset, 20);
+        let _ = app.handle_key(ctrl('f'));
+        assert_eq!(app.scroll_offset, 10);
+        let _ = app.handle_key(ctrl('f'));
+        assert_eq!(app.scroll_offset, 0);
+        // Stops at zero — no underflow.
+        let _ = app.handle_key(ctrl('f'));
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn ctrl_b_scrolls_even_when_buffer_not_empty() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("typing some text");
+        let _ = app.handle_key(ctrl('b'));
+        assert_eq!(app.scroll_offset, 10);
+    }
+
+    /// Sticky-scroll: when the user has explicitly scrolled up,
+    /// new events should NOT yank them back to the bottom.
+    /// (Without this guard, every streaming PartialToken or
+    /// ToolCall would reset scroll_offset to 0 mid-read.)
+    #[test]
+    fn new_event_keeps_scroll_offset_when_user_scrolled_up() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.scroll_offset = 5; // user pressed Ctrl+B / PgUp etc.
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "hello".into(),
+        });
+        assert_eq!(app.scroll_offset, 5);
+    }
+
+    /// Sticky-scroll counterpart: when the user is at the bottom,
+    /// new events DO scroll-to-bottom (i.e. confirm offset stays 0
+    /// rather than getting bumped by content arriving above the
+    /// visible window — chat.rs's effective_scroll handles this
+    /// already, but we keep the explicit reset for clarity).
+    #[test]
+    fn new_event_at_bottom_keeps_user_at_bottom() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.scroll_offset = 0;
         app.handle_ui_event(UiEvent::AssistantMessage {
             content: "hello".into(),
         });
