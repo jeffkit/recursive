@@ -192,6 +192,12 @@ result = client.run("list files in src/")
 print(result.finish_reason)
 ```
 
+## TUI
+
+The terminal UI is in `crates/recursive-tui/`. For an experience-level
+comparison against fake-cc (Claude Code-style baseline), see
+[docs/tui-fake-cc-gap.md](docs/tui-fake-cc-gap.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
