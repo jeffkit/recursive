@@ -26,7 +26,7 @@ use crate::agent::{FinishReason, PermissionHook, PlanningMode};
 use crate::checkpoint::{CheckpointId, ShadowRepo};
 use crate::checkpoint_log::{CheckpointLogWriter, CheckpointRecord, TouchedVia};
 use crate::error::Result;
-use crate::event::{EventSink, NullSink};
+use crate::event::{AgentEvent, EventSink, NullSink};
 use crate::hooks::HookRegistry;
 use crate::kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 use crate::llm::{LlmProvider, TokenUsage};
@@ -160,11 +160,20 @@ impl AgentRuntime {
             }
         }
 
-        // Append user message
-        self.transcript.push(Message::user(user_text.clone()));
+        // Append user message and emit MessageAppended for persistence.
+        let user_msg = Message::user(user_text.clone());
+        self.transcript.push(user_msg.clone());
+        self.event_sink
+            .emit(AgentEvent::MessageAppended { message: user_msg })
+            .await;
 
         // Cross-turn compaction: summarize old messages if transcript is too large.
         // This is the Wrapper's responsibility — the kernel only does intra-turn trim.
+        //
+        // The compaction summary message is emitted as `MessageAppended` so it lands
+        // in the on-disk jsonl as an append (the jsonl is append-only; the in-memory
+        // drain/insert does not retroactively rewrite it).
+        let mut compaction_summary: Option<Message> = None;
         if let Some(ref compactor) = self.compactor {
             let chars = Compactor::estimate_chars(&self.transcript);
             if chars >= compactor.threshold_chars
@@ -179,9 +188,15 @@ impl AgentRuntime {
                 {
                     split -= 1;
                 }
+                compaction_summary = Some(summary_msg.clone());
                 self.transcript.drain(..split);
                 self.transcript.insert(0, summary_msg);
             }
+        }
+        if let Some(summary) = compaction_summary {
+            self.event_sink
+                .emit(AgentEvent::MessageAppended { message: summary })
+                .await;
         }
 
         // Create AgentEvent channel; kernel converts StepEvent → AgentEvent internally.
@@ -228,8 +243,16 @@ impl AgentRuntime {
             self.pending_plan_calls = None;
         }
 
-        // Append new messages to transcript
-        self.transcript.extend(turn_outcome.new_messages.clone());
+        // Append new messages to transcript and emit MessageAppended for each.
+        let new_messages = turn_outcome.new_messages.clone();
+        self.transcript.extend(new_messages.iter().cloned());
+        for msg in &new_messages {
+            self.event_sink
+                .emit(AgentEvent::MessageAppended {
+                    message: msg.clone(),
+                })
+                .await;
+        }
 
         // ── Checkpoint: post-turn snapshot + record ────────────────────
         let mut outcome: RuntimeOutcome = turn_outcome.into();
