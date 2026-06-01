@@ -1,9 +1,9 @@
 //! UI-facing event and action types.
 //!
 //! [`UiEvent`] flows from the agent backend → UI thread; the UI applies
-//! them to [`crate::app::App`] state. [`UserAction`] flows the other way
+//! them to [`crate::tui::app::App`] state. [`UserAction`] flows the other way
 //! — the UI thread captures key events and the
-//! [`crate::backend::Backend`] worker dispatches them onto the
+//! [`crate::tui::backend::Backend`] worker dispatches them onto the
 //! `AgentRuntime`.
 //!
 //! Goal-144 widens this surface from goal-143's four variants to

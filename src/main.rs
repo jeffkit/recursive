@@ -351,13 +351,18 @@ async fn main() -> anyhow::Result<()> {
     // Determine effective command:
     // - Explicit subcommand → use it
     // - `-p "goal"` → one-shot run (like `claude -p`)
-    // - Nothing → interactive REPL
+    // - Nothing → TUI (if compiled in), else REPL
     let effective_cmd = match cli.cmd {
         Some(cmd) => cmd,
         None => {
             if let Some(prompt) = cli.prompt {
                 Cmd::Run { goal: vec![prompt] }
             } else {
+                #[cfg(feature = "tui")]
+                {
+                    return recursive::tui::run().await.map_err(Into::into);
+                }
+                #[cfg(not(feature = "tui"))]
                 Cmd::Repl
             }
         }

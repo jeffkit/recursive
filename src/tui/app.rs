@@ -13,7 +13,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
-use crate::events::{UiEvent, UserAction};
+use crate::tui::events::{UiEvent, UserAction};
 
 // ──────────────────────────────────────────────────────────────────────
 // Screens
@@ -23,7 +23,7 @@ use crate::events::{UiEvent, UserAction};
 ///
 /// Goal 147 removed the `PlanReview` variant — the plan-mode
 /// confirmation now lives on the modal stack as
-/// [`crate::ui::modal::Modal::PlanReview`], so we are down to two
+/// [`crate::tui::ui::modal::Modal::PlanReview`], so we are down to two
 /// screens: the brief splash and the chat surface.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppScreen {
@@ -63,7 +63,7 @@ pub struct DiffHunk {
 ///
 /// The chat screen renders a `Vec<TranscriptBlock>` in order, with one
 /// blank line between adjacent blocks. Each variant has a corresponding
-/// renderer in [`crate::ui::transcript`].
+/// renderer in [`crate::tui::ui::transcript`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptBlock {
     User {
@@ -228,7 +228,7 @@ pub fn detect_model_name() -> String {
     if let Ok(m) = std::env::var("OPENAI_MODEL") {
         return m;
     }
-    if let Ok(Some(cfg)) = recursive::config_file::FileConfig::load() {
+    if let Ok(Some(cfg)) = crate::config_file::FileConfig::load() {
         if let Some(m) = cfg.provider.and_then(|p| p.model) {
             if !m.is_empty() {
                 return m;
@@ -317,7 +317,7 @@ pub const HISTORY_CAPACITY: usize = 200;
 ///
 /// Owns the editing buffer, byte-cursor, in-session history, and a
 /// stash slot for the user's draft when they walk back through
-/// history. Rendering is in [`crate::ui::input`].
+/// history. Rendering is in [`crate::tui::ui::input`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptInputState {
     pub mode: InputMode,
@@ -579,10 +579,10 @@ pub struct App {
     pub spinner_frame: usize,
     /// Goal-146: stack of overlay modals. The topmost (last) modal
     /// receives keys; an empty stack means chat keys are active.
-    pub modals: Vec<crate::ui::modal::Modal>,
+    pub modals: Vec<crate::tui::ui::modal::Modal>,
     /// Goal-146: registry of `/`-prefixed slash commands. Lazily
     /// initialised in [`App::new`] with [`CommandRegistry::default_set`].
-    pub commands: crate::commands::CommandRegistry,
+    pub commands: crate::tui::commands::CommandRegistry,
     /// Goal-146: list of tools the runtime has registered. Populated
     /// by `main.rs` from `Backend::tool_specs()` after the worker
     /// boots, and read by the `/tools` command. Defaults to a static
@@ -624,7 +624,7 @@ impl App {
             model_name: detect_model_name(),
             spinner_frame: 0,
             modals: Vec::new(),
-            commands: crate::commands::CommandRegistry::default_set(),
+            commands: crate::tui::commands::CommandRegistry::default_set(),
             tool_catalog: default_offline_tool_catalog(),
             command_menu_selected: None,
             planning_mode_on: false,
@@ -985,7 +985,7 @@ impl App {
     /// it up in [`App::commands`], and run the handler. Returns an
     /// optional [`UserAction`] for the dispatcher.
     fn dispatch_slash_command(&mut self, body: &str) -> Option<UserAction> {
-        use crate::commands::{CommandHandler, CommandOutcome};
+        use crate::tui::commands::{CommandHandler, CommandOutcome};
 
         let mut parts = body.split_whitespace();
         let name = parts.next().unwrap_or("");
@@ -1130,7 +1130,7 @@ impl App {
                 // Goal-147: open the PlanReview modal and announce
                 // the proposal in the transcript so the user sees a
                 // historical record after the modal is dismissed.
-                self.modals.push(crate::ui::modal::Modal::PlanReview {
+                self.modals.push(crate::tui::ui::modal::Modal::PlanReview {
                     plan_text,
                     tool_calls,
                     edited_text: None,
@@ -1169,7 +1169,7 @@ impl App {
     fn close_plan_review_modal(&mut self) {
         if matches!(
             self.modals.last(),
-            Some(crate::ui::modal::Modal::PlanReview { .. })
+            Some(crate::tui::ui::modal::Modal::PlanReview { .. })
         ) {
             self.modals.pop();
         }
@@ -1212,7 +1212,7 @@ impl App {
     /// consumed; the outer `None` means "fall through to the regular
     /// chat key path".
     pub fn handle_command_menu_key(&mut self, key: KeyEvent) -> Option<Option<UserAction>> {
-        use crate::ui::command_menu;
+        use crate::tui::ui::command_menu;
         let matches_count = self.commands.search(&self.prompt.buffer).len();
 
         match key.code {
@@ -1274,7 +1274,7 @@ impl App {
     /// modal does this). The outer key dispatcher should not also
     /// process this key against the chat layer.
     pub fn handle_modal_key_action(&mut self, key: KeyEvent) -> Option<UserAction> {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
 
         // Goal-147: PlanReview modal owns y / n / e / Enter / Esc and
         // *bypasses* the generic confirm logic.
@@ -1302,7 +1302,7 @@ impl App {
     /// * Any other key is consumed but ignored, keeping plan-mode
     ///   focus.
     fn handle_plan_review_key(&mut self, key: KeyEvent) -> Option<UserAction> {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
 
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => Some(UserAction::ConfirmPlan),
@@ -1325,7 +1325,7 @@ impl App {
     /// Returns `true` if the key was consumed by the modal layer
     /// (so the caller should skip the chat key path).
     pub fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
-        use crate::ui::modal::{ConfirmAction, Modal};
+        use crate::tui::ui::modal::{ConfirmAction, Modal};
         let Some(top) = self.modals.last_mut() else {
             return false;
         };
@@ -1862,7 +1862,7 @@ mod tests {
     #[test]
     fn detect_model_name_falls_back_to_config_file() {
         let home = tempfile::tempdir().expect("tempdir");
-        let _pin = recursive::test_util::PinnedHome::new(home.path());
+        let _pin = crate::test_util::PinnedHome::new(home.path());
 
         // Snapshot env so we can clear / restore.
         let prev_recursive_model = std::env::var("RECURSIVE_MODEL").ok();
@@ -2131,7 +2131,7 @@ mod tests {
 
     #[test]
     fn plan_proposed_event_opens_plan_review_modal() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::PlanProposed {
@@ -2149,7 +2149,7 @@ mod tests {
 
     #[test]
     fn plan_confirmed_closes_modal_and_pushes_system_block() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -2167,7 +2167,7 @@ mod tests {
 
     #[test]
     fn plan_rejected_pushes_system_block_with_reason() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -2185,7 +2185,7 @@ mod tests {
 
     #[test]
     fn plan_review_y_dispatches_confirm_plan_action() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -2203,7 +2203,7 @@ mod tests {
 
     #[test]
     fn plan_review_n_dispatches_reject_plan_action() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -2221,7 +2221,7 @@ mod tests {
 
     #[test]
     fn plan_review_e_copies_text_to_input_and_closes_modal() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -2239,7 +2239,7 @@ mod tests {
     /// Goal §5: Esc closes the topmost modal rather than quitting.
     #[test]
     fn esc_first_press_closes_modal_not_quits() {
-        use crate::ui::modal::Modal;
+        use crate::tui::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::Help);
@@ -2621,7 +2621,7 @@ mod prompt_input_tests {
         let action = app.handle_key(k(KeyCode::Enter));
         assert!(action.is_none());
         // /help pushed a Help modal onto the stack.
-        assert_eq!(app.modals.last(), Some(&crate::ui::modal::Modal::Help));
+        assert_eq!(app.modals.last(), Some(&crate::tui::ui::modal::Modal::Help));
         // Buffer was reset.
         assert!(app.prompt.buffer.is_empty());
         assert_eq!(app.prompt.mode, InputMode::Prompt);

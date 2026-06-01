@@ -1,3 +1,4 @@
+#![cfg(feature = "tui")]
 //! Smoke test for the in-process agent backend.
 //!
 //! Wires a [`recursive::llm::MockProvider`] into the runtime, sends one
@@ -14,8 +15,8 @@ use std::time::Duration;
 
 use recursive::llm::{Completion, MockProvider};
 use recursive::AgentRuntimeBuilder;
-use recursive_tui::backend::Backend;
-use recursive_tui::events::{UiEvent, UserAction};
+use recursive::tui::backend::Backend;
+use recursive::tui::events::{UiEvent, UserAction};
 
 #[tokio::test]
 async fn backend_smoke_one_turn_with_mock_provider() {
@@ -207,8 +208,8 @@ async fn bash_mode_dispatches_run_shell_without_calling_llm() {
 #[tokio::test]
 async fn note_mode_does_not_reach_provider() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use recursive_tui::app::{App, AppScreen, TranscriptBlock};
-    use recursive_tui::keymap;
+    use recursive::tui::app::{App, AppScreen, TranscriptBlock};
+    use recursive::tui::keymap;
 
     let llm = Arc::new(MockProvider::new(vec![]));
     let llm_observer = llm.clone();

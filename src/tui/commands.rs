@@ -14,9 +14,9 @@
 //! `App.modals`, or set `App.should_quit`. They never block the
 //! event loop.
 
-use crate::app::App as AppState;
-use crate::events::UserAction;
-use crate::ui::modal::Modal;
+use crate::tui::app::App as AppState;
+use crate::tui::events::UserAction;
+use crate::tui::ui::modal::Modal;
 
 /// One registered slash command.
 #[derive(Clone)]
@@ -252,7 +252,7 @@ fn cmd_plan(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
 }
 
 fn cmd_journal(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
-    let entries = crate::ui::modal::load_recent_journal_entries(5);
+    let entries = crate::tui::ui::modal::load_recent_journal_entries(5);
     CommandOutcome::OpenModal(Modal::Journal {
         entries,
         selected: 0,
@@ -271,7 +271,7 @@ fn cmd_exit(app: &mut AppState, _args: &[String]) -> CommandOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, TranscriptBlock};
+    use crate::tui::app::{App, TranscriptBlock};
 
     fn invoke(app: &mut App, line: &str) -> InvokeResult {
         let mut parts = line.split_whitespace();

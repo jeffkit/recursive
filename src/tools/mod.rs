@@ -321,6 +321,64 @@ fn normalise(p: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
+/// Build the standard tool registry for an agent rooted at `workspace`.
+///
+/// This is the canonical tool set shared by all entry points (CLI, TUI, HTTP
+/// server, etc.). Entry points may register additional tools on top of this
+/// baseline (e.g. `ScheduleWakeup` for loop mode, `SubAgent` when enabled).
+///
+/// Skills are opt-in: pass a non-empty `skills` slice to register
+/// `load_skill` and `run_skill_script`. Pass `&[]` to skip.
+pub fn build_standard_tools(
+    workspace: &std::path::Path,
+    skills: &[crate::skills::Skill],
+    shell_timeout_secs: u64,
+) -> ToolRegistry {
+    let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
+    let mut registry = ToolRegistry::local()
+        .register(Arc::new(ReadFile::new(workspace)))
+        .register(Arc::new(WriteFile::new(workspace)))
+        .register(Arc::new(ApplyPatch::new(workspace)))
+        .register(Arc::new(ListDir::new(workspace)))
+        .register(Arc::new(
+            RunShell::new(workspace)
+                .with_timeout(std::time::Duration::from_secs(shell_timeout_secs)),
+        ))
+        .register(Arc::new(SearchFiles::new(workspace)))
+        .register(Arc::new(RunBackground::new(workspace, bg_manager.clone())))
+        .register(Arc::new(CheckBackground::new(bg_manager)))
+        .register(Arc::new(EstimateTokens::new(workspace)))
+        .register(Arc::new(Remember::new(workspace)))
+        .register(Arc::new(Recall::new(workspace)))
+        .register(Arc::new(Forget::new(workspace)))
+        .register(Arc::new(RememberFact::new(workspace)))
+        .register(Arc::new(RecallFact::new(workspace)))
+        .register(Arc::new(ForgetFact::new(workspace)))
+        .register(Arc::new(UpdateFact::new(workspace)))
+        .register(Arc::new(EpisodicRecall::new(workspace)))
+        .register(Arc::new(WorkingMemoryTool::new(workspace)))
+        .register(Arc::new(ScratchpadGet::new(workspace)))
+        .register(Arc::new(ScratchpadDelete::new(workspace)))
+        .register(Arc::new(ScratchpadList::new(workspace)));
+
+    #[cfg(feature = "web_fetch")]
+    {
+        registry = registry.register(Arc::new(WebFetch::new()));
+    }
+
+    if !skills.is_empty() {
+        registry = registry
+            .register(Arc::new(LoadSkill::new(skills.to_vec())))
+            .register(Arc::new(RunSkillScript::new(
+                skills.to_vec(),
+                workspace.to_path_buf(),
+                std::time::Duration::from_secs(shell_timeout_secs),
+            )));
+    }
+
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,13 +12,13 @@
 //! ```
 //!
 //! Cost is omitted when the model is not in
-//! [`crate::app::default_pricing_table`]; elapsed time is shown only
+//! [`crate::tui::app::default_pricing_table`]; elapsed time is shown only
 //! while a turn is running.
 
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::tui::app::App;
 
 /// Build the styled status-bar paragraph for the given [`App`].
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -59,7 +59,7 @@ pub fn build_line(app: &App) -> Line<'static> {
         ),
         Style::default().fg(Color::White).bg(Color::DarkGray),
     ));
-    if let Some(cost) = crate::app::estimate_cost(
+    if let Some(cost) = crate::tui::app::estimate_cost(
         &app.model_name,
         app.usage.total_input,
         app.usage.total_output,

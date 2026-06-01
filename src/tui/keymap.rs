@@ -10,8 +10,8 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::app::App;
-use crate::events::UserAction;
+use crate::tui::app::App;
+use crate::tui::events::UserAction;
 
 /// Dispatch a key event onto the app state. Returns an optional
 /// [`UserAction`] the caller must forward to the agent worker.
@@ -22,7 +22,7 @@ pub fn dispatch(app: &mut App, key: KeyEvent) -> Option<UserAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{AppScreen, TranscriptBlock};
+    use crate::tui::app::{AppScreen, TranscriptBlock};
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn k(code: KeyCode) -> KeyEvent {

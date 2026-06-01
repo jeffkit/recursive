@@ -1,8 +1,11 @@
-//! Recursive TUI entry point.
-//!
-//! Initialises the terminal, spawns the agent backend worker, and
-//! drives the event loop. All real logic lives in the library
-//! modules (`recursive_tui::*`); this binary is intentionally tiny.
+pub mod app;
+pub mod backend;
+pub mod bash;
+pub mod commands;
+pub mod events;
+pub mod keymap;
+pub mod runtime_builder;
+pub mod ui;
 
 use std::io;
 use std::time::Duration;
@@ -14,21 +17,15 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::prelude::*;
-use recursive_tui::app::{App, AppScreen};
-use recursive_tui::backend::Backend;
-use recursive_tui::events::UserAction;
-use recursive_tui::{keymap, ui};
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+use crate::tui::app::{App, AppScreen};
+use crate::tui::backend::Backend;
+use crate::tui::events::UserAction;
+
+/// Launch the TUI and run until the user quits.
+pub async fn run() -> io::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
-    // Capture mouse events so trackpad / wheel scroll drives the
-    // transcript pane instead of the terminal's (empty) alt-screen
-    // scrollback. Trade-off: text selection now requires holding
-    // Option on macOS / Shift on most other terminals to fall back
-    // to the terminal's own selection. This matches fake-cc and
-    // Claude Code TUI behaviour.
     io::stdout().execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
@@ -37,7 +34,6 @@ async fn main() -> io::Result<()> {
 
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
-        // Advance the spinner one frame per draw tick (~50ms).
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
 
         tokio::select! {
@@ -61,7 +57,9 @@ async fn main() -> io::Result<()> {
             }
         }
 
-        if app.screen == AppScreen::Splash && app.splash_start.elapsed() > Duration::from_secs(2) {
+        if app.screen == AppScreen::Splash
+            && app.splash_start.elapsed() > Duration::from_secs(2)
+        {
             app.screen = AppScreen::Chat;
         }
 
@@ -71,20 +69,12 @@ async fn main() -> io::Result<()> {
     }
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
-
     let _ = io::stdout().execute(DisableMouseCapture);
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
 }
 
-/// Map mouse / trackpad scroll events onto the transcript scroll
-/// offset. We only react to wheel events; clicks and motion are
-/// intentionally ignored (no clickable widgets yet).
-///
-/// Speed: 3 lines per wheel tick, matching what most terminals
-/// emit per physical "notch" of a real wheel and what feels right
-/// for two-finger trackpad scrolling on macOS.
 fn handle_mouse(app: &mut App, ev: MouseEvent) {
     if app.screen != AppScreen::Chat {
         return;

@@ -1,25 +1,25 @@
 //! Chat screen renderer (block-aware).
 //!
 //! Goal-144 redraws the messages panel using
-//! [`crate::ui::transcript::render_blocks`] (one block per logical
+//! [`crate::tui::ui::transcript::render_blocks`] (one block per logical
 //! transcript entry, separated by blank lines) and replaces the old
 //! single-line status bar with the rich
-//! [`crate::ui::status::render`] formatter.
+//! [`crate::tui::ui::status::render`] formatter.
 //!
 //! Goal-145 swaps the single-line input footer for the multi-mode
-//! [`crate::ui::input`] renderer (input box + dynamic height + footer
+//! [`crate::tui::ui::input`] renderer (input box + dynamic height + footer
 //! hint) and lets the terminal native cursor land on the actual edit
 //! position.
 //!
 //! While a turn is running the spinner from
-//! [`crate::ui::spinner::format_line`] is appended after the last
+//! [`crate::tui::ui::spinner::format_line`] is appended after the last
 //! block.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::App;
-use crate::ui::{command_menu, input, modal, spinner, status, transcript};
+use crate::tui::app::App;
+use crate::tui::ui::{command_menu, input, modal, spinner, status, transcript};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let input_total = input::total_height(app);

@@ -1,12 +1,12 @@
 //! Command-completion popup (Goal 146).
 //!
-//! When the prompt input is in [`crate::app::InputMode::Command`],
+//! When the prompt input is in [`crate::tui::app::InputMode::Command`],
 //! the chat renderer overlays a small popup just above the input box
 //! that lists the candidate commands matching the current buffer.
 //!
 //! The popup is purely visual — keyboard navigation lives in
-//! [`crate::app::App::handle_command_menu_key`], which is called
-//! from [`crate::app::App::handle_key`] before falling through to
+//! [`crate::tui::app::App::handle_command_menu_key`], which is called
+//! from [`crate::tui::app::App::handle_key`] before falling through to
 //! the generic chat key path.
 
 use ratatui::layout::Rect;
@@ -15,8 +15,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::app::App;
-use crate::commands::CommandSpec;
+use crate::tui::app::App;
+use crate::tui::commands::CommandSpec;
 
 /// Maximum number of candidate rows to display in the popup.
 pub const MAX_VISIBLE: usize = 8;
@@ -86,7 +86,7 @@ pub fn popup_rect(input_area: Rect, candidate_count: usize, frame_area: Rect) ->
 /// Render the popup. No-op when the input mode is not Command, the
 /// buffer is empty, or no matches are available.
 pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
-    if app.prompt.mode != crate::app::InputMode::Command {
+    if app.prompt.mode != crate::tui::app::InputMode::Command {
         return;
     }
     let matches = app.commands.search(&app.prompt.buffer);
@@ -138,7 +138,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, AppScreen, InputMode};
+    use crate::tui::app::{App, AppScreen, InputMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn tab_completes_unique_prefix() {
-        let r = crate::commands::CommandRegistry::default_set();
+        let r = crate::tui::commands::CommandRegistry::default_set();
         // "he" → only /help; should complete to "help".
         let matches = r.search("he");
         let target = tab_completion_target("he", &matches);
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn tab_extends_to_common_prefix_with_multiple_matches() {
-        let r = crate::commands::CommandRegistry::default_set();
+        let r = crate::tui::commands::CommandRegistry::default_set();
         // "co" matches /compact and /cost → common prefix "co"; not a
         // strict extension of "co", so target is None.
         let matches = r.search("co");
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn tab_with_no_matches_returns_none() {
-        let r = crate::commands::CommandRegistry::default_set();
+        let r = crate::tui::commands::CommandRegistry::default_set();
         let matches = r.search("zz");
         assert!(tab_completion_target("zz", &matches).is_none());
     }
@@ -219,7 +219,7 @@ mod tests {
         // /clear resets the transcript to a single "cleared" block.
         assert_eq!(app.blocks.len(), 1);
         match &app.blocks[0] {
-            crate::app::TranscriptBlock::System { text } => {
+            crate::tui::app::TranscriptBlock::System { text } => {
                 assert!(text.contains("cleared"), "got {text:?}")
             }
             other => panic!("expected System, got {other:?}"),

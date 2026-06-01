@@ -10,7 +10,7 @@
 
 use ratatui::Frame;
 
-use crate::app::{App, AppScreen};
+use crate::tui::app::{App, AppScreen};
 
 pub mod chat;
 pub mod command_menu;

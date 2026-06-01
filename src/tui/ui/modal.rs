@@ -1,7 +1,7 @@
 //! Modal stack (Goal 146).
 //!
 //! A modal is a transient overlay drawn on top of the chat screen.
-//! [`crate::app::App`] owns a `Vec<Modal>`; the topmost element (the
+//! [`crate::tui::app::App`] owns a `Vec<Modal>`; the topmost element (the
 //! "active" modal) is rendered centred over a half-screen window and
 //! consumes all key events until popped.
 //!
@@ -9,7 +9,7 @@
 //! read-only views over [`App`]. Side-effects (clear / exit /
 //! compact) are routed through the command system in
 //! [`crate::commands`] and the input dispatcher in
-//! [`crate::app::App`].
+//! [`crate::tui::app::App`].
 
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
@@ -17,8 +17,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{App, UsageStats};
-use crate::commands::CommandRegistry;
+use crate::tui::app::{App, UsageStats};
+use crate::tui::commands::CommandRegistry;
 
 /// A simple read-only journal entry: filename + its first 30 lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,7 +197,7 @@ fn render_help_body() -> Vec<Line<'static>> {
 }
 
 fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
-    let pricing = crate::app::default_pricing_table();
+    let pricing = crate::tui::app::default_pricing_table();
     let cost_in = pricing
         .get(model)
         .map(|(rate, _)| (usage.total_input as f64) / 1000.0 * rate);
@@ -561,7 +561,7 @@ pub fn load_journal_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::tui::app::App;
 
     #[test]
     fn esc_pops_top_modal() {

@@ -6,12 +6,12 @@
 //! (typically the synthesised "Created/Updated" stub for `write_file`)
 //! we render a single muted line summarising the path.
 //!
-//! V4A patch parsing lives in [`crate::app::parse_v4a_patch`]; this
+//! V4A patch parsing lives in [`crate::tui::app::parse_v4a_patch`]; this
 //! module is purely the visual layer.
 
 use ratatui::prelude::*;
 
-use crate::app::{DiffHunk, DiffLineKind};
+use crate::tui::app::{DiffHunk, DiffLineKind};
 
 /// Header line for a Diff block: `  📝 <path>`.
 pub fn header_line(path: &str) -> Line<'static> {
@@ -61,7 +61,7 @@ pub fn empty_stub_line(path: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::DiffLine;
+    use crate::tui::app::DiffLine;
 
     fn span_style_colors(line: &Line) -> Vec<Color> {
         line.spans.iter().filter_map(|s| s.style.fg).collect()

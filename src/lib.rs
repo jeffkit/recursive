@@ -38,6 +38,8 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod transcript;
+#[cfg(feature = "tui")]
+pub mod tui;
 
 pub use agent::PlanningMode;
 pub use agent::{FinishReason, PermissionDecision, PermissionHook};
@@ -94,7 +96,7 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
-pub use tools::{Tool, ToolRegistry, TouchedFiles};
+pub use tools::{build_standard_tools, Tool, ToolRegistry, TouchedFiles};
 pub use transcript::{TranscriptFile, TranscriptMeta};
 
 #[cfg(any(test, feature = "test-utils"))]
