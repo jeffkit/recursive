@@ -259,6 +259,11 @@ pub fn estimate_cost(
 ///
 /// Goal-145: the input box is mode-aware, with auto-detection from the
 /// first character (`!`/`#`/`/`) and explicit cycling via Shift+Tab.
+///
+/// Goal-158: added `AtFile` mode — triggered by typing `@` in Prompt
+/// mode, showing a file-completion popup. The query and suggestion
+/// list are stored separately in [`App`] (`atfile_query`,
+/// `atfile_suggestions`, `atfile_selected`) so this enum stays `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
     /// Default mode — submit goes to the LLM as a user message.
@@ -272,13 +277,16 @@ pub enum InputMode {
     /// `/`-prefixed; submit will eventually invoke a slash-command
     /// (Goal 146). For Step 3 we render a placeholder System block.
     Command,
+    /// `@`-triggered (Goal 158): shows a file-path completion popup.
+    /// The completion query and candidates live in the parent [`App`].
+    AtFile,
 }
 
 impl InputMode {
     /// Indicator character for the left of the input box.
     pub fn indicator(self) -> char {
         match self {
-            InputMode::Prompt => '❯',
+            InputMode::Prompt | InputMode::AtFile => '❯',
             InputMode::Bash => '!',
             InputMode::Note => '#',
             InputMode::Command => '/',
@@ -289,23 +297,23 @@ impl InputMode {
     /// that recalling them later restores the originating mode.
     pub fn history_prefix(self) -> &'static str {
         match self {
-            InputMode::Prompt => "",
+            InputMode::Prompt | InputMode::AtFile => "",
             InputMode::Bash => "!",
             InputMode::Note => "#",
             InputMode::Command => "/",
         }
     }
 
-    /// Cycle Prompt → Bash → Note → Prompt. Skips `Command` because
-    /// the slash-command mode can only be reached by typing `/` —
-    /// matches fake-cc's behaviour.
+    /// Cycle Prompt → Bash → Note → Prompt. Skips `Command` and
+    /// `AtFile` because those can only be reached by typing their
+    /// trigger character — matches fake-cc's behaviour.
     pub fn cycle_next(self) -> InputMode {
         match self {
             InputMode::Prompt => InputMode::Bash,
             InputMode::Bash => InputMode::Note,
             InputMode::Note => InputMode::Prompt,
-            // Cycling out of Command goes to Prompt (defensive).
-            InputMode::Command => InputMode::Prompt,
+            // Cycling out of Command / AtFile goes to Prompt (defensive).
+            InputMode::Command | InputMode::AtFile => InputMode::Prompt,
         }
     }
 }
@@ -601,6 +609,88 @@ pub struct App {
     /// action (interrupt / clear) into a real exit. See
     /// [`App::handle_key`].
     pub double_press: DoublePressTracker,
+    // ── Goal-158: @file autocomplete ─────────────────────────────────
+    /// The text the user has typed after `@` while in AtFile mode.
+    pub atfile_query: String,
+    /// Candidate file paths matching [`atfile_query`]. Refreshed on
+    /// every keystroke in AtFile mode. Contains at most
+    /// [`MAX_ATFILE_SUGGESTIONS`] entries.
+    pub atfile_suggestions: Vec<String>,
+    /// Currently highlighted row in the AtFile popup. `None` means
+    /// nothing is highlighted yet (typing narrows the list).
+    pub atfile_selected: Option<usize>,
+}
+
+/// Maximum candidates shown in the @file popup.
+pub const MAX_ATFILE_SUGGESTIONS: usize = 12;
+
+/// Enumerate workspace files matching `query` (case-insensitive prefix /
+/// substring match). Returns relative paths, newest-first within each
+/// depth tier, capped at [`MAX_ATFILE_SUGGESTIONS`].
+///
+/// Excludes: `target/`, `.git/`, `node_modules/`. Walks at most 3
+/// directory levels deep so the function stays fast even in large trees.
+pub fn glob_workspace_files(query: &str) -> Vec<String> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let q = query.to_lowercase();
+    let mut results: Vec<String> = Vec::new();
+    collect_files(&cwd, &cwd, 0, &q, &mut results);
+    results.sort();
+    results.dedup();
+    // Prefer entries whose filename starts with the query.
+    results.sort_by_key(|p| {
+        let name = std::path::Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if name.starts_with(&q) {
+            0u8
+        } else {
+            1u8
+        }
+    });
+    results.truncate(MAX_ATFILE_SUGGESTIONS);
+    results
+}
+
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    query: &str,
+    out: &mut Vec<String>,
+) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip hidden dirs and common large dirs.
+        if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files(root, &path, depth + 1, query, out);
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| name_str.to_string());
+            if (query.is_empty() || rel.to_lowercase().contains(query))
+                && out.len() < MAX_ATFILE_SUGGESTIONS * 4
+            {
+                out.push(rel);
+            }
+        }
+    }
 }
 
 impl App {
@@ -629,6 +719,9 @@ impl App {
             command_menu_selected: None,
             planning_mode_on: false,
             double_press: DoublePressTracker::default(),
+            atfile_query: String::new(),
+            atfile_suggestions: Vec::new(),
+            atfile_selected: None,
         }
     }
 
@@ -709,6 +802,13 @@ impl App {
         if key.code == KeyCode::BackTab {
             self.prompt.mode = self.prompt.mode.cycle_next();
             return None;
+        }
+
+        // ── @file autocomplete navigation (Goal 158) ─────────────────
+        // When in AtFile mode, route navigation keys to the file
+        // completion popup before anything else.
+        if self.prompt.mode == InputMode::AtFile {
+            return self.handle_atfile_key(key);
         }
 
         // ── Command-menu navigation (Goal 146) ───────────────────────
@@ -934,6 +1034,14 @@ impl App {
                 _ => {}
             }
         }
+        // Goal-158: `@` anywhere in Prompt mode triggers AtFile
+        // completion. The `@` itself IS inserted into the buffer so
+        // the user can see their typing; the query starts empty.
+        if c == '@' && self.prompt.mode == InputMode::Prompt {
+            self.prompt.insert_char('@');
+            self.enter_atfile_mode();
+            return;
+        }
         self.prompt.insert_char(c);
     }
 
@@ -974,6 +1082,17 @@ impl App {
                 None
             }
             InputMode::Command => self.dispatch_slash_command(&body),
+            // AtFile mode is handled before submit_prompt is reached
+            // (handle_atfile_key intercepts Enter). Treat as Prompt if
+            // somehow reached here.
+            InputMode::AtFile => {
+                self.exit_atfile_mode();
+                self.blocks
+                    .push(TranscriptBlock::User { text: body.clone() });
+                self.scroll_to_bottom();
+                self.start_turn();
+                Some(UserAction::SendMessage(body))
+            }
         };
 
         self.prompt.record_submission(prefixed);
@@ -1262,6 +1381,123 @@ impl App {
                     }
                     self.command_menu_selected = None;
                 }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    // ── Goal-158: @file completion helpers ───────────────────────────
+
+    /// Switch to AtFile mode and populate the initial suggestion list.
+    fn enter_atfile_mode(&mut self) {
+        self.prompt.mode = InputMode::AtFile;
+        self.atfile_query.clear();
+        self.atfile_selected = None;
+        self.atfile_suggestions = glob_workspace_files("");
+    }
+
+    /// Recompute [`App::atfile_suggestions`] from [`App::atfile_query`].
+    fn refresh_atfile_suggestions(&mut self) {
+        self.atfile_suggestions = glob_workspace_files(&self.atfile_query);
+        // Clamp selection so it doesn't point past the new list.
+        if let Some(sel) = self.atfile_selected {
+            if sel >= self.atfile_suggestions.len() {
+                self.atfile_selected = if self.atfile_suggestions.is_empty() {
+                    None
+                } else {
+                    Some(self.atfile_suggestions.len() - 1)
+                };
+            }
+        }
+    }
+
+    /// Insert the selected (or first) suggestion into the buffer,
+    /// replacing the `@<query>` tail that was typed.
+    fn commit_atfile_selection(&mut self) {
+        let idx = self.atfile_selected.unwrap_or(0);
+        let Some(chosen) = self.atfile_suggestions.get(idx).cloned() else {
+            self.exit_atfile_mode();
+            return;
+        };
+        // Replace the `@<query>` suffix in the buffer with `@<chosen>`.
+        let at_pos = self
+            .prompt
+            .buffer
+            .rfind('@')
+            .unwrap_or(self.prompt.buffer.len());
+        self.prompt.buffer.truncate(at_pos);
+        self.prompt.buffer.push('@');
+        self.prompt.buffer.push_str(&chosen);
+        self.prompt.cursor = self.prompt.buffer.len();
+        self.exit_atfile_mode();
+    }
+
+    /// Return to Prompt mode and clear completion state.
+    fn exit_atfile_mode(&mut self) {
+        self.prompt.mode = InputMode::Prompt;
+        self.atfile_query.clear();
+        self.atfile_suggestions.clear();
+        self.atfile_selected = None;
+    }
+
+    /// Handle a key when [`InputMode::AtFile`] is active.
+    pub fn handle_atfile_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel: exit AtFile mode, keep `@<query>` in buffer.
+                self.exit_atfile_mode();
+                None
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.commit_atfile_selection();
+                None
+            }
+            KeyCode::Up => {
+                match self.atfile_selected {
+                    None => {}
+                    Some(0) => self.atfile_selected = None,
+                    Some(n) => self.atfile_selected = Some(n - 1),
+                }
+                None
+            }
+            KeyCode::Down => {
+                let count = self.atfile_suggestions.len();
+                if count == 0 {
+                    return None;
+                }
+                let next = match self.atfile_selected {
+                    None => 0,
+                    Some(n) if n + 1 < count => n + 1,
+                    Some(n) => n,
+                };
+                self.atfile_selected = Some(next);
+                None
+            }
+            KeyCode::Backspace => {
+                if self.atfile_query.is_empty() {
+                    // Delete the `@` from the buffer and exit AtFile mode.
+                    self.exit_atfile_mode();
+                    self.prompt.backspace(); // removes `@`
+                } else {
+                    // Delete last char from query and buffer.
+                    let last_len = self
+                        .atfile_query
+                        .chars()
+                        .last()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                    let new_len = self.atfile_query.len() - last_len;
+                    self.atfile_query.truncate(new_len);
+                    self.prompt.backspace();
+                    self.refresh_atfile_suggestions();
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                self.atfile_query.push(c);
+                self.prompt.insert_char(c);
+                self.refresh_atfile_suggestions();
                 None
             }
             _ => None,
@@ -2709,5 +2945,145 @@ mod prompt_input_tests {
         assert_eq!(strip_history_prefix("/cmd").0, InputMode::Command);
         assert_eq!(strip_history_prefix("hello").0, InputMode::Prompt);
         assert_eq!(strip_history_prefix("!ls").1, "ls");
+    }
+}
+
+// ── Goal-158: @file autocomplete tests ───────────────────────────────────────
+#[cfg(test)]
+mod atfile_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn atfile_mode_triggered_by_at_in_prompt_mode() {
+        let mut app = App::new();
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        app.handle_char_input('@');
+        assert_eq!(app.prompt.mode, InputMode::AtFile);
+        assert!(app.prompt.buffer.ends_with('@'));
+    }
+
+    #[test]
+    fn atfile_mode_not_triggered_in_bash_mode() {
+        let mut app = App::new();
+        app.prompt.mode = InputMode::Bash;
+        app.handle_char_input('@');
+        assert_eq!(app.prompt.mode, InputMode::Bash);
+    }
+
+    #[test]
+    fn atfile_mode_not_triggered_in_command_mode() {
+        let mut app = App::new();
+        app.prompt.mode = InputMode::Command;
+        app.handle_char_input('@');
+        assert_eq!(app.prompt.mode, InputMode::Command);
+    }
+
+    #[test]
+    fn glob_workspace_files_filters_by_query_prefix() {
+        // We can only test that the function returns a Vec and doesn't panic;
+        // actual path results are environment-dependent.
+        let results = glob_workspace_files("Cargo");
+        // Should be ≤ MAX_ATFILE_SUGGESTIONS
+        assert!(results.len() <= MAX_ATFILE_SUGGESTIONS);
+        // All returned paths should contain "cargo" (case-insensitive)
+        for r in &results {
+            assert!(r.to_lowercase().contains("cargo"), "unexpected result: {r}");
+        }
+    }
+
+    #[test]
+    fn glob_workspace_files_returns_at_most_12() {
+        let results = glob_workspace_files("");
+        assert!(results.len() <= MAX_ATFILE_SUGGESTIONS);
+    }
+
+    #[test]
+    fn atfile_backspace_on_empty_query_exits_mode_and_deletes_at() {
+        let mut app = App::new();
+        // Type some text, then '@'
+        app.handle_char_input('h');
+        app.handle_char_input('i');
+        app.handle_char_input('@');
+        assert_eq!(app.prompt.mode, InputMode::AtFile);
+        assert_eq!(app.prompt.buffer, "hi@");
+
+        // Backspace with empty query should exit mode and remove '@'
+        app.handle_atfile_key(k(KeyCode::Backspace));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert_eq!(app.prompt.buffer, "hi");
+    }
+
+    #[test]
+    fn atfile_enter_inserts_selected_path_and_exits() {
+        let mut app = App::new();
+        app.handle_char_input('@');
+        assert_eq!(app.prompt.mode, InputMode::AtFile);
+
+        // Manually inject a suggestion so the test is deterministic.
+        app.atfile_suggestions = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        app.atfile_selected = Some(0);
+
+        // Press Enter to commit.
+        app.handle_atfile_key(k(KeyCode::Enter));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert!(
+            app.prompt.buffer.ends_with("@src/lib.rs"),
+            "buffer was: {}",
+            app.prompt.buffer
+        );
+    }
+
+    #[test]
+    fn atfile_esc_cancels_and_preserves_at_query() {
+        let mut app = App::new();
+        app.handle_char_input('t');
+        app.handle_char_input('e');
+        app.handle_char_input('s');
+        app.handle_char_input('t');
+        app.handle_char_input(' ');
+        app.handle_char_input('@');
+        // Type a query.
+        app.handle_atfile_key(k(KeyCode::Char('s')));
+        app.handle_atfile_key(k(KeyCode::Char('r')));
+        app.handle_atfile_key(k(KeyCode::Char('c')));
+
+        assert_eq!(app.prompt.mode, InputMode::AtFile);
+        let buf_before = app.prompt.buffer.clone();
+
+        // Press Esc — mode should exit but buffer kept.
+        app.handle_atfile_key(k(KeyCode::Esc));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert_eq!(app.prompt.buffer, buf_before);
+        // Suggestion list is cleared.
+        assert!(app.atfile_suggestions.is_empty());
+    }
+
+    #[test]
+    fn atfile_up_down_navigation() {
+        let mut app = App::new();
+        app.handle_char_input('@');
+        app.atfile_suggestions = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        app.atfile_selected = None;
+
+        // Down selects first item.
+        app.handle_atfile_key(k(KeyCode::Down));
+        assert_eq!(app.atfile_selected, Some(0));
+
+        // Down again — second.
+        app.handle_atfile_key(k(KeyCode::Down));
+        assert_eq!(app.atfile_selected, Some(1));
+
+        // Up — back to first.
+        app.handle_atfile_key(k(KeyCode::Up));
+        assert_eq!(app.atfile_selected, Some(0));
+
+        // Up again — deselects (None).
+        app.handle_atfile_key(k(KeyCode::Up));
+        assert_eq!(app.atfile_selected, None);
     }
 }

@@ -131,6 +131,51 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
     frame.render_widget(para, area);
 }
 
+/// Render the @file completion popup (Goal 158). No-op when not in
+/// AtFile mode or when the suggestion list is empty.
+pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
+    if app.prompt.mode != crate::app::InputMode::AtFile {
+        return;
+    }
+    let suggestions = &app.atfile_suggestions;
+    if suggestions.is_empty() {
+        return;
+    }
+    let visible = &suggestions[..suggestions.len().min(MAX_VISIBLE)];
+    let Some(area) = popup_rect(input_area, visible.len(), frame.area()) else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+
+    let lines: Vec<Line<'static>> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let style = if app.atfile_selected == Some(i) {
+                selected_style
+            } else {
+                normal_style
+            };
+            Line::from(Span::styled(format!(" {} ", path), style))
+        })
+        .collect();
+
+    let title = format!(" @files  query: {:?} ", app.atfile_query);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .style(Style::default().bg(Color::Black));
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, area);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
