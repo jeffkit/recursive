@@ -145,7 +145,8 @@ fn resume_continues_msg_numbering() {
     let id = w2
         .append(&Message::assistant("a2".to_string()), None, None)
         .unwrap();
-    assert_eq!(id, "msg_004");
+    // append() now returns a UUID v4 (g155), not the sequential msg id.
+    assert_eq!(id.len(), 36, "returned id should be a UUID");
     drop(w2);
 
     let entries = SessionReader::load_transcript(&dir).unwrap();
