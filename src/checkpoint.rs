@@ -544,6 +544,9 @@ const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
+    // Bypass safe.directory ownership checks so git works inside containers
+    // and CI environments where the repo owner differs from the running user.
+    cmd.arg("-c").arg("safe.directory=*");
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("HOME", std::env::temp_dir());
     cmd.env("GIT_PAGER", "cat");

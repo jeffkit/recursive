@@ -22,6 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.email "ci@recursive.local"
+          git config --global user.name "CI Bot"
+          git config --global safe.directory "*"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
