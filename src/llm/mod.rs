@@ -265,7 +265,7 @@ pub struct ToolSpec {
 }
 
 /// A structured request to invoke one of the registered tools.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

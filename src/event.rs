@@ -32,7 +32,7 @@ use crate::agent::StepEvent;
 /// This enum mirrors the variants of [`StepEvent`] but uses `String` for the
 /// finish reason to avoid coupling to the `FinishReason` type.  New variants
 /// can be added without a breaking change (see `#[non_exhaustive]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
@@ -85,6 +85,20 @@ pub enum AgentEvent {
     PlanConfirmed,
     /// Plan was rejected with a reason.
     PlanRejected { reason: String },
+
+    /// A complete message was just appended to the agent transcript.
+    ///
+    /// Fired exactly once per committed message inside the agent runtime:
+    /// once for the user message that starts a turn, once for the compaction
+    /// summary if cross-turn compaction fires, and once per message in the
+    /// kernel's output batch. Carries the full `Message` (role, content,
+    /// tool_calls, tool_call_id, reasoning_content) so persistence consumers
+    /// can write the canonical record without reassembling it from the finer
+    /// `AssistantText` / `ToolCall` / `ToolResult` streaming events.
+    ///
+    /// Not emitted for seeded transcript messages loaded from an existing
+    /// session on resume (those are already on disk).
+    MessageAppended { message: crate::message::Message },
 }
 
 // ---------------------------------------------------------------------------
@@ -566,5 +580,71 @@ mod tests {
             let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(*event, deserialized, "round-trip failed for {json}");
         }
+    }
+
+    // -- MessageAppended unit tests ----------------------------------------
+
+    /// `MessageAppended` carries all three fields (content, tool_calls,
+    /// reasoning_content) through a JSON round-trip intact.
+    #[test]
+    fn message_appended_round_trips_through_event() {
+        use crate::llm::ToolCall as LlmToolCall;
+        use crate::message::Message;
+
+        let tc = LlmToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/tmp/foo"}),
+        };
+        let msg = Message {
+            role: crate::message::Role::Assistant,
+            content: "some text".into(),
+            tool_calls: vec![tc.clone()],
+            tool_call_id: None,
+            reasoning_content: Some("my reasoning".into()),
+        };
+        let event = AgentEvent::MessageAppended {
+            message: msg.clone(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+        if let AgentEvent::MessageAppended { message: m } = deserialized {
+            assert_eq!(m.content, "some text");
+            assert_eq!(m.reasoning_content.as_deref(), Some("my reasoning"));
+            assert_eq!(m.tool_calls.len(), 1);
+            assert_eq!(m.tool_calls[0].name, "read_file");
+        } else {
+            panic!("deserialized to wrong variant");
+        }
+    }
+
+    /// `CompositeSink` fans out `MessageAppended` to both inner sinks.
+    #[tokio::test]
+    async fn composite_sink_preserves_message_appended() {
+        use crate::message::Message;
+
+        let (sink1, mut rx1) = ChannelSink::new();
+        let (sink2, mut rx2) = ChannelSink::new();
+        let composite = CompositeSink::new(vec![
+            Box::new(sink1) as Box<dyn EventSink>,
+            Box::new(sink2) as Box<dyn EventSink>,
+        ]);
+
+        let msg = Message::user("hello");
+        let event = AgentEvent::MessageAppended {
+            message: msg.clone(),
+        };
+        composite.emit(event.clone()).await;
+
+        let got1 = rx1.recv().await.unwrap();
+        let got2 = rx2.recv().await.unwrap();
+        assert_eq!(got1, event);
+        assert_eq!(got2, event);
+
+        // Other variant also propagates.
+        composite.emit(AgentEvent::PlanConfirmed).await;
+        assert_eq!(rx1.recv().await.unwrap(), AgentEvent::PlanConfirmed);
+        assert_eq!(rx2.recv().await.unwrap(), AgentEvent::PlanConfirmed);
     }
 }

@@ -36,8 +36,9 @@ use recursive::{
         SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
-    AgentEvent, AgentRuntime, AgentRuntimeBuilder, ChannelSink, EventSink, FinishReason, NullSink,
-    PlanningMode, RetryPolicy, ToolRegistry, TranscriptFile,
+    AgentEvent, AgentRuntime, AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink,
+    FinishReason, NullSink, PlanningMode, RetryPolicy, SessionPersistenceSink, ToolRegistry,
+    TranscriptFile,
 };
 
 #[derive(Parser, Debug)]
@@ -1837,7 +1838,15 @@ async fn run_resumed(
         None
     };
 
-    let (sink, event_rx) = ChannelSink::new();
+    let (channel_sink, event_rx) = ChannelSink::new();
+    let event_sink: Arc<dyn EventSink> = if let Some(ref sw) = session_writer {
+        Arc::new(CompositeSink::new(vec![
+            Box::new(channel_sink) as Box<dyn EventSink>,
+            Box::new(SessionPersistenceSink::new(sw.clone())) as Box<dyn EventSink>,
+        ]))
+    } else {
+        Arc::new(channel_sink)
+    };
     let mut runtime = build_runtime(
         &config,
         max_transcript_chars,
@@ -1847,7 +1856,7 @@ async fn run_resumed(
         mcp_config,
         hook_timing,
         Some(&goal),
-        Some(Arc::new(sink)),
+        Some(event_sink),
         Some(shutdown.clone()),
     )
     .await?;
@@ -1873,7 +1882,6 @@ async fn run_resumed(
     }
 
     let tool_specs = runtime.kernel().tools().specs();
-    let pre_transcript_len = runtime.transcript().len();
 
     if !json_mode {
         eprintln!("resuming from {seed_len} seeded message(s)");
@@ -1885,14 +1893,6 @@ async fn run_resumed(
     };
 
     let outcome = runtime.run(goal.clone()).await?;
-
-    if let Some(ref sw) = session_writer {
-        if let Ok(mut w) = sw.lock() {
-            for msg in runtime.transcript().iter().skip(pre_transcript_len) {
-                let _ = w.append(msg);
-            }
-        }
-    }
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
@@ -2105,7 +2105,15 @@ async fn run_once(
         None
     };
 
-    let (sink, event_rx) = ChannelSink::new();
+    let (channel_sink, event_rx) = ChannelSink::new();
+    let event_sink: Arc<dyn EventSink> = if let Some(ref sw) = session_writer {
+        Arc::new(CompositeSink::new(vec![
+            Box::new(channel_sink) as Box<dyn EventSink>,
+            Box::new(SessionPersistenceSink::new(sw.clone())) as Box<dyn EventSink>,
+        ]))
+    } else {
+        Arc::new(channel_sink)
+    };
     let mut runtime = build_runtime(
         &config,
         max_transcript_chars,
@@ -2115,7 +2123,7 @@ async fn run_once(
         mcp_config,
         hook_timing,
         Some(&goal),
-        Some(Arc::new(sink)),
+        Some(event_sink),
         Some(shutdown.clone()),
     )
     .await?;
@@ -2145,7 +2153,6 @@ async fn run_once(
     }
 
     let tool_specs = runtime.kernel().tools().specs();
-    let pre_transcript_len = runtime.transcript().len();
 
     let printer = if json_mode {
         tokio::spawn(stream_events_json(event_rx))
@@ -2173,15 +2180,6 @@ async fn run_once(
             break o;
         }
     };
-
-    // Write new messages to session (all messages appended since build_runtime)
-    if let Some(ref sw) = session_writer {
-        if let Ok(mut w) = sw.lock() {
-            for msg in runtime.transcript().iter().skip(pre_transcript_len) {
-                let _ = w.append(msg);
-            }
-        }
-    }
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);

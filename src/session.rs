@@ -12,7 +12,9 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::event::{AgentEvent, EventSink};
 use crate::llm::ToolSpec;
 use crate::message::Message;
 
@@ -1056,6 +1058,62 @@ fn workspace_slug(workspace: &Path) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SessionPersistenceSink
+// ---------------------------------------------------------------------------
+
+/// An [`EventSink`] that persists every [`AgentEvent::MessageAppended`] event
+/// to the session transcript file.
+///
+/// Wraps an `Arc<Mutex<SessionWriter>>` and calls
+/// [`SessionWriter::append`] on every `MessageAppended` event. All other
+/// event variants are silently ignored.
+///
+/// Persistence failures are non-fatal for the agent run but are logged at
+/// `error` level because a missing line on disk would silently break
+/// downstream orphan detection (g153).
+///
+/// # Locking notes
+///
+/// `SessionWriter` is not `Send` across `.await` points, so we keep the
+/// mutex non-`async` (`std::sync::Mutex`). The critical section inside
+/// `emit` is purely synchronous I/O — one `serde_json::to_string` +
+/// `write_all` + `flush` per message — matching every other consumer of
+/// `Arc<Mutex<SessionWriter>>` in the codebase.
+pub struct SessionPersistenceSink {
+    writer: Arc<std::sync::Mutex<SessionWriter>>,
+}
+
+impl SessionPersistenceSink {
+    /// Create a new `SessionPersistenceSink` backed by the given writer.
+    pub fn new(writer: Arc<std::sync::Mutex<SessionWriter>>) -> Self {
+        Self { writer }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for SessionPersistenceSink {
+    async fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::MessageAppended { message } = event {
+            let result = {
+                match self.writer.lock() {
+                    Ok(mut w) => w.append(&message),
+                    Err(poisoned) => {
+                        // Recover from a poisoned mutex (e.g. a panic in
+                        // another thread that held the lock). Persistence
+                        // should continue; we just log and proceed.
+                        let mut w = poisoned.into_inner();
+                        w.append(&message)
+                    }
+                }
+            };
+            if let Err(e) = result {
+                tracing::error!("session persistence: failed to append message: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1835,5 +1893,91 @@ mod tests {
 
         // A fresh acquire should succeed.
         let _lock2 = SessionLock::acquire(&session_dir).unwrap();
+    }
+
+    // -- SessionPersistenceSink tests --------------------------------------
+
+    fn make_isolated_writer() -> (
+        crate::test_util::IsolatedWorkspace,
+        Arc<std::sync::Mutex<SessionWriter>>,
+    ) {
+        let ws = crate::test_util::IsolatedWorkspace::new();
+        let writer = SessionWriter::create(ws.path(), "test goal", "gpt-4o", "openai").unwrap();
+        (ws, Arc::new(std::sync::Mutex::new(writer)))
+    }
+
+    /// `SessionPersistenceSink` appends a message with all fields to disk,
+    /// and the round-trip preserves content, tool_calls, and reasoning_content.
+    #[tokio::test]
+    async fn message_appended_round_trips_through_sink() {
+        use crate::event::{AgentEvent, EventSink};
+        use crate::llm::ToolCall as LlmToolCall;
+
+        let (_ws, sw) = make_isolated_writer();
+        let sink = SessionPersistenceSink::new(sw.clone());
+
+        let tc = LlmToolCall {
+            id: "call_1".into(),
+            name: "my_tool".into(),
+            arguments: serde_json::json!({"x": 1}),
+        };
+        let msg = Message {
+            role: Role::Assistant,
+            content: "response text".into(),
+            tool_calls: vec![tc],
+            tool_call_id: None,
+            reasoning_content: Some("I thought about it".into()),
+        };
+        sink.emit(AgentEvent::MessageAppended {
+            message: msg.clone(),
+        })
+        .await;
+
+        // Other events are silently ignored.
+        sink.emit(AgentEvent::PlanConfirmed).await;
+
+        let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
+        drop(sink);
+        drop(sw);
+
+        let transcript = SessionReader::load_messages(&session_dir).unwrap();
+        assert_eq!(transcript.len(), 1, "exactly one message written");
+        let loaded = &transcript[0];
+        assert_eq!(loaded.content, "response text");
+        assert_eq!(
+            loaded.reasoning_content.as_deref(),
+            Some("I thought about it")
+        );
+        assert_eq!(loaded.tool_calls.len(), 1);
+        assert_eq!(loaded.tool_calls[0].name, "my_tool");
+    }
+
+    /// A poisoned mutex is recovered gracefully: subsequent `emit` calls
+    /// still append and do not panic.
+    #[tokio::test]
+    async fn sink_recovers_from_poisoned_mutex() {
+        use crate::event::{AgentEvent, EventSink};
+
+        let (_ws, sw) = make_isolated_writer();
+        let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
+
+        // Poison the mutex by panicking inside a lock guard on another thread.
+        let sw2 = sw.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = sw2.lock().unwrap();
+            panic!("intentional poison");
+        });
+        assert!(sw.is_poisoned(), "mutex must be poisoned after the panic");
+
+        let sink = SessionPersistenceSink::new(sw);
+        // This must not panic even though the mutex is poisoned.
+        sink.emit(AgentEvent::MessageAppended {
+            message: Message::user("after poison"),
+        })
+        .await;
+
+        let transcript = SessionReader::load_messages(&session_dir).unwrap();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].content, "after poison");
     }
 }

@@ -83,6 +83,7 @@ pub use rewind::{
 };
 pub use runtime::{AgentRuntime, AgentRuntimeBuilder, RuntimeOutcome};
 pub use session::SessionFile;
+pub use session::SessionPersistenceSink;
 pub use session::SessionReader;
 pub use session::SessionWriter;
 pub use session::{
