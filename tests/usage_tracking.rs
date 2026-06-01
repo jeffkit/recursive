@@ -43,7 +43,7 @@ async fn assistant_messages_have_usage_in_jsonl() {
     ));
     let dir = sw.lock().unwrap().session_dir().to_path_buf();
 
-    let llm = Arc::new(MockProvider::from_completions(vec![
+    let llm = Arc::new(MockProvider::with_usage(vec![
         completion_with_usage("hi", 10, 5),
         completion_with_usage("done", 20, 8),
     ]));
@@ -94,7 +94,7 @@ async fn cost_accumulated_in_meta_after_finish() {
     ));
     let dir = sw.lock().unwrap().session_dir().to_path_buf();
 
-    let llm = Arc::new(MockProvider::from_completions(vec![
+    let llm = Arc::new(MockProvider::with_usage(vec![
         completion_with_usage("reply1", 10, 5),
         completion_with_usage("reply2", 20, 8),
     ]));

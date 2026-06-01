@@ -597,7 +597,18 @@ async fn main() -> anyhow::Result<()> {
                         println!("  {}  (old format)", s.display());
                     }
                     for s in &new_sessions {
-                        println!("  {}  (JSONL)", s.display());
+                        // g157: show last_prompt / goal from meta so the user can
+                        // identify sessions without reading the full transcript.
+                        if let Ok(meta) = recursive::session::SessionReader::load_meta(s) {
+                            let label = meta
+                                .last_prompt
+                                .as_deref()
+                                .or(Some(meta.goal.as_str()))
+                                .unwrap_or("(no prompt)");
+                            println!("  {}  [{}] {}", s.display(), meta.status, label);
+                        } else {
+                            println!("  {}  (JSONL)", s.display());
+                        }
                     }
                 }
                 Ok(())
