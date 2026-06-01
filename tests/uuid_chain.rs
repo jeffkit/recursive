@@ -8,7 +8,7 @@
 //! - `AgentRuntimeBuilder::parent_agent_last_uuid` can be set (stored).
 
 use recursive::message::Message;
-use recursive::session::{SessionReader, SessionWriter, TranscriptEntry, UsageMeta};
+use recursive::session::{SessionReader, SessionWriter};
 use recursive::test_util::IsolatedWorkspace;
 use std::sync::{Arc, Mutex};
 
