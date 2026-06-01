@@ -1,0 +1,37 @@
+{
+  "name": "@recursive/sdk",
+  "version": "0.6.0",
+  "description": "TypeScript SDK for the Recursive Agent — compatible with Claude Agent SDK patterns",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "recursive",
+    "agent",
+    "sdk",
+    "ai",
+    "coding"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

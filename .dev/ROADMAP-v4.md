@@ -95,7 +95,7 @@ Higher-level agent capabilities building on the multi-agent framework.
 |----|---------|--------|--------|
 | 18.1 | Self-reflection (agent reviews own output) | M | 🔴 |
 | 18.2 | Tool learning (agent creates new tools from experience) | L | 🔴 |
-| 18.3 | Hierarchical planning (recursive plan decomposition) | M | 🔴 |
+| 18.3 | Hierarchical planning (recursive plan decomposition) | M | ✅ Goals 165+166+167 — Plan Mode 2.0 (enter/exit_plan_mode tools, PlanApprovalGate, write-tool gate) + `todo_write` task list + HTTP confirm/reject API + Python SDK |
 | 18.4 | Consensus protocol (multiple agents vote on decisions) | M | 🔴 |
 | 18.5 | Long-running goals (checkpoint + resume across restarts) | M | 🔴 |
 
@@ -109,9 +109,9 @@ Make Recursive accessible to a wider audience.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 19.1 | TypeScript/Node.js SDK | M | 🔴 |
-| 19.2 | CLI installer (curl | sh) | S | 🔴 |
-| 19.3 | Homebrew formula | S | 🔴 |
+| 19.1 | TypeScript/Node.js SDK | M | ✅ feat/phase19-sdk-ecosystem (pending merge) |
+| 19.2 | CLI installer (curl \| sh) | S | ✅ install.sh in feat/phase19-sdk-ecosystem |
+| 19.3 | Homebrew formula | S | ✅ docs/homebrew/recursive.rb in feat/phase19-sdk-ecosystem |
 | 19.4 | VS Code extension (agent in sidebar) | L | 🔴 |
 | 19.5 | Documentation site (mdbook or similar) | M | 🔴 |
 

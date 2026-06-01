@@ -1,0 +1,228 @@
+/**
+ * Agent — main entrypoint for the Recursive Agent TypeScript SDK.
+ */
+
+import { RecursiveAgentError } from "./exceptions.js";
+import { HttpClient } from "./http.js";
+import type { RunResult, SessionInfo } from "./models.js";
+import { Run } from "./run.js";
+
+// ── AgentSession ──────────────────────────────────────────────────────────
+
+/**
+ * A persistent agent session. Supports multi-turn conversations.
+ *
+ * Do not instantiate directly — use `Agent.create()` or `Agent.resume()`.
+ *
+ * Use `await using` (TypeScript 5.2+) or a `try/finally` block for cleanup:
+ *
+ * ```ts
+ * await using agent = await Agent.create({ baseUrl: "http://localhost:3000" });
+ * const run = await agent.send("do something");
+ * await run.wait();
+ * ```
+ */
+export class AgentSession {
+  readonly sessionId: string;
+
+  private readonly _http: HttpClient;
+  private readonly _ownsSession: boolean;
+  private _closed = false;
+
+  constructor(
+    sessionId: string,
+    http: HttpClient,
+    options: { ownsSession: boolean },
+  ) {
+    this.sessionId = sessionId;
+    this._http = http;
+    this._ownsSession = options.ownsSession;
+  }
+
+  // ── send ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Send *message* to the agent and return a `Run`.
+   *
+   * The returned `Run` is lazy — the network call for streaming starts when
+   * you iterate `run.stream()` or call `run.wait()`.
+   *
+   * ```ts
+   * const run = await agent.send("Fix the failing tests");
+   * for await (const msg of run.stream()) {
+   *   if (msg.type === "assistant") {
+   *     for (const block of msg.content) {
+   *       if (block.type === "text") process.stdout.write(block.text);
+   *     }
+   *   }
+   * }
+   * const result = await run.wait();
+   * ```
+   */
+  async send(message: string): Promise<Run> {
+    if (this._closed) {
+      throw new RecursiveAgentError("Agent session is already closed.");
+    }
+    await this._http.post(`/sessions/${this.sessionId}/messages`, {
+      content: message,
+    });
+    return new Run(this.sessionId, this._http);
+  }
+
+  // ── disposal ─────────────────────────────────────────────────────────────
+
+  async close(): Promise<void> {
+    if (!this._closed) {
+      this._closed = true;
+      if (this._ownsSession) {
+        try {
+          await this._http.delete(`/sessions/${this.sessionId}`);
+        } catch {
+          // best-effort
+        }
+      }
+    }
+  }
+
+  /** `Symbol.asyncDispose` support — use with `await using`. */
+  async [Symbol.asyncDispose](): Promise<void> {
+    return this.close();
+  }
+}
+
+// ── Agent (static factory) ────────────────────────────────────────────────
+
+export interface AgentOptions {
+  /** URL of the Recursive server. Default: `RECURSIVE_BASE_URL` env or `http://127.0.0.1:3000`. */
+  baseUrl?: string;
+  /** API key. Default: `RECURSIVE_API_KEY` env var. */
+  apiKey?: string;
+  /** HTTP timeout in milliseconds. Default: 120_000. */
+  timeout?: number;
+  /** System prompt for the session. */
+  systemPrompt?: string;
+}
+
+export interface PromptOptions extends AgentOptions {
+  maxSteps?: number;
+}
+
+/**
+ * Static factory for creating, resuming, and running agent sessions.
+ *
+ * ### Three invocation patterns
+ *
+ * **One-shot** (`Agent.prompt`):
+ * ```ts
+ * const result = await Agent.prompt("List all TODO comments", {
+ *   baseUrl: "http://localhost:3000",
+ * });
+ * console.log(result.status, result.finishReason);
+ * ```
+ *
+ * **Multi-turn** (`Agent.create` + `agent.send`):
+ * ```ts
+ * await using agent = await Agent.create({ baseUrl: "http://localhost:3000" });
+ * const run = await agent.send("Fix the test failures");
+ * await run.wait();
+ * const run2 = await agent.send("Update the docs");
+ * await run2.wait();
+ * ```
+ *
+ * **Resume** (`Agent.resume`):
+ * ```ts
+ * await using agent = await Agent.resume(sessionId, { baseUrl: "http://localhost:3000" });
+ * const run = await agent.send("Continue where we left off");
+ * await run.wait();
+ * ```
+ */
+export class Agent {
+  /** Create a new agent session. */
+  static async create(options: AgentOptions = {}): Promise<AgentSession> {
+    const http = makeClient(options);
+    const body: Record<string, unknown> = {};
+    if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
+
+    const data = (await http.post("/sessions", body)) as { id: string };
+    return new AgentSession(data.id, http, { ownsSession: true });
+  }
+
+  /**
+   * Resume an existing session by ID.
+   *
+   * The session is **not deleted** on close (since we don't own it).
+   */
+  static async resume(
+    sessionId: string,
+    options: AgentOptions = {},
+  ): Promise<AgentSession> {
+    const http = makeClient(options);
+    await http.get(`/sessions/${sessionId}`); // verify exists
+    return new AgentSession(sessionId, http, { ownsSession: false });
+  }
+
+  /**
+   * One-shot convenience: create a session, send *message*, wait, clean up.
+   *
+   * Returns a `RunResult`.
+   */
+  static async prompt(
+    message: string,
+    options: PromptOptions = {},
+  ): Promise<RunResult> {
+    const http = makeClient(options);
+    const body: Record<string, unknown> = { goal: message };
+    if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
+    if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
+
+    const data = (await http.post("/run", body)) as Record<string, unknown>;
+    const usageRaw = data["usage"] as Record<string, unknown> | undefined;
+
+    return {
+      id: String(data["session_id"] ?? ""),
+      status: (data["status"] as RunResult["status"]) ?? "finished",
+      finishReason: data["finish_reason"] as string | undefined,
+      error: data["error"] as string | undefined,
+      usage: usageRaw
+        ? {
+            inputTokens: Number(usageRaw["input_tokens"] ?? 0),
+            outputTokens: Number(usageRaw["output_tokens"] ?? 0),
+          }
+        : undefined,
+      ok: data["status"] === "finished",
+    };
+  }
+
+  /** List active sessions. */
+  static async listSessions(options: AgentOptions = {}): Promise<SessionInfo[]> {
+    const http = makeClient(options);
+    const data = (await http.get("/sessions")) as Array<Record<string, unknown>>;
+    return data.map((s) => ({
+      id: String(s["id"]),
+      createdAt: String(s["created_at"] ?? ""),
+      messageCount: Number(s["message_count"] ?? 0),
+      lastPrompt: s["last_prompt"] as string | undefined,
+      firstPrompt: s["first_prompt"] as string | undefined,
+      goal: s["goal"] as string | undefined,
+    }));
+  }
+
+  /** Delete a session by ID. */
+  static async deleteSession(
+    sessionId: string,
+    options: AgentOptions = {},
+  ): Promise<void> {
+    const http = makeClient(options);
+    await http.delete(`/sessions/${sessionId}`);
+  }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────
+
+function makeClient(options: AgentOptions): HttpClient {
+  const baseUrl =
+    options.baseUrl ??
+    process.env["RECURSIVE_BASE_URL"] ??
+    "http://127.0.0.1:3000";
+  return new HttpClient({ baseUrl, apiKey: options.apiKey });
+}

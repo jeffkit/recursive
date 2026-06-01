@@ -1,0 +1,258 @@
+"""Agent — main entrypoint for the Recursive Agent SDK."""
+
+from __future__ import annotations
+
+import os
+from typing import List, Optional
+
+from ._http import _HttpClient
+from .exceptions import RecursiveAgentError
+from .models import RunResult, SessionInfo
+from .run import Run
+
+
+class _AgentSession:
+    """
+    A persistent agent session.  Supports multi-turn conversations.
+
+    Do not instantiate directly — use :meth:`Agent.create` or
+    :meth:`Agent.resume`.
+
+    Use as a context manager::
+
+        with Agent.create(base_url="http://localhost:3000") as agent:
+            run = agent.send("do something")
+            run.wait()
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        http: _HttpClient,
+        *,
+        _owns_session: bool = True,
+    ) -> None:
+        self._session_id = session_id
+        self._http = http
+        self._owns_session = _owns_session
+        self._closed = False
+
+    @property
+    def session_id(self) -> str:
+        """The underlying Recursive session ID."""
+        return self._session_id
+
+    # ── send ─────────────────────────────────────────────────────────────────
+
+    def send(self, message: str) -> Run:
+        """
+        Send *message* to the agent and return a :class:`~recursive_sdk.run.Run`.
+
+        The run is lazy — the network call happens when you iterate
+        ``run.messages()`` or call ``run.wait()``.
+
+        Example::
+
+            run = agent.send("refactor src/main.rs")
+            for msg in run.messages():
+                if msg.type == "assistant":
+                    print(msg.text(), end="")
+            result = run.wait()
+        """
+        if self._closed:
+            raise RecursiveAgentError("Agent session is already closed.")
+
+        self._http.post(
+            f"/sessions/{self._session_id}/messages",
+            {"content": message},
+        )
+        return Run(session_id=self._session_id, http=self._http)
+
+    # ── context manager ───────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Close the session (deletes it on the server if we own it)."""
+        if not self._closed:
+            self._closed = True
+            if self._owns_session:
+                try:
+                    self._http.delete(f"/sessions/{self._session_id}")
+                except RecursiveAgentError:
+                    pass  # best-effort
+            self._http.close()
+
+    def __enter__(self) -> "_AgentSession":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+class Agent:
+    """
+    Static factory for creating, resuming, and running agent sessions.
+
+    Three invocation patterns:
+
+    **One-shot** — send a prompt, get a result, done::
+
+        result = Agent.prompt("list all TODO comments", base_url="http://localhost:3000")
+        print(result.status, result.finish_reason)
+
+    **Multi-turn** — create a session and send multiple messages::
+
+        with Agent.create(base_url="http://localhost:3000") as agent:
+            run = agent.send("Fix the test failures")
+            result = run.wait()
+
+            run2 = agent.send("Now update the docs")
+            result2 = run2.wait()
+
+    **Resume** — continue an existing session::
+
+        with Agent.resume(session_id, base_url="http://localhost:3000") as agent:
+            run = agent.send("Continue where we left off")
+            run.wait()
+    """
+
+    # ── factory methods ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def create(
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        timeout: float = 120.0,
+    ) -> _AgentSession:
+        """
+        Create a new agent session.
+
+        Parameters
+        ----------
+        base_url:
+            URL of the Recursive server (default: ``RECURSIVE_BASE_URL`` env var
+            or ``http://127.0.0.1:3000``).
+        api_key:
+            Optional API key (default: ``RECURSIVE_API_KEY`` env var).
+        system_prompt:
+            Optional system prompt for the session.
+        timeout:
+            HTTP / SSE timeout in seconds.
+        """
+        http = _make_client(base_url, api_key, timeout)
+        body: dict = {}
+        if system_prompt:
+            body["system_prompt"] = system_prompt
+        resp = http.post("/sessions", body)
+        session_id = resp.json()["id"]
+        return _AgentSession(session_id, http, _owns_session=True)
+
+    @staticmethod
+    def resume(
+        session_id: str,
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: float = 120.0,
+    ) -> _AgentSession:
+        """
+        Resume an existing session by ID.
+
+        The session is **not deleted** when the context manager exits (since we
+        don't own it).
+        """
+        http = _make_client(base_url, api_key, timeout)
+        # Verify the session exists
+        http.get(f"/sessions/{session_id}")
+        return _AgentSession(session_id, http, _owns_session=False)
+
+    @staticmethod
+    def prompt(
+        message: str,
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        max_steps: Optional[int] = None,
+        timeout: float = 120.0,
+    ) -> RunResult:
+        """
+        One-shot convenience: create a session, send *message*, wait, delete.
+
+        Returns a :class:`~recursive_sdk.models.RunResult`.
+
+        Example::
+
+            result = Agent.prompt("list files", base_url="http://localhost:3000")
+            if result.status == "finished":
+                print("done!")
+        """
+        http = _make_client(base_url, api_key, timeout)
+        body: dict = {"goal": message}
+        if system_prompt:
+            body["system_prompt"] = system_prompt
+        if max_steps is not None:
+            body["max_steps"] = max_steps
+
+        resp = http.post("/run", body)
+        data = resp.json()
+        usage = None
+        if "usage" in data:
+            from .run import _parse_usage
+
+            usage = _parse_usage(data["usage"])
+        return RunResult(
+            id=data.get("session_id", ""),
+            status=data.get("status", "finished"),
+            finish_reason=data.get("finish_reason"),
+            usage=usage,
+            error=data.get("error"),
+        )
+
+    # ── session management helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def list_sessions(
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> List[SessionInfo]:
+        """Return a list of active sessions."""
+        http = _make_client(base_url, api_key)
+        resp = http.get("/sessions")
+        return [
+            SessionInfo(
+                id=s["id"],
+                created_at=s.get("created_at", ""),
+                message_count=s.get("message_count", 0),
+                last_prompt=s.get("last_prompt"),
+                first_prompt=s.get("first_prompt"),
+                goal=s.get("goal"),
+            )
+            for s in resp.json()
+        ]
+
+    @staticmethod
+    def delete_session(
+        session_id: str,
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        """Delete a session by ID."""
+        http = _make_client(base_url, api_key)
+        http.delete(f"/sessions/{session_id}")
+        http.close()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────
+
+
+def _make_client(
+    base_url: Optional[str],
+    api_key: Optional[str],
+    timeout: float = 120.0,
+) -> _HttpClient:
+    url = base_url or os.environ.get("RECURSIVE_BASE_URL", "http://127.0.0.1:3000")
+    return _HttpClient(base_url=url, api_key=api_key, timeout=timeout)
