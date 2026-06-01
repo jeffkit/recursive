@@ -35,7 +35,7 @@ impl Backend {
     }
 
     pub fn spawn_with_runtime(rt: AgentRuntime) -> Self {
-        Self::spawn_with_state(RuntimeBuild::Ready(rt))
+        Self::spawn_with_state(RuntimeBuild::Ready(Box::new(rt)))
     }
 
     fn spawn_with_state(state: RuntimeBuild) -> Self {
