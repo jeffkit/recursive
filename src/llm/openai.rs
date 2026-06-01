@@ -4,6 +4,14 @@
 //! GLM (Zhipu), DeepSeek, Moonshot, Together, Ollama and many others speak.
 //! The only thing that varies is the base URL + model name + API key, which
 //! is all driven by config.
+//!
+//! ## Deferred tool loading
+//!
+//! This provider does **not** support `Tool::should_defer()` or
+//! `complete_with_search`. The default `complete_with_search` impl
+//! in `LlmProvider` concatenates the eager and deferred lists and
+//! calls `complete()` — so the model sees every tool on every turn.
+//! To enable deferred loading, use the Anthropic provider.
 
 use async_trait::async_trait;
 use reqwest::Client;

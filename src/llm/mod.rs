@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 pub mod anthropic;
 pub mod mock;
 pub mod openai;
+pub mod search;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicProvider;
@@ -297,6 +298,31 @@ pub struct Completion {
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion>;
+
+    /// Variant that accepts a partition between eager and deferred
+    /// tools. Providers that support native deferred loading (e.g.
+    /// Anthropic via `defer_loading: true` + `tool_reference` content
+    /// blocks) override this. The default implementation concatenates
+    /// the two lists (dropping the hints) and calls `complete()` —
+    /// i.e., it ignores the partition and behaves identically to the
+    /// legacy interface.
+    ///
+    /// Providers that do NOT support deferred tool loading (e.g. the
+    /// OpenAI provider) inherit this default and see every tool as
+    /// eager. No code change is required in those providers.
+    async fn complete_with_search(
+        &self,
+        messages: &[Message],
+        eager_tools: &[(ToolSpec, Option<String>)],
+        deferred_tools: &[(ToolSpec, Option<String>)],
+    ) -> Result<Completion> {
+        let all: Vec<ToolSpec> = eager_tools
+            .iter()
+            .chain(deferred_tools.iter())
+            .map(|(spec, _)| spec.clone())
+            .collect();
+        self.complete(messages, &all).await
+    }
 
     /// Request a JSON response conforming to a caller-supplied schema.
     /// Default impl returns an error. Providers that support structured
