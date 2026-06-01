@@ -146,8 +146,8 @@ impl Tool for LoadSkill {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {

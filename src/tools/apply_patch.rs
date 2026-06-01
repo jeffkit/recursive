@@ -197,6 +197,10 @@ impl Tool for ApplyPatch {
         }
     }
 
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::Mutating
+    }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let input = args["patch"].as_str().ok_or_else(|| Error::BadToolArgs {
             name: "apply_patch".into(),

@@ -78,7 +78,7 @@ ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-width = { version = "0.2", optional = true }
 syntect = { version = "5", default-features = false, features = ["default-fancy"], optional = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }

@@ -279,8 +279,8 @@ impl Tool for Remember {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::Mutating
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {
@@ -324,6 +324,10 @@ impl Recall {
 
 #[async_trait]
 impl Tool for Recall {
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "recall".into(),

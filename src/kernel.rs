@@ -107,6 +107,11 @@ pub struct TurnOutcome {
     /// Buffered tool calls from a proposed plan (when plan is pending).
     pub plan_buffer: Option<Vec<crate::llm::ToolCall>>,
 
+    /// Goal-153: audit records for tool results, keyed by `tool_call_id`.
+    /// Passed through from `RunInnerOutcome` so the persistence layer
+    /// can emit `MessageAppendedWithAudit` for tool messages.
+    pub tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta>,
+
     /// Whether the plan was confirmed by the user.
     pub plan_confirmed: bool,
 }
@@ -297,6 +302,7 @@ impl AgentKernel {
             side_effects: Vec::new(),
             plan_buffer: inner.plan_buffer,
             plan_confirmed: inner.plan_confirmed,
+            tool_audits: inner.tool_audits,
         })
     }
 }
@@ -504,6 +510,7 @@ mod tests {
             side_effects: vec![],
             plan_buffer: None,
             plan_confirmed: false,
+            tool_audits: std::collections::HashMap::new(),
         };
         assert!(outcome.new_messages.is_empty());
         assert!(outcome.final_text.is_none());

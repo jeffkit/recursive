@@ -195,6 +195,12 @@ enum Cmd {
         /// exclusive with the positional argument.
         #[arg(long, conflicts_with = "session")]
         from_file: Option<PathBuf>,
+        /// How to handle orphan tool calls detected on resume
+        /// (tool_calls in the last assistant message with no matching
+        /// tool result). Choices: ask (default on TTY), skip, redo, abort.
+        /// On non-TTY (CI) the default is abort.
+        #[arg(long, value_name = "POLICY")]
+        orphans: Option<String>,
     },
     /// List or inspect saved sessions.
     Sessions {
@@ -569,11 +575,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Resume { session, from_file } => {
+        Cmd::Resume {
+            session,
+            from_file,
+            orphans,
+        } => {
             cmd_resume(
                 config,
                 session,
                 from_file,
+                orphans,
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,
@@ -1707,10 +1718,59 @@ fn legacy_resume_error(path: &Path) -> String {
 /// validates the tool-registry hash, then opens the existing
 /// session for appending and resumes the run.
 #[allow(clippy::too_many_arguments)]
+/// Goal-153: how to handle orphan tool calls on resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanPolicy {
+    Ask,
+    Skip,
+    Redo,
+    Abort,
+}
+
+impl OrphanPolicy {
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "skip" => Ok(Self::Skip),
+            "redo" => Ok(Self::Redo),
+            "abort" => Ok(Self::Abort),
+            other => anyhow::bail!(
+                "unknown --orphans value {other:?}; valid values: ask, skip, redo, abort"
+            ),
+        }
+    }
+}
+
+fn prompt_orphan_choice(tool_name: &str) -> std::io::Result<OrphanPolicy> {
+    use std::io::{stdin, stdout, Write};
+    let mut attempts = 0;
+    loop {
+        print!("  [r]edo  [s]kip  [a]bort  — choice for '{tool_name}': ");
+        stdout().flush()?;
+        let mut line = String::new();
+        stdin().read_line(&mut line)?;
+        match line.trim().to_ascii_lowercase().as_str() {
+            "r" | "redo" => return Ok(OrphanPolicy::Redo),
+            "s" | "skip" => return Ok(OrphanPolicy::Skip),
+            "a" | "abort" | "" => return Ok(OrphanPolicy::Abort),
+            _ => {
+                attempts += 1;
+                if attempts >= 3 {
+                    eprintln!("Too many invalid inputs — aborting.");
+                    return Ok(OrphanPolicy::Abort);
+                }
+                eprintln!("  Please enter r, s, or a.");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_resume(
     config: Config,
     session: Option<String>,
     from_file: Option<PathBuf>,
+    orphans_flag: Option<String>,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
@@ -1749,6 +1809,93 @@ async fn cmd_resume(
             );
         }
     }
+
+    // ── Goal-153: orphan detection ───────────────────────────────────────────
+    let orphans = recursive::session::SessionReader::scan_orphan_tool_calls(&session_dir, &tools)?;
+    if !orphans.is_empty() {
+        use std::io::IsTerminal;
+
+        // Determine policy: explicit flag > TTY heuristic
+        let default_policy = if orphans_flag.is_none() {
+            if std::io::stdin().is_terminal() {
+                OrphanPolicy::Ask
+            } else {
+                OrphanPolicy::Abort
+            }
+        } else {
+            OrphanPolicy::Ask // overwritten below
+        };
+        let policy = match &orphans_flag {
+            Some(s) => OrphanPolicy::from_str(s)?,
+            None => default_policy,
+        };
+
+        eprintln!(
+            "\nSession {} has {} incomplete tool call(s):\n",
+            session_dir.display(),
+            orphans.len()
+        );
+        for orphan in &orphans {
+            eprintln!(
+                "  step {}  (call-id {})\n    side-effect class: {:?}",
+                orphan.tool_name, orphan.tool_call_id, orphan.side_effect_at_call
+            );
+        }
+        eprintln!();
+
+        match policy {
+            OrphanPolicy::Abort => {
+                anyhow::bail!(
+                    "session has {} orphan tool call(s); refusing to resume. \
+                     Use --orphans=skip, --orphans=redo, or --orphans=ask to proceed.",
+                    orphans.len()
+                );
+            }
+            OrphanPolicy::Skip => {
+                eprintln!("orphans: treating as completed (--orphans=skip)");
+                // Nothing to do — orphan tool calls will be treated as if
+                // they completed with an empty result. The resume seeded
+                // transcript already lacks their tool result messages, which
+                // the model will handle as "no result yet" context.
+            }
+            OrphanPolicy::Redo => {
+                // Warn if any are External — unsafe to auto-redo.
+                for o in &orphans {
+                    if o.side_effect_at_call == recursive::tools::ToolSideEffect::External {
+                        eprintln!(
+                            "WARNING: '{}' is classified External — re-executing \
+                             may duplicate side-effects (network calls, etc.).",
+                            o.tool_name
+                        );
+                    }
+                }
+                eprintln!("orphans: will re-execute on resume (--orphans=redo)");
+            }
+            OrphanPolicy::Ask => {
+                for orphan in &orphans {
+                    eprintln!(
+                        "Orphan: {}  (side-effect: {:?})",
+                        orphan.tool_name, orphan.side_effect_at_call
+                    );
+                    let choice = prompt_orphan_choice(&orphan.tool_name)?;
+                    match choice {
+                        OrphanPolicy::Abort => {
+                            anyhow::bail!("resume aborted by user.");
+                        }
+                        OrphanPolicy::Skip => {
+                            eprintln!("  → skipping '{}'", orphan.tool_name);
+                        }
+                        OrphanPolicy::Redo => {
+                            eprintln!("  → will redo '{}'", orphan.tool_name);
+                        }
+                        OrphanPolicy::Ask => unreachable!(),
+                    }
+                }
+            }
+        }
+        eprintln!();
+    }
+    // ── end orphan detection ─────────────────────────────────────────────────
 
     // Open the existing session for appending. Acquires the
     // SessionLock — refusing if another resume is already in flight.

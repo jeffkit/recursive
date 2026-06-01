@@ -380,6 +380,29 @@ pub struct TranscriptEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMeta>,
     pub timestamp: String,
+    /// Goal-153: per-call audit metadata. Only populated on `role: "tool"`
+    /// messages (i.e. tool results). Never sent to providers — see
+    /// [`entry_to_message`] which drops this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<crate::tools::AuditMeta>,
+}
+
+/// Goal-153: describes a tool call that was dispatched but never completed
+/// (no matching `tool` result message in the transcript).
+#[derive(Debug, Clone)]
+pub struct OrphanToolCall {
+    /// `id` field of the assistant `TranscriptEntry` that issued the call.
+    pub assistant_msg_id: String,
+    /// The `id` of the tool call itself (matches `tool_call_id` on the
+    /// expected — but missing — tool result message).
+    pub tool_call_id: String,
+    /// The name of the tool that was called.
+    pub tool_name: String,
+    /// BLAKE3 of canonical JSON of the call arguments (for drift detection).
+    pub args_hash: String,
+    /// Side-effect class, determined from the current registry (valid because
+    /// `recursive resume` validates the registry hash before calling this).
+    pub side_effect_at_call: crate::tools::ToolSideEffect,
 }
 
 /// A compact-boundary system entry written to the JSONL when cross-turn
@@ -617,6 +640,18 @@ impl SessionWriter {
         parent_uuid_override: Option<&str>,
         usage: Option<&UsageMeta>,
     ) -> std::io::Result<String> {
+        self.append_with_audit(msg, None, parent_uuid_override, usage)
+    }
+
+    /// Append a message with optional audit metadata (Goal 153).
+    /// `audit` should only be `Some` for `Role::Tool` messages.
+    pub fn append_with_audit(
+        &mut self,
+        msg: &Message,
+        audit: Option<crate::tools::AuditMeta>,
+        parent_uuid_override: Option<&str>,
+        usage: Option<&UsageMeta>,
+    ) -> std::io::Result<String> {
         self.message_count += 1;
         let msg_id = format!("msg_{:03}", self.message_count);
 
@@ -674,6 +709,7 @@ impl SessionWriter {
             reasoning_content: msg.reasoning_content.clone(),
             usage: usage.cloned(),
             timestamp: chrono_lite_now(),
+            audit,
         };
 
         let line = serde_json::to_string(&entry)
@@ -1214,6 +1250,71 @@ impl SessionReader {
         Ok(entries.into_iter().map(entry_to_message).collect())
     }
 
+    /// Goal-153: scan the transcript for "orphan" tool calls — tool_calls
+    /// in the last assistant message that have no matching `tool` reply.
+    ///
+    /// Returns an empty vec when the transcript is clean (no orphans).
+    /// Returns the orphan descriptions when one or more tool calls from the
+    /// last assistant message have no corresponding `tool` result message.
+    ///
+    /// This is the **detection** side of durable execution; the *handling*
+    /// (skip / redo / abort) is done by the caller (`cmd_resume`).
+    ///
+    /// `registry` is used to determine `side_effect_at_call` for orphans
+    /// (their `AuditMeta` was never written because the process died before
+    /// the call returned).
+    pub fn scan_orphan_tool_calls(
+        session_dir: &Path,
+        registry: &crate::tools::ToolRegistry,
+    ) -> std::io::Result<Vec<OrphanToolCall>> {
+        let entries = Self::load_transcript(session_dir)?;
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Find the last assistant message with tool_calls.
+        let last_assistant = entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, e)| e.role == "assistant" && !e.tool_calls.is_empty());
+
+        let Some((asst_idx, asst_entry)) = last_assistant else {
+            return Ok(Vec::new());
+        };
+
+        // Collect the set of tool_call_ids that have a matching tool result
+        // at any position *after* the assistant message.
+        let answered: std::collections::HashSet<String> = entries[asst_idx + 1..]
+            .iter()
+            .filter(|e| e.role == "tool")
+            .filter_map(|e| e.tool_call_id.clone())
+            .collect();
+
+        let mut orphans = Vec::new();
+        for tc in &asst_entry.tool_calls {
+            if !answered.contains(&tc.id) {
+                let side_effect = registry
+                    .get(&tc.name)
+                    .map(|t| t.side_effect_class())
+                    .unwrap_or(crate::tools::ToolSideEffect::External);
+                let args_hash = {
+                    let canonical = tc.arguments.to_string();
+                    let hash = blake3::hash(canonical.as_bytes());
+                    hash.to_hex().to_string()
+                };
+                orphans.push(OrphanToolCall {
+                    assistant_msg_id: asst_entry.id.clone(),
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    args_hash,
+                    side_effect_at_call: side_effect,
+                });
+            }
+        }
+        Ok(orphans)
+    }
+
     /// Load the session metadata from a session directory.
     pub fn load_meta(session_dir: &Path) -> std::io::Result<SessionMeta> {
         let meta_path = session_dir.join(".meta.json");
@@ -1402,18 +1503,40 @@ impl EventSink for SessionPersistenceSink {
             } => {
                 let result = {
                     match self.writer.lock() {
-                        Ok(mut w) => w.append(&message, parent_uuid.as_deref(), usage.as_ref()),
+                        Ok(mut w) => w.append_with_audit(
+                            &message,
+                            None,
+                            parent_uuid.as_deref(),
+                            usage.as_ref(),
+                        ),
                         Err(poisoned) => {
-                            // Recover from a poisoned mutex (e.g. a panic in
-                            // another thread that held the lock). Persistence
-                            // should continue; we just log and proceed.
                             let mut w = poisoned.into_inner();
-                            w.append(&message, parent_uuid.as_deref(), usage.as_ref())
+                            w.append_with_audit(
+                                &message,
+                                None,
+                                parent_uuid.as_deref(),
+                                usage.as_ref(),
+                            )
                         }
                     }
                 };
                 if let Err(e) = result {
                     tracing::error!("session persistence: failed to append message: {e}");
+                }
+            }
+            AgentEvent::MessageAppendedWithAudit { message, audit } => {
+                // Goal 153: tool result with audit metadata.
+                let result = {
+                    match self.writer.lock() {
+                        Ok(mut w) => w.append_with_audit(&message, Some(audit), None, None),
+                        Err(poisoned) => {
+                            let mut w = poisoned.into_inner();
+                            w.append_with_audit(&message, None, None, None)
+                        }
+                    }
+                };
+                if let Err(e) = result {
+                    tracing::error!("session persistence: failed to append audited message: {e}");
                 }
             }
             AgentEvent::CompactionBoundary {

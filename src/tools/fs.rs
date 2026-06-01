@@ -47,8 +47,8 @@ impl Tool for ReadFile {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
@@ -177,6 +177,10 @@ impl Tool for WriteFile {
         }
     }
 
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::Mutating
+    }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let path = args["path"].as_str().ok_or_else(|| Error::BadToolArgs {
             name: "write_file".into(),
@@ -233,8 +237,8 @@ impl Tool for ListDir {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
     }
     async fn execute(&self, args: Value) -> Result<String> {
         let path = args["path"].as_str().unwrap_or(".");

@@ -4,6 +4,7 @@
 //! you implement `Tool` and register it; no other file changes.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,128 @@ use tracing::Instrument;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::permissions::{Permission, PermissionsConfig};
+
+// ── Goal-153: Tool side-effect classification + audit types ─────────────────
+
+/// Classification of a tool's observable side-effects on state outside
+/// the agent process. Used by orphan detection and safe-replay (g154) to
+/// decide how aggressively to retry or skip an unfinished tool call.
+///
+/// Distinct from `crate::kernel::SideEffect`, which tracks background-job
+/// scheduling; the two live in different modules and never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSideEffect {
+    /// No mutation of any state outside the agent process. Safe to
+    /// replay at any time. Examples: `read_file`, `search_files`,
+    /// `recall`, `checkpoint_list`.
+    ReadOnly,
+    /// Modifies local state (filesystem, scratchpad) in an idempotent-
+    /// friendly way. Examples: `write_file`, `apply_patch`, `remember`.
+    Mutating,
+    /// Reaches out to the external world or triggers opaque side-effects.
+    /// Cannot determine safe re-execution from local state alone.
+    /// Examples: `run_shell`, `sub_agent`, `schedule_wakeup`.
+    /// **Default** for any tool that does not override `side_effect_class`.
+    External,
+}
+
+/// Maximum length of the persisted error message in [`ExitStatus::Err`].
+/// Anything longer is UTF-8 char-boundary clipped and `truncated` is set.
+pub const AUDIT_ERR_MAX_BYTES: usize = 512;
+
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// Outcome of a single tool invocation, as recorded in [`AuditMeta`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExitStatus {
+    Ok,
+    Err {
+        /// Error message, truncated to [`AUDIT_ERR_MAX_BYTES`] bytes.
+        message: String,
+        /// `true` when the original message was longer and was clipped.
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+}
+
+/// Per-call audit record returned by [`ToolRegistry::invoke_with_audit`]
+/// and stored in [`crate::session::TranscriptEntry::audit`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditMeta {
+    /// UUIDv7 step identifier (time-ordered).
+    pub step_id: String,
+    /// Unix epoch millis at registry dispatch start.
+    pub started_at: i64,
+    /// Unix epoch millis when the tool returned.
+    pub finished_at: i64,
+    /// BLAKE3 of the canonical JSON of `arguments` (hex-encoded).
+    /// Detects argument drift across resumes.
+    pub args_hash: String,
+    /// Side-effect class as reported by the tool at call time.
+    pub side_effect: ToolSideEffect,
+    /// Whether the tool returned `Ok` or `Err`.
+    pub exit_status: ExitStatus,
+}
+
+impl AuditMeta {
+    /// Synthetic `AuditMeta` for an unknown-tool dispatch (tool not in
+    /// registry). Called when `invoke_with_audit` cannot find the tool.
+    pub fn synthetic_unknown_tool(name: &str) -> Self {
+        let now = unix_millis();
+        Self {
+            step_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+            started_at: now,
+            finished_at: now,
+            args_hash: String::new(),
+            side_effect: ToolSideEffect::External,
+            exit_status: ExitStatus::Err {
+                message: format!("unknown tool: {name}"),
+                truncated: false,
+            },
+        }
+    }
+}
+
+/// Return value of [`ToolRegistry::invoke_with_audit`]: the tool result
+/// and its accompanying audit record.
+pub struct ToolDispatch {
+    pub result: Result<String>,
+    pub audit: AuditMeta,
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Clip `s` to at most `AUDIT_ERR_MAX_BYTES` bytes on a UTF-8 char boundary.
+/// Returns `(clipped, was_truncated)`.
+fn truncate_for_audit(s: &str) -> (String, bool) {
+    if s.len() <= AUDIT_ERR_MAX_BYTES {
+        return (s.to_string(), false);
+    }
+    let mut end = AUDIT_ERR_MAX_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
+/// BLAKE3 hash of the canonical JSON encoding of `v`.
+fn blake3_canonical_json(v: &Value) -> String {
+    let canonical = v.to_string();
+    let hash = blake3::hash(canonical.as_bytes());
+    hash.to_hex().to_string()
+}
 
 pub mod apply_patch;
 pub mod checkpoint;
@@ -66,10 +189,21 @@ impl Default for ToolRegistry {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, arguments: Value) -> Result<String>;
-    /// Whether this tool only reads data without side effects.
-    /// Default: false (conservative). Override to true for read-only tools.
+
+    /// Classify this tool's observable side-effects. Default is the most
+    /// conservative value (`External`) so any unannotated tool is treated
+    /// as risky on resume. Override to `ReadOnly` or `Mutating` for
+    /// built-in tools; MCP tools derive this from their annotations.
+    fn side_effect_class(&self) -> ToolSideEffect {
+        ToolSideEffect::External
+    }
+
+    /// Convenience: a tool is read-only iff it classifies as `ReadOnly`.
+    /// Used by the parallel-dispatch path in `agent.rs`. Override only if
+    /// you have an unusual reason (you almost never should — override
+    /// `side_effect_class` instead and let this default through).
     fn is_readonly(&self) -> bool {
-        false
+        matches!(self.side_effect_class(), ToolSideEffect::ReadOnly)
     }
 }
 
@@ -274,12 +408,22 @@ impl ToolRegistry {
                 return Err(Error::PermissionDenied { name: name.into() });
             }
         }
+        self.invoke_with_audit(name, arguments).await.result
+    }
 
-        // Static permission check before any tool execution
+    /// Invoke a tool and return both its result and a populated
+    /// [`AuditMeta`]. Callers that need to persist audit data should
+    /// use this method; callers that don't can call `invoke` which
+    /// discards the audit half.
+    pub async fn invoke_with_audit(&self, name: &str, arguments: Value) -> ToolDispatch {
+        // Static permission check before any tool execution.
         if let Some(ref config) = self.permissions {
             match config.check_static(name) {
                 Permission::Denied(_reason) => {
-                    return Err(Error::PermissionDenied { name: name.into() });
+                    return ToolDispatch {
+                        result: Err(Error::PermissionDenied { name: name.into() }),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
+                    };
                 }
                 Permission::Allowed => {}
             }
@@ -290,22 +434,55 @@ impl ToolRegistry {
             record_touched(name, &arguments, slot);
         }
 
+        let Some(tool) = self.get(name) else {
+            return ToolDispatch {
+                result: Err(Error::UnknownTool(name.into())),
+                audit: AuditMeta::synthetic_unknown_tool(name),
+            };
+        };
+
+        let side_effect = tool.side_effect_class();
+        let step_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let args_hash = blake3_canonical_json(&arguments);
+        let started_at = unix_millis();
+
         let args_size = arguments.to_string().len();
         let span = tracing::info_span!("tool.execute", name = %name, args_size);
-        async move {
-            let tool = self
-                .get(name)
-                .ok_or_else(|| Error::UnknownTool(name.into()))?;
-            tool.execute(arguments).await.map_err(|e| match e {
+        let raw_result = tool
+            .execute(arguments)
+            .instrument(span)
+            .await
+            .map_err(|e| match e {
                 Error::Tool { .. } | Error::BadToolArgs { .. } | Error::UnknownTool(_) => e,
                 other => Error::Tool {
                     name: name.into(),
                     message: other.to_string(),
                 },
-            })
+            });
+
+        let finished_at = unix_millis();
+        let exit_status = match &raw_result {
+            Ok(_) => ExitStatus::Ok,
+            Err(e) => {
+                let (clipped, truncated) = truncate_for_audit(&e.to_string());
+                ExitStatus::Err {
+                    message: clipped,
+                    truncated,
+                }
+            }
+        };
+
+        ToolDispatch {
+            result: raw_result,
+            audit: AuditMeta {
+                step_id,
+                started_at,
+                finished_at,
+                args_hash,
+                side_effect,
+                exit_status,
+            },
         }
-        .instrument(span)
-        .await
     }
 }
 

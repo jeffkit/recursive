@@ -50,8 +50,8 @@ impl Tool for CheckpointList {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, _args: Value) -> Result<String> {
@@ -107,8 +107,8 @@ impl Tool for CheckpointDiff {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

@@ -113,6 +113,19 @@ pub enum AgentEvent {
         usage: Option<crate::session::UsageMeta>,
     },
 
+    /// Variant of [`MessageAppended`] specifically for `Role::Tool` messages
+    /// that have an associated [`AuditMeta`] (Goal 153). The persistence sink
+    /// handles this identically to `MessageAppended` but populates the
+    /// `audit` field of [`crate::session::TranscriptEntry`].
+    ///
+    /// Emitting a separate variant (rather than `Option<AuditMeta>` on
+    /// `MessageAppended`) keeps the common path zero-cost and avoids
+    /// making audit an optional field on every event.
+    MessageAppendedWithAudit {
+        message: crate::message::Message,
+        audit: crate::tools::AuditMeta,
+    },
+
     /// Cross-turn compaction just fired; a compact_boundary marker should be
     /// written to the session JSONL (g157).
     ///

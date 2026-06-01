@@ -84,6 +84,7 @@ pub use rewind::{
     RewindResult,
 };
 pub use runtime::{AgentRuntime, AgentRuntimeBuilder, RuntimeOutcome};
+pub use session::OrphanToolCall;
 pub use session::SessionFile;
 pub use session::SessionPersistenceSink;
 pub use session::SessionReader;
@@ -96,7 +97,10 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
-pub use tools::{build_standard_tools, Tool, ToolRegistry, TouchedFiles};
+pub use tools::{
+    build_standard_tools, AuditMeta, ExitStatus, Tool, ToolDispatch, ToolRegistry, ToolSideEffect,
+    TouchedFiles, AUDIT_ERR_MAX_BYTES,
+};
 pub use transcript::{TranscriptFile, TranscriptMeta};
 
 #[cfg(any(test, feature = "test-utils"))]

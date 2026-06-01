@@ -50,8 +50,8 @@ impl Tool for SearchFiles {
         }
     }
 
-    fn is_readonly(&self) -> bool {
-        true
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        crate::tools::ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

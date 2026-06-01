@@ -78,6 +78,7 @@ async fn mcp_tool_roundtrip() {
         name: "echo".to_string(),
         description: "Echo back input".to_string(),
         input_schema: serde_json::json!({"type":"object","properties":{"message":{"type":"string"}}}),
+        annotations: None,
     };
 
     // McpTool::new + spec/execute are exercised through the public API.

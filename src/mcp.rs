@@ -60,6 +60,38 @@ pub struct McpServer {
     pub url: Option<String>,
 }
 
+/// Optional 2025-03-26 MCP tool annotations that carry hints about
+/// the tool's side-effects. All fields default to `false` / `None`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    /// Hints the tool only reads data without side-effects.
+    #[serde(default)]
+    pub read_only_hint: bool,
+    /// Hints the tool may produce destructive side-effects.
+    #[serde(default)]
+    pub destructive_hint: bool,
+    /// Hints the tool is idempotent.
+    #[serde(default)]
+    pub idempotent_hint: bool,
+    /// Hints the tool interacts with the open world (network, I/O).
+    #[serde(default)]
+    pub open_world_hint: bool,
+}
+
+/// Per-MCP-server trust level. Controls whether annotation hints from
+/// a server are believed when classifying side-effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerTrust {
+    /// Annotations are trusted and used to derive [`ToolSideEffect`].
+    Trusted,
+    /// Annotations are ignored; all tools default to `External`.
+    /// This is the conservative default.
+    #[default]
+    Untrusted,
+}
+
 /// A tool spec as returned by the MCP server's `tools/list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolSpec {
@@ -68,6 +100,9 @@ pub struct McpToolSpec {
     pub description: String,
     #[serde(default)]
     pub input_schema: Value,
+    /// Optional 2025-03-26 annotations field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
 }
 
 /// A resource exposed by an MCP server.
@@ -450,10 +485,15 @@ impl McpClient {
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or(serde_json::json!({"type": "object"}));
+            // Try to deserialize optional annotations field.
+            let annotations = item
+                .get("annotations")
+                .and_then(|v| serde_json::from_value::<McpToolAnnotations>(v.clone()).ok());
             specs.push(McpToolSpec {
                 name: name.to_string(),
                 description: description.to_string(),
                 input_schema,
+                annotations,
             });
         }
 
@@ -1296,6 +1336,9 @@ pub struct McpTool {
     client: Arc<Mutex<McpClient>>,
     spec: McpToolSpec,
     server_name: String,
+    /// Trust level of the originating server. Controls whether annotation
+    /// hints are used to derive [`ToolSideEffect`].
+    trust: McpServerTrust,
 }
 
 impl McpTool {
@@ -1308,7 +1351,14 @@ impl McpTool {
             client,
             spec,
             server_name: server_name.into(),
+            trust: McpServerTrust::Untrusted,
         }
+    }
+
+    /// Builder: set the trust level for this tool's server.
+    pub fn with_trust(mut self, trust: McpServerTrust) -> Self {
+        self.trust = trust;
+        self
     }
 }
 
@@ -1319,6 +1369,24 @@ impl Tool for McpTool {
             name: format!("mcp__{}__{}", self.server_name, self.spec.name),
             description: format!("[mcp:{}] {}", self.server_name, self.spec.description),
             parameters: self.spec.input_schema.clone(),
+        }
+    }
+
+    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
+        use crate::tools::ToolSideEffect;
+        // Conservative default when server is untrusted or annotations missing.
+        let Some(ann) = &self.spec.annotations else {
+            return ToolSideEffect::External;
+        };
+        if self.trust != McpServerTrust::Trusted {
+            return ToolSideEffect::External;
+        }
+        if ann.read_only_hint {
+            ToolSideEffect::ReadOnly
+        } else if ann.open_world_hint {
+            ToolSideEffect::External
+        } else {
+            ToolSideEffect::Mutating
         }
     }
 

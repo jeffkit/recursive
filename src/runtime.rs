@@ -269,20 +269,45 @@ impl AgentRuntime {
         // For assistant messages, attach the turn's token usage (g156).
         let new_messages = turn_outcome.new_messages.clone();
         let turn_usage = crate::session::UsageMeta::from_token_usage(&turn_outcome.usage);
+        let mut tool_audits = turn_outcome.tool_audits.clone();
         self.transcript.extend(new_messages.iter().cloned());
         for msg in &new_messages {
-            let usage = if matches!(msg.role, crate::message::Role::Assistant) {
-                Some(turn_usage.clone())
+            // Goal-153: emit MessageAppendedWithAudit for tool messages that
+            // have a matching audit record keyed by tool_call_id.
+            let event = if msg.role == crate::message::Role::Tool {
+                if let Some(tcid) = &msg.tool_call_id {
+                    if let Some(audit) = tool_audits.remove(tcid) {
+                        AgentEvent::MessageAppendedWithAudit {
+                            message: msg.clone(),
+                            audit,
+                        }
+                    } else {
+                        AgentEvent::MessageAppended {
+                            message: msg.clone(),
+                            parent_uuid: None,
+                            usage: None,
+                        }
+                    }
+                } else {
+                    AgentEvent::MessageAppended {
+                        message: msg.clone(),
+                        parent_uuid: None,
+                        usage: None,
+                    }
+                }
             } else {
-                None
-            };
-            self.event_sink
-                .emit(AgentEvent::MessageAppended {
+                let usage = if matches!(msg.role, crate::message::Role::Assistant) {
+                    Some(turn_usage.clone())
+                } else {
+                    None
+                };
+                AgentEvent::MessageAppended {
                     message: msg.clone(),
                     parent_uuid: None, // g155: SessionWriter manages the chain
                     usage,             // g156
-                })
-                .await;
+                }
+            };
+            self.event_sink.emit(event).await;
         }
 
         // ── Checkpoint: post-turn snapshot + record ────────────────────

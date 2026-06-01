@@ -263,6 +263,10 @@ pub(crate) struct RunInnerOutcome {
     pub(crate) steps: usize,
     pub(crate) plan_buffer: Option<Vec<ToolCall>>,
     pub(crate) plan_confirmed: bool,
+    /// Goal-153: audit metadata for tool results, keyed by `tool_call_id`.
+    /// Only entries for successfully-dispatched tool calls are present;
+    /// the key matches `Message.tool_call_id` on `Role::Tool` messages.
+    pub(crate) tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta>,
 }
 
 /// Private core holding all state needed for one run of the ReAct loop.
@@ -397,8 +401,21 @@ impl<'a> RunCore<'a> {
     async fn execute_tool_calls(
         &self,
         calls: &[ToolCall],
-    ) -> Vec<(String, String, String, serde_json::Value)> {
-        let mut results: Vec<(String, String, String, serde_json::Value)> = Vec::new();
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        serde_json::Value,
+        Option<crate::tools::AuditMeta>,
+    )> {
+        type ResultRow = (
+            String,
+            String,
+            String,
+            serde_json::Value,
+            Option<crate::tools::AuditMeta>,
+        );
+        let mut results: Vec<ResultRow> = Vec::new();
 
         struct PendingCall {
             id: String,
@@ -418,6 +435,7 @@ impl<'a> RunCore<'a> {
                             call.name.clone(),
                             result,
                             call.arguments.clone(),
+                            None,
                         ));
                         continue;
                     }
@@ -439,6 +457,7 @@ impl<'a> RunCore<'a> {
                         call.name.clone(),
                         result,
                         call.arguments.clone(),
+                        None,
                     ));
                     continue;
                 }
@@ -449,6 +468,7 @@ impl<'a> RunCore<'a> {
                         call.name.clone(),
                         result,
                         call.arguments.clone(),
+                        None,
                     ));
                     continue;
                 }
@@ -475,37 +495,45 @@ impl<'a> RunCore<'a> {
                 let mut join_set = tokio::task::JoinSet::new();
                 for pc in &batch {
                     let name = pc.name.clone();
+                    let id = pc.id.clone();
                     let args = pc.args.clone();
                     let tools = self.tools.clone();
                     join_set.spawn(async move {
                         let tool_start = std::time::Instant::now();
-                        let span = tracing::info_span!("tool.exec", tool = %name);
-                        let result = span.in_scope(|| tools.invoke(&name, args)).await;
-                        let result = match result {
+                        let dispatch = tools.invoke_with_audit(&name, args.clone()).await;
+                        let result = match dispatch.result {
                             Ok(output) => output,
                             Err(err) => format!("ERROR: {err}"),
                         };
                         let duration_ms = tool_start.elapsed().as_millis() as u64;
-                        (name, result, duration_ms)
+                        (id, name, result, args, dispatch.audit, duration_ms)
                     });
                 }
 
-                let mut batch_results: Vec<(String, String, u64)> = Vec::new();
+                type BatchRow = (
+                    String,
+                    String,
+                    String,
+                    serde_json::Value,
+                    crate::tools::AuditMeta,
+                    u64,
+                );
+                let mut batch_results: Vec<BatchRow> = Vec::new();
                 while let Some(res) = join_set.join_next().await {
-                    let (name, result, duration_ms) = res.unwrap();
-                    batch_results.push((name, result, duration_ms));
+                    batch_results.push(res.unwrap());
                 }
 
                 for pc in &batch {
-                    let (_, result, duration_ms) = batch_results
+                    let (_, _, result, _, audit, duration_ms) = batch_results
                         .iter()
-                        .find(|(n, _, _)| n == &pc.name)
+                        .find(|(id, _, _, _, _, _)| id == &pc.id)
                         .unwrap();
                     results.push((
                         pc.id.clone(),
                         pc.name.clone(),
                         result.clone(),
                         pc.args.clone(),
+                        Some(audit.clone()),
                     ));
                     self.hooks.dispatch(HookEvent::PostToolCall {
                         name: &pc.name,
@@ -517,11 +545,11 @@ impl<'a> RunCore<'a> {
             } else {
                 let pc = pending.remove(i);
                 let tool_start = std::time::Instant::now();
-                let span = tracing::info_span!("tool.exec", tool = %pc.name);
-                let result = span
-                    .in_scope(|| self.tools.invoke(&pc.name, pc.args.clone()))
+                let dispatch = self
+                    .tools
+                    .invoke_with_audit(&pc.name, pc.args.clone())
                     .await;
-                let result = match result {
+                let result = match dispatch.result {
                     Ok(output) => output,
                     Err(err) => format!("ERROR: {err}"),
                 };
@@ -531,6 +559,7 @@ impl<'a> RunCore<'a> {
                     pc.name.clone(),
                     result.clone(),
                     pc.args.clone(),
+                    Some(dispatch.audit),
                 ));
                 self.hooks.dispatch(HookEvent::PostToolCall {
                     name: &pc.name,
@@ -553,6 +582,9 @@ impl<'a> RunCore<'a> {
         let mut last_call_key: Option<(String, String)> = None;
         let mut consecutive_errors: usize = 0;
         let mut total_usage = TokenUsage::default();
+        // Goal-153: audit metadata for tool calls, keyed by tool_call_id.
+        let mut tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta> =
+            std::collections::HashMap::new();
         self.total_llm_latency_ms = 0;
 
         for step in 1..=self.max_steps {
@@ -593,6 +625,7 @@ impl<'a> RunCore<'a> {
                         steps: finished_steps,
                         plan_buffer: self.plan_buffer,
                         plan_confirmed: self.plan_confirmed,
+                        tool_audits,
                     });
                 }
             }
@@ -625,6 +658,7 @@ impl<'a> RunCore<'a> {
                         steps: step,
                         plan_buffer: self.plan_buffer,
                         plan_confirmed: self.plan_confirmed,
+                        tool_audits,
                     });
                 }
             }
@@ -640,7 +674,7 @@ impl<'a> RunCore<'a> {
                 self.plan_confirmed = false;
                 if let Some(calls) = self.plan_buffer.take() {
                     let results = self.execute_tool_calls(&calls).await;
-                    for (id, name, output, _args) in results {
+                    for (id, name, output, _args, _audit) in results {
                         self.emit(StepEvent::ToolResult {
                             id: id.clone(),
                             name: name.clone(),
@@ -721,6 +755,7 @@ impl<'a> RunCore<'a> {
                     steps: step,
                     plan_buffer: self.plan_buffer,
                     plan_confirmed: self.plan_confirmed,
+                    tool_audits,
                 };
                 return Ok(outcome);
             }
@@ -783,19 +818,24 @@ impl<'a> RunCore<'a> {
                     steps: step,
                     plan_buffer: self.plan_buffer,
                     plan_confirmed: self.plan_confirmed,
+                    tool_audits,
                 });
             }
 
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
-            for (id, name, result, args) in &results {
+            for (id, name, result, args, audit) in &results {
                 self.emit(StepEvent::ToolResult {
                     id: id.clone(),
                     name: name.clone(),
                     output: result.clone(),
                     step,
                 });
+                // Goal-153: accumulate audit keyed by tool_call_id.
+                if let Some(a) = audit {
+                    tool_audits.insert(id.clone(), a.clone());
+                }
 
                 let call_key = (
                     name.clone(),
@@ -835,6 +875,7 @@ impl<'a> RunCore<'a> {
                         steps: step,
                         plan_buffer: self.plan_buffer,
                         plan_confirmed: self.plan_confirmed,
+                        tool_audits,
                     };
                     return Ok(outcome);
                 }
@@ -858,6 +899,7 @@ impl<'a> RunCore<'a> {
             steps: self.max_steps,
             plan_buffer: self.plan_buffer,
             plan_confirmed: self.plan_confirmed,
+            tool_audits,
         };
         Ok(outcome)
     }
