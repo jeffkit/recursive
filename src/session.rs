@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::event::{AgentEvent, EventSink};
 use crate::llm::ToolSpec;
@@ -212,6 +213,84 @@ fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {
 // JSONL session persistence (Goal 107)
 // ---------------------------------------------------------------------------
 
+/// Token usage for one or more LLM API calls, as reported by the provider.
+///
+/// Used both per-message (`TranscriptEntry.usage`) and as a cumulative
+/// session total stored in `SessionMeta.cost` (g156).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsageMeta {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Prompt-cache creation tokens (Anthropic / OpenAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// Prompt-cache read tokens (Anthropic / OpenAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Reasoning/thinking tokens (DeepSeek R1, o1, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+}
+
+impl UsageMeta {
+    /// Accumulate another `UsageMeta` into self.
+    pub fn accumulate(&mut self, other: &UsageMeta) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_tokens = Some(
+            self.cache_creation_tokens.unwrap_or(0) + other.cache_creation_tokens.unwrap_or(0),
+        );
+        self.cache_read_tokens =
+            Some(self.cache_read_tokens.unwrap_or(0) + other.cache_read_tokens.unwrap_or(0));
+        self.reasoning_tokens =
+            Some(self.reasoning_tokens.unwrap_or(0) + other.reasoning_tokens.unwrap_or(0));
+    }
+
+    /// Convert from `crate::llm::TokenUsage` (g156 integration point).
+    pub fn from_token_usage(tu: &crate::llm::TokenUsage) -> Self {
+        UsageMeta {
+            input_tokens: tu.prompt_tokens,
+            output_tokens: tu.completion_tokens,
+            cache_creation_tokens: if tu.cache_miss_tokens > 0 {
+                Some(tu.cache_miss_tokens)
+            } else {
+                None
+            },
+            cache_read_tokens: if tu.cache_hit_tokens > 0 {
+                Some(tu.cache_hit_tokens)
+            } else {
+                None
+            },
+            reasoning_tokens: None,
+        }
+    }
+
+    /// Returns true if both `input_tokens` and `output_tokens` are zero.
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
+}
+
+/// Cumulative token cost for a session, stored in `.meta.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionCost {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub total_cache_creation_tokens: u64,
+    #[serde(default)]
+    pub total_cache_read_tokens: u64,
+}
+
+impl SessionCost {
+    pub fn accumulate(&mut self, usage: &UsageMeta) {
+        self.total_input_tokens += usage.input_tokens as u64;
+        self.total_output_tokens += usage.output_tokens as u64;
+        self.total_cache_creation_tokens += usage.cache_creation_tokens.unwrap_or(0) as u64;
+        self.total_cache_read_tokens += usage.cache_read_tokens.unwrap_or(0) as u64;
+    }
+}
+
 /// Metadata for a JSONL session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -230,6 +309,15 @@ pub struct SessionMeta {
     /// warning rather than an abort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_registry_hash: Option<String>,
+    /// First user message in this session, truncated to 200 chars (g157).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+    /// Most recent user message, truncated to 200 chars (g157).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
+    /// Cumulative token usage for this session (g156).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SessionCost>,
 }
 
 /// A portable exported transcript for sharing and analysis.
@@ -266,6 +354,17 @@ impl ExportedTranscript {
 /// A single JSONL line representing one message in the transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
+    /// Stable UUID v4 for this message (g155). Empty string for pre-g155 entries.
+    #[serde(default)]
+    pub uuid: String,
+    /// UUID of the parent message in the conversation chain (g155).
+    /// `None` for the root message (first message in a session or chain branch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_uuid: Option<String>,
+    /// For tool-result messages, the UUID of the assistant message that issued
+    /// the tool call (g155). Enables correct attribution in multi-agent trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool_assistant_uuid: Option<String>,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -277,7 +376,27 @@ pub struct TranscriptEntry {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Token usage for this message (non-None for assistant messages, g156).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageMeta>,
     pub timestamp: String,
+}
+
+/// A compact-boundary system entry written to the JSONL when cross-turn
+/// compaction fires (g157). Parsed by `SessionReader::load_transcript`
+/// to skip pre-boundary messages on resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactBoundaryEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    subtype: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compacted_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary_uuid: Option<String>,
+    timestamp: String,
 }
 
 /// Convert a persisted [`TranscriptEntry`] into a runtime [`Message`].
@@ -322,6 +441,15 @@ pub struct SessionWriter {
     session_dir: PathBuf,
     writer: BufWriter<std::fs::File>,
     message_count: u64,
+    /// UUID of the last-appended message; used as `parent_uuid` for the
+    /// next message in the chain (g155).
+    last_uuid: Option<String>,
+    /// Accumulated token usage across all appended messages (g156).
+    cumulative_usage: UsageMeta,
+    /// First user prompt, truncated to 200 chars (g157).
+    first_prompt: Option<String>,
+    /// Most recent user prompt, truncated to 200 chars (g157).
+    last_prompt: Option<String>,
     /// Held for the lifetime of the writer so a second
     /// `SessionWriter::open_existing` (or `create`) on the same
     /// `session_dir` is refused. Cleaned up on `Drop`.
@@ -412,6 +540,10 @@ impl SessionWriter {
             session_dir,
             writer: BufWriter::new(file),
             message_count: 0,
+            last_uuid: None,
+            cumulative_usage: UsageMeta::default(),
+            first_prompt: None,
+            last_prompt: None,
             _lock: Some(lock),
         })
     }
@@ -437,6 +569,11 @@ impl SessionWriter {
         let lock = SessionLock::acquire(session_dir)?;
 
         let jsonl_path = session_dir.join("transcript.jsonl");
+
+        // Recover last_uuid from the last message entry in the JSONL so the
+        // UUID chain can continue from where the previous run left off (g155).
+        let last_uuid = read_last_message_uuid(&jsonl_path);
+
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -447,25 +584,55 @@ impl SessionWriter {
             session_dir: session_dir.to_path_buf(),
             writer: BufWriter::new(file),
             message_count: meta.message_count,
+            last_uuid,
+            cumulative_usage: UsageMeta::default(),
+            first_prompt: meta.first_prompt,
+            last_prompt: meta.last_prompt,
             _lock: Some(lock),
         })
     }
 
     /// Append a message to the JSONL file.
     ///
-    /// Returns the assigned message ID (e.g. `msg_001`). Bumps
+    /// Returns the UUID assigned to this message entry. Bumps
     /// `SessionMeta.updated_at` on every `assistant` or `user`
     /// message (skipping per-tool-result writes is an
     /// optimisation — a turn with N tool calls would otherwise
     /// rewrite the meta file 2N times). The "most-recent" shortcut
     /// in `recursive resume` (g151) relies on `updated_at` being
     /// live for crashed sessions.
-    pub fn append(&mut self, msg: &Message) -> std::io::Result<String> {
+    ///
+    /// `parent_uuid_override` — if `Some`, this UUID is used as `parent_uuid`
+    /// for the new entry instead of `self.last_uuid`. Use this for subagent
+    /// messages that branch off a specific parent agent message (g155).
+    ///
+    /// `usage` — token usage to attach to this entry (non-None for assistant
+    /// messages, g156).
+    pub fn append(
+        &mut self,
+        msg: &Message,
+        parent_uuid_override: Option<&str>,
+        usage: Option<&UsageMeta>,
+    ) -> std::io::Result<String> {
         self.message_count += 1;
         let msg_id = format!("msg_{:03}", self.message_count);
 
         let parent_id = if self.message_count > 1 {
             Some(format!("msg_{:03}", self.message_count - 1))
+        } else {
+            None
+        };
+
+        // g155: generate a stable UUID for this entry.
+        let new_uuid = Uuid::new_v4().to_string();
+        let parent_uuid = parent_uuid_override
+            .map(|s| s.to_string())
+            .or_else(|| self.last_uuid.clone());
+
+        // g155: for tool results, track which assistant message issued the call.
+        let source_tool_assistant_uuid = if matches!(msg.role, crate::message::Role::Tool) {
+            // The parent_uuid points to the assistant that issued this tool call.
+            parent_uuid.clone()
         } else {
             None
         };
@@ -477,7 +644,24 @@ impl SessionWriter {
             crate::message::Role::Tool => "tool",
         };
 
+        // g157: track first/last user prompt in memory (written to meta on bump).
+        if matches!(msg.role, crate::message::Role::User) {
+            let prompt: String = msg.content.chars().take(200).collect();
+            if self.first_prompt.is_none() {
+                self.first_prompt = Some(prompt.clone());
+            }
+            self.last_prompt = Some(prompt);
+        }
+
+        // g156: accumulate usage if provided.
+        if let Some(u) = usage {
+            self.cumulative_usage.accumulate(u);
+        }
+
         let entry = TranscriptEntry {
+            uuid: new_uuid.clone(),
+            parent_uuid,
+            source_tool_assistant_uuid,
             id: msg_id,
             parent_id,
             role: role_str.to_string(),
@@ -485,6 +669,7 @@ impl SessionWriter {
             tool_calls: msg.tool_calls.clone(),
             tool_call_id: msg.tool_call_id.clone(),
             reasoning_content: msg.reasoning_content.clone(),
+            usage: usage.cloned(),
             timestamp: chrono_lite_now(),
         };
 
@@ -493,6 +678,9 @@ impl SessionWriter {
         self.writer.write_all(line.as_bytes())?;
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
+
+        // g155: advance the chain pointer.
+        self.last_uuid = Some(new_uuid.clone());
 
         // Bump updated_at on user/assistant messages so the
         // "most-recent" shortcut on resume picks crashed sessions
@@ -505,11 +693,38 @@ impl SessionWriter {
             let _ = self.bump_updated_at();
         }
 
-        Ok(format!("msg_{:03}", self.message_count))
+        Ok(new_uuid)
     }
 
-    /// Update only `updated_at` and `message_count` in `.meta.json`,
-    /// preserving everything else (goal, model, status, tool hash).
+    /// Write a compact_boundary system entry directly to the JSONL (g157).
+    ///
+    /// Called by `SessionPersistenceSink` when it receives a
+    /// `AgentEvent::CompactionBoundary` event. The entry is written outside
+    /// the normal `append` flow so it does not increment `message_count` or
+    /// advance the UUID chain.
+    pub fn write_compact_boundary(
+        &mut self,
+        turn: u32,
+        compacted_count: usize,
+        summary_uuid: Option<&str>,
+    ) -> std::io::Result<()> {
+        let entry = CompactBoundaryEntry {
+            entry_type: "system".to_string(),
+            subtype: "compact_boundary".to_string(),
+            turn: Some(turn),
+            compacted_count: Some(compacted_count),
+            summary_uuid: summary_uuid.map(|s| s.to_string()),
+            timestamp: chrono_lite_now(),
+        };
+        let line = serde_json::to_string(&entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
+    /// Update `updated_at`, `message_count`, `first_prompt`, and `last_prompt`
+    /// in `.meta.json`, preserving everything else (goal, model, status, tool hash).
     /// Best-effort: errors are returned but `append()` swallows them
     /// so a transient meta-write failure does not abort the run.
     fn bump_updated_at(&self) -> std::io::Result<()> {
@@ -519,13 +734,21 @@ impl SessionWriter {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         meta.updated_at = chrono_lite_now();
         meta.message_count = self.message_count;
+        // g157: persist first/last prompt so session picker can show them
+        // without reading the full JSONL.
+        if self.first_prompt.is_some() {
+            meta.first_prompt = self.first_prompt.clone();
+        }
+        if self.last_prompt.is_some() {
+            meta.last_prompt = self.last_prompt.clone();
+        }
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&meta_path, json)
     }
 
     /// Finalise the session: flush the writer and update the meta file
-    /// with the final message count and status.
+    /// with the final message count, status, prompts, and cumulative cost.
     pub fn finish(&mut self, status: &str) -> std::io::Result<()> {
         self.writer.flush()?;
 
@@ -538,6 +761,19 @@ impl SessionWriter {
         meta.updated_at = chrono_lite_now();
         meta.message_count = self.message_count;
         meta.status = status.to_string();
+        // g157: final prompt snapshot.
+        if self.first_prompt.is_some() {
+            meta.first_prompt = self.first_prompt.clone();
+        }
+        if self.last_prompt.is_some() {
+            meta.last_prompt = self.last_prompt.clone();
+        }
+        // g156: write cumulative cost.
+        if !self.cumulative_usage.is_zero() {
+            let mut cost = meta.cost.take().unwrap_or_default();
+            cost.accumulate(&self.cumulative_usage);
+            meta.cost = Some(cost);
+        }
 
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -558,6 +794,33 @@ impl SessionWriter {
     pub fn message_count(&self) -> u64 {
         self.message_count
     }
+
+    /// Return the UUID of the last appended message (g155).
+    pub fn last_uuid(&self) -> Option<&str> {
+        self.last_uuid.as_deref()
+    }
+}
+
+/// Read the UUID of the last message-type (TranscriptEntry) line in a JSONL
+/// file. Skips compact_boundary system entries. Returns `None` if the file
+/// is empty, unreadable, or all entries lack a UUID (pre-g155 files).
+fn read_last_message_uuid(jsonl_path: &Path) -> Option<String> {
+    let file = std::fs::File::open(jsonl_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last = None;
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
+                if !entry.uuid.is_empty() {
+                    last = Some(entry.uuid);
+                }
+            }
+        }
+    }
+    last
 }
 
 /// Truncate `transcript.jsonl` (and the session's `.meta.json`
@@ -873,19 +1136,36 @@ pub struct SessionReader;
 
 impl SessionReader {
     /// Load all transcript entries from a session directory.
+    ///
+    /// If the JSONL contains a `compact_boundary` system entry (g157), all
+    /// entries **before** the last such boundary are discarded—they were
+    /// already summarised and the summary is the first entry after the
+    /// boundary. This makes resume `O(post-compaction size)`.
     pub fn load_transcript(session_dir: &Path) -> std::io::Result<Vec<TranscriptEntry>> {
         let jsonl_path = session_dir.join("transcript.jsonl");
         let file = std::fs::File::open(&jsonl_path)?;
         let reader = std::io::BufReader::new(file);
 
-        let mut entries = Vec::new();
+        let mut all_entries: Vec<TranscriptEntry> = Vec::new();
+        // Index of the line immediately after the last compact_boundary we saw.
+        let mut boundary_after: usize = 0;
+
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
+            // g157: detect compact_boundary system entries before trying to
+            // parse as TranscriptEntry (they have a different shape).
+            if let Ok(sys) = serde_json::from_str::<CompactBoundaryEntry>(&line) {
+                if sys.entry_type == "system" && sys.subtype == "compact_boundary" {
+                    // Everything before this boundary is superseded; restart.
+                    boundary_after = all_entries.len();
+                    continue;
+                }
+            }
             match serde_json::from_str::<TranscriptEntry>(&line) {
-                Ok(entry) => entries.push(entry),
+                Ok(entry) => all_entries.push(entry),
                 Err(e) => {
                     // Skip corrupt lines gracefully
                     eprintln!(
@@ -897,12 +1177,31 @@ impl SessionReader {
                 }
             }
         }
-        Ok(entries)
+        // Discard pre-boundary entries (g157).
+        Ok(all_entries.split_off(boundary_after))
+    }
+
+    /// Load the transcript and build a UUID → `TranscriptEntry` index
+    /// alongside the ordered vec. Enables O(1) lookup by UUID (g155).
+    pub fn load_transcript_indexed(
+        session_dir: &Path,
+    ) -> std::io::Result<(
+        Vec<TranscriptEntry>,
+        std::collections::HashMap<String, TranscriptEntry>,
+    )> {
+        let entries = Self::load_transcript(session_dir)?;
+        let mut index = std::collections::HashMap::with_capacity(entries.len());
+        for entry in &entries {
+            if !entry.uuid.is_empty() {
+                index.insert(entry.uuid.clone(), entry.clone());
+            }
+        }
+        Ok((entries, index))
     }
 
     /// Load the transcript and convert each `TranscriptEntry` to a
     /// runtime [`Message`]. Persistence-only fields (`id`,
-    /// `parent_id`, `timestamp`, and — once g153 lands — `audit`)
+    /// `parent_id`, `uuid`, `parent_uuid`, `timestamp`, `usage`)
     /// are dropped here. The result is what `run_resumed` expects
     /// as its `seed` argument.
     ///
@@ -1094,22 +1393,49 @@ impl SessionPersistenceSink {
 #[async_trait::async_trait]
 impl EventSink for SessionPersistenceSink {
     async fn emit(&self, event: AgentEvent) {
-        if let AgentEvent::MessageAppended { message } = event {
-            let result = {
-                match self.writer.lock() {
-                    Ok(mut w) => w.append(&message),
-                    Err(poisoned) => {
-                        // Recover from a poisoned mutex (e.g. a panic in
-                        // another thread that held the lock). Persistence
-                        // should continue; we just log and proceed.
-                        let mut w = poisoned.into_inner();
-                        w.append(&message)
+        match event {
+            AgentEvent::MessageAppended {
+                message,
+                parent_uuid,
+                usage,
+            } => {
+                let result = {
+                    match self.writer.lock() {
+                        Ok(mut w) => w.append(&message, parent_uuid.as_deref(), usage.as_ref()),
+                        Err(poisoned) => {
+                            // Recover from a poisoned mutex (e.g. a panic in
+                            // another thread that held the lock). Persistence
+                            // should continue; we just log and proceed.
+                            let mut w = poisoned.into_inner();
+                            w.append(&message, parent_uuid.as_deref(), usage.as_ref())
+                        }
                     }
+                };
+                if let Err(e) = result {
+                    tracing::error!("session persistence: failed to append message: {e}");
                 }
-            };
-            if let Err(e) = result {
-                tracing::error!("session persistence: failed to append message: {e}");
             }
+            AgentEvent::CompactionBoundary {
+                turn,
+                compacted_count,
+                summary_uuid,
+            } => {
+                // g157: write a compact_boundary system entry so resume can
+                // skip the pre-compaction messages.
+                let result = match self.writer.lock() {
+                    Ok(mut w) => {
+                        w.write_compact_boundary(turn, compacted_count, summary_uuid.as_deref())
+                    }
+                    Err(poisoned) => {
+                        let mut w = poisoned.into_inner();
+                        w.write_compact_boundary(turn, compacted_count, summary_uuid.as_deref())
+                    }
+                };
+                if let Err(e) = result {
+                    tracing::error!("session persistence: failed to write compact_boundary: {e}");
+                }
+            }
+            _ => {}
         }
     }
 }
