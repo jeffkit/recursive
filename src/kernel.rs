@@ -21,6 +21,7 @@
 //! `TurnContext` from its transcript, calls the kernel, and then
 //! incorporates the `TurnOutcome` back into its state.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +71,10 @@ pub struct TurnContext {
 
     /// Planning mode (execute immediately vs buffer for confirmation).
     pub planning_mode: PlanningMode,
+
+    /// Goal-165: shared flag that enables agent-driven read-only plan mode.
+    /// When `true`, write tools are blocked until `exit_plan_mode` is called.
+    pub exploring_plan_mode: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +280,7 @@ impl AgentKernel {
             total_llm_latency_ms: 0,
             plan_buffer: ctx.plan_buffer,
             plan_confirmed: ctx.plan_confirmed,
+            exploring_plan_mode: ctx.exploring_plan_mode,
             shutdown_token: self.shutdown_token.clone(),
         };
 

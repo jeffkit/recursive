@@ -175,6 +175,7 @@ impl Tool for SubAgent {
             streaming: false,
             permission_hook: self.permission_hook.clone(),
             planning_mode: PlanningMode::default(),
+            exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {

@@ -73,6 +73,11 @@ pub enum UiEvent {
     /// a free-form `reason`. Same UI handling as `PlanConfirmed` plus
     /// the reason in the System block.
     PlanRejected { reason: String },
+    /// Goal-167: the agent updated its task list via `todo_write`. Carries
+    /// the complete replacement list so the UI can re-render without a diff.
+    TodoUpdated {
+        todos: Vec<crate::tools::todo::TodoItem>,
+    },
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────

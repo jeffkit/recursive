@@ -266,6 +266,42 @@ pub fn default_system_prompt() -> String {
         "- Verify behavior via `cargo test`, never via `cargo run | jq`. Cargo build noise on a fresh tree breaks jq parsing and burns your step budget.",
         "",
         "Output should be terse and concrete. Avoid filler.",
+        "",
+        "## Task List Management",
+        "",
+        "Use todo_write to track progress on complex tasks with 3 or more distinct steps.",
+        "",
+        "When to use:",
+        "- Create the list BEFORE starting work (capture requirements as todos)",
+        "- Update status in real-time as you work",
+        "- Mark exactly ONE task as in_progress at a time",
+        "- Mark completed IMMEDIATELY after finishing (not batched)",
+        "- ONLY mark completed when fully done (tests passing, no partial work)",
+        "- Clear the list (call with empty array) when all tasks are done",
+        "",
+        "When NOT to use:",
+        "- Single, straightforward tasks",
+        "- Purely conversational responses",
+        "- Tasks completable in less than 3 trivial steps",
+        "",
+        "## Planning Mode",
+        "",
+        "Use enter_plan_mode when:",
+        "- The task requires exploring 3+ files before deciding what to change",
+        "- The task touches architectural boundaries (new module, new trait, API change)",
+        "- You are unsure of the correct approach and want to discuss options first",
+        "",
+        "While in plan mode:",
+        "- Read files freely (read_file, list_dir, search_files)",
+        "- Think through trade-offs in your responses",
+        "- DO NOT call write_file, apply_patch, or run_shell",
+        "- When you have a clear plan, call exit_plan_mode with a markdown summary",
+        "",
+        "Your plan should include:",
+        "1. What you understand about the current code",
+        "2. The approach you propose and why",
+        "3. Files you will modify and how",
+        "4. How you will verify the change is correct",
     ]
     .join("\n")
 }
@@ -349,7 +385,9 @@ mod tests {
 
     #[test]
     fn default_prompt_is_well_under_a_kilobyte() {
-        assert!(default_system_prompt().len() < 2048);
+        // Goal-167 added a task-list section; Goal-165 added Planning Mode.
+        // Bump the limit to 6 KiB to accommodate both additions.
+        assert!(default_system_prompt().len() < 6144);
     }
 
     #[test]

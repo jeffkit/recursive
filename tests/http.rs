@@ -7,9 +7,11 @@ mod http_tests {
     use recursive::config::Config;
     use recursive::http::{
         build_router, build_router_with_auth, build_router_with_auth_and_rate_limit,
-        map_agent_event, AppState, AuthConfig, JwtConfig, Metrics, RateLimiter, SseEvent, ToolInfo,
+        map_agent_event, AppState, AuthConfig, JwtConfig, Metrics, RateLimiter, SessionState,
+        SseEvent, ToolInfo,
     };
     use recursive::llm::{Completion, MockProvider};
+    use recursive::runtime::AgentRuntimeBuilder;
     use recursive::tools::ToolRegistry;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1899,5 +1901,327 @@ mod http_tests {
                 args.delta
             );
         }
+    }
+
+    // ── Plan-mode HTTP endpoint tests ─────────────────────────────────────
+
+    /// Helper: build a state that has one pre-inserted session whose gate has
+    /// a pending plan (i.e. status == "plan_pending_approval").
+    async fn state_with_pending_plan_session(plan_text: &str) -> (AppState, String) {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(Arc::new(MockProvider::new(vec![])))
+            .build()
+            .expect("runtime build failed");
+        let gate = runtime.plan_approval_gate();
+
+        // Simulate the agent having set a pending plan.
+        gate.pending_plan
+            .write()
+            .expect("write lock")
+            .replace(plan_text.to_string());
+
+        let session_id = "test-session-plan".to_string();
+        let session = SessionState {
+            id: session_id.clone(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            plan_approval_gate: gate,
+        };
+        state
+            .sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        (state, session_id)
+    }
+
+    #[tokio::test]
+    async fn plan_confirm_returns_404_for_unknown_session() {
+        let app = build_router(sample_state());
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent/plan/confirm")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn plan_reject_returns_404_for_unknown_session() {
+        let app = build_router(sample_state());
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent/plan/reject")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"no such session"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn plan_confirm_returns_409_when_no_plan_pending() {
+        // Create a real session with no pending plan.
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        // Create session via API.
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Confirm when no plan is pending → 409.
+        let app2 = build_router(state);
+        let confirm_resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/plan/confirm"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(confirm_resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn plan_reject_returns_409_when_no_plan_pending() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        let app2 = build_router(state);
+        let reject_resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/plan/reject"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reject_resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_plan_pending_approval_status() {
+        let (state, session_id) =
+            state_with_pending_plan_session("Step 1: read files\nStep 2: write summary").await;
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(detail["status"], "plan_pending_approval");
+        assert_eq!(
+            detail["pending_plan"],
+            "Step 1: read files\nStep 2: write summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_confirm_approves_pending_plan_and_returns_200() {
+        let (state, session_id) = state_with_pending_plan_session("Do the thing").await;
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/plan/confirm"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "approved");
+        assert_eq!(result["session_id"], session_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn plan_confirm_with_edits_updates_plan_text() {
+        let (state, session_id) = state_with_pending_plan_session("Original plan").await;
+
+        // Snapshot the gate so we can verify the edit took effect.
+        let gate = {
+            state
+                .sessions
+                .read()
+                .await
+                .get(&session_id)
+                .unwrap()
+                .plan_approval_gate
+                .clone()
+        };
+
+        let app = build_router(state);
+        let body = serde_json::json!({"edits": "Revised plan"}).to_string();
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/plan/confirm"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        // The gate's pending_plan was updated before approve() was called.
+        // After approve() the gate clears the response (not the pending_plan)
+        // so the edited text is still readable.
+        let stored = gate.pending_plan.read().unwrap().clone();
+        assert_eq!(stored.as_deref(), Some("Revised plan"));
+    }
+
+    #[tokio::test]
+    async fn plan_reject_rejects_pending_plan_and_returns_200() {
+        let (state, session_id) = state_with_pending_plan_session("Plan to reject").await;
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/plan/reject"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"not detailed enough"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "rejected");
+        assert_eq!(result["session_id"], session_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn map_agent_event_plan_proposed_maps_to_sse() {
+        use recursive::event::AgentEvent;
+        let event = AgentEvent::PlanProposed {
+            plan_text: "my plan".to_string(),
+            tool_calls: vec![],
+        };
+        let sse = map_agent_event(&event);
+        assert_eq!(
+            sse,
+            Some(SseEvent::PlanProposed {
+                plan: "my plan".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_idle_status_when_no_plan_pending() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        let app2 = build_router(state);
+        let detail_resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(detail_resp.status(), 200);
+        let body = detail_resp.into_body().collect().await.unwrap().to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["status"], "idle");
+        assert!(detail["pending_plan"].is_null());
     }
 }

@@ -144,12 +144,14 @@ pub mod facts;
 pub mod fs;
 pub mod load_skill;
 pub mod memory;
+pub mod plan_mode;
 pub mod run_background;
 pub mod run_skill_script;
 pub mod schedule_wakeup;
 pub mod search;
 pub mod shell;
 pub mod sub_agent;
+pub mod todo;
 pub mod transport;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
@@ -169,12 +171,14 @@ pub use memory::{
     ScratchpadGet, ScratchpadList, WorkingMemoryTool,
 };
 pub use memory::{Forget, Recall, Remember};
+pub use plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use shell::RunShell;
 pub use sub_agent::SubAgent;
+pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
@@ -589,6 +593,7 @@ pub fn build_standard_tools(
     shell_timeout_secs: u64,
 ) -> ToolRegistry {
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
+    let todo_list = Arc::new(std::sync::RwLock::new(Vec::<TodoItem>::new()));
     let mut registry = ToolRegistry::local()
         .register(Arc::new(ReadFile::new(workspace)))
         .register(Arc::new(WriteFile::new(workspace)))
@@ -613,7 +618,23 @@ pub fn build_standard_tools(
         .register(Arc::new(WorkingMemoryTool::new(workspace)))
         .register(Arc::new(ScratchpadGet::new(workspace)))
         .register(Arc::new(ScratchpadDelete::new(workspace)))
-        .register(Arc::new(ScratchpadList::new(workspace)));
+        .register(Arc::new(ScratchpadList::new(workspace)))
+        .register(Arc::new(TodoWriteTool::new(
+            todo_list,
+            Arc::new(crate::event::NullSink),
+        )));
+
+    // Goal-165: plan mode 2.0 tools (NullSink / default gate placeholder).
+    // AgentRuntimeBuilder::build() re-registers these with the real gate and sink.
+    let default_gate = Arc::new(plan_mode::PlanApprovalGate::new());
+    registry = registry
+        .register(Arc::new(plan_mode::EnterPlanModeTool::new(
+            default_gate.clone(),
+        )))
+        .register(Arc::new(plan_mode::ExitPlanModeTool::new(
+            default_gate,
+            Arc::new(crate::event::NullSink),
+        )));
 
     #[cfg(feature = "web_fetch")]
     {

@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::llm::LlmProvider;
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
+use crate::tools::plan_mode::PlanApprovalGate;
 use crate::tools::ToolRegistry;
 
 // ── Rate limiter ───────────────────────────────────────────────────────────
@@ -439,6 +440,10 @@ pub struct SessionState {
     /// Runtime is wrapped in a per-session Mutex so concurrent HTTP requests
     /// for the same session are serialized without blocking the global lock.
     pub runtime: Arc<tokio::sync::Mutex<AgentRuntime>>,
+    /// Shared gate for plan-mode approval. Stored here so HTTP handlers can
+    /// approve/reject without taking the runtime Mutex (which may be held
+    /// by a running agent turn).
+    pub plan_approval_gate: Arc<PlanApprovalGate>,
 }
 
 /// Serialized session info for list/detail endpoints.
@@ -481,6 +486,12 @@ pub struct SessionDetailResponse {
     pub id: String,
     pub created_at: String,
     pub messages: Vec<serde_json::Value>,
+    /// Goal-167: current task list as maintained by `todo_write` calls.
+    pub todos: Vec<crate::tools::todo::TodoItem>,
+    /// Current session lifecycle state: `"idle"` | `"plan_pending_approval"`.
+    pub status: String,
+    /// Non-null when `status` is `"plan_pending_approval"`.
+    pub pending_plan: Option<String>,
 }
 
 // ── SSE event types ──────────────────────────────────────────────────────
@@ -500,6 +511,8 @@ pub enum SseEvent {
     },
     /// An error occurred.
     Error { message: String },
+    /// Agent proposed a plan and is waiting for human review.
+    PlanProposed { plan: String },
 }
 
 // ── App state ──────────────────────────────────────────────────────────────
@@ -615,6 +628,8 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}", axum::routing::delete(delete_session))
         .route("/sessions/{id}/messages", post(send_session_message))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/sessions/{id}/plan/confirm", post(session_plan_confirm))
+        .route("/sessions/{id}/plan/reject", post(session_plan_reject))
         .route("/agui", post(agui_run))
         .route("/openapi.json", get(openapi_spec))
         .route("/metrics", get(metrics_handler))
@@ -1212,10 +1227,15 @@ async fn create_session(
             )
         })?;
 
+    // Extract the gate before moving runtime into the Mutex so HTTP handlers
+    // can approve/reject without acquiring the per-session runtime lock.
+    let plan_approval_gate = runtime.plan_approval_gate();
+
     let session = SessionState {
         id: id.clone(),
         created_at: created_at.clone(),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+        plan_approval_gate,
     };
 
     state.sessions.write().await.insert(id.clone(), session);
@@ -1250,24 +1270,53 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionIn
 }
 
 /// GET /sessions/:id — get session detail with messages.
+///
+/// Reads plan-approval status directly from the session gate (no runtime lock
+/// needed) so this endpoint stays responsive even while an agent turn is
+/// blocked awaiting plan approval.  Messages and todos fall back to empty
+/// vectors when the runtime is busy rather than deadlocking.
 async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionDetailResponse>, StatusCode> {
     let sessions = state.sessions.read().await;
     let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    let runtime = session.runtime.lock().await;
 
-    let messages: Vec<serde_json::Value> = runtime
-        .transcript()
-        .iter()
-        .filter_map(|msg| serde_json::to_value(msg).ok())
-        .collect();
+    // Read plan status without locking the runtime Mutex so callers can poll
+    // while the agent is suspended inside `exit_plan_mode`.
+    let pending_plan = session
+        .plan_approval_gate
+        .pending_plan
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    let status = if pending_plan.is_some() {
+        "plan_pending_approval".to_string()
+    } else {
+        "idle".to_string()
+    };
+
+    // Try a non-blocking lock for messages/todos; fall back to empty when busy.
+    let (messages, todos) = match session.runtime.try_lock() {
+        Ok(runtime) => {
+            let msgs = runtime
+                .transcript()
+                .iter()
+                .filter_map(|msg| serde_json::to_value(msg).ok())
+                .collect();
+            let todos = runtime.current_todos();
+            (msgs, todos)
+        }
+        Err(_) => (vec![], vec![]),
+    };
 
     Ok(Json(SessionDetailResponse {
         id: session.id.clone(),
         created_at: session.created_at.clone(),
         messages,
+        todos,
+        status,
+        pending_plan,
     }))
 }
 
@@ -1279,6 +1328,91 @@ async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<Strin
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+// ── Plan-approval endpoints ───────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct PlanConfirmRequest {
+    /// Optional replacement plan text to use instead of the agent-proposed one.
+    edits: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PlanRejectRequest {
+    /// Reason shown to the agent so it can revise the plan.
+    reason: Option<String>,
+}
+
+/// POST /sessions/:id/plan/confirm — approve the pending plan.
+async fn session_plan_confirm(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<PlanConfirmRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let sessions = state.sessions.read().await;
+    let Some(session) = sessions.get(&session_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        );
+    };
+    let pending = session
+        .plan_approval_gate
+        .pending_plan
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    if pending.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "session is not awaiting plan approval"})),
+        );
+    }
+    // Optionally replace the plan text before approving.
+    if let Some(edited) = body.edits {
+        if let Ok(mut w) = session.plan_approval_gate.pending_plan.write() {
+            *w = Some(edited);
+        }
+    }
+    session.plan_approval_gate.approve();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "approved", "session_id": session_id})),
+    )
+}
+
+/// POST /sessions/:id/plan/reject — reject the pending plan.
+async fn session_plan_reject(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<PlanRejectRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let sessions = state.sessions.read().await;
+    let Some(session) = sessions.get(&session_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        );
+    };
+    let pending = session
+        .plan_approval_gate
+        .pending_plan
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    if pending.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "session is not awaiting plan approval"})),
+        );
+    }
+    let reason = body.reason.unwrap_or_default();
+    session.plan_approval_gate.reject(&reason);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "rejected", "session_id": session_id})),
+    )
 }
 
 /// POST /sessions/:id/messages — send a message in a session.
@@ -1393,6 +1527,7 @@ async fn session_events(
                 SseEvent::ToolResult { .. } => "tool_result",
                 SseEvent::Done { .. } => "done",
                 SseEvent::Error { .. } => "error",
+                SseEvent::PlanProposed { .. } => "plan_proposed",
             };
             let data = serde_json::to_string(&sse_event).unwrap_or_default();
             Some(Ok(Event::default().event(event_type).data(data)))
@@ -1425,7 +1560,11 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
             finish_reason: reason.clone(),
             total_steps: *steps,
         }),
-        // AssistantText, Latency, Usage, Compacted, Plan* don't have SSE equivalents.
+        AgentEvent::PlanProposed { plan_text, .. } => Some(SseEvent::PlanProposed {
+            plan: plan_text.clone(),
+        }),
+        // AssistantText, Latency, Usage, Compacted, PlanConfirmed, PlanRejected
+        // don't have SSE equivalents.
         _ => None,
     }
 }

@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch
 from recursive_client import RecursiveClient
 from recursive_client.models import (
     MessageResponse,
+    PlanProposedMessage,
     RunResponse,
+    SessionDetail,
     SessionInfo,
     ToolInfo,
     UsageInfo,
@@ -179,6 +181,115 @@ class TestRecursiveClient(unittest.TestCase):
             "http://localhost:3000/sessions/s1"
         )
         mock_resp.raise_for_status.assert_called_once()
+
+    def test_get_session_with_plan_pending_fields(self):
+        """SessionDetail should parse status and pending_plan from response."""
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "id": "s1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "messages": [],
+            "status": "plan_pending_approval",
+            "pending_plan": "Step 1: read\nStep 2: write",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        client.session.get.return_value = mock_resp
+
+        detail = client.get_session("s1")
+
+        self.assertEqual(detail.status, "plan_pending_approval")
+        self.assertEqual(detail.pending_plan, "Step 1: read\nStep 2: write")
+
+    def test_get_session_defaults_to_idle_when_status_absent(self):
+        """SessionDetail.status defaults to 'idle' for old API responses."""
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "id": "s1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "messages": [],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        client.session.get.return_value = mock_resp
+
+        detail = client.get_session("s1")
+
+        self.assertEqual(detail.status, "idle")
+        self.assertIsNone(detail.pending_plan)
+
+    def test_approve_plan_calls_correct_endpoint(self):
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "approved", "session_id": "s1"}
+        mock_resp.raise_for_status = MagicMock()
+        client.session.post.return_value = mock_resp
+
+        result = client.approve_plan("s1")
+
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(result["session_id"], "s1")
+        client.session.post.assert_called_once_with(
+            "http://localhost:3000/sessions/s1/plan/confirm",
+            json={},
+        )
+        mock_resp.raise_for_status.assert_called_once()
+
+    def test_approve_plan_with_edits_sends_edits(self):
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "approved", "session_id": "s1"}
+        mock_resp.raise_for_status = MagicMock()
+        client.session.post.return_value = mock_resp
+
+        client.approve_plan("s1", edits="Revised plan text")
+
+        client.session.post.assert_called_once_with(
+            "http://localhost:3000/sessions/s1/plan/confirm",
+            json={"edits": "Revised plan text"},
+        )
+
+    def test_reject_plan_calls_correct_endpoint(self):
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "rejected", "session_id": "s1"}
+        mock_resp.raise_for_status = MagicMock()
+        client.session.post.return_value = mock_resp
+
+        result = client.reject_plan("s1", reason="not detailed enough")
+
+        self.assertEqual(result["status"], "rejected")
+        client.session.post.assert_called_once_with(
+            "http://localhost:3000/sessions/s1/plan/reject",
+            json={"reason": "not detailed enough"},
+        )
+        mock_resp.raise_for_status.assert_called_once()
+
+    def test_reject_plan_default_empty_reason(self):
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "rejected", "session_id": "s1"}
+        mock_resp.raise_for_status = MagicMock()
+        client.session.post.return_value = mock_resp
+
+        client.reject_plan("s1")
+
+        client.session.post.assert_called_once_with(
+            "http://localhost:3000/sessions/s1/plan/reject",
+            json={"reason": ""},
+        )
+
+    def test_plan_proposed_message_dataclass(self):
+        msg = PlanProposedMessage(plan="Do the thing", session_id="s42")
+        self.assertEqual(msg.type, "plan_proposed")
+        self.assertEqual(msg.plan, "Do the thing")
+        self.assertEqual(msg.session_id, "s42")
+
+    def test_plan_proposed_message_defaults(self):
+        msg = PlanProposedMessage()
+        self.assertEqual(msg.type, "plan_proposed")
+        self.assertEqual(msg.plan, "")
+        self.assertEqual(msg.session_id, "")
 
 
 if __name__ == "__main__":

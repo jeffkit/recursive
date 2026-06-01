@@ -1,7 +1,7 @@
 """Data models for Recursive Agent API responses."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional
 
 
 @dataclass
@@ -51,6 +51,8 @@ class SessionDetail:
     id: str
     created_at: str
     messages: List[Any]
+    status: str = "idle"
+    pending_plan: Optional[str] = None
 
 
 @dataclass
@@ -59,3 +61,12 @@ class MessageResponse:
 
     role: str
     content: str
+
+
+@dataclass
+class PlanProposedMessage:
+    """Emitted when the agent enters plan mode and proposes a plan."""
+
+    plan: str = ""
+    session_id: str = ""
+    type: Literal["plan_proposed"] = "plan_proposed"

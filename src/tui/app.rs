@@ -648,6 +648,9 @@ pub struct App {
     /// Whether the runtime permission hook is currently active.
     /// Toggled by `/permissions on|off`. Shared with the backend worker.
     pub permission_hook_enabled: Arc<AtomicBool>,
+    /// Goal-167: current task list maintained by `todo_write` calls.
+    /// Empty when no task list has been set this session.
+    pub current_todos: Vec<crate::tools::todo::TodoItem>,
 }
 
 // ── Goal-161: PendingPermission ──────────────────────────────────────────────
@@ -803,6 +806,7 @@ impl App {
             pending_permission: None,
             auto_allowed_tools: HashSet::new(),
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
+            current_todos: Vec::new(),
         }
     }
 
@@ -1394,6 +1398,10 @@ impl App {
                 self.blocks.push(TranscriptBlock::System {
                     text: format!("Plan rejected: {reason}"),
                 });
+            }
+            // Goal-167: replace the task list whenever the agent calls todo_write.
+            UiEvent::TodoUpdated { todos } => {
+                self.current_todos = todos;
             }
         }
         // Sticky-scroll: when the user is already at the bottom
