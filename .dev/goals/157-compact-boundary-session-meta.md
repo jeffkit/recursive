@@ -181,18 +181,25 @@ calls (pre-boundary messages were already resolved).
 
 ## Acceptance criteria
 
-- [ ] After compaction, `transcript.jsonl` contains a
+- [x] After compaction, `transcript.jsonl` contains a
       `{"type":"system","subtype":"compact_boundary"}` line.
-- [ ] `SessionReader::load_transcript` with default behavior returns
+- [x] `SessionReader::load_transcript` with default behavior returns
       only post-boundary messages; the pre-boundary segment is not
       allocated.
-- [ ] A session's `.meta.json` contains `first_prompt` and
+- [x] A session's `.meta.json` contains `first_prompt` and
       `last_prompt` after at least one user turn completes.
-- [ ] `first_prompt` / `last_prompt` are present in `.meta.json`
+- [x] `first_prompt` / `last_prompt` are present in `.meta.json`
       even if the session crashes before `finalize` is called.
-- [ ] `recursive sessions list` displays `last_prompt` as the
+- [x] `recursive sessions list` displays `last_prompt` as the
       session summary where available.
-- [ ] Old JSONL files without `compact_boundary` entries load
+- [x] Old JSONL files without `compact_boundary` entries load
       correctly (no boundary found → load everything).
-- [ ] `cargo test --all-targets` green; `cargo clippy -D warnings`
+- [x] `cargo test --all-targets` green; `cargo clippy -D warnings`
       green.
+
+## Status: COMPLETED (2026-06-01)
+
+CompactionBoundary emitted in `runtime.rs` BEFORE the summary message
+(so the summary is post-boundary). Boundary-skip logic in
+`SessionReader::load_transcript`. Verified by `tests/compact_boundary.rs`
+(5 tests, all green).

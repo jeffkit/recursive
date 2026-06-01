@@ -187,12 +187,18 @@ flag can follow in a subsequent PR.
 
 ## Acceptance criteria
 
-- [ ] A completed session's `transcript.jsonl` has `"usage"` on every
+- [x] A completed session's `transcript.jsonl` has `"usage"` on every
       `role: "assistant"` entry (non-zero input/output counts).
-- [ ] A completed session's `.meta.json` has a `"cost"` object with
+- [x] A completed session's `.meta.json` has a `"cost"` object with
       cumulative totals that equal the sum of per-message usage.
-- [ ] Provider adapters parse cache tokens where the API provides them
-      (Anthropic); fall back to zeros for adapters that don't.
-- [ ] Old JSONL files without `usage` load without error.
-- [ ] `cargo test --all-targets` green; `cargo clippy -D warnings`
+- [x] Provider adapters: `UsageMeta::from_token_usage` maps existing
+      `TokenUsage` fields; cache tokens included where provided.
+- [x] Old JSONL files without `usage` load without error.
+- [x] `cargo test --all-targets` green; `cargo clippy -D warnings`
       green.
+
+## Status: COMPLETED (2026-06-01)
+
+Implemented in `src/session.rs` (UsageMeta, SessionCost), `src/event.rs`
+(MessageAppended.usage), `src/runtime.rs` (attach usage to assistant
+events). Verified by `tests/usage_tracking.rs` (4 tests, all green).

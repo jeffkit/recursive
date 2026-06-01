@@ -175,16 +175,21 @@ let sub_rt = AgentRuntime::builder()
 
 ## Acceptance criteria
 
-- [ ] Every new `TranscriptEntry` in the JSONL has a non-empty `uuid`
+- [x] Every new `TranscriptEntry` in the JSONL has a non-empty `uuid`
       field (UUID v4 format).
-- [ ] `parent_uuid` of each entry (except root) equals the `uuid` of
+- [x] `parent_uuid` of each entry (except root) equals the `uuid` of
       the preceding entry in the same chain.
-- [ ] A subagent sharing a `SessionWriter` produces entries whose
+- [x] A subagent sharing a `SessionWriter` produces entries whose
       `parent_uuid` correctly points to the parent agent's last
       entry UUID, not to each other.
-- [ ] `SessionReader::load_transcript` returns a `uuid_index`
+- [x] `SessionReader::load_transcript_indexed` returns a `uuid_index`
       allowing O(1) lookup by UUID.
-- [ ] Old JSONL files without `uuid` fields load without error
+- [x] Old JSONL files without `uuid` fields load without error
       (missing UUID fields deserialized as empty string or None).
-- [ ] `cargo test --all-targets` green; `cargo clippy -D warnings`
+- [x] `cargo test --all-targets` green; `cargo clippy -D warnings`
       green.
+
+## Status: COMPLETED (2026-06-01)
+
+Implemented in commits `a875240` – `862f6cb`. All 6 acceptance criteria
+verified by `tests/uuid_chain.rs` (6 tests, all green).
