@@ -811,15 +811,13 @@ fn read_last_message_uuid(jsonl_path: &Path) -> Option<String> {
     let file = std::fs::File::open(jsonl_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut last = None;
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
-                if !entry.uuid.is_empty() {
-                    last = Some(entry.uuid);
-                }
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
+            if !entry.uuid.is_empty() {
+                last = Some(entry.uuid);
             }
         }
     }
