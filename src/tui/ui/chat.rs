@@ -98,6 +98,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Goal-158: @file completion popup.
     command_menu::render_atfile(frame, chunks[2], app);
 
+    // Goal-160: Ctrl+R history-search popup.
+    command_menu::render_history_search(frame, chunks[2], app);
+
     // Goal-146: modals are last so they cover everything else.
     if !app.modals.is_empty() {
         modal::render(frame, app);

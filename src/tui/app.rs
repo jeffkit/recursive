@@ -264,6 +264,11 @@ pub fn estimate_cost(
 /// mode, showing a file-completion popup. The query and suggestion
 /// list are stored separately in [`App`] (`atfile_query`,
 /// `atfile_suggestions`, `atfile_selected`) so this enum stays `Copy`.
+///
+/// Goal-160: added `HistorySearch` mode — triggered by `Ctrl+R` in
+/// Prompt mode, showing a fuzzy-search popup over submission history.
+/// Search state lives in `App` (`hsearch_query`, `hsearch_matches`,
+/// `hsearch_selected`) so this enum stays `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
     /// Default mode — submit goes to the LLM as a user message.
@@ -280,13 +285,16 @@ pub enum InputMode {
     /// `@`-triggered (Goal 158): shows a file-path completion popup.
     /// The completion query and candidates live in the parent [`App`].
     AtFile,
+    /// `Ctrl+R`-triggered (Goal 160): shows a fuzzy history-search
+    /// popup. Search state lives in the parent [`App`].
+    HistorySearch,
 }
 
 impl InputMode {
     /// Indicator character for the left of the input box.
     pub fn indicator(self) -> char {
         match self {
-            InputMode::Prompt | InputMode::AtFile => '❯',
+            InputMode::Prompt | InputMode::AtFile | InputMode::HistorySearch => '❯',
             InputMode::Bash => '!',
             InputMode::Note => '#',
             InputMode::Command => '/',
@@ -297,23 +305,22 @@ impl InputMode {
     /// that recalling them later restores the originating mode.
     pub fn history_prefix(self) -> &'static str {
         match self {
-            InputMode::Prompt | InputMode::AtFile => "",
+            InputMode::Prompt | InputMode::AtFile | InputMode::HistorySearch => "",
             InputMode::Bash => "!",
             InputMode::Note => "#",
             InputMode::Command => "/",
         }
     }
 
-    /// Cycle Prompt → Bash → Note → Prompt. Skips `Command` and
-    /// `AtFile` because those can only be reached by typing their
-    /// trigger character — matches fake-cc's behaviour.
+    /// Cycle Prompt → Bash → Note → Prompt. Skips `Command`, `AtFile`,
+    /// and `HistorySearch` because those can only be reached by typing
+    /// their trigger — matches fake-cc's behaviour.
     pub fn cycle_next(self) -> InputMode {
         match self {
             InputMode::Prompt => InputMode::Bash,
             InputMode::Bash => InputMode::Note,
             InputMode::Note => InputMode::Prompt,
-            // Cycling out of Command / AtFile goes to Prompt (defensive).
-            InputMode::Command | InputMode::AtFile => InputMode::Prompt,
+            InputMode::Command | InputMode::AtFile | InputMode::HistorySearch => InputMode::Prompt,
         }
     }
 }
@@ -619,10 +626,55 @@ pub struct App {
     /// Currently highlighted row in the AtFile popup. `None` means
     /// nothing is highlighted yet (typing narrows the list).
     pub atfile_selected: Option<usize>,
+    // ── Goal-160: Ctrl+R history search ──────────────────────────────
+    /// Current search query in HistorySearch mode.
+    pub hsearch_query: String,
+    /// Indices into `prompt.history` that match [`hsearch_query`],
+    /// in priority order (prefix matches first). Capped at
+    /// [`MAX_HSEARCH_RESULTS`].
+    pub hsearch_matches: Vec<usize>,
+    /// Currently highlighted row in the history-search popup.
+    pub hsearch_selected: usize,
 }
 
 /// Maximum candidates shown in the @file popup.
 pub const MAX_ATFILE_SUGGESTIONS: usize = 12;
+
+/// Maximum results shown in the Ctrl+R history-search popup.
+pub const MAX_HSEARCH_RESULTS: usize = 12;
+
+/// Fuzzy-search `history` for `query` (case-insensitive substring match).
+///
+/// Returns indices into `history` ordered by relevance: prefix matches come
+/// before substring matches. When `query` is empty, returns all indices in
+/// reverse insertion order (most-recent first). Results are capped at
+/// [`MAX_HSEARCH_RESULTS`].
+pub fn search_history(history: &[String], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        // All entries, most recent first.
+        let mut all: Vec<usize> = (0..history.len()).rev().collect();
+        all.truncate(MAX_HSEARCH_RESULTS);
+        return all;
+    }
+    let mut prefix: Vec<usize> = Vec::new();
+    let mut substr: Vec<usize> = Vec::new();
+    for (i, entry) in history.iter().enumerate() {
+        let lower = entry.to_lowercase();
+        if lower.starts_with(&q) {
+            prefix.push(i);
+        } else if lower.contains(&q) {
+            substr.push(i);
+        }
+    }
+    // Most recent prefix matches first, then most recent substr matches.
+    prefix.reverse();
+    substr.reverse();
+    let mut out = prefix;
+    out.extend(substr);
+    out.truncate(MAX_HSEARCH_RESULTS);
+    out
+}
 
 /// Enumerate workspace files matching `query` (case-insensitive prefix /
 /// substring match). Returns relative paths, newest-first within each
@@ -722,6 +774,9 @@ impl App {
             atfile_query: String::new(),
             atfile_suggestions: Vec::new(),
             atfile_selected: None,
+            hsearch_query: String::new(),
+            hsearch_matches: Vec::new(),
+            hsearch_selected: 0,
         }
     }
 
@@ -798,10 +853,37 @@ impl App {
             return None;
         }
 
+        // ── Ctrl+R: history search (Goal 160) ────────────────────────
+        // In Prompt mode, Ctrl+R enters HistorySearch. In
+        // HistorySearch mode, a second Ctrl+R moves down one match
+        // (bash-compatible). In other modes, it is a no-op.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            match self.prompt.mode {
+                InputMode::Prompt => {
+                    self.enter_history_search_mode();
+                    return None;
+                }
+                InputMode::HistorySearch => {
+                    // Cycle to next match.
+                    if !self.hsearch_matches.is_empty() {
+                        self.hsearch_selected =
+                            (self.hsearch_selected + 1) % self.hsearch_matches.len();
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         // ── Shift+Tab: cycle modes ───────────────────────────────────
         if key.code == KeyCode::BackTab {
             self.prompt.mode = self.prompt.mode.cycle_next();
             return None;
+        }
+
+        // ── History-search navigation (Goal 160) ─────────────────────
+        if self.prompt.mode == InputMode::HistorySearch {
+            return self.handle_history_search_key(key);
         }
 
         // ── @file autocomplete navigation (Goal 158) ─────────────────
@@ -1087,6 +1169,16 @@ impl App {
             // somehow reached here.
             InputMode::AtFile => {
                 self.exit_atfile_mode();
+                self.blocks
+                    .push(TranscriptBlock::User { text: body.clone() });
+                self.scroll_to_bottom();
+                self.start_turn();
+                Some(UserAction::SendMessage(body))
+            }
+            // HistorySearch intercepts Enter before submit_prompt.
+            // Treat defensively as Prompt.
+            InputMode::HistorySearch => {
+                self.exit_history_search_mode();
                 self.blocks
                     .push(TranscriptBlock::User { text: body.clone() });
                 self.scroll_to_bottom();
@@ -1498,6 +1590,95 @@ impl App {
                 self.atfile_query.push(c);
                 self.prompt.insert_char(c);
                 self.refresh_atfile_suggestions();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    // ── Goal-160: Ctrl+R history search ───────────────────────────────
+
+    /// Enter HistorySearch mode, clearing the search query and
+    /// pre-populating matches with all history entries (most recent first).
+    fn enter_history_search_mode(&mut self) {
+        self.prompt.mode = InputMode::HistorySearch;
+        self.hsearch_query.clear();
+        self.hsearch_selected = 0;
+        self.hsearch_matches = search_history(&self.prompt.history, "");
+    }
+
+    /// Refresh [`App::hsearch_matches`] from [`App::hsearch_query`].
+    fn refresh_hsearch_matches(&mut self) {
+        self.hsearch_matches = search_history(&self.prompt.history, &self.hsearch_query);
+        if self.hsearch_selected >= self.hsearch_matches.len().max(1) {
+            self.hsearch_selected = 0;
+        }
+    }
+
+    /// Fill the prompt buffer with the currently selected history entry
+    /// and return to Prompt mode.
+    fn commit_history_selection(&mut self) {
+        if let Some(&hist_idx) = self.hsearch_matches.get(self.hsearch_selected) {
+            if let Some(entry) = self.prompt.history.get(hist_idx) {
+                self.prompt.buffer = entry.clone();
+                self.prompt.cursor = self.prompt.buffer.len();
+            }
+        }
+        self.exit_history_search_mode();
+    }
+
+    /// Return to Prompt mode and clear search state.
+    fn exit_history_search_mode(&mut self) {
+        self.prompt.mode = InputMode::Prompt;
+        self.hsearch_query.clear();
+        self.hsearch_matches.clear();
+        self.hsearch_selected = 0;
+    }
+
+    /// Handle a key when [`InputMode::HistorySearch`] is active.
+    pub fn handle_history_search_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        match key.code {
+            KeyCode::Esc => {
+                self.exit_history_search_mode();
+                None
+            }
+            KeyCode::Enter => {
+                self.commit_history_selection();
+                None
+            }
+            KeyCode::Up => {
+                if !self.hsearch_matches.is_empty() && self.hsearch_selected > 0 {
+                    self.hsearch_selected -= 1;
+                }
+                None
+            }
+            KeyCode::Down => {
+                if !self.hsearch_matches.is_empty()
+                    && self.hsearch_selected + 1 < self.hsearch_matches.len()
+                {
+                    self.hsearch_selected += 1;
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                if self.hsearch_query.is_empty() {
+                    self.exit_history_search_mode();
+                } else {
+                    let last_len = self
+                        .hsearch_query
+                        .chars()
+                        .last()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                    let new_len = self.hsearch_query.len() - last_len;
+                    self.hsearch_query.truncate(new_len);
+                    self.refresh_hsearch_matches();
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                self.hsearch_query.push(c);
+                self.refresh_hsearch_matches();
                 None
             }
             _ => None,
@@ -3085,5 +3266,122 @@ mod atfile_tests {
         // Up again — deselects (None).
         app.handle_atfile_key(k(KeyCode::Up));
         assert_eq!(app.atfile_selected, None);
+    }
+}
+
+#[cfg(test)]
+mod hsearch_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn history_app(entries: &[&str]) -> App {
+        let mut app = App::new();
+        for e in entries {
+            app.prompt.history.push(e.to_string());
+        }
+        app
+    }
+
+    // ── search_history unit tests ──────────────────────────────────────
+
+    #[test]
+    fn history_search_empty_query_returns_all_reversed() {
+        let h = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let r = search_history(&h, "");
+        // Most recent first: indices 2,1,0.
+        assert_eq!(r, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn history_search_prefix_match_ranked_first() {
+        let h = vec![
+            "foo bar".to_string(),
+            "zz foo".to_string(),
+            "foobar".to_string(),
+        ];
+        let r = search_history(&h, "foo");
+        // Entries 0 and 2 start with "foo"; entry 1 is a substring match.
+        // Prefix matches come first; within prefix group, reversed = 2 then 0.
+        assert!(r.iter().position(|&x| x == 2) < r.iter().position(|&x| x == 1));
+        assert!(r.iter().position(|&x| x == 0) < r.iter().position(|&x| x == 1));
+    }
+
+    #[test]
+    fn history_search_case_insensitive() {
+        let h = vec!["Hello World".to_string(), "goodbye".to_string()];
+        let r = search_history(&h, "hello");
+        assert!(r.contains(&0));
+        assert!(!r.contains(&1));
+    }
+
+    #[test]
+    fn history_search_returns_at_most_12() {
+        let h: Vec<String> = (0..20).map(|i| format!("entry {i}")).collect();
+        let r = search_history(&h, "entry");
+        assert!(r.len() <= MAX_HSEARCH_RESULTS);
+    }
+
+    // ── App integration tests ──────────────────────────────────────────
+
+    #[test]
+    fn ctrl_r_in_prompt_mode_enters_history_search() {
+        let mut app = history_app(&["hello", "world"]);
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        app.handle_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(app.prompt.mode, InputMode::HistorySearch);
+        // All entries pre-loaded.
+        assert_eq!(app.hsearch_matches.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_r_in_bash_mode_no_op() {
+        let mut app = history_app(&["hello"]);
+        app.prompt.mode = InputMode::Bash;
+        app.handle_key(ctrl(KeyCode::Char('r')));
+        // Should stay in Bash mode, not HistorySearch.
+        assert_eq!(app.prompt.mode, InputMode::Bash);
+    }
+
+    #[test]
+    fn history_search_enter_fills_buffer() {
+        let mut app = history_app(&["cargo build", "cargo test"]);
+        app.handle_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(app.prompt.mode, InputMode::HistorySearch);
+        // With empty query, most recent first: index 1 ("cargo test") selected.
+        assert_eq!(app.hsearch_selected, 0);
+        // Press Enter → fill buffer with the selected entry.
+        app.handle_history_search_key(k(KeyCode::Enter));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert_eq!(app.prompt.buffer, "cargo test");
+    }
+
+    #[test]
+    fn history_search_esc_cancels() {
+        let mut app = history_app(&["hello"]);
+        app.handle_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(app.prompt.mode, InputMode::HistorySearch);
+        app.handle_history_search_key(k(KeyCode::Esc));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        // Buffer should be unchanged.
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    #[test]
+    fn history_search_backspace_on_empty_exits_mode() {
+        let mut app = history_app(&["hello"]);
+        app.handle_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(app.prompt.mode, InputMode::HistorySearch);
+        assert!(app.hsearch_query.is_empty());
+        // Backspace on empty query exits HistorySearch.
+        app.handle_history_search_key(k(KeyCode::Backspace));
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
     }
 }

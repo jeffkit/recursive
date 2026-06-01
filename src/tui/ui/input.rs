@@ -123,6 +123,7 @@ fn indicator_style(mode: InputMode) -> Style {
         InputMode::Note => Color::DarkGray,
         InputMode::Command => Color::Magenta,
         InputMode::AtFile => Color::Cyan,
+        InputMode::HistorySearch => Color::LightGreen,
     };
     Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
@@ -135,6 +136,7 @@ fn input_box_title(mode: InputMode) -> &'static str {
         InputMode::Note => " Note ",
         InputMode::Command => " Command ",
         InputMode::AtFile => " @File ",
+        InputMode::HistorySearch => " 🔍 History Search ",
     }
 }
 
@@ -176,6 +178,9 @@ pub fn footer_hint(mode: InputMode) -> String {
             "⏎ run command  tab autocomplete  ↑↓ history  ctrl+b/f or wheel scroll".into()
         }
         InputMode::AtFile => "⏎/tab confirm  ↑↓ select  backspace edit  esc cancel".into(),
+        InputMode::HistorySearch => {
+            "⏎ confirm  ↑↓ select  ctrl+r next  backspace edit  esc cancel".into()
+        }
     }
 }
 

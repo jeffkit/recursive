@@ -176,6 +176,66 @@ pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
     frame.render_widget(para, area);
 }
 
+/// Render the Ctrl+R history-search popup (Goal 160). No-op when not in
+/// HistorySearch mode or when there are no matches to show.
+pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
+    if app.prompt.mode != crate::app::InputMode::HistorySearch {
+        return;
+    }
+    // Always show the popup (even when matches is empty) so the user
+    // can see the search box with the current query.
+    let match_count = app.hsearch_matches.len();
+    let visible_count = match_count.clamp(1, MAX_VISIBLE);
+    let Some(area) = popup_rect(input_area, visible_count, frame.area()) else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+    let empty_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+
+    let lines: Vec<Line<'static>> = if app.hsearch_matches.is_empty() {
+        vec![Line::from(Span::styled(" (no matches) ", empty_style))]
+    } else {
+        let history = &app.prompt.history;
+        app.hsearch_matches
+            .iter()
+            .take(MAX_VISIBLE)
+            .enumerate()
+            .map(|(i, &hist_idx)| {
+                let entry = history.get(hist_idx).map(String::as_str).unwrap_or("");
+                // Truncate long entries to 60 chars.
+                let display = if entry.len() > 60 {
+                    format!(" {}… ", &entry[..57])
+                } else {
+                    format!(" {} ", entry)
+                };
+                let style = if i == app.hsearch_selected {
+                    selected_style
+                } else {
+                    normal_style
+                };
+                Line::from(Span::styled(display, style))
+            })
+            .collect()
+    };
+
+    let title = format!(" 🔍 {} ", app.hsearch_query);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightGreen))
+        .title(title)
+        .style(Style::default().bg(Color::Black));
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, area);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
