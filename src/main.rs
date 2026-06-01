@@ -921,7 +921,7 @@ fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyhow::Result<(
     // Replay the legacy transcript through `append` (no filter —
     // we keep system messages for round-trip fidelity).
     for msg in legacy.messages() {
-        writer.append(msg)?;
+        writer.append(msg, None, None)?;
     }
     let session_dir = writer.session_dir().to_path_buf();
     writer.finish("interrupted").ok();

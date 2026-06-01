@@ -164,7 +164,11 @@ impl AgentRuntime {
         let user_msg = Message::user(user_text.clone());
         self.transcript.push(user_msg.clone());
         self.event_sink
-            .emit(AgentEvent::MessageAppended { message: user_msg })
+            .emit(AgentEvent::MessageAppended {
+                message: user_msg,
+                parent_uuid: None, // g155: SessionWriter manages the chain
+                usage: None,       // g156: user messages have no usage
+            })
             .await;
 
         // Cross-turn compaction: summarize old messages if transcript is too large.
@@ -173,7 +177,9 @@ impl AgentRuntime {
         // The compaction summary message is emitted as `MessageAppended` so it lands
         // in the on-disk jsonl as an append (the jsonl is append-only; the in-memory
         // drain/insert does not retroactively rewrite it).
-        let mut compaction_summary: Option<Message> = None;
+        // A `CompactionBoundary` event is also emitted (g157) so the reader can
+        // skip pre-compaction messages on resume.
+        let mut compaction_event: Option<(Message, usize)> = None;
         if let Some(ref compactor) = self.compactor {
             let chars = Compactor::estimate_chars(&self.transcript);
             if chars >= compactor.threshold_chars
@@ -188,14 +194,27 @@ impl AgentRuntime {
                 {
                     split -= 1;
                 }
-                compaction_summary = Some(summary_msg.clone());
+                let removed = split;
+                compaction_event = Some((summary_msg.clone(), removed));
                 self.transcript.drain(..split);
                 self.transcript.insert(0, summary_msg);
             }
         }
-        if let Some(summary) = compaction_summary {
+        if let Some((summary, removed)) = compaction_event {
             self.event_sink
-                .emit(AgentEvent::MessageAppended { message: summary })
+                .emit(AgentEvent::MessageAppended {
+                    message: summary,
+                    parent_uuid: None, // g155
+                    usage: None,       // g156: compaction summaries have no usage
+                })
+                .await;
+            // g157: emit boundary marker so the JSONL reader can skip pre-compaction msgs.
+            self.event_sink
+                .emit(AgentEvent::CompactionBoundary {
+                    turn: self.turn_index as u32,
+                    compacted_count: removed,
+                    summary_uuid: None, // SessionWriter knows the UUID it just assigned
+                })
                 .await;
         }
 
@@ -244,12 +263,22 @@ impl AgentRuntime {
         }
 
         // Append new messages to transcript and emit MessageAppended for each.
+        // For assistant messages, attach the turn's token usage (g156).
         let new_messages = turn_outcome.new_messages.clone();
+        let turn_usage =
+            crate::session::UsageMeta::from_token_usage(&turn_outcome.usage);
         self.transcript.extend(new_messages.iter().cloned());
         for msg in &new_messages {
+            let usage = if matches!(msg.role, crate::message::Role::Assistant) {
+                Some(turn_usage.clone())
+            } else {
+                None
+            };
             self.event_sink
                 .emit(AgentEvent::MessageAppended {
                     message: msg.clone(),
+                    parent_uuid: None, // g155: SessionWriter manages the chain
+                    usage,             // g156
                 })
                 .await;
         }
@@ -614,6 +643,12 @@ pub struct AgentRuntimeBuilder {
     planning_mode: PlanningMode,
     saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
+    /// UUID of the parent agent's last message. When set, the first
+    /// `MessageAppended` event will carry this as `parent_uuid`, branching
+    /// the subagent's messages off that point in the conversation tree (g155).
+    /// Stored here for future multi-agent orchestration; not yet wired to
+    /// the actual event emission path.
+    pub parent_agent_last_uuid: Option<String>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -654,7 +689,19 @@ impl AgentRuntimeBuilder {
             planning_mode: PlanningMode::Immediate,
             saved_event_sink: None,
             compactor: None,
+            parent_agent_last_uuid: None,
         }
+    }
+
+    /// Set the UUID of the parent agent's last message.
+    ///
+    /// When set, this runtime's messages will be stamped with this UUID as
+    /// `parent_uuid` on their first `MessageAppended` event, branching the
+    /// subagent chain off the given point in the parent's conversation tree
+    /// (g155). Currently stored for future multi-agent orchestration.
+    pub fn parent_agent_last_uuid(mut self, uuid: impl Into<String>) -> Self {
+        self.parent_agent_last_uuid = Some(uuid.into());
+        self
     }
 
     /// Set the LLM provider (required).

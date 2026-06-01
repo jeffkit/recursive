@@ -527,6 +527,9 @@ impl SessionWriter {
             message_count: 0,
             status: "active".to_string(),
             tool_registry_hash,
+            first_prompt: None,
+            last_prompt: None,
+            cost: None,
         };
 
         // Write initial meta file
@@ -1798,25 +1801,30 @@ mod tests {
 
         let mut writer = SessionWriter::create(ws, "test", "gpt-4o", "openai").unwrap();
 
-        let id1 = writer.append(&Message::user("hello")).unwrap();
-        assert_eq!(id1, "msg_001");
+        let id1 = writer.append(&Message::user("hello"), None, None).unwrap();
+        // append now returns a UUID v4 (g155); just verify it's unique and non-empty
+        assert_eq!(id1.len(), 36, "uuid should be 36 chars");
 
-        let id2 = writer.append(&Message::assistant("hi there")).unwrap();
-        assert_eq!(id2, "msg_002");
+        let id2 = writer.append(&Message::assistant("hi there"), None, None).unwrap();
+        assert_eq!(id2.len(), 36);
+        assert_ne!(id1, id2, "each message gets a unique uuid");
 
         let session_dir = writer.session_dir().to_path_buf();
         writer.finish("completed").unwrap();
 
-        // Load and verify
+        // Load and verify — sequential id/parent_id are still written (g155 compat)
         let entries = SessionReader::load_transcript(&session_dir).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "msg_001");
         assert_eq!(entries[0].parent_id, None);
+        assert_eq!(entries[0].parent_uuid, None, "root has no parent_uuid");
+        assert!(!entries[0].uuid.is_empty(), "uuid must be present");
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[0].content, "hello");
 
         assert_eq!(entries[1].id, "msg_002");
         assert_eq!(entries[1].parent_id, Some("msg_001".to_string()));
+        assert_eq!(entries[1].parent_uuid, Some(entries[0].uuid.clone()), "parent_uuid points to first entry");
         assert_eq!(entries[1].role, "assistant");
         assert_eq!(entries[1].content, "hi there");
     }
@@ -1828,9 +1836,9 @@ mod tests {
 
         let mut writer = SessionWriter::create(ws, "round trip", "gpt-4o", "openai").unwrap();
 
-        writer.append(&Message::system("You are a bot.")).unwrap();
-        writer.append(&Message::user("do something")).unwrap();
-        writer.append(&Message::assistant("I will do it.")).unwrap();
+        writer.append(&Message::system("You are a bot."), None, None).unwrap();
+        writer.append(&Message::user("do something"), None, None).unwrap();
+        writer.append(&Message::assistant("I will do it."), None, None).unwrap();
 
         let session_dir = writer.session_dir().to_path_buf();
         writer.finish("completed").unwrap();
@@ -1848,8 +1856,8 @@ mod tests {
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "meta test", "gpt-4o", "openai").unwrap();
-        writer.append(&Message::user("msg1")).unwrap();
-        writer.append(&Message::assistant("msg2")).unwrap();
+        writer.append(&Message::user("msg1"), None, None).unwrap();
+        writer.append(&Message::assistant("msg2"), None, None).unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         writer.finish("completed").unwrap();
 
@@ -1883,7 +1891,7 @@ mod tests {
         let ws = tmp.path();
 
         let mut writer = SessionWriter::create(ws, "crash test", "gpt-4o", "openai").unwrap();
-        writer.append(&Message::user("good line")).unwrap();
+        writer.append(&Message::user("good line"), None, None).unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         writer.finish("crashed").unwrap();
 
@@ -1932,13 +1940,13 @@ mod tests {
         let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
         // Sequence: system, user(turn 0), assistant, user(turn 1),
         // assistant, user(turn 2), assistant.
-        w.append(&Message::system("sys".to_string())).unwrap();
-        w.append(&Message::user("u0".to_string())).unwrap();
-        w.append(&Message::assistant("a0".to_string())).unwrap();
-        w.append(&Message::user("u1".to_string())).unwrap();
-        w.append(&Message::assistant("a1".to_string())).unwrap();
-        w.append(&Message::user("u2".to_string())).unwrap();
-        w.append(&Message::assistant("a2".to_string())).unwrap();
+        w.append(&Message::system("sys".to_string()), None, None).unwrap();
+        w.append(&Message::user("u0".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None).unwrap();
+        w.append(&Message::user("u1".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a1".to_string()), None, None).unwrap();
+        w.append(&Message::user("u2".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a2".to_string()), None, None).unwrap();
         w.finish("done").unwrap();
 
         let session_dir = w.session_dir().to_path_buf();
@@ -1965,9 +1973,9 @@ mod tests {
     fn truncate_transcript_to_zero_drops_all_turns_keeps_system() {
         let dir = crate::test_util::IsolatedWorkspace::new();
         let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
-        w.append(&Message::system("sys".to_string())).unwrap();
-        w.append(&Message::user("u0".to_string())).unwrap();
-        w.append(&Message::assistant("a0".to_string())).unwrap();
+        w.append(&Message::system("sys".to_string()), None, None).unwrap();
+        w.append(&Message::user("u0".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None).unwrap();
         w.finish("done").unwrap();
         let session_dir = w.session_dir().to_path_buf();
 
@@ -2000,9 +2008,9 @@ mod tests {
         let mut writer = SessionWriter::create(ws, "g151 test", "model", "openai").unwrap();
         let session_dir = writer.session_dir().to_path_buf();
 
-        writer.append(&Message::user("hello".to_string())).unwrap();
+        writer.append(&Message::user("hello".to_string()), None, None).unwrap();
         writer
-            .append(&Message::assistant("hi back".to_string()))
+            .append(&Message::assistant("hi back".to_string()), None, None)
             .unwrap();
         writer.finish("success").unwrap();
         drop(writer);
@@ -2090,7 +2098,7 @@ mod tests {
         // to the second.
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        writer.append(&Message::user("ping".to_string())).unwrap();
+        writer.append(&Message::user("ping".to_string()), None, None).unwrap();
 
         let meta_after = SessionReader::load_meta(&session_dir).unwrap();
         assert_ne!(
@@ -2107,11 +2115,11 @@ mod tests {
         let mut writer = SessionWriter::create(ws, "resume-num", "model", "openai").unwrap();
         let session_dir = writer.session_dir().to_path_buf();
 
-        writer.append(&Message::user("u1".to_string())).unwrap();
+        writer.append(&Message::user("u1".to_string()), None, None).unwrap();
         writer
-            .append(&Message::assistant("a1".to_string()))
+            .append(&Message::assistant("a1".to_string()), None, None)
             .unwrap();
-        writer.append(&Message::user("u2".to_string())).unwrap();
+        writer.append(&Message::user("u2".to_string()), None, None).unwrap();
         // Drop the writer WITHOUT calling finish() — the lock file is
         // released on Drop, but we never marked the session done.
         drop(writer);
@@ -2119,9 +2127,10 @@ mod tests {
         // Re-open and append more.
         let mut writer2 = SessionWriter::open_existing(&session_dir).unwrap();
         let id = writer2
-            .append(&Message::assistant("a2".to_string()))
+            .append(&Message::assistant("a2".to_string()), None, None)
             .unwrap();
-        assert_eq!(id, "msg_004");
+        // append now returns a UUID; just verify it's non-empty
+        assert!(!id.is_empty(), "expected non-empty UUID from append");
         drop(writer2);
 
         let entries = SessionReader::load_transcript(&session_dir).unwrap();
@@ -2256,6 +2265,8 @@ mod tests {
         };
         sink.emit(AgentEvent::MessageAppended {
             message: msg.clone(),
+            parent_uuid: None,
+            usage: None,
         })
         .await;
 
@@ -2299,6 +2310,8 @@ mod tests {
         // This must not panic even though the mutex is poisoned.
         sink.emit(AgentEvent::MessageAppended {
             message: Message::user("after poison"),
+            parent_uuid: None,
+            usage: None,
         })
         .await;
 
