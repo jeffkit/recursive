@@ -447,6 +447,38 @@ async fn main() -> anyhow::Result<()> {
                     Arc::new(openai)
                 }
             };
+            // Goal-169: build the slash command list from built-in TUI commands +
+            // workspace skill files. Guarded by the `tui` feature since
+            // CommandRegistry lives in the tui module.
+            #[cfg(feature = "tui")]
+            let slash_commands: Vec<recursive::http::SlashCommandInfo> = {
+                let registry = recursive::tui::commands::CommandRegistry::default_set();
+                let mut cmds: Vec<recursive::http::SlashCommandInfo> = registry
+                    .commands()
+                    .iter()
+                    .map(|c| recursive::http::SlashCommandInfo {
+                        name: c.name.to_string(),
+                        description: c.summary.to_string(),
+                        source: "builtin".to_string(),
+                        aliases: c.aliases.iter().map(|a| a.to_string()).collect(),
+                        argument_hint: String::new(),
+                    })
+                    .collect();
+                let workspace = std::env::current_dir().unwrap_or_default();
+                let skills = recursive::tui::skill_commands::SkillCommandLoader::load(&workspace);
+                for skill in skills {
+                    cmds.push(recursive::http::SlashCommandInfo {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                        source: "skill".to_string(),
+                        aliases: skill.aliases.clone(),
+                        argument_hint: skill.argument_hint.clone(),
+                    });
+                }
+                cmds
+            };
+            #[cfg(not(feature = "tui"))]
+            let slash_commands: Vec<recursive::http::SlashCommandInfo> = Vec::new();
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -459,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
                     std::collections::HashMap::new(),
                 )),
                 metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
+                slash_commands: std::sync::Arc::new(slash_commands),
             };
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -144,6 +144,33 @@ pub enum AgentEvent {
     TodoUpdated {
         todos: Vec<crate::tools::todo::TodoItem>,
     },
+
+    // ── Goal-168: /goal condition-based autonomous loop ──────────────
+    /// A `/goal` was set for this session.
+    GoalSet {
+        /// The completion condition as written by the user.
+        condition: String,
+        /// Hard cap on autonomous turns.
+        max_turns: u32,
+    },
+    /// The judge evaluated the condition and found it not yet met.
+    /// The loop will continue with another turn.
+    GoalContinuing {
+        /// The judge's explanation for why the condition is not yet met.
+        reason: String,
+        /// Number of turns elapsed so far.
+        turns: u32,
+    },
+    /// The judge evaluated the condition and confirmed it is met.
+    GoalAchieved {
+        /// The original condition string.
+        condition: String,
+        /// Total turns taken to reach the goal.
+        turns: u32,
+    },
+    /// The active goal was cleared — either by `/goal clear`, turn-budget
+    /// exhaustion, or an explicit `DELETE /sessions/:id/goal` call.
+    GoalCleared,
 }
 
 // ---------------------------------------------------------------------------

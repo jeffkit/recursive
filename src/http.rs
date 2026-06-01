@@ -492,6 +492,39 @@ pub struct SessionDetailResponse {
     pub status: String,
     /// Non-null when `status` is `"plan_pending_approval"`.
     pub pending_plan: Option<String>,
+    /// Goal-168: active goal state, or `null` when no goal is set.
+    pub goal: Option<crate::runtime::GoalState>,
+}
+
+// ── Goal-168: goal endpoint types ────────────────────────────────────────
+
+/// Request body for `POST /sessions/:id/goal`.
+#[derive(serde::Deserialize, Debug)]
+pub struct SetGoalRequest {
+    /// The completion condition (free-form text).
+    pub condition: String,
+    /// Hard cap on autonomous turns. Defaults to 20.
+    pub max_turns: Option<u32>,
+}
+
+/// Response body for goal mutation endpoints.
+#[derive(serde::Serialize, Debug)]
+pub struct GoalResponse {
+    pub status: String,
+}
+
+// ── Goal-169: slash commands endpoint types ───────────────────────────────
+
+/// One slash command entry in `GET /slash-commands`.
+#[derive(Clone, serde::Serialize, Debug)]
+pub struct SlashCommandInfo {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub argument_hint: String,
 }
 
 // ── SSE event types ──────────────────────────────────────────────────────
@@ -513,6 +546,10 @@ pub enum SseEvent {
     Error { message: String },
     /// Agent proposed a plan and is waiting for human review.
     PlanProposed { plan: String },
+    /// Goal-168: judge found condition not yet met; loop continues.
+    GoalContinuing { reason: String, turns: u32 },
+    /// Goal-168: judge confirmed condition met.
+    GoalAchieved { condition: String, turns: u32 },
 }
 
 // ── App state ──────────────────────────────────────────────────────────────
@@ -532,6 +569,9 @@ pub struct AppState {
     /// Per-session SSE broadcast channels.
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseEvent>>>>,
     pub metrics: Arc<Metrics>,
+    /// Goal-169: registered slash commands (built-in + skill-backed).
+    /// Pre-built at startup for cheap `GET /slash-commands` responses.
+    pub slash_commands: Arc<Vec<SlashCommandInfo>>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -630,6 +670,14 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/events", get(session_events))
         .route("/sessions/{id}/plan/confirm", post(session_plan_confirm))
         .route("/sessions/{id}/plan/reject", post(session_plan_reject))
+        // Goal-168: goal loop endpoints.
+        .route("/sessions/{id}/goal", post(session_set_goal))
+        .route(
+            "/sessions/{id}/goal",
+            axum::routing::delete(session_clear_goal),
+        )
+        // Goal-169: slash commands listing.
+        .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
         .route("/openapi.json", get(openapi_spec))
         .route("/metrics", get(metrics_handler))
@@ -1296,8 +1344,8 @@ async fn get_session(
         "idle".to_string()
     };
 
-    // Try a non-blocking lock for messages/todos; fall back to empty when busy.
-    let (messages, todos) = match session.runtime.try_lock() {
+    // Try a non-blocking lock for messages/todos/goal; fall back to empty when busy.
+    let (messages, todos, goal) = match session.runtime.try_lock() {
         Ok(runtime) => {
             let msgs = runtime
                 .transcript()
@@ -1305,9 +1353,10 @@ async fn get_session(
                 .filter_map(|msg| serde_json::to_value(msg).ok())
                 .collect();
             let todos = runtime.current_todos();
-            (msgs, todos)
+            let goal = runtime.current_goal();
+            (msgs, todos, goal)
         }
-        Err(_) => (vec![], vec![]),
+        Err(_) => (vec![], vec![], None),
     };
 
     Ok(Json(SessionDetailResponse {
@@ -1317,6 +1366,7 @@ async fn get_session(
         todos,
         status,
         pending_plan,
+        goal,
     }))
 }
 
@@ -1413,6 +1463,95 @@ async fn session_plan_reject(
         StatusCode::OK,
         Json(serde_json::json!({"status": "rejected", "session_id": session_id})),
     )
+}
+
+// ── Goal-168: goal endpoints ──────────────────────────────────────────────
+
+/// POST /sessions/:id/goal — start a condition-based autonomous loop.
+async fn session_set_goal(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<SetGoalRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let runtime_arc = {
+        let sessions = state.sessions.read().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "session not found"})),
+            );
+        };
+        session.runtime.clone()
+    };
+
+    let condition = body.condition.clone();
+    let max_turns = body.max_turns.unwrap_or(20);
+
+    // Lock runtime and set goal state (non-blocking; loop runs in background).
+    match runtime_arc.try_lock() {
+        Ok(runtime) => {
+            runtime.set_goal(condition, max_turns).await;
+        }
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "session runtime is busy"})),
+            );
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "pursuing", "session_id": session_id})),
+    )
+}
+
+/// DELETE /sessions/:id/goal — clear the active goal.
+async fn session_clear_goal(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let sessions = state.sessions.read().await;
+    let Some(session) = sessions.get(&session_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        );
+    };
+
+    match session.runtime.try_lock() {
+        Ok(runtime) => {
+            runtime.clear_goal().await;
+        }
+        Err(_) => {
+            // Runtime is busy; force-clear via the shared goal_state.
+            let _ = runtime_goal_state_clear(&session.runtime).await;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "cleared", "session_id": session_id})),
+    )
+}
+
+/// Force-clear goal state when the runtime Mutex is held.
+async fn runtime_goal_state_clear(runtime: &Arc<tokio::sync::Mutex<AgentRuntime>>) {
+    // Best-effort: try up to 5 times with a small delay.
+    for _ in 0..5u8 {
+        if let Ok(rt) = runtime.try_lock() {
+            rt.clear_goal().await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+// ── Goal-169: slash commands endpoint ─────────────────────────────────────
+
+/// GET /slash-commands — list all registered slash commands.
+async fn list_slash_commands(State(state): State<Arc<AppState>>) -> Json<Vec<SlashCommandInfo>> {
+    Json((*state.slash_commands).clone())
 }
 
 /// POST /sessions/:id/messages — send a message in a session.
@@ -1528,6 +1667,8 @@ async fn session_events(
                 SseEvent::Done { .. } => "done",
                 SseEvent::Error { .. } => "error",
                 SseEvent::PlanProposed { .. } => "plan_proposed",
+                SseEvent::GoalContinuing { .. } => "goal_continuing",
+                SseEvent::GoalAchieved { .. } => "goal_achieved",
             };
             let data = serde_json::to_string(&sse_event).unwrap_or_default();
             Some(Ok(Event::default().event(event_type).data(data)))
@@ -1562,6 +1703,15 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
         }),
         AgentEvent::PlanProposed { plan_text, .. } => Some(SseEvent::PlanProposed {
             plan: plan_text.clone(),
+        }),
+        // Goal-168: forward goal-loop progress events.
+        AgentEvent::GoalContinuing { reason, turns } => Some(SseEvent::GoalContinuing {
+            reason: reason.clone(),
+            turns: *turns,
+        }),
+        AgentEvent::GoalAchieved { condition, turns } => Some(SseEvent::GoalAchieved {
+            condition: condition.clone(),
+            turns: *turns,
         }),
         // AssistantText, Latency, Usage, Compacted, PlanConfirmed, PlanRejected
         // don't have SSE equivalents.

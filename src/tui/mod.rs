@@ -5,6 +5,7 @@ pub mod commands;
 pub mod events;
 pub mod keymap;
 pub mod runtime_builder;
+pub mod skill_commands;
 pub mod ui;
 
 use std::io;

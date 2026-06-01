@@ -70,3 +70,40 @@ class PlanProposedMessage:
     plan: str = ""
     session_id: str = ""
     type: Literal["plan_proposed"] = "plan_proposed"
+
+
+# ── Goal-168: goal-loop models ──────────────────────────────────────────────
+
+@dataclass
+class GoalState:
+    """Active goal loop state for a session."""
+
+    condition: str
+    status: str  # "pursuing" | "achieved" | "cleared"
+    turns: int
+    max_turns: int
+    last_reason: Optional[str] = None
+
+
+@dataclass
+class SessionDetailWithGoal(SessionDetail):
+    """Session detail including the active goal (Goal-168)."""
+
+    goal: Optional[GoalState] = None
+
+    def __post_init__(self):
+        if isinstance(self.goal, dict):
+            self.goal = GoalState(**self.goal)
+
+
+# ── Goal-169: slash-command models ─────────────────────────────────────────
+
+@dataclass
+class SlashCommandInfo:
+    """A registered slash command (built-in or skill-backed)."""
+
+    name: str
+    description: str
+    source: str  # "builtin" | "skill"
+    aliases: List[str] = field(default_factory=list)
+    argument_hint: str = ""
