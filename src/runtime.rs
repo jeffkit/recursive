@@ -201,19 +201,22 @@ impl AgentRuntime {
             }
         }
         if let Some((summary, removed)) = compaction_event {
+            // g157: emit the boundary marker FIRST so the reader knows to discard
+            // everything before it in the JSONL. The summary message that follows
+            // immediately after the marker is the first post-compaction entry.
+            self.event_sink
+                .emit(AgentEvent::CompactionBoundary {
+                    turn: self.turn_index as u32,
+                    compacted_count: removed,
+                    summary_uuid: None,
+                })
+                .await;
+            // Then write the summary message (it's post-boundary, will be kept on load).
             self.event_sink
                 .emit(AgentEvent::MessageAppended {
                     message: summary,
                     parent_uuid: None, // g155
                     usage: None,       // g156: compaction summaries have no usage
-                })
-                .await;
-            // g157: emit boundary marker so the JSONL reader can skip pre-compaction msgs.
-            self.event_sink
-                .emit(AgentEvent::CompactionBoundary {
-                    turn: self.turn_index as u32,
-                    compacted_count: removed,
-                    summary_uuid: None, // SessionWriter knows the UUID it just assigned
                 })
                 .await;
         }

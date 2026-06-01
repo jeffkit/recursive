@@ -1,4 +1,4 @@
-# Goal 158 — TUI: @file 自动补全
+# Goal 158 — TUI: @file 自动补全  ✅ DONE
 
 **Roadmap**: TUI 体验提升系列 (part 1/4)
 
