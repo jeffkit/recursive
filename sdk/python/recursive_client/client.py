@@ -5,11 +5,13 @@ from typing import List, Optional
 import requests
 
 from .models import (
+    GoalState,
     MessageResponse,
     PlanProposedMessage,
     RunResponse,
     SessionDetail,
     SessionInfo,
+    SlashCommandInfo,
     ToolInfo,
 )
 
@@ -74,10 +76,18 @@ class RecursiveClient:
         return MessageResponse(**resp.json())
 
     def get_session(self, session_id: str) -> SessionDetail:
-        """Get session detail with messages."""
+        """Get session detail with messages (may include ``goal`` field)."""
         resp = self.session.get(f"{self.base_url}/sessions/{session_id}")
         resp.raise_for_status()
-        return SessionDetail(**resp.json())
+        data = resp.json()
+        # Strip unknown fields so SessionDetail can be constructed safely.
+        known = {k: v for k, v in data.items() if k in ("id", "created_at", "messages", "status", "pending_plan")}
+        detail = SessionDetail(**known)
+        # Attach raw goal data so callers can access it via detail.__dict__.
+        raw_goal = data.get("goal")
+        if raw_goal is not None:
+            detail.__dict__["goal"] = raw_goal
+        return detail
 
     def delete_session(self, session_id: str) -> None:
         """Delete a session."""
@@ -122,3 +132,86 @@ class RecursiveClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    # ── Goal-168: goal-loop ─────────────────────────────────────────────────
+
+    def set_goal(
+        self,
+        session_id: str,
+        condition: str,
+        max_turns: int = 20,
+    ) -> dict:
+        """
+        Start a condition-based autonomous loop for a session.
+
+        The server will run agent turns and evaluate the condition after each
+        one until the condition is met or ``max_turns`` is exhausted.
+
+        Args:
+            session_id: The session ID.
+            condition: Natural-language completion condition.
+            max_turns: Hard cap on autonomous turns (default 20).
+
+        Returns:
+            ``{"status": "pursuing", "session_id": ...}``
+        """
+        resp = self.session.post(
+            f"{self.base_url}/sessions/{session_id}/goal",
+            json={"condition": condition, "max_turns": max_turns},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def clear_goal(self, session_id: str) -> dict:
+        """
+        Clear the active goal for a session.
+
+        Args:
+            session_id: The session ID.
+
+        Returns:
+            ``{"status": "cleared", "session_id": ...}``
+        """
+        resp = self.session.delete(f"{self.base_url}/sessions/{session_id}/goal")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_goal(self, session_id: str) -> Optional[GoalState]:
+        """
+        Get the active goal for a session, or ``None`` if no goal is set.
+
+        Args:
+            session_id: The session ID.
+
+        Returns:
+            :class:`GoalState` or ``None``.
+        """
+        detail = self.get_session(session_id)
+        raw = detail.__dict__.get("goal")
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return GoalState(**raw)
+        return raw
+
+    # ── Goal-169: slash commands ────────────────────────────────────────────
+
+    def list_slash_commands(self) -> List[SlashCommandInfo]:
+        """
+        List all registered slash commands (built-in and skill-backed).
+
+        Returns:
+            List of :class:`SlashCommandInfo` objects.
+        """
+        resp = self.session.get(f"{self.base_url}/slash-commands")
+        resp.raise_for_status()
+        return [
+            SlashCommandInfo(
+                name=c["name"],
+                description=c["description"],
+                source=c["source"],
+                aliases=c.get("aliases", []),
+                argument_hint=c.get("argument_hint", ""),
+            )
+            for c in resp.json()
+        ]

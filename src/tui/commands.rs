@@ -1,7 +1,8 @@
-//! Slash-command registry and the 10 core commands (Goal 146).
+//! Slash-command registry and the core built-in commands (Goal 146).
 //!
 //! A [`CommandSpec`] is a static description (name, aliases, summary,
-//! handler). The [`CommandRegistry`] wraps a `Vec<CommandSpec>` and
+//! handler). The [`CommandRegistry`] wraps a `Vec<CommandSpec>` (built-ins)
+//! and a `Vec<SkillCommand>` (Goal-169 skill-backed dynamic commands), and
 //! provides exact lookup (with alias resolution) and prefix search
 //! for the completion menu.
 //!
@@ -16,6 +17,7 @@
 
 use crate::tui::app::App as AppState;
 use crate::tui::events::UserAction;
+use crate::tui::skill_commands::SkillCommand;
 use crate::tui::ui::modal::Modal;
 
 /// One registered slash command.
@@ -65,14 +67,18 @@ pub enum CommandOutcome {
 }
 
 /// Vec-backed slash-command registry.
+///
+/// Stores built-in [`CommandSpec`] entries (static) plus Goal-169
+/// skill-backed commands loaded from `.recursive/skills/`.
 #[derive(Clone, Debug)]
 pub struct CommandRegistry {
     commands: Vec<CommandSpec>,
+    /// Goal-169: skill-backed dynamic commands.
+    skill_commands: Vec<SkillCommand>,
 }
 
 impl CommandRegistry {
-    /// Build the default registry — the 10 core commands shipped in
-    /// Goal 146.
+    /// Build the default registry — the built-in commands.
     pub fn default_set() -> Self {
         Self {
             commands: vec![
@@ -153,8 +159,32 @@ impl CommandRegistry {
                     usage: "/exit",
                     handler: CommandHandler::Sync(cmd_exit),
                 },
+                // Goal-168: condition-based autonomous loop.
+                CommandSpec {
+                    name: "goal",
+                    aliases: &[],
+                    summary: "Autonomous loop until condition met",
+                    usage: "/goal <cond> [or stop after N turns] | /goal | /goal clear",
+                    handler: CommandHandler::Async(cmd_goal),
+                },
             ],
+            skill_commands: Vec::new(),
         }
+    }
+
+    /// Goal-169: register skill-backed commands alongside built-ins.
+    ///
+    /// Skill commands appear in lookup and search results.  A skill command
+    /// whose name collides with a built-in is silently shadowed by the
+    /// built-in (built-ins win).
+    pub fn with_skill_commands(mut self, skills: Vec<SkillCommand>) -> Self {
+        self.skill_commands = skills;
+        self
+    }
+
+    /// Return a reference to the loaded skill commands.
+    pub fn skill_commands(&self) -> &[SkillCommand] {
+        &self.skill_commands
     }
 
     /// Read-only access to the registered commands. Used by the help
@@ -163,7 +193,7 @@ impl CommandRegistry {
         &self.commands
     }
 
-    /// Look up a command by canonical name *or* alias. The leading
+    /// Look up a built-in command by canonical name *or* alias. The leading
     /// `/` is **not** part of `name` — strip it before calling.
     pub fn lookup(&self, name: &str) -> Option<&CommandSpec> {
         self.commands
@@ -171,8 +201,22 @@ impl CommandRegistry {
             .find(|c| c.name == name || c.aliases.contains(&name))
     }
 
-    /// Prefix-match across canonical names and aliases. Returns
-    /// commands whose name (or any alias) starts with `prefix`,
+    /// Look up a skill command by canonical name or alias.
+    ///
+    /// Built-ins shadow skill commands: if a built-in with the same name
+    /// exists, this returns `None` (callers should check `lookup` first).
+    pub fn lookup_skill(&self, name: &str) -> Option<&SkillCommand> {
+        // Don't expose skill if a built-in has the same name.
+        if self.lookup(name).is_some() {
+            return None;
+        }
+        self.skill_commands
+            .iter()
+            .find(|s| s.name == name || s.aliases.iter().any(|a| a == name))
+    }
+
+    /// Prefix-match across canonical names and aliases for **built-in** commands.
+    /// Returns commands whose name (or any alias) starts with `prefix`,
     /// sorted alphabetically by canonical name. An empty prefix
     /// returns *all* commands.
     pub fn search(&self, prefix: &str) -> Vec<&CommandSpec> {
@@ -185,6 +229,20 @@ impl CommandRegistry {
             })
             .collect();
         hits.sort_by_key(|c| c.name);
+        hits
+    }
+
+    /// Prefix-match across all skill commands.
+    pub fn search_skills(&self, prefix: &str) -> Vec<&SkillCommand> {
+        let prefix = prefix.trim_start_matches('/');
+        let mut hits: Vec<&SkillCommand> = self
+            .skill_commands
+            .iter()
+            .filter(|s| {
+                s.name.starts_with(prefix) || s.aliases.iter().any(|a| a.starts_with(prefix))
+            })
+            .collect();
+        hits.sort_by_key(|s| s.name.as_str());
         hits
     }
 }
@@ -306,6 +364,67 @@ fn cmd_permissions(app: &mut AppState, args: &[String]) -> CommandOutcome {
     CommandOutcome::Done
 }
 
+/// `/goal [<condition> [or stop after N turns]] | clear`
+///
+/// - `/goal <cond>` → start a condition-based autonomous loop.
+/// - `/goal <cond> or stop after N turns` → same with explicit max turns.
+/// - `/goal` (no args) → show current goal status.
+/// - `/goal clear` → clear the active goal immediately.
+fn cmd_goal(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
+    if args.is_empty() {
+        // Show current status.
+        let status = app
+            .active_goal
+            .as_ref()
+            .map(|g| {
+                format!(
+                    "Goal: \"{}\" — turn {}/{} — {}",
+                    g.condition,
+                    g.turns,
+                    g.max_turns,
+                    g.last_reason.as_deref().unwrap_or("pursuing")
+                )
+            })
+            .unwrap_or_else(|| "No active goal.".to_string());
+        app.push_system(status);
+        return Vec::new();
+    }
+
+    if args.len() == 1 && args[0].eq_ignore_ascii_case("clear") {
+        app.active_goal = None;
+        app.push_system("Goal cleared.");
+        return vec![UserAction::ClearGoal];
+    }
+
+    // Parse: "<condition> [or stop after N turns]"
+    let raw = args.join(" ");
+    let (condition, max_turns) = parse_goal_args(&raw);
+    app.push_system(format!("Goal set: \"{condition}\" (max {max_turns} turns)"));
+    vec![UserAction::SetGoal {
+        condition,
+        max_turns,
+    }]
+}
+
+/// Parse `"<condition> [or stop after N turns]"` from the raw argument string.
+/// Returns `(condition, max_turns)`. Default max_turns = 20.
+fn parse_goal_args(raw: &str) -> (String, u32) {
+    // Look for " or stop after N turns" suffix (case-insensitive).
+    let lower = raw.to_lowercase();
+    if let Some(pos) = lower.rfind(" or stop after ") {
+        let suffix = &raw[pos + " or stop after ".len()..];
+        // Try to parse the first token as a number.
+        let n: u32 = suffix
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let condition = raw[..pos].trim().to_string();
+        return (condition, n);
+    }
+    (raw.trim().to_string(), 20)
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
@@ -349,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_includes_all_ten_commands() {
+    fn registry_includes_all_twelve_commands() {
         let r = CommandRegistry::default_set();
         let names: Vec<&str> = r.commands().iter().map(|c| c.name).collect();
         for expected in &[
@@ -364,13 +483,15 @@ mod tests {
             "journal",
             "exit",
             "permissions",
+            "goal",
         ] {
             assert!(
                 names.contains(expected),
                 "missing /{expected}: have {names:?}"
             );
         }
-        assert_eq!(names.len(), 11);
+        // 11 built-in commands plus the new /goal command = 12.
+        assert_eq!(names.len(), 12);
     }
 
     #[test]
@@ -384,7 +505,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 11);
+        assert_eq!(hits.len(), 12);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();

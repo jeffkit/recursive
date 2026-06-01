@@ -14,6 +14,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
+use crate::runtime::GoalState;
 use crate::tui::events::{UiEvent, UserAction};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -651,6 +652,8 @@ pub struct App {
     /// Goal-167: current task list maintained by `todo_write` calls.
     /// Empty when no task list has been set this session.
     pub current_todos: Vec<crate::tools::todo::TodoItem>,
+    /// Goal-168: mirrored goal state, updated by `UiEvent::Goal*` events.
+    pub active_goal: Option<GoalState>,
 }
 
 // ── Goal-161: PendingPermission ──────────────────────────────────────────────
@@ -807,6 +810,7 @@ impl App {
             auto_allowed_tools: HashSet::new(),
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
             current_todos: Vec::new(),
+            active_goal: None,
         }
     }
 
@@ -1242,29 +1246,47 @@ impl App {
         // Clone the registry to avoid borrowing self while invoking
         // the handler (which takes &mut self).
         let registry = self.commands.clone();
-        let Some(spec) = registry.lookup(name) else {
-            self.push_error(format!("Unknown command: /{name}. Try /help."));
-            return None;
-        };
 
-        match &spec.handler {
-            CommandHandler::Sync(f) => {
-                match f(self, &args) {
-                    CommandOutcome::Done => {}
-                    CommandOutcome::Error(msg) => self.push_error(msg),
-                    CommandOutcome::OpenModal(modal) => self.modals.push(modal),
+        // Goal-169: check built-in commands first, then skill commands.
+        if let Some(spec) = registry.lookup(name) {
+            return match &spec.handler {
+                CommandHandler::Sync(f) => {
+                    match f(self, &args) {
+                        CommandOutcome::Done => {}
+                        CommandOutcome::Error(msg) => self.push_error(msg),
+                        CommandOutcome::OpenModal(modal) => self.modals.push(modal),
+                    }
+                    None
                 }
-                None
-            }
-            CommandHandler::Async(f) => {
-                let actions = f(self, &args);
-                // The dispatcher only carries one UserAction back to
-                // the caller; queue the rest into App for later. In
-                // practice every async command returns 0 or 1 actions
-                // today.
-                actions.into_iter().next()
-            }
+                CommandHandler::Async(f) => {
+                    let actions = f(self, &args);
+                    // The dispatcher only carries one UserAction back to
+                    // the caller; queue the rest into App for later. In
+                    // practice every async command returns 0 or 1 actions
+                    // today.
+                    actions.into_iter().next()
+                }
+            };
         }
+
+        // Goal-169: skill command fallback.
+        if let Some(skill) = registry.lookup_skill(name) {
+            let args_str = args.join(" ");
+            let prompt = skill.expand(&args_str);
+            self.push_system(format!(
+                "Running skill /{}: {}",
+                skill.name, skill.description
+            ));
+            self.blocks.push(crate::tui::app::TranscriptBlock::User {
+                text: prompt.clone(),
+            });
+            self.scroll_to_bottom();
+            self.start_turn();
+            return Some(UserAction::RunSkillPrompt { prompt });
+        }
+
+        self.push_error(format!("Unknown command: /{name}. Try /help."));
+        None
     }
 
     /// Apply an event coming from the backend worker.
@@ -1402,6 +1424,30 @@ impl App {
             // Goal-167: replace the task list whenever the agent calls todo_write.
             UiEvent::TodoUpdated { todos } => {
                 self.current_todos = todos;
+            }
+
+            // ── Goal-168: goal-loop events ──────────────────────────────────
+            UiEvent::GoalContinuing { reason, turns } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Goal continuing (turn {turns}): {reason}"),
+                });
+                // Update mirrored state.
+                if let Some(ref mut gs) = self.active_goal {
+                    gs.turns = turns;
+                    gs.last_reason = Some(reason);
+                }
+            }
+            UiEvent::GoalAchieved { condition, turns } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Goal achieved after {turns} turns: \"{condition}\""),
+                });
+                self.active_goal = None;
+            }
+            UiEvent::GoalCleared => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: "Goal cleared.".into(),
+                });
+                self.active_goal = None;
             }
         }
         // Sticky-scroll: when the user is already at the bottom

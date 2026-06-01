@@ -78,6 +78,14 @@ pub enum UiEvent {
     TodoUpdated {
         todos: Vec<crate::tools::todo::TodoItem>,
     },
+
+    // ── Goal-168: goal-loop status events ────────────────────────────────────
+    /// Goal loop is running; the judge found the condition not yet met.
+    GoalContinuing { reason: String, turns: u32 },
+    /// Goal loop completed — condition confirmed met.
+    GoalAchieved { condition: String, turns: u32 },
+    /// Active goal was cleared (budget exceeded, `/goal clear`, or API).
+    GoalCleared,
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
@@ -131,4 +139,23 @@ pub enum UserAction {
     Interrupt,
     /// Tear down the worker and exit the runtime.
     Shutdown,
+
+    // ── Goal-168: goal-loop actions ───────────────────────────────────────────
+    /// Start a condition-based autonomous loop. The backend will kick off
+    /// `run_goal_loop` and emit `GoalContinuing`/`GoalAchieved` events.
+    SetGoal {
+        /// The completion condition.
+        condition: String,
+        /// Hard cap on autonomous turns (default 20).
+        max_turns: u32,
+    },
+    /// Clear the active goal immediately.
+    ClearGoal,
+
+    // ── Goal-169: skill command ───────────────────────────────────────────────
+    /// Send an already-expanded skill prompt to the runtime.
+    RunSkillPrompt {
+        /// The expanded prompt text (with `$ARGUMENTS` substituted).
+        prompt: String,
+    },
 }

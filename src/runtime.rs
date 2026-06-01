@@ -36,6 +36,116 @@ use crate::tools::{TodoItem, TodoWriteTool, ToolRegistry, TouchedFiles};
 use crate::Compactor;
 
 // ──────────────────────────────────────────────────────────────────────────
+// Goal-168: GoalState / GoalStatus / GoalEvaluator
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Status of an active goal loop.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    /// The loop is running — condition not yet confirmed met.
+    Pursuing,
+    /// Condition confirmed met — goal cleared after success.
+    Achieved,
+    /// Explicitly cleared by the user or the turn budget was exceeded.
+    Cleared,
+}
+
+/// Per-session goal state set by `/goal <condition>`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GoalState {
+    /// The completion condition as written by the user.
+    pub condition: String,
+    /// Current status of the loop.
+    pub status: GoalStatus,
+    /// Turns elapsed since the goal was set.
+    pub turns: u32,
+    /// Hard cap: stop regardless of condition after this many turns.
+    pub max_turns: u32,
+    /// Most recent judge model verdict (reason string).
+    pub last_reason: Option<String>,
+}
+
+/// Verdict returned by [`GoalEvaluator::evaluate`].
+#[derive(Debug, Clone)]
+pub struct GoalVerdict {
+    /// Whether the condition is satisfied.
+    pub achieved: bool,
+    /// Judge's brief explanation.
+    pub reason: String,
+}
+
+/// Calls the LLM provider to decide whether a goal condition is met.
+pub struct GoalEvaluator {
+    provider: Arc<dyn LlmProvider>,
+}
+
+impl GoalEvaluator {
+    /// Create an evaluator backed by `provider`.
+    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
+        Self { provider }
+    }
+
+    /// Evaluate `condition` against the last N messages of `transcript`.
+    ///
+    /// Calls the provider with a minimal YES/NO prompt (max_tokens ≈ 256 via
+    /// a short system instruction).  The first word of the response determines
+    /// the verdict; any remaining text is kept as `reason`.
+    pub async fn evaluate(&self, condition: &str, transcript: &[Message]) -> Result<GoalVerdict> {
+        // Only send the last 20 messages to keep the prompt cheap.
+        const TAIL: usize = 20;
+        let tail = if transcript.len() > TAIL {
+            &transcript[transcript.len() - TAIL..]
+        } else {
+            transcript
+        };
+
+        // Format the recent transcript as plain text.
+        let transcript_text: String = tail
+            .iter()
+            .filter_map(|m| {
+                if m.content.is_empty() {
+                    None
+                } else {
+                    Some(format!("[{:?}]: {}", m.role, m.content))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let system_msg = Message::system(
+            "You are a completion evaluator. Answer YES or NO on the first line, \
+             then a single short sentence explaining why.",
+        );
+        let user_msg = Message::user(format!(
+            "Condition: {condition}\n\nRecent transcript:\n{transcript_text}\n\n\
+             Is the condition met? Answer YES or NO on the first line, then a short reason."
+        ));
+
+        let messages = vec![system_msg, user_msg];
+        let completion = self.provider.complete(&messages, &[]).await?;
+        let text = completion.content.trim().to_string();
+
+        let first_line = text.lines().next().unwrap_or("").trim().to_uppercase();
+        let achieved = first_line.starts_with("YES");
+        let reason = text
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        let reason = if reason.is_empty() {
+            text.clone()
+        } else {
+            reason
+        };
+
+        Ok(GoalVerdict { achieved, reason })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // RuntimeOutcome
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -124,6 +234,8 @@ pub struct AgentRuntime {
     /// Goal-165: plan mode 2.0 gate — shared with `EnterPlanModeTool` and
     /// `ExitPlanModeTool`. `confirm_plan` / `reject_plan` forward to it.
     plan_approval_gate: Arc<PlanApprovalGate>,
+    /// Goal-168: active goal state (set by `/goal`). `None` when no goal is active.
+    pub goal_state: Arc<RwLock<Option<GoalState>>>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -141,6 +253,14 @@ impl std::fmt::Debug for AgentRuntime {
             .field(
                 "todo_list",
                 &self.todo_list.read().map(|l| l.len()).unwrap_or(0),
+            )
+            .field(
+                "goal_state",
+                &self
+                    .goal_state
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|s| s.condition.clone())),
             )
             .finish()
     }
@@ -455,6 +575,154 @@ impl AgentRuntime {
 
         // Plan Mode 2.0: wake the blocking ExitPlanModeTool with the reason.
         self.plan_approval_gate.reject(reason);
+    }
+
+    // ── Goal-168: goal state accessors ────────────────────────────────────
+
+    /// Return a clone of the current goal state (or `None`).
+    pub fn current_goal(&self) -> Option<GoalState> {
+        self.goal_state.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Set a new active goal. Emits `AgentEvent::GoalSet` via the event sink.
+    pub async fn set_goal(&self, condition: String, max_turns: u32) {
+        let state = GoalState {
+            condition: condition.clone(),
+            status: GoalStatus::Pursuing,
+            turns: 0,
+            max_turns,
+            last_reason: None,
+        };
+        if let Ok(mut g) = self.goal_state.write() {
+            *g = Some(state);
+        }
+        self.event_sink
+            .emit(AgentEvent::GoalSet {
+                condition,
+                max_turns,
+            })
+            .await;
+    }
+
+    /// Clear the active goal. Emits `AgentEvent::GoalCleared`.
+    pub async fn clear_goal(&self) {
+        if let Ok(mut g) = self.goal_state.write() {
+            if let Some(ref mut s) = *g {
+                s.status = GoalStatus::Cleared;
+            }
+            *g = None;
+        }
+        self.event_sink.emit(AgentEvent::GoalCleared).await;
+    }
+
+    /// Run a goal loop: execute turns until the judge says the condition
+    /// is met, the turn budget is exhausted, or the goal is cleared externally.
+    ///
+    /// Steps per iteration:
+    /// 1. `run(prompt)` — execute one agent turn.
+    /// 2. Increment `GoalState.turns`.
+    /// 3. If `turns >= max_turns` → emit `GoalCleared` (budget exceeded), break.
+    /// 4. Call `GoalEvaluator::evaluate(condition, transcript_tail)`.
+    /// 5. If `achieved` → emit `GoalAchieved`, break.
+    /// 6. Else → emit `GoalContinuing { reason }`, continue with auto-prompt.
+    pub async fn run_goal_loop(
+        &mut self,
+        initial_prompt: impl Into<String>,
+        condition: impl Into<String>,
+        max_turns: u32,
+    ) -> Result<Vec<RuntimeOutcome>> {
+        let condition = condition.into();
+        self.set_goal(condition.clone(), max_turns).await;
+
+        let evaluator = GoalEvaluator::new(self.kernel.llm().clone());
+        let mut outcomes = Vec::new();
+        let mut next_prompt = initial_prompt.into();
+
+        loop {
+            // Check if goal was externally cleared while we were looping.
+            let active = self
+                .goal_state
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+                .map(|g| g.status == GoalStatus::Pursuing)
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+
+            let outcome = self.run(&next_prompt).await?;
+            outcomes.push(outcome);
+
+            // Increment turn counter.
+            let turns = {
+                let mut guard = self.goal_state.write().ok();
+                if let Some(ref mut guard) = guard {
+                    if let Some(ref mut gs) = **guard {
+                        gs.turns += 1;
+                        gs.turns
+                    } else {
+                        break; // goal was cleared externally
+                    }
+                } else {
+                    break;
+                }
+            };
+
+            // Budget exceeded?
+            if turns >= max_turns {
+                if let Ok(mut g) = self.goal_state.write() {
+                    if let Some(ref mut gs) = *g {
+                        gs.status = GoalStatus::Cleared;
+                    }
+                    *g = None;
+                }
+                self.event_sink.emit(AgentEvent::GoalCleared).await;
+                tracing::warn!(
+                    "goal loop: turn budget of {max_turns} exceeded without achieving condition"
+                );
+                break;
+            }
+
+            // Ask the judge.
+            let verdict = evaluator.evaluate(&condition, self.transcript()).await?;
+            if verdict.achieved {
+                if let Ok(mut g) = self.goal_state.write() {
+                    if let Some(ref mut gs) = *g {
+                        gs.status = GoalStatus::Achieved;
+                        gs.last_reason = Some(verdict.reason.clone());
+                    }
+                    *g = None;
+                }
+                self.event_sink
+                    .emit(AgentEvent::GoalAchieved {
+                        condition: condition.clone(),
+                        turns,
+                    })
+                    .await;
+                break;
+            } else {
+                // Store reason and continue.
+                if let Ok(mut g) = self.goal_state.write() {
+                    if let Some(ref mut gs) = *g {
+                        gs.last_reason = Some(verdict.reason.clone());
+                    }
+                }
+                self.event_sink
+                    .emit(AgentEvent::GoalContinuing {
+                        reason: verdict.reason.clone(),
+                        turns,
+                    })
+                    .await;
+
+                next_prompt = format!(
+                    "(Goal: {condition})\n\nPrevious attempt reason: {}\n\nContinue.",
+                    verdict.reason
+                );
+            }
+        }
+
+        Ok(outcomes)
     }
 
     /// Run a loop: execute turns until the agent stops scheduling wakeups.
@@ -928,6 +1196,7 @@ impl AgentRuntimeBuilder {
             touched_files: None,
             todo_list,
             plan_approval_gate,
+            goal_state: Arc::new(RwLock::new(None)),
         })
     }
 }
@@ -1449,5 +1718,197 @@ mod tests {
         assert_eq!(rt.planning_mode, PlanningMode::PlanFirst);
         rt.set_planning_mode(PlanningMode::Immediate);
         assert_eq!(rt.planning_mode, PlanningMode::Immediate);
+    }
+
+    // ── Goal-168: GoalState / GoalEvaluator / run_goal_loop tests ──────────
+
+    #[tokio::test]
+    async fn set_goal_stores_state() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        assert!(rt.current_goal().is_none());
+        rt.set_goal("task is done".to_string(), 10).await;
+        let g = rt.current_goal().expect("goal should be set");
+        assert_eq!(g.condition, "task is done");
+        assert_eq!(g.max_turns, 10);
+        assert_eq!(g.turns, 0);
+        assert_eq!(g.status, GoalStatus::Pursuing);
+    }
+
+    #[tokio::test]
+    async fn clear_goal_removes_state() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.set_goal("anything".to_string(), 5).await;
+        assert!(rt.current_goal().is_some());
+        rt.clear_goal().await;
+        assert!(rt.current_goal().is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_status_default_is_pursuing() {
+        let g = GoalState {
+            condition: "done".to_string(),
+            status: GoalStatus::Pursuing,
+            turns: 0,
+            max_turns: 20,
+            last_reason: None,
+        };
+        assert_eq!(g.status, GoalStatus::Pursuing);
+        assert_eq!(g.turns, 0);
+        assert!(g.last_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_returns_achieved_on_yes_response() {
+        // Mock a provider that returns "YES\nLooks complete."
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "YES\nLooks complete.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let evaluator = GoalEvaluator::new(llm);
+        let msgs = vec![crate::message::Message::user("I completed the task.")];
+        let verdict = evaluator
+            .evaluate("task is done", &msgs)
+            .await
+            .expect("evaluate should succeed");
+        assert!(verdict.achieved);
+        assert!(!verdict.reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_returns_not_achieved_on_no_response() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "NO\nStill in progress.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let evaluator = GoalEvaluator::new(llm);
+        let msgs = vec![crate::message::Message::user("I started the task.")];
+        let verdict = evaluator
+            .evaluate("task is done", &msgs)
+            .await
+            .expect("evaluate should succeed");
+        assert!(!verdict.achieved);
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_tolerates_empty_transcript() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "YES\nEmpty transcript but condition trivially met.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let evaluator = GoalEvaluator::new(llm);
+        let verdict = evaluator
+            .evaluate("anything", &[])
+            .await
+            .expect("should not error on empty transcript");
+        assert!(verdict.achieved);
+    }
+
+    #[tokio::test]
+    async fn run_goal_loop_stops_when_achieved() {
+        // Provider: first call for the agent turn, second for the judge.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "I wrote the greeting.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "YES\nGreeting was written.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let null_sink = Arc::new(crate::event::NullSink);
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .event_sink(null_sink)
+            .build()
+            .unwrap();
+        let _ = rt
+            .run_goal_loop("write a greeting", "write a greeting", 5)
+            .await;
+        // Goal should be cleared after achievement.
+        assert!(rt.current_goal().is_none());
+    }
+
+    #[tokio::test]
+    async fn run_goal_loop_stops_at_max_turns() {
+        // Provider: every judge call returns NO → loop hits max_turns.
+        let completions: Vec<Completion> = (0..20)
+            .flat_map(|_| {
+                vec![
+                    Completion {
+                        content: "still working".into(),
+                        tool_calls: vec![],
+                        finish_reason: Some("stop".into()),
+                        usage: None,
+                        reasoning_content: None,
+                    },
+                    Completion {
+                        content: "NO\nNot done yet.".into(),
+                        tool_calls: vec![],
+                        finish_reason: Some("stop".into()),
+                        usage: None,
+                        reasoning_content: None,
+                    },
+                ]
+            })
+            .collect();
+        let llm = Arc::new(MockProvider::new(completions));
+        let null_sink = Arc::new(crate::event::NullSink);
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .event_sink(null_sink)
+            .build()
+            .unwrap();
+        // max_turns=2 so we stop after 2 regardless.
+        let _ = rt
+            .run_goal_loop("start on impossible task", "impossible task", 2)
+            .await;
+        // Goal should be cleared after budget exhaustion.
+        assert!(rt.current_goal().is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_serde_round_trip() {
+        let g = GoalState {
+            condition: "file written".to_string(),
+            status: GoalStatus::Achieved,
+            turns: 3,
+            max_turns: 10,
+            last_reason: Some("File was created.".to_string()),
+        };
+        let json = serde_json::to_string(&g).expect("serialize");
+        let g2: GoalState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(g2.condition, g.condition);
+        assert_eq!(g2.status, GoalStatus::Achieved);
+        assert_eq!(g2.turns, 3);
+        assert_eq!(g2.last_reason, Some("File was created.".to_string()));
+    }
+
+    #[tokio::test]
+    async fn multiple_set_goal_calls_overwrite_state() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.set_goal("first goal".to_string(), 5).await;
+        rt.set_goal("second goal".to_string(), 15).await;
+        let g = rt.current_goal().unwrap();
+        assert_eq!(g.condition, "second goal");
+        assert_eq!(g.max_turns, 15);
     }
 }

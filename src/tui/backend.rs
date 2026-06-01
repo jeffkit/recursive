@@ -133,6 +133,16 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         AgentEvent::PlanRejected { reason } => Some(UiEvent::PlanRejected { reason }),
         // Goal-167: forward todo updates to the UI.
         AgentEvent::TodoUpdated { todos } => Some(UiEvent::TodoUpdated { todos }),
+
+        // Goal-168: forward goal-loop events.
+        AgentEvent::GoalContinuing { reason, turns } => {
+            Some(UiEvent::GoalContinuing { reason, turns })
+        }
+        AgentEvent::GoalAchieved { condition, turns } => {
+            Some(UiEvent::GoalAchieved { condition, turns })
+        }
+        AgentEvent::GoalCleared => Some(UiEvent::GoalCleared),
+
         _ => None,
     }
 }
@@ -275,6 +285,76 @@ async fn worker_loop(
             }
             UserAction::Interrupt => {
                 cancel_flag.store(true, Ordering::SeqCst);
+            }
+
+            // Goal-168: start a condition-based autonomous loop.
+            UserAction::SetGoal {
+                condition,
+                max_turns,
+            } => {
+                if let RuntimeBuild::Ready(rt) = &mut state {
+                    cancel_flag.store(false, Ordering::SeqCst);
+                    let cancel_for_select = cancel_flag.clone();
+                    let prompt = format!(
+                        "Start working towards the following goal: {condition}\n\nContinue until the goal is achieved."
+                    );
+                    let result: Result<(), crate::Error> = tokio::select! {
+                        r = rt.run_goal_loop(prompt, condition, max_turns) => r.map(|_| ()),
+                        _ = wait_for_cancel(cancel_for_select) => {
+                            let _ = event_tx.send(UiEvent::Error {
+                                message: "goal loop interrupted".into(),
+                            });
+                            Ok(())
+                        }
+                    };
+                    if let Err(e) = result {
+                        let _ = event_tx.send(UiEvent::Error {
+                            message: format!("goal loop error: {e}"),
+                        });
+                    }
+                    let _ = event_tx.send(UiEvent::TurnFinished);
+                    cancel_flag.store(false, Ordering::SeqCst);
+                } else if let RuntimeBuild::Offline { reason } = &state {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: reason.clone(),
+                    });
+                }
+            }
+
+            // Goal-168: clear the active goal.
+            UserAction::ClearGoal => {
+                if let RuntimeBuild::Ready(rt) = &mut state {
+                    rt.clear_goal().await;
+                }
+            }
+
+            // Goal-169: run an already-expanded skill prompt.
+            UserAction::RunSkillPrompt { prompt } => {
+                if let RuntimeBuild::Ready(rt) = &mut state {
+                    cancel_flag.store(false, Ordering::SeqCst);
+                    let cancel_for_select = cancel_flag.clone();
+                    let result: Result<(), crate::Error> = tokio::select! {
+                        r = rt.run(prompt) => r.map(|_| ()),
+                        _ = wait_for_cancel(cancel_for_select) => {
+                            let _ = event_tx.send(UiEvent::Error {
+                                message: "interrupted".into(),
+                            });
+                            Ok(())
+                        }
+                    };
+                    if let Err(e) = result {
+                        let _ = event_tx.send(UiEvent::Error {
+                            message: e.to_string(),
+                        });
+                    }
+                    let _ = event_tx.send(UiEvent::TurnFinished);
+                    cancel_flag.store(false, Ordering::SeqCst);
+                } else if let RuntimeBuild::Offline { reason } = &state {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: reason.clone(),
+                    });
+                    let _ = event_tx.send(UiEvent::TurnFinished);
+                }
             }
         }
     }

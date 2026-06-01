@@ -57,6 +57,7 @@ mod v050_integration {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         }
     }
 

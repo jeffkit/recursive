@@ -77,6 +77,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         }
     }
 
@@ -89,6 +90,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         }
     }
 
@@ -165,6 +167,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         });
 
         let response = app
@@ -209,6 +212,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         };
         let app = build_router(state);
 
@@ -256,6 +260,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         };
         let app = build_router(state);
 
@@ -309,6 +314,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         };
         let app = build_router(state);
 
@@ -374,6 +380,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         };
         let app = build_router(state);
 
@@ -446,6 +453,7 @@ mod http_tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
         };
         let app = build_router(state);
 
@@ -2223,5 +2231,242 @@ mod http_tests {
         let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(detail["status"], "idle");
         assert!(detail["pending_plan"].is_null());
+    }
+
+    // ── Goal-168: /goal endpoint tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_goal_returns_200_for_valid_session() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "YES\nCondition met.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        // Create a session first.
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"system_prompt": null}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Set a goal.
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"condition": "Write a greeting", "max_turns": 3}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["status"], "pursuing");
+        assert_eq!(val["session_id"], session_id);
+    }
+
+    #[tokio::test]
+    async fn set_goal_returns_404_for_missing_session() {
+        let app = build_router(sample_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions/no-such-session/goal")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"condition": "anything"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn clear_goal_returns_200_for_valid_session() {
+        let state = sample_state();
+        let app = build_router(state.clone());
+
+        // Create session.
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Delete goal (even though none is set — should still be 200).
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["status"], "cleared");
+    }
+
+    #[tokio::test]
+    async fn clear_goal_returns_404_for_missing_session() {
+        let app = build_router(sample_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions/ghost/goal")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn session_detail_includes_goal_field_when_null() {
+        let state = sample_state();
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // goal field should be present (as null) when no goal is set.
+        assert!(detail.get("goal").is_some());
+        assert!(detail["goal"].is_null());
+    }
+
+    // ── Goal-169: /slash-commands endpoint tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn slash_commands_returns_empty_list_when_none_configured() {
+        let state = sample_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/slash-commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let cmds: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(cmds.is_array());
+        // Our sample state has slash_commands: Arc::new(Vec::new())
+        assert_eq!(cmds.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn slash_commands_returns_configured_commands() {
+        use recursive::http::SlashCommandInfo;
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = AppState {
+            tools: vec![],
+            config: mock_config(),
+            tool_registry: ToolRegistry::local(),
+            provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(vec![
+                SlashCommandInfo {
+                    name: "deploy".to_string(),
+                    description: "Deploy the service".to_string(),
+                    source: "skill".to_string(),
+                    aliases: vec!["d".to_string()],
+                    argument_hint: "<env>".to_string(),
+                },
+                SlashCommandInfo {
+                    name: "rollback".to_string(),
+                    description: "Roll back the deployment".to_string(),
+                    source: "skill".to_string(),
+                    aliases: vec![],
+                    argument_hint: String::new(),
+                },
+            ]),
+        };
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/slash-commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let cmds: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = cmds.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "deploy");
+        assert_eq!(arr[0]["source"], "skill");
+        assert_eq!(arr[0]["aliases"][0], "d");
+        assert_eq!(arr[0]["argument_hint"], "<env>");
+        assert_eq!(arr[1]["name"], "rollback");
     }
 }
