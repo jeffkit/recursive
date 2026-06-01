@@ -131,6 +131,8 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         }),
         AgentEvent::PlanConfirmed => Some(UiEvent::PlanConfirmed),
         AgentEvent::PlanRejected { reason } => Some(UiEvent::PlanRejected { reason }),
+        // Goal-167: forward todo updates to the UI.
+        AgentEvent::TodoUpdated { todos } => Some(UiEvent::TodoUpdated { todos }),
         _ => None,
     }
 }

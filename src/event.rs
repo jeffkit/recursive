@@ -137,6 +137,13 @@ pub enum AgentEvent {
         compacted_count: usize,
         summary_uuid: Option<String>,
     },
+
+    /// Goal-167: emitted when the agent updates its task checklist via
+    /// `todo_write`. Carries the complete replacement list so consumers
+    /// can render the current state without storing diffs.
+    TodoUpdated {
+        todos: Vec<crate::tools::todo::TodoItem>,
+    },
 }
 
 // ---------------------------------------------------------------------------

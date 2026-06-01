@@ -11,6 +11,9 @@
 //! hint) and lets the terminal native cursor land on the actual edit
 //! position.
 //!
+//! Goal-167 adds a compact task-list panel between the messages area and
+//! the status bar when `current_todos` is non-empty.
+//!
 //! While a turn is running the spinner from
 //! [`crate::tui::ui::spinner::format_line`] is appended after the last
 //! block.
@@ -18,15 +21,28 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use crate::tools::todo::TodoStatus;
 use crate::tui::app::App;
 use crate::tui::ui::{command_menu, input, modal, spinner, status, transcript};
 
+/// Height of the todo panel (border + one row per item, capped at 6 items).
+fn todo_panel_height(app: &App) -> u16 {
+    if app.current_todos.is_empty() {
+        0
+    } else {
+        // 2 for the border + 1 per item (capped so it doesn't take over)
+        (app.current_todos.len().min(6) as u16) + 2
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let input_total = input::total_height(app);
+    let todo_height = todo_panel_height(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),              // messages
+            Constraint::Length(todo_height), // Goal-167: task list (0 when empty)
             Constraint::Length(1),           // status bar
             Constraint::Length(input_total), // input + footer hint
         ])
@@ -48,6 +64,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     let messages_area = chunks[0];
+    let todo_area = chunks[1];
     let inner_width = messages_area.width.saturating_sub(2); // borders
     let visible_rows = messages_area.height.saturating_sub(2);
 
@@ -85,21 +102,26 @@ pub fn render(frame: &mut Frame, app: &App) {
         .scroll((effective_scroll, 0));
     frame.render_widget(messages_widget, messages_area);
 
+    // Goal-167: task-list panel (only rendered when non-empty).
+    if !app.current_todos.is_empty() {
+        render_todo_panel(frame, todo_area, app);
+    }
+
     // Status bar.
-    status::render(frame, chunks[1], app);
+    status::render(frame, chunks[2], app);
 
     // Input panel + footer hint.
-    input::render(frame, chunks[2], app);
+    input::render(frame, chunks[3], app);
 
     // Goal-146: floating slash-command popup, drawn after the input
     // box so it overlays the messages panel.
-    command_menu::render(frame, chunks[2], app);
+    command_menu::render(frame, chunks[3], app);
 
     // Goal-158: @file completion popup.
-    command_menu::render_atfile(frame, chunks[2], app);
+    command_menu::render_atfile(frame, chunks[3], app);
 
     // Goal-160: Ctrl+R history-search popup.
-    command_menu::render_history_search(frame, chunks[2], app);
+    command_menu::render_history_search(frame, chunks[3], app);
 
     // Goal-161: permission-request modal (top layer — covers everything).
     command_menu::render_permission_modal(frame, app);
@@ -108,4 +130,46 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.modals.is_empty() {
         modal::render(frame, app);
     }
+}
+
+/// Render the compact task-list panel.
+///
+/// Shows up to 6 items with ✓/◉/○/✗ status icons. Items beyond the first
+/// 6 are silently truncated (the agent should keep lists short).
+fn render_todo_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let completed = app
+        .current_todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let total = app.current_todos.len();
+    let title = format!(" Tasks ({completed}/{total} done) ");
+
+    let items: Vec<Line> = app
+        .current_todos
+        .iter()
+        .take(6)
+        .map(|item| {
+            let (icon, style) = match item.status {
+                TodoStatus::Completed => ("✓", Style::default().fg(Color::Green)),
+                TodoStatus::InProgress => ("◉", Style::default().fg(Color::Yellow)),
+                TodoStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
+                TodoStatus::Cancelled => ("✗", Style::default().fg(Color::DarkGray)),
+            };
+            let label = item
+                .active_form
+                .as_deref()
+                .filter(|_| item.status == TodoStatus::InProgress)
+                .unwrap_or(&item.content);
+            Line::from(vec![
+                Span::styled(format!(" {icon} "), style),
+                Span::styled(label.to_string(), style),
+            ])
+        })
+        .collect();
+
+    let widget = Paragraph::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(widget, area);
 }

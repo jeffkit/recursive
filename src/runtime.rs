@@ -20,7 +20,7 @@
 //! println!("{}", outcome.final_text.unwrap_or_default());
 //! ```
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::agent::{FinishReason, PermissionHook, PlanningMode};
 use crate::checkpoint::{CheckpointId, ShadowRepo};
@@ -31,7 +31,8 @@ use crate::hooks::HookRegistry;
 use crate::kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 use crate::llm::{LlmProvider, TokenUsage};
 use crate::message::Message;
-use crate::tools::{ToolRegistry, TouchedFiles};
+use crate::tools::plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate};
+use crate::tools::{TodoItem, TodoWriteTool, ToolRegistry, TouchedFiles};
 use crate::Compactor;
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -117,6 +118,12 @@ pub struct AgentRuntime {
     /// instance lives for the runtime's lifetime; it's cleared at
     /// the start of every turn.
     touched_files: Option<Arc<Mutex<TouchedFiles>>>,
+    /// Goal-167: shared task-list state written by `todo_write` calls.
+    /// Read back via [`current_todos`](AgentRuntime::current_todos).
+    todo_list: Arc<RwLock<Vec<TodoItem>>>,
+    /// Goal-165: plan mode 2.0 gate — shared with `EnterPlanModeTool` and
+    /// `ExitPlanModeTool`. `confirm_plan` / `reject_plan` forward to it.
+    plan_approval_gate: Arc<PlanApprovalGate>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -131,6 +138,10 @@ impl std::fmt::Debug for AgentRuntime {
                 &self.permission_hook.as_ref().map(|_| "<hook>"),
             )
             .field("planning_mode", &self.planning_mode)
+            .field(
+                "todo_list",
+                &self.todo_list.read().map(|l| l.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -242,6 +253,8 @@ impl AgentRuntime {
             streaming: self.streaming,
             permission_hook: self.permission_hook.clone(),
             planning_mode: self.planning_mode.clone(),
+            // Goal-165: share the plan mode flag so RunCore can gate write tools.
+            exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
         };
 
         // Execute turn
@@ -343,7 +356,31 @@ impl AgentRuntime {
 
     /// Set a new event sink (useful for REPL mode between turns).
     pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
-        self.event_sink = sink;
+        self.event_sink = sink.clone();
+        // Goal-167: re-register TodoWriteTool with the new sink so that
+        // AgentEvent::TodoUpdated reaches the new consumer (e.g. TUI).
+        self.kernel
+            .tools_mut()
+            .register_mut(Arc::new(TodoWriteTool::new(
+                self.todo_list.clone(),
+                sink.clone(),
+            )));
+        // Goal-165: re-register ExitPlanModeTool with the new sink so that
+        // AgentEvent::PlanProposed reaches the new consumer (e.g. TUI).
+        self.kernel
+            .tools_mut()
+            .register_mut(Arc::new(ExitPlanModeTool::new(
+                self.plan_approval_gate.clone(),
+                sink,
+            )));
+    }
+
+    /// Goal-167: return a snapshot of the current agent task list.
+    ///
+    /// Returns a clone of the list as it stands at call time. Returns an
+    /// empty vec if the internal lock is poisoned.
+    pub fn current_todos(&self) -> Vec<TodoItem> {
+        self.todo_list.read().map(|l| l.clone()).unwrap_or_default()
     }
 
     /// Goal-161: attach a [`crate::tools::PermissionHook`] to the
@@ -353,9 +390,22 @@ impl AgentRuntime {
         self.kernel.tools_mut().set_permission_hook(hook);
     }
 
+    /// Return a shared reference to the plan-approval gate.
+    ///
+    /// Callers (e.g. HTTP handlers) that need to inspect `pending_plan` or
+    /// call `approve`/`reject` without holding the runtime `Mutex` can clone
+    /// this `Arc` and operate on the gate directly.
+    pub fn plan_approval_gate(&self) -> Arc<PlanApprovalGate> {
+        self.plan_approval_gate.clone()
+    }
+
     /// Confirm the pending plan, allowing execution to proceed on the next run.
+    ///
+    /// Covers both PlanFirst mode (sets `plan_confirmed` flag for kernel) and
+    /// Plan Mode 2.0 (wakes `exit_plan_mode`'s blocking wait via the gate).
     pub fn confirm_plan(&mut self) {
         self.plan_confirmed = true;
+        self.plan_approval_gate.approve();
     }
 
     /// Force a compaction pass right now, regardless of the
@@ -394,16 +444,17 @@ impl AgentRuntime {
 
     /// Reject the pending plan with a reason.
     ///
-    /// This injects a tool error message into the transcript to inform the agent
-    /// that the plan was rejected.
+    /// Covers both PlanFirst mode (injects a user message) and Plan Mode 2.0
+    /// (wakes `exit_plan_mode`'s blocking wait with the rejection reason).
     pub fn reject_plan(&mut self, reason: &str) {
-        // Clear pending plan calls
+        // PlanFirst mode: clear pending plan calls and inject rejection message.
         self.pending_plan_calls = None;
         self.plan_confirmed = false;
-
-        // Inject a user message with the rejection into the transcript
         let rejection_msg = Message::user(format!("Plan rejected: {}", reason));
         self.transcript.push(rejection_msg);
+
+        // Plan Mode 2.0: wake the blocking ExitPlanModeTool with the reason.
+        self.plan_approval_gate.reject(reason);
     }
 
     /// Run a loop: execute turns until the agent stops scheduling wakeups.
@@ -829,7 +880,7 @@ impl AgentRuntimeBuilder {
     ///
     /// Returns an error if the LLM provider is missing.
     pub fn build(self) -> Result<AgentRuntime> {
-        let kernel = self.kernel_builder.build()?;
+        let mut kernel = self.kernel_builder.build()?;
 
         let mut transcript = Vec::new();
         if let Some(sys) = self.system_prompt {
@@ -837,10 +888,33 @@ impl AgentRuntimeBuilder {
         }
         transcript.extend(self.seed);
 
+        let event_sink: Arc<dyn EventSink> =
+            self.saved_event_sink.unwrap_or_else(|| Arc::new(NullSink));
+
+        // Goal-167: create the shared todo list and register a properly-sinked
+        // TodoWriteTool, overriding the NullSink version from build_standard_tools.
+        let todo_list = Arc::new(RwLock::new(Vec::<TodoItem>::new()));
+        kernel.tools_mut().register_mut(Arc::new(TodoWriteTool::new(
+            todo_list.clone(),
+            event_sink.clone(),
+        )));
+
+        // Goal-165: create the plan approval gate and register the plan mode tools.
+        let plan_approval_gate = Arc::new(PlanApprovalGate::new());
+        kernel
+            .tools_mut()
+            .register_mut(Arc::new(EnterPlanModeTool::new(plan_approval_gate.clone())));
+        kernel
+            .tools_mut()
+            .register_mut(Arc::new(ExitPlanModeTool::new(
+                plan_approval_gate.clone(),
+                event_sink.clone(),
+            )));
+
         Ok(AgentRuntime {
             kernel,
             transcript,
-            event_sink: self.saved_event_sink.unwrap_or_else(|| Arc::new(NullSink)),
+            event_sink,
             pending_plan_calls: None,
             plan_confirmed: false,
             streaming: self.streaming,
@@ -852,6 +926,8 @@ impl AgentRuntimeBuilder {
             turn_index: 0,
             checkpoint_writer: None,
             touched_files: None,
+            todo_list,
+            plan_approval_gate,
         })
     }
 }

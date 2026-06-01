@@ -33,7 +33,8 @@ use recursive::{
         ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
         RunSkillScript, ScheduleWakeup, ScratchpadDelete, ScratchpadGet, ScratchpadList,
-        SearchFiles, SubAgent, ToolTransport, WakeupSlot, WebFetch, WorkingMemoryTool, WriteFile,
+        SearchFiles, SubAgent, TodoWriteTool, ToolTransport, WakeupSlot, WebFetch,
+        WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentEvent, AgentRuntime, AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink,
@@ -1134,6 +1135,12 @@ async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(ScratchpadGet::new(root)))
         .register(Arc::new(ScratchpadDelete::new(root)))
         .register(Arc::new(ScratchpadList::new(root)));
+    // Goal-167: register with a NullSink placeholder; AgentRuntimeBuilder::build()
+    // will overwrite this with a properly-wired sink.
+    registry = registry.register(Arc::new(TodoWriteTool::new(
+        Arc::new(std::sync::RwLock::new(vec![])),
+        Arc::new(recursive::NullSink),
+    )));
     let skills = discover_loaded_skills(config);
     if !skills.is_empty() {
         registry = registry.register(Arc::new(LoadSkill::new(skills.clone())));

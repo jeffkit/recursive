@@ -305,6 +305,7 @@ impl AgentPool {
             streaming: false,
             permission_hook: None,
             planning_mode: PlanningMode::default(),
+            exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         kernel.run(ctx).await

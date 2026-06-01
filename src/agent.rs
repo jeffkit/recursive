@@ -10,6 +10,7 @@
 //! The loop emits `StepEvent`s through a channel so a UI/CLI/log layer can
 //! observe progress without coupling to the agent's internals.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -290,6 +291,9 @@ pub(crate) struct RunCore<'a> {
     pub(crate) total_llm_latency_ms: u64,
     pub(crate) plan_buffer: Option<Vec<ToolCall>>,
     pub(crate) plan_confirmed: bool,
+    /// Goal-165: shared flag set by `EnterPlanModeTool`; blocks write tools
+    /// while the agent is in read-only exploring / planning mode.
+    pub(crate) exploring_plan_mode: Arc<AtomicBool>,
     /// Optional cancellation token. When cancelled, the step loop
     /// terminates at the next step boundary with
     /// [`FinishReason::Cancelled`].
@@ -425,6 +429,28 @@ impl<'a> RunCore<'a> {
         let mut pending: Vec<PendingCall> = Vec::new();
 
         for call in calls {
+            // Goal-165: while in agent-driven plan mode, block any write tool
+            // that is not `exit_plan_mode` itself.
+            if self.exploring_plan_mode.load(Ordering::Relaxed)
+                && !self.tools.is_readonly(&call.name)
+                && call.name != "exit_plan_mode"
+            {
+                results.push((
+                    call.id.clone(),
+                    call.name.clone(),
+                    format!(
+                        "ERROR: Cannot execute '{}' in plan mode. \
+                         You are in read-only planning mode. \
+                         Explore freely with read tools, then call \
+                         exit_plan_mode with your plan.",
+                        call.name
+                    ),
+                    call.arguments.clone(),
+                    None,
+                ));
+                continue;
+            }
+
             let effective_args = if let Some(ref hook) = self.permission_hook {
                 match hook(&call.name, &call.arguments) {
                     PermissionDecision::Allow => call.arguments.clone(),
@@ -1138,6 +1164,8 @@ impl Agent {
             total_llm_latency_ms: self.total_llm_latency_ms,
             plan_buffer: self.plan_buffer.take(),
             plan_confirmed: self.plan_confirmed,
+            // Legacy Agent path: plan mode 2.0 not wired up, default to off.
+            exploring_plan_mode: Arc::new(AtomicBool::new(false)),
             shutdown_token: self.shutdown_token.clone(),
         };
 

@@ -6,6 +6,7 @@ import requests
 
 from .models import (
     MessageResponse,
+    PlanProposedMessage,
     RunResponse,
     SessionDetail,
     SessionInfo,
@@ -82,3 +83,42 @@ class RecursiveClient:
         """Delete a session."""
         resp = self.session.delete(f"{self.base_url}/sessions/{session_id}")
         resp.raise_for_status()
+
+    def approve_plan(self, session_id: str, edits: Optional[str] = None) -> dict:
+        """
+        Approve the pending plan for a session in plan_pending_approval state.
+
+        Args:
+            session_id: The session ID.
+            edits: Optional replacement plan text.
+
+        Returns:
+            {"status": "approved", "session_id": ...}
+        """
+        body: dict = {}
+        if edits is not None:
+            body["edits"] = edits
+        resp = self.session.post(
+            f"{self.base_url}/sessions/{session_id}/plan/confirm",
+            json=body,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def reject_plan(self, session_id: str, reason: str = "") -> dict:
+        """
+        Reject the pending plan for a session in plan_pending_approval state.
+
+        Args:
+            session_id: The session ID.
+            reason: Reason for rejection shown to the agent.
+
+        Returns:
+            {"status": "rejected", "session_id": ...}
+        """
+        resp = self.session.post(
+            f"{self.base_url}/sessions/{session_id}/plan/reject",
+            json={"reason": reason},
+        )
+        resp.raise_for_status()
+        return resp.json()
