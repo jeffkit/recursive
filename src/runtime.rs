@@ -265,8 +265,7 @@ impl AgentRuntime {
         // Append new messages to transcript and emit MessageAppended for each.
         // For assistant messages, attach the turn's token usage (g156).
         let new_messages = turn_outcome.new_messages.clone();
-        let turn_usage =
-            crate::session::UsageMeta::from_token_usage(&turn_outcome.usage);
+        let turn_usage = crate::session::UsageMeta::from_token_usage(&turn_outcome.usage);
         self.transcript.extend(new_messages.iter().cloned());
         for msg in &new_messages {
             let usage = if matches!(msg.role, crate::message::Role::Assistant) {

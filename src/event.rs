@@ -96,9 +96,34 @@ pub enum AgentEvent {
     /// can write the canonical record without reassembling it from the finer
     /// `AssistantText` / `ToolCall` / `ToolResult` streaming events.
     ///
+    /// `parent_uuid` — if `Some`, the emitter wants this message to be written
+    /// as a branch off the given UUID rather than the SessionWriter's internal
+    /// chain pointer. Used by subagent runtimes (g155).
+    ///
+    /// `usage` — token usage for this message (non-None for assistant messages
+    /// produced by an LLM call, g156).
+    ///
     /// Not emitted for seeded transcript messages loaded from an existing
     /// session on resume (those are already on disk).
-    MessageAppended { message: crate::message::Message },
+    MessageAppended {
+        message: crate::message::Message,
+        /// Explicit parent UUID override for subagent branch points (g155).
+        parent_uuid: Option<String>,
+        /// Token usage for this message (g156).
+        usage: Option<crate::session::UsageMeta>,
+    },
+
+    /// Cross-turn compaction just fired; a compact_boundary marker should be
+    /// written to the session JSONL (g157).
+    ///
+    /// `turn` — the turn index when compaction occurred.
+    /// `compacted_count` — how many messages were removed.
+    /// `summary_uuid` — UUID of the compaction summary message that replaced them.
+    CompactionBoundary {
+        turn: u32,
+        compacted_count: usize,
+        summary_uuid: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -605,11 +630,13 @@ mod tests {
         };
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),
+            parent_uuid: None,
+            usage: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
-        if let AgentEvent::MessageAppended { message: m } = deserialized {
+        if let AgentEvent::MessageAppended { message: m, .. } = deserialized {
             assert_eq!(m.content, "some text");
             assert_eq!(m.reasoning_content.as_deref(), Some("my reasoning"));
             assert_eq!(m.tool_calls.len(), 1);
@@ -634,6 +661,8 @@ mod tests {
         let msg = Message::user("hello");
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),
+            parent_uuid: None,
+            usage: None,
         };
         composite.emit(event.clone()).await;
 

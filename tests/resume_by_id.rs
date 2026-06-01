@@ -60,8 +60,10 @@ fn resume_by_full_id_round_trips_seed() {
     let mut w =
         SessionWriter::create_with_tools(&ws, "round trip", "model", "openai", &specs).unwrap();
     let dir = w.session_dir().to_path_buf();
-    w.append(&Message::user("hello".to_string())).unwrap();
-    w.append(&Message::assistant("hi".to_string())).unwrap();
+    w.append(&Message::user("hello".to_string()), None, None)
+        .unwrap();
+    w.append(&Message::assistant("hi".to_string()), None, None)
+        .unwrap();
     w.finish("interrupted").unwrap();
     drop(w);
 
@@ -79,7 +81,8 @@ fn most_recent_shortcut_picks_active_or_interrupted() {
 
     // Create three sessions in order.
     let mut a = SessionWriter::create(&ws, "A", "m", "p").unwrap();
-    a.append(&Message::user("a".to_string())).unwrap();
+    a.append(&Message::user("a".to_string()), None, None)
+        .unwrap();
     a.finish("success").unwrap();
     let dir_a = a.session_dir().to_path_buf();
     drop(a);
@@ -88,7 +91,8 @@ fn most_recent_shortcut_picks_active_or_interrupted() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let mut b = SessionWriter::create(&ws, "B", "m", "p").unwrap();
-    b.append(&Message::user("b".to_string())).unwrap();
+    b.append(&Message::user("b".to_string()), None, None)
+        .unwrap();
     // Don't call finish — stays "active".
     let dir_b = b.session_dir().to_path_buf();
     drop(b);
@@ -96,7 +100,8 @@ fn most_recent_shortcut_picks_active_or_interrupted() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let mut c = SessionWriter::create(&ws, "C", "m", "p").unwrap();
-    c.append(&Message::user("c".to_string())).unwrap();
+    c.append(&Message::user("c".to_string()), None, None)
+        .unwrap();
     c.finish("success").unwrap();
     let dir_c = c.session_dir().to_path_buf();
     drop(c);
@@ -127,14 +132,19 @@ fn resume_continues_msg_numbering() {
 
     let mut w = SessionWriter::create(&ws, "g151", "m", "p").unwrap();
     let dir = w.session_dir().to_path_buf();
-    w.append(&Message::user("u1".to_string())).unwrap();
-    w.append(&Message::assistant("a1".to_string())).unwrap();
-    w.append(&Message::user("u2".to_string())).unwrap();
+    w.append(&Message::user("u1".to_string()), None, None)
+        .unwrap();
+    w.append(&Message::assistant("a1".to_string()), None, None)
+        .unwrap();
+    w.append(&Message::user("u2".to_string()), None, None)
+        .unwrap();
     drop(w); // No finish() — simulate crash.
 
     // Re-open and append more.
     let mut w2 = SessionWriter::open_existing(&dir).unwrap();
-    let id = w2.append(&Message::assistant("a2".to_string())).unwrap();
+    let id = w2
+        .append(&Message::assistant("a2".to_string()), None, None)
+        .unwrap();
     assert_eq!(id, "msg_004");
     drop(w2);
 
@@ -235,9 +245,10 @@ fn load_messages_round_trips_tool_calls_and_reasoning() {
         tool_call_id: None,
         reasoning_content: Some("internal monologue".into()),
     };
-    w.append(&Message::user("u".to_string())).unwrap();
-    w.append(&assistant).unwrap();
-    w.append(&Message::tool_result("call_001", "result body"))
+    w.append(&Message::user("u".to_string()), None, None)
+        .unwrap();
+    w.append(&assistant, None, None).unwrap();
+    w.append(&Message::tool_result("call_001", "result body"), None, None)
         .unwrap();
     w.finish("success").unwrap();
     drop(w);

@@ -122,12 +122,12 @@ async fn rewind_undoes_turn_and_restores_files_and_transcript() {
     let mut prev = 0usize;
     let _o0 = runtime.run("please write a.txt").await.unwrap();
     for m in runtime.transcript().iter().skip(prev) {
-        sw.append(m).unwrap();
+        sw.append(m, None, None).unwrap();
     }
     prev = runtime.transcript().len();
     let _o1 = runtime.run("please write b.txt").await.unwrap();
     for m in runtime.transcript().iter().skip(prev) {
-        sw.append(m).unwrap();
+        sw.append(m, None, None).unwrap();
     }
     sw.finish("done").unwrap();
 

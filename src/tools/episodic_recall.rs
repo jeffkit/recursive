@@ -296,7 +296,7 @@ mod tests {
                 "system" => Message::system(content.to_string()),
                 _ => Message::user(content.to_string()),
             };
-            writer.append(&msg).unwrap();
+            writer.append(&msg, None, None).unwrap();
         }
         writer.finish("completed").unwrap();
         session_dir

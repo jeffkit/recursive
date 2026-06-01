@@ -364,18 +364,23 @@ async fn resume_after_crash_orphan_visible() {
     // Manually write an orphan: assistant with tool_calls, crash before result.
     let session_dir = {
         let mut w = sw.lock().unwrap();
-        w.append(&Message::user("do something")).unwrap();
-        w.append(&Message {
-            role: Role::Assistant,
-            content: "I will call the tool".into(),
-            tool_calls: vec![ToolCall {
-                id: "orphan_call_1".into(),
-                name: "run_shell".into(),
-                arguments: json!({"cmd": "dangerous"}),
-            }],
-            tool_call_id: None,
-            reasoning_content: None,
-        })
+        w.append(&Message::user("do something"), None, None)
+            .unwrap();
+        w.append(
+            &Message {
+                role: Role::Assistant,
+                content: "I will call the tool".into(),
+                tool_calls: vec![ToolCall {
+                    id: "orphan_call_1".into(),
+                    name: "run_shell".into(),
+                    arguments: json!({"cmd": "dangerous"}),
+                }],
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            None,
+            None,
+        )
         .unwrap();
         // "Crash" here — no tool result written.
         w.session_dir().to_path_buf()
