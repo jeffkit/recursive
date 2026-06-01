@@ -1,4 +1,4 @@
-# Goal 153 — Tool execution audit fields in `TranscriptEntry`
+# Goal 153 — Tool execution audit fields in `TranscriptEntry` ✅ DONE
 
 > **Roadmap**: Phase 18.5 — Long-running goals (part 1: durable execution journal)
 > **Design principle check**:
