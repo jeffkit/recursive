@@ -10,13 +10,14 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::tools::PermissionHook;
 use crate::{AgentEvent, AgentRuntime, EventSink};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::tui::bash::{build_bash_registry, resolve_workspace_root, run_bash_command};
-use crate::tui::events::{UiEvent, UserAction};
+use crate::tui::events::{PermissionRequest, UiEvent, UserAction};
 use crate::tui::runtime_builder::{build_runtime, RuntimeBuild};
 
 /// A handle to the agent worker task.
@@ -26,6 +27,13 @@ pub struct Backend {
     /// Shared cancel flag: the UI flips this to `true` to interrupt an
     /// in-flight turn; the worker's `tokio::select!` wakes and aborts.
     pub cancel_flag: Arc<AtomicBool>,
+    /// Goal-161: side-channel for runtime permission requests.
+    /// Separate from `event_rx` because `PermissionRequest` carries a
+    /// `oneshot::Sender<bool>` which is not `PartialEq`/`Clone`.
+    pub perm_rx: mpsc::UnboundedReceiver<PermissionRequest>,
+    /// Goal-161: shared flag that enables/disables the runtime permission
+    /// hook. The UI thread can flip this via `/permissions on|off`.
+    pub permission_enabled: Arc<AtomicBool>,
     _worker: JoinHandle<()>,
 }
 
@@ -41,14 +49,25 @@ impl Backend {
     fn spawn_with_state(state: RuntimeBuild) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let permission_enabled = Arc::new(AtomicBool::new(false));
 
-        let worker = tokio::spawn(worker_loop(state, action_rx, event_tx, cancel_flag.clone()));
+        let worker = tokio::spawn(worker_loop(
+            state,
+            action_rx,
+            event_tx,
+            perm_tx,
+            cancel_flag.clone(),
+            permission_enabled.clone(),
+        ));
 
         Self {
             action_tx,
             event_rx,
+            perm_rx,
             cancel_flag,
+            permission_enabled,
             _worker: worker,
         }
     }
@@ -116,15 +135,50 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
     }
 }
 
+// ── Goal-161: TuiPermissionHook ──────────────────────────────────────────────
+
+/// Forwards tool-permission requests to the UI via a side-channel and blocks
+/// until the user responds. When `enabled` is `false`, auto-allows all calls.
+struct TuiPermissionHook {
+    tx: mpsc::UnboundedSender<PermissionRequest>,
+    enabled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl PermissionHook for TuiPermissionHook {
+    async fn ask_permission(&self, tool_name: &str, args_preview: &str) -> bool {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return true;
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<bool>();
+        let req = PermissionRequest {
+            tool_name: tool_name.to_string(),
+            args_preview: args_preview.to_string(),
+            reply: reply_tx,
+        };
+        if self.tx.send(req).is_err() {
+            return true; // UI dropped — allow so agent isn't stuck.
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+}
+
 async fn worker_loop(
     mut state: RuntimeBuild,
     mut action_rx: mpsc::UnboundedReceiver<UserAction>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
+    perm_tx: mpsc::UnboundedSender<PermissionRequest>,
     cancel_flag: Arc<AtomicBool>,
+    permission_enabled: Arc<AtomicBool>,
 ) {
     if let RuntimeBuild::Ready(ref mut rt) = state {
         rt.set_event_sink(Arc::new(TuiEventSink {
             tx: event_tx.clone(),
+        }));
+        // Goal-161: wire up the permission hook.
+        rt.set_permission_hook(Arc::new(TuiPermissionHook {
+            tx: perm_tx,
+            enabled: permission_enabled,
         }));
     }
 

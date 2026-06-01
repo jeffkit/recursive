@@ -321,6 +321,13 @@ impl AgentRuntime {
         self.event_sink = sink;
     }
 
+    /// Goal-161: attach a [`crate::tools::PermissionHook`] to the
+    /// underlying tool registry so every tool invocation passes through
+    /// the async permission gate before execution.
+    pub fn set_permission_hook(&mut self, hook: Arc<dyn crate::tools::PermissionHook>) {
+        self.kernel.tools_mut().set_permission_hook(hook);
+    }
+
     /// Confirm the pending plan, allowing execution to proceed on the next run.
     pub fn confirm_plan(&mut self) {
         self.plan_confirmed = true;

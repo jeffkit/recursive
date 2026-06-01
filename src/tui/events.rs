@@ -10,6 +10,12 @@
 //! consume seven extra `AgentEvent` flavours: streaming partial
 //! tokens, completed assistant text, token usage, latency, transcript
 //! compaction and id-paired tool call/result events.
+//!
+//! Goal-161 adds a separate `PermissionRequest` side-channel (not
+//! part of `UiEvent`) because it carries a `oneshot::Sender<bool>` which
+//! cannot implement `PartialEq`. The backend exposes a
+//! `perm_rx: mpsc::UnboundedReceiver<PermissionRequest>` alongside
+//! `event_rx`; the main event loop polls both.
 
 /// Events bubbled up from the backend worker into the UI loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +73,20 @@ pub enum UiEvent {
     /// a free-form `reason`. Same UI handling as `PlanConfirmed` plus
     /// the reason in the System block.
     PlanRejected { reason: String },
+}
+
+// ── Goal-161: permission side-channel ────────────────────────────────────────
+
+/// A pending permission request bubbled up from the `TuiPermissionHook`
+/// running inside the backend worker. Carried on a dedicated side-channel
+/// (separate from `UiEvent`) because `oneshot::Sender` is not `PartialEq`.
+pub struct PermissionRequest {
+    /// The name of the tool that wants to run.
+    pub tool_name: String,
+    /// A short human-readable preview of the tool arguments (≤ 80 chars).
+    pub args_preview: String,
+    /// Resolve the request: `true` → allow, `false` → deny.
+    pub reply: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// Actions originating from key events that the backend worker must

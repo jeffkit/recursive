@@ -101,6 +101,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Goal-160: Ctrl+R history-search popup.
     command_menu::render_history_search(frame, chunks[2], app);
 
+    // Goal-161: permission-request modal (top layer — covers everything).
+    command_menu::render_permission_modal(frame, app);
+
     // Goal-146: modals are last so they cover everything else.
     if !app.modals.is_empty() {
         modal::render(frame, app);

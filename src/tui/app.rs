@@ -7,7 +7,8 @@
 //! Rendering lives in [`crate::ui`]; this file is *only* state plus the
 //! reducers that mutate it in response to [`UiEvent`]s and key events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -635,6 +636,28 @@ pub struct App {
     pub hsearch_matches: Vec<usize>,
     /// Currently highlighted row in the history-search popup.
     pub hsearch_selected: usize,
+    // ── Goal-161: Permission Request Modal ───────────────────────────
+    /// A pending tool-permission request delivered from the backend
+    /// worker via the side-channel. `None` means no permission dialog
+    /// is open. When `Some`, the modal is rendered and all keys are
+    /// routed to `handle_permission_key`.
+    pub pending_permission: Option<PendingPermission>,
+    /// Set of tool names the user has chosen to "Allow All" for the
+    /// current session. Requests for these tools skip the modal.
+    pub auto_allowed_tools: HashSet<String>,
+    /// Whether the runtime permission hook is currently active.
+    /// Toggled by `/permissions on|off`. Shared with the backend worker.
+    pub permission_hook_enabled: Arc<AtomicBool>,
+}
+
+// ── Goal-161: PendingPermission ──────────────────────────────────────────────
+
+/// Holds the state for the permission-request modal while it is open.
+/// The `reply` sender is consumed exactly once when the user presses Y or N.
+pub struct PendingPermission {
+    pub tool_name: String,
+    pub args_preview: String,
+    pub reply: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// Maximum candidates shown in the @file popup.
@@ -777,6 +800,9 @@ impl App {
             hsearch_query: String::new(),
             hsearch_matches: Vec::new(),
             hsearch_selected: 0,
+            pending_permission: None,
+            auto_allowed_tools: HashSet::new(),
+            permission_hook_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -805,6 +831,13 @@ impl App {
         // always quits.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.handle_ctrl_c();
+        }
+
+        // ── Goal-161: permission modal ───────────────────────────────
+        // When a tool-permission request is pending, all keys go to the
+        // permission dialog. Y/Enter allow, N/Esc deny.
+        if self.pending_permission.is_some() {
+            return self.handle_permission_key(key);
         }
 
         // ── Modal stack ──────────────────────────────────────────────
@@ -1683,6 +1716,50 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    // ── Goal-161: permission modal ────────────────────────────────────
+
+    /// Receive a pending permission request from the backend side-channel.
+    /// Auto-allow if the tool is in the `auto_allowed_tools` set;
+    /// otherwise store it so the UI can display the modal on the next render.
+    pub fn set_pending_permission(&mut self, req: crate::tui::events::PermissionRequest) {
+        if self.auto_allowed_tools.contains(&req.tool_name) {
+            // Auto-allow: resolve immediately without showing the modal.
+            let _ = req.reply.send(true);
+            return;
+        }
+        // If a previous request is somehow still pending (shouldn't happen
+        // in practice — the backend serialises tool calls), deny it so the
+        // oneshot is consumed and the worker can unblock.
+        if let Some(old) = self.pending_permission.take() {
+            let _ = old.reply.send(false);
+        }
+        self.pending_permission = Some(PendingPermission {
+            tool_name: req.tool_name,
+            args_preview: req.args_preview,
+            reply: req.reply,
+        });
+    }
+
+    /// Handle a key while a permission modal is active.
+    /// - `y` / `Y` / `Enter` → allow once
+    /// - `n` / `N` / `Esc`   → deny
+    /// - `a` / `A`           → allow + add tool to auto-allow list
+    pub fn handle_permission_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        let (allow, auto_allow) = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => (true, false),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => (false, false),
+            KeyCode::Char('a') | KeyCode::Char('A') => (true, true),
+            _ => return None,
+        };
+        if let Some(p) = self.pending_permission.take() {
+            if auto_allow {
+                self.auto_allowed_tools.insert(p.tool_name.clone());
+            }
+            let _ = p.reply.send(allow);
+        }
+        None
     }
 
     /// Handle a key event when at least one modal is on the stack.
@@ -3383,5 +3460,115 @@ mod hsearch_tests {
         // Backspace on empty query exits HistorySearch.
         app.handle_history_search_key(k(KeyCode::Backspace));
         assert_eq!(app.prompt.mode, InputMode::Prompt);
+    }
+}
+
+// ── Goal-161: Permission Modal tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod perm_tests {
+    use super::*;
+
+    fn make_perm(tool: &str, args: &str) -> (App, tokio::sync::oneshot::Receiver<bool>) {
+        let mut app = App::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let req = crate::tui::events::PermissionRequest {
+            tool_name: tool.to_string(),
+            args_preview: args.to_string(),
+            reply: tx,
+        };
+        app.set_pending_permission(req);
+        (app, rx)
+    }
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn pending_permission_set_and_stored() {
+        let (app, _rx) = make_perm("run_shell", "ls -la");
+        assert!(app.pending_permission.is_some());
+        let p = app.pending_permission.as_ref().unwrap();
+        assert_eq!(p.tool_name, "run_shell");
+        assert_eq!(p.args_preview, "ls -la");
+    }
+
+    #[tokio::test]
+    async fn y_key_sends_true_and_clears_modal() {
+        let (mut app, rx) = make_perm("run_shell", "ls");
+        app.handle_permission_key(k(KeyCode::Char('y')));
+        assert!(app.pending_permission.is_none());
+        assert!(rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn n_key_sends_false_and_clears_modal() {
+        let (mut app, rx) = make_perm("run_shell", "rm -rf /");
+        app.handle_permission_key(k(KeyCode::Char('n')));
+        assert!(app.pending_permission.is_none());
+        assert!(!rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn esc_key_sends_false() {
+        let (mut app, rx) = make_perm("write_file", "path=foo.txt");
+        app.handle_permission_key(k(KeyCode::Esc));
+        assert!(app.pending_permission.is_none());
+        assert!(!rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn enter_key_sends_true() {
+        let (mut app, rx) = make_perm("read_file", "path=foo.txt");
+        app.handle_permission_key(k(KeyCode::Enter));
+        assert!(app.pending_permission.is_none());
+        assert!(rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_key_sends_true_and_adds_to_auto_allowed() {
+        let (mut app, rx) = make_perm("run_shell", "cargo test");
+        app.handle_permission_key(k(KeyCode::Char('a')));
+        assert!(app.pending_permission.is_none());
+        assert!(rx.await.unwrap());
+        assert!(app.auto_allowed_tools.contains("run_shell"));
+    }
+
+    #[tokio::test]
+    async fn auto_allowed_tool_skips_modal() {
+        let mut app = App::new();
+        app.auto_allowed_tools.insert("run_shell".to_string());
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let req = crate::tui::events::PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            args_preview: "cargo build".to_string(),
+            reply: tx,
+        };
+        // Should auto-allow without storing to pending_permission.
+        app.set_pending_permission(req);
+        assert!(app.pending_permission.is_none());
+        assert!(rx.await.unwrap());
+    }
+
+    #[test]
+    fn handle_key_routes_to_permission_when_pending() {
+        // When pending_permission is set, handle_key routes to permission handler.
+        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
+        let mut app = App::new();
+        let req = crate::tui::events::PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args_preview: "path=foo.rs".to_string(),
+            reply: tx,
+        };
+        app.pending_permission = Some(PendingPermission {
+            tool_name: req.tool_name,
+            args_preview: req.args_preview,
+            reply: req.reply,
+        });
+        assert!(app.pending_permission.is_some());
+        // N key via handle_key should route to permission handler.
+        app.handle_key(k(KeyCode::Char('n')));
+        assert!(app.pending_permission.is_none());
     }
 }

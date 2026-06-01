@@ -31,6 +31,9 @@ pub async fn run() -> io::Result<()> {
 
     let mut backend = Backend::spawn();
     let mut app = App::new();
+    // Goal-161: share the permission-enabled flag so the UI (/permissions command)
+    // can toggle the backend hook without a separate channel.
+    app.permission_hook_enabled = backend.permission_enabled.clone();
 
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
@@ -54,6 +57,11 @@ pub async fn run() -> io::Result<()> {
             }
             Some(ui_event) = backend.event_rx.recv() => {
                 app.handle_ui_event(ui_event);
+            }
+            // Goal-161: permission side-channel — delivers tool-call
+            // permission requests from the backend worker to the UI.
+            Some(perm_req) = backend.perm_rx.recv() => {
+                app.set_pending_permission(perm_req);
             }
         }
 

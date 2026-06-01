@@ -1535,15 +1535,18 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "crossterm",
  "dirs",
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
+ "ratatui",
  "recursive-agent",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "syntect",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1555,25 +1558,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "unicode-width 0.2.0",
  "url",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "recursive-tui"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "crossterm",
- "ratatui",
- "recursive-agent",
- "serde",
- "serde_json",
- "syntect",
- "tempfile",
- "tokio",
- "unicode-width 0.2.0",
 ]
 
 [[package]]

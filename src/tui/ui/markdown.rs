@@ -14,7 +14,7 @@
 //! - [`render_inline`] — single-line inline markdown → `Vec<Span<'static>>`
 //! - [`render_table`]  — slice of table-row lines → `Vec<Line<'static>>`
 
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,9 +24,18 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 // ── Lazy-loaded syntect state ──────────────────────────────────────────
+// Use OnceLock (stable since 1.70) instead of LazyLock (stable 1.80)
+// to stay within the project's MSRV of 1.75.
 
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn theme_set() -> &'static ThemeSet {
+    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+    THEME_SET.get_or_init(ThemeSet::load_defaults)
+}
 
 // ── Public types ───────────────────────────────────────────────────────
 
@@ -252,8 +261,8 @@ pub fn is_table_line(line: &str) -> bool {
 // ── Internal helpers ───────────────────────────────────────────────────
 
 fn highlight_code_line(line: &str, lang: &str) -> Vec<Span<'static>> {
-    let ss = &*SYNTAX_SET;
-    let ts = &*THEME_SET;
+    let ss = syntax_set();
+    let ts = theme_set();
 
     // Try to find the syntax for the given language tag.
     let syntax = if lang.is_empty() {

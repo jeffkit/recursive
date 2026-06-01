@@ -140,6 +140,13 @@ impl CommandRegistry {
                     handler: CommandHandler::Sync(cmd_journal),
                 },
                 CommandSpec {
+                    name: "permissions",
+                    aliases: &["perm"],
+                    summary: "Toggle runtime permission hook (/permissions on|off)",
+                    usage: "/permissions on|off",
+                    handler: CommandHandler::Sync(cmd_permissions),
+                },
+                CommandSpec {
                     name: "exit",
                     aliases: &["quit", "q"],
                     summary: "Quit the TUI",
@@ -264,6 +271,41 @@ fn cmd_exit(app: &mut AppState, _args: &[String]) -> CommandOutcome {
     CommandOutcome::Done
 }
 
+fn cmd_permissions(app: &mut AppState, args: &[String]) -> CommandOutcome {
+    let arg = args.first().map(|s| s.to_lowercase());
+    let on = match arg.as_deref() {
+        Some("on") | Some("true") | Some("1") => true,
+        Some("off") | Some("false") | Some("0") => false,
+        _ => {
+            let current = if app
+                .permission_hook_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "on"
+            } else {
+                "off"
+            };
+            app.push_error(format!("Usage: /permissions on|off  (currently {current})"));
+            return CommandOutcome::Done;
+        }
+    };
+    app.permission_hook_enabled
+        .store(on, std::sync::atomic::Ordering::Relaxed);
+    if !on {
+        // Clear auto-allow list when disabling so it starts fresh next time.
+        app.auto_allowed_tools.clear();
+        // If a modal is open, deny and close it.
+        if let Some(old) = app.pending_permission.take() {
+            let _ = old.reply.send(false);
+        }
+    }
+    app.push_system(format!(
+        "Permissions hook: {}",
+        if on { "on" } else { "off" }
+    ));
+    CommandOutcome::Done
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
@@ -311,15 +353,24 @@ mod tests {
         let r = CommandRegistry::default_set();
         let names: Vec<&str> = r.commands().iter().map(|c| c.name).collect();
         for expected in &[
-            "help", "clear", "compact", "cost", "model", "status", "tools", "plan", "journal",
+            "help",
+            "clear",
+            "compact",
+            "cost",
+            "model",
+            "status",
+            "tools",
+            "plan",
+            "journal",
             "exit",
+            "permissions",
         ] {
             assert!(
                 names.contains(expected),
                 "missing /{expected}: have {names:?}"
             );
         }
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]
@@ -333,7 +384,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 10);
+        assert_eq!(hits.len(), 11);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();

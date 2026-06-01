@@ -73,12 +73,25 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Goal-161: runtime permission hook. Implement this trait to intercept
+/// every tool invocation before it runs. Return `true` to allow or
+/// `false` to deny. When no hook is registered, all tools are allowed.
+#[async_trait]
+pub trait PermissionHook: Send + Sync {
+    /// Called before every tool dispatch.
+    async fn ask_permission(&self, tool_name: &str, args_preview: &str) -> bool;
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     transport: Arc<dyn ToolTransport>,
     permissions: Option<PermissionsConfig>,
     touched: Option<Arc<Mutex<TouchedFiles>>>,
+    /// Goal-161: optional runtime permission hook. When `Some`, called
+    /// before every tool invocation. `None` means allow all (backward-
+    /// compatible default).
+    permission_hook: Option<Arc<dyn PermissionHook>>,
 }
 
 /// Observer that records files touched by structured filesystem tools
@@ -151,6 +164,7 @@ impl ToolRegistry {
             transport,
             permissions: None,
             touched: None,
+            permission_hook: None,
         }
     }
 
@@ -171,7 +185,27 @@ impl ToolRegistry {
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
             touched: self.touched.clone(),
+            permission_hook: self.permission_hook.clone(),
         }
+    }
+
+    /// Attach a [`PermissionHook`] (Goal 161). When set, `ask_permission`
+    /// is called before every tool invocation; returning `false` causes
+    /// `invoke` to return `Error::PermissionDenied` without running the tool.
+    pub fn with_permission_hook(mut self, hook: Arc<dyn PermissionHook>) -> Self {
+        self.permission_hook = Some(hook);
+        self
+    }
+
+    /// Attach a permission hook via mutable reference.
+    /// Equivalent to [`with_permission_hook`] but usable on existing registries.
+    pub fn set_permission_hook(&mut self, hook: Arc<dyn PermissionHook>) {
+        self.permission_hook = Some(hook);
+    }
+
+    /// Remove any previously attached permission hook.
+    pub fn clear_permission_hook(&mut self) {
+        self.permission_hook = None;
     }
 
     /// Set the permissions configuration for this registry.
@@ -232,6 +266,15 @@ impl ToolRegistry {
     }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
+        // Goal-161: runtime permission hook — checked first, before static
+        // config, so the user gets the chance to allow/deny at call time.
+        if let Some(hook) = &self.permission_hook {
+            let preview = args_preview_for_permission(&arguments);
+            if !hook.ask_permission(name, &preview).await {
+                return Err(Error::PermissionDenied { name: name.into() });
+            }
+        }
+
         // Static permission check before any tool execution
         if let Some(ref config) = self.permissions {
             match config.check_static(name) {
@@ -263,6 +306,40 @@ impl ToolRegistry {
         }
         .instrument(span)
         .await
+    }
+}
+
+/// Build a short human-readable preview of tool arguments for the
+/// permission dialog. Extracts up to 80 characters.
+fn args_preview_for_permission(arguments: &Value) -> String {
+    let s = match arguments {
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .take(3)
+                .map(|(k, v)| {
+                    let v_str = match v {
+                        Value::String(s) => {
+                            let short: String = s.chars().take(30).collect();
+                            format!("\"{}\"", short)
+                        }
+                        other => {
+                            let s = other.to_string();
+                            s.chars().take(30).collect()
+                        }
+                    };
+                    format!("{k}={v_str}")
+                })
+                .collect();
+            parts.join(", ")
+        }
+        other => other.to_string(),
+    };
+    if s.chars().count() > 80 {
+        let head: String = s.chars().take(79).collect();
+        format!("{head}…")
+    } else {
+        s
     }
 }
 
@@ -445,5 +522,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::PermissionDenied { .. }));
+    }
+
+    // ── Goal-161: PermissionHook tests ───────────────────────────────────
+
+    struct AllowHook;
+    struct DenyHook;
+
+    #[async_trait]
+    impl PermissionHook for AllowHook {
+        async fn ask_permission(&self, _name: &str, _args: &str) -> bool {
+            true
+        }
+    }
+
+    #[async_trait]
+    impl PermissionHook for DenyHook {
+        async fn ask_permission(&self, _name: &str, _args: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_hook_allow_lets_tool_run() {
+        let reg = ToolRegistry::local()
+            .with_permission_hook(Arc::new(AllowHook))
+            .register(Arc::new(Echo));
+        let result = reg
+            .invoke("echo", serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn permission_hook_deny_blocks_invoke() {
+        let reg = ToolRegistry::local()
+            .with_permission_hook(Arc::new(DenyHook))
+            .register(Arc::new(Echo));
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "blocked"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn args_preview_truncates_long_strings() {
+        let big_val = "x".repeat(200);
+        let args = serde_json::json!({"command": big_val});
+        let preview = args_preview_for_permission(&args);
+        assert!(preview.chars().count() <= 81); // 80 chars + ellipsis
     }
 }

@@ -134,7 +134,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
 /// Render the @file completion popup (Goal 158). No-op when not in
 /// AtFile mode or when the suggestion list is empty.
 pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
-    if app.prompt.mode != crate::app::InputMode::AtFile {
+    if app.prompt.mode != crate::tui::app::InputMode::AtFile {
         return;
     }
     let suggestions = &app.atfile_suggestions;
@@ -179,7 +179,7 @@ pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
 /// Render the Ctrl+R history-search popup (Goal 160). No-op when not in
 /// HistorySearch mode or when there are no matches to show.
 pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
-    if app.prompt.mode != crate::app::InputMode::HistorySearch {
+    if app.prompt.mode != crate::tui::app::InputMode::HistorySearch {
         return;
     }
     // Always show the popup (even when matches is empty) so the user
@@ -234,6 +234,104 @@ pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
         .style(Style::default().bg(Color::Black));
     let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, area);
+}
+
+// ── Goal-161: Permission Request Modal ───────────────────────────────────────
+
+/// Render the permission-request modal when a tool is waiting for user
+/// approval. Displayed as a centred overlay with the tool name, an
+/// abbreviated argument preview, and `[Y]es / [N]o` instructions.
+pub fn render_permission_modal(frame: &mut Frame, app: &App) {
+    let Some(ref perm) = app.pending_permission else {
+        return;
+    };
+
+    // Centre a fixed-size box on screen.
+    let area = frame.area();
+    let modal_w = area.width.saturating_sub(8).min(72);
+    let modal_h = 8u16;
+    let x = (area.width.saturating_sub(modal_w)) / 2;
+    let y = (area.height.saturating_sub(modal_h)) / 2;
+    let modal_area = Rect::new(x, y, modal_w, modal_h);
+
+    frame.render_widget(Clear, modal_area);
+
+    let header_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(Color::White);
+    let hint_style = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+    let muted_style = Style::default().fg(Color::DarkGray);
+
+    let tool_line = Line::from(vec![
+        Span::styled(" Tool: ", header_style),
+        Span::styled(perm.tool_name.clone(), body_style),
+    ]);
+
+    let args_preview = if perm.args_preview.is_empty() {
+        "(no arguments)".to_string()
+    } else {
+        perm.args_preview.clone()
+    };
+    let args_short: String = args_preview.chars().take(60).collect();
+    let args_truncated = if args_preview.chars().count() > 60 {
+        format!("{args_short}…")
+    } else {
+        args_short
+    };
+    let args_line = Line::from(vec![
+        Span::styled(" Args: ", muted_style),
+        Span::styled(args_truncated, body_style),
+    ]);
+
+    let sep_line = Line::from(Span::styled("─".repeat(modal_w as usize - 2), muted_style));
+
+    let hint_line = Line::from(vec![
+        Span::styled("  [Y]", hint_style),
+        Span::styled("/", muted_style),
+        Span::styled("[Enter]", hint_style),
+        Span::styled(" Allow  ", body_style),
+        Span::styled(
+            "[N]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("/", muted_style),
+        Span::styled("[Esc]", muted_style),
+        Span::styled(" Deny  ", body_style),
+        Span::styled(
+            "[A]",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Allow All", body_style),
+    ]);
+
+    let lines = vec![
+        Line::from(""),
+        tool_line,
+        args_line,
+        Line::from(""),
+        sep_line,
+        hint_line,
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " ⚠ Permission Request ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Black));
+
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, modal_area);
 }
 
 // ──────────────────────────────────────────────────────────────────────
