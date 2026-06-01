@@ -1,4 +1,4 @@
-# Goal 161 — TUI: Permission Request Modal (runtime hook + TUI 弹框)
+# Goal 161 — TUI: Permission Request Modal (runtime hook + TUI 弹框) ✅ DONE
 
 **Roadmap**: TUI 体验提升系列 (part 4/4)
 
