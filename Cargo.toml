@@ -30,7 +30,7 @@ mcp = ["dep:futures-util"]
 web_fetch = []
 anthropic = []
 http = ["dep:axum", "dep:tower-http", "dep:tokio-stream", "dep:futures-util", "dep:jsonwebtoken", "dep:agui-protocol"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:syntect"]
 
 [lib]
 name = "recursive"
@@ -77,6 +77,7 @@ agui-protocol = { path = "crates/agui-protocol", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-width = { version = "0.2", optional = true }
+syntect = { version = "5", default-features = false, features = ["default-fancy"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

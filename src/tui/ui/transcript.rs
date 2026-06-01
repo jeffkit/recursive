@@ -108,15 +108,34 @@ fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec
         ));
     }
     let mut out = vec![Line::from(header)];
+
+    let all_lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
     let mut md_state = markdown::MdState::default();
-    for line in text.lines() {
+
+    while i < all_lines.len() {
+        let line = all_lines[i];
+
+        // Detect a table block (consecutive `|…` lines) only outside code blocks.
+        if !md_state.in_code_block && markdown::is_table_line(line) {
+            let table_start = i;
+            while i < all_lines.len() && markdown::is_table_line(all_lines[i]) {
+                i += 1;
+            }
+            let table_rows = &all_lines[table_start..i];
+            out.extend(markdown::render_table(table_rows, "│  ", gutter_style));
+            continue;
+        }
+
         let rendered = markdown::render_inline(line, Color::White, md_state);
         md_state = rendered.state;
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(rendered.spans.len() + 1);
         spans.push(Span::styled("│  ", gutter_style));
         spans.extend(rendered.spans);
         out.push(Line::from(spans));
+        i += 1;
     }
+
     if text.is_empty() {
         out.push(Line::from(vec![Span::styled(
             "│  ".to_string(),
