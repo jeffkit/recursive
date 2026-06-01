@@ -36,7 +36,8 @@ pub fn build_runtime() -> RuntimeBuild {
             .with_temperature(config.temperature),
     );
 
-    let tools = crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
+    let tools =
+        crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
 
     match AgentRuntimeBuilder::new()
         .llm(provider)
@@ -55,8 +56,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::tui::events::UiEvent;
     use crate::tui::backend::Backend;
+    use crate::tui::events::UiEvent;
     use crate::tui::events::UserAction;
 
     #[tokio::test]

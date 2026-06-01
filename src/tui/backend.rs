@@ -10,8 +10,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use crate::{AgentEvent, AgentRuntime, EventSink};
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -398,8 +398,11 @@ mod tests {
     async fn run_with_cancel_flag_true_returns_quickly() {
         let flag = Arc::new(AtomicBool::new(true));
         let started = std::time::Instant::now();
-        let timed =
-            tokio::time::timeout(std::time::Duration::from_millis(500), wait_for_cancel(flag.clone())).await;
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            wait_for_cancel(flag.clone()),
+        )
+        .await;
         let elapsed = started.elapsed();
         assert!(timed.is_ok(), "wait_for_cancel didn't return in time");
         assert!(

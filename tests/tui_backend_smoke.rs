@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use recursive::llm::{Completion, MockProvider};
-use recursive::AgentRuntimeBuilder;
 use recursive::tui::backend::Backend;
 use recursive::tui::events::{UiEvent, UserAction};
+use recursive::AgentRuntimeBuilder;
 
 #[tokio::test]
 async fn backend_smoke_one_turn_with_mock_provider() {

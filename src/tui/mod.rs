@@ -57,9 +57,7 @@ pub async fn run() -> io::Result<()> {
             }
         }
 
-        if app.screen == AppScreen::Splash
-            && app.splash_start.elapsed() > Duration::from_secs(2)
-        {
+        if app.screen == AppScreen::Splash && app.splash_start.elapsed() > Duration::from_secs(2) {
             app.screen = AppScreen::Chat;
         }
 
