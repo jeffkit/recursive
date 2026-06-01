@@ -556,6 +556,12 @@ fn git_cmd() -> Command {
     // user environments that have a localized git installation.
     cmd.env("LC_ALL", "C");
     cmd.env("LANG", "C");
+    // Clear any ambient GIT_DIR / GIT_WORK_TREE that a parent process (e.g. a
+    // pre-receive hook) might have set. Commands that need these variables set
+    // them explicitly; leaving them inherited causes `git init --bare` to fail
+    // with "GIT_WORK_TREE not allowed without GIT_DIR".
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
     cmd
 }
 
