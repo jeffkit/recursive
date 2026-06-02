@@ -2004,4 +2004,24 @@ mod tests {
         rt.message_queue.push_back("also pending".into());
         assert_eq!(rt.queue_len(), 2);
     }
+
+    // ── Goal-201: plan mode tools are registered by the runtime builder ──
+
+    #[test]
+    fn runtime_builder_has_plan_mode_tools() {
+        // AgentRuntimeBuilder::build() must register enter_plan_mode and
+        // exit_plan_mode with the real PlanApprovalGate and EventSink.
+        // These are channel capabilities used by the TUI and HTTP paths.
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let tools = rt.kernel.tools();
+        assert!(
+            tools.get("enter_plan_mode").is_some(),
+            "enter_plan_mode must be registered by AgentRuntimeBuilder"
+        );
+        assert!(
+            tools.get("exit_plan_mode").is_some(),
+            "exit_plan_mode must be registered by AgentRuntimeBuilder"
+        );
+    }
 }
