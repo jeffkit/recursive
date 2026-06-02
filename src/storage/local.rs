@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::storage::StorageBackend;
+use async_trait::async_trait;
 
 /// [`StorageBackend`] backed by the local filesystem.
 ///
@@ -37,6 +38,7 @@ impl LocalStorageBackend {
     }
 }
 
+#[async_trait]
 impl StorageBackend for LocalStorageBackend {
     async fn load_transcript(&self, session_id: &str) -> Result<Vec<Message>> {
         let path = self.transcript_path(session_id);

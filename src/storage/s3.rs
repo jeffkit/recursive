@@ -6,6 +6,7 @@
 //!
 //! Gated behind the `cloud-runtime` feature flag.
 
+use async_trait::async_trait;
 use aws_sdk_s3::Client;
 
 use crate::error::{Error, Result};
@@ -70,6 +71,7 @@ impl S3StorageBackend {
     }
 }
 
+#[async_trait]
 impl StorageBackend for S3StorageBackend {
     async fn load_transcript(&self, session_id: &str) -> Result<Vec<Message>> {
         let key = self.transcript_key(session_id);

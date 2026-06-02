@@ -31,6 +31,8 @@ use crate::event::{AgentEvent, EventSink};
 use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, TokenUsage, ToolSpec};
 use crate::message::Message;
+use crate::storage::{NoopSessionStore, SessionStore, StorageBackend};
+use crate::tool_set_provider::ToolSetProvider;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
@@ -177,6 +179,12 @@ pub struct AgentKernel {
     /// [`FinishReason::Cancelled`](crate::agent::FinishReason::Cancelled)
     /// at the next step boundary.
     pub(crate) shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    /// Pluggable storage backend (transcript + memory). Defaults to a
+    /// `LocalStorageBackend` when not set; cloud deployments inject S3.
+    pub(crate) storage: Arc<dyn StorageBackend>,
+    /// Pluggable session hot-state store (checkpoint step/transcript_len).
+    /// Defaults to `NoopSessionStore`; cloud deployments inject Redis.
+    pub(crate) session_store: Arc<dyn SessionStore>,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -190,6 +198,8 @@ impl std::fmt::Debug for AgentKernel {
             .field("max_transcript_chars", &self.max_transcript_chars)
             .field("compactor", &self.compactor)
             .field("hooks_count", &hooks_count)
+            .field("storage", &"<StorageBackend>")
+            .field("session_store", &"<SessionStore>")
             .finish()
     }
 }
@@ -227,6 +237,16 @@ impl AgentKernel {
         self.shutdown_token.as_ref()
     }
 
+    /// Access the storage backend.
+    pub fn storage(&self) -> &Arc<dyn StorageBackend> {
+        &self.storage
+    }
+
+    /// Access the session store.
+    pub fn session_store(&self) -> &Arc<dyn SessionStore> {
+        &self.session_store
+    }
+
     /// Create a new kernel with a different tool registry (same LLM, same config).
     /// Useful for Multi-Agent scenarios where sub-agents get restricted tool subsets.
     pub fn with_tools(&self, tools: ToolRegistry) -> Self {
@@ -238,6 +258,8 @@ impl AgentKernel {
             compactor: self.compactor.clone(),
             hooks: self.hooks.clone(),
             shutdown_token: self.shutdown_token.clone(),
+            storage: self.storage.clone(),
+            session_store: self.session_store.clone(),
         }
     }
 
@@ -335,6 +357,15 @@ pub struct AgentKernelBuilder {
     compactor: Option<Compactor>,
     hooks: Option<HookRegistry>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    /// Pluggable storage backend. When `None`, `build()` falls back to
+    /// `LocalStorageBackend` rooted at the current directory.
+    storage: Option<Arc<dyn StorageBackend>>,
+    /// Pluggable session hot-state store. When `None`, `build()` uses
+    /// `NoopSessionStore` (no-op, zero overhead).
+    session_store: Option<Arc<dyn SessionStore>>,
+    /// Pluggable tool set provider. When `Some`, `build()` calls
+    /// `provider.build_registry()` unless `tools` was set explicitly.
+    tool_set_provider: Option<Arc<dyn ToolSetProvider>>,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -348,6 +379,18 @@ impl std::fmt::Debug for AgentKernelBuilder {
             .field("max_transcript_chars", &self.max_transcript_chars)
             .field("compactor", &self.compactor)
             .field("hooks", &hooks_desc)
+            .field(
+                "storage",
+                &self.storage.as_ref().map(|_| "<StorageBackend>"),
+            )
+            .field(
+                "session_store",
+                &self.session_store.as_ref().map(|_| "<SessionStore>"),
+            )
+            .field(
+                "tool_set_provider",
+                &self.tool_set_provider.as_ref().map(|_| "<ToolSetProvider>"),
+            )
             .finish()
     }
 }
@@ -398,14 +441,52 @@ impl AgentKernelBuilder {
         self
     }
 
+    /// Inject a storage backend. If not set, `build()` defaults to
+    /// `LocalStorageBackend` rooted at the current working directory.
+    pub fn with_storage(mut self, backend: Arc<dyn StorageBackend>) -> Self {
+        self.storage = Some(backend);
+        self
+    }
+
+    /// Inject a session hot-state store. If not set, `build()` uses
+    /// `NoopSessionStore` (zero cost, no I/O).
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Inject a tool set provider. When set and `tools()` is NOT also called,
+    /// `build()` delegates `tools` construction to `provider.build_registry()`.
+    /// If `tools()` was set explicitly, that registry takes precedence.
+    pub fn with_tool_set_provider(mut self, provider: Arc<dyn ToolSetProvider>) -> Self {
+        self.tool_set_provider = Some(provider);
+        self
+    }
+
     /// Build the `AgentKernel`, or return an error if required fields are missing.
     pub fn build(self) -> crate::error::Result<AgentKernel> {
         let llm = self.llm.ok_or_else(|| crate::error::Error::Config {
             message: "llm provider is required".into(),
         })?;
-        let tools = self.tools.unwrap_or_else(ToolRegistry::local);
+        // Tools: explicit registry > tool_set_provider > local default.
+        let tools = if let Some(registry) = self.tools {
+            registry
+        } else if let Some(ref provider) = self.tool_set_provider {
+            provider.build_registry()
+        } else {
+            ToolRegistry::local()
+        };
         let max_steps = self.max_steps.unwrap_or(32);
         let hooks = self.hooks.unwrap_or_default();
+        // Storage defaults: local filesystem, no-op session store.
+        let storage: Arc<dyn StorageBackend> = self.storage.unwrap_or_else(|| {
+            Arc::new(crate::storage::local::LocalStorageBackend::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ))
+        });
+        let session_store: Arc<dyn SessionStore> = self
+            .session_store
+            .unwrap_or_else(|| Arc::new(NoopSessionStore));
         Ok(AgentKernel {
             llm,
             tools,
@@ -414,6 +495,8 @@ impl AgentKernelBuilder {
             compactor: self.compactor,
             hooks,
             shutdown_token: self.shutdown_token,
+            storage,
+            session_store,
         })
     }
 }

@@ -33,7 +33,7 @@ pub use s3::S3StorageBackend;
 
 use crate::error::Result;
 use crate::message::Message;
-use std::future::Future;
+use async_trait::async_trait;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StorageBackend
@@ -48,32 +48,29 @@ use std::future::Future;
 /// - `load_memory` returns `None` (not an error) when the key does not exist.
 /// - Implementations must be safe to call concurrently from multiple async
 ///   tasks (`Send + Sync + 'static`).
+///
+/// The trait uses `#[async_trait]` so it is `dyn`-compatible and can be
+/// stored as `Arc<dyn StorageBackend>` without generics spreading to callers.
+#[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {
     /// Load the full transcript for a session.
     ///
     /// Returns `Ok(vec![])` if the session has no persisted transcript yet.
-    fn load_transcript(
-        &self,
-        session_id: &str,
-    ) -> impl Future<Output = Result<Vec<Message>>> + Send;
+    async fn load_transcript(&self, session_id: &str) -> Result<Vec<Message>>;
 
     /// Persist the full transcript for a session.
     ///
     /// This is a full overwrite — the caller is responsible for appending
     /// new messages before calling this.
-    fn save_transcript(
-        &self,
-        session_id: &str,
-        messages: &[Message],
-    ) -> impl Future<Output = Result<()>> + Send;
+    async fn save_transcript(&self, session_id: &str, messages: &[Message]) -> Result<()>;
 
     /// Load a named memory entry (e.g. `"user.md"`, `"project.md"`).
     ///
     /// Returns `Ok(None)` if the key has never been written.
-    fn load_memory(&self, key: &str) -> impl Future<Output = Result<Option<String>>> + Send;
+    async fn load_memory(&self, key: &str) -> Result<Option<String>>;
 
     /// Store a named memory entry.
-    fn save_memory(&self, key: &str, value: &str) -> impl Future<Output = Result<()>> + Send;
+    async fn save_memory(&self, key: &str, value: &str) -> Result<()>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,31 +108,27 @@ pub struct AgentCheckpointState {
 ///   and continue.
 /// - `load_state` returns `Ok(None)` when no checkpoint exists (new session).
 /// - `delete_state` is idempotent: deleting a non-existent key is `Ok(())`.
+///
+/// Uses `#[async_trait]` so it is `dyn`-compatible (`Arc<dyn SessionStore>`).
+#[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
     /// Persist the current loop state for a session.
     ///
     /// Called after each tool execution.  Failures should be treated as
     /// warnings, not errors.
-    fn save_state(
-        &self,
-        session_id: &str,
-        state: &AgentCheckpointState,
-    ) -> impl Future<Output = Result<()>> + Send;
+    async fn save_state(&self, session_id: &str, state: &AgentCheckpointState) -> Result<()>;
 
     /// Load the most recent checkpoint for a session.
     ///
     /// Returns `Ok(None)` if no checkpoint exists (fresh session or already
     /// cleaned up).
-    fn load_state(
-        &self,
-        session_id: &str,
-    ) -> impl Future<Output = Result<Option<AgentCheckpointState>>> + Send;
+    async fn load_state(&self, session_id: &str) -> Result<Option<AgentCheckpointState>>;
 
     /// Remove all checkpoint state for a session.
     ///
     /// Should be called after the Agent Loop finishes (success or failure) to
     /// avoid stale state in Redis/KV.
-    fn delete_state(&self, session_id: &str) -> impl Future<Output = Result<()>> + Send;
+    async fn delete_state(&self, session_id: &str) -> Result<()>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +141,7 @@ pub trait SessionStore: Send + Sync + 'static {
 /// All operations are immediate `Ok(())` / `Ok(None)` with zero overhead.
 pub struct NoopSessionStore;
 
+#[async_trait]
 impl SessionStore for NoopSessionStore {
     async fn save_state(&self, _session_id: &str, _state: &AgentCheckpointState) -> Result<()> {
         Ok(())

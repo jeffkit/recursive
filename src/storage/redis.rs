@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use deadpool_redis::{Config, Pool, Runtime};
 use redis::AsyncCommands;
 
@@ -54,6 +55,7 @@ impl RedisSessionStore {
     }
 }
 
+#[async_trait]
 impl SessionStore for RedisSessionStore {
     async fn save_state(&self, session_id: &str, state: &AgentCheckpointState) -> Result<()> {
         let mut conn = self.pool.get().await.map_err(|e| Error::Storage {
