@@ -306,12 +306,29 @@ impl Tool for A2aCallTool {
                 });
             }
             SendMessageResponse::HasTask { mut task } => {
-                // ── Async mode: return task ID immediately without polling ─
+                // ── Async mode: return task ID + background poll script ──────
                 if use_async {
+                    let task_id = &task.id;
+                    let state = task.status.state.as_str();
+                    // Build a shell one-liner the agent can pass to run_background.
+                    // When the task reaches a terminal state the script exits, and
+                    // run_event_loop detects the completed background job and starts
+                    // a new turn with the output as its goal.
+                    let poll_cmd = format!(
+                        "end=$(($(date +%s)+{timeout_secs})); \
+while [ $(date +%s) -lt $end ]; do \
+  r=$(curl -sf '{base}/tasks/{task_id}' 2>/dev/null || echo '{{}}'); \
+  s=$(echo \"$r\" | python3 -c \"import sys,json;print(json.load(sys.stdin).get('status',{{}}).get('state','UNKNOWN'))\" 2>/dev/null || echo UNKNOWN); \
+  case \"$s\" in TASK_STATE_COMPLETED|TASK_STATE_FAILED|TASK_STATE_CANCELED|TASK_STATE_REJECTED) \
+    echo \"A2A task {task_id} finished: $s\"; echo \"$r\"; exit 0;; \
+  esac; sleep 2; done; \
+echo \"A2A task {task_id} timed out after {timeout_secs}s\""
+                    );
                     return Ok(format!(
-                        "TASK_ID: {}\nSTATE: {}\n(Use a2a_task_check with url={base} to poll for results)",
-                        task.id,
-                        task.status.state.as_str()
+                        "TASK_ID: {task_id}\nSTATE: {state}\n\n\
+To poll in background and auto-trigger a new turn on completion, \
+call run_background with:\n  command: {poll_cmd}\n  name: a2a-{task_id}\n\n\
+When the background job completes, a new turn will start automatically with the result."
                     ));
                 }
 
@@ -793,8 +810,10 @@ impl Tool for A2aTaskCheckTool {
         ToolSpec {
             name: "a2a_task_check".into(),
             description: "Check the current status and artifacts of a previously submitted A2A task. \
-                           Use this after calling a2a_call with async_mode=true to retrieve results. \
-                           Combine with schedule_wakeup for periodic polling of long-running tasks."
+                           Useful for one-off manual inspection. The preferred pattern for automatic \
+                           async polling is: use a2a_call with async_mode=true (which provides a \
+                           ready-to-run shell command), pass that command to run_background, and let \
+                           run_event_loop auto-trigger a new turn when the background job completes."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -1264,6 +1283,8 @@ mod tests {
 
         assert!(result.contains("TASK_ID: async-t1"), "got: {result}");
         assert!(result.contains("TASK_STATE_SUBMITTED"), "got: {result}");
+        assert!(result.contains("run_background"), "got: {result}");
+        assert!(result.contains("curl"), "got: {result}");
     }
 
     #[tokio::test]
