@@ -2,11 +2,20 @@ pub mod app;
 pub mod backend;
 pub mod bash;
 pub mod commands;
+pub mod completion;
+pub mod cost;
 pub mod events;
+pub mod input_state;
 pub mod keymap;
+pub mod model;
 pub mod runtime_builder;
 pub mod skill_commands;
 pub mod ui;
+
+// Re-export types used outside the tui module.
+pub use cost::UsageStats;
+pub use input_state::{InputMode, PromptInputState};
+pub use model::{AppScreen, DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
 
 use std::io;
 use std::time::Duration;
@@ -19,7 +28,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use crate::tui::app::{App, AppScreen};
+use crate::tui::app::App;
 use crate::tui::backend::Backend;
 use crate::tui::events::UserAction;
 
