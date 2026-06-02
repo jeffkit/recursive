@@ -239,3 +239,69 @@ AgentEvent::GoalCleared,
 
 **M** — ~2-3 days. Most complexity is in the evaluator + loop + HTTP wiring.
 The TUI slash command is straightforward given existing command machinery.
+
+---
+
+## Termination contract (post-merge)
+
+This section pins down the exact conditions under which `run_goal_loop` exits
+and what state it leaves behind. Read it before changing the loop body in
+`src/runtime.rs:628`.
+
+### Pre-flight
+
+`run_goal_loop` always calls `set_goal()` first, which writes a fresh
+`GoalState { status: Pursuing, turns: 0, last_reason: None }`. Any existing
+goal on the runtime is overwritten.
+
+### Exit paths
+
+| # | Trigger                                                                 | Final `goal_state` | Final emitted event       | Loop returns    |
+|---|-------------------------------------------------------------------------|---------------------|----------------------------|-----------------|
+| 1 | **Achieved** — judge returns `verdict.achieved == true`                 | `None` (cleared)*  | `GoalAchieved`             | `Ok(outcomes)`  |
+| 2 | **Budget exceeded** — `turns >= max_turns` after a successful turn      | `None` (cleared)*  | `GoalCleared`              | `Ok(outcomes)`  |
+| 3 | **External clear** — caller writes `None` into `goal_state` mid-loop    | `None`             | (no terminal event)        | `Ok(outcomes)`  |
+| 4 | **Turn error** — `self.run(&next_prompt).await?` returns `Err(_)`       | unchanged          | (no terminal event)        | `Err(e)`        |
+
+\* The transitional `GoalStatus::{Achieved,Cleared}` is set in-place before
+the slot is wiped, so a reader observing the lock at the right moment will
+see the final status. The persisted state visible to subsequent
+`current_goal()` calls is `None` in all three success paths — callers that
+need to act on `Achieved` vs `Cleared` MUST read the emitted `AgentEvent`,
+not poll `goal_state`.
+
+### Invariants
+
+* **Judge is only called after `self.run()` succeeds.** A turn that errors
+  out (path 4) does *not* increment `turns`. Operators may want to rerun
+  the same prompt; the goal slot still says `Pursuing` so that's safe.
+* **`turns` is bounded.** The check `turns >= max_turns` runs *before* the
+  judge call, so the judge is consulted at most `max_turns` times.
+* **External clear is non-destructive.** Path 3 leaves `outcomes` as a
+  truthful record of the turns that already ran; the caller can resume
+  later by issuing a new `run_goal_loop` (or a plain `run`) on the same
+  runtime.
+* **Re-entry is illegal.** `run_goal_loop` mutates `self`; concurrent
+  invocations on the same runtime would corrupt `turns` and the prompt
+  chain. The TUI/HTTP wiring guards this with the runtime's single-task
+  ownership; SDK callers must enforce it themselves.
+
+### What is *not* a termination
+
+* The judge returning `achieved: false` — the loop continues with
+  `last_reason` set and a follow-up prompt that quotes the reason back to
+  the agent. This will only stop the loop if it converges to path 1, 2,
+  or 3.
+* `AgentRuntime` being dropped mid-turn — the future is cancelled and no
+  terminal event is emitted. The on-disk transcript still reflects every
+  message that was committed before cancellation.
+
+### Open questions (not blocking v1, but record before they bite)
+
+* Path 4 leaves `goal_state` set to `Pursuing`. Should the loop emit a
+  `GoalCleared` (or new `GoalErrored`) event before bailing? Today the
+  HTTP `GET /sessions/:id` will keep reporting `pursuing` until something
+  else writes the slot.
+* The judge runs against `self.transcript()` (full transcript). For long
+  sessions this is wasteful — a `transcript_tail(n)` helper would cap
+  judge token usage.
