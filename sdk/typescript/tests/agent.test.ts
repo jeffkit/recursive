@@ -240,3 +240,37 @@ describe("Agent.listSessions", () => {
     expect(sessions[0]!.lastPrompt).toBe("hello");
   });
 });
+
+// ── Agent.getSessionMessages ───────────────────────────────────────────────
+
+describe("Agent.getSessionMessages", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("returns messages array from session detail", async () => {
+    mockGet({
+      id: "sess-42",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi there" },
+      ],
+    });
+
+    const msgs = await Agent.getSessionMessages("sess-42", {
+      baseUrl: "http://localhost:3000",
+    });
+
+    expect(msgs.length).toBe(2);
+    expect(msgs[0]!["role"]).toBe("user");
+    expect(msgs[1]!["content"]).toBe("hi there");
+  });
+
+  it("returns empty array when messages field is absent", async () => {
+    mockGet({ id: "sess-99" });
+
+    const msgs = await Agent.getSessionMessages("sess-99", {
+      baseUrl: "http://localhost:3000",
+    });
+
+    expect(msgs).toEqual([]);
+  });
+});

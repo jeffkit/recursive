@@ -388,6 +388,20 @@ declare class Agent {
      * Pass an empty string to clear the title.
      */
     static renameSession(sessionId: string, title: string, options?: AgentOptions): Promise<void>;
+    /**
+     * Return the transcript messages for a session.
+     *
+     * Fetches `GET /sessions/:id` and returns the `messages` array.
+     * Each message is a raw object with at minimum `role` and `content` fields.
+     *
+     * ```ts
+     * const msgs = await Agent.getSessionMessages(sessionId);
+     * for (const m of msgs) {
+     *   console.log(m["role"], String(m["content"]).slice(0, 60));
+     * }
+     * ```
+     */
+    static getSessionMessages(sessionId: string, options?: AgentOptions): Promise<Record<string, unknown>[]>;
     /** Delete a session by ID. */
     static deleteSession(sessionId: string, options?: AgentOptions): Promise<void>;
 }
