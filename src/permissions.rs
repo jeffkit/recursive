@@ -15,6 +15,8 @@
 //! for existing callers.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// The reason why a permission decision was made.
 ///
@@ -412,6 +414,71 @@ impl LayeredPermissionsConfig {
             .flat_map(|l| l.interactive.iter())
             .map(|s| s.as_str())
     }
+
+    // ── Goal-197: Runtime session rule management ───────────────────────
+
+    /// Add a permission rule to the session layer at runtime.
+    ///
+    /// The session layer is always the highest-priority layer (index 0).
+    /// If it doesn't exist yet, it is created on first use.
+    ///
+    /// Rules added via this method take effect immediately for all
+    /// subsequent `check_static` calls, without requiring a restart.
+    /// They are **not** persisted to disk — they live only in memory
+    /// for the current session.
+    pub fn add_session_rule(&mut self, behavior: RuleBehavior, pattern: String) {
+        let layer = self.session_layer_mut();
+        match behavior {
+            RuleBehavior::Allow => layer.allow.push(pattern),
+            RuleBehavior::Deny => layer.deny.push(pattern),
+            RuleBehavior::Interactive => layer.interactive.push(pattern),
+        }
+    }
+
+    /// Remove a permission rule from the session layer.
+    ///
+    /// The `pattern` is matched against existing rules as a substring.
+    /// All rules whose string representation *contains* `pattern` are
+    /// removed from the corresponding behaviour list.
+    pub fn remove_session_rule(&mut self, behavior: RuleBehavior, pattern: &str) {
+        let layer = self.session_layer_mut();
+        let list = match behavior {
+            RuleBehavior::Allow => &mut layer.allow,
+            RuleBehavior::Deny => &mut layer.deny,
+            RuleBehavior::Interactive => &mut layer.interactive,
+        };
+        list.retain(|r| !r.contains(pattern));
+    }
+
+    /// Return a reference to the session layer.
+    ///
+    /// Panics if the session layer does not exist — call
+    /// `session_layer_mut()` first to ensure it is created.
+    pub fn session_rules(&self) -> &PermissionLayer {
+        self.layers
+            .iter()
+            .find(|l| l.source == RuleSource::Session)
+            .expect("session layer always present after first mutation")
+    }
+
+    /// Return a mutable reference to the session layer, creating it if
+    /// it doesn't exist yet. The session layer is always placed at the
+    /// front of the layers list (highest priority).
+    fn session_layer_mut(&mut self) -> &mut PermissionLayer {
+        if !self.layers.iter().any(|l| l.source == RuleSource::Session) {
+            self.layers.insert(
+                0,
+                PermissionLayer {
+                    source: RuleSource::Session,
+                    ..Default::default()
+                },
+            );
+        }
+        self.layers
+            .iter_mut()
+            .find(|l| l.source == RuleSource::Session)
+            .expect("session layer just created")
+    }
 }
 
 // ── Backward compatibility ─────────────────────────────────────────────────
@@ -467,6 +534,26 @@ impl From<OldPermissionsConfig> for LayeredPermissionsConfig {
 /// Most existing code uses `PermissionsConfig`; this alias maps to the
 /// new layered type so existing callers continue to compile.
 pub type PermissionsConfig = LayeredPermissionsConfig;
+
+/// Thread-safe shared reference to a layered permissions configuration.
+///
+/// Wraps the config in an `Arc<RwLock<...>>` so that multiple components
+/// (ToolRegistry, plan mode tools, HTTP handlers) can share a single
+/// config instance. Runtime rule changes via `add_session_rule` /
+/// `remove_session_rule` are immediately visible to all readers on their
+/// next `.read().await`.
+pub type SharedPermissions = Arc<RwLock<LayeredPermissionsConfig>>;
+
+/// Behaviour to associate with a session-level permission rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleBehavior {
+    /// Explicitly allow the tool matching this pattern.
+    Allow,
+    /// Explicitly deny the tool matching this pattern.
+    Deny,
+    /// Mark the tool as requiring interactive confirmation.
+    Interactive,
+}
 
 // ── Goal-196: Safety path protection ────────────────────────────────────────
 
@@ -1414,5 +1501,96 @@ mod tests {
         assert!(!path_contains_protected("", ".git"));
         // Root-level match
         assert!(path_contains_protected(".ssh/authorized_keys", ".ssh"));
+    }
+
+    // ── Goal-197: Session rule management tests ─────────────────────────
+
+    #[test]
+    fn add_session_allow_rule() {
+        let mut config = LayeredPermissionsConfig::default();
+        config.add_session_rule(RuleBehavior::Allow, "run_shell".into());
+        let session = config.session_rules();
+        assert_eq!(session.source, RuleSource::Session);
+        assert!(session.allow.contains(&"run_shell".to_string()));
+        assert!(session.deny.is_empty());
+        assert!(session.interactive.is_empty());
+    }
+
+    #[test]
+    fn add_session_deny_rule() {
+        let mut config = LayeredPermissionsConfig::default();
+        config.add_session_rule(RuleBehavior::Deny, "run_shell".into());
+        let session = config.session_rules();
+        assert!(session.deny.contains(&"run_shell".to_string()));
+    }
+
+    #[test]
+    fn add_session_interactive_rule() {
+        let mut config = LayeredPermissionsConfig::default();
+        config.add_session_rule(RuleBehavior::Interactive, "run_shell".into());
+        let session = config.session_rules();
+        assert!(session.interactive.contains(&"run_shell".to_string()));
+    }
+
+    #[test]
+    fn remove_session_rule() {
+        let mut config = LayeredPermissionsConfig::default();
+        config.add_session_rule(RuleBehavior::Allow, "run_shell".into());
+        config.add_session_rule(RuleBehavior::Allow, "write_file".into());
+        assert_eq!(config.session_rules().allow.len(), 2);
+
+        config.remove_session_rule(RuleBehavior::Allow, "run_shell");
+        assert_eq!(config.session_rules().allow.len(), 1);
+        assert!(config
+            .session_rules()
+            .allow
+            .contains(&"write_file".to_string()));
+    }
+
+    #[test]
+    fn session_layer_created_on_first_use() {
+        let mut config = LayeredPermissionsConfig::default();
+        // Before any mutation, layers is empty
+        assert!(config.layers.is_empty());
+        // Adding a rule creates the session layer
+        config.add_session_rule(RuleBehavior::Allow, "read_file".into());
+        assert_eq!(config.layers.len(), 1);
+        assert_eq!(config.layers[0].source, RuleSource::Session);
+    }
+
+    #[test]
+    fn session_deny_takes_precedence_over_user_allow() {
+        let mut config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                allow: vec!["run_shell".into()],
+                ..Default::default()
+            }],
+        };
+        // Session deny should override user allow
+        config.add_session_rule(RuleBehavior::Deny, "run_shell".into());
+        let result = config.check_static("run_shell", false, None);
+        assert!(result.is_denied());
+    }
+
+    #[test]
+    fn shared_permissions_arc_clone_sees_mutation() {
+        let config = LayeredPermissionsConfig::default();
+        let shared = Arc::new(RwLock::new(config));
+        let clone = Arc::clone(&shared);
+
+        // Mutate through the original
+        {
+            let mut guard = shared.try_write().unwrap();
+            guard.add_session_rule(RuleBehavior::Allow, "run_shell".into());
+        }
+
+        // Clone sees the change
+        let guard = clone.try_read().unwrap();
+        assert!(guard
+            .session_rules()
+            .allow
+            .contains(&"run_shell".to_string()));
     }
 }

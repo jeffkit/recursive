@@ -12,7 +12,9 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::permissions::SharedPermissions;
 use crate::permissions::{DecisionReason, Permission, PermissionMode, PermissionsConfig};
+use tokio::sync::RwLock;
 
 // ── Goal-153: Tool side-effect classification + audit types ─────────────────
 
@@ -255,7 +257,11 @@ pub struct ToolRegistry {
     /// Populated by `register`; never mutated by `invoke`.
     aliases: BTreeMap<String, String>,
     transport: Arc<dyn ToolTransport>,
-    permissions: Option<PermissionsConfig>,
+    /// Goal-197: thread-safe shared permissions for runtime rule updates.
+    /// When `Some`, `invoke_with_audit` reads through the lock at call time,
+    /// so `add_session_rule` / `remove_session_rule` changes are immediately
+    /// visible. When `None`, all tools are allowed (backward-compatible).
+    permissions: Option<SharedPermissions>,
     /// Default permission mode for tools not covered by the config lists.
     /// Mirrors `PermissionsConfig.mode` for quick access without config lookup.
     permission_mode: PermissionMode,
@@ -443,7 +449,23 @@ impl ToolRegistry {
     /// Set the permissions configuration for this registry.
     pub fn with_permissions(mut self, permissions: PermissionsConfig) -> Self {
         self.permission_mode = permissions.mode.clone();
-        self.permissions = Some(permissions);
+        self.permissions = Some(Arc::new(RwLock::new(permissions)));
+        self
+    }
+
+    /// Attach a [`SharedPermissions`] reference for runtime rule updates.
+    ///
+    /// Unlike [`with_permissions`], this accepts an already-constructed
+    /// `Arc<RwLock<LayeredPermissionsConfig>>` so that multiple components
+    /// can share the same mutable config. Changes made via
+    /// `add_session_rule` / `remove_session_rule` on the shared config
+    /// are immediately visible through this registry.
+    pub fn with_shared_permissions(mut self, sp: SharedPermissions) -> Self {
+        // Snapshot the current mode for quick access.
+        if let Ok(guard) = sp.try_read() {
+            self.permission_mode = guard.mode.clone();
+        }
+        self.permissions = Some(sp);
         self
     }
 
@@ -453,8 +475,16 @@ impl ToolRegistry {
     }
 
     /// Return a reference to the current permissions config, if any.
-    pub fn permissions_config(&self) -> Option<&PermissionsConfig> {
-        self.permissions.as_ref()
+    /// Return a cloned snapshot of the current permissions config.
+    ///
+    /// Uses `try_read()` — returns `None` if the lock is held for writing
+    /// (which is rare and brief). Callers that need a guaranteed read
+    /// should use [`invoke_with_audit`] which does an async `.read().await`.
+    pub fn permissions_config(&self) -> Option<PermissionsConfig> {
+        self.permissions
+            .as_ref()
+            .and_then(|sp| sp.try_read().ok())
+            .map(|guard| guard.clone())
     }
 
     /// Check whether a tool requires plan mode according to the current
@@ -462,7 +492,8 @@ impl ToolRegistry {
     pub fn is_plan_mode(&self, tool_name: &str) -> bool {
         self.permissions
             .as_ref()
-            .map(|p| p.is_plan_mode(tool_name))
+            .and_then(|sp| sp.try_read().ok())
+            .map(|guard| guard.is_plan_mode(tool_name))
             .unwrap_or(false)
     }
 
@@ -591,9 +622,14 @@ impl ToolRegistry {
         // pass it to `check_static` so the safety check (protected paths
         // like `.git`, `.ssh`, `.env`) can fire on file tools.
         let safety_content = safety_content_for_tool(name, &arguments);
-        if let Some(ref config) = self.permissions {
+        // Goal-197: read through the shared permissions lock so that
+        // runtime session rules (add_session_rule / remove_session_rule)
+        // take effect immediately. The lock is held only for the
+        // permission check, not during tool execution.
+        if let Some(ref sp) = self.permissions {
+            let guard = sp.read().await;
             let is_readonly = self.is_readonly(name);
-            match config.check_static(name, is_readonly, safety_content.as_deref()) {
+            match guard.check_static(name, is_readonly, safety_content.as_deref()) {
                 Permission::Denied(reason, _msg) => {
                     return ToolDispatch {
                         result: Err(Error::PermissionDenied {
@@ -605,45 +641,45 @@ impl ToolRegistry {
                 }
                 Permission::Allowed(_) | Permission::Passthrough => {}
             }
-        }
 
-        // Goal-199: headless mode — interactive tools go through external hooks.
-        // If headless and the tool requires interaction, try external hooks first.
-        // Hook approval (Continue) allows execution; Skip, Error, or no hooks → deny.
-        if self.headless {
-            if let Some(ref perms) = self.permissions {
-                if perms.any_interactive(name) {
-                    // If no external hooks are registered → auto-deny.
-                    if self.hook_runner.is_empty() {
-                        return ToolDispatch {
-                            result: Err(Error::PermissionDenied {
-                                name: name.into(),
-                                reason: DecisionReason::Hook {
-                                    name: "PermissionRequest".into(),
-                                },
-                            }),
-                            audit: AuditMeta::synthetic_unknown_tool(name),
-                        };
-                    }
-                    let hook_input = crate::hooks::external::HookInput {
-                        event: crate::hooks::external::HookEvent::PermissionRequest,
-                        tool_name: name.to_string(),
-                        args: arguments.clone(),
-                        mode: format!("{:?}", self.permission_mode),
+            // Goal-199: headless mode — interactive tools go through external hooks.
+            if self.headless && guard.any_interactive(name) {
+                // If no external hooks are registered → auto-deny.
+                if self.hook_runner.is_empty() {
+                    return ToolDispatch {
+                        result: Err(Error::PermissionDenied {
+                            name: name.into(),
+                            reason: DecisionReason::Hook {
+                                name: "PermissionRequest".into(),
+                            },
+                        }),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
                     };
-                    let hook_action = self.hook_runner.dispatch(&hook_input).await;
-                    if !matches!(hook_action, crate::hooks::HookAction::Continue) {
-                        return ToolDispatch {
-                            result: Err(Error::PermissionDenied {
-                                name: name.into(),
-                                reason: DecisionReason::Hook {
-                                    name: "PermissionRequest".into(),
-                                },
-                            }),
-                            audit: AuditMeta::synthetic_unknown_tool(name),
-                        };
-                    }
                 }
+                let hook_input = crate::hooks::external::HookInput {
+                    event: crate::hooks::external::HookEvent::PermissionRequest,
+                    tool_name: name.to_string(),
+                    args: arguments.clone(),
+                    mode: format!("{:?}", self.permission_mode),
+                };
+                // Drop the read guard before the async hook dispatch to
+                // avoid holding the lock across an await point.
+                drop(guard);
+                let hook_action = self.hook_runner.dispatch(&hook_input).await;
+                if !matches!(hook_action, crate::hooks::HookAction::Continue) {
+                    return ToolDispatch {
+                        result: Err(Error::PermissionDenied {
+                            name: name.into(),
+                            reason: DecisionReason::Hook {
+                                name: "PermissionRequest".into(),
+                            },
+                        }),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
+                    };
+                }
+            } else {
+                // Drop guard before tool execution (not holding across await).
+                drop(guard);
             }
         }
 

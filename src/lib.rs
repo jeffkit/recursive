@@ -87,6 +87,7 @@ pub use paths::{
 };
 pub use permissions::PermissionMode;
 pub use permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+pub use permissions::{RuleBehavior, SharedPermissions};
 pub use providers::{all_presets, find_preset, ProviderPreset};
 pub use rewind::{
     apply_rewind, checkpoint_log_path, detect_conflicts, plan_rewind, ConflictReport, RewindPlan,
