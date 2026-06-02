@@ -181,6 +181,29 @@ pub enum AgentEvent {
     /// The active goal was cleared — either by `/goal clear`, turn-budget
     /// exhaustion, or an explicit `DELETE /sessions/:id/goal` call.
     GoalCleared,
+
+    // ── Goal 210: hook progress events ────────────────────────────
+    /// A hook started executing.
+    HookStarted {
+        hook_event: String,
+        hook_name: String,
+        status_message: Option<String>,
+    },
+    /// A hook produced incremental stdout output.
+    HookProgress {
+        hook_event: String,
+        hook_name: String,
+        last_line: String,
+    },
+    /// A hook finished executing.
+    HookFinished {
+        hook_event: String,
+        hook_name: String,
+        outcome: String,
+        duration_ms: u64,
+    },
+    /// A hook produced a system message to show to the user.
+    HookSystemMessage { text: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +271,36 @@ impl From<StepEvent> for AgentEvent {
             },
             StepEvent::PlanConfirmed => AgentEvent::PlanConfirmed,
             StepEvent::PlanRejected { reason } => AgentEvent::PlanRejected { reason },
+            StepEvent::HookStarted {
+                hook_event,
+                hook_name,
+                status_message,
+            } => AgentEvent::HookStarted {
+                hook_event,
+                hook_name,
+                status_message,
+            },
+            StepEvent::HookProgress {
+                hook_event,
+                hook_name,
+                last_line,
+            } => AgentEvent::HookProgress {
+                hook_event,
+                hook_name,
+                last_line,
+            },
+            StepEvent::HookFinished {
+                hook_event,
+                hook_name,
+                outcome,
+                duration_ms,
+            } => AgentEvent::HookFinished {
+                hook_event,
+                hook_name,
+                outcome,
+                duration_ms,
+            },
+            StepEvent::HookSystemMessage { text } => AgentEvent::HookSystemMessage { text },
         }
     }
 }

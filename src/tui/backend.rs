@@ -147,6 +147,38 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         }
         AgentEvent::GoalCleared => Some(UiEvent::GoalCleared),
 
+        // Goal-210: hook progress events.
+        AgentEvent::HookStarted {
+            hook_event,
+            hook_name,
+            status_message,
+        } => Some(UiEvent::HookStarted {
+            hook_event,
+            hook_name,
+            status_message,
+        }),
+        AgentEvent::HookProgress {
+            hook_event,
+            hook_name,
+            last_line,
+        } => Some(UiEvent::HookProgress {
+            hook_event,
+            hook_name,
+            last_line,
+        }),
+        AgentEvent::HookFinished {
+            hook_event,
+            hook_name,
+            outcome,
+            duration_ms,
+        } => Some(UiEvent::HookFinished {
+            hook_event,
+            hook_name,
+            outcome,
+            duration_ms,
+        }),
+        AgentEvent::HookSystemMessage { text } => Some(UiEvent::HookSystemMessage { text }),
+
         _ => None,
     }
 }

@@ -1197,18 +1197,25 @@ async fn build_tools(config: &Config) -> ToolRegistry {
     if let Some(perms) = resolve_tool_permissions() {
         registry = registry.with_permissions(perms);
     }
-    // Goal-199: headless mode — configure external hooks.
+    // Goal-199 / Goal-206: headless mode — configure external hooks.
     {
         let mut hook_dirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut config_dirs: Vec<std::path::PathBuf> = Vec::new();
         if let Some(home) = std::env::var_os("HOME") {
-            hook_dirs.push(
-                std::path::PathBuf::from(home)
-                    .join(".recursive")
-                    .join("hooks"),
-            );
+            let home_recursive = std::path::PathBuf::from(home).join(".recursive");
+            hook_dirs.push(home_recursive.join("hooks"));
+            config_dirs.push(home_recursive);
         }
         hook_dirs.push(config.workspace.join(".recursive").join("hooks"));
-        let hook_runner = recursive::hooks::ExternalHookRunner::discover(&hook_dirs);
+        config_dirs.push(config.workspace.join(".recursive"));
+
+        // Prefer hooks.json structured config; fall back to directory scan.
+        let hooks_config = recursive::hooks::load_hooks_config(&config_dirs);
+        let hook_runner = if hooks_config.events.is_empty() {
+            recursive::hooks::ExternalHookRunner::discover(&hook_dirs)
+        } else {
+            recursive::hooks::ExternalHookRunner::from_config(hooks_config)
+        };
         registry = registry
             .with_headless(config.headless)
             .with_hook_runner(hook_runner);

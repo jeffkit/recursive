@@ -1554,6 +1554,57 @@ impl App {
                 self.turn.finish();
                 self.scroll_to_bottom();
             }
+
+            // Goal-210: hook progress events → status-bar style System blocks.
+            UiEvent::HookStarted {
+                hook_event,
+                hook_name,
+                ..
+            } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("⚡ hook [{hook_event}] {hook_name} started"),
+                });
+                self.scroll_to_bottom();
+            }
+            UiEvent::HookProgress {
+                hook_name,
+                last_line,
+                ..
+            } => {
+                // Update the last System block if it was a hook block; otherwise push a new one.
+                let hook_prefix = "⚡ hook".to_string();
+                let should_update = self
+                    .blocks
+                    .last()
+                    .map(|b| matches!(b, TranscriptBlock::System { text } if text.starts_with(&hook_prefix)))
+                    .unwrap_or(false);
+                let text = format!("⚡ hook {hook_name}: {last_line}");
+                if should_update {
+                    if let Some(TranscriptBlock::System { text: t }) = self.blocks.last_mut() {
+                        *t = text;
+                    }
+                } else {
+                    self.blocks.push(TranscriptBlock::System { text });
+                }
+                self.scroll_to_bottom();
+            }
+            UiEvent::HookFinished {
+                hook_event,
+                hook_name,
+                outcome,
+                duration_ms,
+            } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!(
+                        "✓ hook [{hook_event}] {hook_name} → {outcome} ({duration_ms}ms)"
+                    ),
+                });
+                self.scroll_to_bottom();
+            }
+            UiEvent::HookSystemMessage { text } => {
+                self.blocks.push(TranscriptBlock::System { text });
+                self.scroll_to_bottom();
+            }
         }
         // Sticky-scroll: when the user is already at the bottom
         // (scroll_offset == 0), keep them pinned as new content

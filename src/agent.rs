@@ -162,6 +162,47 @@ pub enum StepEvent {
     PlanConfirmed,
     /// Plan was rejected with a reason.
     PlanRejected { reason: String },
+
+    // ── Goal 210: hook progress events ────────────────────────────
+    /// A hook started executing.
+    ///
+    /// Emitted just before a hook process/request is dispatched. Allows
+    /// UI layers (TUI) to show a spinner while the hook runs.
+    HookStarted {
+        /// Serialized event name (e.g. `"preToolCall"`).
+        hook_event: String,
+        /// Human-readable hook identifier (path, URL, or `"prompt"`).
+        hook_name: String,
+        /// Optional custom status message from `HookCommand::status_message`.
+        status_message: Option<String>,
+    },
+    /// A hook produced incremental stdout output.
+    ///
+    /// Emitted periodically while a hook is running (if stdout streaming
+    /// is available). Contains the most recent stdout line.
+    HookProgress {
+        hook_event: String,
+        hook_name: String,
+        /// The most recently observed stdout line.
+        last_line: String,
+    },
+    /// A hook finished executing.
+    ///
+    /// Emitted immediately after a hook returns. `outcome` describes the
+    /// final status: `"success"`, `"error"`, `"timeout"`, or `"skipped"`.
+    HookFinished {
+        hook_event: String,
+        hook_name: String,
+        /// Final status: `"success"` / `"error"` / `"timeout"` / `"skipped"`.
+        outcome: String,
+        /// Wall-clock duration of the hook in milliseconds.
+        duration_ms: u64,
+    },
+    /// A hook produced a system message to show to the user.
+    HookSystemMessage {
+        /// The message text to display.
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1809,6 +1850,10 @@ mod tests {
                 StepEvent::PlanProposed { .. } => "plan_proposed",
                 StepEvent::PlanConfirmed => "plan_confirmed",
                 StepEvent::PlanRejected { .. } => "plan_rejected",
+                StepEvent::HookStarted { .. } => "hook_started",
+                StepEvent::HookProgress { .. } => "hook_progress",
+                StepEvent::HookFinished { .. } => "hook_finished",
+                StepEvent::HookSystemMessage { .. } => "hook_system_message",
             });
         }
         assert_eq!(
