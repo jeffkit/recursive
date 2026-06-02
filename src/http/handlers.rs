@@ -212,7 +212,7 @@ pub(super) async fn create_session(
         .system_prompt
         .unwrap_or_else(|| state.config.system_prompt.clone());
 
-    let runtime = AgentRuntimeBuilder::new()
+    let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
         .tools(state.tool_registry.clone())
         .system_prompt(system_prompt)
@@ -227,6 +227,10 @@ pub(super) async fn create_session(
                 }),
             )
         })?;
+
+    // Register the session ID so all turns emit tracing spans with session_id
+    // and transcript is auto-saved to the storage backend after each turn.
+    runtime.set_session_id(&id);
 
     // Extract the gate before moving runtime into the Mutex so HTTP handlers
     // can approve/reject without acquiring the per-session runtime lock.
