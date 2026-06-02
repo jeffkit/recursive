@@ -42,6 +42,24 @@ class Run:
         self._session_id = session_id
         self._http = http
         self._result: Optional[RunResult] = None
+        # Reference to the dispatch thread set by `Agent.send()`. ``wait()``
+        # joins this so callers don't need to track it themselves. Set
+        # externally; ``None`` for runs constructed without a dispatcher
+        # (e.g. tests).
+        self._send_thread: Optional[Any] = None
+
+    def _fail(self, err: str) -> None:
+        """Record a dispatch failure. Surfaces through ``wait()``.
+
+        Used by :meth:`Agent.send` to capture HTTP errors from the
+        background POST so they propagate to the caller.
+        """
+        if self._result is None:
+            self._result = RunResult(
+                id=self._session_id,
+                status="error",
+                error=err,
+            )
 
     @property
     def id(self) -> str:
@@ -76,6 +94,16 @@ class Run:
                 msg = _parse_message(data, self._session_id)
                 if msg is not None:
                     yield msg
+
+            elif ev_type == "partial_message":
+                # Streaming token deltas — surface as a SystemMessage so
+                # callers that opt in via ``msg.subtype == 'partial_message'``
+                # can render token-level UI. Default consumers will skip it.
+                yield SystemMessage(
+                    type="system",
+                    subtype="partial_message",
+                    data=data,
+                )
 
             elif ev_type == "done":
                 finish_reason = data.get("finish_reason")
@@ -125,6 +153,13 @@ class Run:
         if self._result is None:
             # Drain without exposing messages to the caller
             for _ in self.messages():
+                pass
+        # Make sure the dispatcher thread (if any) finished so a failed POST
+        # has had a chance to call ``_fail()`` before we return.
+        if self._send_thread is not None:
+            try:
+                self._send_thread.join(timeout=5.0)
+            except Exception:
                 pass
         assert self._result is not None
         return self._result

@@ -22,9 +22,35 @@ export class Run {
   private readonly _http: HttpClient;
   private _result: RunResult | null = null;
 
+  /**
+   * Pending send POST issued by `Agent.send()`. Set by the Agent factory
+   * after construction; awaited inside `wait()` so callers don't have to
+   * separately await the dispatch.
+   * @internal
+   */
+  _sendPromise: Promise<unknown> | null = null;
+
   constructor(sessionId: string, http: HttpClient) {
     this.id = sessionId;
     this._http = http;
+  }
+
+  /**
+   * Used by `Agent.send()` to record a failed POST. The error becomes
+   * the `RunResult` when `wait()` is next called.
+   * @internal
+   */
+  _fail(err: unknown): void {
+    if (this._result === null) {
+      const msg =
+        err instanceof Error ? err.message : `failed to send message: ${err}`;
+      this._result = {
+        id: this.id,
+        status: "error",
+        error: msg,
+        ok: false,
+      };
+    }
   }
 
   // ── streaming ────────────────────────────────────────────────────────────
@@ -59,6 +85,16 @@ export class Run {
       if (evType === "message" || evType === "") {
         const msg = parseMessage(data, this.id);
         if (msg) yield msg;
+      } else if (evType === "partial_message") {
+        // Streaming token deltas — surface as a system message so callers
+        // that want token-level granularity can opt in via msg.subtype.
+        // Higher-level helpers (`iterText()`) ignore these by default since
+        // the eventual `message` event will carry the full text.
+        yield {
+          type: "system",
+          subtype: "partial_message",
+          data,
+        };
       } else if (evType === "done") {
         finishReason = data["finish_reason"] as string | undefined;
         usageData = data["usage"] as Record<string, unknown> | undefined;
@@ -135,6 +171,11 @@ export class Run {
       for await (const _ of this.stream()) {
         // discard
       }
+    }
+    // Ensure any background POST has settled — surfaces _fail() results
+    // even if the SSE stream never produced a terminal `done` event.
+    if (this._sendPromise) {
+      await this._sendPromise;
     }
     return this._result!;
   }

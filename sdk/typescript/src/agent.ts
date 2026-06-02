@@ -44,8 +44,11 @@ export class AgentSession {
   /**
    * Send *message* to the agent and return a `Run`.
    *
-   * The returned `Run` is lazy — the network call for streaming starts when
-   * you iterate `run.stream()` or call `run.wait()`.
+   * The POST is dispatched in the background — `send()` returns as soon
+   * as the request is on the wire. The returned `Run` is lazy: the SSE
+   * subscription opens when you iterate `run.stream()` or call
+   * `run.wait()`. This avoids a race where the server-side run completes
+   * (and broadcasts its events) before a subscriber attaches.
    *
    * ```ts
    * const run = await agent.send("Fix the failing tests");
@@ -63,10 +66,23 @@ export class AgentSession {
     if (this._closed) {
       throw new RecursiveAgentError("Agent session is already closed.");
     }
-    await this._http.post(`/sessions/${this.sessionId}/messages`, {
-      content: message,
-    });
-    return new Run(this.sessionId, this._http);
+    // Fire-and-forget the POST so the SSE subscription in Run.stream()
+    // can attach before the agent run starts emitting events. The server
+    // creates the per-session broadcast channel inside the POST handler
+    // before kicking off the runtime, so subscribers that connect within
+    // the time it takes to issue this fetch will see every event.
+    //
+    // Errors from the POST surface either through the SSE `error` event
+    // (HTTP 5xx, runtime failures) or through `wait()` returning the
+    // failure stashed on the Run via `_fail()`.
+    const run = new Run(this.sessionId, this._http);
+    const sendPromise = this._http
+      .post(`/sessions/${this.sessionId}/messages`, { content: message })
+      .catch((err) => {
+        run._fail(err);
+      });
+    run._sendPromise = sendPromise;
+    return run;
   }
 
   // ── disposal ─────────────────────────────────────────────────────────────

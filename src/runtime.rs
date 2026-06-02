@@ -39,111 +39,9 @@ use crate::Compactor;
 // Goal-168: GoalState / GoalStatus / GoalEvaluator
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Status of an active goal loop.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalStatus {
-    /// The loop is running — condition not yet confirmed met.
-    Pursuing,
-    /// Condition confirmed met — goal cleared after success.
-    Achieved,
-    /// Explicitly cleared by the user or the turn budget was exceeded.
-    Cleared,
-}
-
-/// Per-session goal state set by `/goal <condition>`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GoalState {
-    /// The completion condition as written by the user.
-    pub condition: String,
-    /// Current status of the loop.
-    pub status: GoalStatus,
-    /// Turns elapsed since the goal was set.
-    pub turns: u32,
-    /// Hard cap: stop regardless of condition after this many turns.
-    pub max_turns: u32,
-    /// Most recent judge model verdict (reason string).
-    pub last_reason: Option<String>,
-}
-
-/// Verdict returned by [`GoalEvaluator::evaluate`].
-#[derive(Debug, Clone)]
-pub struct GoalVerdict {
-    /// Whether the condition is satisfied.
-    pub achieved: bool,
-    /// Judge's brief explanation.
-    pub reason: String,
-}
-
-/// Calls the LLM provider to decide whether a goal condition is met.
-pub struct GoalEvaluator {
-    provider: Arc<dyn LlmProvider>,
-}
-
-impl GoalEvaluator {
-    /// Create an evaluator backed by `provider`.
-    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
-        Self { provider }
-    }
-
-    /// Evaluate `condition` against the last N messages of `transcript`.
-    ///
-    /// Calls the provider with a minimal YES/NO prompt (max_tokens ≈ 256 via
-    /// a short system instruction).  The first word of the response determines
-    /// the verdict; any remaining text is kept as `reason`.
-    pub async fn evaluate(&self, condition: &str, transcript: &[Message]) -> Result<GoalVerdict> {
-        // Only send the last 20 messages to keep the prompt cheap.
-        const TAIL: usize = 20;
-        let tail = if transcript.len() > TAIL {
-            &transcript[transcript.len() - TAIL..]
-        } else {
-            transcript
-        };
-
-        // Format the recent transcript as plain text.
-        let transcript_text: String = tail
-            .iter()
-            .filter_map(|m| {
-                if m.content.is_empty() {
-                    None
-                } else {
-                    Some(format!("[{:?}]: {}", m.role, m.content))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system_msg = Message::system(
-            "You are a completion evaluator. Answer YES or NO on the first line, \
-             then a single short sentence explaining why.",
-        );
-        let user_msg = Message::user(format!(
-            "Condition: {condition}\n\nRecent transcript:\n{transcript_text}\n\n\
-             Is the condition met? Answer YES or NO on the first line, then a short reason."
-        ));
-
-        let messages = vec![system_msg, user_msg];
-        let completion = self.provider.complete(&messages, &[]).await?;
-        let text = completion.content.trim().to_string();
-
-        let first_line = text.lines().next().unwrap_or("").trim().to_uppercase();
-        let achieved = first_line.starts_with("YES");
-        let reason = text
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string();
-        let reason = if reason.is_empty() {
-            text.clone()
-        } else {
-            reason
-        };
-
-        Ok(GoalVerdict { achieved, reason })
-    }
-}
+// Goal-loop data + judge live in `crate::runtime_goal`. Re-exported here so
+// historical paths like `crate::runtime::GoalState` keep working.
+pub use crate::runtime_goal::{GoalEvaluator, GoalState, GoalStatus, GoalVerdict};
 
 // ──────────────────────────────────────────────────────────────────────────
 // RuntimeOutcome
@@ -353,13 +251,29 @@ impl AgentRuntime {
         }
 
         // Create AgentEvent channel; kernel converts StepEvent → AgentEvent internally.
+        //
+        // The forwarder withholds the terminal `TurnFinished` event so the
+        // runtime can emit it *after* the per-message `MessageAppended`
+        // events below. SDK consumers (sdk/typescript/src/run.ts) treat
+        // `done` as a hard stream-stop signal — emitting it before the
+        // assistant message races the SDK into closing the stream too
+        // early and dropping the final assistant text.
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::event::AgentEvent>();
         let sink = self.event_sink.clone();
         let forwarder = tokio::spawn(async move {
+            let mut deferred_finished: Option<crate::event::AgentEvent> = None;
             while let Some(ev) = event_rx.recv().await {
+                if matches!(ev, AgentEvent::TurnFinished { .. }) {
+                    // Hold onto the most recent TurnFinished — overwrite if
+                    // the kernel emits more than one (only the last is
+                    // meaningful for downstream consumers).
+                    deferred_finished = Some(ev);
+                    continue;
+                }
                 sink.emit(ev).await;
             }
+            deferred_finished
         });
 
         // Build turn context with the AgentEvent channel.
@@ -382,7 +296,7 @@ impl AgentRuntime {
 
         // Drop the sender to signal the forwarder to stop, then wait for it.
         drop(event_tx);
-        forwarder.await.ok();
+        let deferred_finished = forwarder.await.ok().flatten();
 
         // Handle plan confirmation state
         if turn_outcome.finish_reason == crate::agent::FinishReason::PlanPending {
@@ -441,6 +355,14 @@ impl AgentRuntime {
                 }
             };
             self.event_sink.emit(event).await;
+        }
+
+        // Now that every assistant/tool message is on the wire, emit the
+        // terminal `TurnFinished` that the forwarder held back. Without
+        // this, SDK clients see `done` before the final assistant text
+        // and close their stream early.
+        if let Some(ev) = deferred_finished {
+            self.event_sink.emit(ev).await;
         }
 
         // ── Checkpoint: post-turn snapshot + record ────────────────────

@@ -48,8 +48,12 @@ class _AgentSession:
         """
         Send *message* to the agent and return a :class:`~recursive_sdk.run.Run`.
 
-        The run is lazy — the network call happens when you iterate
-        ``run.messages()`` or call ``run.wait()``.
+        The POST is dispatched in a background thread so the returned ``Run``
+        can subscribe to SSE *before* the server starts emitting events —
+        the broadcast channel does not replay missed events. Errors from the
+        POST surface either through the SSE ``error`` event (HTTP 5xx,
+        runtime failures) or through ``run.wait()`` returning the failure
+        captured during dispatch.
 
         Example::
 
@@ -62,11 +66,23 @@ class _AgentSession:
         if self._closed:
             raise RecursiveAgentError("Agent session is already closed.")
 
-        self._http.post(
-            f"/sessions/{self._session_id}/messages",
-            {"content": message},
-        )
-        return Run(session_id=self._session_id, http=self._http)
+        run = Run(session_id=self._session_id, http=self._http)
+
+        def _dispatch() -> None:
+            try:
+                self._http.post(
+                    f"/sessions/{self._session_id}/messages",
+                    {"content": message},
+                )
+            except Exception as err:  # noqa: BLE001 — bubble via Run.wait()
+                run._fail(str(err))
+
+        import threading
+
+        thread = threading.Thread(target=_dispatch, daemon=True)
+        thread.start()
+        run._send_thread = thread
+        return run
 
     # ── context manager ───────────────────────────────────────────────────────
 

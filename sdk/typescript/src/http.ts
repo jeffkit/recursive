@@ -66,7 +66,22 @@ export class HttpClient {
       throw new RecursiveAgentError("Response body is null");
     }
 
-    yield* parseSse(streamToLines(resp.body));
+    const body = resp.body;
+    try {
+      yield* parseSse(streamToLines(body));
+    } finally {
+      // The Recursive server's `/sessions/:id/events` SSE feed never
+      // closes from the server side (the broadcast channel is kept
+      // alive for the lifetime of the session). When a consumer breaks
+      // out of the for-await loop after seeing `done`, we must
+      // explicitly cancel the underlying Response body — otherwise the
+      // socket lingers and prevents Node from exiting.
+      try {
+        await body.cancel();
+      } catch {
+        // best-effort
+      }
+    }
   }
 
   private async _fetch(

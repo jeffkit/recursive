@@ -529,10 +529,38 @@ pub struct SlashCommandInfo {
 
 // ── SSE event types ──────────────────────────────────────────────────────
 
+/// A single block of message content (mirrors Claude Agent SDK's
+/// `TextBlock` / `ToolUseBlock`). Emitted as part of [`SseEvent::Message`]
+/// so SDK clients can iterate `for block in msg.content` without doing a
+/// second round-trip to the session detail endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SseContentBlock {
+    /// A run of plain text from the assistant.
+    Text { text: String },
+    /// A request from the assistant to call a tool.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+}
+
 /// Server-Sent Event payload emitted during an agent session run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SseEvent {
+    /// A full role-tagged message, with content broken into typed blocks.
+    /// Modeled on Claude Agent SDK's `AssistantMessage` / `UserMessage`
+    /// streaming shape so the TS / Python SDKs can yield typed messages
+    /// without falling back to the session detail endpoint.
+    Message {
+        role: String,
+        content: Vec<SseContentBlock>,
+    },
+    /// A partial text delta during streaming. Concatenate `text` deltas
+    /// keyed by `step` to reconstruct the eventual `Message::Text` block.
+    PartialMessage { text: String, step: usize },
     /// A tool is being called.
     ToolCall { name: String, step: usize },
     /// A tool call completed.
@@ -1662,6 +1690,8 @@ async fn session_events(
     let stream = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(sse_event) => {
             let event_type = match &sse_event {
+                SseEvent::Message { .. } => "message",
+                SseEvent::PartialMessage { .. } => "partial_message",
                 SseEvent::ToolCall { .. } => "tool_call",
                 SseEvent::ToolResult { .. } => "tool_result",
                 SseEvent::Done { .. } => "done",
@@ -1686,6 +1716,26 @@ async fn session_events(
 /// Returns `None` for events that have no SSE equivalent (latency, tokens, etc.).
 pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
     match event {
+        // Streaming token deltas — clients reconstruct the final text by
+        // concatenating deltas keyed on `step`.
+        AgentEvent::PartialToken { text, step } => Some(SseEvent::PartialMessage {
+            text: text.clone(),
+            step: *step,
+        }),
+        // A canonical persisted message — emit it as a typed Message event so
+        // SDK consumers iterating `Run.stream()` get role-tagged content
+        // (assistant text, tool_use blocks). User and tool messages flow
+        // through here too; we only forward roles that are useful to a
+        // streaming consumer.
+        //
+        // We deliberately do NOT also map `AgentEvent::AssistantText` — the
+        // runtime emits both `AssistantText` (per-step) and `MessageAppended`
+        // (once per committed message), so consuming both would produce
+        // duplicate Message events on every assistant turn.
+        AgentEvent::MessageAppended { message, .. }
+        | AgentEvent::MessageAppendedWithAudit { message, .. } => {
+            sse_message_from_canonical(message)
+        }
         AgentEvent::ToolCall { name, step, .. } => Some(SseEvent::ToolCall {
             name: name.clone(),
             step: *step,
@@ -1713,10 +1763,46 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
             condition: condition.clone(),
             turns: *turns,
         }),
-        // AssistantText, Latency, Usage, Compacted, PlanConfirmed, PlanRejected
-        // don't have SSE equivalents.
+        // AssistantText, Latency, Usage, Compacted, PlanConfirmed,
+        // PlanRejected don't have SSE equivalents (AssistantText is
+        // intentionally suppressed in favour of MessageAppended above).
         _ => None,
     }
+}
+
+/// Convert a canonical [`crate::message::Message`] into an [`SseEvent::Message`].
+///
+/// `system` and `tool` messages are filtered out — system messages carry
+/// internal seeds the SDK consumer never asked for, and tool *result*
+/// messages are already represented by [`SseEvent::ToolResult`].
+fn sse_message_from_canonical(msg: &crate::message::Message) -> Option<SseEvent> {
+    use crate::message::Role;
+    let role = match msg.role {
+        Role::Assistant => "assistant",
+        Role::User => "user",
+        Role::System | Role::Tool => return None,
+    };
+
+    let mut content: Vec<SseContentBlock> = Vec::new();
+    if !msg.content.is_empty() {
+        content.push(SseContentBlock::Text {
+            text: msg.content.clone(),
+        });
+    }
+    for tc in &msg.tool_calls {
+        content.push(SseContentBlock::ToolUse {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            input: tc.arguments.clone(),
+        });
+    }
+    if content.is_empty() {
+        return None;
+    }
+    Some(SseEvent::Message {
+        role: role.into(),
+        content,
+    })
 }
 
 // ── AG-UI endpoint ───────────────────────────────────────────────────────

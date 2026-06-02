@@ -984,6 +984,114 @@ mod http_tests {
         assert!(map_agent_event(&event).is_none());
     }
 
+    // ── New SDK-facing Message / PartialMessage events ───────────────────
+
+    #[tokio::test]
+    async fn map_message_appended_assistant_text_only() {
+        use recursive::http::SseContentBlock;
+        use recursive::message::{Message, Role};
+        use recursive::AgentEvent;
+
+        let event = AgentEvent::MessageAppended {
+            message: Message {
+                role: Role::Assistant,
+                content: "Hi there".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            parent_uuid: None,
+            usage: None,
+        };
+        let sse = map_agent_event(&event).unwrap();
+        assert_eq!(
+            sse,
+            SseEvent::Message {
+                role: "assistant".into(),
+                content: vec![SseContentBlock::Text {
+                    text: "Hi there".into(),
+                }],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn map_message_appended_assistant_with_tool_calls() {
+        use recursive::http::SseContentBlock;
+        use recursive::llm::ToolCall;
+        use recursive::message::{Message, Role};
+        use recursive::AgentEvent;
+
+        let event = AgentEvent::MessageAppended {
+            message: Message {
+                role: Role::Assistant,
+                content: "calling".into(),
+                tool_calls: vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "x"}),
+                }],
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            parent_uuid: None,
+            usage: None,
+        };
+        let sse = map_agent_event(&event).unwrap();
+        let SseEvent::Message { role, content } = sse else {
+            panic!("expected Message variant");
+        };
+        assert_eq!(role, "assistant");
+        assert_eq!(content.len(), 2);
+        assert!(matches!(&content[0], SseContentBlock::Text { text } if text == "calling"));
+        assert!(matches!(
+            &content[1],
+            SseContentBlock::ToolUse { id, name, .. } if id == "tc1" && name == "read_file"
+        ));
+    }
+
+    #[tokio::test]
+    async fn map_message_appended_skips_system_and_tool_roles() {
+        use recursive::message::{Message, Role};
+        use recursive::AgentEvent;
+
+        for role in [Role::System, Role::Tool] {
+            let event = AgentEvent::MessageAppended {
+                message: Message {
+                    role,
+                    content: "x".into(),
+                    tool_calls: vec![],
+                    tool_call_id: Some("tc".into()),
+                    reasoning_content: None,
+                },
+                parent_uuid: None,
+                usage: None,
+            };
+            assert!(
+                map_agent_event(&event).is_none(),
+                "role {role:?} should not produce a Message event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn map_partial_token_emits_partial_message() {
+        use recursive::AgentEvent;
+
+        let event = AgentEvent::PartialToken {
+            text: "hel".into(),
+            step: 3,
+        };
+        let sse = map_agent_event(&event).unwrap();
+        assert_eq!(
+            sse,
+            SseEvent::PartialMessage {
+                text: "hel".into(),
+                step: 3,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn broadcast_channel_delivers_events() {
         // Verify that the broadcast channel properly delivers SseEvents
