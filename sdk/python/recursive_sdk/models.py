@@ -86,6 +86,32 @@ class UsageMeta:
     reasoning_tokens: Optional[int] = None
 
 
+def _map_finish_reason_to_subtype(finish_reason: Optional[str], status: str) -> str:
+    """Map Rust FinishReason debug strings to Claude Agent SDK–compatible subtypes.
+
+    Returns one of:
+    - ``"success"``                — normal completion
+    - ``"error_max_turns"``        — budget / turn limit exceeded
+    - ``"error_during_execution"`` — runtime error (stuck, provider stop, etc.)
+    - ``"cancelled"``              — interrupted / cancelled
+    """
+    if status == "cancelled":
+        return "cancelled"
+    if status != "finished" or finish_reason is None:
+        if finish_reason and (
+            "BudgetExceeded" in finish_reason or "TranscriptLimit" in finish_reason
+        ):
+            return "error_max_turns"
+        return "error_during_execution"
+    if "NoMoreToolCalls" in finish_reason or "PlanPending" in finish_reason:
+        return "success"
+    if "BudgetExceeded" in finish_reason or "TranscriptLimit" in finish_reason:
+        return "error_max_turns"
+    if "Cancelled" in finish_reason:
+        return "cancelled"
+    return "success"
+
+
 @dataclass
 class RunResult:
     """
@@ -112,6 +138,16 @@ class RunResult:
     @property
     def ok(self) -> bool:
         return self.status == "finished"
+
+    @property
+    def subtype(self) -> str:
+        """Claude Agent SDK–compatible result subtype.
+
+        Maps the Rust ``finish_reason`` debug string to one of:
+        ``"success"``, ``"error_max_turns"``, ``"error_during_execution"``,
+        ``"cancelled"``.
+        """
+        return _map_finish_reason_to_subtype(self.finish_reason, self.status)
 
 
 # ── Session info ──────────────────────────────────────────────────────────

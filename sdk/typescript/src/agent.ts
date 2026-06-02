@@ -4,6 +4,7 @@
 
 import { RecursiveAgentError } from "./exceptions.js";
 import { HttpClient } from "./http.js";
+import { mapFinishReasonToSubtype } from "./models.js";
 import type { RunResult, SessionInfo } from "./models.js";
 import { Run } from "./run.js";
 
@@ -194,10 +195,13 @@ export class Agent {
     const data = (await http.post("/run", body)) as Record<string, unknown>;
     const usageRaw = data["usage"] as Record<string, unknown> | undefined;
 
+    const status = (data["status"] as RunResult["status"]) ?? "finished";
+    const finishReason = data["finish_reason"] as string | undefined;
     return {
       id: String(data["session_id"] ?? ""),
-      status: (data["status"] as RunResult["status"]) ?? "finished",
-      finishReason: data["finish_reason"] as string | undefined,
+      status,
+      subtype: mapFinishReasonToSubtype(finishReason, status),
+      finishReason,
       error: data["error"] as string | undefined,
       usage: usageRaw
         ? {
@@ -205,7 +209,7 @@ export class Agent {
             outputTokens: Number(usageRaw["output_tokens"] ?? 0),
           }
         : undefined,
-      ok: data["status"] === "finished",
+      ok: status === "finished",
     };
   }
 

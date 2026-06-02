@@ -72,11 +72,48 @@ export interface UsageMeta {
   reasoningTokens?: number;
 }
 
+/**
+ * Claude Agent SDK–compatible result subtype.
+ *
+ * Maps the Rust `finish_reason` debug string to a portable label:
+ * - `"success"` — normal completion
+ * - `"error_max_turns"` — turn budget or transcript size exceeded
+ * - `"error_during_execution"` — stuck loop, provider stop, etc.
+ * - `"cancelled"` — interrupted / cancelled
+ */
+export type RunSubtype =
+  | "success"
+  | "error_max_turns"
+  | "error_during_execution"
+  | "cancelled";
+
+/** @internal Map Rust FinishReason debug strings to RunSubtype. */
+export function mapFinishReasonToSubtype(
+  finishReason: string | undefined,
+  status: "finished" | "error" | "cancelled",
+): RunSubtype {
+  if (status === "cancelled") return "cancelled";
+  if (!finishReason) return status === "finished" ? "success" : "error_during_execution";
+  if (finishReason.includes("BudgetExceeded") || finishReason.includes("TranscriptLimit")) {
+    return "error_max_turns";
+  }
+  if (finishReason.includes("Cancelled")) return "cancelled";
+  if (finishReason.includes("NoMoreToolCalls") || finishReason.includes("PlanPending")) {
+    return "success";
+  }
+  return status === "finished" ? "success" : "error_during_execution";
+}
+
 export interface RunResult {
   /** Session ID. */
   id: string;
   /** `"finished"` | `"error"` | `"cancelled"` */
   status: "finished" | "error" | "cancelled";
+  /**
+   * Claude Agent SDK–compatible result subtype.
+   * Derived from `finishReason` and `status`.
+   */
+  subtype: RunSubtype;
   finishReason?: string;
   usage?: UsageMeta;
   error?: string;

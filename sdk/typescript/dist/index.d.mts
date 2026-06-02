@@ -83,11 +83,28 @@ interface UsageMeta {
     cacheReadTokens?: number;
     reasoningTokens?: number;
 }
+/**
+ * Claude Agent SDK–compatible result subtype.
+ *
+ * Maps the Rust `finish_reason` debug string to a portable label:
+ * - `"success"` — normal completion
+ * - `"error_max_turns"` — turn budget or transcript size exceeded
+ * - `"error_during_execution"` — stuck loop, provider stop, etc.
+ * - `"cancelled"` — interrupted / cancelled
+ */
+type RunSubtype = "success" | "error_max_turns" | "error_during_execution" | "cancelled";
+/** @internal Map Rust FinishReason debug strings to RunSubtype. */
+declare function mapFinishReasonToSubtype(finishReason: string | undefined, status: "finished" | "error" | "cancelled"): RunSubtype;
 interface RunResult {
     /** Session ID. */
     id: string;
     /** `"finished"` | `"error"` | `"cancelled"` */
     status: "finished" | "error" | "cancelled";
+    /**
+     * Claude Agent SDK–compatible result subtype.
+     * Derived from `finishReason` and `status`.
+     */
+    subtype: RunSubtype;
     finishReason?: string;
     usage?: UsageMeta;
     error?: string;
@@ -459,4 +476,4 @@ declare class RecursiveAgentError extends Error {
     });
 }
 
-export { Agent, type AgentOptions, AgentSession, type AssistantMessage, type ContentBlock, type GoalActionResponse, type GoalState, type PlanApprovalResponse, type PromptOptions, RecursiveAgentError, RecursiveClient, type RecursiveClientOptions, Run, type RunResult, type SDKMessage, type SessionDetail, type SessionInfo, type SlashCommandInfo, type SystemMessage, type TextContent, type ToolInfo, type ToolProgressMessage, type ToolResultBlock, type ToolUseBlock, type UsageMeta, type UserMessage };
+export { Agent, type AgentOptions, AgentSession, type AssistantMessage, type ContentBlock, type GoalActionResponse, type GoalState, type PlanApprovalResponse, type PromptOptions, RecursiveAgentError, RecursiveClient, type RecursiveClientOptions, Run, type RunResult, type RunSubtype, type SDKMessage, type SessionDetail, type SessionInfo, type SlashCommandInfo, type SystemMessage, type TextContent, type ToolInfo, type ToolProgressMessage, type ToolResultBlock, type ToolUseBlock, type UsageMeta, type UserMessage, mapFinishReasonToSubtype };

@@ -3,6 +3,7 @@
  */
 
 import type { HttpClient } from "./http.js";
+import { mapFinishReasonToSubtype } from "./models.js";
 import type {
   AssistantMessage,
   ContentBlock,
@@ -48,6 +49,7 @@ export class Run {
       this._result = {
         id: this.id,
         status: "error",
+        subtype: "error_during_execution",
         error: msg,
         ok: false,
       };
@@ -127,6 +129,7 @@ export class Run {
         this._result = {
           id: this.id,
           status: "error",
+          subtype: "error_during_execution",
           error: String(data["message"] ?? data),
           ok: false,
           numTurns,
@@ -140,6 +143,7 @@ export class Run {
     this._result = {
       id: this.id,
       status: runStatus,
+      subtype: mapFinishReasonToSubtype(finishReason, runStatus),
       finishReason,
       usage,
       ok: runStatus === "finished",

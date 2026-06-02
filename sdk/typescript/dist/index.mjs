@@ -137,6 +137,20 @@ var HttpClient = class {
   }
 };
 
+// src/models.ts
+function mapFinishReasonToSubtype(finishReason, status) {
+  if (status === "cancelled") return "cancelled";
+  if (!finishReason) return status === "finished" ? "success" : "error_during_execution";
+  if (finishReason.includes("BudgetExceeded") || finishReason.includes("TranscriptLimit")) {
+    return "error_max_turns";
+  }
+  if (finishReason.includes("Cancelled")) return "cancelled";
+  if (finishReason.includes("NoMoreToolCalls") || finishReason.includes("PlanPending")) {
+    return "success";
+  }
+  return status === "finished" ? "success" : "error_during_execution";
+}
+
 // src/run.ts
 var Run = class {
   constructor(sessionId, http) {
@@ -162,6 +176,7 @@ var Run = class {
       this._result = {
         id: this.id,
         status: "error",
+        subtype: "error_during_execution",
         error: msg,
         ok: false
       };
@@ -232,6 +247,7 @@ var Run = class {
         this._result = {
           id: this.id,
           status: "error",
+          subtype: "error_during_execution",
           error: String(data["message"] ?? data),
           ok: false,
           numTurns,
@@ -244,6 +260,7 @@ var Run = class {
     this._result = {
       id: this.id,
       status: runStatus,
+      subtype: mapFinishReasonToSubtype(finishReason, runStatus),
       finishReason,
       usage,
       ok: runStatus === "finished",
@@ -463,16 +480,19 @@ var Agent = class {
     if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
     const data = await http.post("/run", body);
     const usageRaw = data["usage"];
+    const status = data["status"] ?? "finished";
+    const finishReason = data["finish_reason"];
     return {
       id: String(data["session_id"] ?? ""),
-      status: data["status"] ?? "finished",
-      finishReason: data["finish_reason"],
+      status,
+      subtype: mapFinishReasonToSubtype(finishReason, status),
+      finishReason,
       error: data["error"],
       usage: usageRaw ? {
         inputTokens: Number(usageRaw["input_tokens"] ?? 0),
         outputTokens: Number(usageRaw["output_tokens"] ?? 0)
       } : void 0,
-      ok: data["status"] === "finished"
+      ok: status === "finished"
     };
   }
   /** List active sessions. */
@@ -683,5 +703,6 @@ export {
   AgentSession,
   RecursiveAgentError,
   RecursiveClient,
-  Run
+  Run,
+  mapFinishReasonToSubtype
 };

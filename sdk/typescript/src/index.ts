@@ -37,6 +37,7 @@ export type { AgentOptions, PromptOptions } from "./agent.js";
 export { RecursiveClient } from "./client.js";
 export type { RecursiveClientOptions } from "./client.js";
 export { RecursiveAgentError } from "./exceptions.js";
+export { mapFinishReasonToSubtype } from "./models.js";
 export type {
   AssistantMessage,
   ContentBlock,
@@ -44,6 +45,7 @@ export type {
   GoalState,
   PlanApprovalResponse,
   RunResult,
+  RunSubtype,
   SDKMessage,
   SessionDetail,
   SessionInfo,
