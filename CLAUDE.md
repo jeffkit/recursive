@@ -70,7 +70,7 @@ run, check first:
 
 ```bash
 ls .dev/runs/ 2>/dev/null
-ls .worktree/ 2>/dev/null
+ls .worktrees/ 2>/dev/null
 ```
 
 Don't edit files that a live worktree run is working on.
@@ -81,8 +81,8 @@ All feature development happens in a dedicated worktree, not on the main
 checkout at the project root. The main checkout (the project root itself)
 is reserved for the `main` branch — it is the stable, non-bare working
 tree used for shared admin tasks (fetch, merge, housekeeping). Each
-feature worktree lives at `<project-root>/.worktree/<name>/`, and
-`.worktree/` is git-ignored so worktrees never get accidentally
+feature worktree lives at `<project-root>/.worktrees/<name>/`, and
+`.worktrees/` is git-ignored so worktrees never get accidentally
 committed.
 
 This separation keeps the main checkout clean, makes parallel feature
@@ -99,7 +99,7 @@ so editing one does not touch the other.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Recursive** (6020 symbols, 16287 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Recursive** (6104 symbols, 16466 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
