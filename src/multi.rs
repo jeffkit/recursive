@@ -268,6 +268,11 @@ impl AgentPool {
         self.roles.len()
     }
 
+    /// Remove a role from the pool.  Returns `true` if the role existed.
+    pub fn remove_role(&mut self, name: &str) -> bool {
+        self.roles.remove(name).is_some()
+    }
+
     pub async fn run_with_role(
         &self,
         role_name: &str,

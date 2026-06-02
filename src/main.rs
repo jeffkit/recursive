@@ -33,7 +33,7 @@ use recursive::{
         ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
         LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
         RunSkillScript, ScheduleWakeup, ScratchpadDelete, ScratchpadGet, ScratchpadList,
-        SearchFiles, SubAgent, TodoWriteTool, ToolTransport, WakeupSlot, WebFetch,
+        SearchFiles, SpawnWorkerTool, SubAgent, TodoWriteTool, ToolTransport, WakeupSlot, WebFetch,
         WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
@@ -1391,6 +1391,18 @@ async fn build_runtime(
             None,
         );
         tools = tools.register(Arc::new(sub));
+
+        // Also register spawn_worker — the coordinator-pattern first-class
+        // delegation tool.  Uses the same depth limit as sub_agent.
+        let worker = SpawnWorkerTool::new(
+            &config.workspace,
+            provider.clone(),
+            tools.clone(),
+            max_depth,
+            0,
+            None,
+        );
+        tools = tools.register(Arc::new(worker));
     }
 
     let skills = discover_loaded_skills(config);
