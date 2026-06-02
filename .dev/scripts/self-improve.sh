@@ -657,16 +657,16 @@ fi
 # unformatted code (rare — almost certainly a bug in the agent's edit).
 if [[ "${RECURSIVE_FMT_CHECK:-1}" == "1" ]] \
    && ! cargo fmt --all -- --check >/tmp/cargo-fmt-errors.log 2>&1; then
+  # fmt failures are purely cosmetic — just run cargo fmt and continue rather
+  # than rolling back. No need to resume the agent; rustfmt is deterministic.
   {
     echo ""
-    echo "--- FMT-CHECK: cargo fmt --all -- --check FAILED ---"
-    tail -40 /tmp/cargo-fmt-errors.log
-    echo ""
-    echo "Run \`cargo fmt --all\` locally to fix, or set RECURSIVE_FMT_CHECK=0"
-    echo "if this is intentional (with a journal note explaining why)."
+    echo "--- FMT-CHECK: cargo fmt --all -- --check FAILED — auto-fixing ---"
+    tail -20 /tmp/cargo-fmt-errors.log
     echo ""
   } | tee -a "$LOG"
-  verdict_and_exit "rolled-back" "post-agent cargo fmt --check failed"
+  cargo fmt --all 2>&1 | tee -a "$LOG"
+  echo "[self-improve] FMT-CHECK: auto-fixed with cargo fmt --all ✓" | tee -a "$LOG"
 fi
 
 # ---- E2E Smoke Gate ----------------------------------------------------------
@@ -681,11 +681,55 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # we need to test the NEW binary that includes this goal's changes)
   cargo build -q 2>/dev/null
 
-  if argusai -c e2e/e2e.yaml run -s smoke 2>&1 | tail -5; then
+  # argusai resolves 'file:' paths relative to CWD, not relative to e2e.yaml,
+  # so we must cd into e2e/ before invoking it.
+  if (cd e2e && argusai -c e2e.yaml run -s smoke 2>&1 | tail -5); then
     echo "[self-improve] E2E smoke: PASSED ✓"
   else
     echo "[self-improve] E2E smoke: FAILED ✗"
-    verdict_and_exit "rolled-back" "E2E smoke test failed (new binary broken)"
+    # Give the agent one chance to fix the regression before rolling back.
+    if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
+       && [[ -f "$TRANSCRIPT_OUT" ]] \
+       && [[ -z "${_RECURSIVE_SMOKE_RESUME_ATTEMPTED:-}" ]] \
+       && command -v jq >/dev/null 2>&1; then
+      export _RECURSIVE_SMOKE_RESUME_ATTEMPTED=1
+      RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
+      if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
+        SMOKE_ERRORS="$(cd e2e && argusai -c e2e.yaml run -s smoke 2>&1 | tail -30 || true)"
+        SMOKE_PROMPT="The E2E smoke suite failed after your changes. Output:
+
+\`\`\`
+${SMOKE_ERRORS}
+\`\`\`
+
+Please investigate and fix the regression. Do NOT start over — fix the specific issue above."
+
+        SMOKE_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-smoke-fix.json"
+        echo "--- SMOKE-FIX: E2E smoke failed, resuming agent to fix ---" | tee -a "$LOG"
+        set +e
+        "$BIN" --workspace . \
+          --system-prompt-file "$SYSPROMPT_FILE" \
+          --transcript-out "$SMOKE_TRANSCRIPT_OUT" \
+          $PRICING_FLAG \
+          --log warn \
+          replay "$TRANSCRIPT_OUT" \
+          --resume-from "$RESUME_FROM" "$SMOKE_PROMPT" 2>&1 | tee -a "$LOG"
+        SMOKE_FIX_STATUS=${PIPESTATUS[0]}
+        set -e
+
+        cargo build -q 2>/dev/null
+        if [[ "$SMOKE_FIX_STATUS" -eq 0 ]] && (cd e2e && argusai -c e2e.yaml run -s smoke >/dev/null 2>&1); then
+          echo "[self-improve] SMOKE-FIX: smoke passes after fix ✓" | tee -a "$LOG"
+        else
+          echo "[self-improve] SMOKE-FIX: still failing after fix attempt" | tee -a "$LOG"
+          verdict_and_exit "rolled-back" "E2E smoke test failed (smoke-fix also failed)"
+        fi
+      else
+        verdict_and_exit "rolled-back" "E2E smoke test failed (new binary broken)"
+      fi
+    else
+      verdict_and_exit "rolled-back" "E2E smoke test failed (new binary broken)"
+    fi
   fi
 elif [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]; then
   echo "[self-improve] WARN: E2E smoke skipped (argusai not found or e2e/e2e.yaml missing)"
