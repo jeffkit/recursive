@@ -1449,6 +1449,14 @@ impl App {
                 });
                 self.active_goal = None;
             }
+            // ── Goal-170: turn abort ──────────────────────────────────────────
+            UiEvent::Interrupted => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: "[Interrupted]".into(),
+                });
+                self.turn.finish();
+                self.pending_latency_ms = None;
+            }
         }
         // Sticky-scroll: when the user is already at the bottom
         // (scroll_offset == 0), keep them pinned as new content

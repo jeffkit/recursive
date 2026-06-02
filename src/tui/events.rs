@@ -86,6 +86,12 @@ pub enum UiEvent {
     GoalAchieved { condition: String, turns: u32 },
     /// Active goal was cleared (budget exceeded, `/goal clear`, or API).
     GoalCleared,
+
+    // ── Goal-170: turn abort ────────────────────────────────────────────────
+    /// The current turn was aborted by the user (Esc/Ctrl+C). The backend
+    /// cancelled the in-flight LLM request via `JoinHandle::abort()` and
+    /// truncated the transcript back to the pre-turn state.
+    Interrupted,
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
