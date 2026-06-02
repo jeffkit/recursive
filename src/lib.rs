@@ -119,8 +119,9 @@ pub use tool_set_provider::{
 pub use tools::policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
-    PlanApprovalGate, PlanApprovalResult, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch,
-    ToolRegistry, ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
+    PlanApprovalGate, PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult,
+    RequestPlanModeTool, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch, ToolRegistry,
+    ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
 };
 pub use transcript::{TranscriptFile, TranscriptMeta};
 

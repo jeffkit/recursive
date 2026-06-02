@@ -183,7 +183,10 @@ pub use memory::{
     ScratchpadGet, ScratchpadList, WorkingMemoryTool,
 };
 pub use memory::{Forget, Recall, Remember};
-pub use plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult};
+pub use plan_mode::{
+    EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult, PlanModeRequestGate,
+    PlanModeRequestResult, RequestPlanModeTool,
+};
 pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
@@ -838,17 +841,12 @@ pub fn build_standard_tools(
         .register(Arc::new(A2aCardTool::new()))
         .register(Arc::new(A2aTaskCheckTool::new()));
 
-    // Goal-165: plan mode 2.0 tools (NullSink / default gate placeholder).
-    // AgentRuntimeBuilder::build() re-registers these with the real gate and sink.
-    let default_gate = Arc::new(plan_mode::PlanApprovalGate::new());
-    registry = registry
-        .register(Arc::new(plan_mode::EnterPlanModeTool::new(
-            default_gate.clone(),
-        )))
-        .register(Arc::new(plan_mode::ExitPlanModeTool::new(
-            default_gate,
-            Arc::new(crate::event::NullSink),
-        )));
+    // Goal-201: plan mode tools are channel capabilities (TUI / HTTP only).
+    // They are registered exclusively by AgentRuntimeBuilder::build() which
+    // wires them to the real PlanApprovalGate and EventSink.  Headless /
+    // CLI / self-improve runs that call default_tool_registry() directly
+    // will not have these tools, preventing the LLM from blocking on an
+    // interactive review that can never complete.
 
     #[cfg(feature = "web_fetch")]
     {
@@ -1101,5 +1099,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "hello");
+    }
+
+    // ── Goal-201: plan mode tools are opt-in (not in default registry) ──────
+
+    #[test]
+    fn default_registry_has_no_plan_mode_tools() {
+        // build_standard_tools() must NOT register enter_plan_mode / exit_plan_mode.
+        // These are channel capabilities owned exclusively by AgentRuntimeBuilder.
+        let workspace = std::path::PathBuf::from(".");
+        let registry = build_standard_tools(&workspace, &[], 30);
+        assert!(
+            registry.get("enter_plan_mode").is_none(),
+            "enter_plan_mode must not be in the default registry"
+        );
+        assert!(
+            registry.get("exit_plan_mode").is_none(),
+            "exit_plan_mode must not be in the default registry"
+        );
     }
 }
