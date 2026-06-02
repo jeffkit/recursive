@@ -139,6 +139,10 @@ fn blake3_canonical_json(v: &Value) -> String {
 pub mod a2a;
 pub mod apply_patch;
 pub mod checkpoint;
+#[cfg(feature = "cloud-runtime")]
+pub mod docker_provider;
+#[cfg(feature = "cloud-runtime")]
+pub mod docker_sandbox;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;

@@ -31,9 +31,10 @@ web_fetch = []
 anthropic = []
 http = ["dep:axum", "dep:tower-http", "dep:tokio-stream", "dep:futures-util", "dep:jsonwebtoken", "dep:agui-protocol"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:syntect", "dep:pulldown-cmark"]
-cloud-runtime = ["dep:redis", "dep:deadpool-redis", "dep:aws-sdk-s3", "dep:aws-config"]
+cloud-runtime = ["dep:redis", "dep:deadpool-redis", "dep:aws-sdk-s3", "dep:aws-config", "dep:bollard"]
 aws-sdk-s3 = ["dep:aws-sdk-s3"]
 aws-config = ["dep:aws-config"]
+bollard = ["dep:bollard"]
 
 [lib]
 name = "recursive"
@@ -87,6 +88,7 @@ deadpool-redis = { version = "0.18", optional = true }
 uuid = { version = "1", features = ["v4", "v7"] }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+bollard = { version = "0.18", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
