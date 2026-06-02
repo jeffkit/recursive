@@ -140,7 +140,6 @@ impl Tool for SearchFiles {
                 };
                 if is_match {
                     let truncated = if line.len() > DEFAULT_MAX_LINE_LEN {
-                        // walk back from the byte limit to a char boundary
                         let mut end = DEFAULT_MAX_LINE_LEN;
                         while !line.is_char_boundary(end) {
                             end -= 1;
@@ -333,5 +332,59 @@ Todo",
         assert!(out.contains("TODO"));
         assert!(!out.contains("todo"));
         assert!(!out.contains("Todo"));
+    }
+
+    /// Regression test: long lines containing multi-byte Unicode characters (like the
+    /// box-drawing `─` U+2500, encoded as 3 UTF-8 bytes E2 94 80) must not panic
+    /// when the truncation boundary lands in the middle of a multi-byte sequence.
+    #[tokio::test]
+    async fn long_line_with_multibyte_unicode_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+
+        // Build a line where the 240-byte boundary lands inside `─` (U+2500, 3 bytes).
+        // "search_target " is 14 ASCII bytes. Then append `─` chars until line > 240 bytes.
+        // `─` takes 3 bytes, so we need (240 - 14) / 3 ≈ 75 chars to land near boundary.
+        let mut long_line = String::from("search_target ");
+        while long_line.len() <= 240 {
+            long_line.push('─');
+        }
+        // Append a suffix so the file has another match-less line too.
+        let body = format!("{long_line}\nno match here\n");
+        write(&tmp, "unicode.txt", &body);
+
+        // Must not panic.
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "search_target"}))
+            .await
+            .unwrap();
+        assert!(out.contains("unicode.txt:1:"));
+        assert!(out.contains("search_target"));
+    }
+
+    /// Regression test: JSONL files with multi-byte Unicode inside a long JSON line
+    /// (mimicking a session transcript that contains box-drawing characters) must not panic.
+    #[tokio::test]
+    async fn jsonl_line_with_unicode_box_drawing_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        // Construct a long JSONL-like line that contains the target pattern AND box-drawing chars.
+        let separator = "─".repeat(60); // 60 × 3 bytes = 180 bytes
+        let content_field = format!(
+            "pub struct AgentRuntime{{}}\\n// {separator}─────────────────────────"
+        );
+        let line = format!(
+            "{{\"role\":\"tool\",\"content\":\"# range: lines 1-50 of 200\\\\n{content_field}\"}}"
+        );
+        assert!(
+            line.len() > 240,
+            "test line must exceed truncation limit; got {}",
+            line.len()
+        );
+        write(&tmp, "transcript.jsonl", &line);
+
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "pub struct AgentRuntime"}))
+            .await
+            .unwrap();
+        assert!(out.contains("transcript.jsonl:1:"));
     }
 }

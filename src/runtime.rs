@@ -386,6 +386,13 @@ impl AgentRuntime {
         self.transcript = transcript;
     }
 
+    /// Discard all transcript messages after index `len`, restoring the
+    /// transcript to the state it had before a turn started. Used by the
+    /// TUI abort path to prevent orphan tool_call entries.
+    pub fn truncate_transcript(&mut self, len: usize) {
+        self.transcript.truncate(len);
+    }
+
     /// Return a reference to the inner kernel.
     pub fn kernel(&self) -> &AgentKernel {
         &self.kernel
