@@ -712,7 +712,7 @@ pub fn build_standard_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::{PermissionMode, PermissionsConfig};
+    use crate::permissions::PermissionMode;
     use async_trait::async_trait;
 
     struct Echo;
@@ -762,12 +762,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_permission_deny_blocks_invoke() {
-        let config = PermissionsConfig {
-            allow: vec!["echo".into()],
-            deny: vec!["echo".into()],
-            interactive: vec![],
-            plan: vec![],
+        let config = crate::permissions::LayeredPermissionsConfig {
             mode: PermissionMode::Allow,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                allow: vec!["echo".into()],
+                deny: vec!["echo".into()],
+                ..Default::default()
+            }],
         };
         let reg = ToolRegistry::local()
             .with_permissions(config)

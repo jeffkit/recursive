@@ -1197,7 +1197,7 @@ async fn build_tools(config: &Config) -> ToolRegistry {
 /// Resolution order:
 ///   1. `RECURSIVE_TOOL_PERMISSIONS_FILE=<path>` env — TOML file
 ///      whose top-level keys are `allow`, `deny`, `interactive`
-///      (matches [`recursive::permissions::PermissionsConfig`] verbatim).
+///      (matches [`recursive::permissions::OldPermissionsConfig`] verbatim).
 ///   2. `~/.recursive/config.toml`'s `[permissions]` section.
 ///   3. None — every tool allowed (back-compat default).
 ///
@@ -1209,8 +1209,8 @@ fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfi
         if !path.is_empty() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
-                    match toml::from_str::<recursive::permissions::PermissionsConfig>(&content) {
-                        Ok(perms) => return Some(perms),
+                    match toml::from_str::<recursive::permissions::OldPermissionsConfig>(&content) {
+                        Ok(old) => return Some(old.into()),
                         Err(e) => {
                             eprintln!("permissions: failed to parse {path}: {e}");
                         }
@@ -1224,22 +1224,26 @@ fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfi
     }
     let file_config = recursive::config_file::FileConfig::load().ok().flatten()?;
     let section = file_config.permissions?;
-    Some(recursive::permissions::PermissionsConfig {
-        allow: section.allow,
-        deny: section.deny,
-        interactive: section.interactive,
-        plan: section.plan,
-        mode: section
-            .mode
-            .as_deref()
-            .map(|s| match s {
-                "deny" => recursive::permissions::PermissionMode::Deny,
-                "interactive" => recursive::permissions::PermissionMode::Interactive,
-                "plan" => recursive::permissions::PermissionMode::Plan,
-                _ => recursive::permissions::PermissionMode::Allow,
-            })
-            .unwrap_or_default(),
-    })
+    let mode = section
+        .mode
+        .as_deref()
+        .map(|s| match s {
+            "deny" => recursive::permissions::PermissionMode::Deny,
+            "interactive" => recursive::permissions::PermissionMode::Interactive,
+            "plan" => recursive::permissions::PermissionMode::Plan,
+            _ => recursive::permissions::PermissionMode::Allow,
+        })
+        .unwrap_or_default();
+    let mut layers = Vec::new();
+    if !section.allow.is_empty() || !section.deny.is_empty() || !section.interactive.is_empty() {
+        layers.push(recursive::permissions::PermissionLayer {
+            source: recursive::permissions::RuleSource::User,
+            allow: section.allow,
+            deny: section.deny,
+            interactive: section.interactive,
+        });
+    }
+    Some(recursive::permissions::LayeredPermissionsConfig { mode, layers })
 }
 
 /// Register MCP tools from a config file into the registry.

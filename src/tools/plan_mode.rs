@@ -181,10 +181,6 @@ impl Tool for EnterPlanModeTool {
         // If permissions are configured, report which tools are in Plan mode.
         let mut response = json!({ "entered": true });
         if let Some(ref config) = self.permissions {
-            let plan_tools: Vec<String> = config.plan.iter().cloned().collect();
-            if !plan_tools.is_empty() {
-                response["plan_mode_tools"] = json!(plan_tools);
-            }
             if config.mode == PermissionMode::Plan {
                 response["default_mode"] = json!("plan");
             }
@@ -273,13 +269,9 @@ impl Tool for ExitPlanModeTool {
             .to_string();
 
         // If permissions are configured, check that the plan covers Plan-mode tools.
-        if let Some(ref config) = self.permissions {
-            let plan_tools: Vec<String> = config.plan.iter().cloned().collect();
-            if !plan_tools.is_empty() {
-                // We don't block execution — we just note it in the plan text
-                // so the reviewer can see which tools require plan coverage.
-                // The plan text is passed through to the reviewer as-is.
-            }
+        if let Some(ref _config) = self.permissions {
+            // Plan-mode tools are determined by the default mode.
+            // The plan text is passed through to the reviewer as-is.
         }
 
         // Clear exploring mode so normal tool execution resumes after approval.

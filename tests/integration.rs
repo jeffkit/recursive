@@ -938,7 +938,7 @@ mod shutdown {
 
 mod permissions {
     use recursive::error::Error;
-    use recursive::permissions::{PermissionMode, PermissionsConfig};
+    use recursive::permissions::PermissionMode;
     use recursive::tools::{
         BackgroundJobManager, LocalTransport, ReadFile, RunBackground, RunShell, ToolRegistry,
         WriteFile,
@@ -947,7 +947,9 @@ mod permissions {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn registry_with(perms: PermissionsConfig) -> (ToolRegistry, TempDir) {
+    fn registry_with(
+        perms: recursive::permissions::LayeredPermissionsConfig,
+    ) -> (ToolRegistry, TempDir) {
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path().to_path_buf();
         let bg = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
@@ -965,12 +967,13 @@ mod permissions {
     /// result message at the agent loop level).
     #[tokio::test]
     async fn permissions_deny_blocks_invoke() {
-        let perms = PermissionsConfig {
-            allow: vec![],
-            deny: vec!["run_shell".into()],
-            interactive: vec![],
-            plan: vec![],
+        let perms = recursive::permissions::LayeredPermissionsConfig {
             mode: PermissionMode::Allow,
+            layers: vec![recursive::permissions::PermissionLayer {
+                source: recursive::permissions::RuleSource::User,
+                deny: vec!["run_shell".into()],
+                ..Default::default()
+            }],
         };
         let (registry, _tmp) = registry_with(perms);
         let result = registry
@@ -985,12 +988,13 @@ mod permissions {
     /// Test B — non-empty allow list rejects unlisted tools.
     #[tokio::test]
     async fn permissions_allow_filter_blocks_unlisted() {
-        let perms = PermissionsConfig {
-            allow: vec!["read_file".into()],
-            deny: vec![],
-            interactive: vec![],
-            plan: vec![],
+        let perms = recursive::permissions::LayeredPermissionsConfig {
             mode: PermissionMode::Allow,
+            layers: vec![recursive::permissions::PermissionLayer {
+                source: recursive::permissions::RuleSource::User,
+                allow: vec!["read_file".into()],
+                ..Default::default()
+            }],
         };
         let (registry, _tmp) = registry_with(perms);
         let result = registry
@@ -1005,12 +1009,13 @@ mod permissions {
     /// Test C — glob patterns match multiple tools.
     #[tokio::test]
     async fn permissions_glob_pattern_matches() {
-        let perms = PermissionsConfig {
-            allow: vec![],
-            deny: vec!["run_*".into()],
-            interactive: vec![],
-            plan: vec![],
+        let perms = recursive::permissions::LayeredPermissionsConfig {
             mode: PermissionMode::Allow,
+            layers: vec![recursive::permissions::PermissionLayer {
+                source: recursive::permissions::RuleSource::User,
+                deny: vec!["run_*".into()],
+                ..Default::default()
+            }],
         };
         let (registry, _tmp) = registry_with(perms);
 
