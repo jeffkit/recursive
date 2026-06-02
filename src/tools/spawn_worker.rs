@@ -342,6 +342,7 @@ impl Tool for SpawnWorkerTool {
             FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
             FinishReason::PlanPending => "PlanPending",
             FinishReason::Cancelled => "Cancelled",
+            FinishReason::PermissionDenialLimit => "PermissionDenialLimit",
         };
 
         let final_text = outcome

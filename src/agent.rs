@@ -198,6 +198,11 @@ pub enum FinishReason {
     PlanPending,
     /// Agent was cancelled by a shutdown signal (SIGINT/SIGTERM).
     Cancelled,
+
+    /// The auto permission classifier reached its denial limit
+    /// (3 consecutive or 10 total denials). All subsequent tool
+    /// calls are blocked to prevent denial loops.
+    PermissionDenialLimit,
 }
 
 /// The outcome of a single [`Agent::run()`] call.

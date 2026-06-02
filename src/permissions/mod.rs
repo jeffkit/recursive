@@ -14,6 +14,8 @@
 //! The legacy [`PermissionsConfig`] type alias provides backward compatibility
 //! for existing callers.
 
+pub mod auto_classifier;
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -109,6 +111,14 @@ pub enum PermissionMode {
         /// (only true when pre-plan mode was BypassPermissions).
         bypass_available: bool,
     },
+
+    /// Auto mode: delegate every tool-call decision to an LLM classifier.
+    ///
+    /// The classifier receives the tool name, argument summary, and recent
+    /// conversation context and returns `{"block": true|false, "reason": "..."}`.
+    /// A denial tracker prevents runaway loops (3 consecutive / 10 total
+    /// denials → all subsequent calls denied).
+    Auto,
 }
 
 // Custom Deserialize to handle both old and new string names as well as
@@ -129,7 +139,7 @@ impl<'de> Deserialize<'de> for PermissionMode {
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str(
                     "a permission mode string (\"default\", \"acceptEdits\", \
-                     \"bypassPermissions\", \"dontAsk\", \"plan\", \
+                     \"bypassPermissions\", \"dontAsk\", \"plan\", \"auto\", \
                      or legacy \"allow\"/\"deny\"/\"interactive\") \
                      or a Plan object {\"prePlanMode\": \"...\", \"bypassAvailable\": bool}",
                 )
@@ -143,6 +153,7 @@ impl<'de> Deserialize<'de> for PermissionMode {
                         Ok(PermissionMode::BypassPermissions)
                     }
                     "dontAsk" | "dont_ask" | "deny" | "interactive" => Ok(PermissionMode::DontAsk),
+                    "auto" => Ok(PermissionMode::Auto),
                     "plan" => Ok(PermissionMode::Plan {
                         pre_plan_mode: Box::new(PermissionMode::Default),
                         bypass_available: false,
@@ -153,6 +164,7 @@ impl<'de> Deserialize<'de> for PermissionMode {
                             "default",
                             "acceptEdits",
                             "bypassPermissions",
+                            "auto",
                             "dontAsk",
                             "plan",
                         ],

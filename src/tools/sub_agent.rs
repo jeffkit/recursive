@@ -294,6 +294,7 @@ impl Tool for SubAgent {
             FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
             FinishReason::PlanPending => "PlanPending",
             FinishReason::Cancelled => "Cancelled",
+            FinishReason::PermissionDenialLimit => "PermissionDenialLimit",
         };
 
         let final_text = outcome

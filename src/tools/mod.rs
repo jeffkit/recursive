@@ -12,6 +12,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::permissions::auto_classifier::AutoClassifier;
 use crate::permissions::SharedPermissions;
 use crate::permissions::{DecisionReason, Permission, PermissionMode, PermissionsConfig};
 use tokio::sync::RwLock;
@@ -279,6 +280,12 @@ pub struct ToolRegistry {
     pub headless: bool,
     /// Goal-199: external hook runner for headless permission checks.
     pub hook_runner: crate::hooks::ExternalHookRunner,
+
+    /// Goal-200: optional auto classifier for `PermissionMode::Auto`.
+    /// When `Some`, each tool call in Auto mode is classified by the
+    /// LLM before execution. Wrapped in a `Mutex` (tokio) because `classify()`
+    /// takes `&mut self` (it updates the denial tracker).
+    pub auto_classifier: Option<Arc<tokio::sync::Mutex<AutoClassifier>>>,
 }
 
 /// Observer that records files touched by structured filesystem tools
@@ -351,6 +358,7 @@ impl ToolRegistry {
             aliases: BTreeMap::new(),
             transport,
             permissions: None,
+            auto_classifier: None,
             permission_mode: PermissionMode::Default,
             touched: None,
             permission_hook: None,
@@ -377,6 +385,7 @@ impl ToolRegistry {
             aliases: BTreeMap::new(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
+            auto_classifier: self.auto_classifier.clone(),
             permission_mode: self.permission_mode.clone(),
             touched: self.touched.clone(),
             permission_hook: self.permission_hook.clone(),
@@ -466,6 +475,17 @@ impl ToolRegistry {
             self.permission_mode = guard.mode.clone();
         }
         self.permissions = Some(sp);
+        self
+    }
+
+    /// Attach an [`AutoClassifier`] for `PermissionMode::Auto`.
+    ///
+    /// When the registry's permission mode is [`Auto`](PermissionMode::Auto),
+    /// each tool call is sent to the classifier before execution. The
+    /// classifier is wrapped in `Arc<Mutex<...>>` so it can be shared
+    /// across clones of the registry.
+    pub fn with_auto_classifier(mut self, classifier: AutoClassifier) -> Self {
+        self.auto_classifier = Some(Arc::new(tokio::sync::Mutex::new(classifier)));
         self
     }
 
@@ -628,6 +648,49 @@ impl ToolRegistry {
         // permission check, not during tool execution.
         if let Some(ref sp) = self.permissions {
             let guard = sp.read().await;
+
+            // Goal-200: Auto mode — delegate to the LLM classifier before
+            // falling through to the static permission check. If the
+            // classifier blocks, return denial immediately. If the denial
+            // tracker is over limit, return a special error that the agent
+            // loop can use to set FinishReason::PermissionDenialLimit.
+            if matches!(guard.mode, PermissionMode::Auto) {
+                if let Some(ref classifier) = self.auto_classifier {
+                    let args_summary =
+                        serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into());
+                    let mut c = classifier.lock().await;
+                    match c.classify(name, &args_summary, "").await {
+                        Ok((true, _reason)) => {
+                            let reason_enum = DecisionReason::Mode(PermissionMode::Auto);
+                            if c.tracker.is_over_limit() {
+                                return ToolDispatch {
+                                    result: Err(Error::PermissionDenied {
+                                        name: name.into(),
+                                        reason: reason_enum,
+                                    }),
+                                    audit: AuditMeta::synthetic_unknown_tool(name),
+                                };
+                            }
+                            return ToolDispatch {
+                                result: Err(Error::PermissionDenied {
+                                    name: name.into(),
+                                    reason: reason_enum,
+                                }),
+                                audit: AuditMeta::synthetic_unknown_tool(name),
+                            };
+                        }
+                        Ok((false, _)) => {
+                            // Allowed — fall through to static check.
+                        }
+                        Err(_e) => {
+                            // Classifier error — conservative: allow.
+                        }
+                    }
+                }
+                // If no classifier configured in Auto mode, fall through
+                // to static check (safe default).
+            }
+
             let is_readonly = self.is_readonly(name);
             match guard.check_static(name, is_readonly, safety_content.as_deref()) {
                 Permission::Denied(reason, _msg) => {
