@@ -1187,7 +1187,7 @@ impl AgentRuntimeBuilder {
         let plan_approval_gate = Arc::new(PlanApprovalGate::new());
         // Goal-190: pass permissions config to plan mode tools so they can
         // report which tools are in Plan mode.
-        let permissions_arc = kernel.tools().permissions_config().cloned().map(Arc::new);
+        let permissions_arc = kernel.tools().permissions_config().map(Arc::new);
         kernel.tools_mut().register_mut({
             let mut tool = EnterPlanModeTool::new(plan_approval_gate.clone());
             if let Some(ref perms) = permissions_arc {
