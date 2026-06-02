@@ -39,6 +39,8 @@ pub mod runtime_goal;
 pub mod session;
 pub mod session_lock;
 pub mod skills;
+pub mod storage;
+pub mod tool_set_provider;
 pub mod tools;
 pub mod transcript;
 #[cfg(feature = "tui")]
@@ -103,6 +105,17 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
+#[cfg(feature = "cloud-runtime")]
+pub use storage::RedisSessionStore;
+#[cfg(feature = "cloud-runtime")]
+pub use storage::S3StorageBackend;
+pub use storage::{
+    AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
+};
+pub use tool_set_provider::{
+    LocalToolSetProvider, PolicyToolSetProvider, SandboxMode, ToolSetProvider,
+};
+pub use tools::policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
     PlanApprovalGate, PlanApprovalResult, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch,

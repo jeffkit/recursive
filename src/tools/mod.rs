@@ -139,6 +139,12 @@ fn blake3_canonical_json(v: &Value) -> String {
 pub mod a2a;
 pub mod apply_patch;
 pub mod checkpoint;
+#[cfg(feature = "cloud-runtime")]
+pub mod docker_provider;
+#[cfg(feature = "cloud-runtime")]
+pub mod docker_sandbox;
+#[cfg(feature = "e2b-sandbox")]
+pub mod e2b_provider;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
@@ -146,6 +152,7 @@ pub mod fs;
 pub mod load_skill;
 pub mod memory;
 pub mod plan_mode;
+pub mod policy_sandbox;
 pub mod run_background;
 pub mod run_skill_script;
 pub mod schedule_wakeup;
@@ -177,6 +184,7 @@ pub use memory::{
 };
 pub use memory::{Forget, Recall, Remember};
 pub use plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult};
+pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
@@ -240,6 +248,9 @@ pub trait PermissionHook: Send + Sync {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Alias → primary name mapping for `find_by_name`.
+    /// Populated by `register`; never mutated by `invoke`.
+    aliases: BTreeMap<String, String>,
     transport: Arc<dyn ToolTransport>,
     permissions: Option<PermissionsConfig>,
     /// Default permission mode for tools not covered by the config lists.
@@ -250,6 +261,10 @@ pub struct ToolRegistry {
     /// before every tool invocation. `None` means allow all (backward-
     /// compatible default).
     permission_hook: Option<Arc<dyn PermissionHook>>,
+    /// Goal-184: optional L1 policy config. Stored here so individual tools
+    /// can query it at call time. Does not enforce anything by itself;
+    /// tools must call `registry.policy()` and check before executing.
+    policy: Option<policy_sandbox::PolicyConfig>,
 }
 
 /// Observer that records files touched by structured filesystem tools
@@ -319,11 +334,13 @@ impl ToolRegistry {
     pub fn new(transport: Arc<dyn ToolTransport>) -> Self {
         Self {
             tools: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             transport,
             permissions: None,
             permission_mode: PermissionMode::Allow,
             touched: None,
             permission_hook: None,
+            policy: None,
         }
     }
 
@@ -341,11 +358,13 @@ impl ToolRegistry {
     pub fn with_same_transport(&self) -> Self {
         Self {
             tools: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
             permission_mode: self.permission_mode,
             touched: self.touched.clone(),
             permission_hook: self.permission_hook.clone(),
+            policy: self.policy.clone(),
         }
     }
 
@@ -366,6 +385,24 @@ impl ToolRegistry {
     /// Remove any previously attached permission hook.
     pub fn clear_permission_hook(&mut self) {
         self.permission_hook = None;
+    }
+
+    /// Attach an L1 policy config. The registry stores the policy so that
+    /// individual tools (e.g. `run_shell`) can query it via
+    /// `registry.policy()` at call time.
+    pub fn with_policy(mut self, policy: policy_sandbox::PolicyConfig) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Set the L1 policy config via mutable reference.
+    pub fn set_policy(&mut self, policy: policy_sandbox::PolicyConfig) {
+        self.policy = Some(policy);
+    }
+
+    /// Return the attached policy config, if any.
+    pub fn policy(&self) -> Option<&policy_sandbox::PolicyConfig> {
+        self.policy.as_ref()
     }
 
     /// Set the permissions configuration for this registry.
@@ -419,10 +456,49 @@ impl ToolRegistry {
         self
     }
 
+    /// Register a tool and associate one or more aliases with it.
+    ///
+    /// Aliases are **not** sent to the LLM — they are only used by
+    /// [`find_by_name`] so sandboxed replacements can be looked up under
+    /// the original name the model knows.
+    pub fn register_with_aliases(mut self, tool: Arc<dyn Tool>, aliases: &[&str]) -> Self {
+        let name = tool.spec().name.clone();
+        for &alias in aliases {
+            self.aliases.insert(alias.to_string(), name.clone());
+        }
+        self.tools.insert(name, tool);
+        self
+    }
+
     /// Register a tool via mutable reference (for use with shared registries).
     pub fn register_mut(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.spec().name;
         self.tools.insert(name, tool);
+    }
+
+    /// Register a tool with aliases via mutable reference.
+    pub fn register_mut_with_aliases(&mut self, tool: Arc<dyn Tool>, aliases: &[&str]) {
+        let name = tool.spec().name.clone();
+        for &alias in aliases {
+            self.aliases.insert(alias.to_string(), name.clone());
+        }
+        self.tools.insert(name, tool);
+    }
+
+    /// Find a registered tool by its primary name or any alias.
+    ///
+    /// This is the preferred lookup path. `invoke` delegates to this so that
+    /// sandboxed tool replacements can be reached under the original name.
+    pub fn find_by_name(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        // Fast path: primary name.
+        if let Some(tool) = self.tools.get(name) {
+            return Some(tool.clone());
+        }
+        // Alias path.
+        if let Some(primary) = self.aliases.get(name) {
+            return self.tools.get(primary).cloned();
+        }
+        None
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -496,7 +572,7 @@ impl ToolRegistry {
             record_touched(name, &arguments, slot);
         }
 
-        let Some(tool) = self.get(name) else {
+        let Some(tool) = self.find_by_name(name) else {
             return ToolDispatch {
                 result: Err(Error::UnknownTool(name.into())),
                 audit: AuditMeta::synthetic_unknown_tool(name),

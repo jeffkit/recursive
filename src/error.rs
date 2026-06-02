@@ -68,6 +68,10 @@ pub enum Error {
     #[error("timeout after {duration_ms}ms")]
     Timeout { duration_ms: u64 },
 
+    /// Storage backend error (I/O, serialization, remote storage, etc.)
+    #[error("storage error: {message}")]
+    Storage { message: String },
+
     /// Catch-all for errors that don't fit elsewhere
     #[error("{0}")]
     Other(String),
