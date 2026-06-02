@@ -136,6 +136,7 @@ fn blake3_canonical_json(v: &Value) -> String {
     hash.to_hex().to_string()
 }
 
+pub mod a2a;
 pub mod apply_patch;
 pub mod checkpoint;
 pub mod episodic_recall;
@@ -156,6 +157,7 @@ pub mod transport;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
+pub use a2a::A2aCallTool;
 pub use apply_patch::ApplyPatch;
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
@@ -641,7 +643,8 @@ pub fn build_standard_tools(
         .register(Arc::new(TodoWriteTool::new(
             todo_list,
             Arc::new(crate::event::NullSink),
-        )));
+        )))
+        .register(Arc::new(A2aCallTool::new()));
 
     // Goal-165: plan mode 2.0 tools (NullSink / default gate placeholder).
     // AgentRuntimeBuilder::build() re-registers these with the real gate and sink.
