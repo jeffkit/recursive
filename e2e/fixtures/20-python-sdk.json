@@ -1,0 +1,11 @@
+{
+  "fixtures": [
+    {
+      "_comment": "Python SDK session test: single-turn, agent replies directly.",
+      "match": { "userMessage": "sdk-python-hello", "turnIndex": 0 },
+      "response": {
+        "content": "Hello from the Python SDK! Task completed."
+      }
+    }
+  ]
+}

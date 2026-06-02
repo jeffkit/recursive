@@ -98,3 +98,27 @@ tests:
     - name: "MCP Stdio Server"
       id: mcp-serve
       file: tests/14-mcp-serve.yaml
+
+    - name: "search_files Tool"
+      id: search-files
+      file: tests/15-search-files.yaml
+
+    - name: "Skill Lazy Load"
+      id: skill-lazy-load
+      file: tests/16-skill-lazy-load.yaml
+
+    - name: "Loop Mode — schedule_wakeup multi-turn"
+      id: loop-schedule
+      file: tests/17-loop-mode.yaml
+
+    - name: "Goal Loop API (Goal-168)"
+      id: goal-loop
+      file: tests/18-goal-loop.yaml
+
+    - name: "HTTP Interrupt endpoint (Goal-170)"
+      id: http-interrupt
+      file: tests/19-http-interrupt.yaml
+
+    - name: "Python SDK smoke test"
+      id: python-sdk
+      file: tests/20-python-sdk.yaml

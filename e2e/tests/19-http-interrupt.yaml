@@ -1,0 +1,109 @@
+name: "HTTP API Interrupt endpoint"
+description: |
+  Verify POST /sessions/:id/interrupt behaves correctly:
+    - Returns 200 + JSON {"interrupted": true/false} for a valid session
+      (even when no agent run is currently active).
+    - Returns 404 for a non-existent session.
+
+  No LLM turn is executed; this purely exercises the interrupt route
+  contract added in Goal 170.
+sequential: true
+
+setup:
+  - name: "Kill any leftover server on port 9093"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9093' 2>/dev/null || true
+        sleep 1
+        echo cleaned
+
+  - name: "Reset state files"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -f /tmp/intr-sid /tmp/intr-http.log && echo reset
+
+  - name: "Start HTTP server on port 9093"
+    exec:
+      container: recursive-e2e
+      command: |
+        nohup recursive \
+          --api-base http://aimock:4010/v1 \
+          --api-key mock-key -m mock-chat \
+          http --addr 0.0.0.0:9093 \
+          > /tmp/intr-http.log 2>&1 &
+        sleep 2
+        echo started
+
+  - name: "Sanity: GET /health returns ok"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9093/health
+    expect:
+      exitCode: 0
+      output:
+        contains: "ok"
+
+  - name: "Create session, save id to /tmp/intr-sid"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf -X POST http://localhost:9093/sessions
+        -H 'Content-Type: application/json'
+        -d '{"system_prompt":"You are a test assistant."}'
+        | jq -r .id > /tmp/intr-sid
+        && echo created=$(cat /tmp/intr-sid)
+    expect:
+      exitCode: 0
+      output:
+        contains: "created="
+
+cases:
+  - name: "POST /sessions/:id/interrupt returns 200 for a valid session"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/intr-sid)
+        && curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9093/sessions/$SID/interrupt
+        -H 'Content-Type: application/json'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=200"
+
+  - name: "POST /sessions/:id/interrupt response contains interrupted field"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/intr-sid)
+        && curl -sf -X POST http://localhost:9093/sessions/$SID/interrupt
+        -H 'Content-Type: application/json'
+    expect:
+      exitCode: 0
+      output:
+        contains: "interrupted"
+
+  - name: "POST /sessions/nonexistent/interrupt returns 404"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9093/sessions/no-such-session-xyz/interrupt
+        -H 'Content-Type: application/json'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=404"
+
+teardown:
+  - name: "Stop HTTP server on 9093 and clean up"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9093' 2>/dev/null || true
+        rm -f /tmp/intr-sid /tmp/intr-http.log
+        echo stopped

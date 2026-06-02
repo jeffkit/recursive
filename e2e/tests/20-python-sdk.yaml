@@ -1,0 +1,110 @@
+name: "Python SDK smoke test"
+description: |
+  Verify the Python SDK (recursive-sdk) works end-to-end against the
+  HTTP server:
+    - Agent.create() opens a session
+    - agent.send() returns a Run
+    - run.wait() returns RunResult with all Phase-A fields populated:
+        status, result (concatenated assistant text), num_turns, duration_ms
+
+  Requires python3 + recursive-sdk to be installed in the e2e container.
+  The Dockerfile installs the SDK from /sdk/python using pip.
+sequential: true
+
+setup:
+  - name: "Kill any leftover server on port 9095"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9095' 2>/dev/null || true
+        sleep 1
+        echo cleaned
+
+  - name: "Reset state files"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -f /tmp/sdk-result.txt /tmp/sdk-http.log && echo reset
+
+  - name: "Start HTTP server on port 9095"
+    exec:
+      container: recursive-e2e
+      command: |
+        nohup recursive \
+          --api-base http://aimock:4010/v1 \
+          --api-key mock-key -m mock-chat \
+          http --addr 0.0.0.0:9095 \
+          > /tmp/sdk-http.log 2>&1 &
+        sleep 2
+        echo started
+
+  - name: "Sanity: GET /health returns ok"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9095/health
+    expect:
+      exitCode: 0
+      output:
+        contains: "ok"
+
+  - name: "Run Python SDK test script, save result to /tmp/sdk-result.txt"
+    exec:
+      container: recursive-e2e
+      command: |
+        python3 - <<'PYEOF' > /tmp/sdk-result.txt
+        from recursive_sdk import Agent
+        with Agent.create(base_url='http://localhost:9095', api_key='test') as agent:
+            run = agent.send('sdk-python-hello')
+            result = run.wait()
+            print('status=' + str(result.status))
+            print('has_result=' + str(result.result is not None))
+            print('num_turns=' + str(result.num_turns))
+            print('has_duration=' + str(result.duration_ms is not None and result.duration_ms >= 0))
+        PYEOF
+        cat /tmp/sdk-result.txt
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "status=finished"
+          - "has_result=True"
+
+cases:
+  - name: "Python SDK RunResult status is finished"
+    file:
+      container: recursive-e2e
+      path: /tmp/sdk-result.txt
+      exists: true
+      contains: "status=finished"
+
+  - name: "Python SDK RunResult has non-null result field"
+    file:
+      container: recursive-e2e
+      path: /tmp/sdk-result.txt
+      exists: true
+      contains: "has_result=True"
+
+  - name: "Python SDK RunResult has num_turns >= 1"
+    file:
+      container: recursive-e2e
+      path: /tmp/sdk-result.txt
+      exists: true
+      contains: "num_turns=1"
+
+  - name: "Python SDK RunResult has duration_ms populated"
+    file:
+      container: recursive-e2e
+      path: /tmp/sdk-result.txt
+      exists: true
+      contains: "has_duration=True"
+
+teardown:
+  - name: "Stop HTTP server on 9095 and clean up"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9095' 2>/dev/null || true
+        rm -f /tmp/sdk-result.txt /tmp/sdk-http.log
+        echo stopped
