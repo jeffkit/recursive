@@ -113,6 +113,7 @@ pub use storage::{
 pub use tool_set_provider::{
     LocalToolSetProvider, PolicyToolSetProvider, SandboxMode, ToolSetProvider,
 };
+pub use tools::policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
     PlanApprovalGate, PlanApprovalResult, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch,

@@ -143,6 +143,8 @@ pub mod checkpoint;
 pub mod docker_provider;
 #[cfg(feature = "cloud-runtime")]
 pub mod docker_sandbox;
+#[cfg(feature = "e2b-sandbox")]
+pub mod e2b_provider;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
