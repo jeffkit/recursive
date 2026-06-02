@@ -103,11 +103,13 @@ trap 'rm -f "$SYSPROMPT_FILE"' EXIT
     # bounded. Earlier 3-entry context blew past MiniMax's response-length
     # budget on multi-step goals and the LLM truncated at step 1.
     echo "=== Most recent journal entry ==="
-    ls -1t "$DEV_DIR/journal"/*.md 2>/dev/null | head -1 | while read -r f; do
-      echo "--- $(basename "$f") ---"
-      cat "$f"
+    local latest
+    latest="$(ls -1t "$DEV_DIR/journal"/*.md 2>/dev/null | head -1 || true)"
+    if [[ -n "$latest" ]]; then
+      echo "--- $(basename "$latest") ---"
+      cat "$latest"
       echo ""
-    done
+    fi
   fi
 } > "$SYSPROMPT_FILE"
 
