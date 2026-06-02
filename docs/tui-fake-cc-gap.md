@@ -291,7 +291,7 @@ Recursive 是 ⛔，详见末节），重点在每类的 ✅/🔴 决断。
 
 | 命令 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| `/resume` | 是（`src/screens/ResumeConversation.tsx`） | 否 | 🔴 | 候选下一期；建议路径：先做 session 磁盘存储，再加 Resume picker modal |
+| `/resume` | 是（`src/screens/ResumeConversation.tsx`） | 是 | ✅ | Goal-171 落地：`/resume` 命令弹 `Modal::ResumePicker`，↑/↓ 选择历史 session，Enter 加载 transcript（`src/tui/commands.rs`, `src/tui/ui/modal.rs`） |
 | `/session` | 是（按 ID 切换） | 否 | 🔴 | 同上前置 |
 | `/rewind` | 是（runtime 已支持，TUI 未集成） | 🟡 | 🟡 | 候选；Recursive runtime 有 checkpoint snapshot（`recursive sessions rewind` 命令），TUI 未做 picker |
 | `/share` | 是（拷贝公开链接） | 否 | 🔴 | 候选；先依赖 session 持久化 |
@@ -437,7 +437,7 @@ ui/modal.rs:43-71`）。
 | Vim text input（`VimTextInput.tsx`） | 是 | 否 | 🔴 | 同上 |
 | @file 自动补全 | 是 | 否 | 🔴 | 候选；建议路径：扩展 InputMode 触发字符到 `@`，glob 工作区文件，复用 CommandRegistry::search 的实现风格 |
 | @symbol 补全（LSP） | 是（`LspRecommendation`） | 否 | 🔴 | 候选；前置 LSP 集成 |
-| Resume conversation | 是（`src/screens/ResumeConversation.tsx`） | 否 | 🔴 | 候选下一期；建议路径：(1) session 磁盘存储；(2) Resume picker modal。runtime 已有 checkpoint snapshot 链可作为模型 |
+| Resume conversation | 是（`src/screens/ResumeConversation.tsx`） | 是 | ✅ | Goal-171 落地：`Modal::ResumePicker` + `/resume` 命令，`SessionReader::list_sessions_sorted_by_updated_at` 驱动列表 |
 | Conversation fork / branch | 是 | 否 | 🔴 | 候选；前置 session 持久化 |
 | Rewind to checkpoint | 是 | 🟡（runtime 支持，TUI 未集成） | 🟡 | runtime 通过 `recursive sessions rewind <session-id> --to-turn N` 支持（参考 `AGENTS.md` 提到的 `checkpoint_list` / `checkpoint_diff`），TUI 缺 picker |
 | Multi-agent / swarm 视图 | 是（`AgentProgressLine.tsx`、`coordinator/`） | 否 | ⛔ | 不在 Recursive 单 agent 定位内 |
@@ -474,12 +474,9 @@ ui/modal.rs:43-71`）。
 下面按"对终端 Agent 体验提升 / 实现成本 / 是否符合定位"打分排序。
 "高 / 低 / 中"指**主观工程感受**，不是承诺。
 
-1. **Resume / 会话持久化**（高价值 / 中成本）
-   - 落地路径：(1) 把 `recursive_agent::AgentRuntime` 的 transcript +
-     usage + checkpoint 链落地到 `~/.recursive/sessions/<id>/`；
-     (2) TUI 启动时扫描，加 `Modal::ResumePicker`；(3) `/resume` 命令
-     与 ↑ picker 复用。预估 2 个 goal（持久化 + UI）。
-   - 解锁：`/share`、`/fork`、历史持久化、`/rewind` picker。
+1. ~~**Resume / 会话持久化**（高价值 / 中成本）~~ ✅ **Goal-171 已落地**
+   - `/resume` 命令 + `Modal::ResumePicker` + `SessionReader` 集成完成。
+   - 剩余解锁：`/share`、`/fork`、历史持久化、`/rewind` picker。
 
 2. **@file 自动补全**（高 / 低）
    - 落地路径：扩展 `InputMode` 触发字符到 `@`，buf 非空时弹文件 glob
