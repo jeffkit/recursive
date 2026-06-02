@@ -240,3 +240,26 @@ describe("Agent.listSessions", () => {
     expect(sessions[0]!.lastPrompt).toBe("hello");
   });
 });
+
+// ── Agent.forkSession ────────────────────────────────────────────────────
+
+describe("Agent.forkSession", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("calls POST /sessions/:id/fork and returns SessionInfo", async () => {
+    const postSpy = vi.spyOn(HttpClient.prototype, "post").mockResolvedValue({
+      id: "forked-id",
+      created_at: "2026-06-02T12:00:00Z",
+      message_count: 5,
+    });
+
+    const result = await Agent.forkSession("src-id", {
+      baseUrl: "http://localhost:3000",
+    });
+
+    expect(postSpy).toHaveBeenCalledWith("/sessions/src-id/fork", {});
+    expect(result.id).toBe("forked-id");
+    expect(result.createdAt).toBe("2026-06-02T12:00:00Z");
+    expect(result.messageCount).toBe(5);
+  });
+});

@@ -734,6 +734,8 @@ pub fn build_router_with_auth_and_rate_limit(
         )
         // Goal-170: interrupt the current agent turn.
         .route("/sessions/{id}/interrupt", post(session_interrupt))
+        // SDK Phase C: fork a session.
+        .route("/sessions/{id}/fork", post(fork_session))
         // Goal-169: slash commands listing.
         .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
@@ -1519,6 +1521,77 @@ async fn patch_session(
         message_count: 0, // omitted in patch response; caller can re-fetch if needed
         title: session.title.clone(),
     }))
+}
+
+// ── Fork session ─────────────────────────────────────────────────────────
+
+/// Response for `POST /sessions/:id/fork`.
+#[derive(serde::Serialize)]
+struct ForkSessionResponse {
+    /// ID of the newly created forked session.
+    id: String,
+    /// Timestamp when the fork was created.
+    created_at: String,
+    /// Number of messages copied from the source session.
+    message_count: usize,
+}
+
+/// POST /sessions/:id/fork — fork a session, copying its transcript.
+///
+/// Creates a new session with the same transcript as the source session.
+/// The forked session is independent: subsequent messages do not affect the
+/// original.
+///
+/// Returns the new session's ID and metadata.
+async fn fork_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ForkSessionResponse>), StatusCode> {
+    // Snapshot the source transcript while holding the write lock.
+    let transcript_snapshot = {
+        let sessions = state.sessions.read().await;
+        let src = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+        let rt = src.runtime.try_lock().map_err(|_| StatusCode::CONFLICT)?;
+        rt.transcript().to_vec()
+    };
+
+    let message_count = transcript_snapshot.len();
+
+    // Build a new session with the copied transcript.
+    let new_id = generate_session_id();
+    let created_at = format_timestamp(SystemTime::now());
+    let system_prompt = state.config.system_prompt.clone();
+
+    let mut runtime = AgentRuntimeBuilder::new()
+        .llm(state.provider.clone())
+        .tools(state.tool_registry.clone())
+        .system_prompt(system_prompt)
+        .max_steps(state.config.max_steps)
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    runtime.set_transcript(transcript_snapshot);
+
+    let plan_approval_gate = runtime.plan_approval_gate();
+    let session = SessionState {
+        id: new_id.clone(),
+        created_at: created_at.clone(),
+        title: None,
+        runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+        plan_approval_gate,
+        interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+
+    state.sessions.write().await.insert(new_id.clone(), session);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ForkSessionResponse {
+            id: new_id,
+            created_at,
+            message_count,
+        }),
+    ))
 }
 
 // ── Plan-approval endpoints ───────────────────────────────────────────────
