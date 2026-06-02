@@ -2777,4 +2777,68 @@ mod http_tests {
         assert_eq!(arr[0]["argument_hint"], "<env>");
         assert_eq!(arr[1]["name"], "rollback");
     }
+
+    // ── fork_session ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fork_session_returns_201_with_new_id() {
+        let state = sample_state();
+        let app = build_router(state.clone());
+
+        // Create the source session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let src: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let src_id = src["id"].as_str().unwrap().to_string();
+
+        // Fork it.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{src_id}/fork"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let fork: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let fork_id = fork["id"].as_str().unwrap();
+        assert!(!fork_id.is_empty(), "fork id should be non-empty");
+        assert_ne!(fork_id, src_id, "fork id must differ from source");
+        // message_count reflects the source transcript at fork time (may include system init)
+        assert!(fork["message_count"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn fork_session_returns_404_for_missing_session() {
+        let state = sample_state();
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent/fork")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
 }

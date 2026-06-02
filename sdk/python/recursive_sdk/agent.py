@@ -358,6 +358,33 @@ class Agent:
         http.close()
 
     @staticmethod
+    def fork_session(
+        session_id: str,
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> "SessionInfo":
+        """Fork a session, copying its transcript to a new independent session.
+
+        Calls ``POST /sessions/:id/fork`` and returns a
+        :class:`~recursive_sdk.models.SessionInfo` for the newly created session.
+
+        Example::
+
+            forked = Agent.fork_session(session_id)
+            print(forked.id, forked.message_count)
+        """
+        http = _make_client(base_url, api_key)
+        resp = http.post(f"/sessions/{session_id}/fork", {})
+        data = resp.json()
+        http.close()
+        return SessionInfo(
+            id=data["id"],
+            created_at=data.get("created_at", ""),
+            message_count=data.get("message_count", 0),
+        )
+
+    @staticmethod
     def delete_session(
         session_id: str,
         *,

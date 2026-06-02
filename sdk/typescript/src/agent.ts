@@ -280,6 +280,33 @@ export class Agent {
     return (data["messages"] as Record<string, unknown>[] | undefined) ?? [];
   }
 
+  /**
+   * Fork a session, copying its transcript to a new independent session.
+   *
+   * Calls `POST /sessions/:id/fork` and returns a `SessionInfo` for the
+   * newly created session.
+   *
+   * ```ts
+   * const forked = await Agent.forkSession(sessionId);
+   * console.log(forked.id, forked.messageCount);
+   * ```
+   */
+  static async forkSession(
+    sessionId: string,
+    options: AgentOptions = {},
+  ): Promise<SessionInfo> {
+    const http = makeClient(options);
+    const data = (await http.post(`/sessions/${sessionId}/fork`, {})) as Record<
+      string,
+      unknown
+    >;
+    return {
+      id: String(data["id"]),
+      createdAt: String(data["created_at"] ?? ""),
+      messageCount: Number(data["message_count"] ?? 0),
+    };
+  }
+
   /** Delete a session by ID. */
   static async deleteSession(
     sessionId: string,
