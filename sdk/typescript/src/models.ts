@@ -136,6 +136,8 @@ export interface SessionInfo {
   lastPrompt?: string;
   firstPrompt?: string;
   goal?: string;
+  /** Optional human-readable title, set via `Agent.renameSession()`. */
+  title?: string;
 }
 
 // ── Tool info (Goal-169 / /tools) ─────────────────────────────────────────
@@ -158,11 +160,17 @@ export interface ToolInfo {
 export interface SessionDetail {
   id: string;
   createdAt: string;
+  /** Optional human-readable title. */
+  title?: string;
   messages: unknown[];
   status: string;
   pendingPlan?: string;
   goal?: GoalState;
   todos?: unknown[];
+  /** First user message in the session. */
+  firstPrompt?: string;
+  /** Most recent user message in the session. */
+  lastPrompt?: string;
 }
 
 // ── Plan Mode 2.0 (g165–167) ──────────────────────────────────────────────

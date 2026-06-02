@@ -36,6 +36,11 @@ export class HttpClient {
     return resp.json();
   }
 
+  async patch(path: string, body: unknown): Promise<unknown> {
+    const resp = await this._fetch("PATCH", path, body);
+    return resp.json();
+  }
+
   async delete(path: string): Promise<void> {
     await this._fetch("DELETE", path);
   }

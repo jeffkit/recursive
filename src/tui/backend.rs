@@ -420,6 +420,35 @@ async fn worker_loop(
                 }
             }
 
+            // Goal-173: list MCP servers.
+            UserAction::ListMcpServers => {
+                let workspace = resolve_workspace_root();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let servers = crate::mcp::discover_mcp_servers(&workspace)
+                        .await
+                        .unwrap_or_default();
+                    let entries: Vec<crate::tui::ui::modal::McpEntry> = servers
+                        .iter()
+                        .map(|s| {
+                            let transport = if s.url.is_some() {
+                                "http".to_string()
+                            } else if !s.command.is_empty() {
+                                "stdio".to_string()
+                            } else {
+                                "unknown".to_string()
+                            };
+                            crate::tui::ui::modal::McpEntry {
+                                name: s.name.clone(),
+                                transport,
+                                enabled: true,
+                            }
+                        })
+                        .collect();
+                    let _ = tx.send(UiEvent::McpServersLoaded { entries });
+                });
+            }
+
             // Goal-169: run an already-expanded skill prompt.
             UserAction::RunSkillPrompt { prompt } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {

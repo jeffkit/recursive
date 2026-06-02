@@ -302,12 +302,28 @@ class Agent:
     @staticmethod
     def list_sessions(
         *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> List[SessionInfo]:
-        """Return a list of active sessions."""
+        """Return a list of active sessions.
+
+        Args:
+            limit: Maximum number of sessions to return (default: all).
+            offset: Number of sessions to skip (default: 0).
+        """
         http = _make_client(base_url, api_key)
-        resp = http.get("/sessions")
+        params: dict = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        url = "/sessions"
+        if params:
+            from urllib.parse import urlencode
+            url = f"/sessions?{urlencode(params)}"
+        resp = http.get(url)
         return [
             SessionInfo(
                 id=s["id"],
@@ -319,6 +335,27 @@ class Agent:
             )
             for s in resp.json()
         ]
+
+    @staticmethod
+    def rename_session(
+        session_id: str,
+        title: str,
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        """Set a human-readable title for a session.
+
+        Calls ``PATCH /sessions/:id`` with ``{"title": title}``.
+        Pass an empty string to clear the title.
+
+        Args:
+            session_id: Target session ID.
+            title: New display title (pass ``""`` to clear).
+        """
+        http = _make_client(base_url, api_key)
+        http.patch(f"/sessions/{session_id}", {"title": title})
+        http.close()
 
     @staticmethod
     def delete_session(

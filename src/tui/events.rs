@@ -100,6 +100,12 @@ pub enum UiEvent {
         session_id: String,
         turn_count: usize,
     },
+
+    // ── Goal-173: MCP server list ────────────────────────────────────────────
+    /// MCP server list loaded from the workspace config.
+    McpServersLoaded {
+        entries: Vec<crate::tui::ui::modal::McpEntry>,
+    },
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
@@ -179,4 +185,8 @@ pub enum UserAction {
         /// The session directory path (absolute).
         session_dir: std::path::PathBuf,
     },
+
+    // ── Goal-173: MCP server list ────────────────────────────────────────────
+    /// List configured MCP servers.
+    ListMcpServers,
 }

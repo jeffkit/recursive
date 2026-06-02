@@ -76,6 +76,10 @@ var HttpClient = class {
     const resp = await this._fetch("POST", path, body);
     return resp.json();
   }
+  async patch(path, body) {
+    const resp = await this._fetch("PATCH", path, body);
+    return resp.json();
+  }
   async delete(path) {
     await this._fetch("DELETE", path);
   }
@@ -495,18 +499,38 @@ var Agent = class {
       ok: status === "finished"
     };
   }
-  /** List active sessions. */
-  static async listSessions(options = {}) {
+  /**
+   * List active sessions, with optional pagination.
+   *
+   * @param pagination - Optional `limit` and `offset` query params.
+   * @param options - Connection options.
+   */
+  static async listSessions(pagination = {}, options = {}) {
     const http = makeClient(options);
-    const data = await http.get("/sessions");
+    const params = new URLSearchParams();
+    if (pagination.limit != null) params.set("limit", String(pagination.limit));
+    if (pagination.offset != null) params.set("offset", String(pagination.offset));
+    const url = params.size > 0 ? `/sessions?${params}` : "/sessions";
+    const data = await http.get(url);
     return data.map((s) => ({
       id: String(s["id"]),
       createdAt: String(s["created_at"] ?? ""),
       messageCount: Number(s["message_count"] ?? 0),
       lastPrompt: s["last_prompt"],
       firstPrompt: s["first_prompt"],
-      goal: s["goal"]
+      goal: s["goal"],
+      title: s["title"]
     }));
+  }
+  /**
+   * Set a human-readable title for a session.
+   *
+   * Calls `PATCH /sessions/:id` with `{"title": title}`.
+   * Pass an empty string to clear the title.
+   */
+  static async renameSession(sessionId, title, options = {}) {
+    const http = makeClient(options);
+    await http.patch(`/sessions/${sessionId}`, { title });
   }
   /** Delete a session by ID. */
   static async deleteSession(sessionId, options = {}) {

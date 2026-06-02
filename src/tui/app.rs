@@ -1467,6 +1467,12 @@ impl App {
                 self.turn.finish();
                 self.pending_latency_ms = None;
             }
+            UiEvent::McpServersLoaded { entries } => {
+                self.modals.push(crate::tui::ui::modal::Modal::McpServers {
+                    entries,
+                    selected: 0,
+                });
+            }
             UiEvent::SessionResumed {
                 session_id,
                 turn_count,
@@ -1863,6 +1869,11 @@ impl App {
             return self.handle_resume_picker_key(key);
         }
 
+        // Goal-173: McpServers owns ↑/↓/Esc.
+        if let Some(Modal::McpServers { .. }) = self.modals.last() {
+            return self.handle_mcp_servers_key(key);
+        }
+
         // Generic modal dispatch (Goal 146).
         self.handle_modal_key(key);
         None
@@ -1935,6 +1946,34 @@ impl App {
                     }
                 }
                 self.modals.pop();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Goal-173: dispatch a key against an active `Modal::McpServers`.
+    fn handle_mcp_servers_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        use crate::tui::ui::modal::Modal;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.modals.pop();
+                None
+            }
+            KeyCode::Up => {
+                if let Some(Modal::McpServers { selected, .. }) = self.modals.last_mut() {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    }
+                }
+                None
+            }
+            KeyCode::Down => {
+                if let Some(Modal::McpServers { entries, selected }) = self.modals.last_mut() {
+                    if *selected + 1 < entries.len() {
+                        *selected += 1;
+                    }
+                }
                 None
             }
             _ => None,

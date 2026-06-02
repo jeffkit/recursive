@@ -175,6 +175,14 @@ impl CommandRegistry {
                     usage: "/resume",
                     handler: CommandHandler::Sync(cmd_resume),
                 },
+                // Goal-173: MCP server list.
+                CommandSpec {
+                    name: "mcp",
+                    aliases: &[],
+                    summary: "List configured MCP servers",
+                    usage: "/mcp",
+                    handler: CommandHandler::Async(cmd_mcp),
+                },
             ],
             skill_commands: Vec::new(),
         }
@@ -451,6 +459,10 @@ fn cmd_resume(app: &mut AppState, _args: &[String]) -> CommandOutcome {
     }
 }
 
+fn cmd_mcp(_app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
+    vec![UserAction::ListMcpServers]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +491,14 @@ mod tests {
     }
 
     #[test]
+    fn cmd_mcp_is_registered() {
+        let r = CommandRegistry::default_set();
+        assert!(r.lookup("mcp").is_some(), "/mcp should be registered");
+        let spec = r.lookup("mcp").unwrap();
+        assert!(matches!(spec.handler, CommandHandler::Async(_)));
+    }
+
+    #[test]
     fn registry_finds_help_by_name_and_alias() {
         let r = CommandRegistry::default_set();
         assert!(r.lookup("help").is_some());
@@ -490,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_includes_all_thirteen_commands() {
+    fn registry_includes_all_fourteen_commands() {
         let r = CommandRegistry::default_set();
         let names: Vec<&str> = r.commands().iter().map(|c| c.name).collect();
         for expected in &[
@@ -506,14 +526,15 @@ mod tests {
             "exit",
             "permissions",
             "goal",
+            "mcp",
         ] {
             assert!(
                 names.contains(expected),
                 "missing /{expected}: have {names:?}"
             );
         }
-        // 11 built-in commands plus /goal and /resume = 13.
-        assert_eq!(names.len(), 13);
+        // 11 built-in commands plus /goal, /resume, and /mcp = 14.
+        assert_eq!(names.len(), 14);
     }
 
     #[test]
@@ -527,7 +548,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 13);
+        assert_eq!(hits.len(), 14);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();

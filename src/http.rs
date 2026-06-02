@@ -437,6 +437,8 @@ async fn rate_limit_middleware(
 pub struct SessionState {
     pub id: String,
     pub created_at: String,
+    /// Optional human-readable title, settable via `PATCH /sessions/:id`.
+    pub title: Option<String>,
     /// Runtime is wrapped in a per-session Mutex so concurrent HTTP requests
     /// for the same session are serialized without blocking the global lock.
     pub runtime: Arc<tokio::sync::Mutex<AgentRuntime>>,
@@ -457,6 +459,9 @@ pub struct SessionInfo {
     pub id: String,
     pub created_at: String,
     pub message_count: usize,
+    /// Optional human-readable title, set via `PATCH /sessions/:id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Request body for `POST /sessions`.
@@ -490,6 +495,9 @@ pub struct SessionMessageResponse {
 pub struct SessionDetailResponse {
     pub id: String,
     pub created_at: String,
+    /// Optional human-readable title (set via `PATCH /sessions/:id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub messages: Vec<serde_json::Value>,
     /// Goal-167: current task list as maintained by `todo_write` calls.
     pub todos: Vec<crate::tools::todo::TodoItem>,
@@ -499,6 +507,12 @@ pub struct SessionDetailResponse {
     pub pending_plan: Option<String>,
     /// Goal-168: active goal state, or `null` when no goal is set.
     pub goal: Option<crate::runtime::GoalState>,
+    /// First user message in the session (for quick display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+    /// Most recent user message in the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 // ── Goal-168: goal endpoint types ────────────────────────────────────────
@@ -707,6 +721,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}", axum::routing::delete(delete_session))
+        .route("/sessions/{id}", axum::routing::patch(patch_session))
         .route("/sessions/{id}/messages", post(send_session_message))
         .route("/sessions/{id}/events", get(session_events))
         .route("/sessions/{id}/plan/confirm", post(session_plan_confirm))
@@ -1325,6 +1340,7 @@ async fn create_session(
     let session = SessionState {
         id: id.clone(),
         created_at: created_at.clone(),
+        title: None,
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1338,8 +1354,22 @@ async fn create_session(
     ))
 }
 
-/// GET /sessions — list all sessions.
-async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionInfo>> {
+/// Query parameters for `GET /sessions`.
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct ListSessionsQuery {
+    /// Maximum number of sessions to return (default: all).
+    pub limit: Option<usize>,
+    /// Number of sessions to skip before returning results (default: 0).
+    pub offset: Option<usize>,
+}
+
+/// GET /sessions — list all sessions, with optional `limit` and `offset` pagination.
+///
+/// Example: `GET /sessions?limit=10&offset=20`
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ListSessionsQuery>,
+) -> Json<Vec<SessionInfo>> {
     let sessions = state.sessions.read().await;
     let mut infos = Vec::with_capacity(sessions.len());
     for s in sessions.values() {
@@ -1356,9 +1386,17 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionIn
             id: s.id.clone(),
             created_at: s.created_at.clone(),
             message_count,
+            title: s.title.clone(),
         });
     }
-    Json(infos)
+    // Apply offset + limit pagination.
+    let offset = params.offset.unwrap_or(0);
+    let page: Vec<SessionInfo> = infos
+        .into_iter()
+        .skip(offset)
+        .take(params.limit.unwrap_or(usize::MAX))
+        .collect();
+    Json(page)
 }
 
 /// GET /sessions/:id — get session detail with messages.
@@ -1403,14 +1441,34 @@ async fn get_session(
         Err(_) => (vec![], vec![], None),
     };
 
+    // Extract first/last user prompt for display without a separate lock.
+    let (first_prompt, last_prompt) = {
+        let user_msgs: Vec<String> = messages
+            .iter()
+            .filter_map(|m| {
+                if m.get("role")?.as_str()? == "user" {
+                    m.get("content")?.as_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let first = user_msgs.first().cloned();
+        let last = user_msgs.last().cloned();
+        (first, last)
+    };
+
     Ok(Json(SessionDetailResponse {
         id: session.id.clone(),
         created_at: session.created_at.clone(),
+        title: session.title.clone(),
         messages,
         todos,
         status,
         pending_plan,
         goal,
+        first_prompt,
+        last_prompt,
     }))
 }
 
@@ -1422,6 +1480,45 @@ async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<Strin
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+// ── Session patch endpoint (rename) ──────────────────────────────────────
+
+/// Request body for `PATCH /sessions/:id` — update mutable session fields.
+#[derive(serde::Deserialize, Debug)]
+struct PatchSessionRequest {
+    /// Optional new title for the session.
+    title: Option<String>,
+}
+
+/// PATCH /sessions/:id — update mutable session metadata.
+///
+/// Currently supports setting/clearing the `title` field.
+///
+/// Example:
+/// ```text
+/// PATCH /sessions/abc123
+/// {"title": "Fix login bug"}
+/// ```
+async fn patch_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchSessionRequest>,
+) -> Result<Json<SessionInfo>, StatusCode> {
+    let mut sessions = state.sessions.write().await;
+    let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+
+    if let Some(title) = body.title {
+        session.title = if title.is_empty() { None } else { Some(title) };
+    }
+
+    // Build response without taking the runtime lock (message_count is approximate here).
+    Ok(Json(SessionInfo {
+        id: session.id.clone(),
+        created_at: session.created_at.clone(),
+        message_count: 0, // omitted in patch response; caller can re-fetch if needed
+        title: session.title.clone(),
+    }))
 }
 
 // ── Plan-approval endpoints ───────────────────────────────────────────────

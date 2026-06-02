@@ -510,9 +510,16 @@ impl<'a> RunCore<'a> {
 
         let mut i = 0;
         while i < pending.len() {
-            if self.tools.is_readonly(&pending[i].name) {
+            if self
+                .tools
+                .is_readonly_for_call(&pending[i].name, &pending[i].args)
+            {
                 let batch_start = i;
-                while i < pending.len() && self.tools.is_readonly(&pending[i].name) {
+                while i < pending.len()
+                    && self
+                        .tools
+                        .is_readonly_for_call(&pending[i].name, &pending[i].args)
+                {
                     i += 1;
                 }
                 let batch: Vec<PendingCall> = pending.drain(batch_start..i).collect();
@@ -1060,10 +1067,17 @@ impl Agent {
         // Second pass: execute read-only calls in parallel, write calls sequentially.
         let mut i = 0;
         while i < pending.len() {
-            if self.tools.is_readonly(&pending[i].name) {
-                // Batch consecutive read-only calls
+            if self
+                .tools
+                .is_readonly_for_call(&pending[i].name, &pending[i].args)
+            {
+                // Batch consecutive read-only calls (including explore sub-agents)
                 let batch_start = i;
-                while i < pending.len() && self.tools.is_readonly(&pending[i].name) {
+                while i < pending.len()
+                    && self
+                        .tools
+                        .is_readonly_for_call(&pending[i].name, &pending[i].args)
+                {
                     i += 1;
                 }
                 let batch: Vec<PendingCall> = pending.drain(batch_start..i).collect();

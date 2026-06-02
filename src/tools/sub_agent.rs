@@ -8,6 +8,15 @@
 //! default 2) prevents unbounded nesting. Each nested invocation increments
 //! a counter; when the limit is reached, the tool returns an error string
 //! instead of spawning.
+//!
+//! # Agent types (`subagent_type`)
+//!
+//! Inspired by fake-cc's `AgentTool`, this tool accepts an optional
+//! `subagent_type` parameter that selects a named agent personality:
+//!
+//! - `"explore"`: read-only tools only; declared [`ReadOnly`](crate::tools::ToolSideEffect::ReadOnly)
+//!   so the dispatch layer can run multiple explore sub-agents **in parallel**.
+//! - `"general_purpose"` (default): full tool access; declared `External`.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -20,6 +29,68 @@ use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::tools::{Tool, ToolRegistry};
+
+// ---------------------------------------------------------------------------
+// AgentType — named sub-agent personality
+// ---------------------------------------------------------------------------
+
+/// Named sub-agent personality, aligned with fake-cc's `subagent_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentType {
+    /// Read-only exploration agent. Restricts tool access to read-only tools.
+    /// Declared `ReadOnly` so the parallel-dispatch layer can run multiple
+    /// explore sub-agents concurrently.
+    Explore,
+    /// General-purpose agent with access to the full (parent-provided) tool
+    /// registry. Declared `External` (the conservative default).
+    GeneralPurpose,
+}
+
+impl AgentType {
+    /// Parse from the `subagent_type` JSON string.
+    /// Returns `None` for unknown values (caller falls back to `GeneralPurpose`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "explore" => Some(Self::Explore),
+            "general_purpose" => Some(Self::GeneralPurpose),
+            _ => None,
+        }
+    }
+
+    /// `true` for agent types that only read, never write.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Explore)
+    }
+
+    /// System prompt fragment to prepend for this agent type.
+    pub fn system_prompt_hint(self) -> &'static str {
+        match self {
+            Self::Explore => {
+                "You are an exploration sub-agent. Use only read tools to gather \
+                 information. Do NOT write or modify files. Be thorough and concise."
+            }
+            Self::GeneralPurpose => {
+                "You are a focused sub-agent. Complete the given task using the \
+                 available tools. Be concise."
+            }
+        }
+    }
+
+    /// Restricted tool names for this agent type, or `None` for "use caller-supplied list".
+    pub fn allowed_tool_names(self) -> Option<Vec<String>> {
+        match self {
+            Self::Explore => Some(vec![
+                "read_file".to_string(),
+                "list_dir".to_string(),
+                "search_files".to_string(),
+                "recall".to_string(),
+                "web_fetch".to_string(),
+                "sub_agent".to_string(),
+            ]),
+            Self::GeneralPurpose => None,
+        }
+    }
+}
 
 /// The sub-agent tool.
 ///
@@ -93,6 +164,11 @@ impl Tool for SubAgent {
                         "type": "string",
                         "description": "The goal / prompt for the sub-agent"
                     },
+                    "subagent_type": {
+                        "type": "string",
+                        "enum": ["explore", "general_purpose"],
+                        "description": "Agent personality. 'explore': read-only tools only, can run in parallel with other explore agents. 'general_purpose' (default): full tool access, runs sequentially."
+                    },
                     "max_steps": {
                         "type": "integer",
                         "description": "Maximum steps for the sub-agent (default 30, capped at parent's remaining budget)",
@@ -101,12 +177,23 @@ impl Tool for SubAgent {
                     "tools": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of tool names to make available to the sub-agent. Default: read_file, list_dir, search_files, web_fetch"
+                        "description": "Optional list of tool names to make available to the sub-agent. Ignored when subagent_type is 'explore' (which enforces its own read-only tool set). Default: read_file, list_dir, search_files, web_fetch"
                     }
                 },
                 "required": ["prompt"]
             }),
         }
+    }
+
+    /// Returns `true` when `subagent_type` is `"explore"`, making the dispatch
+    /// layer treat this call as read-only and eligible for parallel execution.
+    fn is_readonly_for_args(&self, arguments: &serde_json::Value) -> bool {
+        arguments
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .and_then(AgentType::parse)
+            .map(AgentType::is_read_only)
+            .unwrap_or(false)
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {
@@ -117,16 +204,29 @@ impl Tool for SubAgent {
                 message: "missing required parameter: prompt".to_string(),
             })?;
 
+        // Resolve agent type (defaults to GeneralPurpose if absent or unknown).
+        let agent_type = arguments
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .and_then(AgentType::parse)
+            .unwrap_or(AgentType::GeneralPurpose);
+
         let max_steps = arguments["max_steps"].as_i64().unwrap_or(30).clamp(1, 100) as usize;
 
-        let tool_names: Vec<String> = arguments["tools"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_else(Self::default_tool_names);
+        // Tool list: explore type enforces its own read-only set;
+        // general_purpose respects the caller-supplied list or the default.
+        let tool_names: Vec<String> = if let Some(forced) = agent_type.allowed_tool_names() {
+            forced
+        } else {
+            arguments["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_else(Self::default_tool_names)
+        };
 
         // Depth limit check
         if self.current_depth >= self.max_depth {
@@ -164,7 +264,7 @@ impl Tool for SubAgent {
 
         let ctx = TurnContext {
             messages: vec![
-                Message::system("You are a focused sub-agent. Complete the given task using the available tools. Be concise.".to_string()),
+                Message::system(agent_type.system_prompt_hint().to_string()),
                 Message::user(prompt.to_string()),
             ],
             event_sink: Some(Box::new(NullSink)),
@@ -437,5 +537,108 @@ mod tests {
         // (as a tool result), not in the final message. The depth limit
         // was enforced: the grandchild could not spawn deeper.
         // This test verifies the nesting works without panicking.
+    }
+
+    // ── AgentType & is_readonly_for_args tests (Goal 175) ─────────────────
+
+    #[test]
+    fn explore_agent_type_is_read_only() {
+        assert!(AgentType::Explore.is_read_only());
+        assert!(!AgentType::GeneralPurpose.is_read_only());
+    }
+
+    #[test]
+    fn agent_type_from_str_roundtrip() {
+        assert_eq!(AgentType::parse("explore"), Some(AgentType::Explore));
+        assert_eq!(
+            AgentType::parse("general_purpose"),
+            Some(AgentType::GeneralPurpose)
+        );
+        assert_eq!(AgentType::parse("unknown"), None);
+        assert_eq!(AgentType::parse(""), None);
+    }
+
+    #[test]
+    fn explore_agent_has_restricted_tool_list() {
+        let names = AgentType::Explore.allowed_tool_names().unwrap();
+        // Must contain read tools
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"list_dir".to_string()));
+        assert!(names.contains(&"search_files".to_string()));
+        // Must NOT contain write tools
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"apply_patch".to_string()));
+        assert!(!names.contains(&"run_shell".to_string()));
+    }
+
+    #[test]
+    fn general_purpose_agent_has_no_forced_tool_list() {
+        assert!(AgentType::GeneralPurpose.allowed_tool_names().is_none());
+    }
+
+    #[test]
+    fn is_readonly_for_args_explore_returns_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let provider = mock_provider(vec![]);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
+
+        assert!(sub.is_readonly_for_args(&json!({"subagent_type": "explore"})));
+    }
+
+    #[test]
+    fn is_readonly_for_args_general_purpose_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let provider = mock_provider(vec![]);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
+
+        assert!(!sub.is_readonly_for_args(&json!({"subagent_type": "general_purpose"})));
+    }
+
+    #[test]
+    fn is_readonly_for_args_missing_type_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let provider = mock_provider(vec![]);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
+
+        assert!(!sub.is_readonly_for_args(&json!({"prompt": "hello"})));
+    }
+
+    #[test]
+    fn is_readonly_for_args_unknown_type_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let provider = mock_provider(vec![]);
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
+
+        assert!(!sub.is_readonly_for_args(&json!({"subagent_type": "super_agent"})));
+    }
+
+    #[tokio::test]
+    async fn explore_agent_dispatch_succeeds() {
+        let provider = mock_provider(vec![Completion {
+            content: "Exploration complete.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
+
+        let result = sub
+            .execute(json!({
+                "prompt": "Explore the workspace",
+                "subagent_type": "explore"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("NoMoreToolCalls"));
+        assert!(result.contains("Exploration complete."));
     }
 }

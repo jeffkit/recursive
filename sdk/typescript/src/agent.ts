@@ -213,10 +213,22 @@ export class Agent {
     };
   }
 
-  /** List active sessions. */
-  static async listSessions(options: AgentOptions = {}): Promise<SessionInfo[]> {
+  /**
+   * List active sessions, with optional pagination.
+   *
+   * @param pagination - Optional `limit` and `offset` query params.
+   * @param options - Connection options.
+   */
+  static async listSessions(
+    pagination: { limit?: number; offset?: number } = {},
+    options: AgentOptions = {},
+  ): Promise<SessionInfo[]> {
     const http = makeClient(options);
-    const data = (await http.get("/sessions")) as Array<Record<string, unknown>>;
+    const params = new URLSearchParams();
+    if (pagination.limit != null) params.set("limit", String(pagination.limit));
+    if (pagination.offset != null) params.set("offset", String(pagination.offset));
+    const url = params.size > 0 ? `/sessions?${params}` : "/sessions";
+    const data = (await http.get(url)) as Array<Record<string, unknown>>;
     return data.map((s) => ({
       id: String(s["id"]),
       createdAt: String(s["created_at"] ?? ""),
@@ -224,7 +236,23 @@ export class Agent {
       lastPrompt: s["last_prompt"] as string | undefined,
       firstPrompt: s["first_prompt"] as string | undefined,
       goal: s["goal"] as string | undefined,
+      title: s["title"] as string | undefined,
     }));
+  }
+
+  /**
+   * Set a human-readable title for a session.
+   *
+   * Calls `PATCH /sessions/:id` with `{"title": title}`.
+   * Pass an empty string to clear the title.
+   */
+  static async renameSession(
+    sessionId: string,
+    title: string,
+    options: AgentOptions = {},
+  ): Promise<void> {
+    const http = makeClient(options);
+    await http.patch(`/sessions/${sessionId}`, { title });
   }
 
   /** Delete a session by ID. */

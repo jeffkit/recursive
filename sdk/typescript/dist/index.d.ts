@@ -24,6 +24,7 @@ declare class HttpClient {
     constructor({ baseUrl, apiKey }: HttpClientOptions);
     get(path: string): Promise<unknown>;
     post(path: string, body: unknown): Promise<unknown>;
+    patch(path: string, body: unknown): Promise<unknown>;
     delete(path: string): Promise<void>;
     streamEvents(path: string): AsyncGenerator<SseEvent>;
     private _fetch;
@@ -124,6 +125,8 @@ interface SessionInfo {
     lastPrompt?: string;
     firstPrompt?: string;
     goal?: string;
+    /** Optional human-readable title, set via `Agent.renameSession()`. */
+    title?: string;
 }
 interface ToolInfo {
     name: string;
@@ -140,11 +143,17 @@ interface ToolInfo {
 interface SessionDetail {
     id: string;
     createdAt: string;
+    /** Optional human-readable title. */
+    title?: string;
     messages: unknown[];
     status: string;
     pendingPlan?: string;
     goal?: GoalState;
     todos?: unknown[];
+    /** First user message in the session. */
+    firstPrompt?: string;
+    /** Most recent user message in the session. */
+    lastPrompt?: string;
 }
 interface PlanApprovalResponse {
     status: "approved" | "rejected";
@@ -362,8 +371,23 @@ declare class Agent {
      * Returns a `RunResult`.
      */
     static prompt(message: string, options?: PromptOptions): Promise<RunResult>;
-    /** List active sessions. */
-    static listSessions(options?: AgentOptions): Promise<SessionInfo[]>;
+    /**
+     * List active sessions, with optional pagination.
+     *
+     * @param pagination - Optional `limit` and `offset` query params.
+     * @param options - Connection options.
+     */
+    static listSessions(pagination?: {
+        limit?: number;
+        offset?: number;
+    }, options?: AgentOptions): Promise<SessionInfo[]>;
+    /**
+     * Set a human-readable title for a session.
+     *
+     * Calls `PATCH /sessions/:id` with `{"title": title}`.
+     * Pass an empty string to clear the title.
+     */
+    static renameSession(sessionId: string, title: string, options?: AgentOptions): Promise<void>;
     /** Delete a session by ID. */
     static deleteSession(sessionId: string, options?: AgentOptions): Promise<void>;
 }

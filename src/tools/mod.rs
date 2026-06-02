@@ -209,6 +209,15 @@ pub trait Tool: Send + Sync {
     fn is_readonly(&self) -> bool {
         matches!(self.side_effect_class(), ToolSideEffect::ReadOnly)
     }
+
+    /// Like `is_readonly` but can inspect the call-time arguments.
+    ///
+    /// Override this when read-only-ness depends on parameters (e.g. `sub_agent`
+    /// with `subagent_type: "explore"` behaves as read-only while `"general_purpose"`
+    /// is not). The default delegates to `is_readonly()`.
+    fn is_readonly_for_args(&self, _arguments: &Value) -> bool {
+        self.is_readonly()
+    }
 }
 
 /// Goal-161: runtime permission hook. Implement this trait to intercept
@@ -400,6 +409,16 @@ impl ToolRegistry {
         self.tools
             .get(name)
             .map(|t| t.is_readonly())
+            .unwrap_or(false)
+    }
+
+    /// Like `is_readonly` but passes call-time arguments to the tool so it can
+    /// make an argument-specific decision (e.g. `sub_agent` checking
+    /// `subagent_type: "explore"`).
+    pub fn is_readonly_for_call(&self, name: &str, args: &Value) -> bool {
+        self.tools
+            .get(name)
+            .map(|t| t.is_readonly_for_args(args))
             .unwrap_or(false)
     }
 

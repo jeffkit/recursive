@@ -2043,6 +2043,7 @@ mod http_tests {
         let session = SessionState {
             id: session_id.clone(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
             runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
             plan_approval_gate: gate,
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),

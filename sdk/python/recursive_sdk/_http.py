@@ -67,6 +67,25 @@ class _HttpClient:
                 is_retryable=exc.response.status_code >= 500,
             ) from exc
 
+    def patch(self, path: str, body: Dict[str, Any]) -> requests.Response:
+        """PATCH with a JSON body and return the response."""
+        try:
+            resp = self._session.patch(
+                f"{self.base_url}{path}", json=body, timeout=self.timeout
+            )
+            resp.raise_for_status()
+            return resp
+        except requests.ConnectionError as exc:
+            raise RecursiveAgentError(
+                f"Cannot reach Recursive server at {self.base_url}: {exc}",
+                is_retryable=True,
+            ) from exc
+        except requests.HTTPError as exc:
+            raise RecursiveAgentError(
+                f"HTTP {exc.response.status_code}: {exc.response.text}",
+                is_retryable=exc.response.status_code >= 500,
+            ) from exc
+
     def delete(self, path: str) -> None:
         try:
             resp = self._session.delete(

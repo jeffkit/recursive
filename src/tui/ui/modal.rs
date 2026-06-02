@@ -44,6 +44,14 @@ pub struct ResumeEntry {
     pub cost_usd: f64,
 }
 
+/// One entry in the [`Modal::McpServers`] list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpEntry {
+    pub name: String,
+    pub transport: String,
+    pub enabled: bool,
+}
+
 /// A confirmation request awaiting `y/n`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmAction {
@@ -91,6 +99,12 @@ pub enum Modal {
         entries: Vec<ResumeEntry>,
         selected: usize,
     },
+    /// Goal-173: MCP server list. Shows configured MCP servers with
+    /// their transport type and enabled status.
+    McpServers {
+        entries: Vec<McpEntry>,
+        selected: usize,
+    },
 }
 
 impl Modal {
@@ -105,6 +119,7 @@ impl Modal {
             Modal::Confirm { .. } => " Confirm ",
             Modal::PlanReview { .. } => " Plan Proposal ",
             Modal::ResumePicker { .. } => " Resume Session ",
+            Modal::McpServers { .. } => " MCP Servers ",
         }
     }
 }
@@ -135,6 +150,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::Journal { entries, selected } => render_journal_body(entries, *selected),
         Modal::Confirm { prompt, .. } => render_confirm_body(prompt),
         Modal::ResumePicker { entries, selected } => render_resume_picker_body(entries, *selected),
+        Modal::McpServers { entries, selected } => render_mcp_servers_body(entries, *selected),
         Modal::PlanReview {
             plan_text,
             tool_calls,
@@ -452,6 +468,54 @@ fn render_resume_picker_body(entries: &[ResumeEntry], selected: usize) -> Vec<Li
     out.push(Line::raw(""));
     out.push(Line::from(Span::styled(
         "↑/↓ navigate  |  Enter resume  |  Esc cancel".to_string(),
+        dim,
+    )));
+    out
+}
+
+fn render_mcp_servers_body(entries: &[McpEntry], selected: usize) -> Vec<Line<'static>> {
+    let header = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let green = Style::default().fg(Color::Green);
+    let disabled = Style::default().fg(Color::DarkGray);
+
+    let mut out = vec![Line::from(Span::styled(
+        "Configured MCP servers  (↑/↓ navigate · Esc close)".to_string(),
+        header,
+    ))];
+    out.push(Line::raw(""));
+
+    if entries.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  No MCP servers configured".to_string(),
+            dim,
+        )));
+        return out;
+    }
+
+    for (i, entry) in entries.iter().enumerate() {
+        let sel_marker = if i == selected { "▶" } else { " " };
+        let bullet = if entry.enabled { "●" } else { "○" };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if entry.enabled {
+            green
+        } else {
+            disabled
+        };
+        let line_text = format!(
+            " {} {}  {}  ({})",
+            sel_marker, bullet, entry.name, entry.transport
+        );
+        out.push(Line::from(Span::styled(line_text, style)));
+    }
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "↑/↓ navigate  |  Esc / q close".to_string(),
         dim,
     )));
     out
@@ -822,6 +886,23 @@ mod tests {
         // Keys section
         assert!(text.contains("Shift+Tab"));
         assert!(text.contains("Ctrl+E"));
+    }
+
+    #[test]
+    fn mcp_entry_renders_enabled() {
+        let entry = McpEntry {
+            name: "my-server".to_string(),
+            transport: "stdio".to_string(),
+            enabled: true,
+        };
+        let lines = render_mcp_servers_body(&[entry], 0);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("my-server"));
+        assert!(text.contains("stdio"));
+        assert!(text.contains("●"));
     }
 
     #[test]
