@@ -552,9 +552,13 @@ impl ToolRegistry {
     /// discards the audit half.
     pub async fn invoke_with_audit(&self, name: &str, arguments: Value) -> ToolDispatch {
         // Static permission check before any tool execution.
+        // Goal-196: extract the file-path "content" from arguments and
+        // pass it to `check_static` so the safety check (protected paths
+        // like `.git`, `.ssh`, `.env`) can fire on file tools.
+        let safety_content = safety_content_for_tool(name, &arguments);
         if let Some(ref config) = self.permissions {
             let is_readonly = self.is_readonly(name);
-            match config.check_static(name, is_readonly) {
+            match config.check_static(name, is_readonly, safety_content.as_deref()) {
                 Permission::Denied(reason, _msg) => {
                     return ToolDispatch {
                         result: Err(Error::PermissionDenied {
@@ -790,6 +794,23 @@ pub fn build_standard_tools(
     }
 
     registry
+}
+
+// ── Goal-196: Safety path content extraction ───────────────────────────────
+
+/// Extract the file-path "content" from tool arguments for the safety
+/// check in `check_static`. Returns `None` for tools that don't operate
+/// on a file path.
+///
+/// - `write_file` / `read_file`: extract `args["path"]`
+/// - `apply_patch`: extract `args["patch"]` (the full V4A patch body)
+/// - All other tools: `None`
+fn safety_content_for_tool(name: &str, args: &serde_json::Value) -> Option<String> {
+    match name {
+        "write_file" | "read_file" => args["path"].as_str().map(String::from),
+        "apply_patch" => args["patch"].as_str().map(String::from),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

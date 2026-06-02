@@ -261,6 +261,10 @@ impl LayeredPermissionsConfig {
     ///
     /// Checks are applied in priority order (highest first):
     ///
+    /// 0. **Safety check (Goal 196)** — if `content` resolves to a file
+    ///    path under a protected location (`.git`, `.ssh`, etc.), deny
+    ///    with `DecisionReason::SafetyCheck`. This is enforced even under
+    ///    `BypassPermissions`. Read-only tools are exempt.
     /// 1. **Plan mode** — blocks write tools unless `bypass_available`
     ///    (always exempts `exit_plan_mode`).
     /// 2. **BypassPermissions** — skips all rules, allows everything.
@@ -268,7 +272,34 @@ impl LayeredPermissionsConfig {
     /// 4. **AcceptEdits** — auto-allows write tools.
     /// 5. **Deny/allow rules** — static deny (union) then allow (union).
     /// 6. **Default** — falls through with `Passthrough`.
-    pub fn check_static(&self, tool_name: &str, is_readonly: bool) -> Permission {
+    ///
+    /// `content` is the call-time content the tool will operate on. For
+    /// `write_file` / `read_file` it should be the file path; for
+    /// `apply_patch` it should be the full V4A patch body. Other tools
+    /// can pass `None`. See [`extract_file_path_from_content`].
+    pub fn check_static(
+        &self,
+        tool_name: &str,
+        is_readonly: bool,
+        content: Option<&str>,
+    ) -> Permission {
+        // 0. Safety check (Goal 196): protected paths cannot be written
+        // to, even under BypassPermissions. Read-only tools are exempt.
+        if !is_readonly {
+            if let Some(path) = extract_file_path_from_content(tool_name, content) {
+                for protected in PROTECTED_PATHS {
+                    if path_contains_protected(&path, protected) {
+                        return Permission::Denied(
+                            DecisionReason::SafetyCheck { path: path.clone() },
+                            format!(
+                                "writing to `{path}` is protected and requires explicit confirmation"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         // 1. Plan mode: block write tools (exit_plan_mode exempted)
         if let PermissionMode::Plan {
             bypass_available, ..
@@ -344,7 +375,7 @@ impl LayeredPermissionsConfig {
     pub fn is_interactive(&self, tool_name: &str) -> bool {
         // Denied tools are never interactive
         if matches!(
-            self.check_static(tool_name, false),
+            self.check_static(tool_name, false, None),
             Permission::Denied(_, _)
         ) {
             return false;
@@ -436,6 +467,72 @@ impl From<OldPermissionsConfig> for LayeredPermissionsConfig {
 /// Most existing code uses `PermissionsConfig`; this alias maps to the
 /// new layered type so existing callers continue to compile.
 pub type PermissionsConfig = LayeredPermissionsConfig;
+
+// ── Goal-196: Safety path protection ────────────────────────────────────────
+
+/// Hard-coded list of paths that write tools must never touch, regardless
+/// of permission mode. Read-only operations are exempt.
+///
+/// This is a defense-in-depth check: even `BypassPermissions` mode is
+/// subject to it. The list is intentionally simple and explicit; tooling
+/// around it is intentionally not user-configurable in this iteration.
+///
+/// Component-based matching (via [`path_contains_protected`]) means a file
+/// like `legitimate.git_info` is *not* flagged, but `sub/.git/config` is.
+/// The `.env` entry matches `.env` exactly, not `.env.example` (which is
+/// safe and common in repos); a project-root `.env` is correctly flagged
+/// because it's a top-level component.
+const PROTECTED_PATHS: &[&str] = &[
+    ".git",
+    ".recursive",
+    ".ssh",
+    ".gnupg",
+    ".bashrc",
+    ".zshrc",
+    ".profile",
+    ".bash_profile",
+    ".bash_logout",
+    ".env",
+];
+
+/// Extract a file path from `content` for tools that operate on a file.
+///
+/// - For `write_file` and `read_file`, `content` *is* the file path
+///   (the caller is expected to have passed `args["path"]` as `content`).
+/// - For `apply_patch`, `content` is the full V4A patch body; this
+///   helper extracts the **first** file path mentioned in the body
+///   (i.e. the first `*** Update/Add/Delete File:` header). This is
+///   intentionally conservative: if any file in the patch is protected,
+///   we deny.
+/// - All other tools return `None`.
+fn extract_file_path_from_content(tool_name: &str, content: Option<&str>) -> Option<String> {
+    let content = content?;
+    match tool_name {
+        "write_file" | "read_file" => Some(content.to_string()),
+        "apply_patch" => {
+            for line in content.lines() {
+                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        return Some(rest.trim().to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Returns `true` if any component of `path` is exactly `protected`.
+///
+/// Uses [`std::path::Path::components`] rather than a substring check,
+/// so `legitimate.git_info` is **not** flagged against `.git`, but
+/// `sub/dir/.git/config` is correctly detected.
+fn path_contains_protected(path: &str, protected: &str) -> bool {
+    std::path::Path::new(path)
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().as_ref() == protected)
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -616,7 +713,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = config.check_static("write_file", false);
+        let result = config.check_static("write_file", false, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -640,7 +737,7 @@ mod tests {
             ..Default::default()
         };
         // exit_plan_mode is exempted from plan-mode write blocking
-        let result = config.check_static("exit_plan_mode", false);
+        let result = config.check_static("exit_plan_mode", false, None);
         assert!(!result.is_denied());
         // Falls through to Passthrough
         assert!(matches!(result, Permission::Passthrough));
@@ -659,7 +756,7 @@ mod tests {
         };
         // With bypass_available, write tool is not blocked at plan step;
         // falls through to Passthrough (no rules configured).
-        let result = config.check_static("write_file", false);
+        let result = config.check_static("write_file", false, None);
         assert!(!result.is_denied());
         assert!(matches!(result, Permission::Passthrough));
     }
@@ -675,7 +772,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let result = config.check_static("run_shell", false);
+        let result = config.check_static("run_shell", false, None);
         assert!(result.is_allowed());
         if let Permission::Allowed(reason) = result {
             assert!(matches!(
@@ -698,7 +795,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let result = config.check_static("run_shell", false);
+        let result = config.check_static("run_shell", false, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -718,7 +815,7 @@ mod tests {
             mode: PermissionMode::AcceptEdits,
             ..Default::default()
         };
-        let result = config.check_static("write_file", false);
+        let result = config.check_static("write_file", false, None);
         assert!(result.is_allowed());
         if let Permission::Allowed(reason) = result {
             assert!(matches!(
@@ -741,7 +838,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let result = config.check_static("run_shell", true);
+        let result = config.check_static("run_shell", true, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, _msg) = result {
             assert!(matches!(
@@ -767,7 +864,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let result = config.check_static("read_file", true);
+        let result = config.check_static("read_file", true, None);
         assert!(result.is_allowed());
         if let Permission::Allowed(reason) = result {
             assert!(matches!(
@@ -794,7 +891,7 @@ mod tests {
             ..Default::default()
         };
         // read-only tools are not blocked by plan mode
-        let result = config.check_static("read_file", true);
+        let result = config.check_static("read_file", true, None);
         assert!(!result.is_denied());
     }
 
@@ -820,7 +917,7 @@ mod tests {
     fn test_empty_config_passthrough() {
         let config = LayeredPermissionsConfig::default();
         // Default mode with no layers: Passthrough
-        let result = config.check_static("anything", false);
+        let result = config.check_static("anything", false, None);
         assert!(matches!(result, Permission::Passthrough));
     }
 
@@ -834,8 +931,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false).is_denied());
-        assert!(!config.check_static("read_file", false).is_denied());
+        assert!(config.check_static("run_shell", false, None).is_denied());
+        assert!(!config.check_static("read_file", false, None).is_denied());
     }
 
     #[test]
@@ -848,9 +945,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("read_file", false).is_allowed());
+        assert!(config.check_static("read_file", false, None).is_allowed());
         assert!(matches!(
-            config.check_static("run_shell", false),
+            config.check_static("run_shell", false, None),
             Permission::Passthrough
         ));
     }
@@ -888,7 +985,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false).is_denied());
+        assert!(config.check_static("run_shell", false, None).is_denied());
     }
 
     #[test]
@@ -909,8 +1006,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(config.check_static("read_file", true).is_allowed());
-        assert!(config.check_static("write_file", false).is_allowed());
+        assert!(config.check_static("read_file", true, None).is_allowed());
+        assert!(config.check_static("write_file", false, None).is_allowed());
     }
 
     #[test]
@@ -952,7 +1049,7 @@ mod tests {
             ..Default::default()
         };
         // Session layer has empty allow → doesn't restrict
-        assert!(config.check_static("read_file", true).is_allowed());
+        assert!(config.check_static("read_file", true, None).is_allowed());
     }
 
     #[test]
@@ -966,7 +1063,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false).is_denied());
+        assert!(config.check_static("run_shell", false, None).is_denied());
     }
 
     #[test]
@@ -979,10 +1076,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false).is_allowed());
-        assert!(config.check_static("run_background", false).is_allowed());
+        assert!(config.check_static("run_shell", false, None).is_allowed());
+        assert!(config
+            .check_static("run_background", false, None)
+            .is_allowed());
         assert!(matches!(
-            config.check_static("read_file", false),
+            config.check_static("read_file", false, None),
             Permission::Passthrough
         ));
     }
@@ -997,8 +1096,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("anything", false).is_allowed());
-        assert!(config.check_static("", false).is_allowed());
+        assert!(config.check_static("anything", false, None).is_allowed());
+        assert!(config.check_static("", false, None).is_allowed());
     }
 
     #[test]
@@ -1012,8 +1111,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("read_file", true).is_allowed());
-        assert!(config.check_static("run_shell", false).is_denied());
+        assert!(config.check_static("read_file", true, None).is_allowed());
+        assert!(config.check_static("run_shell", false, None).is_denied());
     }
 
     #[test]
@@ -1221,7 +1320,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = config.check_static("run_shell", false);
+        let result = config.check_static("run_shell", false, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -1235,5 +1334,85 @@ mod tests {
         } else {
             panic!("expected Denied");
         }
+    }
+
+    // ── Goal-196: Safety path protection tests ───────────────────────────
+
+    #[test]
+    fn protected_path_denied_in_default_mode() {
+        let config = LayeredPermissionsConfig::default();
+        let result = config.check_static("write_file", false, Some(".git/config"));
+        assert!(result.is_denied());
+        if let Permission::Denied(DecisionReason::SafetyCheck { path }, msg) = &result {
+            assert_eq!(path, ".git/config");
+            assert!(msg.contains("protected"));
+        } else {
+            panic!("expected Denied(SafetyCheck), got {result:?}");
+        }
+    }
+
+    #[test]
+    fn protected_path_denied_in_bypass_mode() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::BypassPermissions,
+            ..Default::default()
+        };
+        let result = config.check_static("write_file", false, Some(".ssh/id_rsa"));
+        assert!(result.is_denied());
+        if let Permission::Denied(DecisionReason::SafetyCheck { path }, msg) = &result {
+            assert_eq!(path, ".ssh/id_rsa");
+            assert!(msg.contains("protected"));
+        } else {
+            panic!("expected Denied(SafetyCheck), got {result:?}");
+        }
+    }
+
+    #[test]
+    fn protected_path_readonly_allowed() {
+        let config = LayeredPermissionsConfig::default();
+        // Read-only tools are exempt from the safety check
+        let result = config.check_static("read_file", true, Some(".git/config"));
+        assert!(matches!(result, Permission::Passthrough));
+    }
+
+    #[test]
+    fn non_protected_path_not_blocked() {
+        let config = LayeredPermissionsConfig::default();
+        let result = config.check_static("write_file", false, Some("src/main.rs"));
+        assert!(matches!(result, Permission::Passthrough));
+    }
+
+    #[test]
+    fn nested_protected_path_detected() {
+        let config = LayeredPermissionsConfig::default();
+        let result =
+            config.check_static("write_file", false, Some("some/dir/.recursive/config.toml"));
+        assert!(result.is_denied());
+        if let Permission::Denied(DecisionReason::SafetyCheck { path }, _) = &result {
+            assert_eq!(path, "some/dir/.recursive/config.toml");
+        } else {
+            panic!("expected Denied(SafetyCheck), got {result:?}");
+        }
+    }
+
+    #[test]
+    fn path_contains_protected_fn() {
+        // Direct match
+        assert!(path_contains_protected(".git/config", ".git"));
+        assert!(path_contains_protected("a/.git/config", ".git"));
+        // Nested match
+        assert!(path_contains_protected(
+            "some/dir/.recursive/config.toml",
+            ".recursive"
+        ));
+        // No false positive on legitimate.git_info
+        assert!(!path_contains_protected("legitimate.git_info/x", ".git"));
+        // .env matches exactly, not .env.example
+        assert!(path_contains_protected(".env", ".env"));
+        assert!(!path_contains_protected(".env.example", ".env"));
+        // Empty path
+        assert!(!path_contains_protected("", ".git"));
+        // Root-level match
+        assert!(path_contains_protected(".ssh/authorized_keys", ".ssh"));
     }
 }
