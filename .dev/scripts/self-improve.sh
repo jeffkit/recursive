@@ -18,7 +18,7 @@
 # Env:
 #   RECURSIVE_API_KEY (required; falls back to GLM_API_KEY / MINIMAX_API_KEY)
 #   RECURSIVE_API_BASE (default: MiniMax)
-#   RECURSIVE_MODEL    (default: MiniMax-M2)
+#   RECURSIVE_MODEL    (default: MiniMax-M3)
 #   RECURSIVE_MAX_STEPS (default: 200, matches Cursor's per-turn ceiling)
 #   RECURSIVE_NO_COMMIT (set to 1 to skip the auto-commit step)
 #   RECURSIVE_AUTO_RESUME (default: 1; set to 0 to disable). When the
@@ -120,7 +120,7 @@ apply_provider_profile() {
   case "$1" in
     minimax)
       export RECURSIVE_API_BASE="https://api.minimaxi.com/v1"
-      export RECURSIVE_MODEL="MiniMax-M2"
+      export RECURSIVE_MODEL="MiniMax-M3"
       export RECURSIVE_API_KEY="${MINIMAX_API_KEY:-}"
       ;;
     deepseek)
@@ -141,7 +141,7 @@ apply_provider_profile() {
     anthropic-minimax)
       export RECURSIVE_PROVIDER_TYPE="anthropic"
       export RECURSIVE_API_BASE="https://api.minimaxi.com/anthropic"
-      export RECURSIVE_MODEL="MiniMax-M2"
+      export RECURSIVE_MODEL="MiniMax-M3"
       export RECURSIVE_API_KEY="${MINIMAX_API_KEY:-}"
       ;;
     anthropic-deepseek)
