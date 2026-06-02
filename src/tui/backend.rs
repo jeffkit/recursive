@@ -206,6 +206,10 @@ async fn worker_loop(
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
                     let rt = rt_opt.take().unwrap();
+                    // Clone the gate before moving the runtime into the spawned task.
+                    // This lets us signal plan approval/rejection via action_rx while
+                    // the task is blocked inside exit_plan_mode.
+                    let gate = rt.plan_approval_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
@@ -214,23 +218,15 @@ async fn worker_loop(
                         let mut g = rt_clone.lock().await;
                         g.enqueue(text).await.map(|_| ())
                     });
-                    let aborted = tokio::select! {
-                        res = &mut handle => {
-                            if let Err(e) = res
-                                .map_err(|e| crate::Error::Other(e.to_string()))
-                                .and_then(|r| r)
-                            {
-                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
-                            }
-                            false
-                        },
-                        _ = wait_for_cancel(cancel_clone) => {
-                            handle.abort();
-                            let _ = handle.await;
-                            let _ = event_tx.send(UiEvent::Interrupted);
-                            true
-                        }
-                    };
+                    let aborted = run_turn_select_loop(
+                        &mut handle,
+                        &mut action_rx,
+                        &event_tx,
+                        &cancel_flag,
+                        cancel_clone,
+                        &gate,
+                    )
+                    .await;
                     let mut recovered = Arc::try_unwrap(rt_shared)
                         .expect("single owner after task end")
                         .into_inner();
@@ -257,6 +253,7 @@ async fn worker_loop(
                     rt_opt.as_mut().unwrap().confirm_plan();
                     let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
                     let rt = rt_opt.take().unwrap();
+                    let gate = rt.plan_approval_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
@@ -265,23 +262,15 @@ async fn worker_loop(
                         let mut g = rt_clone.lock().await;
                         g.run("").await.map(|_| ())
                     });
-                    let aborted = tokio::select! {
-                        res = &mut handle => {
-                            if let Err(e) = res
-                                .map_err(|e| crate::Error::Other(e.to_string()))
-                                .and_then(|r| r)
-                            {
-                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
-                            }
-                            false
-                        },
-                        _ = wait_for_cancel(cancel_clone) => {
-                            handle.abort();
-                            let _ = handle.await;
-                            let _ = event_tx.send(UiEvent::Interrupted);
-                            true
-                        }
-                    };
+                    let aborted = run_turn_select_loop(
+                        &mut handle,
+                        &mut action_rx,
+                        &event_tx,
+                        &cancel_flag,
+                        cancel_clone,
+                        &gate,
+                    )
+                    .await;
                     let mut recovered = Arc::try_unwrap(rt_shared)
                         .expect("single owner after task end")
                         .into_inner();
