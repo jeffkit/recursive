@@ -980,7 +980,7 @@ mod permissions {
             .invoke("run_shell", json!({ "command": "echo hi" }))
             .await;
         match result {
-            Err(Error::PermissionDenied { name }) => assert_eq!(name, "run_shell"),
+            Err(Error::PermissionDenied { name, .. }) => assert_eq!(name, "run_shell"),
             other => panic!("expected PermissionDenied, got {other:?}"),
         }
     }
