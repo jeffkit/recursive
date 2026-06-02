@@ -943,7 +943,7 @@ pub fn build_standard_tools(
     // Goal-201: plan mode tools are channel capabilities (TUI / HTTP only).
     // They are registered exclusively by AgentRuntimeBuilder::build() which
     // wires them to the real PlanApprovalGate and EventSink.  Headless /
-    // CLI / self-improve runs that call default_tool_registry() directly
+    // CLI / self-improve runs that call build_standard_tools() directly
     // will not have these tools, preventing the LLM from blocking on an
     // interactive review that can never complete.
 
