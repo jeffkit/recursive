@@ -102,7 +102,9 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
-pub use storage::{AgentCheckpointState, NoopSessionStore, SessionStore, StorageBackend};
+pub use storage::{
+    AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
+};
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
     PlanApprovalGate, PlanApprovalResult, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch,
