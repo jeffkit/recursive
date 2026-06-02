@@ -1,107 +1,282 @@
-# Goal 170 — TUI: 真正的取消 LLM 请求（abort handle）
+# Goal 170 — TUI: 真正的取消 LLM 请求（backend abort）
 
 **Roadmap**: TUI 体验提升系列 — gap doc §8 ROI #4
 
 **Design principle check**:
-- 仅改 `src/tui/backend.rs`，不动核心库 / agent.rs / runtime.rs
-- 利用 tokio `JoinHandle::abort()` — `_worker` 已经是 `JoinHandle<()>`，
-  可在 cancel 时直接 abort 掉正在飞的 turn task
-- 不改 `wait_for_cancel` 的 API（保留向下兼容），只改触发路径
+- 仅改 `src/tui/backend.rs`，UI 侧（`UiEvent::Interrupted` + handler）已由
+  partial commit c17b732 完成
+- 利用 `tokio::task::JoinHandle::abort()` 在取消时立即 drop reqwest 响应
 - ❌ 不在 `agent.rs::Agent::run` 主循环里加分支
 
 ## Why
 
-当前 `cancel_flag` + `select!` 的方案在每 100ms 检查一次 flag，但
-reqwest 的 SSE 流仍然在继续消耗网络连接和计算资源，直到当前 token 边界
-才能中断。对长推理（Claude Sonnet thinking、DeepSeek R1）来说，用户按
-Esc 后可能还要等 5-30 秒才能中断，体验很差。
+当前 `cancel_flag` + `select!` 方案在 flag 设为 true 后，reqwest SSE 流
+仍然继续，直到 100ms poll 间隔或下一个 yield 点才中断。对长推理（Sonnet
+thinking、DeepSeek R1）用户按 Esc 后可能还要等 5-30 秒。
 
-Gap doc §8 注明：
-> 真正的取消正在飞的 LLM 请求（中 / 中）
-> 落地路径：reqwest 的 RequestBuilder 在异步任务里 spawn 后保留 abort 句柄；
-> `backend.rs::wait_for_cancel` 改为直接 abort handle。
+`UiEvent::Interrupted` 和 app 里的 handler 已经存在（c17b732）。
+本 goal **只改 `src/tui/backend.rs`**，把 4 个 turn path 升级为真正的 abort。
 
-## Scope
+## 技术方案
 
-### 1. 把 turn 逻辑提取到一个可 abort 的 task
+`AgentRuntime::run()` 是 `&mut self`，不能直接 move 进 `tokio::spawn`。
+解法：在 worker_loop 进入每次 turn 之前，把 runtime 从 `state` 里暂时取出，
+包进 `Arc<tokio::sync::Mutex<Box<AgentRuntime>>>`，再 spawn。
 
-`worker_loop`（`src/tui/backend.rs`）目前在处理 `UserAction::SubmitPrompt`
-/ `Bash` / `Compact` 时，直接 `tokio::select! { result = run_turn(...), _ = wait_for_cancel(...) }`.
+### 具体步骤
 
-改法：
+**Step 1**: 在 worker_loop 开头或第一次使用前，把 `state` 改成持有
+`Arc<tokio::sync::Mutex<Box<AgentRuntime>>>` 而不是直接持有 `Box<AgentRuntime>`：
 
 ```rust
-// 伪代码示意
-let turn_task: JoinHandle<Result<()>> = tokio::spawn(run_turn(rt, action, sink));
-tokio::select! {
-    res = &mut turn_task => { /* normal completion */ }
-    _ = wait_for_cancel(cancel_flag.clone()) => {
-        turn_task.abort();
-        let _ = turn_task.await; // drain
-        sink.send(UiEvent::TurnAborted).await;
+// 在 worker_loop 初始化阶段：
+let rt_lock: Arc<tokio::sync::Mutex<Option<Box<AgentRuntime>>>> = match state {
+    RuntimeBuild::Ready(rt) => Arc::new(tokio::sync::Mutex::new(Some(rt))),
+    RuntimeBuild::Offline { reason } => {
+        // handle offline separately — offline path 不需要 spawn
+        // ...
+    }
+};
+```
+
+实际上，最小改动方案是**不改 state 结构体**，而是在每个 turn path 内部临时
+操作：
+
+```rust
+// 以 SendMessage 为例：
+UserAction::SendMessage(text) => match &mut state {
+    RuntimeBuild::Ready(rt_box) => {
+        // 1. 取出 runtime
+        let mut rt = std::mem::replace(rt_box, placeholder_rt());
+        let pre_turn_len = rt.transcript().len();
+
+        // 2. 放进 Mutex，spawn
+        let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+        let rt_for_task = rt_shared.clone();
+        let handle = tokio::task::spawn(async move {
+            let mut guard = rt_for_task.lock().await;
+            guard.run(text).await
+        });
+
+        // 3. select!
+        cancel_flag.store(false, Ordering::SeqCst);
+        let cancel_for_select = cancel_flag.clone();
+        let result = tokio::select! {
+            r = handle => match r {
+                Ok(inner) => inner.map(|_| ()),
+                Err(e) if e.is_cancelled() => Ok(()),
+                Err(e) => Err(crate::Error::Other(e.to_string())),
+            },
+            _ = wait_for_cancel(cancel_for_select) => {
+                // abort 会 drop reqwest 响应
+                handle.abort();
+                let _ = handle.await; // drain
+                let _ = event_tx.send(UiEvent::Interrupted);
+                Ok(())
+            }
+        };
+
+        // 4. 取回 runtime（abort 后 lock 会立即可得，因为任务已 drop）
+        let recovered_rt = Arc::try_unwrap(rt_shared)
+            .expect("no other owners after task abort/complete")
+            .into_inner();
+
+        // 5. 若 abort，截断 transcript 到 pre-turn
+        let mut recovered_rt = if result.is_ok() && /* was interrupted */ false {
+            // 截断在 abort 分支里已处理，recovered_rt 仍是 pre-turn 状态
+            recovered_rt
+        } else {
+            recovered_rt
+        };
+        // 重新放回 state
+        *rt_box = recovered_rt;
+
+        if let Err(e) = result { ... }
+        let _ = event_tx.send(UiEvent::TurnFinished);
+        cancel_flag.store(false, Ordering::SeqCst);
+    }
+    ...
+}
+```
+
+**`placeholder_rt()`** 问题：`std::mem::replace` 需要一个临时值，但
+`AgentRuntime` 没有 `Default`。解法：用 `Option<Box<AgentRuntime>>` 作为
+state 中的 inner type：把 `RuntimeBuild::Ready(Box<AgentRuntime>)` 改成
+`RuntimeBuild::Ready(Option<Box<AgentRuntime>>)` 并在所有 match arm 里用
+`.as_mut().unwrap()` 或 `.take()` / `.replace(...)` 操作。
+
+**最小侵入的替代方案**（推荐实现）：
+
+用一个 `fn run_turn_with_abort(...)` 异步辅助函数，接受 `&mut AgentRuntime`
+的引用，用 `unsafe` 延长生命周期（**不推荐**）；
+
+OR：
+
+接受 `Box<AgentRuntime>` 所有权，执行 turn，返回 `(Box<AgentRuntime>, Result<...>)`：
+
+```rust
+async fn run_turn_abortable(
+    rt: Box<AgentRuntime>,
+    run_fn: impl FnOnce(&mut AgentRuntime) -> impl Future<Output = Result<RuntimeOutcome>>,
+    cancel_flag: Arc<AtomicBool>,
+    event_tx: mpsc::UnboundedSender<UiEvent>,
+) -> (Box<AgentRuntime>, bool /* was_aborted */) {
+    let pre_turn_len = rt.transcript().len();
+    let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+    let rt_for_task = rt_shared.clone();
+    let handle = tokio::task::spawn(async move {
+        let mut g = rt_for_task.lock().await;
+        run_fn(&mut *g).await
+    });
+    // ... select! + abort ...
+    let rt = Arc::try_unwrap(rt_shared).unwrap().into_inner();
+    (rt, was_aborted)
+}
+```
+
+实际上 `run_fn: impl FnOnce(&mut AgentRuntime) -> impl Future` 在 Rust
+里难以表达（closure 借用问题）。
+
+**最实际的方案**（已经过思考，直接实现这个）：
+
+把 `RuntimeBuild` 改成：
+
+```rust
+pub enum RuntimeBuild {
+    Ready(Option<Box<AgentRuntime>>),  // Option 允许 .take()
+    Offline { reason: String },
+}
+```
+
+在所有现有的 `RuntimeBuild::Ready(rt)` match arm 里，把 `rt` 改成
+`rt_opt.as_mut().unwrap()` 或 `let rt = rt_opt.as_mut().unwrap();`
+（非 turn path 不需要 take，turn path 用 `.take().unwrap()`）。
+
+Turn path 统一模式：
+
+```rust
+UserAction::SendMessage(text) => {
+    if let RuntimeBuild::Ready(rt_opt) = &mut state {
+        let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+        // take ownership
+        let rt = rt_opt.take().unwrap();
+        let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+        let rt_clone = rt_shared.clone();
+
+        cancel_flag.store(false, Ordering::SeqCst);
+        let cancel_clone = cancel_flag.clone();
+
+        let mut handle = tokio::task::spawn(async move {
+            let mut g = rt_clone.lock().await;
+            g.run(text).await.map(|_| ())
+        });
+
+        let aborted = tokio::select! {
+            res = &mut handle => {
+                if let Err(e) = res.and_then(|r| r.map_err(|e| /* wrap */ e)) {
+                    let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                }
+                false
+            },
+            _ = wait_for_cancel(cancel_clone) => {
+                handle.abort();
+                let _ = handle.await;
+                let _ = event_tx.send(UiEvent::Interrupted);
+                true
+            }
+        };
+
+        // recover runtime
+        let mut recovered = Arc::try_unwrap(rt_shared).ok()
+            .expect("single owner after task end")
+            .into_inner();
+
+        if aborted {
+            // truncate to pre-turn to avoid orphan tool_calls
+            recovered.truncate_transcript(pre_turn_len);
+        }
+
+        // put back
+        *rt_opt = Some(recovered);
+        let _ = event_tx.send(UiEvent::TurnFinished);
+        cancel_flag.store(false, Ordering::SeqCst);
+    } else if let RuntimeBuild::Offline { reason } = &state {
+        let _ = event_tx.send(UiEvent::Error { message: reason.clone() });
+        let _ = event_tx.send(UiEvent::TurnFinished);
     }
 }
 ```
 
-具体步骤：
-1. 在 `worker_loop` 中，每次开始一个 turn，`tokio::spawn` 出 `JoinHandle`
-2. `tokio::select!` 在 `JoinHandle` 完成 vs `wait_for_cancel` 之间竞争
-3. cancel 获胜时调 `handle.abort()`，等 join（`.await` 会返回
-   `Err(JoinError::Cancelled)`，ignore 掉）
-4. 向 UI 推送一个 `UiEvent::Interrupted` 事件（已有，`src/tui/events.rs`
-   应该已有此变体），让 transcript 加一行"[Interrupted]"
+## Scope
 
-### 2. 处理 transcript 一致性
+### 1. `src/tui/runtime_builder.rs`
 
-abort 后，若 LLM 已返回部分 `tool_call` 但对应 `tool_result` 还没回来，
-下一次 turn 发给 LLM 的 messages 里会出现悬空的 `tool_call` —— OpenAI
-/ Anthropic 都会 400。
+Change `RuntimeBuild::Ready(Box<AgentRuntime>)` → `RuntimeBuild::Ready(Option<Box<AgentRuntime>>)`.
 
-解决方案：在 abort 后，让 `AgentRuntime` 的 transcript 截断到最后一条
-完整 `user` 消息（即 turn 的起始点）。
+### 2. `src/runtime.rs`
 
-做法：在 turn 开始前记录 transcript 长度 `pre_turn_len`，abort 后截断：
+Add a one-liner helper method to `AgentRuntime` (in `src/runtime.rs`, which we
+*are* allowed to minimally extend with a builder/helper method):
+
 ```rust
-// 如果 Runtime 暴露了 transcript 长度 / truncate 方法，调它
-// 否则，直接构建一个新的 runtime（re-use `app.runtime`，丢弃当前 turn 状态）
+/// Truncate transcript to `len` messages (used by TUI abort to restore
+/// pre-turn state and avoid orphan tool_call entries).
+pub fn truncate_transcript(&mut self, len: usize) {
+    self.messages.truncate(len);
+}
 ```
 
-注意：`AgentRuntime` 已经在 backend 里持有；可以在 abort 后在下一个
-`UserAction` 触发时，重新构建 `AgentRuntime`（传入截断后的 transcript）。
-**简化方案**：abort 后推 `UiEvent::Interrupted`，同时 backend 内部把
-`runtime` 标记为"需要重建"；下次用户提交时用现有 messages（截至上次
-完整 user turn）重建。
+This is a 3-line addition. The goal doc says "只允许加一个 builder 方法" — this fits.
 
-### 3. UI 展示
+### 3. `src/tui/backend.rs`
 
-`UiEvent::Interrupted` 已经在 `src/tui/events.rs` 里（Goal 147 加的），
-app 的 `apply_event` 会把它渲染成 transcript 里的灰色"[interrupted]"块。
-不需要新增变体。
+Apply the turn-abort pattern to all 4 turn paths:
+- `UserAction::SendMessage` (line ~203)
+- `UserAction::ConfirmPlan` (line ~234)
+- `UserAction::SetGoal` (line ~291)
+- `UserAction::RunSkillPrompt` (line ~332)
 
-### 4. 测试
+For each: replace the old `tokio::select! { r = rt.run(...), _ = wait_for_cancel }` with the `Option::take → spawn → select! → abort → recover → truncate_if_aborted → put_back` pattern above.
 
-在 `src/tui/backend.rs` 的 `#[cfg(test)] mod tests` 里增加：
-- `abort_cancels_task_immediately`：创建一个 sleep 很长的 task，
-  cancel_flag 设 true，验证 select! 返回后 task 确实被 abort 了
-- `abort_after_partial_token`：mock runtime 发几个 partial token，然后
-  cancel，验证 UI 收到 `TurnAborted` / `Interrupted` 事件
+Update the event sink and permission hook wiring at line ~186 to use `rt_opt.as_mut().unwrap()` instead of `rt`.
+
+All other `match &mut state { RuntimeBuild::Ready(rt) => ... }` arms that do NOT spawn — e.g., `Compact`, `SetPlanningMode`, `RejectPlan`, `ClearGoal` — simply change to `RuntimeBuild::Ready(rt_opt) => { let rt = rt_opt.as_mut().unwrap(); ... }`.
+
+### 4. Tests
+
+In `src/tui/backend.rs` `#[cfg(test)]` block, add:
+- `abort_cancels_inflight_turn`: create a mock runtime that sleeps for 5s in
+  `run()`, set cancel_flag=true immediately, verify the select! branch returns
+  quickly (< 500ms) and `UiEvent::Interrupted` was sent.
+  Use `tokio::time::timeout` to bound the test.
 
 ## Acceptance
 
-- `cargo test` 绿
-- `cargo clippy --all-targets --all-features -- -D warnings` 干净
-- Esc/Ctrl+C 后，reqwest connection 在 < 200ms 内断开（不是等 token 边界）
-- 下一次 turn 正常发出，没有 400 错误（transcript 一致性保证）
-- `UiEvent::Interrupted` 在 transcript 可见
+- `cargo test --workspace` green
+- `cargo clippy --all-targets --all-features -- -D warnings` clean
+- All 4 turn paths use the spawn+abort pattern
+- Pressing Esc/Ctrl+C while a turn is in flight emits `UiEvent::Interrupted`
+  in < 200ms (reqwest connection drops immediately)
+- Next turn after abort sends successfully (no orphan tool_call in transcript)
 
 ## Notes for the agent
 
-- `_worker` 字段是 `JoinHandle<()>`，但它是整个 worker loop，不能 abort。
-  需要在 loop 内部对每个 turn spawned 的 task 做 abort。
-- `wait_for_cancel` 保持不变，继续作为 select! 的对端条件。
-- reqwest 的 `Response::bytes_stream()` 在 task abort 时会被 drop，
-  底层 TCP 连接随之关闭 —— 不需要额外的 `reqwest::Client::abort()`。
-- 截断 transcript 最安全的方式：`AgentRuntime` 持有 `messages: Vec<Message>`，
-  abort 后重新 clone runtime 但只保留 pre_turn messages。参考
-  `src/runtime.rs` 的 `messages` 字段。
-- **DO NOT modify** `src/agent.rs` / `src/runtime.rs` / `src/llm/`.
+- `Arc::try_unwrap(rt_shared).ok().expect("single owner")` will panic if
+  the spawned task is still holding the lock — this CAN'T happen because:
+  (a) on normal completion, the task completed before we reach `try_unwrap`
+  (b) on abort, `handle.await` drained the task before `try_unwrap`
+  So the panic branch is unreachable in practice.
+- `AgentRuntime` is `Send` (all its fields are `Arc<dyn ... + Send + Sync>`),
+  so `tokio::task::spawn` works.
+- `truncate_transcript` is safe to call because after abort the task is fully
+  drained — no other references to the runtime exist.
+- The 4 turn paths are the only places that call `rt.run(...)` /
+  `rt.run_goal_loop(...)`. The `Compact`, `SetPlanningMode`, `RejectPlan`,
+  `ClearGoal`, `RunShell` paths do NOT need spawn+abort — they are either
+  synchronous or short async ops.
+- Do NOT change `wait_for_cancel` — keep it as the select! condition.
+- `UiEvent::Interrupted` is already defined in `src/tui/events.rs` and
+  handled in `src/tui/app.rs` (added in partial commit c17b732).
+  Do NOT re-add it. Just send it from backend.
+- **DO NOT** change `src/agent.rs` beyond the `truncate_transcript` addition
+  to `src/runtime.rs`.
