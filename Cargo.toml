@@ -102,6 +102,7 @@ jsonwebtoken = "9"
 agui-client = { path = "crates/agui-client" }
 agui-protocol = { path = "crates/agui-protocol" }
 url = "2"
+mockito = "1.7.2"
 
 [profile.dev]
 opt-level = 0

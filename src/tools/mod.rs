@@ -723,15 +723,20 @@ impl ToolRegistry {
                 }
                 let hook_input = crate::hooks::external::HookInput {
                     event: crate::hooks::external::HookEvent::PermissionRequest,
-                    tool_name: name.to_string(),
-                    args: arguments.clone(),
+                    tool_name: Some(name.to_string()),
+                    args: Some(arguments.clone()),
                     mode: format!("{:?}", self.permission_mode),
+                    content: None,
+                    message: None,
+                    depth: None,
+                    reason: None,
+                    error: None,
                 };
                 // Drop the read guard before the async hook dispatch to
                 // avoid holding the lock across an await point.
                 drop(guard);
-                let hook_action = self.hook_runner.dispatch(&hook_input).await;
-                if !matches!(hook_action, crate::hooks::HookAction::Continue) {
+                let hook_result = self.hook_runner.dispatch(&hook_input).await;
+                if !matches!(hook_result.action, crate::hooks::HookAction::Continue) {
                     return ToolDispatch {
                         result: Err(Error::PermissionDenied {
                             name: name.into(),

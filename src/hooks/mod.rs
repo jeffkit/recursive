@@ -37,9 +37,11 @@
 //! registry.register(Arc::new(MyHook));
 //! ```
 
+pub mod config;
 pub mod external;
 
-pub use external::ExternalHookRunner;
+pub use config::{load_hooks_config, HookCommand, HookCommandType, HookMatcher, HooksConfig};
+pub use external::{ExternalHookRunner, HookResult, PermissionDecision};
 
 use std::sync::Arc;
 
@@ -107,6 +109,53 @@ pub enum HookEvent<'a> {
         /// The outcome that will be returned.
         outcome: &'a AgentOutcome,
     },
+    /// Fired after the user submits a message, before the LLM processes it.
+    UserPromptSubmit {
+        /// The user's input content.
+        content: &'a str,
+    },
+    /// Fired when the agent completes normally (`NoMoreToolCalls`).
+    Stop {
+        /// The final outcome.
+        outcome: &'a AgentOutcome,
+    },
+    /// Fired before a sub-agent is dispatched.
+    SubagentStart {
+        /// The sub-agent's goal text.
+        goal: &'a str,
+        /// Nesting depth (0 = top-level).
+        depth: usize,
+    },
+    /// Fired after a sub-agent completes.
+    SubagentStop {
+        /// The sub-agent's outcome.
+        outcome: &'a AgentOutcome,
+        /// Nesting depth.
+        depth: usize,
+    },
+    /// Fired when a tool call returns an error (before `PostToolCall`).
+    PostToolCallFailure {
+        /// Name of the tool that failed.
+        name: &'a str,
+        /// Arguments that were passed to the tool.
+        args: &'a Value,
+        /// The error message.
+        error: &'a str,
+    },
+    /// Fired when a permission check denies a tool call.
+    PermissionDenied {
+        /// Name of the tool that was denied.
+        tool_name: &'a str,
+        /// Human-readable reason for the denial.
+        reason: &'a str,
+    },
+    /// Fired when the agent emits a notification to the user.
+    Notification {
+        /// Notification content.
+        message: &'a str,
+    },
+    /// Fired once at the very beginning, before `SessionStart`, for one-time setup.
+    Setup,
 }
 
 /// A lifecycle hook that can observe and influence agent behaviour.
@@ -159,6 +208,12 @@ impl HookRegistry {
             }
         }
         HookAction::Continue
+    }
+
+    /// Returns true if hooks of the given type would be dispatched.
+    /// Currently always true when hooks are registered; reserved for future filtering.
+    pub fn has_hooks(&self) -> bool {
+        !self.hooks.is_empty()
     }
 
     /// Returns true if no hooks are registered.
@@ -481,6 +536,99 @@ mod tests {
     fn hook_event_is_non_exhaustive() {
         // Compile-time check: HookEvent is #[non_exhaustive]
         let _ = HookEvent::SessionStart { goal: "test" };
+    }
+
+    // ── Goal 204 new event tests ──────────────────────────────────
+
+    #[test]
+    fn new_events_compile_and_dispatch() {
+        let reg = HookRegistry::new();
+        let outcome = AgentOutcome {
+            final_message: None,
+            transcript: vec![],
+            steps: 0,
+            finish: crate::agent::FinishReason::NoMoreToolCalls,
+            total_usage: crate::llm::TokenUsage::default(),
+            total_llm_latency_ms: 0,
+        };
+        let empty_args = serde_json::json!({});
+
+        let action = reg.dispatch(HookEvent::UserPromptSubmit { content: "hello" });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::Stop { outcome: &outcome });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::SubagentStart {
+            goal: "sub-goal",
+            depth: 1,
+        });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::SubagentStop {
+            outcome: &outcome,
+            depth: 1,
+        });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::PostToolCallFailure {
+            name: "run_shell",
+            args: &empty_args,
+            error: "err",
+        });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::PermissionDenied {
+            tool_name: "write_file",
+            reason: "not allowed",
+        });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::Notification { message: "hi" });
+        assert!(matches!(action, HookAction::Continue));
+        let action = reg.dispatch(HookEvent::Setup);
+        assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[test]
+    fn post_tool_call_failure_dispatched_to_hook() {
+        let captured = Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let c = captured.clone();
+        struct CaptureFailure(Arc<std::sync::Mutex<Option<(String, String)>>>);
+        impl Hook for CaptureFailure {
+            fn on_event(&self, event: HookEvent) -> HookAction {
+                if let HookEvent::PostToolCallFailure { name, error, .. } = event {
+                    *self.0.lock().unwrap() = Some((name.to_string(), error.to_string()));
+                }
+                HookAction::Continue
+            }
+        }
+        let mut reg = HookRegistry::new();
+        reg.register(Arc::new(CaptureFailure(c)));
+        let args = serde_json::json!({"command": "rm -rf /"});
+        reg.dispatch(HookEvent::PostToolCallFailure {
+            name: "run_shell",
+            args: &args,
+            error: "permission denied",
+        });
+        let cap = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(cap.0, "run_shell");
+        assert_eq!(cap.1, "permission denied");
+    }
+
+    #[test]
+    fn user_prompt_submit_received_by_hook() {
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let c = captured.clone();
+        struct CapturePrompt(Arc<std::sync::Mutex<String>>);
+        impl Hook for CapturePrompt {
+            fn on_event(&self, event: HookEvent) -> HookAction {
+                if let HookEvent::UserPromptSubmit { content } = event {
+                    *self.0.lock().unwrap() = content.to_string();
+                }
+                HookAction::Continue
+            }
+        }
+        let mut reg = HookRegistry::new();
+        reg.register(Arc::new(CapturePrompt(c)));
+        reg.dispatch(HookEvent::UserPromptSubmit {
+            content: "test prompt",
+        });
+        assert_eq!(*captured.lock().unwrap(), "test prompt");
     }
 
     #[test]

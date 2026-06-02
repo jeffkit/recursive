@@ -112,6 +112,29 @@ pub enum UiEvent {
     McpServersLoaded {
         entries: Vec<crate::tui::ui::modal::McpEntry>,
     },
+
+    // ── Goal-210: hook progress display ─────────────────────────────────────
+    /// A hook started executing.
+    HookStarted {
+        hook_event: String,
+        hook_name: String,
+        status_message: Option<String>,
+    },
+    /// A hook produced incremental output (last stdout line).
+    HookProgress {
+        hook_event: String,
+        hook_name: String,
+        last_line: String,
+    },
+    /// A hook finished executing.
+    HookFinished {
+        hook_event: String,
+        hook_name: String,
+        outcome: String,
+        duration_ms: u64,
+    },
+    /// The hook produced a system message to surface to the user.
+    HookSystemMessage { text: String },
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
