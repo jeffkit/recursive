@@ -163,6 +163,7 @@ pub mod search;
 pub mod send_message;
 pub mod shell;
 pub mod spawn_worker;
+pub mod str_replace;
 pub mod sub_agent;
 pub mod team_manage;
 pub mod todo;
@@ -198,6 +199,7 @@ pub use search::SearchFiles;
 pub use send_message::{SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
 pub use spawn_worker::{SpawnWorkerTool, WorkerType};
+pub use str_replace::StrReplaceTool;
 pub use sub_agent::SubAgent;
 pub use team_manage::{TeamAddRole, TeamListRoles, TeamRemoveRole};
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
@@ -911,6 +913,7 @@ pub fn build_standard_tools(
         .register(Arc::new(ReadFile::new(workspace)))
         .register(Arc::new(WriteFile::new(workspace)))
         .register(Arc::new(ApplyPatch::new(workspace)))
+        .register(Arc::new(StrReplaceTool::new(workspace)))
         .register(Arc::new(ListDir::new(workspace)))
         .register(Arc::new(
             RunShell::new(workspace)
