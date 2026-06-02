@@ -5,41 +5,27 @@
 //!   - `repl`:          interactive loop, one goal per line.
 //!   - `tools`:         print the registered tool specs as JSON.
 
+mod cli;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
 use tracing::Level;
 
-use recursive::config::load_project_context;
-use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
-use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
 use recursive::SessionFile;
 use recursive::SessionWriter;
 use recursive::{
     config::Config,
-    llm::{
-        load_pricing_from_yaml, pricing_for, AnthropicProvider, LlmProvider, ModelPricing,
-        OpenAiProvider, TokenUsage,
-    },
-    tools::EpisodicRecall,
-    tools::{
-        ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
-        LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
-        RunSkillScript, ScheduleWakeup, ScratchpadDelete, ScratchpadGet, ScratchpadList,
-        SearchFiles, SpawnWorkerTool, SubAgent, TodoWriteTool, ToolTransport, WakeupSlot, WebFetch,
-        WorkingMemoryTool, WriteFile,
-    },
-    tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
-    AgentEvent, AgentRuntime, AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink,
-    FinishReason, NullSink, PlanningMode, RetryPolicy, SessionPersistenceSink, ToolRegistry,
-    TranscriptFile,
+    llm::{load_pricing_from_yaml, AnthropicProvider, LlmProvider, ModelPricing, OpenAiProvider},
+    tools::{ScheduleWakeup, WakeupSlot},
+    AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink, FinishReason, NullSink,
+    PlanningMode, RetryPolicy, SessionPersistenceSink, ToolRegistry,
 };
 
 #[derive(Parser, Debug)]
@@ -401,7 +387,7 @@ async fn main() -> anyhow::Result<()> {
 
     match effective_cmd {
         Cmd::Tools => {
-            let tools = build_tools(&config).await;
+            let tools = cli::builder::build_tools(&config).await;
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
@@ -417,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
-            let tools = build_tools(&config).await;
+            let tools = cli::builder::build_tools(&config).await;
             let tool_infos: Vec<recursive::http::ToolInfo> = tools
                 .specs()
                 .into_iter()
@@ -511,7 +497,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("shutdown: HTTP server stopped gracefully");
             Ok(())
         }
-        Cmd::Init => run_init().await,
+        Cmd::Init => cli::init::run_init().await,
         Cmd::Run { goal } => {
             let shutdown = shutdown_signal();
             run_once(
@@ -597,7 +583,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                     })?;
                     let shutdown = shutdown_signal();
-                    run_resumed(
+                    cli::resume::run_resumed(
                         config,
                         seed.to_vec(),
                         goal.join(" "),
@@ -622,7 +608,7 @@ async fn main() -> anyhow::Result<()> {
             from_file,
             orphans,
         } => {
-            cmd_resume(
+            cli::resume::cmd_resume(
                 config,
                 session,
                 from_file,
@@ -672,7 +658,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             SessionCmd::Show { session } => {
-                let path = resolve_session_path(&config.workspace, &session)?;
+                let path = cli::session::resolve_session_path(&config.workspace, &session)?;
                 if path.is_dir() {
                     // New JSONL session format (directory with transcript.jsonl + .meta.json)
                     let meta = recursive::session::SessionReader::load_meta(&path)
@@ -744,7 +730,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             SessionCmd::Delete { session, force } => {
-                let path = resolve_session_path(&config.workspace, &session)?;
+                let path = cli::session::resolve_session_path(&config.workspace, &session)?;
 
                 if !force {
                     eprint!("Delete session '{}'? [y/N] ", path.display());
@@ -774,7 +760,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             SessionCmd::Export { session, output } => {
-                let path = resolve_session_path(&config.workspace, &session)?;
+                let path = cli::session::resolve_session_path(&config.workspace, &session)?;
                 let exported = recursive::session::ExportedTranscript::from_session_dir(&path)?;
                 let json = serde_json::to_string_pretty(&exported)?;
                 if let Some(out) = output {
@@ -790,9 +776,15 @@ async fn main() -> anyhow::Result<()> {
                 to_turn,
                 force,
                 dry_run,
-            } => cmd_session_rewind(&config.workspace, &session, to_turn, force, dry_run),
+            } => cli::session::cmd_session_rewind(
+                &config.workspace,
+                &session,
+                to_turn,
+                force,
+                dry_run,
+            ),
             SessionCmd::MigrateLegacy { path } => {
-                cmd_session_migrate_legacy(&config.workspace, &path)
+                cli::session::cmd_session_migrate_legacy(&config.workspace, &path)
             }
         },
         Cmd::Config { cmd } => match cmd {
@@ -834,257 +826,8 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        Cmd::Migrate { dry_run } => cmd_migrate(&config.workspace, dry_run),
+        Cmd::Migrate { dry_run } => cli::session::cmd_migrate(&config.workspace, dry_run),
     }
-}
-
-fn cmd_migrate(workspace: &Path, dry_run: bool) -> anyhow::Result<()> {
-    let report = recursive::migrate_workspace(workspace, dry_run)?;
-    if report.already_clean {
-        println!(
-            "Workspace {} has no legacy in-tree state. Nothing to migrate.",
-            workspace.display()
-        );
-        return Ok(());
-    }
-    let prefix = if dry_run { "(dry-run) " } else { "" };
-    if !report.moved.is_empty() {
-        println!("{prefix}Moved:");
-        for (src, dst) in &report.moved {
-            println!("  {} -> {}", src.display(), dst.display());
-        }
-    }
-    if !report.skipped.is_empty() {
-        println!("{prefix}Skipped (destination already exists):");
-        for (src, dst) in &report.skipped {
-            println!(
-                "  {} stays put; {} already has data",
-                src.display(),
-                dst.display()
-            );
-        }
-        eprintln!(
-            "warning: some items were not migrated. Inspect the destinations and \
-             merge manually if needed."
-        );
-    }
-    if report.removed_empty_dotrecursive {
-        println!("{prefix}Removed empty <workspace>/.recursive/");
-    }
-    Ok(())
-}
-
-/// Resolve a session path from a user-provided string.
-///
-/// If the string is an existing file or directory path, return it as-is.
-/// Otherwise, search the workspace's session directory for a session whose
-/// filename or directory name contains the given string (case-insensitive).
-/// Returns an error if no match or multiple matches are found.
-fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(session);
-
-    // If it's an existing path, use it directly
-    if path.exists() {
-        return Ok(path);
-    }
-
-    // Search both the new (user data dir) and legacy (in-tree) session
-    // directories so users with un-migrated state can still address
-    // their old sessions.
-    let new_dir = recursive::user_sessions_dir(workspace).ok();
-    let legacy_dir = workspace.join(".recursive").join("sessions");
-    let search_dirs: Vec<PathBuf> = new_dir
-        .into_iter()
-        .chain(if legacy_dir.is_dir() {
-            Some(legacy_dir.clone())
-        } else {
-            None
-        })
-        .filter(|d| d.is_dir())
-        .collect();
-
-    if search_dirs.is_empty() {
-        anyhow::bail!(
-            "Session not found: '{}'. No sessions directory exists (looked in user data dir and {}).",
-            session,
-            legacy_dir.display()
-        );
-    }
-
-    let lower = session.to_lowercase();
-    let mut matches: Vec<PathBuf> = Vec::new();
-
-    for sessions_dir in &search_dirs {
-        // Search flat session files (old format: <timestamp>-<goal>.json)
-        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() {
-                    if let Some(name) = p.file_stem().and_then(|n| n.to_str()) {
-                        if name.to_lowercase().contains(&lower) {
-                            matches.push(p);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Search nested session directories (new JSONL format)
-        if let Ok(slug_entries) = std::fs::read_dir(sessions_dir) {
-            for slug_entry in slug_entries.flatten() {
-                let slug_dir = slug_entry.path();
-                if !slug_dir.is_dir() {
-                    continue;
-                }
-                if let Ok(session_entries) = std::fs::read_dir(&slug_dir) {
-                    for session_entry in session_entries.flatten() {
-                        let p = session_entry.path();
-                        if p.is_dir() {
-                            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                                if name.to_lowercase().contains(&lower) {
-                                    matches.push(p);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    match matches.len() {
-        0 => anyhow::bail!(
-            "Session not found: '{}'. Use 'recursive sessions list' to see available sessions.",
-            session
-        ),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => {
-            eprintln!("Multiple sessions match '{}' ({}):", session, n);
-            for m in &matches {
-                eprintln!("  {}", m.display());
-            }
-            anyhow::bail!("Ambiguous session identifier. Use a more specific path or ID.");
-        }
-    }
-}
-
-/// Implementation of `recursive sessions migrate-legacy`.
-///
-/// Reads a legacy single-file `.json` session (as written by
-/// `--session-out`) and emits an equivalent JSONL session
-/// directory under the user data dir, preserving the original
-/// `tool_registry_hash`. The migrated session can then be resumed
-/// by ID via `recursive resume <id>`.
-fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        anyhow::bail!("legacy session file does not exist: {}", path.display());
-    }
-    let legacy = SessionFile::read_from(path)
-        .with_context(|| format!("reading legacy session: {}", path.display()))?;
-
-    // Open a fresh JSONL session, then patch in the carried-over hash.
-    let mut writer =
-        SessionWriter::create(workspace, &legacy.goal, &legacy.model, &legacy.provider)
-            .with_context(|| "creating new JSONL session for migration")?;
-
-    // Replay the legacy transcript through `append` (no filter —
-    // we keep system messages for round-trip fidelity).
-    for msg in legacy.messages() {
-        writer.append(msg, None, None)?;
-    }
-    let session_dir = writer.session_dir().to_path_buf();
-    writer.finish("interrupted").ok();
-    drop(writer);
-
-    // Patch `.meta.json` to carry over the legacy `tool_registry_hash`.
-    let meta_path = session_dir.join(".meta.json");
-    let bytes = std::fs::read(&meta_path)?;
-    let mut meta: recursive::session::SessionMeta = serde_json::from_slice(&bytes)?;
-    meta.tool_registry_hash = Some(legacy.tool_registry_hash.clone());
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
-
-    println!("Migrated to: {}", session_dir.display());
-    println!(
-        "Resume with: recursive resume {}",
-        session_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("<id>"),
-    );
-    Ok(())
-}
-
-/// Implementation of `recursive sessions rewind`.
-fn cmd_session_rewind(
-    workspace: &Path,
-    session: &str,
-    to_turn: usize,
-    force: bool,
-    dry_run: bool,
-) -> anyhow::Result<()> {
-    let session_path = resolve_session_path(workspace, session)?;
-    // The session path returned by resolve_session_path is the session
-    // directory under .recursive/sessions/<slug>/<sid>/. The
-    // checkpoints log lives inside it.
-    if !session_path.is_dir() {
-        anyhow::bail!(
-            "Rewind requires a JSONL session directory; got file: {}",
-            session_path.display()
-        );
-    }
-    let log_path = session_path.join("checkpoints.jsonl");
-    if !log_path.exists() {
-        anyhow::bail!(
-            "No checkpoints.jsonl in {}. \
-             This session predates checkpointing or had it disabled.",
-            session_path.display()
-        );
-    }
-
-    let plan = recursive::plan_rewind(&log_path, to_turn)?;
-
-    println!("Rewind plan:");
-    println!("  target checkpoint: {}", plan.target);
-    println!("  turns to drop:     {:?}", plan.turns_to_drop);
-    println!("  files to restore:  {} path(s)", plan.touched_paths.len());
-    for p in &plan.touched_paths {
-        println!("    - {p}");
-    }
-    if dry_run {
-        println!("(--dry-run: not applied)");
-        return Ok(());
-    }
-
-    let repo = recursive::ShadowRepo::open(workspace).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot open shadow repo at {}/.recursive/shadow-git: {e}",
-            workspace.display()
-        )
-    })?;
-
-    let result = recursive::apply_rewind(&repo, &log_path, &plan, force)?;
-    println!(
-        "Rewind applied: {} restored, {} deleted, {} unchanged. {} turn(s) dropped from log.",
-        result.stats.restored,
-        result.stats.deleted,
-        result.stats.unchanged,
-        result.dropped_turns.len()
-    );
-
-    // Also truncate transcript.jsonl so the conversation state matches
-    // the restored workspace state.
-    match recursive::truncate_transcript_to_turn(&session_path, to_turn) {
-        Ok(stats) => {
-            println!(
-                "Transcript truncated: {} message(s) kept, {} dropped.",
-                stats.kept, stats.dropped
-            );
-        }
-        Err(e) => {
-            eprintln!("warning: transcript truncation failed: {e}");
-        }
-    }
-    Ok(())
 }
 
 /// Returns a [`CancellationToken`] that fires on SIGINT (Ctrl+C) or SIGTERM.
@@ -1143,1052 +886,6 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the tool registry, optionally registering MCP tools from a config file.
-async fn build_tools(config: &Config) -> ToolRegistry {
-    let root = &config.workspace;
-    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
-    let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
-    let mut registry = ToolRegistry::new(transport)
-        .register(Arc::new(ReadFile::new(root)))
-        .register(Arc::new(WriteFile::new(root)))
-        .register(Arc::new(ApplyPatch::new(root)))
-        .register(Arc::new(ListDir::new(root)))
-        .register(Arc::new(
-            RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
-        ))
-        .register(Arc::new(SearchFiles::new(root)))
-        .register(Arc::new(WebFetch::new()))
-        .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
-        .register(Arc::new(CheckBackground::new(bg_manager.clone())));
-    registry = registry.register(Arc::new(EstimateTokens::new(root)));
-    registry = registry
-        .register(Arc::new(Remember::new(root)))
-        .register(Arc::new(Recall::new(root)))
-        .register(Arc::new(Forget::new(root)));
-    registry = registry
-        .register(Arc::new(RememberFact::new(root)))
-        .register(Arc::new(RecallFact::new(root)))
-        .register(Arc::new(ForgetFact::new(root)))
-        .register(Arc::new(UpdateFact::new(root)));
-    registry = registry.register(Arc::new(EpisodicRecall::new(root)));
-    registry = registry
-        .register(Arc::new(WorkingMemoryTool::new(root)))
-        .register(Arc::new(ScratchpadGet::new(root)))
-        .register(Arc::new(ScratchpadDelete::new(root)))
-        .register(Arc::new(ScratchpadList::new(root)));
-    // Goal-167: register with a NullSink placeholder; AgentRuntimeBuilder::build()
-    // will overwrite this with a properly-wired sink.
-    registry = registry.register(Arc::new(TodoWriteTool::new(
-        Arc::new(std::sync::RwLock::new(vec![])),
-        Arc::new(recursive::NullSink),
-    )));
-    let skills = discover_loaded_skills(config);
-    if !skills.is_empty() {
-        registry = registry.register(Arc::new(LoadSkill::new(skills.clone())));
-        registry = registry.register(Arc::new(RunSkillScript::new(
-            skills,
-            root.clone(),
-            Duration::from_secs(config.shell_timeout_secs),
-        )));
-    }
-    // Note: read-only checkpoint tools (checkpoint_list / checkpoint_diff)
-    // are registered by the runtime when a session id is known, since
-    // they must be scoped to the current session's checkpoint chain.
-    if let Some(perms) = resolve_tool_permissions() {
-        registry = registry.with_permissions(perms);
-    }
-    // Goal-199: headless mode — configure external hooks.
-    {
-        let mut hook_dirs: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            hook_dirs.push(
-                std::path::PathBuf::from(home)
-                    .join(".recursive")
-                    .join("hooks"),
-            );
-        }
-        hook_dirs.push(config.workspace.join(".recursive").join("hooks"));
-        let hook_runner = recursive::hooks::ExternalHookRunner::discover(&hook_dirs);
-        registry = registry
-            .with_headless(config.headless)
-            .with_hook_runner(hook_runner);
-    }
-    registry
-}
-
-/// Resolve the active tool-permission configuration.
-///
-/// Resolution order:
-///   1. `RECURSIVE_TOOL_PERMISSIONS_FILE=<path>` env — TOML file
-///      whose top-level keys are `allow`, `deny`, `interactive`
-///      (matches [`recursive::permissions::OldPermissionsConfig`] verbatim).
-///   2. `~/.recursive/config.toml`'s `[permissions]` section.
-///   3. None — every tool allowed (back-compat default).
-///
-/// Errors during file read or TOML parse are logged to stderr and
-/// treated as "no permissions config" — a malformed file should not
-/// brick the CLI for unrelated commands.
-fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfig> {
-    if let Ok(path) = std::env::var("RECURSIVE_TOOL_PERMISSIONS_FILE") {
-        if !path.is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    match toml::from_str::<recursive::permissions::OldPermissionsConfig>(&content) {
-                        Ok(old) => return Some(old.into()),
-                        Err(e) => {
-                            eprintln!("permissions: failed to parse {path}: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("permissions: failed to read {path}: {e}");
-                }
-            }
-        }
-    }
-    let file_config = recursive::config_file::FileConfig::load().ok().flatten()?;
-    let section = file_config.permissions?;
-    let mode = section.mode.unwrap_or_default();
-    let mut layers = Vec::new();
-    if !section.allow.is_empty() || !section.deny.is_empty() || !section.interactive.is_empty() {
-        layers.push(recursive::permissions::PermissionLayer {
-            source: recursive::permissions::RuleSource::User,
-            allow: section.allow,
-            deny: section.deny,
-            interactive: section.interactive,
-        });
-    }
-    Some(recursive::permissions::LayeredPermissionsConfig { mode, layers })
-}
-
-/// Register MCP tools from a config file into the registry.
-async fn register_mcp_tools(
-    registry: &mut ToolRegistry,
-    workspace: &Path,
-    mcp_config_path: Option<PathBuf>,
-) {
-    let servers: Vec<McpServer> = if let Some(path) = &mcp_config_path {
-        // Explicit config file provided
-        if !path.exists() {
-            eprintln!("warning: MCP config file not found: {}", path.display());
-            return;
-        }
-        match load_mcp_config(path) {
-            Ok(s) => {
-                eprintln!(
-                    "mcp: loaded {} server(s) from explicit config `{}`",
-                    s.len(),
-                    path.display()
-                );
-                s
-            }
-            Err(e) => {
-                eprintln!("warning: failed to load MCP config: {e}");
-                return;
-            }
-        }
-    } else {
-        // Auto-discover from workspace
-        match discover_mcp_servers(workspace).await {
-            Ok(s) => {
-                if !s.is_empty() {
-                    eprintln!("mcp: auto-discovered {} server(s) from workspace", s.len());
-                }
-                s
-            }
-            Err(e) => {
-                eprintln!("warning: failed to auto-discover MCP servers: {e}");
-                return;
-            }
-        }
-    };
-    if servers.is_empty() {
-        return;
-    }
-    for server in &servers {
-        match register_mcp_server_tools(registry, server).await {
-            Ok(count) => {
-                eprintln!(
-                    "mcp: registered {} tool(s) from server `{}`",
-                    count, server.name
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to register MCP server `{}`: {e}",
-                    server.name
-                );
-            }
-        }
-    }
-}
-
-/// Spawn an MCP server, list its tools, and register them in the registry.
-async fn register_mcp_server_tools(
-    registry: &mut ToolRegistry,
-    server: &McpServer,
-) -> anyhow::Result<usize> {
-    let mut client = McpClient::spawn(server).await?;
-    let tool_specs = client.list_tools().await?;
-    let count = tool_specs.len();
-    let client = Arc::new(tokio::sync::Mutex::new(client));
-    for spec in tool_specs {
-        let tool = McpTool::new(client.clone(), spec, &server.name);
-        registry.register_mut(Arc::new(tool));
-    }
-    Ok(count)
-}
-
-/// Discover skills from configured search paths.
-/// Defaults: <workspace>/.recursive/skills/, ~/.recursive/skills/.
-/// Override with RECURSIVE_SKILL_PATHS=path1:path2 (colon-separated).
-fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
-    let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
-        env_paths.split(':').map(PathBuf::from).collect()
-    } else {
-        let mut defaults = vec![config.workspace.join(".recursive").join("skills")];
-        if let Some(home) = std::env::var_os("HOME") {
-            defaults.push(PathBuf::from(home).join(".recursive").join("skills"));
-        }
-        defaults
-    };
-    discover_skills(&paths)
-}
-
-/// Build an [`AgentRuntime`], optionally registering MCP tools from a config file.
-#[allow(clippy::too_many_arguments)]
-async fn build_runtime(
-    config: &Config,
-    max_transcript_chars: Option<usize>,
-    seed: Vec<recursive::message::Message>,
-    stream: bool,
-    plan_first: bool,
-    mcp_config: Option<PathBuf>,
-    hook_timing: bool,
-    goal: Option<&str>,
-    event_sink: Option<Arc<dyn EventSink>>,
-    shutdown_token: Option<tokio_util::sync::CancellationToken>,
-) -> anyhow::Result<AgentRuntime> {
-    let api_key = config.require_api_key()?;
-    let provider_type = &config.provider_type;
-    let retry = RetryPolicy {
-        max_retries: config.retry_max,
-        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-    };
-    let provider: Arc<dyn LlmProvider> = match provider_type.as_str() {
-        "anthropic" => {
-            let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
-                max_retries: config.retry_max,
-                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-            };
-            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)
-                .with_temperature(config.temperature)
-                .with_retry_policy(anthropic_retry);
-            Arc::new(anthropic)
-        }
-        _ => {
-            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
-                .with_temperature(config.temperature)
-                .with_retry_policy(retry);
-            Arc::new(openai)
-        }
-    };
-    let mut tools = build_tools(config).await;
-    register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
-
-    // Always attach a TouchedFiles collector so AgentRuntime can record
-    // per-turn file touches when checkpoints are enabled later via
-    // enable_checkpoints(). When checkpoints are disabled this is a
-    // no-op observer.
-    tools = tools.with_touched_files(Arc::new(std::sync::Mutex::new(
-        recursive::TouchedFiles::new(),
-    )));
-
-    let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1");
-    if sub_agent_enabled {
-        let max_depth: usize = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
-        let sub = SubAgent::new(
-            &config.workspace,
-            provider.clone(),
-            tools.clone(),
-            max_depth,
-            0,
-            None,
-        );
-        tools = tools.register(Arc::new(sub));
-
-        // Also register spawn_worker — the coordinator-pattern first-class
-        // delegation tool.  Uses the same depth limit as sub_agent.
-        let worker = SpawnWorkerTool::new(
-            &config.workspace,
-            provider.clone(),
-            tools.clone(),
-            max_depth,
-            0,
-            None,
-        );
-        tools = tools.register(Arc::new(worker));
-    }
-
-    let skills = discover_loaded_skills(config);
-    let project_context = load_project_context(&config.workspace);
-    let mut system_prompt = match (&project_context, skills.is_empty()) {
-        (Some(ctx), true) => {
-            format!(
-                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}",
-                ctx, config.system_prompt
-            )
-        }
-        (Some(ctx), false) => {
-            format!(
-                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}\n{}",
-                ctx,
-                config.system_prompt,
-                skill_index(&skills)
-            )
-        }
-        (None, true) => config.system_prompt.clone(),
-        (None, false) => format!("{}\n{}", config.system_prompt, skill_index(&skills)),
-    };
-    let injected = skills_for_injection(&skills, goal.unwrap_or(""));
-    if !injected.is_empty() {
-        let mut injection_block = String::new();
-        let mut total_chars = 0usize;
-        let max_injection_chars = 8192usize;
-        for (name, body) in &injected {
-            let snippet = format!(
-                "=== Skill: {name} (auto-loaded) ===
-{body}
-
-"
-            );
-            if total_chars + snippet.len() > max_injection_chars {
-                let remaining = max_injection_chars.saturating_sub(total_chars);
-                let truncated = if remaining > 20 {
-                    format!(
-                        "{}...
-[truncated]
-",
-                        &snippet[..remaining.saturating_sub(20)]
-                    )
-                } else {
-                    "[truncated]
-"
-                    .to_string()
-                };
-                injection_block.push_str(&truncated);
-                break;
-            }
-            injection_block.push_str(&snippet);
-            total_chars += snippet.len();
-        }
-        system_prompt = format!(
-            "{}
-
-{}",
-            system_prompt, injection_block
-        );
-    }
-    let system_prompt = if sub_agent_enabled {
-        format!(
-            "{}\n\nWhen you need to do focused research or scan files without polluting your main context, use the `sub_agent` tool. It spawns a fresh agent with its own transcript and a restricted tool set (read-only by default).",
-            system_prompt
-        )
-    } else {
-        system_prompt
-    };
-
-    let mut builder = AgentRuntimeBuilder::new()
-        .llm(provider)
-        .tools(tools)
-        .system_prompt(&system_prompt)
-        .max_steps(config.max_steps)
-        .streaming(stream);
-    if let Some(n) = max_transcript_chars {
-        builder = builder.max_transcript_chars(n);
-    }
-    if let Some(token) = shutdown_token {
-        builder = builder.shutdown_token(token);
-    }
-    if !seed.is_empty() {
-        builder = builder.seed_transcript(seed);
-    }
-    if let Ok(threshold) = std::env::var("RECURSIVE_COMPACT_THRESHOLD") {
-        if let Ok(n) = threshold.parse::<usize>() {
-            if n > 0 {
-                builder = builder.compactor(recursive::Compactor::new(n));
-            }
-        }
-    }
-    if hook_timing {
-        use recursive::hooks::HookRegistry;
-        let mut hooks = HookRegistry::new();
-        hooks.register(Arc::new(recursive::hooks::ToolTimingHook::new()));
-        builder = builder.hooks(hooks);
-    }
-    if plan_first {
-        builder = builder.planning_mode(PlanningMode::PlanFirst);
-    }
-    if let Some(sink) = event_sink {
-        builder = builder.event_sink(sink);
-    }
-    builder.build().map_err(Into::into)
-}
-
-/// Get pricing for a model: external pricing takes precedence, then falls back
-/// to hardcoded pricing_for().
-fn get_pricing(
-    model: &str,
-    external: &Option<HashMap<String, ModelPricing>>,
-) -> Option<ModelPricing> {
-    if let Some(ext) = external {
-        if let Some(pricing) = ext.get(model) {
-            return Some(*pricing);
-        }
-    }
-    pricing_for(model)
-}
-
-fn print_usage(
-    usage: TokenUsage,
-    model: &str,
-    total_llm_latency_ms: u64,
-    steps: usize,
-    external_pricing: &Option<HashMap<String, ModelPricing>>,
-) {
-    if usage.total_tokens > 0 {
-        eprintln!(
-            "tokens: prompt={} completion={} total={}",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        );
-        if usage.cache_hit_tokens > 0 {
-            let total_cache = usage.cache_hit_tokens + usage.cache_miss_tokens;
-            let hit_rate = if total_cache > 0 {
-                (usage.cache_hit_tokens as f64 / total_cache as f64) * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "cache: hit={} miss={} ({:.1}% hit rate)",
-                usage.cache_hit_tokens, usage.cache_miss_tokens, hit_rate
-            );
-        }
-        if let Some(pricing) = get_pricing(model, external_pricing) {
-            let cost = pricing.cost_usd(usage);
-            eprintln!("cost: ${:.4} ({})", cost, model);
-        }
-    }
-    if total_llm_latency_ms > 0 && steps > 0 {
-        let avg = total_llm_latency_ms / steps as u64;
-        eprintln!(
-            "llm latency: total={}ms avg={}ms over {} steps",
-            total_llm_latency_ms, avg, steps
-        );
-    }
-}
-
-fn print_finish_note(finish: &FinishReason) {
-    match finish {
-        FinishReason::TranscriptLimit { chars, limit } => {
-            eprintln!(
-                "note: stopped because transcript reached {} chars (limit {})",
-                chars, limit
-            );
-        }
-        FinishReason::Cancelled => {
-            eprintln!("shutdown: agent stopped at next step boundary after signal");
-        }
-        _ => {}
-    }
-}
-
-/// Save the transcript to disk if a path was requested. Always called
-/// before any exit-code decision so auto-resume (which keys off the
-/// transcript file's existence) works even when the agent terminated
-/// abnormally (e.g. BudgetExceeded).
-fn save_transcript(
-    outcome_transcript: &[recursive::message::Message],
-    outcome_steps: usize,
-    model: &str,
-    path: &Path,
-) -> anyhow::Result<()> {
-    let file = TranscriptFile::new(
-        outcome_transcript.to_vec(),
-        outcome_steps,
-        Some(model.into()),
-    );
-    file.write_to(path)?;
-    eprintln!(
-        "transcript: wrote {} messages to {}",
-        outcome_transcript.len(),
-        path.display()
-    );
-    Ok(())
-}
-
-/// Save a session file for non-success finishes.
-fn save_session(
-    transcript: &[recursive::message::Message],
-    steps: usize,
-    goal: String,
-    model: &str,
-    provider: &str,
-    tool_specs: &[recursive::ToolSpec],
-    path: &Path,
-) -> anyhow::Result<()> {
-    let session = SessionFile::new(
-        goal,
-        model.to_string(),
-        provider.to_string(),
-        tool_specs,
-        steps,
-        transcript.to_vec(),
-    );
-    session.write_to(path)?;
-    eprintln!(
-        "session: wrote {} messages to {}",
-        transcript.len(),
-        path.display()
-    );
-    Ok(())
-}
-
-/// Return Err iff the finish reason should propagate as a non-zero binary
-/// exit code so that self-improve.sh's auto-resume gate fires. The
-/// transcript has already been saved by the caller before this is called.
-///
-/// `Cancelled` is intentionally **not** an error: shutdown via SIGINT
-/// or SIGTERM is user-initiated, the saved transcript is intact, and
-/// self-improve.sh must NOT auto-resume something the user explicitly
-/// stopped. The fall-through `_ => Ok(())` covers it.
-fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
-    match finish {
-        FinishReason::BudgetExceeded => {
-            anyhow::bail!("agent exceeded step budget ({steps})")
-        }
-        _ => Ok(()),
-    }
-}
-
-fn finalize_session_writer(
-    session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
-    status: &str,
-) {
-    let Some(sw) = session_writer else { return };
-    match Arc::into_inner(sw) {
-        Some(mutex) => match mutex.lock() {
-            Ok(mut w) => {
-                if let Err(e) = w.finish(status) {
-                    eprintln!("session: failed to finalize: {e}");
-                } else {
-                    eprintln!(
-                        "session: saved {} message(s) to {}",
-                        w.message_count(),
-                        w.session_dir().display()
-                    );
-                }
-            }
-            Err(e) => eprintln!("session: failed to lock writer: {e}"),
-        },
-        None => eprintln!("session: writer still has other references; cannot finalize"),
-    }
-}
-
-fn finalize_cost_tracker(
-    cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>>,
-    usage: recursive::llm::TokenUsage,
-    llm_latency_ms: u64,
-    model: &str,
-) {
-    let Some(tracker) = cost_tracker else { return };
-    match tracker.into_inner() {
-        Ok(mut t) => {
-            t.record_usage(usage, llm_latency_ms);
-            if let Err(e) = t.finish() {
-                eprintln!("cost: failed to write cost.json: {e}");
-            } else {
-                eprintln!("cost: ${:.4} ({})", t.cost_usd().unwrap_or(0.0), model);
-            }
-        }
-        Err(e) => eprintln!("cost: failed to lock cost tracker: {e}"),
-    }
-}
-
-/// Resolve a `Cmd::Resume` invocation into a session directory and
-/// load its seed transcript. Returns the session_dir alongside the
-/// data needed to drive `run_resumed`.
-///
-/// Dispatch order:
-/// 1. `from_file` is set → must point at a JSONL session directory
-///    (a legacy `.json` is rejected with a migrate-legacy hint).
-/// 2. `session` is set → if it looks like a legacy `.json` path
-///    (ends with `.json`, or is an existing file), reject with the
-///    migrate hint. Otherwise resolve as ID/substring.
-/// 3. Neither → pick the most-recent active/interrupted session in
-///    the workspace via `list_sessions_sorted_by_updated_at`.
-fn resolve_resume_target(
-    workspace: &Path,
-    session: Option<String>,
-    from_file: Option<PathBuf>,
-) -> anyhow::Result<PathBuf> {
-    if let Some(path) = from_file {
-        if path.extension().and_then(|e| e.to_str()) == Some("json") || path.is_file() {
-            anyhow::bail!(legacy_resume_error(&path));
-        }
-        if !path.is_dir() {
-            anyhow::bail!(
-                "--from-file: {} is not a JSONL session directory",
-                path.display()
-            );
-        }
-        return Ok(path);
-    }
-
-    if let Some(s) = session {
-        // Legacy detection: `.json` extension or a real file path.
-        let candidate = PathBuf::from(&s);
-        if s.ends_with(".json") || candidate.is_file() {
-            anyhow::bail!(legacy_resume_error(&candidate));
-        }
-        let resolved = resolve_session_path(workspace, &s)?;
-        if resolved.is_file() {
-            // resolve_session_path can return a stray .json under
-            // the sessions tree.
-            anyhow::bail!(legacy_resume_error(&resolved));
-        }
-        return Ok(resolved);
-    }
-
-    // No arg → most-recent shortcut.
-    let sorted = recursive::session::SessionReader::list_sessions_sorted_by_updated_at(workspace)
-        .with_context(|| {
-        format!(
-            "scanning sessions for the workspace at {}",
-            workspace.display()
-        )
-    })?;
-    let pick = sorted
-        .into_iter()
-        .find(|(_, m)| matches!(m.status.as_str(), "active" | "interrupted"));
-    match pick {
-        Some((dir, _meta)) => Ok(dir),
-        None => anyhow::bail!(
-            "no active or interrupted session found in {}. \
-             Run `recursive sessions list` to see what's available.",
-            workspace.display()
-        ),
-    }
-}
-
-fn legacy_resume_error(path: &Path) -> String {
-    format!(
-        "legacy .json sessions are no longer resumable directly: {}\n\
-         Run `recursive sessions migrate-legacy {}` to convert it to the JSONL\n\
-         format, then `recursive resume <id>`.",
-        path.display(),
-        path.display()
-    )
-}
-
-/// `recursive resume` command: dispatches based on which of
-/// (positional `session`, `--from-file`, neither) was provided,
-/// validates the tool-registry hash, then opens the existing
-/// session for appending and resumes the run.
-#[allow(clippy::too_many_arguments)]
-/// Goal-153: how to handle orphan tool calls on resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrphanPolicy {
-    Ask,
-    Skip,
-    Redo,
-    Abort,
-}
-
-impl OrphanPolicy {
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "ask" => Ok(Self::Ask),
-            "skip" => Ok(Self::Skip),
-            "redo" => Ok(Self::Redo),
-            "abort" => Ok(Self::Abort),
-            other => anyhow::bail!(
-                "unknown --orphans value {other:?}; valid values: ask, skip, redo, abort"
-            ),
-        }
-    }
-}
-
-fn prompt_orphan_choice(tool_name: &str) -> std::io::Result<OrphanPolicy> {
-    use std::io::{stdin, stdout, Write};
-    let mut attempts = 0;
-    loop {
-        print!("  [r]edo  [s]kip  [a]bort  — choice for '{tool_name}': ");
-        stdout().flush()?;
-        let mut line = String::new();
-        stdin().read_line(&mut line)?;
-        match line.trim().to_ascii_lowercase().as_str() {
-            "r" | "redo" => return Ok(OrphanPolicy::Redo),
-            "s" | "skip" => return Ok(OrphanPolicy::Skip),
-            "a" | "abort" | "" => return Ok(OrphanPolicy::Abort),
-            _ => {
-                attempts += 1;
-                if attempts >= 3 {
-                    eprintln!("Too many invalid inputs — aborting.");
-                    return Ok(OrphanPolicy::Abort);
-                }
-                eprintln!("  Please enter r, s, or a.");
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_resume(
-    config: Config,
-    session: Option<String>,
-    from_file: Option<PathBuf>,
-    orphans_flag: Option<String>,
-    max_transcript_chars: Option<usize>,
-    transcript_out: Option<PathBuf>,
-    session_out: Option<PathBuf>,
-    json_mode: bool,
-    plan_first: bool,
-    mcp_config: Option<PathBuf>,
-    external_pricing: Option<HashMap<String, ModelPricing>>,
-    hook_timing: bool,
-    session_recording: bool,
-) -> anyhow::Result<()> {
-    let session_dir = resolve_resume_target(&config.workspace, session, from_file)?;
-    eprintln!("session: resuming from {}", session_dir.display());
-
-    // Load meta and validate the tool-registry hash up front (before
-    // building the runtime). If the hash mismatches, abort with the
-    // same error string the legacy SessionFile path used.
-    let meta = recursive::session::SessionReader::load_meta(&session_dir)
-        .with_context(|| format!("reading .meta.json for session {}", session_dir.display()))?;
-    let tools = build_tools(&config).await;
-    let specs = tools.specs();
-    let current_hash = recursive::session::hash_tool_specs(&specs);
-    match &meta.tool_registry_hash {
-        Some(stored) if stored != &current_hash => {
-            anyhow::bail!(
-                "tool registry hash mismatch: session has '{stored}', current is \
-                 '{current_hash}'. Tools have changed since the session was saved; \
-                 cannot resume."
-            );
-        }
-        Some(_) => {} // matches → continue
-        None => {
-            eprintln!(
-                "warning: session {} has no tool_registry_hash recorded \
-                 (pre-g151 record); resuming without validation.",
-                session_dir.display()
-            );
-        }
-    }
-
-    // ── Goal-153: orphan detection ───────────────────────────────────────────
-    let orphans = recursive::session::SessionReader::scan_orphan_tool_calls(&session_dir, &tools)?;
-    if !orphans.is_empty() {
-        use std::io::IsTerminal;
-
-        // Determine policy: explicit flag > TTY heuristic
-        let default_policy = if orphans_flag.is_none() {
-            if std::io::stdin().is_terminal() {
-                OrphanPolicy::Ask
-            } else {
-                OrphanPolicy::Abort
-            }
-        } else {
-            OrphanPolicy::Ask // overwritten below
-        };
-        let policy = match &orphans_flag {
-            Some(s) => OrphanPolicy::from_str(s)?,
-            None => default_policy,
-        };
-
-        eprintln!(
-            "\nSession {} has {} incomplete tool call(s):\n",
-            session_dir.display(),
-            orphans.len()
-        );
-        for orphan in &orphans {
-            eprintln!(
-                "  step {}  (call-id {})\n    side-effect class: {:?}",
-                orphan.tool_name, orphan.tool_call_id, orphan.side_effect_at_call
-            );
-        }
-        eprintln!();
-
-        match policy {
-            OrphanPolicy::Abort => {
-                anyhow::bail!(
-                    "session has {} orphan tool call(s); refusing to resume. \
-                     Use --orphans=skip, --orphans=redo, or --orphans=ask to proceed.",
-                    orphans.len()
-                );
-            }
-            OrphanPolicy::Skip => {
-                eprintln!("orphans: treating as completed (--orphans=skip)");
-                // Nothing to do — orphan tool calls will be treated as if
-                // they completed with an empty result. The resume seeded
-                // transcript already lacks their tool result messages, which
-                // the model will handle as "no result yet" context.
-            }
-            OrphanPolicy::Redo => {
-                // Warn if any are External — unsafe to auto-redo.
-                for o in &orphans {
-                    if o.side_effect_at_call == recursive::tools::ToolSideEffect::External {
-                        eprintln!(
-                            "WARNING: '{}' is classified External — re-executing \
-                             may duplicate side-effects (network calls, etc.).",
-                            o.tool_name
-                        );
-                    }
-                }
-                eprintln!("orphans: will re-execute on resume (--orphans=redo)");
-            }
-            OrphanPolicy::Ask => {
-                for orphan in &orphans {
-                    eprintln!(
-                        "Orphan: {}  (side-effect: {:?})",
-                        orphan.tool_name, orphan.side_effect_at_call
-                    );
-                    let choice = prompt_orphan_choice(&orphan.tool_name)?;
-                    match choice {
-                        OrphanPolicy::Abort => {
-                            anyhow::bail!("resume aborted by user.");
-                        }
-                        OrphanPolicy::Skip => {
-                            eprintln!("  → skipping '{}'", orphan.tool_name);
-                        }
-                        OrphanPolicy::Redo => {
-                            eprintln!("  → will redo '{}'", orphan.tool_name);
-                        }
-                        OrphanPolicy::Ask => unreachable!(),
-                    }
-                }
-            }
-        }
-        eprintln!();
-    }
-    // ── end orphan detection ─────────────────────────────────────────────────
-
-    // Open the existing session for appending. Acquires the
-    // SessionLock — refusing if another resume is already in flight.
-    let writer = if session_recording {
-        match SessionWriter::open_existing(&session_dir) {
-            Ok(w) => Some(Arc::new(std::sync::Mutex::new(w))),
-            Err(e) => {
-                anyhow::bail!("cannot open session {}: {e}", session_dir.display());
-            }
-        }
-    } else {
-        None
-    };
-
-    // Load the seeded transcript (everything that's already on disk).
-    let seed = recursive::session::SessionReader::load_messages(&session_dir)
-        .with_context(|| format!("loading transcript for session {}", session_dir.display()))?;
-    let goal = meta.goal.clone();
-
-    let shutdown = shutdown_signal();
-    run_resumed(
-        config,
-        seed,
-        goal,
-        max_transcript_chars,
-        transcript_out,
-        session_out,
-        json_mode,
-        plan_first,
-        mcp_config,
-        external_pricing,
-        hook_timing,
-        false, // session_recording — we already opened the writer below
-        shutdown,
-        writer,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_resumed(
-    config: Config,
-    seed: Vec<recursive::message::Message>,
-    goal: String,
-    max_transcript_chars: Option<usize>,
-    transcript_out: Option<PathBuf>,
-    session_out: Option<PathBuf>,
-    json_mode: bool,
-    plan_first: bool,
-    mcp_config: Option<PathBuf>,
-    external_pricing: Option<HashMap<String, ModelPricing>>,
-    hook_timing: bool,
-    session: bool,
-    shutdown: tokio_util::sync::CancellationToken,
-    // Goal 151: when resuming an existing JSONL session by ID, the
-    // caller has already opened a `SessionWriter::open_existing`
-    // for the session_dir. Pass it in so we don't create a fresh
-    // session directory and so msg_NNN numbering continues.
-    // `None` means "create a new session writer if `session` is
-    // true" (the legacy `--resume-from <transcript.json>` path).
-    existing_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
-) -> anyhow::Result<()> {
-    let seed_len = seed.len();
-
-    let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> =
-        if let Some(w) = existing_writer {
-            eprintln!(
-                "session: appending to {}",
-                w.lock().unwrap().session_dir().display()
-            );
-            Some(w)
-        } else if session {
-            match SessionWriter::create(
-                &config.workspace,
-                &goal,
-                &config.model,
-                &config.provider_type,
-            ) {
-                Ok(writer) => {
-                    eprintln!("session: recording to {}", writer.session_dir().display());
-                    Some(Arc::new(std::sync::Mutex::new(writer)))
-                }
-                Err(e) => {
-                    eprintln!("session: failed to create session writer: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-    let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
-        session_writer.as_ref().map(|w| {
-            let session_dir = w.lock().unwrap().session_dir().to_path_buf();
-            std::sync::Mutex::new(recursive::cost::CostTracker::new(
-                session_dir,
-                &config.model,
-                &config.provider_type,
-                &external_pricing,
-            ))
-        })
-    } else {
-        None
-    };
-
-    let (channel_sink, event_rx) = ChannelSink::new();
-    let event_sink: Arc<dyn EventSink> = if let Some(ref sw) = session_writer {
-        Arc::new(CompositeSink::new(vec![
-            Box::new(channel_sink) as Box<dyn EventSink>,
-            Box::new(SessionPersistenceSink::new(sw.clone())) as Box<dyn EventSink>,
-        ]))
-    } else {
-        Arc::new(channel_sink)
-    };
-    let mut runtime = build_runtime(
-        &config,
-        max_transcript_chars,
-        seed,
-        false,
-        plan_first,
-        mcp_config,
-        hook_timing,
-        Some(&goal),
-        Some(event_sink),
-        Some(shutdown.clone()),
-    )
-    .await?;
-
-    // Wire up per-turn checkpoints (resume path).
-    if let Some(ref sw) = session_writer {
-        match recursive::ShadowRepo::open(&config.workspace) {
-            Ok(repo) => {
-                let session_id = sw.lock().unwrap().session_id().to_string();
-                let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
-                let log_path = session_dir.join("checkpoints.jsonl");
-                let touched = runtime.kernel().tools().touched_files();
-                if let Err(e) =
-                    runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
-                {
-                    eprintln!("checkpoint: failed to enable, continuing without: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("checkpoint: shadow repo unavailable, continuing without: {e}");
-            }
-        }
-    }
-
-    let tool_specs = runtime.kernel().tools().specs();
-
-    if !json_mode {
-        eprintln!("resuming from {seed_len} seeded message(s)");
-    }
-    let printer = if json_mode {
-        tokio::spawn(stream_events_json(event_rx))
-    } else {
-        tokio::spawn(stream_events(event_rx))
-    };
-
-    let outcome = runtime.run(goal.clone()).await?;
-
-    let transcript = runtime.transcript().to_vec();
-    drop(runtime);
-    printer.await.ok();
-
-    if !json_mode {
-        if let Some(ref msg) = outcome.final_text {
-            println!("\n=== final ===\n{msg}");
-        }
-        print_usage(
-            outcome.total_usage,
-            &config.model,
-            outcome.llm_latency_ms,
-            outcome.steps,
-            &external_pricing,
-        );
-        print_finish_note(&outcome.finish_reason);
-    }
-
-    let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-        "success"
-    } else {
-        "incomplete"
-    };
-    finalize_session_writer(session_writer, finish_status);
-    finalize_cost_tracker(
-        cost_tracker,
-        outcome.total_usage,
-        outcome.llm_latency_ms,
-        &config.model,
-    );
-
-    if let Some(path) = transcript_out {
-        save_transcript(&transcript, outcome.steps, &config.model, &path)?;
-    }
-    if let Some(path) = session_out {
-        if !matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-            save_session(
-                &transcript,
-                outcome.steps,
-                goal,
-                &config.model,
-                &config.provider_type,
-                &tool_specs,
-                &path,
-            )?;
-        }
-    }
-    exit_for_finish(&outcome.finish_reason, outcome.steps)
-}
-
 /// Run the agent in loop mode: agent self-schedules wakeups until it stops.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
@@ -2214,8 +911,8 @@ async fn run_loop(
 
     // Build tools with ScheduleWakeup registered; must happen before build_runtime
     // so the slot is shared between the tool and the runtime loop.
-    let mut tools = build_tools(&config).await;
-    register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
+    let mut tools = cli::builder::build_tools(&config).await;
+    cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
     tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot.clone())));
 
     // Build LLM provider
@@ -2289,7 +986,7 @@ async fn run_loop(
     }
 
     if let Some(last) = outcomes.last() {
-        let _ = exit_for_finish(&last.finish_reason, last.steps);
+        let _ = cli::output::exit_for_finish(&last.finish_reason, last.steps);
     }
 
     Ok(())
@@ -2359,7 +1056,7 @@ async fn run_once(
     } else {
         Arc::new(channel_sink)
     };
-    let mut runtime = build_runtime(
+    let mut runtime = cli::builder::build_runtime(
         &config,
         max_transcript_chars,
         Vec::new(),
@@ -2400,9 +1097,9 @@ async fn run_once(
     let tool_specs = runtime.kernel().tools().specs();
 
     let printer = if json_mode {
-        tokio::spawn(stream_events_json(event_rx))
+        tokio::spawn(cli::output::stream_events_json(event_rx))
     } else {
-        tokio::spawn(stream_events(event_rx))
+        tokio::spawn(cli::output::stream_events(event_rx))
     };
 
     let outcome = loop {
@@ -2441,14 +1138,14 @@ async fn run_once(
         if let Some(ref msg) = outcome.final_text {
             println!("\n=== final ===\n{msg}");
         }
-        print_usage(
+        cli::output::print_usage(
             outcome.total_usage,
             &config.model,
             outcome.llm_latency_ms,
             outcome.steps,
             &external_pricing,
         );
-        print_finish_note(&outcome.finish_reason);
+        cli::output::print_finish_note(&outcome.finish_reason);
     }
 
     let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
@@ -2456,8 +1153,8 @@ async fn run_once(
     } else {
         "incomplete"
     };
-    finalize_session_writer(session_writer, finish_status);
-    finalize_cost_tracker(
+    cli::output::finalize_session_writer(session_writer, finish_status);
+    cli::output::finalize_cost_tracker(
         cost_tracker,
         outcome.total_usage,
         outcome.llm_latency_ms,
@@ -2465,11 +1162,11 @@ async fn run_once(
     );
 
     if let Some(path) = transcript_out {
-        save_transcript(&transcript, outcome.steps, &config.model, &path)?;
+        cli::output::save_transcript(&transcript, outcome.steps, &config.model, &path)?;
     }
     if let Some(path) = session_out {
         if !matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-            save_session(
+            cli::output::save_session(
                 &transcript,
                 outcome.steps,
                 goal,
@@ -2480,195 +1177,7 @@ async fn run_once(
             )?;
         }
     }
-    exit_for_finish(&outcome.finish_reason, outcome.steps)
-}
-
-/// Interactive setup wizard: walk the user through provider/model/key config.
-/// Interactive setup wizard: walk the user through provider/model/key config.
-async fn run_init() -> anyhow::Result<()> {
-    use std::io::{self, Write};
-
-    println!("recursive init — interactive setup\n");
-
-    let config_path = recursive::config_file::config_file_path()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-
-    if config_path.exists() {
-        println!("  Existing config: {}\n", config_path.display());
-    }
-
-    // 1. Vendor selection via preset catalog
-    let presets = recursive::all_presets();
-    let anthropic_preset = recursive::find_preset("anthropic").unwrap();
-
-    println!("Select a provider (or press Enter for Anthropic):\n");
-
-    // Group by mainland_accessible
-    let international: Vec<_> = presets.iter().filter(|p| !p.mainland_accessible).collect();
-    let mainland: Vec<_> = presets
-        .iter()
-        .filter(|p| p.mainland_accessible && p.id != "ollama")
-        .collect();
-    let local: Vec<_> = presets.iter().filter(|p| p.id == "ollama").collect();
-
-    let mut all_entries: Vec<&recursive::ProviderPreset> = Vec::new();
-
-    println!("  International:");
-    for (i, p) in international.iter().enumerate() {
-        let num = i + 1;
-        let key_hint = if p.key_env.is_empty() {
-            "(no key needed)".to_string()
-        } else {
-            format!("[{}]", p.key_env)
-        };
-        println!(
-            "    {num:>2}) {:<20} {:<30} {}",
-            p.name, p.default_model, key_hint
-        );
-        all_entries.push(p);
-    }
-
-    println!("\n  Mainland China (直连):");
-    for (i, p) in mainland.iter().enumerate() {
-        let num = all_entries.len() + i + 1;
-        let key_hint = if p.key_env.is_empty() {
-            "(no key needed)".to_string()
-        } else {
-            format!("[{}]", p.key_env)
-        };
-        println!(
-            "    {num:>2}) {:<20} {:<30} {}",
-            p.name, p.default_model, key_hint
-        );
-        all_entries.push(p);
-    }
-
-    println!("\n  Local:");
-    for (i, p) in local.iter().enumerate() {
-        let num = all_entries.len() + i + 1;
-        let key_hint = if p.key_env.is_empty() {
-            "(no key needed)".to_string()
-        } else {
-            format!("[{}]", p.key_env)
-        };
-        println!(
-            "    {num:>2}) {:<20} {:<30} {}",
-            p.name, p.default_model, key_hint
-        );
-        all_entries.push(p);
-    }
-
-    println!("\n  Other: enter 0 to specify custom API base manually");
-    print!("\nChoice [1]: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-
-    let (provider_type, api_base, default_model, key_env, key_url) = if trimmed == "0" {
-        // Manual fallback
-        println!("\nAPI base URL");
-        print!("API base: ");
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        let manual_base = input.trim().to_string();
-
-        let manual_provider_type = if manual_base.contains("anthropic") {
-            "anthropic"
-        } else {
-            "openai"
-        };
-        let manual_default_model = if manual_base.contains("deepseek") {
-            "deepseek-chat"
-        } else if manual_base.contains("bigmodel") {
-            "glm-4-flash"
-        } else if manual_base.contains("anthropic") {
-            "claude-sonnet-4-20250514"
-        } else if manual_base.contains("localhost") || manual_base.contains("11434") {
-            "qwen2.5-coder"
-        } else {
-            "gpt-4o-mini"
-        };
-        (
-            manual_provider_type.to_string(),
-            manual_base,
-            manual_default_model.to_string(),
-            String::new(),
-            String::new(),
-        )
-    } else if trimmed.is_empty() {
-        // Default: Anthropic
-        (
-            anthropic_preset.provider_type.clone(),
-            anthropic_preset.api_base.clone(),
-            anthropic_preset.default_model.clone(),
-            anthropic_preset.key_env.clone(),
-            anthropic_preset.key_url.clone(),
-        )
-    } else {
-        // Try numeric selection
-        let idx: usize = trimmed.parse().unwrap_or(1);
-        let preset = if idx > 0 && idx <= all_entries.len() {
-            all_entries[idx - 1]
-        } else {
-            // Try matching by id
-            recursive::find_preset(trimmed).unwrap_or(anthropic_preset)
-        };
-        (
-            preset.provider_type.clone(),
-            preset.api_base.clone(),
-            preset.default_model.clone(),
-            preset.key_env.clone(),
-            preset.key_url.clone(),
-        )
-    };
-
-    // 2. Model (with preset default)
-    print!("\nModel [{}]: ", default_model);
-    io::stdout().flush()?;
-    input.clear();
-    io::stdin().read_line(&mut input)?;
-    let model = if input.trim().is_empty() {
-        default_model.to_string()
-    } else {
-        input.trim().to_string()
-    };
-
-    // 3. API key (skip if key_env is empty, e.g. Ollama)
-    let api_key = if key_env.is_empty() {
-        String::new()
-    } else {
-        if !key_url.is_empty() {
-            println!("\n  Get your key at: {key_url}");
-        }
-        print!("\nAPI key ({}): ", key_env);
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        let key = input.trim().to_string();
-        if key.is_empty() {
-            println!("\n  Warning: no API key set. You can add it later:");
-            println!("    recursive config set provider.api_key <KEY>");
-        }
-        key
-    };
-
-    // Write config
-    recursive::config_file::set_value("provider.type", &provider_type)?;
-    recursive::config_file::set_value("provider.api_base", &api_base)?;
-    recursive::config_file::set_value("provider.model", &model)?;
-    if !api_key.is_empty() {
-        recursive::config_file::set_value("provider.api_key", &api_key)?;
-    }
-
-    println!("\n  Config saved to: {}", config_path.display());
-    println!("\n  You can now run:");
-    println!("    recursive                — interactive REPL");
-    println!("    recursive -p \"hello\"     — one-shot");
-    println!("    recursive config show    — verify settings");
-
-    Ok(())
+    cli::output::exit_for_finish(&outcome.finish_reason, outcome.steps)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2699,7 +1208,7 @@ async fn repl(
 
     // Build runtime ONCE — MCP servers are spawned here and stay alive.
     // Start with NullSink; we swap in a fresh ChannelSink per turn.
-    let mut runtime = build_runtime(
+    let mut runtime = cli::builder::build_runtime(
         &config,
         max_transcript_chars,
         Vec::new(),
@@ -2745,9 +1254,9 @@ async fn repl(
         runtime.set_event_sink(Arc::new(sink));
 
         let printer = if json_mode {
-            tokio::spawn(stream_events_json(event_rx))
+            tokio::spawn(cli::output::stream_events_json(event_rx))
         } else {
-            tokio::spawn(stream_events_repl(event_rx))
+            tokio::spawn(cli::output::stream_events_repl(event_rx))
         };
 
         match runtime.run(goal.to_string()).await {
@@ -2757,14 +1266,14 @@ async fn repl(
                 printer.await.ok();
 
                 if !json_mode {
-                    print_usage(
+                    cli::output::print_usage(
                         outcome.total_usage,
                         &config.model,
                         outcome.llm_latency_ms,
                         outcome.steps,
                         &external_pricing,
                     );
-                    print_finish_note(&outcome.finish_reason);
+                    cli::output::print_finish_note(&outcome.finish_reason);
                 }
 
                 total_turns += 1;
@@ -2782,91 +1291,6 @@ async fn repl(
     Ok(())
 }
 
-async fn stream_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            AgentEvent::AssistantText { ref text, step } if !text.trim().is_empty() => {
-                println!("[step {step}] assistant: {text}");
-            }
-            AgentEvent::ToolCall {
-                ref name,
-                ref arguments,
-                step,
-                ..
-            } => {
-                println!("[step {step}] -> {name} {arguments}");
-            }
-            AgentEvent::ToolResult {
-                ref name,
-                ref output,
-                step,
-                ..
-            } => {
-                let preview = if output.len() > 800 {
-                    let mut end = 800.min(output.len());
-                    while end > 0 && !output.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}\n...[truncated]", &output[..end])
-                } else {
-                    output.clone()
-                };
-                println!("[step {step}] <- {name}\n{preview}");
-            }
-            AgentEvent::TurnFinished { ref reason, steps } => {
-                println!("[done after {steps} steps] reason: {reason}");
-            }
-            AgentEvent::Latency { step, llm_ms } => {
-                println!("[step {step}] llm latency: {llm_ms}ms");
-            }
-            AgentEvent::Compacted {
-                removed,
-                kept,
-                summary_chars,
-                step,
-            } => {
-                println!(
-                    "[step {step}] compacted {removed} msgs -> {kept} kept + {summary_chars}-char summary"
-                );
-            }
-            AgentEvent::PlanProposed { ref plan_text, .. } => {
-                println!("[plan] proposed: {plan_text}");
-            }
-            AgentEvent::PlanConfirmed => {
-                println!("[plan] confirmed");
-            }
-            AgentEvent::PlanRejected { ref reason } => {
-                println!("[plan] rejected: {reason}");
-            }
-            _ => {}
-        }
-    }
-}
-
-/// REPL-specific event handler: clean output without step prefixes on assistant text.
-/// Tool calls are shown briefly; assistant text is printed directly.
-async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            AgentEvent::AssistantText { ref text, .. } if !text.trim().is_empty() => {
-                println!("{text}");
-            }
-            AgentEvent::ToolCall { ref name, .. } => {
-                eprintln!("  ↳ {name}");
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
-    while let Some(ev) = rx.recv().await {
-        if let Ok(line) = serde_json::to_string(&ev) {
-            println!("{line}");
-        }
-    }
-}
-
 /// Run as an MCP stdio server.
 ///
 /// Reads newline-delimited JSON-RPC 2.0 requests from stdin, dispatches
@@ -2878,7 +1302,7 @@ async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
 async fn run_mcp_server_stdio(config: Config, _mcp_config: Option<PathBuf>) -> anyhow::Result<()> {
     // Build the tool registry (local tools only — no MCP servers, since
     // we *are* the MCP server).
-    let tools = build_tools(&config).await;
+    let tools = cli::builder::build_tools(&config).await;
 
     // We don't need an LLM provider or agent for the stdio server mode.
     // The tools are called directly via dispatch_request.
@@ -3029,6 +1453,7 @@ async fn dispatch_request_via_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::builder::build_runtime;
 
     fn dummy_config(tmp: &std::path::Path) -> Config {
         Config {
