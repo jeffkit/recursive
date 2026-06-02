@@ -39,6 +39,7 @@ pub mod runtime_goal;
 pub mod session;
 pub mod session_lock;
 pub mod skills;
+pub mod storage;
 pub mod tools;
 pub mod transcript;
 #[cfg(feature = "tui")]
@@ -101,6 +102,7 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
+pub use storage::{AgentCheckpointState, NoopSessionStore, SessionStore, StorageBackend};
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
     PlanApprovalGate, PlanApprovalResult, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch,
