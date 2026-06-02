@@ -140,7 +140,12 @@ impl Tool for SearchFiles {
                 };
                 if is_match {
                     let truncated = if line.len() > DEFAULT_MAX_LINE_LEN {
-                        format!("{}…", &line[..DEFAULT_MAX_LINE_LEN])
+                        // walk back from the byte limit to a char boundary
+                        let mut end = DEFAULT_MAX_LINE_LEN;
+                        while !line.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}…", &line[..end])
                     } else {
                         line.to_string()
                     };
