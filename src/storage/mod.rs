@@ -21,6 +21,11 @@
 pub mod local;
 pub use local::LocalStorageBackend;
 
+#[cfg(feature = "cloud-runtime")]
+pub mod redis;
+#[cfg(feature = "cloud-runtime")]
+pub use redis::RedisSessionStore;
+
 use crate::error::Result;
 use crate::message::Message;
 use std::future::Future;

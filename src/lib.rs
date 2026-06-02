@@ -103,6 +103,8 @@ pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
     SkillScript, SkillSection,
 };
+#[cfg(feature = "cloud-runtime")]
+pub use storage::RedisSessionStore;
 pub use storage::{
     AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
