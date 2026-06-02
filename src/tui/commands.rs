@@ -183,6 +183,14 @@ impl CommandRegistry {
                     usage: "/mcp",
                     handler: CommandHandler::Async(cmd_mcp),
                 },
+                // Goal-174: theme picker.
+                CommandSpec {
+                    name: "theme",
+                    aliases: &[],
+                    summary: "Switch colour theme (dark / light / solarized)",
+                    usage: "/theme <name>",
+                    handler: CommandHandler::Sync(cmd_theme),
+                },
             ],
             skill_commands: Vec::new(),
         }
@@ -463,6 +471,32 @@ fn cmd_mcp(_app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
     vec![UserAction::ListMcpServers]
 }
 
+fn cmd_theme(app: &mut AppState, args: &[String]) -> CommandOutcome {
+    use crate::tui::ui::theme::ALL_THEMES;
+    let theme_list: Vec<&str> = ALL_THEMES.iter().map(|t| t.name).collect();
+    if args.is_empty() {
+        let names = theme_list.join(", ");
+        app.push_system(format!(
+            "Current theme: {}. Available: {}",
+            app.theme.name, names
+        ));
+        return CommandOutcome::Done;
+    }
+    let requested = args[0].to_lowercase();
+    let found = crate::tui::ui::theme::find_theme(&requested);
+    if found.name == requested {
+        app.theme = found;
+        app.push_system(format!("Theme switched to '{}'.", found.name));
+    } else {
+        let names = theme_list.join(", ");
+        app.push_error(format!(
+            "Unknown theme '{}'. Available: {}",
+            requested, names
+        ));
+    }
+    CommandOutcome::Done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +532,31 @@ mod tests {
         assert!(matches!(spec.handler, CommandHandler::Async(_)));
     }
 
+    // Goal-174: theme command tests
+    #[test]
+    fn cmd_theme_switches_to_light() {
+        let mut app = App::new();
+        assert_eq!(app.theme.name, "dark");
+        invoke(&mut app, "theme light");
+        assert_eq!(app.theme.name, "light");
+    }
+
+    #[test]
+    fn cmd_theme_no_args_prints_current() {
+        let mut app = App::new();
+        let blocks_before = app.blocks.len();
+        invoke(&mut app, "theme");
+        assert!(app.blocks.len() > blocks_before);
+    }
+
+    #[test]
+    fn cmd_theme_unknown_shows_error() {
+        let mut app = App::new();
+        invoke(&mut app, "theme neon");
+        // Theme unchanged (still dark) because neon isn't known.
+        assert_eq!(app.theme.name, "dark");
+    }
+
     #[test]
     fn registry_finds_help_by_name_and_alias() {
         let r = CommandRegistry::default_set();
@@ -510,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_includes_all_fourteen_commands() {
+    fn registry_includes_all_fifteen_commands() {
         let r = CommandRegistry::default_set();
         let names: Vec<&str> = r.commands().iter().map(|c| c.name).collect();
         for expected in &[
@@ -527,14 +586,15 @@ mod tests {
             "permissions",
             "goal",
             "mcp",
+            "theme",
         ] {
             assert!(
                 names.contains(expected),
                 "missing /{expected}: have {names:?}"
             );
         }
-        // 11 built-in commands plus /goal, /resume, and /mcp = 14.
-        assert_eq!(names.len(), 14);
+        // 11 built-in commands plus /goal, /resume, /mcp, and /theme = 15.
+        assert_eq!(names.len(), 15);
     }
 
     #[test]
@@ -548,7 +608,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 14);
+        assert_eq!(hits.len(), 15);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();
