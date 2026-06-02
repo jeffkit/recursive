@@ -4,6 +4,7 @@ use crate::agent::PlanningMode;
 use crate::event::NullSink;
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
+use crate::permissions::PermissionMode;
 use crate::{Config, LlmProvider};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -311,6 +312,7 @@ impl AgentPool {
             permission_hook: None,
             planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            permission_mode: PermissionMode::Allow,
             mailbox: None,
         };
 

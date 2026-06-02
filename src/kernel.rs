@@ -31,6 +31,7 @@ use crate::event::{AgentEvent, EventSink};
 use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, TokenUsage, ToolSpec};
 use crate::message::Message;
+use crate::permissions::PermissionMode;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,10 @@ pub struct TurnContext {
     /// Goal-165: shared flag that enables agent-driven read-only plan mode.
     /// When `true`, write tools are blocked until `exit_plan_mode` is called.
     pub exploring_plan_mode: Arc<AtomicBool>,
+
+    /// Goal-190: default permission mode for tools not covered by explicit
+    /// config lists. Mirrors `PermissionsConfig.mode` for quick access.
+    pub permission_mode: PermissionMode,
 
     /// Optional mailbox for mid-run message injection from a coordinator.
     ///
@@ -288,6 +293,7 @@ impl AgentKernel {
             plan_buffer: ctx.plan_buffer,
             plan_confirmed: ctx.plan_confirmed,
             exploring_plan_mode: ctx.exploring_plan_mode,
+            permission_mode: ctx.permission_mode,
             shutdown_token: self.shutdown_token.clone(),
             mailbox: ctx.mailbox,
         };

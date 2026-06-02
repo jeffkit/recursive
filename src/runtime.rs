@@ -295,6 +295,8 @@ impl AgentRuntime {
             planning_mode: self.planning_mode.clone(),
             // Goal-165: share the plan mode flag so RunCore can gate write tools.
             exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
+            // Goal-190: share the permission mode so RunCore can check plan-mode tools.
+            permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
         };
 
@@ -1162,15 +1164,23 @@ impl AgentRuntimeBuilder {
 
         // Goal-165: create the plan approval gate and register the plan mode tools.
         let plan_approval_gate = Arc::new(PlanApprovalGate::new());
-        kernel
-            .tools_mut()
-            .register_mut(Arc::new(EnterPlanModeTool::new(plan_approval_gate.clone())));
-        kernel
-            .tools_mut()
-            .register_mut(Arc::new(ExitPlanModeTool::new(
-                plan_approval_gate.clone(),
-                event_sink.clone(),
-            )));
+        // Goal-190: pass permissions config to plan mode tools so they can
+        // report which tools are in Plan mode.
+        let permissions_arc = kernel.tools().permissions_config().cloned().map(Arc::new);
+        kernel.tools_mut().register_mut({
+            let mut tool = EnterPlanModeTool::new(plan_approval_gate.clone());
+            if let Some(ref perms) = permissions_arc {
+                tool = tool.with_permissions(perms.clone());
+            }
+            Arc::new(tool)
+        });
+        kernel.tools_mut().register_mut({
+            let mut tool = ExitPlanModeTool::new(plan_approval_gate.clone(), event_sink.clone());
+            if let Some(ref perms) = permissions_arc {
+                tool = tool.with_permissions(perms.clone());
+            }
+            Arc::new(tool)
+        });
 
         Ok(AgentRuntime {
             kernel,

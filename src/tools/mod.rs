@@ -12,7 +12,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
-use crate::permissions::{Permission, PermissionsConfig};
+use crate::permissions::{Permission, PermissionMode, PermissionsConfig};
 
 // ── Goal-153: Tool side-effect classification + audit types ─────────────────
 
@@ -242,6 +242,9 @@ pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     transport: Arc<dyn ToolTransport>,
     permissions: Option<PermissionsConfig>,
+    /// Default permission mode for tools not covered by the config lists.
+    /// Mirrors `PermissionsConfig.mode` for quick access without config lookup.
+    permission_mode: PermissionMode,
     touched: Option<Arc<Mutex<TouchedFiles>>>,
     /// Goal-161: optional runtime permission hook. When `Some`, called
     /// before every tool invocation. `None` means allow all (backward-
@@ -318,6 +321,7 @@ impl ToolRegistry {
             tools: BTreeMap::new(),
             transport,
             permissions: None,
+            permission_mode: PermissionMode::Allow,
             touched: None,
             permission_hook: None,
         }
@@ -339,6 +343,7 @@ impl ToolRegistry {
             tools: BTreeMap::new(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
+            permission_mode: self.permission_mode,
             touched: self.touched.clone(),
             permission_hook: self.permission_hook.clone(),
         }
@@ -365,8 +370,28 @@ impl ToolRegistry {
 
     /// Set the permissions configuration for this registry.
     pub fn with_permissions(mut self, permissions: PermissionsConfig) -> Self {
+        self.permission_mode = permissions.mode;
         self.permissions = Some(permissions);
         self
+    }
+
+    /// Return the current permission mode.
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
+    }
+
+    /// Return a reference to the current permissions config, if any.
+    pub fn permissions_config(&self) -> Option<&PermissionsConfig> {
+        self.permissions.as_ref()
+    }
+
+    /// Check whether a tool requires plan mode according to the current
+    /// permissions configuration.
+    pub fn is_plan_mode(&self, tool_name: &str) -> bool {
+        self.permissions
+            .as_ref()
+            .map(|p| p.is_plan_mode(tool_name))
+            .unwrap_or(false)
     }
 
     /// Attach a [`TouchedFiles`] collector. Tool invocations on
@@ -687,7 +712,7 @@ pub fn build_standard_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::PermissionsConfig;
+    use crate::permissions::{PermissionMode, PermissionsConfig};
     use async_trait::async_trait;
 
     struct Echo;
@@ -741,6 +766,8 @@ mod tests {
             allow: vec!["echo".into()],
             deny: vec!["echo".into()],
             interactive: vec![],
+            plan: vec![],
+            mode: PermissionMode::Allow,
         };
         let reg = ToolRegistry::local()
             .with_permissions(config)

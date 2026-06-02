@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::hooks::{Hook, HookAction, HookEvent, HookRegistry};
 use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
+use crate::permissions::PermissionMode;
 use crate::tools::ToolRegistry;
 
 /// Threshold for consecutive identical failing tool calls before declaring stuck.
@@ -294,6 +295,9 @@ pub(crate) struct RunCore<'a> {
     /// Goal-165: shared flag set by `EnterPlanModeTool`; blocks write tools
     /// while the agent is in read-only exploring / planning mode.
     pub(crate) exploring_plan_mode: Arc<AtomicBool>,
+    /// Goal-190: default permission mode for tools not covered by explicit
+    /// config lists. Used to check if a tool requires plan mode.
+    pub(crate) permission_mode: PermissionMode,
     /// Optional cancellation token. When cancelled, the step loop
     /// terminates at the next step boundary with
     /// [`FinishReason::Cancelled`].
@@ -449,6 +453,28 @@ impl<'a> RunCore<'a> {
                          You are in read-only planning mode. \
                          Explore freely with read tools, then call \
                          exit_plan_mode with your plan.",
+                        call.name
+                    ),
+                    call.arguments.clone(),
+                    None,
+                ));
+                continue;
+            }
+
+            // Goal-190: if a tool is in Plan mode and we're not in plan mode,
+            // tell the agent to enter plan mode first.
+            if !self.exploring_plan_mode.load(Ordering::Relaxed)
+                && self.tools.is_plan_mode(&call.name)
+                && call.name != "enter_plan_mode"
+                && call.name != "exit_plan_mode"
+            {
+                results.push((
+                    call.id.clone(),
+                    call.name.clone(),
+                    format!(
+                        "ERROR: Tool '{}' requires plan mode. \
+                         Call enter_plan_mode first to explore and plan, \
+                         then call exit_plan_mode with your plan before using this tool.",
                         call.name
                     ),
                     call.arguments.clone(),
@@ -1203,6 +1229,7 @@ impl Agent {
             plan_confirmed: self.plan_confirmed,
             // Legacy Agent path: plan mode 2.0 not wired up, default to off.
             exploring_plan_mode: Arc::new(AtomicBool::new(false)),
+            permission_mode: PermissionMode::Allow,
             shutdown_token: self.shutdown_token.clone(),
             // Legacy Agent path: mailbox not wired up, default to None.
             mailbox: None,

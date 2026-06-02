@@ -82,6 +82,7 @@ pub use paths::{
     legacy_paths_in_workspace, user_data_dir, user_scratchpad_path, user_sessions_dir,
     user_shadow_git_dir, user_workspace_dir, workspace_hash,
 };
+pub use permissions::PermissionMode;
 pub use providers::{all_presets, find_preset, ProviderPreset};
 pub use rewind::{
     apply_rewind, checkpoint_log_path, detect_conflicts, plan_rewind, ConflictReport, RewindPlan,

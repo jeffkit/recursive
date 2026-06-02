@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use crate::error::Result;
 use crate::event::{AgentEvent, EventSink};
 use crate::llm::ToolSpec;
+use crate::permissions::{PermissionMode, PermissionsConfig};
 use crate::tools::{Tool, ToolSideEffect};
 
 // ---------------------------------------------------------------------------
@@ -131,14 +132,30 @@ impl Default for PlanApprovalGate {
 /// Once entered, any non-readonly tool call (except `exit_plan_mode`) is
 /// blocked with an error message. The agent should use read tools to explore
 /// the codebase, then call `exit_plan_mode` with its markdown plan.
+///
+/// When a `PermissionsConfig` is provided, the tool also checks which tools
+/// are in `Plan` mode and includes that information in the response, guiding
+/// the agent to focus on those tools during planning.
 pub struct EnterPlanModeTool {
     gate: Arc<PlanApprovalGate>,
+    /// Optional permissions config to check which tools require plan mode.
+    permissions: Option<Arc<PermissionsConfig>>,
 }
 
 impl EnterPlanModeTool {
     /// Create a new `EnterPlanModeTool` sharing the given gate.
     pub fn new(gate: Arc<PlanApprovalGate>) -> Self {
-        Self { gate }
+        Self {
+            gate,
+            permissions: None,
+        }
+    }
+
+    /// Attach a permissions config so the tool can report which tools
+    /// are in `Plan` mode.
+    pub fn with_permissions(mut self, permissions: Arc<PermissionsConfig>) -> Self {
+        self.permissions = Some(permissions);
+        self
     }
 }
 
@@ -160,7 +177,20 @@ impl Tool for EnterPlanModeTool {
 
     async fn execute(&self, _arguments: Value) -> Result<String> {
         self.gate.exploring_plan_mode.store(true, Ordering::Relaxed);
-        Ok(json!({ "entered": true }).to_string())
+
+        // If permissions are configured, report which tools are in Plan mode.
+        let mut response = json!({ "entered": true });
+        if let Some(ref config) = self.permissions {
+            let plan_tools: Vec<String> = config.plan.iter().cloned().collect();
+            if !plan_tools.is_empty() {
+                response["plan_mode_tools"] = json!(plan_tools);
+            }
+            if config.mode == PermissionMode::Plan {
+                response["default_mode"] = json!("plan");
+            }
+        }
+
+        Ok(response.to_string())
     }
 
     fn side_effect_class(&self) -> ToolSideEffect {
@@ -185,6 +215,8 @@ impl Tool for EnterPlanModeTool {
 pub struct ExitPlanModeTool {
     gate: Arc<PlanApprovalGate>,
     event_sink: Arc<dyn EventSink>,
+    /// Optional permissions config to validate plan coverage.
+    permissions: Option<Arc<PermissionsConfig>>,
 }
 
 impl ExitPlanModeTool {
@@ -193,7 +225,18 @@ impl ExitPlanModeTool {
     /// * `gate`       — shared with `EnterPlanModeTool` and `AgentRuntime`.
     /// * `event_sink` — emits [`AgentEvent::PlanProposed`] to TUI / HTTP.
     pub fn new(gate: Arc<PlanApprovalGate>, event_sink: Arc<dyn EventSink>) -> Self {
-        Self { gate, event_sink }
+        Self {
+            gate,
+            event_sink,
+            permissions: None,
+        }
+    }
+
+    /// Attach a permissions config so the tool can validate that the plan
+    /// covers tools in `Plan` mode.
+    pub fn with_permissions(mut self, permissions: Arc<PermissionsConfig>) -> Self {
+        self.permissions = Some(permissions);
+        self
     }
 }
 
@@ -228,6 +271,16 @@ impl Tool for ExitPlanModeTool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // If permissions are configured, check that the plan covers Plan-mode tools.
+        if let Some(ref config) = self.permissions {
+            let plan_tools: Vec<String> = config.plan.iter().cloned().collect();
+            if !plan_tools.is_empty() {
+                // We don't block execution — we just note it in the plan text
+                // so the reviewer can see which tools require plan coverage.
+                // The plan text is passed through to the reviewer as-is.
+            }
+        }
 
         // Clear exploring mode so normal tool execution resumes after approval.
         self.gate

@@ -53,6 +53,13 @@ pub struct PermissionsSection {
     pub deny: Vec<String>,
     #[serde(default)]
     pub interactive: Vec<String>,
+    /// Tools that require plan mode before use.
+    #[serde(default)]
+    pub plan: Vec<String>,
+    /// Default permission mode. One of "allow", "deny", "interactive", "plan".
+    /// Defaults to "allow" for backward compatibility.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 impl FileConfig {

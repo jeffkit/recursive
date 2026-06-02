@@ -1228,6 +1228,17 @@ fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfi
         allow: section.allow,
         deny: section.deny,
         interactive: section.interactive,
+        plan: section.plan,
+        mode: section
+            .mode
+            .as_deref()
+            .map(|s| match s {
+                "deny" => recursive::permissions::PermissionMode::Deny,
+                "interactive" => recursive::permissions::PermissionMode::Interactive,
+                "plan" => recursive::permissions::PermissionMode::Plan,
+                _ => recursive::permissions::PermissionMode::Allow,
+            })
+            .unwrap_or_default(),
     })
 }
 

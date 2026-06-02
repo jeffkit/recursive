@@ -28,6 +28,7 @@ use crate::event::NullSink;
 use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
+use crate::permissions::PermissionMode;
 use crate::tools::{Tool, ToolRegistry};
 
 // ---------------------------------------------------------------------------
@@ -276,6 +277,7 @@ impl Tool for SubAgent {
             permission_hook: self.permission_hook.clone(),
             planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            permission_mode: PermissionMode::Allow,
             mailbox: None,
         };
 

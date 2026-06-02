@@ -938,7 +938,7 @@ mod shutdown {
 
 mod permissions {
     use recursive::error::Error;
-    use recursive::permissions::PermissionsConfig;
+    use recursive::permissions::{PermissionMode, PermissionsConfig};
     use recursive::tools::{
         BackgroundJobManager, LocalTransport, ReadFile, RunBackground, RunShell, ToolRegistry,
         WriteFile,
@@ -969,6 +969,8 @@ mod permissions {
             allow: vec![],
             deny: vec!["run_shell".into()],
             interactive: vec![],
+            plan: vec![],
+            mode: PermissionMode::Allow,
         };
         let (registry, _tmp) = registry_with(perms);
         let result = registry
@@ -987,6 +989,8 @@ mod permissions {
             allow: vec!["read_file".into()],
             deny: vec![],
             interactive: vec![],
+            plan: vec![],
+            mode: PermissionMode::Allow,
         };
         let (registry, _tmp) = registry_with(perms);
         let result = registry
@@ -1005,6 +1009,8 @@ mod permissions {
             allow: vec![],
             deny: vec!["run_*".into()],
             interactive: vec![],
+            plan: vec![],
+            mode: PermissionMode::Allow,
         };
         let (registry, _tmp) = registry_with(perms);
 
