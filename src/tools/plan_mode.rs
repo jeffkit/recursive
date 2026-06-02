@@ -181,7 +181,7 @@ impl Tool for EnterPlanModeTool {
         // If permissions are configured, report which tools are in Plan mode.
         let mut response = json!({ "entered": true });
         if let Some(ref config) = self.permissions {
-            if config.mode == PermissionMode::Plan {
+            if matches!(config.mode, PermissionMode::Plan { .. }) {
                 response["default_mode"] = json!("plan");
             }
         }

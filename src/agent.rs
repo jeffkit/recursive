@@ -1230,7 +1230,7 @@ impl Agent {
             plan_confirmed: self.plan_confirmed,
             // Legacy Agent path: plan mode 2.0 not wired up, default to off.
             exploring_plan_mode: Arc::new(AtomicBool::new(false)),
-            permission_mode: PermissionMode::Allow,
+            permission_mode: PermissionMode::Default,
             shutdown_token: self.shutdown_token.clone(),
             // Legacy Agent path: mailbox not wired up, default to None.
             mailbox: None,

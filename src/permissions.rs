@@ -5,13 +5,16 @@
 //! semantics:
 //!
 //! - **deny**: any layer denies → denied (union)
-//! - **allow**: all relevant layers must allow (intersection; empty allow = pass)
+//! - **allow**: any layer allows → allowed (union)
 //! - **interactive**: any layer marks as interactive → interactive (union)
+//!
+//! The session-level [`PermissionMode`] provides additional runtime behaviour
+//! on top of the static rules (plan-mode write blocking, bypass, dont-ask, etc.).
 //!
 //! The legacy [`PermissionsConfig`] type alias provides backward compatibility
 //! for existing callers.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The reason why a permission decision was made.
 ///
@@ -55,25 +58,152 @@ impl Permission {
     }
 }
 
-/// The permission mode for a tool or the default mode for the config.
+/// The session-wide permission mode, determining runtime behaviour for
+/// tool dispatch.
 ///
-/// Determines how a tool is gated:
-/// - `Allow`: tool is allowed without extra checks.
-/// - `Deny`: tool is denied unconditionally.
-/// - `Interactive`: tool requires user confirmation before running.
-/// - `Plan`: tool requires the agent to enter plan mode first.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// This is separate from the per-tool allow/deny/interactive lists in
+/// the layered config — the mode acts as a top-level policy on top of
+/// those static rules.
+///
+/// ## Serde
+///
+/// This enum supports both the **new** camelCase names and the **old**
+/// snake_case names for backward compatibility:
+///
+/// | New                  | Old aliases           |
+/// |----------------------|-----------------------|
+/// | `default`            | `allow`               |
+/// | `acceptEdits`        | —                     |
+/// | `bypassPermissions`  | —                     |
+/// | `dontAsk`            | `deny`, `interactive` |
+/// | `plan` (string)      | `plan`                |
+///
+/// The `plan` variant also accepts an object form:
+/// `{"prePlanMode": "default", "bypassAvailable": false}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
-    /// Tool is allowed without extra checks.
+    /// Normal mode: follow static allow/deny rules, defer to Passthrough
+    /// for unknown tools.
+    #[serde(alias = "allow")]
     #[default]
-    Allow,
-    /// Tool is denied unconditionally.
-    Deny,
-    /// Tool requires interactive user confirmation.
-    Interactive,
-    /// Tool requires the agent to enter plan mode before use.
-    Plan,
+    Default,
+    /// Auto-allow write tools within the workspace.
+    AcceptEdits,
+    /// Skip all rule checks; every tool is allowed.
+    BypassPermissions,
+    /// Deny any tool that is in the interactive list.
+    #[serde(alias = "deny")]
+    #[serde(alias = "interactive")]
+    DontAsk,
+    /// Plan mode: blocks write tools (except `exit_plan_mode`).
+    /// `pre_plan_mode` stores the mode to restore on exit.
+    /// `bypass_available` allows writes to bypass plan-mode blocking
+    /// when the agent was in `BypassPermissions` before entering plan.
+    Plan {
+        /// The mode that was active before entering plan mode.
+        pre_plan_mode: Box<PermissionMode>,
+        /// Whether write tools are allowed during plan mode
+        /// (only true when pre-plan mode was BypassPermissions).
+        bypass_available: bool,
+    },
+}
+
+// Custom Deserialize to handle both old and new string names as well as
+// the object form for the Plan variant.
+impl<'de> Deserialize<'de> for PermissionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct PermissionModeVisitor;
+
+        impl<'de> Visitor<'de> for PermissionModeVisitor {
+            type Value = PermissionMode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "a permission mode string (\"default\", \"acceptEdits\", \
+                     \"bypassPermissions\", \"dontAsk\", \"plan\", \
+                     or legacy \"allow\"/\"deny\"/\"interactive\") \
+                     or a Plan object {\"prePlanMode\": \"...\", \"bypassAvailable\": bool}",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<PermissionMode, E> {
+                match s {
+                    "default" | "allow" => Ok(PermissionMode::Default),
+                    "acceptEdits" | "accept_edits" => Ok(PermissionMode::AcceptEdits),
+                    "bypassPermissions" | "bypass_permissions" => {
+                        Ok(PermissionMode::BypassPermissions)
+                    }
+                    "dontAsk" | "dont_ask" | "deny" | "interactive" => Ok(PermissionMode::DontAsk),
+                    "plan" => Ok(PermissionMode::Plan {
+                        pre_plan_mode: Box::new(PermissionMode::Default),
+                        bypass_available: false,
+                    }),
+                    _ => Err(de::Error::unknown_variant(
+                        s,
+                        &[
+                            "default",
+                            "acceptEdits",
+                            "bypassPermissions",
+                            "dontAsk",
+                            "plan",
+                        ],
+                    )),
+                }
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<PermissionMode, M::Error> {
+                // Object form: {"pre_plan_mode": "...", "bypass_available": bool}
+                // Also accepts camelCase keys: "prePlanMode", "bypassAvailable"
+                let mut pre_plan_mode: Option<PermissionMode> = None;
+                let mut bypass_available: Option<bool> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "prePlanMode" | "pre_plan_mode" => {
+                            if pre_plan_mode.is_some() {
+                                return Err(de::Error::duplicate_field("pre_plan_mode"));
+                            }
+                            pre_plan_mode = Some(map.next_value()?);
+                        }
+                        "bypassAvailable" | "bypass_available" => {
+                            if bypass_available.is_some() {
+                                return Err(de::Error::duplicate_field("bypass_available"));
+                            }
+                            bypass_available = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(
+                                other,
+                                &[
+                                    "pre_plan_mode",
+                                    "prePlanMode",
+                                    "bypass_available",
+                                    "bypassAvailable",
+                                ],
+                            ));
+                        }
+                    }
+                }
+
+                let pre_plan_mode =
+                    pre_plan_mode.ok_or_else(|| de::Error::missing_field("pre_plan_mode"))?;
+                let bypass_available = bypass_available.unwrap_or(false);
+                Ok(PermissionMode::Plan {
+                    pre_plan_mode: Box::new(pre_plan_mode),
+                    bypass_available,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PermissionModeVisitor)
+    }
 }
 
 // ── Layered permission system ──────────────────────────────────────────────
@@ -81,7 +211,7 @@ pub enum PermissionMode {
 /// The source/origin of a permission layer.
 ///
 /// Priority (highest first): Session > Project > User.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 pub enum RuleSource {
     /// Highest priority — set at runtime via API (Goal 196).
     Session,
@@ -93,7 +223,7 @@ pub enum RuleSource {
 }
 
 /// A single layer of permission rules from one source.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PermissionLayer {
     /// Which source this layer comes from.
     pub source: RuleSource,
@@ -110,91 +240,101 @@ pub struct PermissionLayer {
 /// Layers are ordered by priority (highest first). The merging semantics
 /// for `check_static` are:
 /// - **deny**: any layer denies → denied (union)
-/// - **allow**: all layers with non-empty allow must match (intersection);
-///   if no layer has a non-empty allow list, all tools pass.
+/// - **allow**: any layer allows → allowed (union)
 /// - **interactive**: any layer marks as interactive → interactive (union)
-#[derive(Debug, Clone, Default)]
+///
+/// The [`mode`](Self::mode) field provides session-level behaviour on top
+/// of these static rules.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LayeredPermissionsConfig {
-    /// Default permission mode for tools not covered by any layer's lists.
+    /// Session-wide permission mode.
+    #[serde(default)]
     pub mode: PermissionMode,
     /// Ordered layers (highest priority first).
+    #[serde(default)]
     pub layers: Vec<PermissionLayer>,
 }
 
 impl LayeredPermissionsConfig {
-    /// Check whether a tool is allowed or denied across all layers.
+    /// Check whether a tool is allowed or denied, taking the current
+    /// [`PermissionMode`] into account.
     ///
-    /// Deny rules take priority over everything. If any layer denies the
-    /// tool, it is denied. Otherwise, if any layer has a non-empty allow
-    /// list, the tool must match at least one allow pattern across all
-    /// such layers. If no layer has a non-empty allow list, all tools
-    /// are allowed (subject to deny).
-    pub fn check_static(&self, tool_name: &str) -> Permission {
-        // Deny: any layer denies → denied (union)
-        for layer in &self.layers {
-            for pattern in &layer.deny {
-                if matches_pattern(pattern, tool_name) {
-                    return Permission::Denied(
-                        DecisionReason::Rule {
-                            source: layer.source,
-                            pattern: pattern.clone(),
-                        },
-                        format!(
-                            "tool `{tool_name}` is denied by pattern `{pattern}` (source: {:?})",
-                            layer.source
-                        ),
-                    );
-                }
+    /// Checks are applied in priority order (highest first):
+    ///
+    /// 1. **Plan mode** — blocks write tools unless `bypass_available`
+    ///    (always exempts `exit_plan_mode`).
+    /// 2. **BypassPermissions** — skips all rules, allows everything.
+    /// 3. **DontAsk** — denies tools in the interactive list.
+    /// 4. **AcceptEdits** — auto-allows write tools.
+    /// 5. **Deny/allow rules** — static deny (union) then allow (union).
+    /// 6. **Default** — falls through with `Passthrough`.
+    pub fn check_static(&self, tool_name: &str, is_readonly: bool) -> Permission {
+        // 1. Plan mode: block write tools (exit_plan_mode exempted)
+        if let PermissionMode::Plan {
+            bypass_available, ..
+        } = &self.mode
+        {
+            if !is_readonly && tool_name != "exit_plan_mode" && !bypass_available {
+                return Permission::Denied(
+                    DecisionReason::Mode(self.mode.clone()),
+                    "write tools are blocked in plan mode".to_string(),
+                );
             }
+            // bypass_available: write ops continue to rule checks
         }
 
-        // Allow: all layers with non-empty allow must match (intersection).
-        // If no layer has a non-empty allow list, all tools pass.
-        let any_layer_has_allow = self.layers.iter().any(|l| !l.allow.is_empty());
-        if any_layer_has_allow {
-            let all_layers_allow = self.layers.iter().all(|layer| {
-                layer.allow.is_empty() || layer.allow.iter().any(|p| matches_pattern(p, tool_name))
-            });
-            if !all_layers_allow {
+        // 2. BypassPermissions: skip all rules
+        if matches!(self.mode, PermissionMode::BypassPermissions) {
+            return Permission::Allowed(DecisionReason::Mode(self.mode.clone()));
+        }
+
+        // 3. DontAsk: deny interactive tools
+        if matches!(self.mode, PermissionMode::DontAsk) && self.any_interactive(tool_name) {
+            return Permission::Denied(
+                DecisionReason::Mode(self.mode.clone()),
+                format!("tool `{tool_name}` requires interaction but mode is dontAsk"),
+            );
+        }
+
+        // 4. AcceptEdits: auto-allow write tools
+        if matches!(self.mode, PermissionMode::AcceptEdits) && !is_readonly {
+            return Permission::Allowed(DecisionReason::Mode(self.mode.clone()));
+        }
+
+        // 5. Static deny/allow rules (union semantics)
+        for pattern in self.all_deny() {
+            if matches_pattern(pattern, tool_name) {
                 return Permission::Denied(
                     DecisionReason::Rule {
                         source: RuleSource::User,
-                        pattern: tool_name.to_string(),
+                        pattern: pattern.to_string(),
                     },
-                    format!("tool `{tool_name}` is not in the allow list of all layers"),
+                    format!("tool `{tool_name}` matches deny pattern `{pattern}`"),
                 );
             }
         }
-
-        // Fall back to the default mode
-        match self.mode {
-            PermissionMode::Deny => Permission::Denied(
-                DecisionReason::Mode(PermissionMode::Deny),
-                format!("tool `{tool_name}` is denied by default mode `deny`"),
-            ),
-            PermissionMode::Allow | PermissionMode::Interactive | PermissionMode::Plan => {
-                Permission::Allowed(DecisionReason::Mode(self.mode))
+        for pattern in self.all_allow() {
+            if matches_pattern(pattern, tool_name) {
+                return Permission::Allowed(DecisionReason::Rule {
+                    source: RuleSource::User,
+                    pattern: pattern.to_string(),
+                });
             }
         }
+
+        // 6. Default: defer to upper layer
+        Permission::Passthrough
     }
 
     /// Check whether a tool requires plan mode.
     ///
-    /// Returns `true` if the tool is in plan mode (either via any layer's
-    /// plan list or via the default `mode`). Returns `false` if the tool
-    /// is denied (denied tools never require plan mode).
+    /// Returns `true` if the session mode is `Plan`.
+    /// Returns `false` if the tool is denied.
     pub fn is_plan_mode(&self, tool_name: &str) -> bool {
-        // Denied tools are never plan mode
-        if matches!(self.check_static(tool_name), Permission::Denied(_, _)) {
-            return false;
-        }
-        // Check default mode
-        if self.mode == PermissionMode::Plan {
-            return true;
-        }
-        // Check any layer's plan list (via plan field — not stored in PermissionLayer yet,
-        // but we check the mode field which is the default)
-        false
+        let _ = tool_name; // kept for API compatibility (Goal 194 will use it)
+                           // Plan mode is determined by the session mode directly, not via
+                           // check_static (which would trigger write-block for non-readonly tools).
+        matches!(self.mode, PermissionMode::Plan { .. })
     }
 
     /// Check whether a tool requires interactive confirmation.
@@ -203,21 +343,19 @@ impl LayeredPermissionsConfig {
     /// Returns `false` if the tool is denied (denied tools never prompt).
     pub fn is_interactive(&self, tool_name: &str) -> bool {
         // Denied tools are never interactive
-        if matches!(self.check_static(tool_name), Permission::Denied(_, _)) {
+        if matches!(
+            self.check_static(tool_name, false),
+            Permission::Denied(_, _)
+        ) {
             return false;
         }
-        // Interactive: any layer marks → interactive (union)
-        for layer in &self.layers {
-            if layer
-                .interactive
-                .iter()
-                .any(|p| matches_pattern(p, tool_name))
-            {
-                return true;
-            }
-        }
-        // Check default mode
-        self.mode == PermissionMode::Interactive
+        self.any_interactive(tool_name)
+    }
+
+    /// Returns `true` if the tool is in the interactive list of any layer.
+    pub fn any_interactive(&self, tool_name: &str) -> bool {
+        self.all_interactive()
+            .any(|p| matches_pattern(p, tool_name))
     }
 
     /// Iterate over all deny patterns across all layers.
@@ -268,7 +406,9 @@ pub struct OldPermissionsConfig {
     #[serde(default)]
     pub plan: Vec<String>,
     /// Default permission mode for tools not covered by the lists above.
-    /// Defaults to `Allow` for backward compatibility.
+    /// Accepts both old ("allow", "deny", "interactive", "plan") and
+    /// new ("default", "acceptEdits", "bypassPermissions", "dontAsk")
+    /// value names.
     #[serde(default)]
     pub mode: PermissionMode,
 }
@@ -320,45 +460,368 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    // ── PermissionMode ────────────────────────────────────────────────────
+    // ── PermissionMode serde ──────────────────────────────────────────────
 
     #[test]
-    fn test_permission_mode_default_is_allow() {
-        assert_eq!(PermissionMode::default(), PermissionMode::Allow);
+    fn test_permission_mode_default_is_default() {
+        assert_eq!(PermissionMode::default(), PermissionMode::Default);
     }
 
     #[test]
-    fn test_permission_mode_deserialize_allow() {
-        let mode: PermissionMode = serde_json::from_str("\"allow\"").unwrap();
-        assert_eq!(mode, PermissionMode::Allow);
+    fn test_permission_mode_deserialize_default() {
+        let mode: PermissionMode = serde_json::from_str("\"default\"").unwrap();
+        assert_eq!(mode, PermissionMode::Default);
     }
 
     #[test]
-    fn test_permission_mode_deserialize_deny() {
-        let mode: PermissionMode = serde_json::from_str("\"deny\"").unwrap();
-        assert_eq!(mode, PermissionMode::Deny);
+    fn test_permission_mode_deserialize_accept_edits() {
+        let mode: PermissionMode = serde_json::from_str("\"acceptEdits\"").unwrap();
+        assert_eq!(mode, PermissionMode::AcceptEdits);
     }
 
     #[test]
-    fn test_permission_mode_deserialize_interactive() {
-        let mode: PermissionMode = serde_json::from_str("\"interactive\"").unwrap();
-        assert_eq!(mode, PermissionMode::Interactive);
+    fn test_permission_mode_deserialize_bypass() {
+        let mode: PermissionMode = serde_json::from_str("\"bypassPermissions\"").unwrap();
+        assert_eq!(mode, PermissionMode::BypassPermissions);
     }
 
     #[test]
-    fn test_permission_mode_deserialize_plan() {
+    fn test_permission_mode_deserialize_dont_ask() {
+        let mode: PermissionMode = serde_json::from_str("\"dontAsk\"").unwrap();
+        assert_eq!(mode, PermissionMode::DontAsk);
+    }
+
+    #[test]
+    fn test_permission_mode_deserialize_plan_string() {
         let mode: PermissionMode = serde_json::from_str("\"plan\"").unwrap();
-        assert_eq!(mode, PermissionMode::Plan);
+        assert_eq!(
+            mode,
+            PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            }
+        );
     }
 
-    // ── LayeredPermissionsConfig ──────────────────────────────────────────
+    #[test]
+    fn test_permission_mode_deserialize_plan_object() {
+        let json = r#"{"prePlanMode": "acceptEdits", "bypassAvailable": true}"#;
+        let mode: PermissionMode = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            mode,
+            PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::AcceptEdits),
+                bypass_available: true,
+            }
+        );
+    }
 
     #[test]
-    fn test_empty_config_allows_all() {
+    fn test_permission_mode_deserialize_plan_object_default_bypass() {
+        let json = r#"{"prePlanMode": "default"}"#;
+        let mode: PermissionMode = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            mode,
+            PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            }
+        );
+    }
+
+    // ── Backward-compat aliases ───────────────────────────────────────────
+
+    #[test]
+    fn test_permission_mode_old_allow_is_default() {
+        let mode: PermissionMode = serde_json::from_str("\"allow\"").unwrap();
+        assert_eq!(mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_permission_mode_old_deny_is_dont_ask() {
+        let mode: PermissionMode = serde_json::from_str("\"deny\"").unwrap();
+        assert_eq!(mode, PermissionMode::DontAsk);
+    }
+
+    #[test]
+    fn test_permission_mode_old_interactive_is_dont_ask() {
+        let mode: PermissionMode = serde_json::from_str("\"interactive\"").unwrap();
+        assert_eq!(mode, PermissionMode::DontAsk);
+    }
+
+    #[test]
+    fn test_permission_mode_snake_case_accept_edits() {
+        let mode: PermissionMode = serde_json::from_str("\"accept_edits\"").unwrap();
+        assert_eq!(mode, PermissionMode::AcceptEdits);
+    }
+
+    #[test]
+    fn test_permission_mode_snake_case_bypass() {
+        let mode: PermissionMode = serde_json::from_str("\"bypass_permissions\"").unwrap();
+        assert_eq!(mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn test_permission_mode_snake_case_dont_ask() {
+        let mode: PermissionMode = serde_json::from_str("\"dont_ask\"").unwrap();
+        assert_eq!(mode, PermissionMode::DontAsk);
+    }
+
+    // ── Mode round-trip (serialize) ───────────────────────────────────────
+
+    #[test]
+    fn test_mode_serialize_default() {
+        let json = serde_json::to_string(&PermissionMode::Default).unwrap();
+        assert_eq!(json, "\"default\"");
+    }
+
+    #[test]
+    fn test_mode_serialize_accept_edits() {
+        let json = serde_json::to_string(&PermissionMode::AcceptEdits).unwrap();
+        assert_eq!(json, "\"acceptEdits\"");
+    }
+
+    #[test]
+    fn test_mode_serialize_bypass() {
+        let json = serde_json::to_string(&PermissionMode::BypassPermissions).unwrap();
+        assert_eq!(json, "\"bypassPermissions\"");
+    }
+
+    #[test]
+    fn test_mode_serialize_dont_ask() {
+        let json = serde_json::to_string(&PermissionMode::DontAsk).unwrap();
+        assert_eq!(json, "\"dontAsk\"");
+    }
+
+    #[test]
+    fn test_mode_serialize_plan() {
+        let mode = PermissionMode::Plan {
+            pre_plan_mode: Box::new(PermissionMode::AcceptEdits),
+            bypass_available: true,
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(json.contains("\"pre_plan_mode\":\"acceptEdits\""));
+        assert!(json.contains("\"bypass_available\":true"));
+    }
+
+    // ── LayeredPermissionsConfig: mode-based checks (Goal 193) ────────────
+
+    /// plan_mode_blocks_write: mode=Plan, is_readonly=false → Denied(Mode)
+    #[test]
+    fn test_plan_mode_blocks_write() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            },
+            ..Default::default()
+        };
+        let result = config.check_static("write_file", false);
+        assert!(result.is_denied());
+        if let Permission::Denied(reason, msg) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Mode(PermissionMode::Plan { .. })
+            ));
+            assert!(msg.contains("plan mode"));
+        } else {
+            panic!("expected Denied");
+        }
+    }
+
+    /// plan_mode_allows_exit: mode=Plan, tool="exit_plan_mode" — exempted
+    #[test]
+    fn test_plan_mode_allows_exit() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            },
+            ..Default::default()
+        };
+        // exit_plan_mode is exempted from plan-mode write blocking
+        let result = config.check_static("exit_plan_mode", false);
+        assert!(!result.is_denied());
+        // Falls through to Passthrough
+        assert!(matches!(result, Permission::Passthrough));
+    }
+
+    /// plan_mode_bypass_write_continues: mode=Plan{bypass_available:true},
+    /// write tool continues past plan check
+    #[test]
+    fn test_plan_mode_bypass_write_continues() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::BypassPermissions),
+                bypass_available: true,
+            },
+            ..Default::default()
+        };
+        // With bypass_available, write tool is not blocked at plan step;
+        // falls through to Passthrough (no rules configured).
+        let result = config.check_static("write_file", false);
+        assert!(!result.is_denied());
+        assert!(matches!(result, Permission::Passthrough));
+    }
+
+    /// bypass_skips_deny_rules: mode=BypassPermissions, tool in deny list → Allowed
+    #[test]
+    fn test_bypass_skips_deny_rules() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::BypassPermissions,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                deny: vec!["run_shell".into()],
+                ..Default::default()
+            }],
+        };
+        let result = config.check_static("run_shell", false);
+        assert!(result.is_allowed());
+        if let Permission::Allowed(reason) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Mode(PermissionMode::BypassPermissions)
+            ));
+        } else {
+            panic!("expected Allowed");
+        }
+    }
+
+    /// dontask_converts_interactive: mode=DontAsk, tool in interactive list → Denied
+    #[test]
+    fn test_dontask_converts_interactive() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::DontAsk,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: vec!["run_shell".into()],
+                ..Default::default()
+            }],
+        };
+        let result = config.check_static("run_shell", false);
+        assert!(result.is_denied());
+        if let Permission::Denied(reason, msg) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Mode(PermissionMode::DontAsk)
+            ));
+            assert!(msg.contains("dontAsk"));
+        } else {
+            panic!("expected Denied");
+        }
+    }
+
+    /// accept_edits_allows_write: mode=AcceptEdits, is_readonly=false → Allowed
+    #[test]
+    fn test_accept_edits_allows_write() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::AcceptEdits,
+            ..Default::default()
+        };
+        let result = config.check_static("write_file", false);
+        assert!(result.is_allowed());
+        if let Permission::Allowed(reason) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Mode(PermissionMode::AcceptEdits)
+            ));
+        } else {
+            panic!("expected Allowed");
+        }
+    }
+
+    /// deny_rule_takes_effect: mode=Default, tool in deny list → Denied(Rule)
+    #[test]
+    fn test_deny_rule_takes_effect() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                deny: vec!["run_shell".into()],
+                ..Default::default()
+            }],
+        };
+        let result = config.check_static("run_shell", true);
+        assert!(result.is_denied());
+        if let Permission::Denied(reason, _msg) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Rule {
+                    source: RuleSource::User,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected Denied");
+        }
+    }
+
+    /// allow_rule_takes_effect: mode=Default, tool in allow list → Allowed(Rule)
+    #[test]
+    fn test_allow_rule_takes_effect() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                allow: vec!["read_file".into()],
+                ..Default::default()
+            }],
+        };
+        let result = config.check_static("read_file", true);
+        assert!(result.is_allowed());
+        if let Permission::Allowed(reason) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Rule {
+                    source: RuleSource::User,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected Allowed");
+        }
+    }
+
+    // ── check_static: read-only tools in plan mode ──────────────────────
+
+    #[test]
+    fn test_plan_mode_allows_readonly() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            },
+            ..Default::default()
+        };
+        // read-only tools are not blocked by plan mode
+        let result = config.check_static("read_file", true);
+        assert!(!result.is_denied());
+    }
+
+    // ── any_interactive helper ───────────────────────────────────────────
+
+    #[test]
+    fn test_any_interactive_detects_match() {
+        let config = LayeredPermissionsConfig {
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: vec!["run_*".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(config.any_interactive("run_shell"));
+        assert!(!config.any_interactive("read_file"));
+    }
+
+    // ── LayeredPermissionsConfig: basic layer tests ──────────────────────
+
+    #[test]
+    fn test_empty_config_passthrough() {
         let config = LayeredPermissionsConfig::default();
-        assert!(config.check_static("anything").is_allowed());
-        assert!(!config.is_interactive("anything"));
-        assert!(!config.is_plan_mode("anything"));
+        // Default mode with no layers: Passthrough
+        let result = config.check_static("anything", false);
+        assert!(matches!(result, Permission::Passthrough));
     }
 
     #[test]
@@ -371,8 +834,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell").is_denied());
-        assert!(config.check_static("read_file").is_allowed());
+        assert!(config.check_static("run_shell", false).is_denied());
+        assert!(!config.check_static("read_file", false).is_denied());
     }
 
     #[test]
@@ -385,12 +848,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("read_file").is_allowed());
-        assert!(config.check_static("run_shell").is_denied());
+        assert!(config.check_static("read_file", false).is_allowed());
+        assert!(matches!(
+            config.check_static("run_shell", false),
+            Permission::Passthrough
+        ));
     }
 
     #[test]
-    fn test_single_layer_interactive() {
+    fn test_is_interactive_layer_match() {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
@@ -407,7 +873,6 @@ mod tests {
 
     #[test]
     fn test_deny_wins_across_layers() {
-        // User layer allows, Project layer denies → denied
         let config = LayeredPermissionsConfig {
             layers: vec![
                 PermissionLayer {
@@ -423,56 +888,33 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell").is_denied());
+        assert!(config.check_static("run_shell", false).is_denied());
     }
 
     #[test]
-    fn test_allow_requires_all_layers() {
-        // User layer has no allow rules, Project layer allows read_file → allowed
+    fn test_allow_union_across_layers() {
+        // User layer allows read_file → allowed
         let config = LayeredPermissionsConfig {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    allow: vec!["read_file".into()],
+                    allow: vec!["write_file".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    // Empty allow = allow all
+                    allow: vec!["read_file".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        assert!(config.check_static("read_file").is_allowed());
-    }
-
-    #[test]
-    fn test_allow_requires_all_layers_with_rules() {
-        // User layer allows read_file, Project layer allows read_file → allowed
-        // But run_shell is not in either allow list → denied
-        let config = LayeredPermissionsConfig {
-            layers: vec![
-                PermissionLayer {
-                    source: RuleSource::Project,
-                    allow: vec!["read_file".into()],
-                    ..Default::default()
-                },
-                PermissionLayer {
-                    source: RuleSource::User,
-                    allow: vec!["read_file".into(), "write_file".into()],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        assert!(config.check_static("read_file").is_allowed());
-        assert!(config.check_static("run_shell").is_denied());
+        assert!(config.check_static("read_file", true).is_allowed());
+        assert!(config.check_static("write_file", false).is_allowed());
     }
 
     #[test]
     fn test_interactive_union() {
-        // User layer marks run_shell, Project layer marks write_file → both interactive
         let config = LayeredPermissionsConfig {
             layers: vec![
                 PermissionLayer {
@@ -494,8 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_layer_always_present() {
-        // Simulate load_layered_permissions result: always has a Session layer
+    fn test_session_layer_present() {
         let config = LayeredPermissionsConfig {
             layers: vec![
                 PermissionLayer {
@@ -511,7 +952,7 @@ mod tests {
             ..Default::default()
         };
         // Session layer has empty allow → doesn't restrict
-        assert!(config.check_static("read_file").is_allowed());
+        assert!(config.check_static("read_file", true).is_allowed());
     }
 
     #[test]
@@ -525,15 +966,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell").is_denied());
-    }
-
-    #[test]
-    fn test_empty_allow_allows_all() {
-        let config = LayeredPermissionsConfig::default();
-        assert!(config.check_static("run_shell").is_allowed());
-        assert!(config.check_static("read_file").is_allowed());
-        assert!(config.check_static("anything").is_allowed());
+        assert!(config.check_static("run_shell", false).is_denied());
     }
 
     #[test]
@@ -546,9 +979,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell").is_allowed());
-        assert!(config.check_static("run_background").is_allowed());
-        assert!(config.check_static("read_file").is_denied());
+        assert!(config.check_static("run_shell", false).is_allowed());
+        assert!(config.check_static("run_background", false).is_allowed());
+        assert!(matches!(
+            config.check_static("read_file", false),
+            Permission::Passthrough
+        ));
     }
 
     #[test]
@@ -561,8 +997,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("anything").is_allowed());
-        assert!(config.check_static("").is_allowed());
+        assert!(config.check_static("anything", false).is_allowed());
+        assert!(config.check_static("", false).is_allowed());
     }
 
     #[test]
@@ -576,8 +1012,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("read_file").is_allowed());
-        assert!(config.check_static("run_shell").is_denied());
+        assert!(config.check_static("read_file", true).is_allowed());
+        assert!(config.check_static("run_shell", false).is_denied());
     }
 
     #[test]
@@ -600,32 +1036,21 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_deny_fallback() {
+    fn test_is_plan_mode_when_mode_is_plan() {
         let config = LayeredPermissionsConfig {
-            mode: PermissionMode::Deny,
-            ..Default::default()
-        };
-        assert!(config.check_static("anything").is_denied());
-    }
-
-    #[test]
-    fn test_mode_interactive_fallback() {
-        let config = LayeredPermissionsConfig {
-            mode: PermissionMode::Interactive,
-            ..Default::default()
-        };
-        assert!(config.is_interactive("anything"));
-        assert!(config.check_static("anything").is_allowed());
-    }
-
-    #[test]
-    fn test_mode_plan_fallback() {
-        let config = LayeredPermissionsConfig {
-            mode: PermissionMode::Plan,
+            mode: PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            },
             ..Default::default()
         };
         assert!(config.is_plan_mode("anything"));
-        assert!(config.check_static("anything").is_allowed());
+    }
+
+    #[test]
+    fn test_is_plan_mode_false_when_default() {
+        let config = LayeredPermissionsConfig::default();
+        assert!(!config.is_plan_mode("anything"));
     }
 
     // ── Backward compat: OldPermissionsConfig → LayeredPermissionsConfig ──
@@ -637,7 +1062,7 @@ mod tests {
             deny: vec!["run_shell".into()],
             interactive: vec!["write_file".into()],
             plan: vec![],
-            mode: PermissionMode::Allow,
+            mode: PermissionMode::Default,
         };
         let layered: LayeredPermissionsConfig = old.into();
         assert_eq!(layered.layers.len(), 1);
@@ -729,14 +1154,14 @@ mod tests {
 
     #[test]
     fn permission_is_allowed_helper() {
-        let reason = DecisionReason::Mode(PermissionMode::Allow);
+        let reason = DecisionReason::Mode(PermissionMode::Default);
         assert!(Permission::Allowed(reason.clone()).is_allowed());
         assert!(!Permission::Allowed(reason).is_denied());
     }
 
     #[test]
     fn permission_is_denied_helper() {
-        let reason = DecisionReason::Mode(PermissionMode::Deny);
+        let reason = DecisionReason::Mode(PermissionMode::DontAsk);
         assert!(Permission::Denied(reason.clone(), "blocked".into()).is_denied());
         assert!(!Permission::Denied(reason, "blocked".into()).is_allowed());
     }
@@ -761,9 +1186,9 @@ mod tests {
 
     #[test]
     fn decision_reason_mode_debug() {
-        let reason = DecisionReason::Mode(PermissionMode::Deny);
+        let reason = DecisionReason::Mode(PermissionMode::DontAsk);
         let debug = format!("{:?}", reason);
-        assert!(debug.contains("Deny"));
+        assert!(debug.contains("DontAsk"));
     }
 
     #[test]
@@ -787,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn check_static_returns_reason_on_deny() {
+    fn check_static_deny_returns_rule_reason() {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
@@ -796,7 +1221,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = config.check_static("run_shell");
+        let result = config.check_static("run_shell", false);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -807,36 +1232,6 @@ mod tests {
                 }
             ));
             assert!(msg.contains("run_shell"));
-        } else {
-            panic!("expected Denied");
-        }
-    }
-
-    #[test]
-    fn check_static_returns_reason_on_allow() {
-        let config = LayeredPermissionsConfig::default();
-        let result = config.check_static("anything");
-        assert!(result.is_allowed());
-        if let Permission::Allowed(reason) = result {
-            assert!(matches!(
-                reason,
-                DecisionReason::Mode(PermissionMode::Allow)
-            ));
-        } else {
-            panic!("expected Allowed");
-        }
-    }
-
-    #[test]
-    fn check_static_deny_mode_returns_mode_reason() {
-        let config = LayeredPermissionsConfig {
-            mode: PermissionMode::Deny,
-            ..Default::default()
-        };
-        let result = config.check_static("anything");
-        assert!(result.is_denied());
-        if let Permission::Denied(reason, _msg) = result {
-            assert!(matches!(reason, DecisionReason::Mode(PermissionMode::Deny)));
         } else {
             panic!("expected Denied");
         }

@@ -312,7 +312,7 @@ impl AgentPool {
             permission_hook: None,
             planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            permission_mode: PermissionMode::Allow,
+            permission_mode: PermissionMode::Default,
             mailbox: None,
         };
 

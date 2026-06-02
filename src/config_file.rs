@@ -4,6 +4,7 @@
 //! The config file is optional — if absent, we gracefully fall back.
 
 use crate::error::{Error, Result};
+use crate::permissions::PermissionMode;
 use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -57,10 +58,12 @@ pub struct PermissionsSection {
     /// Tools that require plan mode before use.
     #[serde(default)]
     pub plan: Vec<String>,
-    /// Default permission mode. One of "allow", "deny", "interactive", "plan".
-    /// Defaults to "allow" for backward compatibility.
+    /// Default permission mode. Accepts both old and new format names.
+    /// New: "default", "acceptEdits", "bypassPermissions", "dontAsk", "plan".
+    /// Old: "allow" (→ default), "deny" (→ dontAsk), "interactive" (→ dontAsk).
+    /// The "plan" variant can also be an object `{prePlanMode, bypassAvailable}`.
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<PermissionMode>,
 }
 
 impl FileConfig {

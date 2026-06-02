@@ -230,7 +230,7 @@ async fn worker_receives_coordinator_message_via_mailbox() {
         permission_hook: None,
         planning_mode: PlanningMode::default(),
         exploring_plan_mode: Arc::new(AtomicBool::new(false)),
-        permission_mode: PermissionMode::Allow,
+        permission_mode: PermissionMode::Default,
         mailbox: Some(mailbox.clone()),
     };
 

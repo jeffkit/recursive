@@ -337,7 +337,7 @@ impl ToolRegistry {
             aliases: BTreeMap::new(),
             transport,
             permissions: None,
-            permission_mode: PermissionMode::Allow,
+            permission_mode: PermissionMode::Default,
             touched: None,
             permission_hook: None,
             policy: None,
@@ -361,7 +361,7 @@ impl ToolRegistry {
             aliases: BTreeMap::new(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
-            permission_mode: self.permission_mode,
+            permission_mode: self.permission_mode.clone(),
             touched: self.touched.clone(),
             permission_hook: self.permission_hook.clone(),
             policy: self.policy.clone(),
@@ -407,14 +407,14 @@ impl ToolRegistry {
 
     /// Set the permissions configuration for this registry.
     pub fn with_permissions(mut self, permissions: PermissionsConfig) -> Self {
-        self.permission_mode = permissions.mode;
+        self.permission_mode = permissions.mode.clone();
         self.permissions = Some(permissions);
         self
     }
 
     /// Return the current permission mode.
     pub fn permission_mode(&self) -> PermissionMode {
-        self.permission_mode
+        self.permission_mode.clone()
     }
 
     /// Return a reference to the current permissions config, if any.
@@ -553,7 +553,8 @@ impl ToolRegistry {
     pub async fn invoke_with_audit(&self, name: &str, arguments: Value) -> ToolDispatch {
         // Static permission check before any tool execution.
         if let Some(ref config) = self.permissions {
-            match config.check_static(name) {
+            let is_readonly = self.is_readonly(name);
+            match config.check_static(name, is_readonly) {
                 Permission::Denied(reason, _msg) => {
                     return ToolDispatch {
                         result: Err(Error::PermissionDenied {
@@ -845,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn test_permission_deny_blocks_invoke() {
         let config = crate::permissions::LayeredPermissionsConfig {
-            mode: PermissionMode::Allow,
+            mode: PermissionMode::Default,
             layers: vec![crate::permissions::PermissionLayer {
                 source: crate::permissions::RuleSource::User,
                 allow: vec!["echo".into()],
