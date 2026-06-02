@@ -1878,8 +1878,17 @@ async fn send_session_message(
         }
     });
 
-    // Run the agent turn (transcript is managed internally by AgentRuntime).
-    let run_result = runtime.run(&body.content).await;
+    // Run the agent turn via enqueue so the runtime's FIFO queue is used.
+    let run_result = runtime.enqueue(&body.content).await.map(|opt| {
+        opt.unwrap_or_else(|| crate::runtime::RuntimeOutcome {
+            final_text: None,
+            finish_reason: crate::agent::FinishReason::NoMoreToolCalls,
+            total_usage: crate::TokenUsage::default(),
+            steps: 0,
+            llm_latency_ms: 0,
+            checkpoint_id: None,
+        })
+    });
 
     // Clear the interrupt token slot — the turn is done.
     {
