@@ -128,7 +128,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let body = match modal {
-        Modal::Help => render_help_body(),
+        Modal::Help => render_help_body(&app.commands),
         Modal::CostDetail => render_cost_body(&app.usage, &app.model_name),
         Modal::ModelInfo => render_model_body(&app.model_name),
         Modal::ToolList { entries } => render_tool_body(entries),
@@ -164,12 +164,13 @@ fn centred_rect(outer: Rect, pct_w: u16, pct_h: u16) -> Rect {
     }
 }
 
-fn render_help_body() -> Vec<Line<'static>> {
+fn render_help_body(registry: &CommandRegistry) -> Vec<Line<'static>> {
     let header = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let key = Style::default().fg(Color::Cyan);
     let dim = Style::default().fg(Color::DarkGray);
+    let skill_style = Style::default().fg(Color::Green);
 
     let mut out = Vec::new();
     out.push(Line::from(Span::styled(
@@ -179,9 +180,7 @@ fn render_help_body() -> Vec<Line<'static>> {
     out.push(Line::raw(""));
     out.push(Line::from(Span::styled("Commands:".to_string(), header)));
 
-    // Build the command list directly from the registry so it stays
-    // in sync. We don't list aliases here to keep the table compact.
-    let registry = CommandRegistry::default_set();
+    // Built-in commands from the registry.
     for spec in registry.commands() {
         out.push(Line::from(vec![
             Span::raw("  "),
@@ -189,6 +188,24 @@ fn render_help_body() -> Vec<Line<'static>> {
             Span::raw(" "),
             Span::raw(spec.summary.to_string()),
         ]));
+    }
+
+    // Goal-169: skill-backed commands loaded from .recursive/skills/.
+    let skills = registry.skill_commands();
+    if !skills.is_empty() {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled(
+            "Skill Commands:".to_string(),
+            header,
+        )));
+        for skill in skills {
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("/{:<10}", skill.name), skill_style),
+                Span::raw(" "),
+                Span::raw(skill.description.clone()),
+            ]));
+        }
     }
 
     out.push(Line::raw(""));
@@ -793,7 +810,8 @@ mod tests {
 
     #[test]
     fn render_help_lists_registered_commands() {
-        let lines = render_help_body();
+        let registry = CommandRegistry::default_set();
+        let lines = render_help_body(&registry);
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -804,5 +822,29 @@ mod tests {
         // Keys section
         assert!(text.contains("Shift+Tab"));
         assert!(text.contains("Ctrl+E"));
+    }
+
+    #[test]
+    fn render_help_lists_skill_commands_when_present() {
+        use crate::tui::skill_commands::SkillCommand;
+        use std::path::PathBuf;
+        let skill = SkillCommand {
+            name: "my-skill".to_string(),
+            description: "A test skill".to_string(),
+            aliases: Vec::new(),
+            argument_hint: String::new(),
+            allowed_tools: None,
+            prompt_template: "Do $ARGUMENTS".to_string(),
+            source_path: PathBuf::from("my-skill.md"),
+        };
+        let registry = CommandRegistry::default_set().with_skill_commands(vec![skill]);
+        let lines = render_help_body(&registry);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("Skill Commands:"));
+        assert!(text.contains("/my-skill"));
+        assert!(text.contains("A test skill"));
     }
 }

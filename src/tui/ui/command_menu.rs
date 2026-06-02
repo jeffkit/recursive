@@ -83,18 +83,56 @@ pub fn popup_rect(input_area: Rect, candidate_count: usize, frame_area: Rect) ->
     })
 }
 
+/// A single entry in the combined command-menu popup — either a built-in
+/// command or a Goal-169 skill-backed command.
+enum MenuEntry<'a> {
+    Builtin(&'a crate::tui::commands::CommandSpec),
+    Skill(&'a crate::tui::skill_commands::SkillCommand),
+}
+
+impl<'a> MenuEntry<'a> {
+    fn name(&self) -> &str {
+        match self {
+            MenuEntry::Builtin(s) => s.name,
+            MenuEntry::Skill(s) => &s.name,
+        }
+    }
+    fn summary(&self) -> &str {
+        match self {
+            MenuEntry::Builtin(s) => s.summary,
+            MenuEntry::Skill(s) => &s.description,
+        }
+    }
+    fn is_skill(&self) -> bool {
+        matches!(self, MenuEntry::Skill(_))
+    }
+}
+
 /// Render the popup. No-op when the input mode is not Command, the
 /// buffer is empty, or no matches are available.
+///
+/// Goal-169: the popup now shows both built-in and skill-backed commands
+/// (skills are suffixed with `[skill]` in a dim colour so the user can
+/// distinguish them at a glance).
 pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
     if app.prompt.mode != crate::tui::app::InputMode::Command {
         return;
     }
-    let matches = app.commands.search(&app.prompt.buffer);
-    if matches.is_empty() {
+    let builtin_matches = app.commands.search(&app.prompt.buffer);
+    let skill_matches = app.commands.search_skills(&app.prompt.buffer);
+
+    // Combine: built-ins first, then skills.
+    let mut combined: Vec<MenuEntry<'_>> = builtin_matches
+        .iter()
+        .map(|s| MenuEntry::Builtin(s))
+        .chain(skill_matches.iter().map(|s| MenuEntry::Skill(s)))
+        .collect();
+    combined.truncate(MAX_VISIBLE);
+
+    if combined.is_empty() {
         return;
     }
-    let visible = &matches[..matches.len().min(MAX_VISIBLE)];
-    let Some(area) = popup_rect(input_area, visible.len(), frame.area()) else {
+    let Some(area) = popup_rect(input_area, combined.len(), frame.area()) else {
         return;
     };
     frame.render_widget(Clear, area);
@@ -105,20 +143,25 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let normal_style = Style::default().fg(Color::White);
     let summary_style = Style::default().fg(Color::DarkGray);
+    let skill_badge_style = Style::default().fg(Color::Green);
 
-    let lines: Vec<Line<'static>> = visible
+    let lines: Vec<Line<'static>> = combined
         .iter()
         .enumerate()
-        .map(|(i, spec)| {
+        .map(|(i, entry)| {
             let style = if app.command_menu_selected == Some(i) {
                 selected_style
             } else {
                 normal_style
             };
-            Line::from(vec![
-                Span::styled(format!(" /{:<10} ", spec.name), style),
-                Span::styled(spec.summary.to_string(), summary_style),
-            ])
+            let mut spans = vec![
+                Span::styled(format!(" /{:<10} ", entry.name().to_string()), style),
+                Span::styled(entry.summary().to_string(), summary_style),
+            ];
+            if entry.is_skill() {
+                spans.push(Span::styled(" [skill]".to_string(), skill_badge_style));
+            }
+            Line::from(spans)
         })
         .collect();
 

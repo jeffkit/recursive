@@ -778,6 +778,13 @@ fn collect_files(
 
 impl App {
     pub fn new() -> Self {
+        // Goal-169: load workspace skill commands at startup.
+        let workspace = crate::config::Config::from_env()
+            .map(|c| c.workspace)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let skills = crate::tui::skill_commands::SkillCommandLoader::load(&workspace);
+        let commands =
+            crate::tui::commands::CommandRegistry::default_set().with_skill_commands(skills);
         Self {
             prompt: PromptInputState::new(),
             blocks: vec![TranscriptBlock::System {
@@ -797,7 +804,7 @@ impl App {
             model_name: detect_model_name(),
             spinner_frame: 0,
             modals: Vec::new(),
-            commands: crate::tui::commands::CommandRegistry::default_set(),
+            commands,
             tool_catalog: default_offline_tool_catalog(),
             command_menu_selected: None,
             planning_mode_on: false,
@@ -813,9 +820,7 @@ impl App {
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
             current_todos: Vec::new(),
             active_goal: None,
-            workspace_path: crate::config::Config::from_env()
-                .map(|c| c.workspace)
-                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            workspace_path: workspace,
         }
     }
 
