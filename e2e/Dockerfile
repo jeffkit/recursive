@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     python3 \
     python3-pip \
+    nodejs \
     curl \
     jq \
     && rm -rf /var/lib/apt/lists/*
@@ -24,6 +25,10 @@ COPY --from=builder /build/target/release/recursive /usr/local/bin/recursive
 # Install Python SDK (for 20-python-sdk e2e test)
 COPY sdk/python /sdk/python
 RUN pip3 install --break-system-packages /sdk/python
+
+# Copy TypeScript SDK dist (pre-built; no npm install needed — zero runtime deps)
+COPY sdk/typescript/dist /sdk/typescript/dist
+COPY sdk/typescript/package.json /sdk/typescript/package.json
 
 # Default workspace
 WORKDIR /workspace

@@ -122,3 +122,11 @@ tests:
     - name: "Python SDK smoke test"
       id: python-sdk
       file: tests/20-python-sdk.yaml
+
+    - name: "TypeScript SDK smoke test"
+      id: typescript-sdk
+      file: tests/21-typescript-sdk.yaml
+
+    - name: "Context compaction multi-turn"
+      id: compaction
+      file: tests/22-compaction.yaml

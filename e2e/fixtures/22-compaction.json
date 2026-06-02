@@ -1,0 +1,18 @@
+{
+  "fixtures": [
+    {
+      "_comment": "Compaction test turn 1: first message — response large enough to exceed the low 100-char threshold.",
+      "match": { "userMessage": "compaction-turn-1" },
+      "response": {
+        "content": "This is the first response. It contains enough text to exceed the tiny compaction threshold that we set in the test environment. The agent should compact the transcript after this turn and continue working normally."
+      }
+    },
+    {
+      "_comment": "Compaction test turn 2: after compaction the agent must still reply.",
+      "match": { "userMessage": "compaction-turn-2" },
+      "response": {
+        "content": "Compaction successful. The agent is still responding correctly after transcript compaction."
+      }
+    }
+  ]
+}
