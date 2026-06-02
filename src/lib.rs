@@ -34,6 +34,7 @@ pub mod paths;
 pub mod permissions;
 pub mod providers;
 pub mod rewind;
+pub mod run_core;
 pub mod runtime;
 pub mod runtime_goal;
 pub mod session;
