@@ -41,7 +41,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Fix-E: show a 1-row approval banner when a plan is awaiting the
     // user's decision. The banner replaces the floating modal and keeps
     // the full transcript visible.
-    let plan_banner_height: u16 = if app.plan_awaiting_approval { 1 } else { 0 };
+    // Goal-202: also show 1-row banner when plan-mode entry request is pending.
+    let plan_banner_height: u16 = if app.plan_awaiting_approval || app.plan_mode_request_pending {
+        1
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -116,8 +121,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     status::render(frame, chunks[2], app);
 
     // Fix-E: plan approval banner (1 row, visible only when plan_awaiting_approval).
+    // Goal-202: also shown when plan_mode_request_pending.
     if app.plan_awaiting_approval {
         render_plan_approval_banner(frame, chunks[3], app);
+    } else if app.plan_mode_request_pending {
+        render_plan_mode_request_banner(frame, chunks[3]);
     }
 
     // Input panel + footer hint (chunks[4] when banner present, [3] otherwise).
@@ -237,5 +245,50 @@ fn render_plan_approval_banner(frame: &mut Frame, area: Rect, _app: &App) {
         ),
     ]);
     let widget = Paragraph::new(line);
+    frame.render_widget(widget, area);
+}
+
+/// Goal-202: render a 1-row plan-mode request banner between the status bar
+/// and the input box. Visible while `plan_mode_request_pending` is set.
+///
+/// ```text
+///  ⓘ Plan mode request — [y/Enter] Allow   [n/Esc] Skip
+/// ```
+fn render_plan_mode_request_banner(frame: &mut Frame, area: Rect) {
+    use ratatui::style::Modifier;
+    let line = Line::from(vec![
+        Span::styled(
+            " ⓘ Plan mode request — ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "[y/Enter]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " Allow  ",
+            Style::default().fg(Color::Black).bg(Color::Blue),
+        ),
+        Span::styled(
+            "[n/Esc]",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " Skip — execute directly ",
+            Style::default().fg(Color::White).bg(Color::Blue),
+        ),
+    ]);
+    let widget = Paragraph::new(line)
+        .style(Style::default().bg(Color::Blue))
+        .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }

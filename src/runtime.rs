@@ -31,7 +31,9 @@ use crate::hooks::HookRegistry;
 use crate::kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 use crate::llm::{LlmProvider, TokenUsage};
 use crate::message::Message;
-use crate::tools::plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate};
+use crate::tools::plan_mode::{
+    EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanModeRequestGate, RequestPlanModeTool,
+};
 use crate::tools::{TodoItem, TodoWriteTool, ToolRegistry, TouchedFiles};
 use crate::Compactor;
 
@@ -132,6 +134,9 @@ pub struct AgentRuntime {
     /// Goal-165: plan mode 2.0 gate — shared with `EnterPlanModeTool` and
     /// `ExitPlanModeTool`. `confirm_plan` / `reject_plan` forward to it.
     plan_approval_gate: Arc<PlanApprovalGate>,
+    /// Goal-202: pre-confirmation gate — shared with `RequestPlanModeTool`.
+    /// `approve_plan_mode_request` / `reject_plan_mode_request` forward here.
+    plan_mode_request_gate: Arc<PlanModeRequestGate>,
     /// Goal-168: active goal state (set by `/goal`). `None` when no goal is active.
     pub goal_state: Arc<RwLock<Option<GoalState>>>,
     /// Goal-181: FIFO queue of user messages waiting to be processed.
@@ -555,6 +560,22 @@ impl AgentRuntime {
     /// without rebuilding the runtime.
     pub fn set_planning_mode(&mut self, mode: PlanningMode) {
         self.planning_mode = mode;
+    }
+
+    /// Goal-202: approve the plan-mode entry request.
+    ///
+    /// Wakes `RequestPlanModeTool`'s blocking wait, returning `{"approved": true}`
+    /// to the LLM so it can proceed with `enter_plan_mode`.
+    pub fn approve_plan_mode_request(&self) {
+        self.plan_mode_request_gate.approve();
+    }
+
+    /// Goal-202: reject the plan-mode entry request with a reason.
+    ///
+    /// Wakes `RequestPlanModeTool`'s blocking wait, returning
+    /// `{"approved": false, "reason": "..."}` so the LLM can execute directly.
+    pub fn reject_plan_mode_request(&self, reason: &str) {
+        self.plan_mode_request_gate.reject(reason);
     }
 
     /// Reject the pending plan with a reason.
@@ -1182,6 +1203,16 @@ impl AgentRuntimeBuilder {
             Arc::new(tool)
         });
 
+        // Goal-202: create the plan-mode pre-confirmation gate and register
+        // the request_plan_mode tool (TUI / HTTP only, same as plan mode tools).
+        let plan_mode_request_gate = Arc::new(PlanModeRequestGate::new());
+        kernel
+            .tools_mut()
+            .register_mut(Arc::new(RequestPlanModeTool::new(
+                plan_mode_request_gate.clone(),
+                event_sink.clone(),
+            )));
+
         Ok(AgentRuntime {
             kernel,
             transcript,
@@ -1199,6 +1230,7 @@ impl AgentRuntimeBuilder {
             touched_files: None,
             todo_list,
             plan_approval_gate,
+            plan_mode_request_gate,
             goal_state: Arc::new(RwLock::new(None)),
             message_queue: std::collections::VecDeque::new(),
         })

@@ -51,6 +51,9 @@ pub fn render_block(block: &TranscriptBlock) -> Vec<Line<'static>> {
             plan_text,
             tool_calls,
         } => render_plan_proposal(plan_text, tool_calls),
+        TranscriptBlock::PlanModeRequest { reason, approved } => {
+            render_plan_mode_request(reason, *approved)
+        }
     }
 }
 
@@ -423,6 +426,125 @@ fn plan_args_preview(value: &serde_json::Value, limit: usize) -> String {
     } else {
         raw
     }
+}
+
+// ── PlanModeRequest (Goal-202) ────────────────────────────────────────
+
+/// Render the inline plan-mode entry request block:
+///
+/// ```text
+/// ╔─ ⓘ Plan Mode Request ────────────────╗
+/// ║ Agent wants to enter plan mode:       ║
+/// ║                                       ║
+/// ║   <reason>                            ║
+/// ║                                       ║
+/// ║ Allow agent to explore and plan?      ║
+/// ║  [y/Enter] Allow   [n/Esc] Skip       ║
+/// ╚───────────────────────────────────────╝
+/// ```
+///
+/// After decision: shows `✓ Plan mode allowed` or `✗ Plan mode skipped`.
+fn render_plan_mode_request(reason: &str, approved: Option<bool>) -> Vec<Line<'static>> {
+    let border = Style::default().fg(Color::Blue);
+    let header_style = Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(Color::White);
+    let key = Style::default().fg(Color::Cyan);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::raw(""));
+
+    match approved {
+        Some(true) => {
+            out.push(Line::from(vec![
+                Span::styled("┌─ ", border),
+                Span::styled(
+                    "✓ Plan mode allowed",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ─────────────────────────────────────────", border),
+            ]));
+            out.push(Line::from(vec![
+                Span::styled("│  ", border),
+                Span::styled(reason.to_owned(), Style::default().fg(Color::DarkGray)),
+            ]));
+            out.push(Line::from(vec![Span::styled(
+                "└─────────────────────────────────────────────────────",
+                border,
+            )]));
+        }
+        Some(false) => {
+            out.push(Line::from(vec![
+                Span::styled("┌─ ", border),
+                Span::styled(
+                    "✗ Plan mode skipped",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ─────────────────────────────────────────", border),
+            ]));
+            out.push(Line::from(vec![
+                Span::styled("│  ", border),
+                Span::styled(reason.to_owned(), Style::default().fg(Color::DarkGray)),
+            ]));
+            out.push(Line::from(vec![Span::styled(
+                "└─────────────────────────────────────────────────────",
+                border,
+            )]));
+        }
+        None => {
+            // Pending — show full request UI.
+            out.push(Line::from(vec![
+                Span::styled("┌─ ", border),
+                Span::styled("ⓘ Plan Mode Request", header_style),
+                Span::styled(" ─────────────────────────────────────────", border),
+            ]));
+            out.push(Line::from(vec![
+                Span::styled("│  ", border),
+                Span::styled(
+                    "Agent wants to enter plan mode:",
+                    body.add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            out.push(Line::from(vec![Span::styled("│", border)]));
+            for line in reason.lines() {
+                out.push(Line::from(vec![
+                    Span::styled("│    ", border),
+                    Span::styled(line.to_owned(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
+            out.push(Line::from(vec![Span::styled("│", border)]));
+            out.push(Line::from(vec![
+                Span::styled("│  ", border),
+                Span::styled("Allow agent to explore and create a plan?", body),
+            ]));
+            out.push(Line::raw("│"));
+            out.push(Line::from(vec![
+                Span::styled("│   ", border),
+                Span::styled("[y/Enter] ", key),
+                Span::styled(
+                    "Allow",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("[n/Esc] ", key),
+                Span::styled("Skip — execute directly", Style::default().fg(Color::Red)),
+            ]));
+            out.push(Line::from(vec![Span::styled(
+                "└─────────────────────────────────────────────────────",
+                border,
+            )]));
+        }
+    }
+
+    out.push(Line::raw(""));
+    out
 }
 
 // ──────────────────────────────────────────────────────────────────────

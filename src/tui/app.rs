@@ -109,6 +109,13 @@ pub enum TranscriptBlock {
         plan_text: String,
         tool_calls: Vec<serde_json::Value>,
     },
+    /// Goal-202: plan-mode entry request rendered inline in the transcript.
+    /// Agent called `request_plan_mode`; user should approve or skip.
+    PlanModeRequest {
+        reason: String,
+        /// Set to `Some(true/false)` after the user decides.
+        approved: Option<bool>,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -625,6 +632,10 @@ pub struct App {
     /// `PlanConfirmed` / `PlanRejected` events. Used to show a status-bar
     /// indicator so the user knows input is expected.
     pub plan_awaiting_approval: bool,
+    /// Goal-202: set when the agent has called `request_plan_mode` and we are
+    /// waiting for the user to allow or skip planning. Cleared by
+    /// `PlanModeApproved` / `PlanModeRejected` events.
+    pub plan_mode_request_pending: bool,
     /// Goal-147: tracks the most recent Esc / Ctrl+C presses so the
     /// second press within [`double_press_window`] can promote a soft
     /// action (interrupt / clear) into a real exit. See
@@ -824,6 +835,7 @@ impl App {
             command_menu_selected: None,
             planning_mode_on: false,
             plan_awaiting_approval: false,
+            plan_mode_request_pending: false,
             double_press: DoublePressTracker::default(),
             atfile_query: String::new(),
             atfile_suggestions: Vec::new(),
@@ -873,6 +885,13 @@ impl App {
         // permission dialog. Y/Enter allow, N/Esc deny.
         if self.pending_permission.is_some() {
             return self.handle_permission_key(key);
+        }
+
+        // ── Goal-202: plan-mode pre-confirmation ──────────────────────
+        // When the agent has called `request_plan_mode`, y/Enter approve
+        // and n/Esc reject — just like the plan approval banner.
+        if self.plan_mode_request_pending {
+            return self.handle_plan_mode_request_key(key);
         }
 
         // ── Modal stack ──────────────────────────────────────────────
@@ -1450,6 +1469,38 @@ impl App {
                 });
                 self.plan_awaiting_approval = false;
             }
+
+            // ── Goal-202: plan-mode pre-confirmation events ─────────────────
+            UiEvent::PlanModeRequested { reason } => {
+                // Render the request inline in the transcript so the user can
+                // read the reason and decide without a modal obscuring context.
+                self.blocks.push(TranscriptBlock::PlanModeRequest {
+                    reason,
+                    approved: None,
+                });
+                self.plan_mode_request_pending = true;
+            }
+            UiEvent::PlanModeApproved => {
+                // Mark the last PlanModeRequest block as approved.
+                for block in self.blocks.iter_mut().rev() {
+                    if let TranscriptBlock::PlanModeRequest { approved, .. } = block {
+                        *approved = Some(true);
+                        break;
+                    }
+                }
+                self.plan_mode_request_pending = false;
+            }
+            UiEvent::PlanModeRejected { reason: _ } => {
+                // Mark the last PlanModeRequest block as rejected.
+                for block in self.blocks.iter_mut().rev() {
+                    if let TranscriptBlock::PlanModeRequest { approved, .. } = block {
+                        *approved = Some(false);
+                        break;
+                    }
+                }
+                self.plan_mode_request_pending = false;
+            }
+
             // Goal-167: replace the task list whenever the agent calls todo_write.
             UiEvent::TodoUpdated { todos } => {
                 self.current_todos = todos;
@@ -1934,6 +1985,27 @@ impl App {
                 }
                 self.modals.pop();
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// Goal-202: dispatch a key when `plan_mode_request_pending` is set.
+    ///
+    /// * `y` / `Enter` → approve — optimistically clears the pending flag
+    ///   and emits `UserAction::ApprovePlanMode`.
+    /// * `n` / `Esc` → reject — clears the flag and emits
+    ///   `UserAction::RejectPlanMode("user skipped")`.
+    /// * Any other key is consumed (request focus kept).
+    fn handle_plan_mode_request_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.plan_mode_request_pending = false;
+                Some(UserAction::ApprovePlanMode)
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.plan_mode_request_pending = false;
+                Some(UserAction::RejectPlanMode("user skipped".into()))
             }
             _ => None,
         }
@@ -3766,5 +3838,78 @@ mod perm_tests {
         // N key via handle_key should route to permission handler.
         app.handle_key(k(KeyCode::Char('n')));
         assert!(app.pending_permission.is_none());
+    }
+
+    // ── Goal-202: plan-mode pre-confirmation ───────────────────────────
+
+    #[test]
+    fn plan_mode_requested_event_sets_pending_flag() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanModeRequested {
+            reason: "This task is complex".into(),
+        });
+        assert!(app.plan_mode_request_pending);
+        assert!(app.blocks.iter().any(|b| matches!(b,
+            TranscriptBlock::PlanModeRequest { reason, approved: None }
+                if reason.contains("complex"))));
+    }
+
+    #[test]
+    fn plan_mode_request_y_dispatches_approve_action() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanModeRequested {
+            reason: "need to plan".into(),
+        });
+        assert!(app.plan_mode_request_pending);
+        let action = app.handle_key(k(KeyCode::Char('y')));
+        assert!(!app.plan_mode_request_pending, "flag should be cleared");
+        assert!(matches!(action, Some(UserAction::ApprovePlanMode)));
+    }
+
+    #[test]
+    fn plan_mode_request_n_dispatches_reject_action() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanModeRequested {
+            reason: "need to plan".into(),
+        });
+        let action = app.handle_key(k(KeyCode::Char('n')));
+        assert!(!app.plan_mode_request_pending, "flag should be cleared");
+        assert!(matches!(action, Some(UserAction::RejectPlanMode(r)) if r == "user skipped"));
+    }
+
+    #[test]
+    fn plan_mode_approved_event_marks_block() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanModeRequested {
+            reason: "complex".into(),
+        });
+        app.handle_ui_event(UiEvent::PlanModeApproved);
+        assert!(!app.plan_mode_request_pending);
+        assert!(app.blocks.iter().any(|b| matches!(
+            b,
+            TranscriptBlock::PlanModeRequest {
+                approved: Some(true),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn plan_mode_rejected_event_marks_block() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanModeRequested {
+            reason: "complex".into(),
+        });
+        app.handle_ui_event(UiEvent::PlanModeRejected {
+            reason: "user skipped".into(),
+        });
+        assert!(!app.plan_mode_request_pending);
+        assert!(app.blocks.iter().any(|b| matches!(
+            b,
+            TranscriptBlock::PlanModeRequest {
+                approved: Some(false),
+                ..
+            }
+        )));
     }
 }
