@@ -393,6 +393,33 @@ async fn worker_loop(
                 }
             }
 
+            // Goal-171: load a saved session transcript into the runtime.
+            UserAction::ResumeSession { session_dir } => {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    let rt = rt_opt.as_mut().unwrap();
+                    match crate::session::SessionReader::load_messages(&session_dir) {
+                        Ok(messages) => {
+                            let turn_count = messages.len();
+                            rt.set_transcript(messages);
+                            let session_id = session_dir
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let _ = event_tx.send(UiEvent::SessionResumed {
+                                session_id,
+                                turn_count,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(UiEvent::Error {
+                                message: format!("Failed to load session: {e}"),
+                            });
+                        }
+                    }
+                }
+            }
+
             // Goal-169: run an already-expanded skill prompt.
             UserAction::RunSkillPrompt { prompt } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {

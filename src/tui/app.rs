@@ -654,6 +654,8 @@ pub struct App {
     pub current_todos: Vec<crate::tools::todo::TodoItem>,
     /// Goal-168: mirrored goal state, updated by `UiEvent::Goal*` events.
     pub active_goal: Option<GoalState>,
+    /// Goal-171: workspace root path, used by /resume to list sessions.
+    pub workspace_path: std::path::PathBuf,
 }
 
 // ── Goal-161: PendingPermission ──────────────────────────────────────────────
@@ -811,6 +813,9 @@ impl App {
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
             current_todos: Vec::new(),
             active_goal: None,
+            workspace_path: crate::config::Config::from_env()
+                .map(|c| c.workspace)
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
         }
     }
 
@@ -1457,6 +1462,16 @@ impl App {
                 self.turn.finish();
                 self.pending_latency_ms = None;
             }
+            UiEvent::SessionResumed {
+                session_id,
+                turn_count,
+            } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("▶ Resumed session {session_id} ({turn_count} messages)"),
+                });
+                self.turn.finish();
+                self.scroll_to_bottom();
+            }
         }
         // Sticky-scroll: when the user is already at the bottom
         // (scroll_offset == 0), keep them pinned as new content
@@ -1838,6 +1853,11 @@ impl App {
             return self.handle_plan_review_key(key);
         }
 
+        // Goal-171: ResumePicker owns ↑/↓/Enter/Esc and may return a UserAction.
+        if let Some(Modal::ResumePicker { .. }) = self.modals.last() {
+            return self.handle_resume_picker_key(key);
+        }
+
         // Generic modal dispatch (Goal 146).
         self.handle_modal_key(key);
         None
@@ -1869,6 +1889,45 @@ impl App {
             KeyCode::Char('e') => {
                 if let Some(Modal::PlanReview { plan_text, .. }) = self.modals.last().cloned() {
                     self.set_input(plan_text);
+                }
+                self.modals.pop();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Goal-171: dispatch a key against an active `Modal::ResumePicker`.
+    fn handle_resume_picker_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        use crate::tui::ui::modal::Modal;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.modals.pop();
+                None
+            }
+            KeyCode::Up => {
+                if let Some(Modal::ResumePicker { selected, .. }) = self.modals.last_mut() {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    }
+                }
+                None
+            }
+            KeyCode::Down => {
+                if let Some(Modal::ResumePicker { entries, selected }) = self.modals.last_mut() {
+                    if *selected + 1 < entries.len() {
+                        *selected += 1;
+                    }
+                }
+                None
+            }
+            KeyCode::Enter => {
+                if let Some(Modal::ResumePicker { entries, selected }) = self.modals.last() {
+                    if let Some(entry) = entries.get(*selected) {
+                        let session_dir = entry.session_dir.clone();
+                        self.modals.pop();
+                        return Some(UserAction::ResumeSession { session_dir });
+                    }
                 }
                 self.modals.pop();
                 None

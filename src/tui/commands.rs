@@ -56,7 +56,7 @@ pub enum CommandHandler {
 }
 
 /// Result of a synchronous command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CommandOutcome {
     /// Handler completed; nothing more for the dispatcher to do.
     Done,
@@ -166,6 +166,14 @@ impl CommandRegistry {
                     summary: "Autonomous loop until condition met",
                     usage: "/goal <cond> [or stop after N turns] | /goal | /goal clear",
                     handler: CommandHandler::Async(cmd_goal),
+                },
+                // Goal-171: session resume picker.
+                CommandSpec {
+                    name: "resume",
+                    aliases: &["r"],
+                    summary: "Pick a previous conversation to continue",
+                    usage: "/resume",
+                    handler: CommandHandler::Sync(cmd_resume),
                 },
             ],
             skill_commands: Vec::new(),
@@ -429,6 +437,20 @@ fn parse_goal_args(raw: &str) -> (String, u32) {
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
+fn cmd_resume(app: &mut AppState, _args: &[String]) -> CommandOutcome {
+    use crate::tui::ui::modal::{load_recent_sessions, ResumeEntry};
+    let workspace = app.workspace_path.clone();
+    let entries: Vec<ResumeEntry> = load_recent_sessions(&workspace, 20);
+    if entries.is_empty() {
+        CommandOutcome::Error("No saved sessions found.".into())
+    } else {
+        CommandOutcome::OpenModal(Modal::ResumePicker {
+            entries,
+            selected: 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_includes_all_twelve_commands() {
+    fn registry_includes_all_thirteen_commands() {
         let r = CommandRegistry::default_set();
         let names: Vec<&str> = r.commands().iter().map(|c| c.name).collect();
         for expected in &[
@@ -490,8 +512,8 @@ mod tests {
                 "missing /{expected}: have {names:?}"
             );
         }
-        // 11 built-in commands plus the new /goal command = 12.
-        assert_eq!(names.len(), 12);
+        // 11 built-in commands plus /goal and /resume = 13.
+        assert_eq!(names.len(), 13);
     }
 
     #[test]
@@ -505,7 +527,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 12);
+        assert_eq!(hits.len(), 13);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();

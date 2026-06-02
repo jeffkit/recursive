@@ -92,6 +92,14 @@ pub enum UiEvent {
     /// cancelled the in-flight LLM request via `JoinHandle::abort()` and
     /// truncated the transcript back to the pre-turn state.
     Interrupted,
+
+    // ── Goal-171: session resume ────────────────────────────────────────────
+    /// A previous session was successfully loaded into the runtime.
+    /// The UI should clear the in-progress transcript and show a System block.
+    SessionResumed {
+        session_id: String,
+        turn_count: usize,
+    },
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
@@ -163,5 +171,12 @@ pub enum UserAction {
     RunSkillPrompt {
         /// The expanded prompt text (with `$ARGUMENTS` substituted).
         prompt: String,
+    },
+
+    // ── Goal-171: session resume ────────────────────────────────────────────
+    /// Load a previously saved session transcript into the runtime.
+    ResumeSession {
+        /// The session directory path (absolute).
+        session_dir: std::path::PathBuf,
     },
 }

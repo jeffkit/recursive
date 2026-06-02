@@ -27,6 +27,23 @@ pub struct JournalEntry {
     pub preview: String,
 }
 
+// ── Goal-171: resume-picker entry ────────────────────────────────────────────
+
+/// One entry in the [`Modal::ResumePicker`] list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResumeEntry {
+    /// Absolute path to the session directory.
+    pub session_dir: std::path::PathBuf,
+    /// Short description (≤40 chars): first user prompt or goal text.
+    pub slug: String,
+    /// Human-readable last-updated date ("2026-06-01 14:22").
+    pub updated_at: String,
+    /// Number of recorded messages.
+    pub turn_count: usize,
+    /// Cumulative cost in USD (0.0 if unknown).
+    pub cost_usd: f64,
+}
+
 /// A confirmation request awaiting `y/n`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmAction {
@@ -40,7 +57,7 @@ pub enum ConfirmAction {
 /// / Confirm. Goal 147 folds the Plan-mode confirmation into the
 /// modal stack as `Modal::PlanReview`, replacing the dedicated
 /// `AppScreen::PlanReview` (now removed).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Modal {
     Help,
     CostDetail,
@@ -68,6 +85,12 @@ pub enum Modal {
         tool_calls: Vec<serde_json::Value>,
         edited_text: Option<String>,
     },
+    /// Goal-171: session resume picker. Shows a list of recent sessions
+    /// ordered by last-updated; ↑/↓ selects, Enter resumes, Esc cancels.
+    ResumePicker {
+        entries: Vec<ResumeEntry>,
+        selected: usize,
+    },
 }
 
 impl Modal {
@@ -81,6 +104,7 @@ impl Modal {
             Modal::Journal { .. } => " Journal ",
             Modal::Confirm { .. } => " Confirm ",
             Modal::PlanReview { .. } => " Plan Proposal ",
+            Modal::ResumePicker { .. } => " Resume Session ",
         }
     }
 }
@@ -110,6 +134,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::ToolList { entries } => render_tool_body(entries),
         Modal::Journal { entries, selected } => render_journal_body(entries, *selected),
         Modal::Confirm { prompt, .. } => render_confirm_body(prompt),
+        Modal::ResumePicker { entries, selected } => render_resume_picker_body(entries, *selected),
         Modal::PlanReview {
             plan_text,
             tool_calls,
@@ -372,6 +397,49 @@ fn render_journal_body(entries: &[JournalEntry], selected: usize) -> Vec<Line<'s
     out
 }
 
+fn render_resume_picker_body(entries: &[ResumeEntry], selected: usize) -> Vec<Line<'static>> {
+    let header = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut out = vec![Line::from(Span::styled(
+        "Recent sessions  (↑/↓ select · Enter resume · Esc cancel)".to_string(),
+        header,
+    ))];
+    out.push(Line::raw(""));
+
+    if entries.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  (no saved sessions found)".to_string(),
+            dim,
+        )));
+        return out;
+    }
+
+    for (i, entry) in entries.iter().enumerate() {
+        let sel_marker = if i == selected { "▶" } else { " " };
+        let row_style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let line_text = format!(
+            " {} {:<42} turns:{:>3}  {}",
+            sel_marker, entry.slug, entry.turn_count, entry.updated_at
+        );
+        out.push(Line::from(Span::styled(line_text, row_style)));
+    }
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "↑/↓ navigate  |  Enter resume  |  Esc cancel".to_string(),
+        dim,
+    )));
+    out
+}
+
 fn render_confirm_body(prompt: &str) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(prompt.to_string())];
     out.push(Line::raw(""));
@@ -550,6 +618,52 @@ pub fn load_journal_from(
                 .collect::<Vec<_>>()
                 .join("\n");
             JournalEntry { name, preview }
+        })
+        .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Session helpers (Goal-171)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Load up to `limit` recent sessions from `workspace`, sorted by
+/// `updated_at` descending. Silently skips dirs with missing/corrupt metadata.
+pub fn load_recent_sessions(workspace: &std::path::Path, limit: usize) -> Vec<ResumeEntry> {
+    let pairs = match crate::session::SessionReader::list_sessions_sorted_by_updated_at(workspace) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    pairs
+        .into_iter()
+        .take(limit)
+        .map(|(dir, meta)| {
+            let raw_slug = if !meta.goal.is_empty() {
+                meta.goal.clone()
+            } else {
+                meta.first_prompt.clone().unwrap_or_default()
+            };
+            let slug = if raw_slug.chars().count() > 40 {
+                let s: String = raw_slug.chars().take(39).collect();
+                format!("{s}…")
+            } else {
+                raw_slug
+            };
+            let updated_at = meta
+                .updated_at
+                .get(..16)
+                .unwrap_or(&meta.updated_at)
+                .replace('T', " ");
+            // SessionCost tracks token counts only; no USD field.
+            let cost_usd = 0.0_f64;
+            let _ = meta.cost; // suppress unused warning
+            ResumeEntry {
+                session_dir: dir,
+                slug,
+                updated_at,
+                turn_count: meta.message_count as usize,
+                cost_usd,
+            }
         })
         .collect()
 }
