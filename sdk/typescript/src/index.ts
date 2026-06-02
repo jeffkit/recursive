@@ -43,6 +43,7 @@ export type {
   ContentBlock,
   GoalActionResponse,
   GoalState,
+  PartialAssistantMessage,
   PlanApprovalResponse,
   RunResult,
   RunSubtype,

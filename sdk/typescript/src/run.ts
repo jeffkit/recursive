@@ -7,6 +7,7 @@ import { mapFinishReasonToSubtype } from "./models.js";
 import type {
   AssistantMessage,
   ContentBlock,
+  PartialAssistantMessage,
   RunResult,
   SDKMessage,
   ToolProgressMessage,
@@ -100,15 +101,16 @@ export class Run {
           yield msg;
         }
       } else if (evType === "partial_message") {
-        // Streaming token deltas — surface as a system message so callers
-        // that want token-level granularity can opt in via msg.subtype.
-        // Higher-level helpers (`iterText()`) ignore these by default since
-        // the eventual `message` event will carry the full text.
-        yield {
-          type: "system",
-          subtype: "partial_message",
-          data,
+        // SDK Phase C: streaming token deltas — surface as a typed
+        // PartialAssistantMessage (type="stream_event") aligned with
+        // SDKPartialAssistantMessage in the Claude Agent SDK.
+        const pm: PartialAssistantMessage = {
+          type: "stream_event",
+          text: String(data["text"] ?? ""),
+          step: Number(data["step"] ?? 0),
+          sessionId: this.id,
         };
+        yield pm;
       } else if (evType === "tool_progress") {
         // SDK Phase B: tool execution timing event.
         const tp: ToolProgressMessage = {

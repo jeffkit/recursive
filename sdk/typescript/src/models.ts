@@ -56,11 +56,37 @@ export interface ToolProgressMessage {
   sessionId: string;
 }
 
+/**
+ * SDK Phase C: a streaming text delta from the assistant.
+ *
+ * Corresponds to `SDKPartialAssistantMessage` in the Claude Agent SDK.
+ * Yielded by `Run.stream()` / `Run.messages()` as `type === "stream_event"`.
+ *
+ * Callers that want token-level granularity (e.g. typewriter UI) can filter:
+ * ```ts
+ * for await (const msg of run.stream()) {
+ *   if (msg.type === "stream_event") process.stdout.write(msg.text);
+ * }
+ * ```
+ *
+ * Most callers should use the full `AssistantMessage` (`type === "assistant"`),
+ * which is emitted once the entire turn is complete.
+ */
+export interface PartialAssistantMessage {
+  type: "stream_event";
+  /** The token delta text. */
+  text: string;
+  /** Agent step index — use to group deltas from the same turn. */
+  step: number;
+  sessionId: string;
+}
+
 export type SDKMessage =
   | AssistantMessage
   | UserMessage
   | SystemMessage
-  | ToolProgressMessage;
+  | ToolProgressMessage
+  | PartialAssistantMessage;
 
 // ── Run result ────────────────────────────────────────────────────────────
 
