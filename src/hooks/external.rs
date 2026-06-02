@@ -98,6 +98,7 @@ impl HookOutput {
 /// the runner sends the event to each hook in order and returns the
 /// first non-`Continue` decision. Hooks that timeout or return
 /// invalid output are treated as `Continue` (fail-open).
+#[derive(Clone)]
 pub struct ExternalHookRunner {
     hooks: Vec<PathBuf>,
 }

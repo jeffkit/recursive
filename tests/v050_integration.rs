@@ -40,6 +40,7 @@ mod v050_integration {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 10,
             shell_timeout_secs: 30,
+            headless: false,
             memory_summary_limit: 5,
         })
     }
