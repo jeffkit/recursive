@@ -40,6 +40,7 @@ pub mod session;
 pub mod session_lock;
 pub mod skills;
 pub mod storage;
+pub mod tool_set_provider;
 pub mod tools;
 pub mod transcript;
 #[cfg(feature = "tui")]
@@ -105,6 +106,7 @@ pub use skills::{
 pub use storage::{
     AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
+pub use tool_set_provider::{LocalToolSetProvider, SandboxMode, ToolSetProvider};
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
     PlanApprovalGate, PlanApprovalResult, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch,
