@@ -563,6 +563,24 @@ var Agent = class {
     const http = makeClient(options);
     await http.patch(`/sessions/${sessionId}`, { title });
   }
+  /**
+   * Return the transcript messages for a session.
+   *
+   * Fetches `GET /sessions/:id` and returns the `messages` array.
+   * Each message is a raw object with at minimum `role` and `content` fields.
+   *
+   * ```ts
+   * const msgs = await Agent.getSessionMessages(sessionId);
+   * for (const m of msgs) {
+   *   console.log(m["role"], String(m["content"]).slice(0, 60));
+   * }
+   * ```
+   */
+  static async getSessionMessages(sessionId, options = {}) {
+    const http = makeClient(options);
+    const data = await http.get(`/sessions/${sessionId}`);
+    return data["messages"] ?? [];
+  }
   /** Delete a session by ID. */
   static async deleteSession(sessionId, options = {}) {
     const http = makeClient(options);
