@@ -92,11 +92,11 @@ src/app.rs::PromptInputState`（`crates/recursive-tui/src/app.rs:303-516`）
 | 光标移动 ←/→ | 是（按 char） | 是（按 char，UTF-8 安全） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::move_left/move_right`)；`cursor_handles_multibyte_chars` 测试覆盖 |
 | Home / End | 是（按视觉行） | 是（按视觉行） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::move_home/move_end`) |
 | Ctrl+A / Ctrl+E（行首尾） | 是 | Ctrl+A 是；Ctrl+E 仅在 buf 空时给 transcript（展开），buf 非空时给输入框（行尾） | 🟡 | Goal 145；冲突解：buf 非空时优先输入框，buf 空时优先 transcript expand。简化方式：避免引入 readline 模式，靠状态分流 |
-| 历史回溯 ↑/↓ | 是 + 模糊搜索（Ctrl+R 弹 `HistorySearchDialog`） | 仅 ↑/↓ + buf 空（或正在 nav 中）时翻页 | 🟡 | Goal 145；Ctrl+R 模糊搜索未实现 |
+| 历史回溯 ↑/↓ | 是 + 模糊搜索（Ctrl+R 弹 `HistorySearchDialog`） | ↑/↓ 翻页 + Ctrl+R 模糊搜索 | ✅ | Goal 145 + Goal-160（`src/tui/app.rs:640`）；Ctrl+R 弹 `InputMode::HistorySearch` popup |
 | 历史回溯保留模式前缀 | 是 | 是（`!`/`#`/`/` 前缀重新解析） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::strip_history_prefix`) |
 | 历史持久化（跨会话） | 是（写到 history.ts 的本地存储） | 否 | 🔴 | 未实现原因：Recursive 没有 session 持久化层；建议路径：先做 session 磁盘存储（Resume modal 复用） |
 | 草稿暂存（进入历史时） | 是 | 是 (`PromptInputState.draft` + `draft_mode`) | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs:317-321`) |
-| @file 自动补全 | 是（`src/components/ContextSuggestions.tsx`） | 否 | 🔴 | 候选下一期。建议路径：扩展 Command 模式触发字符到 `@`，参考 CommandRegistry 的 `search()` |
+| @file 自动补全 | 是（`src/components/ContextSuggestions.tsx`） | 是 | ✅ | Goal-158 落地：`InputMode::AtFile`，`@` 触发弹 popup，↑/↓/Tab/Enter 选择（`src/tui/app.rs:621`、`src/tui/ui/command_menu.rs:134`） |
 | @symbol 补全（LSP） | 是（仅启用 `LspRecommendation` 时） | 否 | 🔴 | 依赖 LSP 集成 |
 | 外部编辑器 Ctrl+G / `Ctrl+X Ctrl+E` | 是（`$EDITOR` 调用） | 否 | 🔴 | 未实现原因：crossterm 切换 raw mode 临时 spawn 子进程的逻辑未写；建议路径：`tokio::process::Command` + 暂停渲染循环 |
 | 图片粘贴（Ctrl+V/Alt+V） | 是 | 否 | ⛔ | Recursive 短期内不接多模态 |
@@ -106,7 +106,7 @@ src/app.rs::PromptInputState`（`crates/recursive-tui/src/app.rs:303-516`）
 | 队列命令显示（`PromptInputQueuedCommands.tsx`） | 是 | 否 | 🔴 | fake-cc 在 Agent 跑动时允许排队下一条；Recursive 当前 turn-running 时输入框冻结（无显式排队） |
 | Stash notice（`PromptInputStashNotice.tsx`） | 是（输入框上方浮短行通知） | 否 | 🔴 | 与 stash 命令绑定，stash 未实现 |
 | Sandbox 提示（`SandboxPromptFooterHint.tsx`） | 是 | 否（Recursive 默认 sandbox 模式无切换） | ⛔ | Recursive 工具箱里 sandbox 行为是配置时定的，无运行时 toggle |
-| 模糊搜索历史（`HistorySearchInput.tsx`） | 是 | 否 | 🔴 | 候选下一期；建议路径：在 InputMode 上加 `HistorySearch` 变体，复用 fzf 算法 |
+| 模糊搜索历史（`HistorySearchInput.tsx`） | 是 | 是 | ✅ | Goal-160 落地：`InputMode::HistorySearch`，Ctrl+R 触发，fzf 风格模糊匹配（`src/tui/app.rs:640`、`src/tui/ui/command_menu.rs:160`） |
 | 占位符（`usePromptInputPlaceholder.ts`） | 是（"Try: ..." 旋转提示） | 无 | 🟡 | 简化方式：欢迎 System 块代替 |
 | 闪烁输入光标 | 是（`ShimmeredInput.tsx` 在 thinking 时） | 真光标定位（`frame.set_cursor_position`） | ✅ | Goal 145；视觉风格不同但都能定位 |
 | Voice indicator（`VoiceIndicator.tsx`） | 是 | 否 | ⛔ | 同 Voice |
@@ -204,7 +204,7 @@ fake-cc 的键位通过 `src/keybindings/{defaultBindings,resolver,match}.ts`
 | Ctrl+C 第二次（2s 内） | 真退出 | 真退出（`should_quit`） | ✅ | Goal 147；窗口可由 `RECURSIVE_TUI_DOUBLE_MS` 环境变量调（默认 2000ms） |
 | Ctrl+D（input 空时） | 退出 | 退出 | ✅ | Goal 143 |
 | Ctrl+L | 重绘屏幕 | 无显式键 | 🟡 | crossterm `Resize` 自动重绘；显式 `Ctrl+L` 候选 |
-| Ctrl+R | 弹历史搜索 dialog | 无 | 🔴 | 候选下一期；同 §2 模糊搜索 |
+| Ctrl+R | 弹历史搜索 dialog | 是 | ✅ | Goal-160：`InputMode::HistorySearch`，fzf 模糊匹配历史记录 |
 | Ctrl+T | 打开 todos 列表 | 无 | 🔴 | Recursive 没有 todo 系统；候选与 task 系统集成 |
 | Ctrl+O | 切到 transcript pager 模式 | 无 | 🔴 | 候选；建议路径：把 transcript 切到全屏 less 风格 |
 | Ctrl+Shift+P | Quick Open（命令 / 文件） | 无 | 🔴 | 候选；可参考 `/` 命令补全扩展 |
@@ -217,7 +217,7 @@ fake-cc 的键位通过 `src/keybindings/{defaultBindings,resolver,match}.ts`
 | Ctrl+Z | 终端原生 suspend | 终端原生（不拦截） | ✅ | 默认行为不动 |
 | Ctrl+_ / Ctrl+Shift+- | 撤销最后一条消息 | 无 | 🔴 | 候选 |
 | Ctrl+X Ctrl+K | Kill agents（多 agent） | 无 | ⛔ | 多 agent swarm 不在 Recursive 范围 |
-| Tab | 自动补全 | 在 Command 模式补全唯一前缀 | 🟡 | Goal 146 (`crates/recursive-tui/src/ui/command_menu.rs`)；@file 补全未做 |
+| Tab | 自动补全 | 在 Command 模式补全唯一前缀；AtFile 模式确认选择 | ✅ | Goal 146 + Goal-158；@file 补全在 `AtFile` 模式下 Tab/Enter 确认 |
 | ↑/↓（buf 空 + 无 modal） | 历史回溯 | 历史回溯 | ✅ | Goal 145 |
 | ↑/↓（modal 中） | 选择项 | 选择项（Journal modal） | ✅ | Goal 146 (`crates/recursive-tui/src/app.rs::handle_modal_key`) |
 | PgUp / PgDn | transcript 滚动 | transcript 滚动（每页半屏） | ✅ | Goal 143 |
@@ -386,8 +386,8 @@ ui/modal.rs:43-71`）。
 | Journal viewer | — | 是（`Modal::Journal`，Recursive 独有） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::render_journal`) |
 | Confirm（y/n） | 是 | 是（`Modal::Confirm`，Exit / Clear 两种 ConfirmAction） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::ConfirmAction`) |
 | Plan review | 是 | 是（`Modal::PlanReview`，Goal 147 替代旧 PlanReview screen） | ✅ | Goal 147 (`crates/recursive-tui/src/ui/modal.rs:66-71`、`crates/recursive-tui/src/ui/modal.rs::render_plan_review`) |
-| Resume picker | 是（`ResumeConversation.tsx`） | 否 | 🔴 | 候选下一期；前置 session 持久化 |
-| History search | 是（`HistorySearchDialog.tsx`） | 否 | 🔴 | 候选；同 §2 模糊搜索 |
+| Resume picker | 是（`ResumeConversation.tsx`） | 是 | ✅ | Goal-171 落地：`Modal::ResumePicker`，`/resume` 命令，`SessionReader` 驱动 |
+| History search | 是（`HistorySearchDialog.tsx`） | 是 | ✅ | Goal-160：Ctrl+R，`InputMode::HistorySearch` |
 | Quick open | 是（`QuickOpenDialog.tsx`） | 否 | 🔴 | 候选；与 Ctrl+Shift+P 绑定 |
 | Global search | 是（`GlobalSearchDialog.tsx`） | 否 | 🔴 | 候选 |
 | Permission request | 是（`src/components/permissions/`） | 否 | 🔴 | **重要候选**；runtime 已有 permission_hook（参考 `src/runtime.rs:204` 类似位置），需要加 UI 通道（mpsc 双向） |
@@ -435,7 +435,7 @@ ui/modal.rs:43-71`）。
 |---|---|---|---|---|
 | Vim 模式 | 完整（motion / operator / text-object，`src/vim/` 5 个 .ts） | 否 | 🔴 | 候选下一期。建议路径：`InputMode` enum 升级为状态机；引入 `vim::Mode { Insert, Normal, Visual }`；motion / operator / text-object 三个模块映射 fake-cc 同名文件；测试覆盖率要高（vim 用户对边界很挑剔） |
 | Vim text input（`VimTextInput.tsx`） | 是 | 否 | 🔴 | 同上 |
-| @file 自动补全 | 是 | 否 | 🔴 | 候选；建议路径：扩展 InputMode 触发字符到 `@`，glob 工作区文件，复用 CommandRegistry::search 的实现风格 |
+| @file 自动补全 | 是 | 是 | ✅ | Goal-158 落地：`InputMode::AtFile`，glob 工作区文件，popup 选择 |
 | @symbol 补全（LSP） | 是（`LspRecommendation`） | 否 | 🔴 | 候选；前置 LSP 集成 |
 | Resume conversation | 是（`src/screens/ResumeConversation.tsx`） | 是 | ✅ | Goal-171 落地：`Modal::ResumePicker` + `/resume` 命令，`SessionReader::list_sessions_sorted_by_updated_at` 驱动列表 |
 | Conversation fork / branch | 是 | 否 | 🔴 | 候选；前置 session 持久化 |
@@ -458,7 +458,7 @@ ui/modal.rs:43-71`）。
 | 真正的取消正在飞的 LLM 请求 | 是（abort controller） | ✅（JoinHandle::abort() 立即 drop reqwest 响应，transcript 截断至 pre-turn） | ✅ | Goal 170 (`src/tui/backend.rs::worker_loop` 4 个 turn path；`src/runtime.rs::truncate_transcript`)；Esc 触发 UiEvent::Interrupted，< 200ms |
 | 中断历史 / 撤销最近一条 | 是（`Ctrl+_`） | 否 | 🔴 | 候选 |
 | Plan 编辑后 inline diff | 是 | 否（`e` 键把文本扔回输入框） | 🟡 | Goal 147 显式简化；候选：在 PlanReview modal 内提供编辑 buffer |
-| Permission 请求 modal | 是 | 否 | 🔴 | **下一期重点**；建议路径：runtime 加 permission_hook 与 mpsc 双向通道，UI 弹 Confirm modal |
+| Permission 请求 modal | 是 | 是 | ✅ | Goal-161 落地：`TuiPermissionHook` + `PendingPermission` + `Modal::Confirm` 双向通道（`src/tui/backend.rs:150`、`src/tui/app.rs:640`） |
 | Permission policy（auto-mode / bypass / threshold） | 是 | 否 | 🔴 | 与 permission modal 配套 |
 | Skill / memory UI | 是 | 否（CLI 有 remember/recall/load_skill） | 🔴 | 候选；TUI 入口缺 |
 | Worktree workflow UI | 是 | 否 | 🔴 | Recursive 有 worktree skill（`worktree-start`、`worktree-done`），TUI 未联动 |
@@ -478,17 +478,11 @@ ui/modal.rs:43-71`）。
    - `/resume` 命令 + `Modal::ResumePicker` + `SessionReader` 集成完成。
    - 剩余解锁：`/share`、`/fork`、历史持久化、`/rewind` picker。
 
-2. **@file 自动补全**（高 / 低）
-   - 落地路径：扩展 `InputMode` 触发字符到 `@`，buf 非空时弹文件 glob
-     菜单，参考 `crates/recursive-tui/src/ui/command_menu.rs` 的实现。
-     工作区根可以从 `Backend` 暴露一个 sync channel 提供。1 个 goal。
+2. ~~**@file 自动补全**（高 / 低）~~ ✅ **Goal-158 已落地**
+   - `InputMode::AtFile`，`@` 触发弹 popup，glob 工作区文件，Tab/Enter 确认。
 
-3. **Permission request modal**（高 / 中）
-   - 落地路径：在 `recursive_agent::AgentRuntime` 里加 permission_hook
-     trait（`async fn ask(&self, ToolCall) -> Decision`），TUI 端实现
-     一个 mpsc 双向通道，把 ask 转成 `Modal::Permission` + 等待用户
-     y/n。runtime 改动 < 80 行，TUI 改动 ~ 一个新 modal + dispatch 钩。
-     2 个 goal。
+3. ~~**Permission request modal**（高 / 中）~~ ✅ **Goal-161 已落地**
+   - `TuiPermissionHook` + `perm_rx` 双向通道 + `Modal::Confirm` UI 完成。
 
 4. ~~**真正的取消正在飞的 LLM 请求**~~ ✅ Goal-170（2026-06-02 落地）
 
@@ -502,9 +496,8 @@ ui/modal.rs:43-71`）。
      textObjects,transitions}.rs` 对应 fake-cc 同名 .ts；测试覆盖率
      要高。3 个 goal。
 
-7. **历史模糊搜索（Ctrl+R）**（中 / 低）
-   - 落地路径：在 `PromptInputState` 加 `HistorySearch` 模式，引入
-     `nucleo-matcher` 或自写 fzf；菜单复用 command_menu。1 个 goal。
+7. ~~**历史模糊搜索（Ctrl+R）**（中 / 低）~~ ✅ **Goal-160 已落地**
+   - `InputMode::HistorySearch`，Ctrl+R 触发，fzf 风格模糊匹配。
 
 8. **`/mcp` TUI 入口**（中 / 低）
    - 落地路径：把 MCP CLI 子命令（在 `recursive-mcp` crate 里）映射
