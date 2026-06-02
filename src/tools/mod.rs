@@ -146,6 +146,7 @@ pub mod fs;
 pub mod load_skill;
 pub mod memory;
 pub mod plan_mode;
+pub mod policy_sandbox;
 pub mod run_background;
 pub mod run_skill_script;
 pub mod schedule_wakeup;
@@ -177,6 +178,7 @@ pub use memory::{
 };
 pub use memory::{Forget, Recall, Remember};
 pub use plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult};
+pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
@@ -250,6 +252,10 @@ pub struct ToolRegistry {
     /// before every tool invocation. `None` means allow all (backward-
     /// compatible default).
     permission_hook: Option<Arc<dyn PermissionHook>>,
+    /// Goal-184: optional L1 policy config. Stored here so individual tools
+    /// can query it at call time. Does not enforce anything by itself;
+    /// tools must call `registry.policy()` and check before executing.
+    policy: Option<policy_sandbox::PolicyConfig>,
 }
 
 /// Observer that records files touched by structured filesystem tools
@@ -324,6 +330,7 @@ impl ToolRegistry {
             permissions: None,
             touched: None,
             permission_hook: None,
+            policy: None,
         }
     }
 
@@ -346,6 +353,7 @@ impl ToolRegistry {
             permissions: self.permissions.clone(),
             touched: self.touched.clone(),
             permission_hook: self.permission_hook.clone(),
+            policy: self.policy.clone(),
         }
     }
 
@@ -366,6 +374,24 @@ impl ToolRegistry {
     /// Remove any previously attached permission hook.
     pub fn clear_permission_hook(&mut self) {
         self.permission_hook = None;
+    }
+
+    /// Attach an L1 policy config. The registry stores the policy so that
+    /// individual tools (e.g. `run_shell`) can query it via
+    /// `registry.policy()` at call time.
+    pub fn with_policy(mut self, policy: policy_sandbox::PolicyConfig) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Set the L1 policy config via mutable reference.
+    pub fn set_policy(&mut self, policy: policy_sandbox::PolicyConfig) {
+        self.policy = Some(policy);
+    }
+
+    /// Return the attached policy config, if any.
+    pub fn policy(&self) -> Option<&policy_sandbox::PolicyConfig> {
+        self.policy.as_ref()
     }
 
     /// Set the permissions configuration for this registry.
