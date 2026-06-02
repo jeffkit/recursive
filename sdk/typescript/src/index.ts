@@ -51,6 +51,7 @@ export type {
   SystemMessage,
   TextContent,
   ToolInfo,
+  ToolProgressMessage,
   ToolResultBlock,
   ToolUseBlock,
   UsageMeta,

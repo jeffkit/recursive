@@ -40,7 +40,27 @@ export interface SystemMessage {
   data: Record<string, unknown>;
 }
 
-export type SDKMessage = AssistantMessage | UserMessage | SystemMessage;
+/**
+ * SDK Phase B: emitted when a tool call completes with wall-clock timing.
+ *
+ * Yielded by `Run.stream()` / `Run.messages()` as `type === "tool_progress"`.
+ */
+export interface ToolProgressMessage {
+  type: "tool_progress";
+  /** The tool call ID that just finished. */
+  toolUseId: string;
+  /** Name of the tool that was called. */
+  toolName: string;
+  /** Wall-clock milliseconds from tool call start to result receipt. */
+  elapsedMs: number;
+  sessionId: string;
+}
+
+export type SDKMessage =
+  | AssistantMessage
+  | UserMessage
+  | SystemMessage
+  | ToolProgressMessage;
 
 // ── Run result ────────────────────────────────────────────────────────────
 

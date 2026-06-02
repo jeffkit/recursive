@@ -37,6 +37,7 @@ from .models import (
     SessionInfo,
     SystemMessage,
     TextContent,
+    ToolProgressMessage,
     ToolResultBlock,
     ToolUseBlock,
     UsageMeta,
@@ -59,6 +60,8 @@ __all__ = [
     "TextContent",
     "ToolUseBlock",
     "ToolResultBlock",
+    # SDK Phase B: tool execution progress
+    "ToolProgressMessage",
     # Goal-168
     "GoalState",
     # Misc

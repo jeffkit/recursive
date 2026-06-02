@@ -11,6 +11,7 @@ from .models import (
     RunResult,
     SystemMessage,
     TextContent,
+    ToolProgressMessage,
     ToolResultBlock,
     ToolUseBlock,
     UsageMeta,
@@ -110,6 +111,16 @@ class Run:
                     type="system",
                     subtype="partial_message",
                     data=data,
+                )
+
+            elif ev_type == "tool_progress":
+                # SDK Phase B: tool execution timing event.
+                yield ToolProgressMessage(
+                    type="tool_progress",
+                    tool_use_id=data.get("tool_use_id", ""),
+                    tool_name=data.get("tool_name", ""),
+                    elapsed_ms=int(data.get("elapsed_ms", 0)),
+                    session_id=self._session_id,
                 )
 
             elif ev_type == "done":

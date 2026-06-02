@@ -8,6 +8,7 @@ import type {
   ContentBlock,
   RunResult,
   SDKMessage,
+  ToolProgressMessage,
   UsageMeta,
 } from "./models.js";
 
@@ -106,6 +107,16 @@ export class Run {
           subtype: "partial_message",
           data,
         };
+      } else if (evType === "tool_progress") {
+        // SDK Phase B: tool execution timing event.
+        const tp: ToolProgressMessage = {
+          type: "tool_progress",
+          toolUseId: String(data["tool_use_id"] ?? ""),
+          toolName: String(data["tool_name"] ?? ""),
+          elapsedMs: Number(data["elapsed_ms"] ?? 0),
+          sessionId: this.id,
+        };
+        yield tp;
       } else if (evType === "done") {
         finishReason = data["finish_reason"] as string | undefined;
         usageData = data["usage"] as Record<string, unknown> | undefined;

@@ -583,6 +583,14 @@ pub enum SseEvent {
     GoalContinuing { reason: String, turns: u32 },
     /// Goal-168: judge confirmed condition met.
     GoalAchieved { condition: String, turns: u32 },
+    /// SDK Phase B: a tool call just completed; elapsed_ms is wall-clock time
+    /// from when the ToolCall event was received to when ToolResult arrived.
+    /// Emitted in addition to (and after) the `tool_result` event.
+    ToolProgress {
+        tool_use_id: String,
+        tool_name: String,
+        elapsed_ms: u64,
+    },
 }
 
 // ── App state ──────────────────────────────────────────────────────────────
@@ -1671,10 +1679,31 @@ async fn send_session_message(
     runtime.set_event_sink(Arc::new(sink));
 
     // Spawn a forwarder: AgentEvent → SseEvent → broadcast channel.
+    // SDK Phase B: track tool call start times so we can emit tool_progress
+    // events with elapsed_ms when each tool finishes.
     let forward_handle = tokio::spawn(async move {
-        while let Some(agent_event) = event_rx.recv().await {
-            if let Some(sse_event) = map_agent_event(&agent_event) {
+        let mut tool_start_times: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        while let Some(ref agent_event) = event_rx.recv().await {
+            // Record start time for each tool call so we can compute elapsed
+            // when the result arrives.
+            if let AgentEvent::ToolCall { id, .. } = agent_event {
+                tool_start_times.insert(id.clone(), std::time::Instant::now());
+            }
+            if let Some(sse_event) = map_agent_event(agent_event) {
                 let _ = broadcast_tx.send(sse_event);
+            }
+            // After forwarding the tool_result, emit tool_progress with timing.
+            if let AgentEvent::ToolResult { id, name, .. } = agent_event {
+                let elapsed_ms = tool_start_times
+                    .remove(id)
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = broadcast_tx.send(SseEvent::ToolProgress {
+                    tool_use_id: id.clone(),
+                    tool_name: name.clone(),
+                    elapsed_ms,
+                });
             }
         }
     });
@@ -1754,6 +1783,7 @@ async fn session_events(
                 SseEvent::PlanProposed { .. } => "plan_proposed",
                 SseEvent::GoalContinuing { .. } => "goal_continuing",
                 SseEvent::GoalAchieved { .. } => "goal_achieved",
+                SseEvent::ToolProgress { .. } => "tool_progress",
             };
             let data = serde_json::to_string(&sse_event).unwrap_or_default();
             Some(Ok(Event::default().event(event_type).data(data)))
@@ -2358,5 +2388,100 @@ mod tests {
         assert!(matches!(out[0], ag::Event::TextMessageStart(_)));
         assert!(matches!(out[1], ag::Event::TextMessageContent(_)));
         assert!(matches!(out[2], ag::Event::TextMessageEnd(_)));
+    }
+
+    // ── SDK Phase B: tool_progress forwarder ─────────────────────────────
+
+    /// Verify that the stateful forwarder logic correctly emits ToolProgress
+    /// after ToolResult with the right tool_name.  We simulate the forwarder's
+    /// HashMap bookkeeping without spinning up a full Tokio task.
+    #[test]
+    fn tool_progress_emitted_after_tool_result() {
+        use crate::event::AgentEvent;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut tool_start_times: HashMap<String, Instant> = HashMap::new();
+        let mut emitted: Vec<SseEvent> = Vec::new();
+
+        // Simulate ToolCall arrival
+        let call_event = AgentEvent::ToolCall {
+            name: "run_shell".to_string(),
+            id: "tc-1".to_string(),
+            arguments: "{}".to_string(),
+            step: 0,
+        };
+        if let AgentEvent::ToolCall { id, .. } = &call_event {
+            tool_start_times.insert(id.clone(), Instant::now());
+        }
+        if let Some(ev) = map_agent_event(&call_event) {
+            emitted.push(ev);
+        }
+
+        // Simulate ToolResult arrival (no sleep needed — elapsed_ms ≥ 0)
+        let result_event = AgentEvent::ToolResult {
+            id: "tc-1".to_string(),
+            name: "run_shell".to_string(),
+            output: "ok".to_string(),
+            step: 0,
+        };
+        if let Some(ev) = map_agent_event(&result_event) {
+            emitted.push(ev);
+        }
+        if let AgentEvent::ToolResult { id, name, .. } = &result_event {
+            let elapsed_ms = tool_start_times
+                .remove(id)
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            emitted.push(SseEvent::ToolProgress {
+                tool_use_id: id.clone(),
+                tool_name: name.clone(),
+                elapsed_ms,
+            });
+        }
+
+        // Expect: ToolCall, ToolResult, ToolProgress
+        assert_eq!(emitted.len(), 3, "expected 3 events");
+        assert!(matches!(emitted[0], SseEvent::ToolCall { .. }));
+        assert!(matches!(emitted[1], SseEvent::ToolResult { .. }));
+        let SseEvent::ToolProgress {
+            tool_use_id,
+            tool_name,
+            elapsed_ms,
+        } = &emitted[2]
+        else {
+            panic!("third event should be ToolProgress");
+        };
+        assert_eq!(tool_use_id, "tc-1");
+        assert_eq!(tool_name, "run_shell");
+        let _ = elapsed_ms; // ≥ 0 is trivially true for u64
+    }
+
+    /// Verify that tool_start_times does NOT grow if a ToolResult arrives
+    /// without a matching ToolCall (e.g. replayed events).
+    #[test]
+    fn tool_progress_elapsed_is_zero_for_unmatched_result() {
+        use crate::event::AgentEvent;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut tool_start_times: HashMap<String, Instant> = HashMap::new();
+
+        let result_event = AgentEvent::ToolResult {
+            id: "tc-orphan".to_string(),
+            name: "read_file".to_string(),
+            output: "data".to_string(),
+            step: 0,
+        };
+        let elapsed_ms = if let AgentEvent::ToolResult { id, .. } = &result_event {
+            tool_start_times
+                .remove(id)
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0)
+        } else {
+            unreachable!()
+        };
+        // No panic; elapsed defaults to 0 when no matching ToolCall.
+        assert_eq!(elapsed_ms, 0);
     }
 }

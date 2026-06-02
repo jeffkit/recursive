@@ -58,6 +58,23 @@ class SystemMessage:
     data: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ToolProgressMessage:
+    """SDK Phase B: emitted when a tool call completes with timing info.
+
+    Yielded by :meth:`Run.messages` as ``type="tool_progress"`` events.
+    """
+
+    type: str  # "tool_progress"
+    tool_use_id: str
+    """The tool call ID that just finished."""
+    tool_name: str
+    """Name of the tool that was called."""
+    elapsed_ms: int
+    """Wall-clock milliseconds from tool call start to result receipt."""
+    session_id: str = ""
+
+
 # ── Run result ────────────────────────────────────────────────────────────
 
 @dataclass
