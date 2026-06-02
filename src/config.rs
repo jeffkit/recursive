@@ -52,7 +52,7 @@ impl Config {
             .or_else(|_| std::env::var("OPENAI_API_BASE"))
             .ok()
             .or_else(|| file_provider.and_then(|p| p.api_base.clone()))
-            .unwrap_or_else(|| "https://api.openai.com/v1".into());
+            .unwrap_or_else(|| "https://api.anthropic.com".into());
 
         let api_key = std::env::var("RECURSIVE_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
@@ -63,7 +63,7 @@ impl Config {
             .or_else(|_| std::env::var("OPENAI_MODEL"))
             .ok()
             .or_else(|| file_provider.and_then(|p| p.model.clone()))
-            .unwrap_or_else(|| "gpt-4o-mini".into());
+            .unwrap_or_else(|| "claude-sonnet-4-6".into());
 
         let max_steps = std::env::var("RECURSIVE_MAX_STEPS")
             .ok()
@@ -105,7 +105,7 @@ impl Config {
         let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
             .ok()
             .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
-            .unwrap_or_else(|| "openai".into());
+            .unwrap_or_else(|| "anthropic".into());
 
         let memory_summary_limit = std::env::var("RECURSIVE_MEMORY_SUMMARY_LIMIT")
             .ok()
