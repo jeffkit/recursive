@@ -404,10 +404,7 @@ mod tests {
             .execute(json!({"prompt": "Summarise the current directory."}))
             .await
             .unwrap();
-        assert!(
-            result.contains("type:general finished:"),
-            "got: {result}"
-        );
+        assert!(result.contains("type:general finished:"), "got: {result}");
         assert!(result.contains("Task complete"), "got: {result}");
     }
 
@@ -426,10 +423,7 @@ mod tests {
             .execute(json!({"prompt": "List Rust files.", "worker_type": "explore"}))
             .await
             .unwrap();
-        assert!(
-            result.contains("type:explore finished:"),
-            "got: {result}"
-        );
+        assert!(result.contains("type:explore finished:"), "got: {result}");
     }
 
     #[tokio::test]
