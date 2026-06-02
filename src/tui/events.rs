@@ -73,6 +73,12 @@ pub enum UiEvent {
     /// a free-form `reason`. Same UI handling as `PlanConfirmed` plus
     /// the reason in the System block.
     PlanRejected { reason: String },
+    /// Goal-202: agent called `request_plan_mode`; user should approve or skip.
+    PlanModeRequested { reason: String },
+    /// Goal-202: user approved the plan-mode entry request.
+    PlanModeApproved,
+    /// Goal-202: user rejected the plan-mode entry request.
+    PlanModeRejected { reason: String },
     /// Goal-167: the agent updated its task list via `todo_write`. Carries
     /// the complete replacement list so the UI can re-render without a diff.
     TodoUpdated {
@@ -142,6 +148,10 @@ pub enum UserAction {
     ConfirmPlan,
     /// Reject the pending plan with a free-form reason.
     RejectPlan(String),
+    /// Goal-202: user approves the plan-mode entry request (`request_plan_mode`).
+    ApprovePlanMode,
+    /// Goal-202: user rejects the plan-mode entry request; agent executes directly.
+    RejectPlanMode(String),
     /// Goal-146: trigger a transcript compaction pass via
     /// [`AgentRuntime::compact_now`]. The worker pushes a
     /// `Compacted` event when summarisation succeeds.

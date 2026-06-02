@@ -131,6 +131,10 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         }),
         AgentEvent::PlanConfirmed => Some(UiEvent::PlanConfirmed),
         AgentEvent::PlanRejected { reason } => Some(UiEvent::PlanRejected { reason }),
+        // Goal-202: plan-mode pre-confirmation events.
+        AgentEvent::PlanModeRequested { reason } => Some(UiEvent::PlanModeRequested { reason }),
+        AgentEvent::PlanModeApproved => Some(UiEvent::PlanModeApproved),
+        AgentEvent::PlanModeRejected { reason } => Some(UiEvent::PlanModeRejected { reason }),
         // Goal-167: forward todo updates to the UI.
         AgentEvent::TodoUpdated { todos } => Some(UiEvent::TodoUpdated { todos }),
 
@@ -286,6 +290,18 @@ async fn worker_loop(
             UserAction::RejectPlan(reason) => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     rt_opt.as_mut().unwrap().reject_plan(&reason);
+                }
+            }
+
+            // Goal-202: plan-mode pre-confirmation responses.
+            UserAction::ApprovePlanMode => {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    rt_opt.as_ref().unwrap().approve_plan_mode_request();
+                }
+            }
+            UserAction::RejectPlanMode(reason) => {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    rt_opt.as_ref().unwrap().reject_plan_mode_request(&reason);
                 }
             }
 

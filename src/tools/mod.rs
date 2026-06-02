@@ -183,7 +183,10 @@ pub use memory::{
     ScratchpadGet, ScratchpadList, WorkingMemoryTool,
 };
 pub use memory::{Forget, Recall, Remember};
-pub use plan_mode::{EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult};
+pub use plan_mode::{
+    EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult, PlanModeRequestGate,
+    PlanModeRequestResult, RequestPlanModeTool,
+};
 pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
 pub use run_skill_script::RunSkillScript;
