@@ -1,0 +1,436 @@
+//! `spawn_worker` tool: first-class coordinator-pattern delegation.
+//!
+//! Unlike the lower-level `sub_agent` tool (which the LLM can use for arbitrary
+//! sub-tasks), `spawn_worker` is designed for the **coordinator pattern** where
+//! a lead agent explicitly delegates structured work to specialist workers.
+//!
+//! Motivation: The old `TeamOrchestrator` approach required the LLM to write
+//! `DELEGATE:<role>:<task>` text strings, which were then parsed — a fragile,
+//! non-type-safe mechanism. `spawn_worker` gives the coordinator agent a proper
+//! JSON tool call to express delegation, eliminating text parsing entirely.
+//!
+//! # Worker types
+//!
+//! | `worker_type` | System prompt focus | Tool access |
+//! |---------------|---------------------|-------------|
+//! | `general`     | General-purpose     | Full (parent registry) |
+//! | `explore`     | Read-only research  | read_file, list_dir, search_files, web_fetch |
+//! | `coder`       | Code implementation | Full |
+//! | `reviewer`    | Code review         | read_file, list_dir, search_files |
+//! | `researcher`  | External research   | read_file, search_files, web_fetch |
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::error::{Error, Result};
+use crate::event::NullSink;
+use crate::kernel::{AgentKernel, TurnContext};
+use crate::llm::{LlmProvider, ToolSpec};
+use crate::message::Message;
+use crate::tools::{Tool, ToolRegistry, ToolSideEffect};
+
+// ---------------------------------------------------------------------------
+// WorkerType
+// ---------------------------------------------------------------------------
+
+/// Named worker personality for coordinator-pattern delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerType {
+    General,
+    Explore,
+    Coder,
+    Reviewer,
+    Researcher,
+}
+
+impl WorkerType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "general" => Some(Self::General),
+            "explore" => Some(Self::Explore),
+            "coder" => Some(Self::Coder),
+            "reviewer" => Some(Self::Reviewer),
+            "researcher" => Some(Self::Researcher),
+            _ => None,
+        }
+    }
+
+    /// Whether this worker type only reads (never writes files).
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Explore | Self::Reviewer | Self::Researcher)
+    }
+
+    pub fn system_prompt(self) -> &'static str {
+        match self {
+            Self::General => {
+                "You are a focused worker agent. Complete the given task using the \
+                 available tools. Be concise and report what you did."
+            }
+            Self::Explore => {
+                "You are a read-only exploration agent. Use only read tools to gather \
+                 information about the codebase or files. Do NOT write or modify any files. \
+                 Report findings clearly and concisely."
+            }
+            Self::Coder => {
+                "You are a coding specialist. Implement the requested feature or fix. \
+                 Write clean, tested code. Run cargo test or equivalent after changes. \
+                 Commit your work and report the result."
+            }
+            Self::Reviewer => {
+                "You are a code reviewer. Read the relevant code carefully and provide \
+                 a structured review: summary of changes, potential issues, and suggestions. \
+                 Do NOT modify any files."
+            }
+            Self::Researcher => {
+                "You are a research specialist. Gather information from files, search results, \
+                 or web sources to answer the question or produce a report. \
+                 Do NOT modify any files. Report findings in a structured format."
+            }
+        }
+    }
+
+    /// Restricted tool names for this worker type, or `None` for full access.
+    pub fn allowed_tool_names(self) -> Option<Vec<String>> {
+        match self {
+            Self::General | Self::Coder => None,
+            Self::Explore => Some(vec![
+                "read_file".to_string(),
+                "list_dir".to_string(),
+                "search_files".to_string(),
+                "web_fetch".to_string(),
+            ]),
+            Self::Reviewer => Some(vec![
+                "read_file".to_string(),
+                "list_dir".to_string(),
+                "search_files".to_string(),
+            ]),
+            Self::Researcher => Some(vec![
+                "read_file".to_string(),
+                "search_files".to_string(),
+                "web_fetch".to_string(),
+            ]),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpawnWorkerTool
+// ---------------------------------------------------------------------------
+
+/// The `spawn_worker` tool — a first-class coordinator delegation mechanism.
+pub struct SpawnWorkerTool {
+    workspace: std::path::PathBuf,
+    provider: Arc<dyn LlmProvider>,
+    all_tools: ToolRegistry,
+    max_depth: usize,
+    current_depth: usize,
+    permission_hook: Option<PermissionHook>,
+}
+
+impl SpawnWorkerTool {
+    pub fn new(
+        workspace: impl Into<std::path::PathBuf>,
+        provider: Arc<dyn LlmProvider>,
+        all_tools: ToolRegistry,
+        max_depth: usize,
+        current_depth: usize,
+        permission_hook: Option<PermissionHook>,
+    ) -> Self {
+        Self {
+            workspace: workspace.into(),
+            provider,
+            all_tools,
+            max_depth,
+            current_depth,
+            permission_hook,
+        }
+    }
+
+    fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
+        let mut reg = self.all_tools.with_same_transport();
+        for name in tool_names {
+            if let Some(tool) = self.all_tools.get(name) {
+                reg = reg.register(tool);
+            }
+        }
+        reg
+    }
+}
+
+#[async_trait]
+impl Tool for SpawnWorkerTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "spawn_worker".into(),
+            description: concat!(
+                "Spawn a specialist worker agent to handle a focused sub-task. ",
+                "This is the coordinator-pattern delegation tool: use it to assign work to ",
+                "a named specialist (explore, coder, reviewer, researcher, or general). ",
+                "The worker runs independently with an empty transcript and returns its result."
+            )
+            .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Complete task description for the worker. Include all necessary context — the worker has no access to this conversation."
+                    },
+                    "worker_type": {
+                        "type": "string",
+                        "enum": ["general", "explore", "coder", "reviewer", "researcher"],
+                        "description": "Specialist type: 'explore'/'reviewer'/'researcher' are read-only; 'coder'/'general' have full tool access.",
+                        "default": "general"
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": "Optional: override the default system prompt for this worker type."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Maximum steps for the worker (default 30, max 100).",
+                        "default": 30
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        }
+    }
+
+    fn side_effect_class(&self) -> ToolSideEffect {
+        // Read-only workers are safe to run in parallel; general/coder workers
+        // may write files, so they are External (sequential by default).
+        ToolSideEffect::External
+    }
+
+    /// Allow parallel dispatch when the worker type is read-only.
+    fn is_readonly_for_args(&self, arguments: &Value) -> bool {
+        arguments
+            .get("worker_type")
+            .and_then(|v| v.as_str())
+            .and_then(WorkerType::parse)
+            .map(WorkerType::is_read_only)
+            .unwrap_or(false)
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let prompt = arguments["prompt"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "spawn_worker".into(),
+                message: "missing required parameter: prompt".to_string(),
+            })?;
+
+        let worker_type = arguments
+            .get("worker_type")
+            .and_then(|v| v.as_str())
+            .and_then(WorkerType::parse)
+            .unwrap_or(WorkerType::General);
+
+        let max_steps = arguments["max_steps"].as_i64().unwrap_or(30).clamp(1, 100) as usize;
+
+        // Depth limit check (reuse same env var as sub_agent)
+        if self.current_depth >= self.max_depth {
+            return Ok(format!(
+                "ERROR: worker depth limit reached (max_depth={}). Cannot spawn deeper worker.",
+                self.max_depth
+            ));
+        }
+
+        // System prompt: caller override > worker type default
+        let sys_prompt = arguments
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| worker_type.system_prompt())
+            .to_string();
+
+        // Build the tool registry for this worker
+        let tool_names = worker_type.allowed_tool_names();
+        let sub_registry = match &tool_names {
+            Some(names) => self.build_sub_registry(names),
+            None => {
+                // Full access: give worker all parent tools.
+                // Also register a child spawn_worker so workers can sub-delegate.
+                let mut reg = self.all_tools.clone();
+                let child = SpawnWorkerTool::new(
+                    &self.workspace,
+                    self.provider.clone(),
+                    self.all_tools.clone(),
+                    self.max_depth,
+                    self.current_depth + 1,
+                    self.permission_hook.clone(),
+                );
+                reg = reg.register(Arc::new(child));
+                reg
+            }
+        };
+
+        let kernel = AgentKernel::builder()
+            .llm(self.provider.clone())
+            .tools(sub_registry)
+            .max_steps(max_steps)
+            .build()
+            .map_err(|e| Error::Tool {
+                name: "spawn_worker".into(),
+                message: format!("failed to build worker kernel: {e}"),
+            })?;
+
+        let ctx = TurnContext {
+            messages: vec![
+                Message::system(sys_prompt),
+                Message::user(prompt.to_string()),
+            ],
+            event_sink: Some(Box::new(NullSink)),
+            step_events_tx: None,
+            plan_confirmed: false,
+            plan_buffer: None,
+            tool_specs: kernel.tools().specs(),
+            streaming: false,
+            permission_hook: self.permission_hook.clone(),
+            planning_mode: PlanningMode::default(),
+            exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
+            name: "spawn_worker".into(),
+            message: format!("worker failed: {e}"),
+        })?;
+
+        let finish_label = match &outcome.finish_reason {
+            FinishReason::NoMoreToolCalls => "NoMoreToolCalls",
+            FinishReason::BudgetExceeded => "BudgetExceeded",
+            FinishReason::ProviderStop(r) => r,
+            FinishReason::Stuck { .. } => "Stuck",
+            FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
+            FinishReason::PlanPending => "PlanPending",
+            FinishReason::Cancelled => "Cancelled",
+        };
+
+        let final_text = outcome
+            .final_text
+            .unwrap_or_else(|| "(no final message)".to_string());
+
+        Ok(format!(
+            "[worker:{} finished: {finish_label}]\n{final_text}",
+            match worker_type {
+                WorkerType::General => "general",
+                WorkerType::Explore => "explore",
+                WorkerType::Coder => "coder",
+                WorkerType::Reviewer => "reviewer",
+                WorkerType::Researcher => "researcher",
+            }
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{Completion, MockProvider};
+    use crate::tools::{ListDir, LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile};
+    use tempfile::TempDir;
+
+    fn mock_provider(script: Vec<Completion>) -> Arc<dyn LlmProvider> {
+        Arc::new(MockProvider::new(script))
+    }
+
+    fn full_registry(workspace: &std::path::Path) -> ToolRegistry {
+        let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+        ToolRegistry::new(transport)
+            .register(Arc::new(ReadFile::new(workspace)))
+            .register(Arc::new(WriteFile::new(workspace)))
+            .register(Arc::new(ListDir::new(workspace)))
+            .register(Arc::new(SearchFiles::new(workspace)))
+    }
+
+    fn make_tool(workspace: &std::path::Path, provider: Arc<dyn LlmProvider>) -> SpawnWorkerTool {
+        let registry = full_registry(workspace);
+        SpawnWorkerTool::new(workspace, provider, registry, 2, 0, None)
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_general_type() {
+        let dir = TempDir::new().unwrap();
+        let provider = mock_provider(vec![Completion {
+            content: "Task complete. I analysed the situation.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tool = make_tool(dir.path(), provider);
+        let result = tool
+            .execute(json!({"prompt": "Summarise the current directory."}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("[worker:general finished:"),
+            "got: {result}"
+        );
+        assert!(result.contains("Task complete"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_explore_type() {
+        let dir = TempDir::new().unwrap();
+        let provider = mock_provider(vec![Completion {
+            content: "Found 3 Rust source files.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tool = make_tool(dir.path(), provider);
+        let result = tool
+            .execute(json!({"prompt": "List Rust files.", "worker_type": "explore"}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("[worker:explore finished:"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_custom_system_prompt() {
+        let dir = TempDir::new().unwrap();
+        let provider = mock_provider(vec![Completion {
+            content: "Custom result".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tool = make_tool(dir.path(), provider);
+        let result = tool
+            .execute(json!({
+                "prompt": "Do something.",
+                "worker_type": "coder",
+                "system_prompt": "You are a custom expert."
+            }))
+            .await
+            .unwrap();
+        // Should succeed and use the coder worker type label
+        assert!(result.contains("[worker:coder finished:"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_missing_prompt() {
+        let dir = TempDir::new().unwrap();
+        let provider = mock_provider(vec![]);
+        let tool = make_tool(dir.path(), provider);
+        let result = tool.execute(json!({"worker_type": "general"})).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("missing required parameter"),
+            "got: {err}"
+        );
+    }
+}
