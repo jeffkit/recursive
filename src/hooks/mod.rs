@@ -37,6 +37,10 @@
 //! registry.register(Arc::new(MyHook));
 //! ```
 
+pub mod external;
+
+pub use external::ExternalHookRunner;
+
 use std::sync::Arc;
 
 use serde_json::Value;

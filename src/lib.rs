@@ -60,6 +60,7 @@ pub use compact::Compactor;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
+pub use hooks::ExternalHookRunner;
 pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
 pub use kernel::{AgentKernel, AgentKernelBuilder, SideEffect, TurnContext, TurnOutcome};
