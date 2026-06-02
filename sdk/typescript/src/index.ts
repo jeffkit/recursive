@@ -34,15 +34,23 @@
 
 export { Agent, AgentSession } from "./agent.js";
 export type { AgentOptions, PromptOptions } from "./agent.js";
+export { RecursiveClient } from "./client.js";
+export type { RecursiveClientOptions } from "./client.js";
 export { RecursiveAgentError } from "./exceptions.js";
 export type {
   AssistantMessage,
   ContentBlock,
+  GoalActionResponse,
+  GoalState,
+  PlanApprovalResponse,
   RunResult,
   SDKMessage,
+  SessionDetail,
   SessionInfo,
+  SlashCommandInfo,
   SystemMessage,
   TextContent,
+  ToolInfo,
   ToolResultBlock,
   ToolUseBlock,
   UsageMeta,

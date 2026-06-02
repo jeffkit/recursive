@@ -28,7 +28,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["recursive_sdk*"]
+include = ["recursive_sdk*", "recursive_client*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
