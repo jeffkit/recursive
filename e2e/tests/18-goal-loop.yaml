@@ -1,0 +1,171 @@
+name: "Goal loop API — set / get / clear goal on a session"
+description: |
+  Verify the Goal-168 HTTP API:
+    POST   /sessions/:id/goal   → set goal, returns GoalState
+    GET    /sessions/:id         → session detail includes goal field
+    DELETE /sessions/:id/goal   → clear goal, returns GoalState with status=cleared
+
+  No LLM turn is executed; these cases exercise only the goal management
+  endpoints to ensure the API contract is correct and responses are well-formed.
+sequential: true
+
+setup:
+  - name: "Kill any leftover server on port 9091"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null || true
+        sleep 1
+        echo cleaned
+
+  - name: "Reset state files"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -f /tmp/goal-sid /tmp/goal-resp.json /tmp/goal-http.log
+        echo reset
+
+  - name: "Start HTTP server on port 9091"
+    exec:
+      container: recursive-e2e
+      command: |
+        nohup recursive \
+          --api-base http://aimock:4010/v1 \
+          --api-key mock-key -m mock-chat \
+          http --addr 0.0.0.0:9091 \
+          > /tmp/goal-http.log 2>&1 &
+        sleep 2
+        echo started
+
+  - name: "Sanity: /health returns ok"
+    exec:
+      container: recursive-e2e
+      command: curl -sf http://localhost:9091/health
+    expect:
+      exitCode: 0
+      output:
+        contains: "ok"
+
+  - name: "Create session, save id to /tmp/goal-sid"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -sf -X POST http://localhost:9091/sessions
+        -H 'Content-Type: application/json'
+        -d '{"system_prompt":"You are a test assistant."}'
+        | jq -r .id > /tmp/goal-sid
+        && echo created=$(cat /tmp/goal-sid)
+    expect:
+      exitCode: 0
+      output:
+        contains: "created="
+
+cases:
+  # ── Set goal ──────────────────────────────────────────────────────────────
+  - name: "POST /sessions/:id/goal returns goal state with status=pending"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/goal-sid)
+        && curl -sf -X POST http://localhost:9091/sessions/$SID/goal
+        -H 'Content-Type: application/json'
+        -d '{"condition":"Write file goal-output.txt","max_turns":5}'
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "condition"
+          - "pending"
+
+  - name: "POST /sessions/:id/goal response includes session_id field"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/goal-sid)
+        && curl -sf -X POST http://localhost:9091/sessions/$SID/goal
+        -H 'Content-Type: application/json'
+        -d '{"condition":"Write file goal-output.txt","max_turns":5}'
+        | jq -r .session_id
+    expect:
+      exitCode: 0
+      output:
+        contains: "-"
+
+  # ── Session detail includes goal ──────────────────────────────────────────
+  - name: "GET /sessions/:id includes goal field after goal is set"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/goal-sid)
+        && curl -sf http://localhost:9091/sessions/$SID
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "goal"
+          - "condition"
+
+  # ── Error cases ───────────────────────────────────────────────────────────
+  - name: "POST /sessions/:id/goal with missing condition returns 400"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/goal-sid)
+        && curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9091/sessions/$SID/goal
+        -H 'Content-Type: application/json'
+        -d '{}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=400"
+
+  - name: "POST /sessions/nonexistent/goal returns 404"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9091/sessions/no-such-session/goal
+        -H 'Content-Type: application/json'
+        -d '{"condition":"test"}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=404"
+
+  # ── Clear goal ────────────────────────────────────────────────────────────
+  - name: "DELETE /sessions/:id/goal returns goal state with status=cleared"
+    exec:
+      container: recursive-e2e
+      command: >
+        SID=$(cat /tmp/goal-sid)
+        && curl -sf -X DELETE http://localhost:9091/sessions/$SID/goal
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "condition"
+          - "cleared"
+
+  - name: "DELETE /sessions/nonexistent/goal returns 404"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -X DELETE http://localhost:9091/sessions/no-such-session/goal
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=404"
+
+teardown:
+  - name: "Stop HTTP server on 9091"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null || true
+        rm -f /tmp/goal-sid /tmp/goal-resp.json /tmp/goal-http.log
+        echo stopped
