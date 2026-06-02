@@ -4,6 +4,7 @@
 //! The config file is optional — if absent, we gracefully fall back.
 
 use crate::error::{Error, Result};
+use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -150,6 +151,65 @@ fn smart_value(s: &str) -> toml::Value {
     }
 }
 
+/// Load layered permissions from user config and project config.
+///
+/// Resolution order (highest priority first):
+/// 1. Session layer (empty, filled at runtime via Goal 196)
+/// 2. Project layer (`.recursive/config.toml` in the workspace)
+/// 3. User layer (`~/.recursive/config.toml`)
+///
+/// The Session layer is always present (even if empty) so that runtime
+/// rule updates can be written to it.
+pub fn load_layered_permissions(workspace: &Path) -> LayeredPermissionsConfig {
+    let mut config = LayeredPermissionsConfig::default();
+
+    // User layer (lowest priority)
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+    {
+        let path = home.join(".recursive").join("config.toml");
+        if let Some(layer) = load_permission_layer(&path, RuleSource::User) {
+            config.layers.push(layer);
+        }
+    }
+
+    // Project layer (medium priority)
+    let project_path = workspace.join(".recursive").join("config.toml");
+    if let Some(layer) = load_permission_layer(&project_path, RuleSource::Project) {
+        config.layers.push(layer);
+    }
+
+    // Session layer (highest priority) — always present, empty by default
+    config.layers.push(PermissionLayer {
+        source: RuleSource::Session,
+        ..Default::default()
+    });
+
+    config
+}
+
+/// Load a single permission layer from a TOML file, if it exists.
+///
+/// Returns `None` if the file doesn't exist or can't be parsed.
+fn load_permission_layer(path: &Path, source: RuleSource) -> Option<PermissionLayer> {
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    // Parse as FileConfig first so we only extract the [permissions] section.
+    // This avoids picking up unrelated sections (e.g. [provider]) as empty defaults.
+    let file_config: FileConfig = toml::from_str(&content).ok()?;
+    let section = file_config.permissions?;
+    Some(PermissionLayer {
+        source,
+        allow: section.allow,
+        deny: section.deny,
+        interactive: section.interactive,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +298,77 @@ temperature = 0.5
             loaded.provider.unwrap().model.as_deref(),
             Some("deepseek-chat")
         );
+    }
+
+    #[test]
+    fn test_load_layered_permissions_session_layer_always_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = load_layered_permissions(tmp.path());
+        // Session layer is always present
+        assert!(config
+            .layers
+            .iter()
+            .any(|l| l.source == RuleSource::Session));
+        // Even with no config files, we get the session layer
+        assert_eq!(config.layers.len(), 1);
+        assert_eq!(config.layers[0].source, RuleSource::Session);
+    }
+
+    #[test]
+    fn test_load_layered_permissions_loads_user_and_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+
+        // Create user config
+        std::fs::create_dir_all(home.join(".recursive")).unwrap();
+        std::fs::write(
+            home.join(".recursive").join("config.toml"),
+            r#"
+[permissions]
+allow = ["read_file"]
+deny = ["run_shell"]
+"#,
+        )
+        .unwrap();
+
+        // Create project config
+        std::fs::create_dir_all(project.join(".recursive")).unwrap();
+        std::fs::write(
+            project.join(".recursive").join("config.toml"),
+            r#"
+[permissions]
+allow = ["write_file"]
+interactive = ["delete_file"]
+"#,
+        )
+        .unwrap();
+
+        // Override home dir for the test
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let config = load_layered_permissions(&project);
+
+        // Restore home
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        // Should have 3 layers: User, Project, Session
+        assert_eq!(config.layers.len(), 3);
+        assert_eq!(config.layers[0].source, RuleSource::User);
+        assert_eq!(config.layers[1].source, RuleSource::Project);
+        assert_eq!(config.layers[2].source, RuleSource::Session);
+
+        // User layer has allow/deny
+        assert_eq!(config.layers[0].allow, vec!["read_file"]);
+        assert_eq!(config.layers[0].deny, vec!["run_shell"]);
+
+        // Project layer has allow/interactive
+        assert_eq!(config.layers[1].allow, vec!["write_file"]);
+        assert_eq!(config.layers[1].interactive, vec!["delete_file"]);
     }
 }

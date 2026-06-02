@@ -295,6 +295,7 @@ pub(crate) struct RunCore<'a> {
     /// Goal-165: shared flag set by `EnterPlanModeTool`; blocks write tools
     /// while the agent is in read-only exploring / planning mode.
     pub(crate) exploring_plan_mode: Arc<AtomicBool>,
+    #[allow(dead_code)]
     /// Goal-190: default permission mode for tools not covered by explicit
     /// config lists. Used to check if a tool requires plan mode.
     pub(crate) permission_mode: PermissionMode,
