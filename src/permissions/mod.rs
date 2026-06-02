@@ -44,10 +44,12 @@ pub enum Permission {
     Allowed(DecisionReason),
     /// The tool is denied, with the reason and a human-readable message.
     Denied(DecisionReason, String),
-    /// The tool itself did not decide; defer to an upper layer.
+    /// No rule in any layer explicitly matched this tool.
     ///
-    /// Reserved for Goal 198 (tool-level `check_permissions`).
-    Passthrough,
+    /// `invoke_with_audit` treats this as "allowed" for non-interactive
+    /// tools, and delegates to the registered [`PermissionHook`] for
+    /// tools in the interactive list (if a hook is present).
+    Unknown,
 }
 
 impl Permission {
@@ -285,7 +287,10 @@ impl LayeredPermissionsConfig {
     /// 3. **DontAsk** — denies tools in the interactive list.
     /// 4. **AcceptEdits** — auto-allows write tools.
     /// 5. **Deny/allow rules** — static deny (union) then allow (union).
-    /// 6. **Default** — falls through with `Passthrough`.
+    /// 6. **Default** — falls through with `Unknown` (no rule matched).
+    ///    `invoke_with_audit` treats `Unknown` as allowed for non-interactive
+    ///    tools and delegates to the registered `PermissionHook` for
+    ///    interactive tools in non-headless contexts (Goal-212).
     ///
     /// `content` is the call-time content the tool will operate on. For
     /// `write_file` / `read_file` it should be the file path; for
@@ -368,7 +373,7 @@ impl LayeredPermissionsConfig {
         }
 
         // 6. Default: defer to upper layer
-        Permission::Passthrough
+        Permission::Unknown
     }
 
     /// Check whether a tool requires plan mode.
@@ -839,7 +844,7 @@ mod tests {
         let result = config.check_static("exit_plan_mode", false, None);
         assert!(!result.is_denied());
         // Falls through to Passthrough
-        assert!(matches!(result, Permission::Passthrough));
+        assert!(matches!(result, Permission::Unknown));
     }
 
     /// plan_mode_bypass_write_continues: mode=Plan{bypass_available:true},
@@ -857,7 +862,7 @@ mod tests {
         // falls through to Passthrough (no rules configured).
         let result = config.check_static("write_file", false, None);
         assert!(!result.is_denied());
-        assert!(matches!(result, Permission::Passthrough));
+        assert!(matches!(result, Permission::Unknown));
     }
 
     /// bypass_skips_deny_rules: mode=BypassPermissions, tool in deny list → Allowed
@@ -1017,7 +1022,7 @@ mod tests {
         let config = LayeredPermissionsConfig::default();
         // Default mode with no layers: Passthrough
         let result = config.check_static("anything", false, None);
-        assert!(matches!(result, Permission::Passthrough));
+        assert!(matches!(result, Permission::Unknown));
     }
 
     #[test]
@@ -1047,7 +1052,7 @@ mod tests {
         assert!(config.check_static("read_file", false, None).is_allowed());
         assert!(matches!(
             config.check_static("run_shell", false, None),
-            Permission::Passthrough
+            Permission::Unknown
         ));
     }
 
@@ -1181,7 +1186,7 @@ mod tests {
             .is_allowed());
         assert!(matches!(
             config.check_static("read_file", false, None),
-            Permission::Passthrough
+            Permission::Unknown
         ));
     }
 
@@ -1366,8 +1371,8 @@ mod tests {
 
     #[test]
     fn passthrough_is_neither() {
-        assert!(!Permission::Passthrough.is_allowed());
-        assert!(!Permission::Passthrough.is_denied());
+        assert!(!Permission::Unknown.is_allowed());
+        assert!(!Permission::Unknown.is_denied());
     }
 
     #[test]
@@ -1471,14 +1476,14 @@ mod tests {
         let config = LayeredPermissionsConfig::default();
         // Read-only tools are exempt from the safety check
         let result = config.check_static("read_file", true, Some(".git/config"));
-        assert!(matches!(result, Permission::Passthrough));
+        assert!(matches!(result, Permission::Unknown));
     }
 
     #[test]
     fn non_protected_path_not_blocked() {
         let config = LayeredPermissionsConfig::default();
         let result = config.check_static("write_file", false, Some("src/main.rs"));
-        assert!(matches!(result, Permission::Passthrough));
+        assert!(matches!(result, Permission::Unknown));
     }
 
     #[test]
