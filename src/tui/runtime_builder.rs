@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::{AgentRuntime, AgentRuntimeBuilder, LlmProvider};
 
 pub enum RuntimeBuild {
-    Ready(Box<AgentRuntime>),
+    Ready(Option<Box<AgentRuntime>>),
     Offline { reason: String },
 }
 
@@ -44,7 +44,7 @@ pub fn build_runtime() -> RuntimeBuild {
         .tools(tools)
         .build()
     {
-        Ok(rt) => RuntimeBuild::Ready(Box::new(rt)),
+        Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
             reason: format!("failed to build agent runtime: {e}"),
         },

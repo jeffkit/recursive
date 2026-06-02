@@ -43,7 +43,7 @@ impl Backend {
     }
 
     pub fn spawn_with_runtime(rt: AgentRuntime) -> Self {
-        Self::spawn_with_state(RuntimeBuild::Ready(Box::new(rt)))
+        Self::spawn_with_state(RuntimeBuild::Ready(Some(Box::new(rt))))
     }
 
     fn spawn_with_state(state: RuntimeBuild) -> Self {
@@ -183,7 +183,8 @@ async fn worker_loop(
     cancel_flag: Arc<AtomicBool>,
     permission_enabled: Arc<AtomicBool>,
 ) {
-    if let RuntimeBuild::Ready(ref mut rt) = state {
+    if let RuntimeBuild::Ready(rt_opt) = &mut state {
+        let rt = rt_opt.as_mut().unwrap();
         rt.set_event_sink(Arc::new(TuiEventSink {
             tx: event_tx.clone(),
         }));
@@ -200,68 +201,108 @@ async fn worker_loop(
     while let Some(action) = action_rx.recv().await {
         match action {
             UserAction::Shutdown => break,
-            UserAction::SendMessage(text) => match &mut state {
-                RuntimeBuild::Ready(rt) => {
+
+            UserAction::SendMessage(text) => {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+                    let rt = rt_opt.take().unwrap();
+                    let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+                    let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_for_select = cancel_flag.clone();
-                    let result: Result<(), crate::Error> = tokio::select! {
-                        r = rt.run(text) => r.map(|_| ()),
-                        _ = wait_for_cancel(cancel_for_select) => {
-                            let _ = event_tx.send(UiEvent::Error {
-                                message: "interrupted".into(),
-                            });
-                            Ok(())
+                    let cancel_clone = cancel_flag.clone();
+                    let mut handle = tokio::task::spawn(async move {
+                        let mut g = rt_clone.lock().await;
+                        g.run(text).await.map(|_| ())
+                    });
+                    let aborted = tokio::select! {
+                        res = &mut handle => {
+                            if let Err(e) = res
+                                .map_err(|e| crate::Error::Other(e.to_string()))
+                                .and_then(|r| r)
+                            {
+                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                            }
+                            false
+                        },
+                        _ = wait_for_cancel(cancel_clone) => {
+                            handle.abort();
+                            let _ = handle.await;
+                            let _ = event_tx.send(UiEvent::Interrupted);
+                            true
                         }
                     };
-                    if let Err(e) = result {
-                        let _ = event_tx.send(UiEvent::Error {
-                            message: e.to_string(),
-                        });
+                    let mut recovered = Arc::try_unwrap(rt_shared)
+                        .expect("single owner after task end")
+                        .into_inner();
+                    if aborted {
+                        recovered.truncate_transcript(pre_turn_len);
                     }
+                    *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     cancel_flag.store(false, Ordering::SeqCst);
-                }
-                RuntimeBuild::Offline { reason } => {
+                } else if let RuntimeBuild::Offline { reason } = &state {
                     let _ = event_tx.send(UiEvent::Error {
                         message: reason.clone(),
                     });
                     let _ = event_tx.send(UiEvent::TurnFinished);
                 }
-            },
+            }
+
             UserAction::RunShell(cmd) => {
                 run_bash_command(&bash_registry, &bash_seq, cmd, &event_tx).await;
             }
+
             UserAction::ConfirmPlan => {
-                if let RuntimeBuild::Ready(rt) = &mut state {
-                    rt.confirm_plan();
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    rt_opt.as_mut().unwrap().confirm_plan();
+                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+                    let rt = rt_opt.take().unwrap();
+                    let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+                    let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_for_select = cancel_flag.clone();
-                    let result: Result<(), crate::Error> = tokio::select! {
-                        r = rt.run("") => r.map(|_| ()),
-                        _ = wait_for_cancel(cancel_for_select) => {
-                            let _ = event_tx.send(UiEvent::Error {
-                                message: "interrupted".into(),
-                            });
-                            Ok(())
+                    let cancel_clone = cancel_flag.clone();
+                    let mut handle = tokio::task::spawn(async move {
+                        let mut g = rt_clone.lock().await;
+                        g.run("").await.map(|_| ())
+                    });
+                    let aborted = tokio::select! {
+                        res = &mut handle => {
+                            if let Err(e) = res
+                                .map_err(|e| crate::Error::Other(e.to_string()))
+                                .and_then(|r| r)
+                            {
+                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                            }
+                            false
+                        },
+                        _ = wait_for_cancel(cancel_clone) => {
+                            handle.abort();
+                            let _ = handle.await;
+                            let _ = event_tx.send(UiEvent::Interrupted);
+                            true
                         }
                     };
-                    if let Err(e) = result {
-                        let _ = event_tx.send(UiEvent::Error {
-                            message: e.to_string(),
-                        });
+                    let mut recovered = Arc::try_unwrap(rt_shared)
+                        .expect("single owner after task end")
+                        .into_inner();
+                    if aborted {
+                        recovered.truncate_transcript(pre_turn_len);
                     }
+                    *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     cancel_flag.store(false, Ordering::SeqCst);
                 }
             }
+
             UserAction::RejectPlan(reason) => {
-                if let RuntimeBuild::Ready(rt) = &mut state {
-                    rt.reject_plan(&reason);
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    rt_opt.as_mut().unwrap().reject_plan(&reason);
                 }
             }
+
             UserAction::Compact => match &mut state {
-                RuntimeBuild::Ready(rt) => {
-                    if let Err(e) = rt.compact_now().await {
+                RuntimeBuild::Ready(rt_opt) => {
+                    if let Err(e) = rt_opt.as_mut().unwrap().compact_now().await {
                         let _ = event_tx.send(UiEvent::Error {
                             message: format!("compact failed: {e}"),
                         });
@@ -273,16 +314,18 @@ async fn worker_loop(
                     });
                 }
             },
+
             UserAction::SetPlanningMode(on) => {
-                if let RuntimeBuild::Ready(rt) = &mut state {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     let mode = if on {
                         crate::PlanningMode::PlanFirst
                     } else {
                         crate::PlanningMode::Immediate
                     };
-                    rt.set_planning_mode(mode);
+                    rt_opt.as_mut().unwrap().set_planning_mode(mode);
                 }
             }
+
             UserAction::Interrupt => {
                 cancel_flag.store(true, Ordering::SeqCst);
             }
@@ -292,26 +335,48 @@ async fn worker_loop(
                 condition,
                 max_turns,
             } => {
-                if let RuntimeBuild::Ready(rt) = &mut state {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+                    let rt = rt_opt.take().unwrap();
+                    let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+                    let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_for_select = cancel_flag.clone();
+                    let cancel_clone = cancel_flag.clone();
                     let prompt = format!(
                         "Start working towards the following goal: {condition}\n\nContinue until the goal is achieved."
                     );
-                    let result: Result<(), crate::Error> = tokio::select! {
-                        r = rt.run_goal_loop(prompt, condition, max_turns) => r.map(|_| ()),
-                        _ = wait_for_cancel(cancel_for_select) => {
-                            let _ = event_tx.send(UiEvent::Error {
-                                message: "goal loop interrupted".into(),
-                            });
-                            Ok(())
+                    let mut handle = tokio::task::spawn(async move {
+                        let mut g = rt_clone.lock().await;
+                        g.run_goal_loop(prompt, condition, max_turns)
+                            .await
+                            .map(|_| ())
+                    });
+                    let aborted = tokio::select! {
+                        res = &mut handle => {
+                            if let Err(e) = res
+                                .map_err(|e| crate::Error::Other(e.to_string()))
+                                .and_then(|r| r)
+                            {
+                                let _ = event_tx.send(UiEvent::Error {
+                                    message: format!("goal loop error: {e}"),
+                                });
+                            }
+                            false
+                        },
+                        _ = wait_for_cancel(cancel_clone) => {
+                            handle.abort();
+                            let _ = handle.await;
+                            let _ = event_tx.send(UiEvent::Interrupted);
+                            true
                         }
                     };
-                    if let Err(e) = result {
-                        let _ = event_tx.send(UiEvent::Error {
-                            message: format!("goal loop error: {e}"),
-                        });
+                    let mut recovered = Arc::try_unwrap(rt_shared)
+                        .expect("single owner after task end")
+                        .into_inner();
+                    if aborted {
+                        recovered.truncate_transcript(pre_turn_len);
                     }
+                    *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     cancel_flag.store(false, Ordering::SeqCst);
                 } else if let RuntimeBuild::Offline { reason } = &state {
@@ -323,30 +388,48 @@ async fn worker_loop(
 
             // Goal-168: clear the active goal.
             UserAction::ClearGoal => {
-                if let RuntimeBuild::Ready(rt) = &mut state {
-                    rt.clear_goal().await;
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    rt_opt.as_mut().unwrap().clear_goal().await;
                 }
             }
 
             // Goal-169: run an already-expanded skill prompt.
             UserAction::RunSkillPrompt { prompt } => {
-                if let RuntimeBuild::Ready(rt) = &mut state {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+                    let rt = rt_opt.take().unwrap();
+                    let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+                    let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_for_select = cancel_flag.clone();
-                    let result: Result<(), crate::Error> = tokio::select! {
-                        r = rt.run(prompt) => r.map(|_| ()),
-                        _ = wait_for_cancel(cancel_for_select) => {
-                            let _ = event_tx.send(UiEvent::Error {
-                                message: "interrupted".into(),
-                            });
-                            Ok(())
+                    let cancel_clone = cancel_flag.clone();
+                    let mut handle = tokio::task::spawn(async move {
+                        let mut g = rt_clone.lock().await;
+                        g.run(prompt).await.map(|_| ())
+                    });
+                    let aborted = tokio::select! {
+                        res = &mut handle => {
+                            if let Err(e) = res
+                                .map_err(|e| crate::Error::Other(e.to_string()))
+                                .and_then(|r| r)
+                            {
+                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                            }
+                            false
+                        },
+                        _ = wait_for_cancel(cancel_clone) => {
+                            handle.abort();
+                            let _ = handle.await;
+                            let _ = event_tx.send(UiEvent::Interrupted);
+                            true
                         }
                     };
-                    if let Err(e) = result {
-                        let _ = event_tx.send(UiEvent::Error {
-                            message: e.to_string(),
-                        });
+                    let mut recovered = Arc::try_unwrap(rt_shared)
+                        .expect("single owner after task end")
+                        .into_inner();
+                    if aborted {
+                        recovered.truncate_transcript(pre_turn_len);
                     }
+                    *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     cancel_flag.store(false, Ordering::SeqCst);
                 } else if let RuntimeBuild::Offline { reason } = &state {
