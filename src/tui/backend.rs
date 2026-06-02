@@ -327,6 +327,7 @@ async fn worker_loop(
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
                     let rt = rt_opt.take().unwrap();
+                    let gate = rt.plan_approval_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
@@ -340,25 +341,16 @@ async fn worker_loop(
                             .await
                             .map(|_| ())
                     });
-                    let aborted = tokio::select! {
-                        res = &mut handle => {
-                            if let Err(e) = res
-                                .map_err(|e| crate::Error::Other(e.to_string()))
-                                .and_then(|r| r)
-                            {
-                                let _ = event_tx.send(UiEvent::Error {
-                                    message: format!("goal loop error: {e}"),
-                                });
-                            }
-                            false
-                        },
-                        _ = wait_for_cancel(cancel_clone) => {
-                            handle.abort();
-                            let _ = handle.await;
-                            let _ = event_tx.send(UiEvent::Interrupted);
-                            true
-                        }
-                    };
+                    let aborted = run_turn_select_loop(
+                        &mut handle,
+                        &mut action_rx,
+                        &event_tx,
+                        &cancel_flag,
+                        cancel_clone,
+                        &gate,
+                    )
+                    .await;
+                    // Suppress goal-loop errors; they are surfaced via GoalContinuing/GoalAchieved.
                     let mut recovered = Arc::try_unwrap(rt_shared)
                         .expect("single owner after task end")
                         .into_inner();
@@ -494,6 +486,67 @@ pub async fn wait_for_cancel(flag: Arc<AtomicBool>) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Drive a spawned agent turn to completion while remaining responsive to
+/// plan-approval and interrupt actions from the UI.
+///
+/// Returns `true` if the turn was aborted (cancel flag set or Shutdown received),
+/// `false` if the task completed normally.
+///
+/// While a turn runs, `action_rx` is polled concurrently so that
+/// `UserAction::ConfirmPlan` / `UserAction::RejectPlan` can signal the
+/// `PlanApprovalGate` directly — unblocking `exit_plan_mode` without
+/// requiring a new turn. `UserAction::Interrupt` sets the cancel flag.
+/// Any other actions received during the turn are silently discarded
+/// (they cannot be acted on without the runtime, which is inside the task).
+async fn run_turn_select_loop(
+    handle: &mut tokio::task::JoinHandle<Result<(), crate::Error>>,
+    action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UserAction>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    cancel_flag: &Arc<AtomicBool>,
+    cancel_clone: Arc<AtomicBool>,
+    gate: &Arc<crate::tools::plan_mode::PlanApprovalGate>,
+) -> bool {
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut *handle => {
+                if let Err(e) = res
+                    .map_err(|e| crate::Error::Other(e.to_string()))
+                    .and_then(|r| r)
+                {
+                    let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                }
+                return false;
+            }
+            _ = wait_for_cancel(cancel_clone.clone()) => {
+                handle.abort();
+                let _ = handle.await;
+                let _ = event_tx.send(UiEvent::Interrupted);
+                return true;
+            }
+            maybe_action = action_rx.recv() => {
+                match maybe_action {
+                    Some(UserAction::ConfirmPlan) => gate.approve(),
+                    Some(UserAction::RejectPlan(reason)) => gate.reject(&reason),
+                    Some(UserAction::Interrupt) => {
+                        cancel_flag.store(true, Ordering::SeqCst);
+                    }
+                    Some(UserAction::Shutdown) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        return true;
+                    }
+                    // Other actions cannot be serviced while the runtime is
+                    // inside the spawned task. Discard them — in normal usage
+                    // only plan/interrupt actions arrive during a running turn.
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        }
     }
 }
 

@@ -613,6 +613,11 @@ pub struct App {
     /// the latest `/plan on|off` invocation. Used to render an
     /// indicator and to seed `/status`.
     pub planning_mode_on: bool,
+    /// Set when the agent has proposed a plan via `exit_plan_mode` and we are
+    /// waiting for the user to approve or reject it. Cleared by
+    /// `PlanConfirmed` / `PlanRejected` events. Used to show a status-bar
+    /// indicator so the user knows input is expected.
+    pub plan_awaiting_approval: bool,
     /// Goal-147: tracks the most recent Esc / Ctrl+C presses so the
     /// second press within [`double_press_window`] can promote a soft
     /// action (interrupt / clear) into a real exit. See
@@ -811,6 +816,7 @@ impl App {
             tool_catalog: default_offline_tool_catalog(),
             command_menu_selected: None,
             planning_mode_on: false,
+            plan_awaiting_approval: false,
             double_press: DoublePressTracker::default(),
             atfile_query: String::new(),
             atfile_suggestions: Vec::new(),
@@ -1422,18 +1428,21 @@ impl App {
                 self.blocks.push(TranscriptBlock::System {
                     text: "Plan proposed, awaiting approval…".into(),
                 });
+                self.plan_awaiting_approval = true;
             }
             UiEvent::PlanConfirmed => {
                 self.close_plan_review_modal();
                 self.blocks.push(TranscriptBlock::System {
                     text: "Plan approved".into(),
                 });
+                self.plan_awaiting_approval = false;
             }
             UiEvent::PlanRejected { reason } => {
                 self.close_plan_review_modal();
                 self.blocks.push(TranscriptBlock::System {
                     text: format!("Plan rejected: {reason}"),
                 });
+                self.plan_awaiting_approval = false;
             }
             // Goal-167: replace the task list whenever the agent calls todo_write.
             UiEvent::TodoUpdated { todos } => {
@@ -1470,6 +1479,7 @@ impl App {
                 });
                 self.turn.finish();
                 self.pending_latency_ms = None;
+                self.plan_awaiting_approval = false;
             }
             UiEvent::McpServersLoaded { entries } => {
                 self.modals.push(crate::tui::ui::modal::Modal::McpServers {
