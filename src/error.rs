@@ -3,6 +3,7 @@
 //! Structured error types that library consumers can match on.
 //! Every distinct failure mode has its own variant.
 
+use crate::permissions::DecisionReason;
 use thiserror::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -33,8 +34,11 @@ pub enum Error {
     UnknownTool(String),
 
     /// Permission denied for a tool call
-    #[error("permission denied: tool {name}")]
-    PermissionDenied { name: String },
+    #[error("permission denied: tool {name} ({reason:?})")]
+    PermissionDenied {
+        name: String,
+        reason: DecisionReason,
+    },
 
     /// LLM response truncated by provider
     #[error("llm response truncated by provider (finish_reason = {0:?})")]
@@ -137,9 +141,13 @@ mod tests {
     fn test_permission_denied_format() {
         let err = Error::PermissionDenied {
             name: "run_shell".into(),
+            reason: crate::permissions::DecisionReason::Mode(
+                crate::permissions::PermissionMode::Deny,
+            ),
         };
         let msg = err.to_string();
         assert!(msg.contains("run_shell"));
+        assert!(msg.contains("Deny"));
     }
 
     #[test]

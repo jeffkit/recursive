@@ -12,7 +12,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
-use crate::permissions::{Permission, PermissionMode, PermissionsConfig};
+use crate::permissions::{DecisionReason, Permission, PermissionMode, PermissionsConfig};
 
 // ── Goal-153: Tool side-effect classification + audit types ─────────────────
 
@@ -461,7 +461,10 @@ impl ToolRegistry {
         if let Some(hook) = &self.permission_hook {
             let preview = args_preview_for_permission(&arguments);
             if !hook.ask_permission(name, &preview).await {
-                return Err(Error::PermissionDenied { name: name.into() });
+                return Err(Error::PermissionDenied {
+                    name: name.into(),
+                    reason: DecisionReason::Hook { name: name.into() },
+                });
             }
         }
         self.invoke_with_audit(name, arguments).await.result
@@ -475,13 +478,16 @@ impl ToolRegistry {
         // Static permission check before any tool execution.
         if let Some(ref config) = self.permissions {
             match config.check_static(name) {
-                Permission::Denied(_reason) => {
+                Permission::Denied(reason, _msg) => {
                     return ToolDispatch {
-                        result: Err(Error::PermissionDenied { name: name.into() }),
+                        result: Err(Error::PermissionDenied {
+                            name: name.into(),
+                            reason: reason.clone(),
+                        }),
                         audit: AuditMeta::synthetic_unknown_tool(name),
                     };
                 }
-                Permission::Allowed => {}
+                Permission::Allowed(_) | Permission::Passthrough => {}
             }
         }
 

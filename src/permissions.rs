@@ -13,13 +13,46 @@
 
 use serde::Deserialize;
 
+/// The reason why a permission decision was made.
+///
+/// Carries structured information about which rule, mode, hook, or
+/// safety check triggered the decision. Useful for debugging, audit
+/// logging, and user-facing error messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionReason {
+    /// A rule from a specific source matched a pattern.
+    Rule { source: RuleSource, pattern: String },
+    /// The default permission mode triggered the decision.
+    Mode(PermissionMode),
+    /// A runtime permission hook made the decision.
+    Hook { name: String },
+    /// A safety check on a file path triggered the decision.
+    SafetyCheck { path: String },
+}
+
 /// The result of a permission check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Permission {
-    /// The tool is allowed to run.
-    Allowed,
-    /// The tool is denied with a reason message.
-    Denied(String),
+    /// The tool is allowed to run, with the reason why.
+    Allowed(DecisionReason),
+    /// The tool is denied, with the reason and a human-readable message.
+    Denied(DecisionReason, String),
+    /// The tool itself did not decide; defer to an upper layer.
+    ///
+    /// Reserved for Goal 198 (tool-level `check_permissions`).
+    Passthrough,
+}
+
+impl Permission {
+    /// Returns `true` if this is an `Allowed` decision.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Permission::Allowed(_))
+    }
+
+    /// Returns `true` if this is a `Denied` decision.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Permission::Denied(_, _))
+    }
 }
 
 /// The permission mode for a tool or the default mode for the config.
@@ -101,10 +134,16 @@ impl LayeredPermissionsConfig {
         for layer in &self.layers {
             for pattern in &layer.deny {
                 if matches_pattern(pattern, tool_name) {
-                    return Permission::Denied(format!(
-                        "tool `{tool_name}` is denied by pattern `{pattern}` (source: {:?})",
-                        layer.source
-                    ));
+                    return Permission::Denied(
+                        DecisionReason::Rule {
+                            source: layer.source,
+                            pattern: pattern.clone(),
+                        },
+                        format!(
+                            "tool `{tool_name}` is denied by pattern `{pattern}` (source: {:?})",
+                            layer.source
+                        ),
+                    );
                 }
             }
         }
@@ -117,19 +156,24 @@ impl LayeredPermissionsConfig {
                 layer.allow.is_empty() || layer.allow.iter().any(|p| matches_pattern(p, tool_name))
             });
             if !all_layers_allow {
-                return Permission::Denied(format!(
-                    "tool `{tool_name}` is not in the allow list of all layers"
-                ));
+                return Permission::Denied(
+                    DecisionReason::Rule {
+                        source: RuleSource::User,
+                        pattern: tool_name.to_string(),
+                    },
+                    format!("tool `{tool_name}` is not in the allow list of all layers"),
+                );
             }
         }
 
         // Fall back to the default mode
         match self.mode {
-            PermissionMode::Deny => Permission::Denied(format!(
-                "tool `{tool_name}` is denied by default mode `deny`"
-            )),
+            PermissionMode::Deny => Permission::Denied(
+                DecisionReason::Mode(PermissionMode::Deny),
+                format!("tool `{tool_name}` is denied by default mode `deny`"),
+            ),
             PermissionMode::Allow | PermissionMode::Interactive | PermissionMode::Plan => {
-                Permission::Allowed
+                Permission::Allowed(DecisionReason::Mode(self.mode))
             }
         }
     }
@@ -141,7 +185,7 @@ impl LayeredPermissionsConfig {
     /// is denied (denied tools never require plan mode).
     pub fn is_plan_mode(&self, tool_name: &str) -> bool {
         // Denied tools are never plan mode
-        if matches!(self.check_static(tool_name), Permission::Denied(_)) {
+        if matches!(self.check_static(tool_name), Permission::Denied(_, _)) {
             return false;
         }
         // Check default mode
@@ -159,7 +203,7 @@ impl LayeredPermissionsConfig {
     /// Returns `false` if the tool is denied (denied tools never prompt).
     pub fn is_interactive(&self, tool_name: &str) -> bool {
         // Denied tools are never interactive
-        if matches!(self.check_static(tool_name), Permission::Denied(_)) {
+        if matches!(self.check_static(tool_name), Permission::Denied(_, _)) {
             return false;
         }
         // Interactive: any layer marks → interactive (union)
@@ -312,7 +356,7 @@ mod tests {
     #[test]
     fn test_empty_config_allows_all() {
         let config = LayeredPermissionsConfig::default();
-        assert_eq!(config.check_static("anything"), Permission::Allowed);
+        assert!(config.check_static("anything").is_allowed());
         assert!(!config.is_interactive("anything"));
         assert!(!config.is_plan_mode("anything"));
     }
@@ -327,13 +371,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(
-            config.check_static("run_shell"),
-            Permission::Denied(
-                "tool `run_shell` is denied by pattern `run_shell` (source: User)".into()
-            )
-        );
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
+        assert!(config.check_static("run_shell").is_denied());
+        assert!(config.check_static("read_file").is_allowed());
     }
 
     #[test]
@@ -346,11 +385,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
-        assert_eq!(
-            config.check_static("run_shell"),
-            Permission::Denied("tool `run_shell` is not in the allow list of all layers".into())
-        );
+        assert!(config.check_static("read_file").is_allowed());
+        assert!(config.check_static("run_shell").is_denied());
     }
 
     #[test]
@@ -387,12 +423,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(
-            config.check_static("run_shell"),
-            Permission::Denied(
-                "tool `run_shell` is denied by pattern `run_shell` (source: Project)".into()
-            )
-        );
+        assert!(config.check_static("run_shell").is_denied());
     }
 
     #[test]
@@ -413,7 +444,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
+        assert!(config.check_static("read_file").is_allowed());
     }
 
     #[test]
@@ -435,11 +466,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
-        assert_eq!(
-            config.check_static("run_shell"),
-            Permission::Denied("tool `run_shell` is not in the allow list of all layers".into())
-        );
+        assert!(config.check_static("read_file").is_allowed());
+        assert!(config.check_static("run_shell").is_denied());
     }
 
     #[test]
@@ -483,7 +511,7 @@ mod tests {
             ..Default::default()
         };
         // Session layer has empty allow → doesn't restrict
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
+        assert!(config.check_static("read_file").is_allowed());
     }
 
     #[test]
@@ -497,20 +525,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(
-            config.check_static("run_shell"),
-            Permission::Denied(
-                "tool `run_shell` is denied by pattern `run_shell` (source: User)".into()
-            )
-        );
+        assert!(config.check_static("run_shell").is_denied());
     }
 
     #[test]
     fn test_empty_allow_allows_all() {
         let config = LayeredPermissionsConfig::default();
-        assert_eq!(config.check_static("run_shell"), Permission::Allowed);
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
-        assert_eq!(config.check_static("anything"), Permission::Allowed);
+        assert!(config.check_static("run_shell").is_allowed());
+        assert!(config.check_static("read_file").is_allowed());
+        assert!(config.check_static("anything").is_allowed());
     }
 
     #[test]
@@ -523,12 +546,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(config.check_static("run_shell"), Permission::Allowed);
-        assert_eq!(config.check_static("run_background"), Permission::Allowed);
-        assert_eq!(
-            config.check_static("read_file"),
-            Permission::Denied("tool `read_file` is not in the allow list of all layers".into())
-        );
+        assert!(config.check_static("run_shell").is_allowed());
+        assert!(config.check_static("run_background").is_allowed());
+        assert!(config.check_static("read_file").is_denied());
     }
 
     #[test]
@@ -541,8 +561,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(config.check_static("anything"), Permission::Allowed);
-        assert_eq!(config.check_static(""), Permission::Allowed);
+        assert!(config.check_static("anything").is_allowed());
+        assert!(config.check_static("").is_allowed());
     }
 
     #[test]
@@ -556,13 +576,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(config.check_static("read_file"), Permission::Allowed);
-        assert_eq!(
-            config.check_static("run_shell"),
-            Permission::Denied(
-                "tool `run_shell` is denied by pattern `run_*` (source: User)".into()
-            )
-        );
+        assert!(config.check_static("read_file").is_allowed());
+        assert!(config.check_static("run_shell").is_denied());
     }
 
     #[test]
@@ -590,10 +605,7 @@ mod tests {
             mode: PermissionMode::Deny,
             ..Default::default()
         };
-        assert_eq!(
-            config.check_static("anything"),
-            Permission::Denied("tool `anything` is denied by default mode `deny`".into())
-        );
+        assert!(config.check_static("anything").is_denied());
     }
 
     #[test]
@@ -603,7 +615,7 @@ mod tests {
             ..Default::default()
         };
         assert!(config.is_interactive("anything"));
-        assert_eq!(config.check_static("anything"), Permission::Allowed);
+        assert!(config.check_static("anything").is_allowed());
     }
 
     #[test]
@@ -613,7 +625,7 @@ mod tests {
             ..Default::default()
         };
         assert!(config.is_plan_mode("anything"));
-        assert_eq!(config.check_static("anything"), Permission::Allowed);
+        assert!(config.check_static("anything").is_allowed());
     }
 
     // ── Backward compat: OldPermissionsConfig → LayeredPermissionsConfig ──
@@ -711,5 +723,122 @@ mod tests {
         assert!(interactives.contains(&"run_shell"));
         assert!(interactives.contains(&"write_file"));
         assert_eq!(interactives.len(), 2);
+    }
+
+    // ── DecisionReason + Permission helpers ──────────────────────────────
+
+    #[test]
+    fn permission_is_allowed_helper() {
+        let reason = DecisionReason::Mode(PermissionMode::Allow);
+        assert!(Permission::Allowed(reason.clone()).is_allowed());
+        assert!(!Permission::Allowed(reason).is_denied());
+    }
+
+    #[test]
+    fn permission_is_denied_helper() {
+        let reason = DecisionReason::Mode(PermissionMode::Deny);
+        assert!(Permission::Denied(reason.clone(), "blocked".into()).is_denied());
+        assert!(!Permission::Denied(reason, "blocked".into()).is_allowed());
+    }
+
+    #[test]
+    fn passthrough_is_neither() {
+        assert!(!Permission::Passthrough.is_allowed());
+        assert!(!Permission::Passthrough.is_denied());
+    }
+
+    #[test]
+    fn decision_reason_rule_debug() {
+        let reason = DecisionReason::Rule {
+            source: RuleSource::User,
+            pattern: "run_shell".into(),
+        };
+        let debug = format!("{:?}", reason);
+        assert!(debug.contains("Rule"));
+        assert!(debug.contains("User"));
+        assert!(debug.contains("run_shell"));
+    }
+
+    #[test]
+    fn decision_reason_mode_debug() {
+        let reason = DecisionReason::Mode(PermissionMode::Deny);
+        let debug = format!("{:?}", reason);
+        assert!(debug.contains("Deny"));
+    }
+
+    #[test]
+    fn decision_reason_hook_debug() {
+        let reason = DecisionReason::Hook {
+            name: "my_hook".into(),
+        };
+        let debug = format!("{:?}", reason);
+        assert!(debug.contains("Hook"));
+        assert!(debug.contains("my_hook"));
+    }
+
+    #[test]
+    fn decision_reason_safety_check_debug() {
+        let reason = DecisionReason::SafetyCheck {
+            path: "/etc/passwd".into(),
+        };
+        let debug = format!("{:?}", reason);
+        assert!(debug.contains("SafetyCheck"));
+        assert!(debug.contains("/etc/passwd"));
+    }
+
+    #[test]
+    fn check_static_returns_reason_on_deny() {
+        let config = LayeredPermissionsConfig {
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                deny: vec!["run_shell".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = config.check_static("run_shell");
+        assert!(result.is_denied());
+        if let Permission::Denied(reason, msg) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Rule {
+                    source: RuleSource::User,
+                    ..
+                }
+            ));
+            assert!(msg.contains("run_shell"));
+        } else {
+            panic!("expected Denied");
+        }
+    }
+
+    #[test]
+    fn check_static_returns_reason_on_allow() {
+        let config = LayeredPermissionsConfig::default();
+        let result = config.check_static("anything");
+        assert!(result.is_allowed());
+        if let Permission::Allowed(reason) = result {
+            assert!(matches!(
+                reason,
+                DecisionReason::Mode(PermissionMode::Allow)
+            ));
+        } else {
+            panic!("expected Allowed");
+        }
+    }
+
+    #[test]
+    fn check_static_deny_mode_returns_mode_reason() {
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Deny,
+            ..Default::default()
+        };
+        let result = config.check_static("anything");
+        assert!(result.is_denied());
+        if let Permission::Denied(reason, _msg) = result {
+            assert!(matches!(reason, DecisionReason::Mode(PermissionMode::Deny)));
+        } else {
+            panic!("expected Denied");
+        }
     }
 }
