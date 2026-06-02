@@ -355,6 +355,18 @@ pub trait LlmProvider: Send + Sync {
         }
         Ok(completion)
     }
+
+    /// Simple completion with a single user prompt.
+    ///
+    /// Wraps the prompt in a user [`Message`] and calls [`complete`](LlmProvider::complete)
+    /// with no tools. Providers that support temperature or other controls
+    /// should override this method. The default implementation ignores
+    /// `temperature`.
+    async fn complete_simple(&self, prompt: &str, _temperature: f32) -> Result<String> {
+        let messages = vec![Message::user(prompt.to_string())];
+        let completion = self.complete(&messages, &[]).await?;
+        Ok(completion.content)
+    }
 }
 
 #[cfg(test)]
