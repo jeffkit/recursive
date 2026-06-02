@@ -26,6 +26,11 @@ pub mod redis;
 #[cfg(feature = "cloud-runtime")]
 pub use redis::RedisSessionStore;
 
+#[cfg(feature = "cloud-runtime")]
+pub mod s3;
+#[cfg(feature = "cloud-runtime")]
+pub use s3::S3StorageBackend;
+
 use crate::error::Result;
 use crate::message::Message;
 use std::future::Future;

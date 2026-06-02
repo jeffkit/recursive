@@ -105,6 +105,8 @@ pub use skills::{
 };
 #[cfg(feature = "cloud-runtime")]
 pub use storage::RedisSessionStore;
+#[cfg(feature = "cloud-runtime")]
+pub use storage::S3StorageBackend;
 pub use storage::{
     AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
