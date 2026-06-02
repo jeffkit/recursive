@@ -107,10 +107,24 @@ impl SkillCommandLoader {
 
     /// Load all `*.md` skill files from a single directory.
     ///
-    /// Files that fail to parse are silently skipped.
+    /// Files that fail to read or parse are skipped with a `tracing::warn!`
+    /// so users debugging "why isn't my skill showing up?" can find the
+    /// reason in the log instead of having to bisect the directory.
     pub fn load_dir(dir: &Path) -> Vec<SkillCommand> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(it) => it,
+            Err(err) => {
+                if dir.exists() {
+                    // Permissions or some other real failure — surface it.
+                    tracing::warn!(
+                        target: "recursive::tui::skill_commands",
+                        dir = %dir.display(),
+                        error = %err,
+                        "skill_commands: failed to read directory"
+                    );
+                }
+                return Vec::new();
+            }
         };
 
         let mut skills: Vec<SkillCommand> = entries
@@ -128,10 +142,30 @@ impl SkillCommandLoader {
         skills
     }
 
-    /// Parse a single skill file. Returns `None` on IO / parse errors.
+    /// Parse a single skill file. Returns `None` on IO / parse errors and
+    /// emits a `tracing::warn!` describing why the file was skipped.
     pub fn parse_file(path: &Path) -> Option<SkillCommand> {
-        let raw = std::fs::read_to_string(path).ok()?;
-        Self::parse_content(path, &raw)
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    target: "recursive::tui::skill_commands",
+                    path = %path.display(),
+                    error = %err,
+                    "skill_commands: failed to read .md file; skipping"
+                );
+                return None;
+            }
+        };
+        let parsed = Self::parse_content(path, &raw);
+        if parsed.is_none() {
+            tracing::warn!(
+                target: "recursive::tui::skill_commands",
+                path = %path.display(),
+                "skill_commands: front-matter / filename produced an empty command name; skipping"
+            );
+        }
+        parsed
     }
 
     /// Parse skill content (separated from IO for easy unit-testing).
