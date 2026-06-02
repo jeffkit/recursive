@@ -38,13 +38,18 @@ fn todo_panel_height(app: &App) -> u16 {
 pub fn render(frame: &mut Frame, app: &App) {
     let input_total = input::total_height(app);
     let todo_height = todo_panel_height(app);
+    // Fix-E: show a 1-row approval banner when a plan is awaiting the
+    // user's decision. The banner replaces the floating modal and keeps
+    // the full transcript visible.
+    let plan_banner_height: u16 = if app.plan_awaiting_approval { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),              // messages
-            Constraint::Length(todo_height), // Goal-167: task list (0 when empty)
-            Constraint::Length(1),           // status bar
-            Constraint::Length(input_total), // input + footer hint
+            Constraint::Min(3),                     // messages
+            Constraint::Length(todo_height),        // Goal-167: task list (0 when empty)
+            Constraint::Length(1),                  // status bar
+            Constraint::Length(plan_banner_height), // Fix-E: plan approval banner
+            Constraint::Length(input_total),        // input + footer hint
         ])
         .split(frame.area());
 
@@ -110,18 +115,25 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Status bar.
     status::render(frame, chunks[2], app);
 
-    // Input panel + footer hint.
-    input::render(frame, chunks[3], app);
+    // Fix-E: plan approval banner (1 row, visible only when plan_awaiting_approval).
+    if app.plan_awaiting_approval {
+        render_plan_approval_banner(frame, chunks[3], app);
+    }
+
+    // Input panel + footer hint (chunks[4] when banner present, [3] otherwise).
+    // The layout always reserves the slot; when plan_banner_height=0 the
+    // area has zero height and input renders normally at [4].
+    input::render(frame, chunks[4], app);
 
     // Goal-146: floating slash-command popup, drawn after the input
     // box so it overlays the messages panel.
-    command_menu::render(frame, chunks[3], app);
+    command_menu::render(frame, chunks[4], app);
 
     // Goal-158: @file completion popup.
-    command_menu::render_atfile(frame, chunks[3], app);
+    command_menu::render_atfile(frame, chunks[4], app);
 
     // Goal-160: Ctrl+R history-search popup.
-    command_menu::render_history_search(frame, chunks[3], app);
+    command_menu::render_history_search(frame, chunks[4], app);
 
     // Goal-161: permission-request modal (top layer — covers everything).
     command_menu::render_permission_modal(frame, app);
@@ -171,5 +183,59 @@ fn render_todo_panel(frame: &mut Frame, area: Rect, app: &App) {
     let widget = Paragraph::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true });
+    frame.render_widget(widget, area);
+}
+
+/// Fix-E: render a 1-row plan approval banner between the status bar
+/// and the input box. Visible only while `plan_awaiting_approval` is set.
+///
+/// ```text
+/// ⚡ Plan awaiting approval — [y] Approve  [n] Reject  [e] Edit
+/// ```
+fn render_plan_approval_banner(frame: &mut Frame, area: Rect, _app: &App) {
+    use ratatui::style::Modifier;
+    let line = Line::from(vec![
+        Span::styled(
+            " ⚡ Plan awaiting approval — ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "[y/Enter]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " Approve  ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+        Span::styled(
+            "[n/Esc]",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " Reject  ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+        Span::styled(
+            "[e]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " Edit ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+    ]);
+    let widget = Paragraph::new(line);
     frame.render_widget(widget, area);
 }

@@ -593,10 +593,24 @@ pub fn render_plan_review(plan_text: &str, tool_calls: &[serde_json::Value]) -> 
         }
     }
     out.push(Line::raw(""));
-    out.push(Line::from(Span::styled(
-        "[y/Enter] Approve  [n/Esc] Reject  [e] Edit".to_string(),
-        dim,
-    )));
+    out.push(Line::from(vec![
+        Span::styled("[y/Enter] ", key),
+        Span::styled(
+            "Approve",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("[n/Esc] ", key),
+        Span::styled(
+            "Reject",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("[e] ", key),
+        Span::styled("Edit", Style::default().fg(Color::Yellow)),
+    ]));
     out
 }
 
