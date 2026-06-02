@@ -146,12 +146,12 @@ mod tests {
         let err = Error::PermissionDenied {
             name: "run_shell".into(),
             reason: crate::permissions::DecisionReason::Mode(
-                crate::permissions::PermissionMode::Deny,
+                crate::permissions::PermissionMode::DontAsk,
             ),
         };
         let msg = err.to_string();
         assert!(msg.contains("run_shell"));
-        assert!(msg.contains("Deny"));
+        assert!(msg.contains("DontAsk"));
     }
 
     #[test]

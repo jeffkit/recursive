@@ -1224,16 +1224,7 @@ fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfi
     }
     let file_config = recursive::config_file::FileConfig::load().ok().flatten()?;
     let section = file_config.permissions?;
-    let mode = section
-        .mode
-        .as_deref()
-        .map(|s| match s {
-            "deny" => recursive::permissions::PermissionMode::Deny,
-            "interactive" => recursive::permissions::PermissionMode::Interactive,
-            "plan" => recursive::permissions::PermissionMode::Plan,
-            _ => recursive::permissions::PermissionMode::Allow,
-        })
-        .unwrap_or_default();
+    let mode = section.mode.unwrap_or_default();
     let mut layers = Vec::new();
     if !section.allow.is_empty() || !section.deny.is_empty() || !section.interactive.is_empty() {
         layers.push(recursive::permissions::PermissionLayer {

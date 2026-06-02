@@ -968,7 +968,7 @@ mod permissions {
     #[tokio::test]
     async fn permissions_deny_blocks_invoke() {
         let perms = recursive::permissions::LayeredPermissionsConfig {
-            mode: PermissionMode::Allow,
+            mode: PermissionMode::Default,
             layers: vec![recursive::permissions::PermissionLayer {
                 source: recursive::permissions::RuleSource::User,
                 deny: vec!["run_shell".into()],
@@ -985,11 +985,12 @@ mod permissions {
         }
     }
 
-    /// Test B — non-empty allow list rejects unlisted tools.
+    /// Test B — allow list grants access to listed tools; unlisted tools
+    /// fall through to Passthrough (union semantics per Goal 193).
     #[tokio::test]
     async fn permissions_allow_filter_blocks_unlisted() {
         let perms = recursive::permissions::LayeredPermissionsConfig {
-            mode: PermissionMode::Allow,
+            mode: PermissionMode::Default,
             layers: vec![recursive::permissions::PermissionLayer {
                 source: recursive::permissions::RuleSource::User,
                 allow: vec!["read_file".into()],
@@ -997,12 +998,23 @@ mod permissions {
             }],
         };
         let (registry, _tmp) = registry_with(perms);
-        let result = registry
+        // Listed tool is allowed.
+        let ok = registry
+            .invoke("read_file", json!({ "path": "nonexistent.txt" }))
+            .await;
+        // Should succeed (or fail on file not found — but not PermissionDenied)
+        assert!(
+            !matches!(ok, Err(Error::PermissionDenied { .. })),
+            "read_file should be allowed when in allow list"
+        );
+
+        // Unlisted tool is NOT denied — falls through to Passthrough.
+        let ok2 = registry
             .invoke("write_file", json!({ "path": "x.txt", "content": "y" }))
             .await;
         assert!(
-            matches!(result, Err(Error::PermissionDenied { .. })),
-            "expected PermissionDenied for write_file under allow=[read_file]"
+            !matches!(ok2, Err(Error::PermissionDenied { .. })),
+            "write_file should be allowed (Passthrough) when not in deny list"
         );
     }
 
@@ -1010,7 +1022,7 @@ mod permissions {
     #[tokio::test]
     async fn permissions_glob_pattern_matches() {
         let perms = recursive::permissions::LayeredPermissionsConfig {
-            mode: PermissionMode::Allow,
+            mode: PermissionMode::Default,
             layers: vec![recursive::permissions::PermissionLayer {
                 source: recursive::permissions::RuleSource::User,
                 deny: vec!["run_*".into()],
