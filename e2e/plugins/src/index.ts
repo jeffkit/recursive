@@ -1,10 +1,11 @@
 /**
  * Recursive E2E assertion plugins for ArgusAI.
  *
- * Registers three plugin step types:
+ * Registers four plugin step types:
  * - `recursive-session:` — Session JSONL structure validation
  * - `recursive-cost:` — Cost tracking validation
  * - `llm-judge:` — LLM-as-judge semantic evaluation
+ * - `agent-judge:` — Agent-as-judge evaluation with tool use + structured evidence
  *
  * Supports two modes (controlled by E2E_RECORD env var):
  * - replay (default): aimock serves fixtures from /fixtures directory
@@ -17,6 +18,7 @@ import type { PluginModule } from 'argusai-core';
 import { recursiveSessionPlugin } from './session-plugin.js';
 import { recursiveCostPlugin } from './cost-plugin.js';
 import { llmJudgePlugin } from './llm-judge-plugin.js';
+import { agentJudgePlugin } from './agent-judge-plugin.js';
 
 const plugin: PluginModule = {
   name: 'recursive-agent',
@@ -67,9 +69,9 @@ const plugin: PluginModule = {
     }
 
     if (recordMode) {
-      console.log('[recursive-agent] Plugin loaded (RECORD mode) — session, cost & llm-judge assertions registered');
+      console.log('[recursive-agent] Plugin loaded (RECORD mode) — session, cost, llm-judge & agent-judge assertions registered');
     } else {
-      console.log('[recursive-agent] Plugin loaded — session, cost & llm-judge assertions registered');
+      console.log('[recursive-agent] Plugin loaded — session, cost, llm-judge & agent-judge assertions registered');
     }
   },
 
@@ -85,6 +87,7 @@ const plugin: PluginModule = {
     recursiveSessionPlugin,
     recursiveCostPlugin,
     llmJudgePlugin,
+    agentJudgePlugin,
   ],
 };
 
@@ -92,3 +95,4 @@ export default plugin;
 export { recursiveSessionPlugin } from './session-plugin.js';
 export { recursiveCostPlugin } from './cost-plugin.js';
 export { llmJudgePlugin } from './llm-judge-plugin.js';
+export { agentJudgePlugin } from './agent-judge-plugin.js';

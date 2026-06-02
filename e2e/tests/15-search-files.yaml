@@ -1,0 +1,51 @@
+name: "search_files tool (pattern search across workspace)"
+description: |
+  Verify that the search_files tool is available and correctly returns matches.
+  The agent is asked to find all files containing 'fn main' in the workspace.
+  Asserts that the agent invoked search_files and reported the correct files.
+sequential: true
+
+setup:
+  - name: "Prepare workspace with Rust and Python files"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-search
+        mkdir -p /workspace/test-search
+        printf 'fn main() {\n    println!("hello");\n}\n' > /workspace/test-search/main.rs
+        printf 'fn main() {\n    println!("world");\n}\n' > /workspace/test-search/lib.rs
+        printf 'def greet():\n    pass\n' > /workspace/test-search/script.py
+        echo prepared
+
+  - name: "Run agent (act): search for fn main"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-search
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 5
+        run "Search for all files containing 'fn main' and tell me the count."
+
+cases:
+  - name: "Session used search_files tool"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-search/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["search_files"]
+      minMessages: 4
+
+  - name: "search-result.txt contains discovered filenames"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-search/search-result.txt
+      exists: true
+      contains: "main.rs"
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-search

@@ -1,0 +1,64 @@
+name: "Skill lazy loading via load_skill tool"
+description: |
+  Verify that when a skill file exists under .recursive/skills/, the agent
+  lazy-loads it via the load_skill tool before applying its instructions.
+  The skill index is injected into the system prompt, and load_skill returns
+  the full SKILL.md content only when actually needed.
+sequential: true
+
+setup:
+  - name: "Prepare workspace with a formatter skill"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-skill-load
+        mkdir -p /workspace/test-skill-load/.recursive/skills
+
+        cat > /workspace/test-skill-load/.recursive/skills/formatter.md << 'SKILL'
+        # formatter
+
+        ## Description
+        A code formatter skill. When invoked, format the target file and write the output
+        to a new file with the same name plus '-formatted' suffix, or to 'formatted.py'.
+
+        ## Instructions
+        1. Read the source file
+        2. Reformat for PEP 8 compliance (4-space indents, blank lines between functions)
+        3. Write the result to formatted.py
+        SKILL
+
+        printf 'def hello():print("hello")\nhello()\n' > /workspace/test-skill-load/format-me.py
+        echo prepared
+
+  - name: "Run agent (act): format file using formatter skill"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-skill-load
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 8
+        run "Format format-me.py using the formatter skill."
+
+cases:
+  - name: "Session called load_skill (lazy loading verified)"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-skill-load/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["load_skill"]
+      minMessages: 4
+
+  - name: "formatted.py was produced by the agent"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-skill-load/formatted.py
+      exists: true
+      contains: "def hello"
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-skill-load

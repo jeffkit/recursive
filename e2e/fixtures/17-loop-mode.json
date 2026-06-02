@@ -1,0 +1,39 @@
+{
+  "_comment": "Fixtures for 17-loop-mode.yaml — schedule_wakeup multi-turn loop. Turn 0 schedules a wakeup; wakeup turn writes the output file.",
+  "fixtures": [
+    {
+      "_comment": "Wakeup turn 0: agent decides it needs more data, schedules an immediate wakeup",
+      "match": { "userMessage": "multi-loop.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "schedule_wakeup",
+            "arguments": {
+              "seconds": 0,
+              "message": "Continue: now write multi-loop.txt with content 'wakeup-done'"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "After first schedule_wakeup result (loop rescheduled), agent creates the output file",
+      "match": { "userMessage": "multi-loop.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "multi-loop.txt", "contents": "wakeup-done" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "After write_file result, agent finishes without another wakeup",
+      "match": { "userMessage": "multi-loop.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "content": "Done! Wrote multi-loop.txt. No further wakeup needed."
+      }
+    }
+  ]
+}

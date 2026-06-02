@@ -1,0 +1,51 @@
+name: "Loop mode — schedule_wakeup triggers a second turn"
+description: |
+  Verify that when the agent calls schedule_wakeup during a loop run, the loop
+  actually reschedules and invokes the agent again. This is the multi-turn loop
+  scenario: first turn schedules an immediate wakeup; second turn writes the
+  output file.
+
+  This complements 10-loop-mode (which tests the single-turn no-wakeup case)
+  by exercising the actual wakeup/reschedule path.
+sequential: true
+
+setup:
+  - name: "Prepare workspace"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-multi-loop
+        mkdir -p /workspace/test-multi-loop
+        echo prepared
+
+  - name: "Run loop mode (act): multi-turn with schedule_wakeup"
+    exec:
+      container: recursive-e2e
+      command: >
+        recursive --workspace /workspace/test-multi-loop
+        --api-base http://aimock:4010/v1
+        --api-key mock-key -m mock-chat
+        --max-steps 8
+        loop Write file multi-loop.txt with content wakeup-done
+
+cases:
+  - name: "multi-loop.txt produced after wakeup turn"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-multi-loop/multi-loop.txt
+      exists: true
+      contains: "wakeup-done"
+
+  - name: "Session used schedule_wakeup and write_file"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/test-multi-loop/.recursive/sessions
+      status: ["completed", "success"]
+      hasToolCalls: ["schedule_wakeup", "write_file"]
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-multi-loop

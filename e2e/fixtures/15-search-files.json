@@ -1,0 +1,39 @@
+{
+  "_comment": "Fixtures for 15-search-files.yaml — agent uses search_files to find pattern in workspace files.",
+  "fixtures": [
+    {
+      "_comment": "First call: agent decides to search for the pattern",
+      "match": { "userMessage": "fn main", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "search_files",
+            "arguments": { "pattern": "fn main", "path": "." }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "After search result, agent writes summary to a file",
+      "match": { "userMessage": "fn main", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "search-result.txt",
+              "contents": "Found 2 files with 'fn main': main.rs, lib.rs"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "After write_file, agent confirms done",
+      "match": { "userMessage": "fn main", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "content": "Done! Found 2 files containing 'fn main': main.rs and lib.rs. Results saved to search-result.txt."
+      }
+    }
+  ]
+}

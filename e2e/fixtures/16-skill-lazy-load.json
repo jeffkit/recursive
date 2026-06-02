@@ -1,0 +1,39 @@
+{
+  "_comment": "Fixtures for 16-skill-lazy-load.yaml — agent lazy-loads a skill via load_skill before performing a task.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent loads the formatter skill before acting",
+      "match": { "userMessage": "format-me.py", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "load_skill",
+            "arguments": { "name": "formatter" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after reading skill instructions, agent writes formatted output",
+      "match": { "userMessage": "format-me.py", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "formatted.py",
+              "contents": "def hello():\n    print(\"hello\")\n\n\nhello()\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent confirms done",
+      "match": { "userMessage": "format-me.py", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "content": "Done! Loaded the 'formatter' skill and formatted format-me.py to formatted.py."
+      }
+    }
+  ]
+}
