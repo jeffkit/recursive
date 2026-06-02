@@ -79,6 +79,24 @@ pub fn build_line(app: &App) -> Line<'static> {
         Style::default().fg(Color::White).bg(Color::DarkGray),
     ));
 
+    // [plan mode indicators]
+    if app.plan_awaiting_approval {
+        spans.push(separator());
+        spans.push(Span::styled(
+            "plan: y/n".to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.planning_mode_on {
+        spans.push(separator());
+        spans.push(Span::styled(
+            "plan-first".to_string(),
+            Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+        ));
+    }
+
     // [elapsed] — only while turn is running
     if let Some(started) = app.turn.started_at {
         let elapsed = started.elapsed().as_secs_f64();
@@ -169,5 +187,25 @@ mod tests {
         app.turn.start();
         let with_turn = line_text(&build_line(&app));
         assert!(with_turn.contains("⏱"));
+    }
+
+    #[test]
+    fn status_bar_shows_plan_awaiting_indicator() {
+        let mut app = App::new();
+        let no_plan = line_text(&build_line(&app));
+        assert!(!no_plan.contains("plan:"));
+        app.plan_awaiting_approval = true;
+        let with_plan = line_text(&build_line(&app));
+        assert!(with_plan.contains("plan: y/n"));
+    }
+
+    #[test]
+    fn status_bar_shows_plan_first_mode() {
+        let mut app = App::new();
+        let no_mode = line_text(&build_line(&app));
+        assert!(!no_mode.contains("plan-first"));
+        app.planning_mode_on = true;
+        let with_mode = line_text(&build_line(&app));
+        assert!(with_mode.contains("plan-first"));
     }
 }

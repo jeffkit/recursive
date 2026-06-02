@@ -111,6 +111,9 @@ pub struct App {
     pub state: SessionState,
     pub input_buffer: String,
     pub focus: Pane,
+    /// Cursor position (byte offset) within `input_buffer` when
+    /// focus is on the Input pane.
+    pub cursor_pos: usize,
     /// Lines scrolled off the top of the messages pane. Only respected
     /// when focus is on Messages — Input focus auto-scrolls to bottom.
     pub messages_scroll: u16,
@@ -119,7 +122,6 @@ pub struct App {
     /// Set once the user presses Ctrl-C; outer loop should observe.
     pub should_quit: bool,
 }
-
 impl App {
     /// Build a fresh App for `thread_id`. The run hasn't started yet
     /// — the first `RunStarted` from the server fills `run_id` etc.
@@ -134,6 +136,7 @@ impl App {
                 ..Default::default()
             },
             input_buffer: String::new(),
+            cursor_pos: 0,
             focus: Pane::Input,
             messages_scroll: 0,
             status: None,
@@ -304,6 +307,23 @@ impl App {
             return vec![Command::Quit];
         }
 
+        // Ctrl-B / Ctrl-F cursor movement when the input pane is focused.
+        if key.ctrl && self.focus == Pane::Input {
+            match key.code {
+                KeyCode::Char('b') => {
+                    self.cursor_pos = self.cursor_pos.saturating_sub(1);
+                    return vec![];
+                }
+                KeyCode::Char('f') => {
+                    let len = self.input_buffer.len();
+                    if self.cursor_pos < len {
+                        self.cursor_pos += 1;
+                    }
+                    return vec![];
+                }
+                _ => {}
+            }
+        }
         // Permission prompt absorbs y/n/Esc *first* — these letters
         // must not also land in the input buffer.
         if let Some(prompt) = self.pending_permission.clone() {
@@ -413,6 +433,8 @@ pub enum KeyCode {
     Esc,
     Up,
     Down,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
