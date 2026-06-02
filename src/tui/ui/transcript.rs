@@ -47,6 +47,10 @@ pub fn render_block(block: &TranscriptBlock) -> Vec<Line<'static>> {
         TranscriptBlock::Compacted { removed, kept } => render_compacted(*removed, *kept),
         TranscriptBlock::System { text } => render_system(text),
         TranscriptBlock::Error { text } => render_error(text),
+        TranscriptBlock::PlanProposal {
+            plan_text,
+            tool_calls,
+        } => render_plan_proposal(plan_text, tool_calls),
     }
 }
 
@@ -276,6 +280,149 @@ fn render_error(text: &str) -> Vec<Line<'static>> {
         text.to_string(),
         Style::default().fg(Color::Red),
     )])]
+}
+
+// ── PlanProposal ──────────────────────────────────────────────────────
+
+/// Render a plan proposal inline in the transcript.
+///
+/// Layout:
+/// ```text
+/// ╔ ⚡ Plan Proposal ──────────────────╗
+/// ║ <plan_text, line by line>          ║
+/// ║                                    ║
+/// ║ Pending tools (N):                 ║
+/// ║   • tool_name(args_preview)        ║
+/// ║                                    ║
+/// ║ [y/Enter] Approve  [n] Reject  [e] Edit
+/// ╚────────────────────────────────────╝
+/// ```
+fn render_plan_proposal(plan_text: &str, tool_calls: &[serde_json::Value]) -> Vec<Line<'static>> {
+    let border = Style::default().fg(Color::Cyan);
+    let header = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
+    let key = Style::default().fg(Color::Cyan);
+    let tool_name_style = Style::default().fg(Color::Yellow);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Top border + title
+    out.push(Line::from(vec![
+        Span::styled("┌─ ", border),
+        Span::styled("⚡ Plan Proposal ", header),
+        Span::styled("─────────────────────────────────────", border),
+    ]));
+
+    // Plan text body
+    for raw in plan_text.lines() {
+        out.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled(raw.to_string(), body),
+        ]));
+    }
+
+    // Separator before tool list
+    out.push(Line::from(vec![Span::styled("│", border)]));
+    out.push(Line::from(vec![
+        Span::styled("│ ", border),
+        Span::styled(
+            format!("Pending tools ({}):", tool_calls.len()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if tool_calls.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled("  (none)", dim),
+        ]));
+    } else {
+        for tc in tool_calls {
+            let name = tc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            let args = tc
+                .get("arguments")
+                .map(|v| plan_args_preview(v, 50))
+                .unwrap_or_default();
+            out.push(Line::from(vec![
+                Span::styled("│  • ", border),
+                Span::styled(name.to_string(), tool_name_style),
+                Span::styled(format!("({args})"), body),
+            ]));
+        }
+    }
+
+    // Action hint row
+    out.push(Line::from(vec![Span::styled("│", border)]));
+    out.push(Line::from(vec![
+        Span::styled("│  ", border),
+        Span::styled("[y/Enter] ", key),
+        Span::styled(
+            "Approve",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("[n/Esc] ", key),
+        Span::styled(
+            "Reject",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("[e] ", key),
+        Span::styled("Edit", Style::default().fg(Color::Yellow)),
+    ]));
+
+    // Bottom border
+    out.push(Line::from(vec![Span::styled(
+        "└─────────────────────────────────────────────────────────",
+        border,
+    )]));
+
+    out
+}
+
+/// Compact preview of a tool's `arguments` JSON (max `limit` chars).
+fn plan_args_preview(value: &serde_json::Value, limit: usize) -> String {
+    use serde_json::Value;
+    let raw = match value {
+        Value::String(s) => format!("\"{s}\""),
+        Value::Object(map) => {
+            let mut parts = Vec::new();
+            for (k, v) in map.iter().take(2) {
+                let v_str = match v {
+                    Value::String(s) => {
+                        let s = if s.chars().count() > 20 {
+                            let h: String = s.chars().take(19).collect();
+                            format!("{h}…")
+                        } else {
+                            s.clone()
+                        };
+                        format!("\"{s}\"")
+                    }
+                    other => other.to_string(),
+                };
+                parts.push(format!("{k}={v_str}"));
+            }
+            parts.join(", ")
+        }
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    if raw.chars().count() > limit {
+        let head: String = raw.chars().take(limit - 1).collect();
+        format!("{head}…")
+    } else {
+        raw
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

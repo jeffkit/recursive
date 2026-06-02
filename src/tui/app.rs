@@ -102,6 +102,13 @@ pub enum TranscriptBlock {
     Error {
         text: String,
     },
+    /// Goal-E: plan-mode proposal rendered inline in the transcript.
+    /// Replaces the `Modal::PlanReview` pop-up so the plan is visible
+    /// in the message stream without obscuring prior context.
+    PlanProposal {
+        plan_text: String,
+        tool_calls: Vec<serde_json::Value>,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1417,16 +1424,15 @@ impl App {
                 plan_text,
                 tool_calls,
             } => {
-                // Goal-147: open the PlanReview modal and announce
-                // the proposal in the transcript so the user sees a
-                // historical record after the modal is dismissed.
-                self.modals.push(crate::tui::ui::modal::Modal::PlanReview {
+                // Fix-E: show the plan inline in the transcript rather
+                // than as a floating modal.  The dedicated
+                // `TranscriptBlock::PlanProposal` variant is rendered
+                // as a bordered box inside the message stream, and the
+                // status bar already shows "plan: y/n" to signal that
+                // the input layer is awaiting a decision.
+                self.blocks.push(TranscriptBlock::PlanProposal {
                     plan_text,
                     tool_calls,
-                    edited_text: None,
-                });
-                self.blocks.push(TranscriptBlock::System {
-                    text: "Plan proposed, awaiting approval…".into(),
                 });
                 self.plan_awaiting_approval = true;
             }
@@ -1911,7 +1917,13 @@ impl App {
         use crate::tui::ui::modal::Modal;
 
         match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => Some(UserAction::ConfirmPlan),
+            KeyCode::Char('y') | KeyCode::Enter => {
+                // Optimistic close: pop the modal immediately so the user
+                // sees the dismissal without waiting for the PlanConfirmed
+                // event to round-trip from the runtime.
+                self.modals.pop();
+                Some(UserAction::ConfirmPlan)
+            }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.modals.pop();
                 Some(UserAction::RejectPlan("user rejected".into()))
@@ -2804,7 +2816,8 @@ mod tests {
 
     #[test]
     fn plan_proposed_event_opens_plan_review_modal() {
-        use crate::tui::ui::modal::Modal;
+        // Fix-E: PlanProposed now renders inline as a TranscriptBlock
+        // instead of opening a floating modal.
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::PlanProposed {
@@ -2815,9 +2828,13 @@ mod tests {
                 "arguments": { "path": "src/foo.rs" }
             })],
         });
-        assert!(matches!(app.modals.last(), Some(Modal::PlanReview { .. })));
+        // No modal should be opened — plan is inline in the transcript.
+        assert!(app.modals.is_empty());
+        // The plan proposal block should be in the transcript.
         assert!(app.blocks.iter().any(|b| matches!(b,
-            TranscriptBlock::System { text } if text.contains("Plan proposed"))));
+            TranscriptBlock::PlanProposal { plan_text, .. }
+                if plan_text.contains("read_file"))));
+        assert!(app.plan_awaiting_approval);
     }
 
     #[test]
@@ -2868,10 +2885,10 @@ mod tests {
         });
         let action = app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(action, Some(UserAction::ConfirmPlan)));
-        // Goal §3: do **not** pop the modal until the runtime
-        // confirms the plan; the modal stays so the user sees the
-        // pending state.
-        assert!(matches!(app.modals.last(), Some(Modal::PlanReview { .. })));
+        // Fix-E: the modal is now optimistically closed on 'y' so the
+        // user immediately sees the plan was accepted instead of waiting
+        // for the PlanConfirmed round-trip event.
+        assert!(app.modals.is_empty());
     }
 
     #[test]
