@@ -134,6 +134,12 @@ pub struct AgentRuntime {
     plan_approval_gate: Arc<PlanApprovalGate>,
     /// Goal-168: active goal state (set by `/goal`). `None` when no goal is active.
     pub goal_state: Arc<RwLock<Option<GoalState>>>,
+    /// Goal-181: FIFO queue of user messages waiting to be processed.
+    /// Callers use [`enqueue`](AgentRuntime::enqueue) instead of
+    /// [`run`](AgentRuntime::run) directly; the queue is drained in FIFO
+    /// order so that messages sent while a turn is in flight are processed
+    /// automatically when the current turn completes.
+    message_queue: std::collections::VecDeque<String>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -376,6 +382,53 @@ impl AgentRuntime {
 
         Ok(outcome)
     }
+
+    // ── Goal-181: message queue ────────────────────────────────────────────
+
+    /// Enqueue a user message and drain the queue in FIFO order.
+    ///
+    /// This is the preferred entry point for all interaction layers (TUI,
+    /// HTTP, CLI).  Unlike calling [`run`](Self::run) directly, `enqueue`
+    /// is safe to call while a turn is already in flight: the runtime is
+    /// single-threaded (`&mut self`), so multiple callers naturally
+    /// serialise.  The queue ensures messages submitted before the runtime
+    /// is ready are not lost and are processed in order.
+    ///
+    /// ```text
+    /// user sends A → enqueue(A) → run(A)
+    /// user sends B while A runs → enqueue(B) → queue=[B]  (A already running via prior call)
+    /// A finishes → loop pops B → run(B)
+    /// ```
+    ///
+    /// In practice the outer loop (`drain_queue`) is what creates this
+    /// ordering: a call to `enqueue` that arrives while another `enqueue`
+    /// is executing on the same runtime will block on `&mut self` borrow,
+    /// so the messages are processed strictly in order.
+    pub async fn enqueue(&mut self, text: impl Into<String>) -> Result<Option<RuntimeOutcome>> {
+        self.message_queue.push_back(text.into());
+        self.drain_queue().await
+    }
+
+    /// Process all queued messages in FIFO order.
+    ///
+    /// Returns `Ok(Some(outcome))` for the last turn processed, or
+    /// `Ok(None)` if the queue is empty when called.
+    async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
+        let mut last: Option<RuntimeOutcome> = None;
+        while let Some(msg) = self.message_queue.pop_front() {
+            last = Some(self.run(msg).await?);
+        }
+        Ok(last)
+    }
+
+    /// Number of messages currently waiting in the queue.
+    ///
+    /// Callers can expose this to the UI (e.g. status bar: "+N queued").
+    pub fn queue_len(&self) -> usize {
+        self.message_queue.len()
+    }
+
+    // ── Transcript access ──────────────────────────────────────────────────
 
     /// Return a reference to the accumulated transcript.
     pub fn transcript(&self) -> &[Message] {
@@ -1137,6 +1190,7 @@ impl AgentRuntimeBuilder {
             todo_list,
             plan_approval_gate,
             goal_state: Arc::new(RwLock::new(None)),
+            message_queue: std::collections::VecDeque::new(),
         })
     }
 }
@@ -1850,5 +1904,62 @@ mod tests {
         let g = rt.current_goal().unwrap();
         assert_eq!(g.condition, "second goal");
         assert_eq!(g.max_turns, 15);
+    }
+
+    // ── Goal-181: message queue ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn enqueue_processes_single_message() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "queued reply".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let out = rt.enqueue("hello from queue").await.unwrap();
+        assert!(out.is_some());
+        assert_eq!(out.unwrap().final_text.as_deref(), Some("queued reply"));
+        assert_eq!(rt.transcript().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn enqueue_drains_multiple_messages_in_order() {
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "reply A".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "reply B".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        // Push two messages directly into the queue to simulate concurrent enqueue.
+        rt.message_queue.push_back("msg A".into());
+        rt.message_queue.push_back("msg B".into());
+        let last = rt.drain_queue().await.unwrap();
+        assert_eq!(last.unwrap().final_text.as_deref(), Some("reply B"));
+        // Both user messages + both assistant replies are in transcript.
+        assert_eq!(rt.transcript().len(), 4);
+    }
+
+    #[test]
+    fn queue_len_reflects_pending_messages() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        assert_eq!(rt.queue_len(), 0);
+        rt.message_queue.push_back("pending".into());
+        assert_eq!(rt.queue_len(), 1);
+        rt.message_queue.push_back("also pending".into());
+        assert_eq!(rt.queue_len(), 2);
     }
 }

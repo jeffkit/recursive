@@ -212,7 +212,7 @@ async fn worker_loop(
                     let cancel_clone = cancel_flag.clone();
                     let mut handle = tokio::task::spawn(async move {
                         let mut g = rt_clone.lock().await;
-                        g.run(text).await.map(|_| ())
+                        g.enqueue(text).await.map(|_| ())
                     });
                     let aborted = tokio::select! {
                         res = &mut handle => {
