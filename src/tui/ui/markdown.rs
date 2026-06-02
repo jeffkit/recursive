@@ -16,6 +16,7 @@
 
 use std::sync::OnceLock;
 
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
@@ -256,6 +257,236 @@ pub fn is_table_line(line: &str) -> bool {
     // Must start and (ideally) end with `|`, or at minimum contain `|`
     // with the first visible char being `|`.
     t.starts_with('|')
+}
+
+// ── Goal-172: pulldown-cmark based full-document renderer ─────────────
+
+/// Parse `text` as Markdown and return ratatui [`Line`]s for display.
+///
+/// Supported elements (minimum viable set):
+/// - **Bold** `**text**` → bold style
+/// - *Italic* `*text*` → italic style
+/// - `Inline code` `` `code` `` → `Color::Cyan`
+/// - Fenced code blocks ` ``` ` → each line prefixed with `│ ` in cyan
+/// - Unordered lists `- item` / `* item` → prefixed with `• `
+/// - Ordered lists `1. item` → prefixed with `N. `
+/// - Horizontal rules `---` → a line of `─` chars filling `wrap_width`
+/// - Plain paragraphs → rendered as-is
+///
+/// Falls back to a single raw line per `\n` if parsing produces no
+/// output (e.g. an empty string or whitespace-only input).
+pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
+    let width = if wrap_width == 0 { 80 } else { wrap_width } as usize;
+
+    // Fallback: empty / whitespace-only input.
+    if text.trim().is_empty() {
+        return text.lines().map(|l| Line::from(l.to_string())).collect();
+    }
+
+    let parser = Parser::new_ext(text, Options::empty());
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut pending_text: String = String::new();
+    let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
+    let mut list_stack: Vec<ListState> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_block_lang: String = String::new();
+    let mut code_block_buffer: Vec<String> = Vec::new();
+
+    // Helper: append `pending_text` to `current` with the active style.
+    let flush_pending =
+        |current: &mut Vec<Span<'static>>, pending_text: &mut String, style_stack: &[Style]| {
+            if !pending_text.is_empty() {
+                let style = style_stack.last().copied().unwrap_or_default();
+                current.push(Span::styled(std::mem::take(pending_text), style));
+            }
+        };
+
+    // Helper: close out the current logical line.
+    let flush_line = |out: &mut Vec<Line<'static>>,
+                      current: &mut Vec<Span<'static>>,
+                      pending_text: &mut String,
+                      style_stack: &[Style]| {
+        flush_pending(current, pending_text, style_stack);
+        if !current.is_empty() {
+            out.push(Line::from(std::mem::take(current)));
+        }
+    };
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {
+                    // No-op: paragraphs accumulate inline until End.
+                }
+                Tag::Strong => {
+                    flush_pending(&mut current, &mut pending_text, &style_stack);
+                    let base = style_stack.last().copied().unwrap_or_default();
+                    style_stack.push(base.add_modifier(Modifier::BOLD));
+                }
+                Tag::Emphasis => {
+                    flush_pending(&mut current, &mut pending_text, &style_stack);
+                    let base = style_stack.last().copied().unwrap_or_default();
+                    style_stack.push(base.add_modifier(Modifier::ITALIC));
+                }
+                Tag::CodeBlock(kind) => {
+                    // Flush any pending paragraph line first.
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                    in_code_block = true;
+                    code_block_lang = match kind {
+                        CodeBlockKind::Fenced(s) => s.into_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
+                    code_block_buffer.clear();
+                }
+                Tag::List(start) => {
+                    // Flush any pending paragraph line first.
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                    list_stack.push(ListState {
+                        ordered: start.is_some(),
+                        next_num: start.unwrap_or(1),
+                    });
+                }
+                Tag::Item => {
+                    // Flush any pending paragraph line first.
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                    let prefix = if let Some(list) = list_stack.last_mut() {
+                        if list.ordered {
+                            let n = list.next_num;
+                            list.next_num += 1;
+                            format!("{}. ", n)
+                        } else {
+                            "\u{2022} ".to_string()
+                        }
+                    } else {
+                        "\u{2022} ".to_string()
+                    };
+                    current.push(Span::styled(
+                        prefix,
+                        Style::default().fg(Color::LightYellow),
+                    ));
+                }
+                Tag::Heading { level, .. } => {
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                    let _ = level; // currently we render heading body as bold+cyan.
+                }
+                _ => {
+                    // Tags we don't render specially (links, images, tables,
+                    // block quotes, footnote defs, html blocks, def lists,
+                    // strikethrough, metadata, math): fall through; their
+                    // children become plain text.
+                }
+            },
+            Event::End(tag_end) => match tag_end {
+                TagEnd::Paragraph => {
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                }
+                TagEnd::Strong | TagEnd::Emphasis => {
+                    flush_pending(&mut current, &mut pending_text, &style_stack);
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                }
+                TagEnd::CodeBlock => {
+                    // Emit each code block line as a separate `Line` with a `│ ` prefix.
+                    for line in code_block_buffer.drain(..) {
+                        out.push(Line::from(vec![
+                            Span::styled("\u{2502} ".to_string(), Style::default().fg(Color::Cyan)),
+                            Span::styled(line, Style::default().fg(Color::Cyan)),
+                        ]));
+                    }
+                    in_code_block = false;
+                    code_block_lang.clear();
+                }
+                TagEnd::List(_) => {
+                    list_stack.pop();
+                }
+                TagEnd::Item => {
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                }
+                TagEnd::Heading(_) => {
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                }
+                _ => {}
+            },
+            Event::Text(s) => {
+                let text = s.into_string();
+                if in_code_block {
+                    // Code block text is line-delimited; split on '\n' so
+                    // each physical line becomes a separate `Line` later.
+                    // We skip a trailing empty element (the natural result
+                    // of splitting text that ends in '\n').
+                    let mut parts = text.split('\n');
+                    if let Some(first) = parts.next() {
+                        if !first.is_empty() {
+                            code_block_buffer.push(first.to_string());
+                        }
+                        for part in parts {
+                            code_block_buffer.push(part.to_string());
+                        }
+                    }
+                } else {
+                    pending_text.push_str(&text);
+                }
+            }
+            Event::Code(s) => {
+                if in_code_block {
+                    // Should not happen in well-formed input.
+                    code_block_buffer.push(s.into_string());
+                } else {
+                    flush_pending(&mut current, &mut pending_text, &style_stack);
+                    let base = style_stack.last().copied().unwrap_or_default();
+                    let code_style = base.fg(Color::Cyan);
+                    current.push(Span::styled(s.into_string(), code_style));
+                }
+            }
+            Event::SoftBreak => {
+                if in_code_block {
+                    // Treat as hard break inside code blocks.
+                    code_block_buffer.push(String::new());
+                } else {
+                    pending_text.push(' ');
+                }
+            }
+            Event::HardBreak => {
+                if in_code_block {
+                    code_block_buffer.push(String::new());
+                } else {
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                }
+            }
+            Event::Rule => {
+                flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                out.push(Line::from(Span::styled(
+                    "\u{2500}".repeat(width),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            _ => {
+                // Html, InlineHtml, InlineMath, DisplayMath, FootnoteReference,
+                // TaskListMarker: ignored (rendered as nothing).
+            }
+        }
+    }
+
+    // Flush any trailing content.
+    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+
+    if out.is_empty() {
+        // Parser produced no events (e.g. text was just punctuation or
+        // stripped by an option). Fall back to raw lines.
+        return text.lines().map(|l| Line::from(l.to_string())).collect();
+    }
+
+    out
+}
+
+/// State for a single list level, used to render ordered/unordered prefixes.
+struct ListState {
+    /// True for `1. …`, `2. …`; false for `- …` / `* …` / `+ …`.
+    ordered: bool,
+    /// Next item number for ordered lists. Ignored for unordered.
+    next_num: u64,
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────
@@ -676,5 +907,127 @@ mod tests {
         let r = render_inline("", Color::White, state);
         // Empty line shouldn't panic; may produce 0 or 1 span.
         let _ = r.spans;
+    }
+
+    // ── Goal-172: render_markdown tests ────────────────────────────────
+
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn bold_renders_as_bold_span() {
+        let lines = render_markdown("hello **world**!", 80);
+        let all_spans: Vec<&Span<'static>> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        let has_bold = all_spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            has_bold,
+            "expected at least one bold span; got spans={all_spans:?}"
+        );
+    }
+
+    #[test]
+    fn inline_code_renders_cyan() {
+        let lines = render_markdown("call `foo()` now", 80);
+        let all_spans: Vec<&Span<'static>> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        let has_cyan = all_spans.iter().any(|s| s.style.fg == Some(Color::Cyan));
+        assert!(
+            has_cyan,
+            "expected at least one cyan span for inline code; got spans={all_spans:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_prefixed() {
+        let src = "```\nsome code\n```";
+        let lines = render_markdown(src, 80);
+        assert!(!lines.is_empty(), "fenced code block produced no lines");
+        // Every emitted line should start with the `│ ` (U+2502) prefix.
+        for line in &lines {
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            assert!(
+                first.starts_with('\u{2502}'),
+                "expected fenced code line to start with `\u{2502} `, got {first:?}"
+            );
+        }
+        // The original code text should be present in the output.
+        let all_text = lines_text(&lines);
+        assert!(
+            all_text.contains("some code"),
+            "expected code text in output: {all_text:?}"
+        );
+    }
+
+    #[test]
+    fn bullet_list_prefixed() {
+        let lines = render_markdown("- first item\n- second", 80);
+        let all_text = lines_text(&lines);
+        assert!(
+            all_text.contains('\u{2022}'),
+            "expected bullet `\u{2022}` prefix in list output: {all_text:?}"
+        );
+        // Each non-empty line should start with `• `.
+        for line in &lines {
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            if first.is_empty() {
+                continue;
+            }
+            assert!(
+                first.starts_with('\u{2022}'),
+                "expected list line to start with `\u{2022} `, got {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_passthrough() {
+        let lines = render_markdown("hello world", 80);
+        assert!(!lines.is_empty(), "expected at least one line");
+        let all_text = lines_text(&lines);
+        assert!(
+            all_text.contains("hello world"),
+            "expected plain text in output: {all_text:?}"
+        );
+    }
+
+    #[test]
+    fn empty_string_returns_empty() {
+        let lines = render_markdown("", 80);
+        // Empty input: no panic, output is either empty or matches raw lines
+        // (which is empty for "").
+        assert!(
+            lines.is_empty(),
+            "expected empty Vec for empty input, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn zero_wrap_width_falls_back_to_80() {
+        // wrap_width = 0 must not panic and must produce output.
+        let lines = render_markdown("hello", 0);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn horizontal_rule_fills_wrap_width() {
+        let lines = render_markdown("---", 40);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let rule_count = text.chars().filter(|c| *c == '\u{2500}').count();
+        assert_eq!(
+            rule_count, 40,
+            "expected 40 box-drawing chars, got {text:?}"
+        );
     }
 }
