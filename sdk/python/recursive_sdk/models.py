@@ -59,6 +59,34 @@ class SystemMessage:
 
 
 @dataclass
+class PartialAssistantMessage:
+    """SDK Phase C: a streaming text delta from the assistant.
+
+    Yielded by :meth:`Run.messages` as ``type="stream_event"`` events, one
+    per token delta received from the LLM. Corresponds to
+    ``SDKPartialAssistantMessage`` in the Claude Agent SDK.
+
+    Callers that want token-level granularity (e.g. typewriter UI) can filter
+    for ``msg.type == "stream_event"``. Most callers should use the full
+    ``AssistantMessage`` (``type="assistant"``), which is emitted once the
+    entire turn is complete and contains all text blocks.
+
+    Example::
+
+        for msg in run.messages():
+            if msg.type == "stream_event":
+                print(msg.text, end="", flush=True)
+    """
+
+    type: str  # "stream_event"
+    text: str
+    """The token delta text."""
+    step: int = 0
+    """Agent step index — use to group deltas from the same turn."""
+    session_id: str = ""
+
+
+@dataclass
 class ToolProgressMessage:
     """SDK Phase B: emitted when a tool call completes with timing info.
 

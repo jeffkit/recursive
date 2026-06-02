@@ -33,6 +33,7 @@ from .exceptions import RecursiveAgentError
 from .models import (
     AssistantMessage,
     GoalState,
+    PartialAssistantMessage,
     RunResult,
     SessionInfo,
     SystemMessage,
@@ -62,6 +63,8 @@ __all__ = [
     "ToolResultBlock",
     # SDK Phase B: tool execution progress
     "ToolProgressMessage",
+    # SDK Phase C: streaming token deltas
+    "PartialAssistantMessage",
     # Goal-168
     "GoalState",
     # Misc

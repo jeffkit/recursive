@@ -8,6 +8,7 @@ from typing import Any, Dict, Generator, Iterator, List, Optional
 from ._http import _HttpClient
 from .models import (
     AssistantMessage,
+    PartialAssistantMessage,
     RunResult,
     SystemMessage,
     TextContent,
@@ -104,13 +105,15 @@ class Run:
                     yield msg
 
             elif ev_type == "partial_message":
-                # Streaming token deltas — surface as a SystemMessage so
-                # callers that opt in via ``msg.subtype == 'partial_message'``
-                # can render token-level UI. Default consumers will skip it.
-                yield SystemMessage(
-                    type="system",
-                    subtype="partial_message",
-                    data=data,
+                # SDK Phase C: streaming token deltas — surface as a typed
+                # PartialAssistantMessage (type="stream_event") so callers
+                # that want typewriter-effect rendering can filter on
+                # ``msg.type == "stream_event"`` and read ``msg.text``.
+                yield PartialAssistantMessage(
+                    type="stream_event",
+                    text=data.get("text", ""),
+                    step=int(data.get("step", 0)),
+                    session_id=self._session_id,
                 )
 
             elif ev_type == "tool_progress":

@@ -215,6 +215,48 @@ describe("Run", () => {
   });
 });
 
+// ── Run: stream_event delta ───────────────────────────────────────────────
+
+describe("Run stream_event (PartialAssistantMessage)", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("maps partial_message SSE events to stream_event type", async () => {
+    mockPost({ id: "sess-pm" });
+    mockDelete();
+
+    vi.spyOn(HttpClient.prototype, "streamEvents").mockReturnValue(
+      fakeStream([
+        {
+          type: "partial_message",
+          data: { text: "Hello", step: 0 },
+        },
+        {
+          type: "partial_message",
+          data: { text: " world", step: 0 },
+        },
+        { type: "done", data: { status: "finished" } },
+      ]) as unknown as AsyncGenerator<{ type: string; data: unknown }>,
+    );
+
+    const agent = await Agent.create({ baseUrl: "http://localhost:3000" });
+    vi.spyOn(HttpClient.prototype, "post").mockResolvedValueOnce({});
+    const run = await agent.send("hi");
+
+    const msgs: unknown[] = [];
+    for await (const msg of run.stream()) {
+      msgs.push(msg);
+    }
+
+    const deltas = msgs.filter((m: unknown) => (m as {type: string}).type === "stream_event") as Array<{type: string; text: string; step: number}>;
+    expect(deltas.length).toBe(2);
+    expect(deltas[0]!.text).toBe("Hello");
+    expect(deltas[1]!.text).toBe(" world");
+    expect(deltas[0]!.step).toBe(0);
+
+    await agent.close();
+  });
+});
+
 // ── Agent.listSessions ────────────────────────────────────────────────────
 
 describe("Agent.listSessions", () => {
