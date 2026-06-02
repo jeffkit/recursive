@@ -26,6 +26,10 @@ pub struct Config {
     pub retry_initial_backoff_secs: u64,
     pub retry_max_backoff_secs: u64,
     pub shell_timeout_secs: u64,
+    /// Run in headless mode: interactive tools go through external hooks
+    /// instead of waiting for terminal input. If no hook approves the call,
+    /// the tool is auto-denied.
+    pub headless: bool,
     pub memory_summary_limit: usize,
 }
 
@@ -101,6 +105,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .or_else(|| file_agent.and_then(|a| a.shell_timeout_secs))
             .unwrap_or(300);
+
+        let headless = std::env::var("RECURSIVE_HEADLESS")
+            .ok()
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
             .ok()
@@ -181,6 +190,7 @@ impl Config {
             retry_initial_backoff_secs,
             retry_max_backoff_secs,
             shell_timeout_secs,
+            headless,
             memory_summary_limit,
         })
     }
@@ -427,6 +437,7 @@ mod tests {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            headless: false,
             memory_summary_limit: 5,
         };
         assert_eq!(config.retry_max, 2);
@@ -651,6 +662,50 @@ mod tests {
             assert!(prompt.contains("You are Recursive"));
             assert!(!prompt.contains("# User preferences"));
             assert!(!prompt.contains("# Project memory"));
+        }
+    }
+
+    // ── Goal-199: headless env var test ──────────────────────────────────
+
+    #[test]
+    fn headless_env_var_sets_config() {
+        let original_headless = std::env::var("RECURSIVE_HEADLESS").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        // RECURSIVE_HEADLESS not set → default false
+        {
+            std::env::remove_var("RECURSIVE_HEADLESS");
+            let config = Config::from_env().unwrap();
+            assert!(!config.headless);
+        }
+
+        // RECURSIVE_HEADLESS=1 → true
+        {
+            std::env::set_var("RECURSIVE_HEADLESS", "1");
+            let config = Config::from_env().unwrap();
+            assert!(config.headless);
+        }
+
+        // RECURSIVE_HEADLESS=true → true
+        {
+            std::env::set_var("RECURSIVE_HEADLESS", "true");
+            let config = Config::from_env().unwrap();
+            assert!(config.headless);
+        }
+
+        // RECURSIVE_HEADLESS=0 → false
+        {
+            std::env::set_var("RECURSIVE_HEADLESS", "0");
+            let config = Config::from_env().unwrap();
+            assert!(!config.headless);
+        }
+
+        std::env::remove_var("RECURSIVE_HEADLESS");
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
+        if let Some(v) = original_headless {
+            std::env::set_var("RECURSIVE_HEADLESS", v);
         }
     }
 }

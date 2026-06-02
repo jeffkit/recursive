@@ -265,6 +265,11 @@ pub struct ToolRegistry {
     /// can query it at call time. Does not enforce anything by itself;
     /// tools must call `registry.policy()` and check before executing.
     policy: Option<policy_sandbox::PolicyConfig>,
+    /// Goal-199: headless mode — interactive tools go through external hooks
+    /// instead of waiting for terminal input.
+    pub headless: bool,
+    /// Goal-199: external hook runner for headless permission checks.
+    pub hook_runner: crate::hooks::ExternalHookRunner,
 }
 
 /// Observer that records files touched by structured filesystem tools
@@ -341,6 +346,8 @@ impl ToolRegistry {
             touched: None,
             permission_hook: None,
             policy: None,
+            headless: false,
+            hook_runner: crate::hooks::ExternalHookRunner::discover(&[]),
         }
     }
 
@@ -365,6 +372,8 @@ impl ToolRegistry {
             touched: self.touched.clone(),
             permission_hook: self.permission_hook.clone(),
             policy: self.policy.clone(),
+            headless: self.headless,
+            hook_runner: self.hook_runner.clone(),
         }
     }
 
@@ -403,6 +412,29 @@ impl ToolRegistry {
     /// Return the attached policy config, if any.
     pub fn policy(&self) -> Option<&policy_sandbox::PolicyConfig> {
         self.policy.as_ref()
+    }
+
+    /// Enable headless mode (Goal 199): interactive tools go through external
+    /// hooks instead of waiting for terminal input.
+    pub fn with_headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
+        self
+    }
+
+    /// Set headless mode via mutable reference.
+    pub fn set_headless(&mut self, headless: bool) {
+        self.headless = headless;
+    }
+
+    /// Attach an [`ExternalHookRunner`] for headless permission checks.
+    pub fn with_hook_runner(mut self, hook_runner: crate::hooks::ExternalHookRunner) -> Self {
+        self.hook_runner = hook_runner;
+        self
+    }
+
+    /// Set the external hook runner via mutable reference.
+    pub fn set_hook_runner(&mut self, hook_runner: crate::hooks::ExternalHookRunner) {
+        self.hook_runner = hook_runner;
     }
 
     /// Set the permissions configuration for this registry.
@@ -569,6 +601,46 @@ impl ToolRegistry {
                     };
                 }
                 Permission::Allowed(_) | Permission::Passthrough => {}
+            }
+        }
+
+        // Goal-199: headless mode — interactive tools go through external hooks.
+        // If headless and the tool requires interaction, try external hooks first.
+        // Hook approval (Continue) allows execution; Skip, Error, or no hooks → deny.
+        if self.headless {
+            if let Some(ref perms) = self.permissions {
+                if perms.any_interactive(name) {
+                    // If no external hooks are registered → auto-deny.
+                    if self.hook_runner.is_empty() {
+                        return ToolDispatch {
+                            result: Err(Error::PermissionDenied {
+                                name: name.into(),
+                                reason: DecisionReason::Hook {
+                                    name: "PermissionRequest".into(),
+                                },
+                            }),
+                            audit: AuditMeta::synthetic_unknown_tool(name),
+                        };
+                    }
+                    let hook_input = crate::hooks::external::HookInput {
+                        event: crate::hooks::external::HookEvent::PermissionRequest,
+                        tool_name: name.to_string(),
+                        args: arguments.clone(),
+                        mode: format!("{:?}", self.permission_mode),
+                    };
+                    let hook_action = self.hook_runner.dispatch(&hook_input).await;
+                    if !matches!(hook_action, crate::hooks::HookAction::Continue) {
+                        return ToolDispatch {
+                            result: Err(Error::PermissionDenied {
+                                name: name.into(),
+                                reason: DecisionReason::Hook {
+                                    name: "PermissionRequest".into(),
+                                },
+                            }),
+                            audit: AuditMeta::synthetic_unknown_tool(name),
+                        };
+                    }
+                }
             }
         }
 
@@ -934,5 +1006,100 @@ mod tests {
         let args = serde_json::json!({"command": big_val});
         let preview = args_preview_for_permission(&args);
         assert!(preview.chars().count() <= 81); // 80 chars + ellipsis
+    }
+
+    // ── Goal-199: Headless mode tests ────────────────────────────────────
+
+    /// headless=true, no hooks, interactive tool → PermissionDenied
+    #[tokio::test]
+    async fn headless_interactive_tool_denied_without_hooks() {
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_headless(true)
+            .register(Arc::new(Echo));
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "hi"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PermissionDenied { .. }));
+    }
+
+    /// headless=true, mock hook returns Continue → interactive tool allowed
+    #[tokio::test]
+    async fn headless_interactive_tool_allowed_by_hook() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let hook_path = tmp.path().join("allow.sh");
+        let script = "#!/bin/sh\nread -r _\necho '{\"action\":\"continue\"}'\n";
+        std::fs::write(&hook_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+        let hook_runner = crate::hooks::ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
+
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_headless(true)
+            .with_hook_runner(hook_runner)
+            .register(Arc::new(Echo));
+
+        #[cfg(unix)]
+        {
+            let result = reg
+                .invoke("echo", serde_json::json!({"msg": "allowed"}))
+                .await
+                .unwrap();
+            assert_eq!(result, "allowed");
+        }
+        #[cfg(not(unix))]
+        {
+            let err = reg
+                .invoke("echo", serde_json::json!({"msg": "blocked"}))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::PermissionDenied { .. }));
+        }
+    }
+
+    /// headless=false → interactive tools go through normal path (Passthrough)
+    #[tokio::test]
+    async fn non_headless_interactive_not_auto_denied() {
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_headless(false)
+            .register(Arc::new(Echo));
+        let result = reg
+            .invoke("echo", serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "hello");
     }
 }

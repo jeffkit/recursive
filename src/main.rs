@@ -104,6 +104,11 @@ struct Cli {
     /// Enable tool timing hook that prints tool call durations to stderr.
     #[arg(long)]
     hook_timing: bool,
+    /// Run in headless mode: interactive tools go through external hooks
+    /// instead of waiting for terminal input. If no hook approves the call,
+    /// the tool is auto-denied. Also set via RECURSIVE_HEADLESS=1.
+    #[arg(long = "headless", short = 'H', env = "RECURSIVE_HEADLESS")]
+    headless: bool,
     /// Path to write a session file for non-success finishes (budget exceeded,
     /// stuck, transcript limit). The session can be resumed later with `resume`.
     #[arg(long, env = "RECURSIVE_SESSION_OUT")]
@@ -329,6 +334,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(p) = cli.provider {
         config.provider_type = p;
+    }
+    if cli.headless {
+        config.headless = true;
     }
     if let Some(p) = cli.system_prompt_file {
         config.system_prompt = std::fs::read_to_string(&p)
@@ -1188,6 +1196,22 @@ async fn build_tools(config: &Config) -> ToolRegistry {
     // they must be scoped to the current session's checkpoint chain.
     if let Some(perms) = resolve_tool_permissions() {
         registry = registry.with_permissions(perms);
+    }
+    // Goal-199: headless mode — configure external hooks.
+    {
+        let mut hook_dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            hook_dirs.push(
+                std::path::PathBuf::from(home)
+                    .join(".recursive")
+                    .join("hooks"),
+            );
+        }
+        hook_dirs.push(config.workspace.join(".recursive").join("hooks"));
+        let hook_runner = recursive::hooks::ExternalHookRunner::discover(&hook_dirs);
+        registry = registry
+            .with_headless(config.headless)
+            .with_hook_runner(hook_runner);
     }
     registry
 }
@@ -3020,6 +3044,7 @@ mod tests {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 1,
             shell_timeout_secs: 5,
+            headless: false,
             memory_summary_limit: 5,
         }
     }
