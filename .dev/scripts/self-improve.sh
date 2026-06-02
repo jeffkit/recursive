@@ -681,7 +681,7 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # we need to test the NEW binary that includes this goal's changes)
   cargo build -q 2>/dev/null
 
-  if argusai -c e2e/e2e.yaml run -s smoke --quiet 2>&1 | tail -5; then
+  if argusai -c e2e/e2e.yaml run -s smoke 2>&1 | tail -5; then
     echo "[self-improve] E2E smoke: PASSED ✓"
   else
     echo "[self-improve] E2E smoke: FAILED ✗"
