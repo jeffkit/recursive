@@ -694,6 +694,10 @@ impl ToolRegistry {
             }
 
             let is_readonly = self.is_readonly(name);
+            // Pre-compute interactive flag before the match so we can use it
+            // after without holding `guard` across an await point.
+            let is_interactive_tool = guard.any_interactive(name);
+            let mut perm_is_unknown = false;
             match guard.check_static(name, is_readonly, safety_content.as_deref()) {
                 Permission::Denied(reason, _msg) => {
                     return ToolDispatch {
@@ -704,11 +708,41 @@ impl ToolRegistry {
                         audit: AuditMeta::synthetic_unknown_tool(name),
                     };
                 }
-                Permission::Allowed(_) | Permission::Passthrough => {}
+                Permission::Unknown => {
+                    perm_is_unknown = true;
+                }
+                Permission::Allowed(_) => {}
             }
 
+            // Goal-212: When no rule explicitly matched (Unknown) and the tool
+            // is in the interactive list, delegate to the registered
+            // PermissionHook as a safety net for non-headless callers (e.g.
+            // agent loop calling invoke_with_audit directly, bypassing
+            // invoke()). Headless interactive tools are handled below.
+            // Explicitly Allowed tools skip this check to avoid double-asking.
+            if perm_is_unknown && !self.headless && is_interactive_tool {
+                if let Some(hook) = &self.permission_hook {
+                    let preview = args_preview_for_permission(&arguments);
+                    drop(guard);
+                    if !hook.ask_permission(name, &preview).await {
+                        return ToolDispatch {
+                            result: Err(Error::PermissionDenied {
+                                name: name.into(),
+                                reason: DecisionReason::Hook {
+                                    name: "interactive-unknown".into(),
+                                },
+                            }),
+                            audit: AuditMeta::synthetic_unknown_tool(name),
+                        };
+                    }
+                    // Hook allowed; guard already dropped, skip headless block.
+                } else {
+                    // No hook registered — non-headless library caller → allow.
+                    drop(guard);
+                }
+            } else
             // Goal-199: headless mode — interactive tools go through external hooks.
-            if self.headless && guard.any_interactive(name) {
+            if self.headless && is_interactive_tool {
                 // If no external hooks are registered → auto-deny.
                 if self.hook_runner.is_empty() {
                     return ToolDispatch {
@@ -1206,6 +1240,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "hello");
+    }
+
+    // ── Goal-212: Permission::Unknown semantics ──────────────────────────────
+
+    /// Smoke test: Permission::Unknown variant compiles and can be constructed.
+    #[test]
+    fn permission_unknown_variant_exists() {
+        use crate::permissions::Permission;
+        let u = Permission::Unknown;
+        assert!(!u.is_allowed());
+        assert!(!u.is_denied());
+    }
+
+    /// Unknown + non-headless + interactive + DenyHook → PermissionDenied
+    /// (invoke_with_audit called directly, bypassing invoke()).
+    #[tokio::test]
+    async fn unknown_interactive_tool_deny_hook_blocks_invoke_with_audit() {
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_permission_hook(Arc::new(DenyHook))
+            .with_headless(false)
+            .register(Arc::new(Echo));
+        let dispatch = reg
+            .invoke_with_audit("echo", serde_json::json!({"msg": "hi"}))
+            .await;
+        assert!(
+            matches!(dispatch.result, Err(Error::PermissionDenied { .. })),
+            "hook-deny should block interactive Unknown tool via invoke_with_audit"
+        );
+    }
+
+    /// Unknown + non-headless + interactive + no hook → allowed (library default).
+    #[tokio::test]
+    async fn unknown_interactive_tool_no_hook_is_allowed() {
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_headless(false)
+            .register(Arc::new(Echo));
+        let dispatch = reg
+            .invoke_with_audit("echo", serde_json::json!({"msg": "ok"}))
+            .await;
+        assert_eq!(
+            dispatch.result.unwrap(),
+            "ok",
+            "no hook = allow for Unknown interactive tool"
+        );
+    }
+
+    /// Unknown + non-headless + non-interactive + DenyHook → allowed (hook not consulted).
+    #[tokio::test]
+    async fn unknown_non_interactive_tool_hook_not_consulted() {
+        // echo is NOT in the interactive list; DenyHook should not fire.
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_permission_hook(Arc::new(DenyHook))
+            .with_headless(false)
+            .register(Arc::new(Echo));
+        let dispatch = reg
+            .invoke_with_audit("echo", serde_json::json!({"msg": "pass"}))
+            .await;
+        assert_eq!(
+            dispatch.result.unwrap(),
+            "pass",
+            "DenyHook must not fire for non-interactive Unknown tools"
+        );
+    }
+
+    /// Allowed (explicit allow rule) + interactive + DenyHook
+    /// → allowed (no hook fired because perm_is_unknown=false).
+    #[tokio::test]
+    async fn allowed_interactive_tool_hook_not_consulted() {
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                allow: vec!["echo".into()],
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        let reg = ToolRegistry::local()
+            .with_permissions(config)
+            .with_permission_hook(Arc::new(DenyHook))
+            .with_headless(false)
+            .register(Arc::new(Echo));
+        // invoke_with_audit directly: check_static returns Allowed, not Unknown,
+        // so the Goal-212 hook block must NOT fire.
+        let dispatch = reg
+            .invoke_with_audit("echo", serde_json::json!({"msg": "explicit-allow"}))
+            .await;
+        assert_eq!(
+            dispatch.result.unwrap(),
+            "explicit-allow",
+            "Explicitly Allowed tools must not be re-checked via hook"
+        );
     }
 
     // ── Goal-201: plan mode tools are opt-in (not in default registry) ──────
