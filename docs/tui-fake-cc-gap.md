@@ -455,7 +455,7 @@ ui/modal.rs:43-71`）。
 | Auto-update | 是 | 否 | ⛔ | 由 cargo / brew 处理 |
 | Telemetry / Sentry | 是 | 否 | ⛔ | 不上报 |
 | Swarm coordinator status | 是（`CoordinatorAgentStatus.tsx`） | 否 | ⛔ | swarm 不做 |
-| 真正的取消正在飞的 LLM 请求 | 是（abort controller） | 🟡（cancel_flag + select! 100ms poll，下一个 tool 边界中断） | 🟡 | Goal 147 (`crates/recursive-tui/src/backend.rs::wait_for_cancel`)；reqwest 不支持外部 cancel，下个工具边界才 abort。建议路径：`reqwest::Client` 的 RequestBuilder 在异步任务里 spawn 后保留 abort 句柄 |
+| 真正的取消正在飞的 LLM 请求 | 是（abort controller） | ✅（JoinHandle::abort() 立即 drop reqwest 响应，transcript 截断至 pre-turn） | ✅ | Goal 170 (`src/tui/backend.rs::worker_loop` 4 个 turn path；`src/runtime.rs::truncate_transcript`)；Esc 触发 UiEvent::Interrupted，< 200ms |
 | 中断历史 / 撤销最近一条 | 是（`Ctrl+_`） | 否 | 🔴 | 候选 |
 | Plan 编辑后 inline diff | 是 | 否（`e` 键把文本扔回输入框） | 🟡 | Goal 147 显式简化；候选：在 PlanReview modal 内提供编辑 buffer |
 | Permission 请求 modal | 是 | 否 | 🔴 | **下一期重点**；建议路径：runtime 加 permission_hook 与 mpsc 双向通道，UI 弹 Confirm modal |
@@ -493,11 +493,7 @@ ui/modal.rs:43-71`）。
      y/n。runtime 改动 < 80 行，TUI 改动 ~ 一个新 modal + dispatch 钩。
      2 个 goal。
 
-4. **真正的取消正在飞的 LLM 请求**（中 / 中）
-   - 落地路径：`reqwest::Client` 的 RequestBuilder 在异步任务里 spawn
-     后保留 abort 句柄；`backend.rs::wait_for_cancel` 改为直接 abort
-     handle。要小心 transcript 一致性（已发送的 tool_call 必须有
-     tool_result 配对，否则下次 turn 会被 OpenAI 400）。1 个 goal。
+4. ~~**真正的取消正在飞的 LLM 请求**~~ ✅ Goal-170（2026-06-02 落地）
 
 5. **Markdown / Syntax highlighting**（中 / 中）
    - 落地路径：transcript Assistant 块用 `pulldown-cmark` 解析，按
