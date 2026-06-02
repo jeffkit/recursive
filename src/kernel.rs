@@ -75,6 +75,13 @@ pub struct TurnContext {
     /// Goal-165: shared flag that enables agent-driven read-only plan mode.
     /// When `true`, write tools are blocked until `exit_plan_mode` is called.
     pub exploring_plan_mode: Arc<AtomicBool>,
+
+    /// Optional mailbox for mid-run message injection from a coordinator.
+    ///
+    /// When set, the kernel drains this mailbox at the start of every step
+    /// and appends any pending messages as user turns.  This powers the
+    /// `send_message` tool's bidirectional coordinator ↔ worker flow.
+    pub mailbox: Option<crate::tools::send_message::WorkerMailbox>,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +289,7 @@ impl AgentKernel {
             plan_confirmed: ctx.plan_confirmed,
             exploring_plan_mode: ctx.exploring_plan_mode,
             shutdown_token: self.shutdown_token.clone(),
+            mailbox: ctx.mailbox,
         };
 
         let inner = core.run_inner().await?;

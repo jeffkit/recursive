@@ -127,6 +127,9 @@ pub struct SpawnWorkerTool {
     max_depth: usize,
     current_depth: usize,
     permission_hook: Option<PermissionHook>,
+    /// Optional registry — when set, each spawned worker is registered so
+    /// a coordinator can send mid-run messages via `send_message`.
+    registry: Option<crate::tools::send_message::WorkerRegistry>,
 }
 
 impl SpawnWorkerTool {
@@ -145,7 +148,14 @@ impl SpawnWorkerTool {
             max_depth,
             current_depth,
             permission_hook,
+            registry: None,
         }
+    }
+
+    /// Attach a `WorkerRegistry` so spawned workers can receive mid-run messages.
+    pub fn with_registry(mut self, registry: crate::tools::send_message::WorkerRegistry) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
@@ -246,6 +256,19 @@ impl Tool for SpawnWorkerTool {
             .unwrap_or_else(|| worker_type.system_prompt())
             .to_string();
 
+        // Assign a stable worker_id and optionally register in the registry so
+        // the coordinator can send mid-run messages via `send_message`.
+        let worker_id = arguments
+            .get("worker_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let mailbox = match &self.registry {
+            Some(reg) => Some(reg.register(&worker_id).await),
+            None => None,
+        };
+
         // Build the tool registry for this worker
         let tool_names = worker_type.allowed_tool_names();
         let sub_registry = match &tool_names {
@@ -254,7 +277,7 @@ impl Tool for SpawnWorkerTool {
                 // Full access: give worker all parent tools.
                 // Also register a child spawn_worker so workers can sub-delegate.
                 let mut reg = self.all_tools.clone();
-                let child = SpawnWorkerTool::new(
+                let mut child = SpawnWorkerTool::new(
                     &self.workspace,
                     self.provider.clone(),
                     self.all_tools.clone(),
@@ -262,6 +285,9 @@ impl Tool for SpawnWorkerTool {
                     self.current_depth + 1,
                     self.permission_hook.clone(),
                 );
+                if let Some(r) = &self.registry {
+                    child = child.with_registry(r.clone());
+                }
                 reg = reg.register(Arc::new(child));
                 reg
             }
@@ -291,9 +317,17 @@ impl Tool for SpawnWorkerTool {
             permission_hook: self.permission_hook.clone(),
             planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mailbox,
         };
 
-        let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
+        let outcome = kernel.run(ctx).await;
+
+        // Deregister from the registry once the worker is done (success or error).
+        if let Some(reg) = &self.registry {
+            reg.deregister(&worker_id).await;
+        }
+
+        let outcome = outcome.map_err(|e| Error::Tool {
             name: "spawn_worker".into(),
             message: format!("worker failed: {e}"),
         })?;
@@ -312,15 +346,16 @@ impl Tool for SpawnWorkerTool {
             .final_text
             .unwrap_or_else(|| "(no final message)".to_string());
 
+        let type_label = match worker_type {
+            WorkerType::General => "general",
+            WorkerType::Explore => "explore",
+            WorkerType::Coder => "coder",
+            WorkerType::Reviewer => "reviewer",
+            WorkerType::Researcher => "researcher",
+        };
+
         Ok(format!(
-            "[worker:{} finished: {finish_label}]\n{final_text}",
-            match worker_type {
-                WorkerType::General => "general",
-                WorkerType::Explore => "explore",
-                WorkerType::Coder => "coder",
-                WorkerType::Reviewer => "reviewer",
-                WorkerType::Researcher => "researcher",
-            }
+            "[worker_id:{worker_id} type:{type_label} finished:{finish_label}]\n{final_text}"
         ))
     }
 }
@@ -370,7 +405,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.contains("[worker:general finished:"),
+            result.contains("type:general finished:"),
             "got: {result}"
         );
         assert!(result.contains("Task complete"), "got: {result}");
@@ -392,7 +427,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.contains("[worker:explore finished:"),
+            result.contains("type:explore finished:"),
             "got: {result}"
         );
     }
@@ -417,7 +452,7 @@ mod tests {
             .await
             .unwrap();
         // Should succeed and use the coder worker type label
-        assert!(result.contains("[worker:coder finished:"), "got: {result}");
+        assert!(result.contains("type:coder finished:"), "got: {result}");
     }
 
     #[tokio::test]

@@ -276,6 +276,7 @@ impl Tool for SubAgent {
             permission_hook: self.permission_hook.clone(),
             planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mailbox: None,
         };
 
         let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {

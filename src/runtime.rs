@@ -289,6 +289,7 @@ impl AgentRuntime {
             planning_mode: self.planning_mode.clone(),
             // Goal-165: share the plan mode flag so RunCore can gate write tools.
             exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
+            mailbox: None,
         };
 
         // Execute turn

@@ -298,6 +298,12 @@ pub(crate) struct RunCore<'a> {
     /// terminates at the next step boundary with
     /// [`FinishReason::Cancelled`].
     pub(crate) shutdown_token: Option<CancellationToken>,
+
+    /// Optional mailbox for receiving mid-run messages from a coordinator.
+    ///
+    /// Drained at the start of every step so the agent sees coordinator
+    /// instructions as user-role messages injected into the conversation.
+    pub(crate) mailbox: Option<crate::tools::send_message::WorkerMailbox>,
 }
 
 impl<'a> RunCore<'a> {
@@ -659,6 +665,23 @@ impl<'a> RunCore<'a> {
                         plan_buffer: self.plan_buffer,
                         plan_confirmed: self.plan_confirmed,
                         tool_audits,
+                    });
+                }
+            }
+
+            // ---- mailbox drain (coordinator → worker mid-run messages) -----------
+            // Drain any messages that a coordinator pushed via `send_message`.
+            // Each pending message is appended as a user-role turn so the LLM
+            // sees coordinator instructions on the next reasoning step.
+            if let Some(ref mailbox) = self.mailbox {
+                let pending = mailbox.drain_all().await;
+                for msg_text in pending {
+                    self.push_message(Message {
+                        role: crate::message::Role::User,
+                        content: format!("[coordinator]: {msg_text}"),
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -1181,6 +1204,8 @@ impl Agent {
             // Legacy Agent path: plan mode 2.0 not wired up, default to off.
             exploring_plan_mode: Arc::new(AtomicBool::new(false)),
             shutdown_token: self.shutdown_token.clone(),
+            // Legacy Agent path: mailbox not wired up, default to None.
+            mailbox: None,
         };
 
         let inner = core.run_inner().await?;
