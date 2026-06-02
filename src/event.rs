@@ -76,6 +76,16 @@ pub enum AgentEvent {
         /// Number of iterations executed.
         steps: usize,
     },
+    /// Goal-202: Agent is requesting permission to enter plan mode.
+    /// Emitted by `RequestPlanModeTool` before any exploration begins.
+    /// The TUI / HTTP surface should prompt the user and call
+    /// `AgentRuntime::approve_plan_mode_request` or `reject_plan_mode_request`.
+    PlanModeRequested { reason: String },
+    /// Goal-202: The user approved the plan-mode entry request.
+    PlanModeApproved,
+    /// Goal-202: The user rejected the plan-mode entry request.
+    PlanModeRejected { reason: String },
+
     /// Agent has produced a plan and is waiting for confirmation.
     PlanProposed {
         plan_text: String,

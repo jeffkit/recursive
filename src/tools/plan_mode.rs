@@ -316,6 +316,176 @@ impl Tool for ExitPlanModeTool {
 }
 
 // ---------------------------------------------------------------------------
+// PlanModeRequestGate (Goal-202)
+// ---------------------------------------------------------------------------
+
+/// Decision result for the pre-confirmation step.
+#[derive(Debug, Clone)]
+pub enum PlanModeRequestResult {
+    /// User allowed the agent to enter plan mode.
+    Approved,
+    /// User declined; agent should execute without planning.
+    Rejected { reason: String },
+}
+
+/// Gate for the plan-mode pre-confirmation step.
+///
+/// Parallel to [`PlanApprovalGate`] but governs the *entry* decision
+/// (before any exploration), not the plan review.
+pub struct PlanModeRequestGate {
+    response: Arc<RwLock<Option<PlanModeRequestResult>>>,
+    notify: Arc<Notify>,
+}
+
+impl PlanModeRequestGate {
+    /// Create a fresh gate.
+    pub fn new() -> Self {
+        Self {
+            response: Arc::new(RwLock::new(None)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Block until the user makes a decision.
+    pub async fn wait_for_decision(&self) -> PlanModeRequestResult {
+        loop {
+            let result_opt = {
+                let guard = self
+                    .response
+                    .read()
+                    .expect("PlanModeRequestGate response lock poisoned");
+                guard.clone()
+            };
+            if let Some(result) = result_opt {
+                if let Ok(mut w) = self.response.write() {
+                    *w = None;
+                }
+                return result;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    /// Approve the plan-mode request.
+    pub fn approve(&self) {
+        if let Ok(mut w) = self.response.write() {
+            *w = Some(PlanModeRequestResult::Approved);
+        }
+        self.notify.notify_one();
+    }
+
+    /// Reject the plan-mode request with a reason.
+    pub fn reject(&self, reason: impl Into<String>) {
+        if let Ok(mut w) = self.response.write() {
+            *w = Some(PlanModeRequestResult::Rejected {
+                reason: reason.into(),
+            });
+        }
+        self.notify.notify_one();
+    }
+}
+
+impl Default for PlanModeRequestGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RequestPlanModeTool (Goal-202)
+// ---------------------------------------------------------------------------
+
+/// Tool that asks the user for permission before entering plan mode.
+///
+/// The agent should call this tool **before** `enter_plan_mode` whenever
+/// it considers a planning phase beneficial.  If the user approves, the
+/// agent proceeds with `enter_plan_mode` as usual.  If the user rejects,
+/// the agent should execute directly without entering plan mode.
+///
+/// This two-step flow avoids wasting tokens generating a plan that the
+/// user never wanted.
+pub struct RequestPlanModeTool {
+    gate: Arc<PlanModeRequestGate>,
+    event_sink: Arc<dyn EventSink>,
+}
+
+impl RequestPlanModeTool {
+    /// Create a new `RequestPlanModeTool`.
+    pub fn new(gate: Arc<PlanModeRequestGate>, event_sink: Arc<dyn EventSink>) -> Self {
+        Self { gate, event_sink }
+    }
+}
+
+#[async_trait]
+impl Tool for RequestPlanModeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "request_plan_mode".into(),
+            description:
+                "Before entering plan mode, call this tool to ask the user whether they want \
+                 you to create a plan first.  Provide a brief `reason` explaining why planning \
+                 would be helpful for this task.  The call blocks until the user decides. \
+                 If approved, proceed with `enter_plan_mode`; if rejected, execute directly \
+                 without planning."
+                    .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "required": ["reason"],
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of why a planning phase would be \
+                            beneficial (1-2 sentences)."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> Result<String> {
+        let reason = arguments
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Notify TUI / HTTP so they can prompt the user.
+        self.event_sink
+            .emit(crate::event::AgentEvent::PlanModeRequested {
+                reason: reason.clone(),
+            })
+            .await;
+
+        // Block until the user makes a decision.
+        let result = self.gate.wait_for_decision().await;
+
+        match result {
+            PlanModeRequestResult::Approved => {
+                self.event_sink
+                    .emit(crate::event::AgentEvent::PlanModeApproved)
+                    .await;
+                Ok(serde_json::json!({ "approved": true }).to_string())
+            }
+            PlanModeRequestResult::Rejected { reason: r } => {
+                self.event_sink
+                    .emit(crate::event::AgentEvent::PlanModeRejected { reason: r.clone() })
+                    .await;
+                Ok(serde_json::json!({ "approved": false, "reason": r }).to_string())
+            }
+        }
+    }
+
+    fn side_effect_class(&self) -> ToolSideEffect {
+        // Waits for external human input (same as exit_plan_mode).
+        ToolSideEffect::External
+    }
+
+    fn is_readonly(&self) -> bool {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -449,5 +619,83 @@ mod tests {
         // Response should be None now.
         let stored = gate.response.read().unwrap().clone();
         assert!(stored.is_none(), "response should be cleared after read");
+    }
+
+    // -- PlanModeRequestGate (Goal-202) ------------------------------------
+
+    #[tokio::test]
+    async fn request_gate_approve_wakes_waiter() {
+        let gate = Arc::new(PlanModeRequestGate::new());
+        let gate_clone = gate.clone();
+        let waiter = tokio::spawn(async move { gate_clone.wait_for_decision().await });
+        tokio::task::yield_now().await;
+        gate.approve();
+        let result = waiter.await.unwrap();
+        assert!(matches!(result, PlanModeRequestResult::Approved));
+    }
+
+    #[tokio::test]
+    async fn request_gate_reject_propagates_reason() {
+        let gate = Arc::new(PlanModeRequestGate::new());
+        let gate_clone = gate.clone();
+        let waiter = tokio::spawn(async move { gate_clone.wait_for_decision().await });
+        tokio::task::yield_now().await;
+        gate.reject("user skipped");
+        let result = waiter.await.unwrap();
+        assert!(matches!(
+            result,
+            PlanModeRequestResult::Rejected { reason } if reason == "user skipped"
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_gate_cleared_after_use() {
+        let gate = Arc::new(PlanModeRequestGate::new());
+        gate.approve();
+        let _ = gate.wait_for_decision().await;
+        let stored = gate.response.read().unwrap().clone();
+        assert!(
+            stored.is_none(),
+            "response should be cleared after decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_plan_mode_tool_emits_event_and_blocks_until_approved() {
+        use crate::event::NullSink;
+        let gate = Arc::new(PlanModeRequestGate::new());
+        let tool = Arc::new(RequestPlanModeTool::new(gate.clone(), Arc::new(NullSink)));
+        let gate_clone = gate.clone();
+        let approve_handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            gate_clone.approve();
+        });
+        let result = tool
+            .execute(json!({ "reason": "complex task" }))
+            .await
+            .unwrap();
+        approve_handle.await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn request_plan_mode_tool_rejected_returns_false() {
+        use crate::event::NullSink;
+        let gate = Arc::new(PlanModeRequestGate::new());
+        let tool = Arc::new(RequestPlanModeTool::new(gate.clone(), Arc::new(NullSink)));
+        let gate_clone = gate.clone();
+        let reject_handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            gate_clone.reject("not needed");
+        });
+        let result = tool
+            .execute(json!({ "reason": "might need plan" }))
+            .await
+            .unwrap();
+        reject_handle.await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["approved"], false);
+        assert_eq!(parsed["reason"], "not needed");
     }
 }
