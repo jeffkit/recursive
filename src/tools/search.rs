@@ -368,9 +368,8 @@ Todo",
         let tmp = TempDir::new().unwrap();
         // Construct a long JSONL-like line that contains the target pattern AND box-drawing chars.
         let separator = "─".repeat(60); // 60 × 3 bytes = 180 bytes
-        let content_field = format!(
-            "pub struct AgentRuntime{{}}\\n// {separator}─────────────────────────"
-        );
+        let content_field =
+            format!("pub struct AgentRuntime{{}}\\n// {separator}─────────────────────────");
         let line = format!(
             "{{\"role\":\"tool\",\"content\":\"# range: lines 1-50 of 200\\\\n{content_field}\"}}"
         );
