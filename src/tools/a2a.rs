@@ -168,8 +168,10 @@ impl Tool for A2aCallTool {
         ToolSpec {
             name: "a2a_call".into(),
             description: "Invoke a remote A2A (Agent2Agent v1.0) agent and return its response. \
-                           Sends a text message to the agent and waits for completion, \
-                           polling the task status as needed."
+                           Supports both polling mode (default) and real-time SSE streaming mode. \
+                           In polling mode the tool sends a message and polls the task until done. \
+                           In streaming mode it connects to the server's SSE stream and accumulates \
+                           artifact text as it arrives."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -177,7 +179,8 @@ impl Tool for A2aCallTool {
                     "url": {
                         "type": "string",
                         "description": "Base URL of the A2A server (e.g. 'https://agent.example.com'). \
-                                        The tool posts to {url}/message:send and polls {url}/tasks/{id}."
+                                        Polling: posts to {url}/message:send and polls {url}/tasks/{id}. \
+                                        Streaming: posts to {url}/message:stream."
                     },
                     "prompt": {
                         "type": "string",
@@ -191,8 +194,22 @@ impl Tool for A2aCallTool {
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Maximum seconds to wait for task completion (default: 60, max: 300). \
-                                        The tool polls every 2 seconds during this window.",
+                                        In polling mode: polls every 2 seconds. \
+                                        In streaming mode: max time to keep the SSE connection open.",
                         "default": 60
+                    },
+                    "streaming": {
+                        "type": "boolean",
+                        "description": "If true, use SSE streaming mode (POST {url}/message:stream). \
+                                        The server must support A2A streaming. Default: false.",
+                        "default": false
+                    },
+                    "async_mode": {
+                        "type": "boolean",
+                        "description": "If true, submit the task and return immediately with the task ID \
+                                        without waiting for completion. Use a2a_task_check later to \
+                                        retrieve the result (composable with schedule_wakeup). Default: false.",
+                        "default": false
                     }
                 },
                 "required": ["url", "prompt"]
@@ -222,6 +239,8 @@ impl Tool for A2aCallTool {
             .as_u64()
             .unwrap_or(60)
             .clamp(1, 300);
+        let use_streaming = arguments["streaming"].as_bool().unwrap_or(false);
+        let use_async = arguments["async_mode"].as_bool().unwrap_or(false);
 
         // Normalise base URL — strip trailing slash.
         let base = url.trim_end_matches('/');
@@ -230,6 +249,10 @@ impl Tool for A2aCallTool {
             name: "a2a_call".into(),
             message: format!("failed to build HTTP client: {e}"),
         })?;
+
+        if use_streaming {
+            return execute_streaming(base, prompt, authorization, timeout_secs, &client).await;
+        }
 
         // ── Step 1: POST /message:send ────────────────────────────────────
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -283,6 +306,15 @@ impl Tool for A2aCallTool {
                 });
             }
             SendMessageResponse::HasTask { mut task } => {
+                // ── Async mode: return task ID immediately without polling ─
+                if use_async {
+                    return Ok(format!(
+                        "TASK_ID: {}\nSTATE: {}\n(Use a2a_task_check with url={base} to poll for results)",
+                        task.id,
+                        task.status.state.as_str()
+                    ));
+                }
+
                 // ── Step 3: poll until terminal state ─────────────────────
                 let deadline = Instant::now() + Duration::from_secs(timeout_secs);
                 let task_url = format!("{base}/tasks/{}", task.id);
@@ -348,6 +380,509 @@ impl Tool for A2aCallTool {
                     )),
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming implementation
+// ---------------------------------------------------------------------------
+
+/// Parse one SSE event block (multiple `key: value` lines separated by `\n`)
+/// and extract any artifact text and terminal task state from it.
+fn parse_sse_event(event_block: &str) -> (Option<String>, Option<TaskState>) {
+    let mut data_lines: Vec<&str> = Vec::new();
+    for line in event_block.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim());
+        }
+    }
+    let data = data_lines.join("");
+    if data.is_empty() {
+        return (None, None);
+    }
+
+    let Ok(v): std::result::Result<Value, _> = serde_json::from_str(&data) else {
+        return (None, None);
+    };
+
+    // Extract artifact text — handle both A2A REST and JSON-RPC response shapes.
+    let mut text: Option<String> = None;
+    let mut state: Option<TaskState> = None;
+
+    // Shape 1: {"type":"TaskArtifactUpdateEvent","task":{...}}
+    // Shape 2: {"result":{"kind":"artifact-update","artifact":{...}}}
+    if let Some(artifacts) = v
+        .pointer("/task/artifacts")
+        .or_else(|| v.pointer("/result/artifact/parts"))
+        .and_then(|a| a.as_array())
+    {
+        let extracted: String = artifacts
+            .iter()
+            .flat_map(|a| a["parts"].as_array().into_iter().flatten())
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        if !extracted.is_empty() {
+            text = Some(extracted);
+        }
+    } else if let Some(part_text) = v
+        .pointer("/result/artifact/parts/0/text")
+        .and_then(|v| v.as_str())
+    {
+        text = Some(part_text.to_string());
+    }
+
+    // Extract state — handle both shapes.
+    let raw_state = v
+        .pointer("/task/status/state")
+        .or_else(|| v.pointer("/result/status/state"))
+        .and_then(|s| s.as_str());
+
+    if let Some(s) = raw_state {
+        if let Ok(ts) = serde_json::from_value::<TaskState>(Value::String(s.to_string())) {
+            state = Some(ts);
+        }
+    }
+
+    (text, state)
+}
+
+/// Execute `a2a_call` in SSE streaming mode.
+///
+/// POSTs to `{base}/message:stream` with `Accept: text/event-stream` and reads
+/// the SSE stream until a terminal task state is received or the timeout expires.
+async fn execute_streaming(
+    base: &str,
+    prompt: &str,
+    authorization: Option<&str>,
+    timeout_secs: u64,
+    client: &reqwest::Client,
+) -> Result<String> {
+    let stream_url = format!("{base}/message:stream");
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    let mut req = client
+        .post(&stream_url)
+        .header(CONTENT_TYPE, "application/a2a+json")
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .json(&json!({
+            "message": {
+                "role": "ROLE_USER",
+                "parts": [{"text": prompt}],
+                "messageId": message_id
+            }
+        }));
+
+    if let Some(auth) = authorization {
+        req = req.header(AUTHORIZATION, auth);
+    }
+
+    let resp = req.send().await.map_err(|e| Error::Tool {
+        name: "a2a_call".into(),
+        message: format!("network error calling {stream_url}: {e}"),
+    })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(format!("ERROR: HTTP {status} from {stream_url}: {body}"));
+    }
+
+    // Read SSE events chunk by chunk.
+    let mut buffer = String::new();
+    let mut accumulated_text = String::new();
+    let mut final_state: Option<TaskState> = None;
+    let mut resp = resp;
+
+    loop {
+        if Instant::now() >= deadline {
+            let suffix = if accumulated_text.is_empty() {
+                "(no text received before timeout)".to_string()
+            } else {
+                accumulated_text.clone()
+            };
+            return Ok(format!(
+                "ERROR: SSE stream timed out after {timeout_secs}s. Partial output:\n{suffix}"
+            ));
+        }
+
+        let chunk = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+            .await
+            .map_err(|_| Error::Tool {
+                name: "a2a_call".into(),
+                message: "SSE chunk read timed out (5s idle)".into(),
+            })?
+            .map_err(|e| Error::Tool {
+                name: "a2a_call".into(),
+                message: format!("SSE read error: {e}"),
+            })?;
+
+        let Some(bytes) = chunk else {
+            // Connection closed by server.
+            break;
+        };
+
+        if let Ok(text_chunk) = std::str::from_utf8(&bytes) {
+            buffer.push_str(text_chunk);
+        }
+
+        // Process complete SSE event blocks (separated by \n\n or \r\n\r\n).
+        while let Some(pos) = buffer.find("\n\n").or_else(|| buffer.find("\r\n\r\n")) {
+            let sep_len = if buffer[pos..].starts_with("\r\n\r\n") {
+                4
+            } else {
+                2
+            };
+            let event_block = buffer[..pos].to_string();
+            buffer.drain(..pos + sep_len);
+
+            let (text, state) = parse_sse_event(&event_block);
+            if let Some(t) = text {
+                accumulated_text.push_str(&t);
+            }
+            if let Some(s) = state {
+                if s.is_terminal() {
+                    final_state = Some(s);
+                    break;
+                }
+            }
+        }
+
+        if final_state.is_some() {
+            break;
+        }
+    }
+
+    match final_state {
+        Some(TaskState::Completed) | None => {
+            if accumulated_text.is_empty() {
+                Ok("(task completed with no artifact text)".to_string())
+            } else {
+                Ok(accumulated_text)
+            }
+        }
+        Some(other) => Ok(format!(
+            "ERROR: task ended with state {} (partial output: {})",
+            other.as_str(),
+            accumulated_text
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent Card data model
+// ---------------------------------------------------------------------------
+
+/// Capability flags from the A2A Agent Card.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentCapabilities {
+    /// Whether the agent supports streaming (SSE) via `sendSubscribe`.
+    #[serde(default)]
+    pub streaming: bool,
+    /// Whether the agent supports push-notification callbacks.
+    #[serde(rename = "pushNotifications", default)]
+    pub push_notifications: bool,
+}
+
+/// One skill entry in the Agent Card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSkill {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Authentication scheme described in the Agent Card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAuthentication {
+    pub schemes: Vec<String>,
+}
+
+/// Subset of the A2A v1.0 Agent Card returned by `GET /.well-known/agent.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCard {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+    #[serde(default)]
+    pub skills: Vec<AgentSkill>,
+    pub authentication: Option<AgentAuthentication>,
+}
+
+impl AgentCard {
+    /// Return a concise human-readable summary of this Agent Card.
+    pub fn summary(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        let name = if self.name.is_empty() {
+            "<unnamed>"
+        } else {
+            &self.name
+        };
+        lines.push(format!("Agent: {name}"));
+        if !self.description.is_empty() {
+            lines.push(format!("Description: {}", self.description));
+        }
+        lines.push(format!(
+            "Streaming: {}",
+            if self.capabilities.streaming {
+                "supported"
+            } else {
+                "not supported"
+            }
+        ));
+        lines.push(format!(
+            "Push notifications: {}",
+            if self.capabilities.push_notifications {
+                "supported"
+            } else {
+                "not supported"
+            }
+        ));
+        if let Some(auth) = &self.authentication {
+            lines.push(format!("Auth: {}", auth.schemes.join(", ")));
+        } else {
+            lines.push("Auth: none".into());
+        }
+        if !self.skills.is_empty() {
+            lines.push("Skills:".into());
+            for skill in &self.skills {
+                let desc = if skill.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", skill.description)
+                };
+                lines.push(format!("  - {}{}", skill.name, desc));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A2aCardTool
+// ---------------------------------------------------------------------------
+
+/// Tool that fetches and summarises a remote A2A Agent Card
+/// (`GET /.well-known/agent.json`).
+pub struct A2aCardTool;
+
+impl A2aCardTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for A2aCardTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for A2aCardTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "a2a_card".into(),
+            description: "Fetch and display the Agent Card of a remote A2A v1.0 agent. \
+                           The card describes the agent's capabilities (streaming, push \
+                           notifications), authentication scheme, and available skills. \
+                           Call this before a2a_call to discover what the agent supports."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Base URL of the A2A server (e.g. 'https://agent.example.com'). \
+                                        The tool fetches {url}/.well-known/agent.json."
+                    },
+                    "authorization": {
+                        "type": "string",
+                        "description": "Optional Authorization header value (e.g. 'Bearer <token>')."
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    fn side_effect_class(&self) -> ToolSideEffect {
+        ToolSideEffect::External
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let url = arguments["url"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "a2a_card".into(),
+                message: "missing required parameter: url".into(),
+            })?;
+        let authorization = arguments["authorization"].as_str();
+
+        let base = url.trim_end_matches('/');
+        let card_url = format!("{base}/.well-known/agent.json");
+
+        let client = A2aCallTool::build_client().map_err(|e| Error::Tool {
+            name: "a2a_card".into(),
+            message: format!("failed to build HTTP client: {e}"),
+        })?;
+
+        let mut req = client.get(&card_url);
+        if let Some(auth) = authorization {
+            req = req.header(AUTHORIZATION, auth);
+        }
+
+        let resp = req.send().await.map_err(|e| Error::Tool {
+            name: "a2a_card".into(),
+            message: format!("network error fetching {card_url}: {e}"),
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(format!("ERROR: HTTP {status} from {card_url}: {body}"));
+        }
+
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
+            name: "a2a_card".into(),
+            message: format!("failed to read response body: {e}"),
+        })?;
+
+        let card: AgentCard = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "a2a_card".into(),
+            message: format!("invalid Agent Card JSON: {e}\nbody: {body_text}"),
+        })?;
+
+        Ok(card.summary())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A2aTaskCheckTool
+// ---------------------------------------------------------------------------
+
+/// Tool that checks the current state and artifacts of an A2A task.
+///
+/// Designed to be used together with `a2a_call` in `async_mode: true`, allowing
+/// the agent to submit a long-running task and check on it later, optionally
+/// combined with `schedule_wakeup` for periodic polling.
+pub struct A2aTaskCheckTool;
+
+impl A2aTaskCheckTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for A2aTaskCheckTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for A2aTaskCheckTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "a2a_task_check".into(),
+            description: "Check the current status and artifacts of a previously submitted A2A task. \
+                           Use this after calling a2a_call with async_mode=true to retrieve results. \
+                           Combine with schedule_wakeup for periodic polling of long-running tasks."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Base URL of the A2A server (same url used in a2a_call)."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID returned by a2a_call in async_mode (the value after 'TASK_ID: ')."
+                    },
+                    "authorization": {
+                        "type": "string",
+                        "description": "Optional Authorization header value (e.g. 'Bearer <token>')."
+                    }
+                },
+                "required": ["url", "task_id"]
+            }),
+        }
+    }
+
+    fn side_effect_class(&self) -> ToolSideEffect {
+        ToolSideEffect::External
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<String> {
+        let url = arguments["url"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "a2a_task_check".into(),
+                message: "missing required parameter: url".into(),
+            })?;
+        let task_id = arguments["task_id"]
+            .as_str()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "a2a_task_check".into(),
+                message: "missing required parameter: task_id".into(),
+            })?;
+        let authorization = arguments["authorization"].as_str();
+
+        let base = url.trim_end_matches('/');
+        let task_url = format!("{base}/tasks/{task_id}");
+
+        let client = A2aCallTool::build_client().map_err(|e| Error::Tool {
+            name: "a2a_task_check".into(),
+            message: format!("failed to build HTTP client: {e}"),
+        })?;
+
+        let mut req = client.get(&task_url);
+        if let Some(auth) = authorization {
+            req = req.header(AUTHORIZATION, auth);
+        }
+
+        let resp = req.send().await.map_err(|e| Error::Tool {
+            name: "a2a_task_check".into(),
+            message: format!("network error fetching {task_url}: {e}"),
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(format!("ERROR: HTTP {status} from {task_url}: {body}"));
+        }
+
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
+            name: "a2a_task_check".into(),
+            message: format!("failed to read response body: {e}"),
+        })?;
+
+        let task: Task = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "a2a_task_check".into(),
+            message: format!("invalid task JSON: {e}\nbody: {body_text}"),
+        })?;
+
+        let state_str = task.status.state.as_str();
+        let artifact_text = artifacts_to_text(&task.artifacts);
+
+        if task.status.state.is_terminal() {
+            if artifact_text.is_empty() {
+                Ok(format!("STATE: {state_str}\n(no artifact text)"))
+            } else {
+                Ok(format!("STATE: {state_str}\n{artifact_text}"))
+            }
+        } else {
+            Ok(format!(
+                "STATE: {state_str}\n(task not yet complete; check again later)"
+            ))
         }
     }
 }
@@ -563,5 +1098,230 @@ mod tests {
             .unwrap();
 
         assert!(result.starts_with("ERROR: HTTP"), "got: {result}");
+    }
+
+    // ── A2aCardTool tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn agent_card_summary_full() {
+        let card = AgentCard {
+            name: "Weather Bot".into(),
+            description: "Provides forecasts.".into(),
+            capabilities: AgentCapabilities {
+                streaming: true,
+                push_notifications: false,
+            },
+            skills: vec![AgentSkill {
+                id: "s1".into(),
+                name: "get_weather".into(),
+                description: "Get current weather.".into(),
+            }],
+            authentication: Some(AgentAuthentication {
+                schemes: vec!["Bearer".into()],
+            }),
+        };
+        let summary = card.summary();
+        assert!(summary.contains("Agent: Weather Bot"), "{summary}");
+        assert!(summary.contains("Streaming: supported"), "{summary}");
+        assert!(
+            summary.contains("Push notifications: not supported"),
+            "{summary}"
+        );
+        assert!(summary.contains("Auth: Bearer"), "{summary}");
+        assert!(summary.contains("get_weather"), "{summary}");
+    }
+
+    #[test]
+    fn agent_card_summary_empty_name_uses_unnamed() {
+        let card = AgentCard {
+            name: String::new(),
+            description: String::new(),
+            capabilities: AgentCapabilities::default(),
+            skills: vec![],
+            authentication: None,
+        };
+        let summary = card.summary();
+        assert!(summary.contains("Agent: <unnamed>"), "{summary}");
+        assert!(summary.contains("Auth: none"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a2a_card_parses_valid_agent_card() {
+        let body = r#"{
+            "name": "Echo Agent",
+            "description": "Echoes your message.",
+            "capabilities": {"streaming": false, "pushNotifications": false},
+            "skills": [{"id": "echo", "name": "echo", "description": "Echo text."}]
+        }"#;
+        let raw_resp = Box::leak(make_json_response(body).into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aCardTool::new();
+        let result = tool
+            .execute(json!({"url": format!("http://{addr}")}))
+            .await
+            .unwrap();
+
+        assert!(result.contains("Echo Agent"), "{result}");
+        assert!(result.contains("Streaming: not supported"), "{result}");
+        assert!(result.contains("echo"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn a2a_card_returns_error_on_http_404() {
+        let raw_resp =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aCardTool::new();
+        let result = tool
+            .execute(json!({"url": format!("http://{addr}")}))
+            .await
+            .unwrap();
+
+        assert!(result.starts_with("ERROR: HTTP 404"), "{result}");
+    }
+
+    // ── SSE streaming tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_sse_event_extracts_artifact_text() {
+        let event = r#"data: {"type":"TaskArtifactUpdateEvent","task":{"id":"t1","status":{"state":"TASK_STATE_WORKING"},"artifacts":[{"parts":[{"text":"Hello world"}],"index":0}]}}"#;
+        let (text, state) = parse_sse_event(event);
+        assert_eq!(text.as_deref(), Some("Hello world"));
+        assert!(state.is_none() || matches!(state, Some(TaskState::Working)));
+    }
+
+    #[test]
+    fn parse_sse_event_extracts_terminal_state() {
+        let event = r#"data: {"type":"TaskStatusUpdateEvent","task":{"id":"t1","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[]}}"#;
+        let (text, state) = parse_sse_event(event);
+        assert!(text.is_none() || text.as_deref() == Some(""));
+        assert!(matches!(state, Some(TaskState::Completed)));
+    }
+
+    #[test]
+    fn parse_sse_event_ignores_unknown_data() {
+        let event = "data: {\"not_a2a\": true}";
+        let (text, state) = parse_sse_event(event);
+        assert!(text.is_none());
+        assert!(state.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_mode_accumulates_artifact_text() {
+        // Build a minimal SSE response with two artifact events and a COMPLETED status.
+        let body_parts = [
+            "data: {\"type\":\"TaskStatusUpdateEvent\",\"task\":{\"id\":\"s1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"},\"artifacts\":[]}}\n\n",
+            "data: {\"type\":\"TaskArtifactUpdateEvent\",\"task\":{\"id\":\"s1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"},\"artifacts\":[{\"parts\":[{\"text\":\"Hello \"}],\"index\":0}]}}\n\n",
+            "data: {\"type\":\"TaskArtifactUpdateEvent\",\"task\":{\"id\":\"s1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"},\"artifacts\":[{\"parts\":[{\"text\":\"world!\"}],\"index\":0}]}}\n\n",
+            "data: {\"type\":\"TaskStatusUpdateEvent\",\"task\":{\"id\":\"s1\",\"status\":{\"state\":\"TASK_STATE_COMPLETED\"},\"artifacts\":[]}}\n\n",
+        ].concat();
+        let sse_body = body_parts.as_str();
+        let raw_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sse_body.len(),
+            sse_body
+        );
+        let raw_resp: &'static str = Box::leak(raw_resp.into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aCallTool::new();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "prompt": "say hello",
+                "streaming": true,
+                "timeout_secs": 10
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result, "Hello world!", "got: {result}");
+    }
+
+    // ── Goal 179: async_mode + a2a_task_check tests ───────────────────────
+
+    #[tokio::test]
+    async fn async_mode_returns_task_id_immediately() {
+        let body = r#"{"task":{"id":"async-t1","status":{"state":"TASK_STATE_SUBMITTED"},"artifacts":[]}}"#;
+        let raw_resp = Box::leak(make_json_response(body).into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aCallTool::new();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "prompt": "do something slow",
+                "async_mode": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("TASK_ID: async-t1"), "got: {result}");
+        assert!(result.contains("TASK_STATE_SUBMITTED"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn a2a_task_check_completed_task() {
+        let body = r#"{"id":"check-t1","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"parts":[{"text":"Done!"}]}]}"#;
+        let raw_resp = Box::leak(make_json_response(body).into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aTaskCheckTool::new();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "task_id": "check-t1"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("TASK_STATE_COMPLETED"), "got: {result}");
+        assert!(result.contains("Done!"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn a2a_task_check_working_task_hints_to_retry() {
+        let body = r#"{"id":"check-t2","status":{"state":"TASK_STATE_WORKING"},"artifacts":[]}"#;
+        let raw_resp = Box::leak(make_json_response(body).into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aTaskCheckTool::new();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "task_id": "check-t2"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("TASK_STATE_WORKING"), "got: {result}");
+        assert!(result.contains("check again later"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn a2a_task_check_http_error_returns_error_string() {
+        let raw_resp =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aTaskCheckTool::new();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "task_id": "missing-task"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.starts_with("ERROR: HTTP 404"), "got: {result}");
     }
 }

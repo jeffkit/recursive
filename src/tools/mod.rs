@@ -157,7 +157,7 @@ pub mod transport;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 
-pub use a2a::A2aCallTool;
+pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
 pub use apply_patch::ApplyPatch;
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
@@ -644,7 +644,9 @@ pub fn build_standard_tools(
             todo_list,
             Arc::new(crate::event::NullSink),
         )))
-        .register(Arc::new(A2aCallTool::new()));
+        .register(Arc::new(A2aCallTool::new()))
+        .register(Arc::new(A2aCardTool::new()))
+        .register(Arc::new(A2aTaskCheckTool::new()));
 
     // Goal-165: plan mode 2.0 tools (NullSink / default gate placeholder).
     // AgentRuntimeBuilder::build() re-registers these with the real gate and sink.
