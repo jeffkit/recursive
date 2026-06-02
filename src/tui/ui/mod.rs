@@ -21,7 +21,10 @@ pub mod modal;
 pub mod spinner;
 pub mod splash;
 pub mod status;
+pub mod theme;
 pub mod transcript;
+
+pub use theme::{find_theme, Theme, DARK};
 
 /// Render the current screen onto `frame`.
 pub fn render(frame: &mut Frame, app: &App) {

@@ -656,6 +656,9 @@ pub struct App {
     pub active_goal: Option<GoalState>,
     /// Goal-171: workspace root path, used by /resume to list sessions.
     pub workspace_path: std::path::PathBuf,
+    /// Goal-174: active colour palette. Defaults to [`DARK`]; switchable
+    /// via `/theme <name>` without restart.
+    pub theme: &'static crate::tui::ui::theme::Theme,
 }
 
 // ── Goal-161: PendingPermission ──────────────────────────────────────────────
@@ -821,6 +824,7 @@ impl App {
             current_todos: Vec::new(),
             active_goal: None,
             workspace_path: workspace,
+            theme: &crate::tui::ui::theme::DARK,
         }
     }
 
