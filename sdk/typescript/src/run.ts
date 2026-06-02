@@ -75,6 +75,9 @@ export class Run {
     let finishReason: string | undefined;
     let usageData: Record<string, unknown> | undefined;
     let runStatus: "finished" | "error" | "cancelled" = "finished";
+    const resultParts: string[] = [];
+    let numTurns = 0;
+    const startMs = Date.now();
 
     for await (const event of this._http.streamEvents(
       `/sessions/${this.id}/events`,
@@ -84,7 +87,15 @@ export class Run {
 
       if (evType === "message" || evType === "") {
         const msg = parseMessage(data, this.id);
-        if (msg) yield msg;
+        if (msg) {
+          if (msg.type === "assistant") {
+            numTurns++;
+            for (const block of msg.content) {
+              if (block.type === "text") resultParts.push(block.text);
+            }
+          }
+          yield msg;
+        }
       } else if (evType === "partial_message") {
         // Streaming token deltas — surface as a system message so callers
         // that want token-level granularity can opt in via msg.subtype.
@@ -107,6 +118,8 @@ export class Run {
           status: "error",
           error: String(data["message"] ?? data),
           ok: false,
+          numTurns,
+          durationMs: Date.now() - startMs,
         };
         return;
       }
@@ -119,6 +132,9 @@ export class Run {
       finishReason,
       usage,
       ok: runStatus === "finished",
+      result: resultParts.length > 0 ? resultParts.join("") : undefined,
+      numTurns,
+      durationMs: Date.now() - startMs,
     };
   }
 
@@ -180,13 +196,30 @@ export class Run {
     return this._result!;
   }
 
+  // ── cancel ────────────────────────────────────────────────────────────────
+
+  /**
+   * Request cancellation of the current run.
+   *
+   * Sends `POST /sessions/:id/interrupt` to ask the server to stop the active
+   * agent turn as soon as possible.  The stream will eventually close with
+   * `status === "cancelled"`.  Best-effort — does not throw on network errors.
+   */
+  async cancel(): Promise<void> {
+    try {
+      await this._http.post(`/sessions/${this.id}/interrupt`, {});
+    } catch {
+      // best-effort; stream will eventually time out or close naturally
+    }
+  }
+
   // ── supports ─────────────────────────────────────────────────────────────
 
   /**
    * Check whether *operation* is supported for this run.
    */
   supports(operation: string): boolean {
-    return ["stream", "messages", "iterText", "text", "wait"].includes(
+    return ["stream", "messages", "iterText", "text", "wait", "cancel"].includes(
       operation,
     );
   }

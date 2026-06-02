@@ -444,6 +444,11 @@ pub struct SessionState {
     /// approve/reject without taking the runtime Mutex (which may be held
     /// by a running agent turn).
     pub plan_approval_gate: Arc<PlanApprovalGate>,
+    /// Goal-170: cancellation token for the currently running agent turn.
+    /// `POST /sessions/:id/interrupt` cancels this token, which causes
+    /// the kernel to exit with `FinishReason::Cancelled` at the next step
+    /// boundary.  Replaced with a fresh token at the start of every turn.
+    pub interrupt_token: Arc<tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
 }
 
 /// Serialized session info for list/detail endpoints.
@@ -704,6 +709,8 @@ pub fn build_router_with_auth_and_rate_limit(
             "/sessions/{id}/goal",
             axum::routing::delete(session_clear_goal),
         )
+        // Goal-170: interrupt the current agent turn.
+        .route("/sessions/{id}/interrupt", post(session_interrupt))
         // Goal-169: slash commands listing.
         .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
@@ -1312,6 +1319,7 @@ async fn create_session(
         created_at: created_at.clone(),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
+        interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     state.sessions.write().await.insert(id.clone(), session);
@@ -1575,6 +1583,41 @@ async fn runtime_goal_state_clear(runtime: &Arc<tokio::sync::Mutex<AgentRuntime>
     }
 }
 
+// ── Goal-170: interrupt endpoint ───────────────────────────────────────────
+
+/// POST /sessions/:id/interrupt — cancel the active agent turn.
+///
+/// Cancels the `CancellationToken` installed at the start of the current
+/// turn. The kernel exits with `FinishReason::Cancelled` at the next step
+/// boundary.  If no turn is in progress the request is still `200 OK`
+/// (idempotent — no harm done).
+async fn session_interrupt(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let token_arc = {
+        let sessions = state.sessions.read().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "session not found"})),
+            );
+        };
+        session.interrupt_token.clone()
+    };
+
+    // Cancel the current token if one is installed.
+    let token_opt = token_arc.lock().await.clone();
+    if let Some(token) = token_opt {
+        token.cancel();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "interrupted", "session_id": session_id})),
+    )
+}
+
 // ── Goal-169: slash commands endpoint ─────────────────────────────────────
 
 /// GET /slash-commands — list all registered slash commands.
@@ -1588,20 +1631,17 @@ async fn send_session_message(
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Get the session's runtime (Arc clone is cheap; the Mutex is per-session).
-    let runtime_arc = {
+    // Get the session's runtime and interrupt token (Arc clones are cheap).
+    let (runtime_arc, interrupt_token_arc) = {
         let sessions = state.sessions.read().await;
-        sessions
-            .get(&id)
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: "session not found".into(),
-                }),
-            ))?
-            .runtime
-            .clone()
+        let session = sessions.get(&id).ok_or((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: "session not found".into(),
+            }),
+        ))?;
+        (session.runtime.clone(), session.interrupt_token.clone())
     };
 
     // Ensure broadcast channel exists for this session before we lock the runtime.
@@ -1616,6 +1656,15 @@ async fn send_session_message(
 
     // Lock the runtime for this turn (serializes concurrent requests per session).
     let mut runtime = runtime_arc.lock().await;
+
+    // Goal-170: install a fresh cancellation token so `POST .../interrupt`
+    // can cancel this turn without affecting future turns.
+    let interrupt_token = tokio_util::sync::CancellationToken::new();
+    {
+        let mut stored = interrupt_token_arc.lock().await;
+        *stored = Some(interrupt_token.clone());
+    }
+    runtime.set_interrupt_token(interrupt_token);
 
     // Wire a ChannelSink so events are forwarded to SSE subscribers.
     let (sink, mut event_rx) = ChannelSink::new();
@@ -1632,6 +1681,12 @@ async fn send_session_message(
 
     // Run the agent turn (transcript is managed internally by AgentRuntime).
     let run_result = runtime.run(&body.content).await;
+
+    // Clear the interrupt token slot — the turn is done.
+    {
+        let mut stored = interrupt_token_arc.lock().await;
+        *stored = None;
+    }
 
     // Disconnect the sink so the forwarder drains and exits.
     runtime.set_event_sink(Arc::new(NullSink));

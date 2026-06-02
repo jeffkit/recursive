@@ -84,6 +84,25 @@ class _HttpClient:
                 is_retryable=exc.response.status_code >= 500,
             ) from exc
 
+    def delete_json(self, path: str) -> Dict[str, Any]:
+        """DELETE and return the parsed JSON response body."""
+        try:
+            resp = self._session.delete(
+                f"{self.base_url}{path}", timeout=self.timeout
+            )
+            resp.raise_for_status()
+            return resp.json()  # type: ignore[no-any-return]
+        except requests.ConnectionError as exc:
+            raise RecursiveAgentError(
+                f"Cannot reach Recursive server at {self.base_url}: {exc}",
+                is_retryable=True,
+            ) from exc
+        except requests.HTTPError as exc:
+            raise RecursiveAgentError(
+                f"HTTP {exc.response.status_code}: {exc.response.text}",
+                is_retryable=exc.response.status_code >= 500,
+            ) from exc
+
     # ── SSE streaming ────────────────────────────────────────────────────────
 
     def stream_events(self, path: str) -> Generator[Dict[str, Any], None, None]:

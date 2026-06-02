@@ -62,6 +62,12 @@ export interface RunResult {
   error?: string;
   /** Shorthand: `status === "finished"`. */
   ok: boolean;
+  /** Concatenated final assistant text (collected while streaming). */
+  result?: string;
+  /** Number of assistant turns in this run. */
+  numTurns?: number;
+  /** Wall-clock duration from first stream read to close, in milliseconds. */
+  durationMs?: number;
 }
 
 // ── Session info ──────────────────────────────────────────────────────────

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Generator, Iterator, Optional
+import time
+from typing import Any, Dict, Generator, Iterator, List, Optional
 
 from ._http import _HttpClient
 from .models import (
@@ -83,6 +84,9 @@ class Run:
         finish_reason: Optional[str] = None
         usage_data: Optional[Dict[str, Any]] = None
         run_status = "finished"
+        result_parts: List[str] = []
+        num_turns = 0
+        start_ms = int(time.time() * 1000)
 
         for event in self._http.stream_events(
             f"/sessions/{self._session_id}/events"
@@ -93,6 +97,9 @@ class Run:
             if ev_type in ("message", ""):
                 msg = _parse_message(data, self._session_id)
                 if msg is not None:
+                    if isinstance(msg, AssistantMessage):
+                        num_turns += 1
+                        result_parts.append(msg.text())
                     yield msg
 
             elif ev_type == "partial_message":
@@ -117,15 +124,21 @@ class Run:
                     id=self._session_id,
                     status="error",
                     error=data.get("message", str(data)),
+                    num_turns=num_turns,
+                    duration_ms=int(time.time() * 1000) - start_ms,
                 )
                 return
 
+        duration_ms = int(time.time() * 1000) - start_ms
         usage = _parse_usage(usage_data) if usage_data else None
         self._result = RunResult(
             id=self._session_id,
             status=run_status,
             finish_reason=finish_reason,
             usage=usage,
+            result="".join(result_parts) or None,
+            num_turns=num_turns,
+            duration_ms=duration_ms,
         )
 
     # ``stream()`` is an alias for ``messages()``
@@ -164,14 +177,32 @@ class Run:
         assert self._result is not None
         return self._result
 
+    # ── cancel ────────────────────────────────────────────────────────────────
+
+    def cancel(self) -> None:
+        """
+        Request cancellation of the current run.
+
+        Sends ``POST /sessions/:id/interrupt`` to ask the server to stop the
+        active agent turn as soon as possible.  The run's stream will
+        eventually close with ``status == "cancelled"``.
+        """
+        try:
+            self._http.post(
+                f"/sessions/{self._session_id}/interrupt",
+                {},
+            )
+        except Exception:
+            pass  # best-effort; the stream will time out naturally
+
     # ── supports ─────────────────────────────────────────────────────────────
 
     def supports(self, operation: str) -> bool:
         """
         Check whether *operation* is supported for this run.
-        Currently supported: ``"messages"``, ``"stream"``, ``"wait"``.
+        Currently supported: ``"messages"``, ``"stream"``, ``"wait"``, ``"cancel"``.
         """
-        return operation in {"messages", "stream", "wait", "iter_text", "text"}
+        return operation in {"messages", "stream", "wait", "iter_text", "text", "cancel"}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────

@@ -396,6 +396,16 @@ impl AgentRuntime {
         self.event_sink.as_ref()
     }
 
+    /// Set a cancellation token that interrupts the current (or next) agent turn.
+    ///
+    /// When the token is cancelled the step loop exits with
+    /// [`FinishReason::Cancelled`](crate::agent::FinishReason::Cancelled) at
+    /// the next step boundary.  This method replaces any previously installed
+    /// token — call it before each `run()` so a fresh token is in place.
+    pub fn set_interrupt_token(&mut self, token: tokio_util::sync::CancellationToken) {
+        self.kernel.shutdown_token = Some(token);
+    }
+
     /// Set a new event sink (useful for REPL mode between turns).
     pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
         self.event_sink = sink.clone();

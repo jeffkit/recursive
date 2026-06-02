@@ -2045,6 +2045,7 @@ mod http_tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
             plan_approval_gate: gate,
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         };
         state
             .sessions
@@ -2502,6 +2503,204 @@ mod http_tests {
         // goal field should be present (as null) when no goal is set.
         assert!(detail.get("goal").is_some());
         assert!(detail["goal"].is_null());
+    }
+
+    // ── Goal-168 (extra): additional goal endpoint tests ─────────────────────
+
+    #[tokio::test]
+    async fn set_goal_response_includes_session_id_field() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "NO\nNot done yet.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"condition": "tests pass"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Response must include both required fields.
+        assert!(val.get("session_id").is_some());
+        assert_eq!(val["session_id"], session_id);
+        assert_eq!(val["status"], "pursuing");
+    }
+
+    #[tokio::test]
+    async fn clear_goal_response_includes_session_id_field() {
+        let state = sample_state();
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(val.get("session_id").is_some());
+        assert_eq!(val["session_id"], session_id);
+        assert_eq!(val["status"], "cleared");
+    }
+
+    #[tokio::test]
+    async fn set_goal_uses_default_max_turns_when_omitted() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "NO\nNot yet.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Omit max_turns — server should default to 20.
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"condition": "all tests pass"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["status"], "pursuing");
+    }
+
+    // ── Goal-170: interrupt endpoint tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn interrupt_returns_200_for_valid_session() {
+        let state = sample_state();
+        let app = build_router(state.clone());
+
+        let create_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Interrupt with no active run — should still be 200 (idempotent).
+        let app2 = build_router(state);
+        let resp = app2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sessions/{session_id}/interrupt"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["status"], "interrupted");
+        assert_eq!(val["session_id"], session_id);
+    }
+
+    #[tokio::test]
+    async fn interrupt_returns_404_for_missing_session() {
+        let app = build_router(sample_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions/ghost/interrupt")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
     // ── Goal-169: /slash-commands endpoint tests ─────────────────────────────

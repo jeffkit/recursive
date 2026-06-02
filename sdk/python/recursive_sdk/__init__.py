@@ -32,6 +32,7 @@ from .agent import Agent
 from .exceptions import RecursiveAgentError
 from .models import (
     AssistantMessage,
+    GoalState,
     RunResult,
     SessionInfo,
     SystemMessage,
@@ -58,6 +59,8 @@ __all__ = [
     "TextContent",
     "ToolUseBlock",
     "ToolResultBlock",
+    # Goal-168
+    "GoalState",
     # Misc
     "UsageMeta",
     "SessionInfo",

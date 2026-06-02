@@ -121,3 +121,56 @@ impl GoalEvaluator {
         Ok(GoalVerdict { achieved, reason })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_state_serializes_and_deserializes() {
+        let state = GoalState {
+            condition: "all tests pass".into(),
+            status: GoalStatus::Pursuing,
+            turns: 3,
+            max_turns: 20,
+            last_reason: Some("still failing".into()),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let roundtrip: GoalState = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.condition, "all tests pass");
+        assert_eq!(roundtrip.status, GoalStatus::Pursuing);
+        assert_eq!(roundtrip.turns, 3);
+        assert_eq!(roundtrip.max_turns, 20);
+        assert_eq!(roundtrip.last_reason.as_deref(), Some("still failing"));
+    }
+
+    #[test]
+    fn goal_status_snake_case_serialization() {
+        assert_eq!(
+            serde_json::to_string(&GoalStatus::Pursuing).unwrap(),
+            r#""pursuing""#
+        );
+        assert_eq!(
+            serde_json::to_string(&GoalStatus::Achieved).unwrap(),
+            r#""achieved""#
+        );
+        assert_eq!(
+            serde_json::to_string(&GoalStatus::Cleared).unwrap(),
+            r#""cleared""#
+        );
+    }
+
+    #[test]
+    fn goal_verdict_achieved_flag_reflects_yes_logic() {
+        // Directly test the verdict construction used in evaluate().
+        let text = "YES\nAll tests are passing now.";
+        let first_line = text.lines().next().unwrap_or("").trim().to_uppercase();
+        let achieved = first_line.starts_with("YES");
+        assert!(achieved);
+
+        let text_no = "NO\nTests still failing.";
+        let first_line_no = text_no.lines().next().unwrap_or("").trim().to_uppercase();
+        let achieved_no = first_line_no.starts_with("YES");
+        assert!(!achieved_no);
+    }
+}

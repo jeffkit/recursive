@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from ._http import _HttpClient
 from .exceptions import RecursiveAgentError
-from .models import RunResult, SessionInfo
+from .models import GoalState, RunResult, SessionInfo
 from .run import Run
 
 
@@ -83,6 +83,77 @@ class _AgentSession:
         thread.start()
         run._send_thread = thread
         return run
+
+    # ── Goal-168: goal loop ───────────────────────────────────────────────────
+
+    def set_goal(
+        self,
+        condition: str,
+        *,
+        max_turns: int = 20,
+    ) -> GoalState:
+        """
+        Start a condition-based autonomous loop for this session.
+
+        The server evaluates *condition* after every agent turn and keeps
+        looping until the condition is met or *max_turns* is exhausted.
+
+        Returns a :class:`~recursive_sdk.models.GoalState` with
+        ``status == "pursuing"``.
+
+        Example::
+
+            state = agent.set_goal("all tests pass", max_turns=10)
+            print(state.status)  # "pursuing"
+        """
+        if self._closed:
+            raise RecursiveAgentError("Agent session is already closed.")
+        resp = self._http.post(
+            f"/sessions/{self._session_id}/goal",
+            {"condition": condition, "max_turns": max_turns},
+        )
+        data = resp.json()
+        return GoalState(
+            condition=condition,
+            status=data.get("status", "pursuing"),
+            turns=0,
+            max_turns=max_turns,
+        )
+
+    def clear_goal(self) -> GoalState:
+        """
+        Clear the active goal for this session.
+
+        Returns a :class:`~recursive_sdk.models.GoalState` with
+        ``status == "cleared"``.
+        """
+        if self._closed:
+            raise RecursiveAgentError("Agent session is already closed.")
+        data = self._http.delete_json(f"/sessions/{self._session_id}/goal")
+        return GoalState(
+            condition="",
+            status=data.get("status", "cleared"),
+        )
+
+    def get_goal(self) -> Optional[GoalState]:
+        """
+        Return the current goal state, or ``None`` if no goal is active.
+
+        Calls ``GET /sessions/:id`` and extracts the ``goal`` field.
+        """
+        if self._closed:
+            raise RecursiveAgentError("Agent session is already closed.")
+        data = self._http.get(f"/sessions/{self._session_id}").json()
+        raw = data.get("goal")
+        if not raw:
+            return None
+        return GoalState(
+            condition=raw.get("condition", ""),
+            status=raw.get("status", "pursuing"),
+            turns=raw.get("turns", 0),
+            max_turns=raw.get("max_turns", 20),
+            last_reason=raw.get("last_reason"),
+        )
 
     # ── context manager ───────────────────────────────────────────────────────
 
@@ -260,6 +331,30 @@ class Agent:
         http = _make_client(base_url, api_key)
         http.delete(f"/sessions/{session_id}")
         http.close()
+
+    @staticmethod
+    def get_session_messages(
+        session_id: str,
+        *,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> List[dict]:
+        """
+        Return the transcript messages for a session.
+
+        Fetches ``GET /sessions/:id`` and returns the ``messages`` list.
+        Each message is a raw dict with at minimum ``role`` and ``content`` keys.
+
+        Example::
+
+            msgs = Agent.get_session_messages(session_id)
+            for m in msgs:
+                print(m["role"], m["content"][:60])
+        """
+        http = _make_client(base_url, api_key)
+        data = http.get(f"/sessions/{session_id}").json()
+        http.close()
+        return list(data.get("messages", []))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────

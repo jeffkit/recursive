@@ -85,6 +85,12 @@ class RunResult:
     finish_reason: Optional[str] = None
     usage: Optional[UsageMeta] = None
     error: Optional[str] = None
+    result: Optional[str] = None
+    """Concatenated final assistant text (collected while streaming)."""
+    num_turns: int = 0
+    """Number of assistant turns in this run."""
+    duration_ms: Optional[int] = None
+    """Wall-clock duration from first send to stream close, in milliseconds."""
 
     @property
     def ok(self) -> bool:
@@ -101,3 +107,30 @@ class SessionInfo:
     last_prompt: Optional[str] = None
     first_prompt: Optional[str] = None
     goal: Optional[str] = None
+
+
+# ── Goal-168: goal-loop ────────────────────────────────────────────────────
+
+@dataclass
+class GoalState:
+    """
+    Active goal-loop state for a session.
+
+    Set via :meth:`~recursive_sdk.agent._AgentSession.set_goal`;
+    cleared automatically when achieved or the turn budget is exhausted.
+    """
+
+    condition: str
+    """Natural-language completion condition."""
+
+    status: str
+    """``"pursuing"`` | ``"achieved"`` | ``"cleared"``"""
+
+    turns: int = 0
+    """Turns taken so far in the loop."""
+
+    max_turns: int = 20
+    """Hard cap on autonomous turns before the loop stops."""
+
+    last_reason: Optional[str] = None
+    """Brief explanation from the last judge verdict."""

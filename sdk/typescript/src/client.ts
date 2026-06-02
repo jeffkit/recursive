@@ -132,6 +132,18 @@ export class RecursiveClient {
     await this._http.delete(`/sessions/${sessionId}`);
   }
 
+  /**
+   * Return the transcript messages for a session.
+   *
+   * Each message is a raw object with at minimum `role` and `content` keys.
+   * This is a convenience wrapper over {@link getSession} for callers that
+   * only need the message history.
+   */
+  async getSessionMessages(sessionId: string): Promise<unknown[]> {
+    const detail = await this.getSession(sessionId);
+    return detail.messages;
+  }
+
   // ── Plan Mode 2.0 (g165–167) ──────────────────────────────────────────
 
   /**
