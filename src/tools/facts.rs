@@ -534,7 +534,7 @@ pub fn facts_summary(workspace: &std::path::Path, limit: usize) -> String {
         } else {
             String::new()
         };
-        let text_preview = if fact.text.len() > 120 {
+        let text_preview = if fact.text.chars().count() > 120 {
             format!("{}...", crate::truncate_str(&fact.text, 117))
         } else {
             fact.text.clone()
