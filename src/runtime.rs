@@ -145,6 +145,9 @@ pub struct AgentRuntime {
     /// order so that messages sent while a turn is in flight are processed
     /// automatically when the current turn completes.
     message_queue: std::collections::VecDeque<String>,
+    /// Deferred `TurnFinished` event held by `execute_kernel_turn` until
+    /// `emit_turn_messages` can flush it after all assistant messages.
+    deferred_turn_finished: Option<AgentEvent>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -171,6 +174,10 @@ impl std::fmt::Debug for AgentRuntime {
                     .ok()
                     .and_then(|g| g.as_ref().map(|s| s.condition.clone())),
             )
+            .field(
+                "deferred_turn_finished",
+                &self.deferred_turn_finished.as_ref().map(|_| "<event>"),
+            )
             .finish()
     }
 }
@@ -183,15 +190,11 @@ impl AgentRuntime {
 
     /// Run one turn with the given user text.
     ///
-    /// Appends `Message::user(text)` to the transcript, builds a
-    /// [`TurnContext`], delegates to the kernel, appends the kernel's
-    /// new messages to the transcript, and returns a [`RuntimeOutcome`].
+    /// Appends `Message::user(text)` to the transcript, delegates to the kernel,
+    /// appends the new messages back, and returns a [`RuntimeOutcome`].
     pub async fn run(&mut self, user_text: impl Into<String>) -> Result<RuntimeOutcome> {
         let user_text = user_text.into();
 
-        // Record turn-level fields on the *current* span (the caller's span,
-        // or the root span in a standalone executor). Using `tracing::Span::record`
-        // avoids creating a new async span guard (which is !Send across awaits).
         tracing::Span::current().record("session_id", self.session_id.as_deref().unwrap_or(""));
         tracing::debug!(
             session_id = self.session_id.as_deref().unwrap_or(""),
@@ -199,94 +202,103 @@ impl AgentRuntime {
             "agent.turn: starting"
         );
 
-        // ── Checkpoint: pre-turn snapshot ──────────────────────────────
         let started_at = unix_now();
         let pre_id = self.snapshot_pre_turn(&user_text);
-        // Reset touched-files collector for this turn (after pre-snapshot
-        // so any stale state from prior turn is cleared).
+        self.reset_touched_files();
+        self.append_user_message(&user_text).await;
+        self.maybe_compact_cross_turn().await?;
+
+        let turn_outcome = self.execute_kernel_turn().await?;
+        self.update_plan_state(&turn_outcome);
+        self.emit_turn_messages(&turn_outcome).await;
+
+        let mut outcome: RuntimeOutcome = turn_outcome.into();
+        outcome.checkpoint_id = self.snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
+
+        tracing::info!(
+            steps = outcome.steps,
+            finish_reason = ?outcome.finish_reason,
+            "agent.turn: finished"
+        );
+        self.turn_index += 1;
+
+        Ok(outcome)
+    }
+
+    /// Reset the touched-files collector at the start of a turn.
+    fn reset_touched_files(&self) {
         if let Some(slot) = &self.touched_files {
             if let Ok(mut t) = slot.lock() {
                 *t = TouchedFiles::new();
             }
         }
+    }
 
-        // Append user message and emit MessageAppended for persistence.
-        let user_msg = Message::user(user_text.clone());
+    /// Append a user message to the transcript and emit `MessageAppended`.
+    async fn append_user_message(&mut self, user_text: &str) {
+        let user_msg = Message::user(user_text.to_string());
         self.transcript.push(user_msg.clone());
         self.event_sink
             .emit(AgentEvent::MessageAppended {
                 message: user_msg,
-                parent_uuid: None, // g155: SessionWriter manages the chain
-                usage: None,       // g156: user messages have no usage
+                parent_uuid: None,
+                usage: None,
             })
             .await;
+    }
 
-        // Cross-turn compaction: summarize old messages if transcript is too large.
-        // This is the Wrapper's responsibility — the kernel only does intra-turn trim.
-        //
-        // The compaction summary message is emitted as `MessageAppended` so it lands
-        // in the on-disk jsonl as an append (the jsonl is append-only; the in-memory
-        // drain/insert does not retroactively rewrite it).
-        // A `CompactionBoundary` event is also emitted (g157) so the reader can
-        // skip pre-compaction messages on resume.
-        let mut compaction_event: Option<(Message, usize, usize)> = None;
-        if let Some(ref compactor) = self.compactor {
-            let chars = Compactor::estimate_chars(&self.transcript);
-            if chars >= compactor.threshold_chars
-                && self.transcript.len() >= compactor.keep_recent_n + 2
-            {
-                let summary_chars = Compactor::estimate_chars(&self.transcript);
-                self.kernel.hooks().dispatch(HookEvent::PreCompact {
-                    transcript_len: summary_chars,
-                });
-                let summary_msg = compactor
-                    .compact(self.kernel.llm().as_ref(), &self.transcript)
-                    .await?;
-                let keep = compactor.keep_recent_n;
-                let mut split = self.transcript.len().saturating_sub(keep);
-                while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool)
-                {
-                    split -= 1;
-                }
-                let removed = split;
-                compaction_event = Some((summary_msg.clone(), removed, summary_chars));
-                self.transcript.drain(..split);
-                self.transcript.insert(0, summary_msg);
-                self.kernel.hooks().dispatch(HookEvent::PostCompact {
-                    removed,
-                    summary_chars,
-                });
-            }
+    /// Run cross-turn compaction if threshold is exceeded, emitting boundary events.
+    ///
+    /// This is the Wrapper's responsibility — the kernel only does intra-turn trim.
+    /// The compaction summary is emitted as `MessageAppended` so it lands in the
+    /// on-disk jsonl. A `CompactionBoundary` event (g157) lets the reader skip
+    /// pre-compaction messages on resume.
+    async fn maybe_compact_cross_turn(&mut self) -> Result<()> {
+        let Some(ref compactor) = self.compactor else {
+            return Ok(());
+        };
+        let chars = Compactor::estimate_chars(&self.transcript);
+        if chars < compactor.threshold_chars {
+            return Ok(());
         }
-        if let Some((summary, removed, _summary_chars)) = compaction_event {
-            // g157: emit the boundary marker FIRST so the reader knows to discard
-            // everything before it in the JSONL. The summary message that follows
-            // immediately after the marker is the first post-compaction entry.
-            self.event_sink
-                .emit(AgentEvent::CompactionBoundary {
-                    turn: self.turn_index as u32,
-                    compacted_count: removed,
-                    summary_uuid: None,
-                })
-                .await;
-            // Then write the summary message (it's post-boundary, will be kept on load).
+        self.kernel.hooks().dispatch(HookEvent::PreCompact {
+            transcript_len: chars,
+        });
+        let Some((removed, summary_chars)) = compactor
+            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript)
+            .await?
+        else {
+            return Ok(());
+        };
+        self.kernel.hooks().dispatch(HookEvent::PostCompact {
+            removed,
+            summary_chars,
+        });
+        self.event_sink
+            .emit(AgentEvent::CompactionBoundary {
+                turn: self.turn_index as u32,
+                compacted_count: removed,
+                summary_uuid: None,
+            })
+            .await;
+        if let Some(summary) = self.transcript.first().cloned() {
             self.event_sink
                 .emit(AgentEvent::MessageAppended {
                     message: summary,
-                    parent_uuid: None, // g155
-                    usage: None,       // g156: compaction summaries have no usage
+                    parent_uuid: None,
+                    usage: None,
                 })
                 .await;
         }
+        Ok(())
+    }
 
-        // Create AgentEvent channel; kernel converts StepEvent → AgentEvent internally.
-        //
-        // The forwarder withholds the terminal `TurnFinished` event so the
-        // runtime can emit it *after* the per-message `MessageAppended`
-        // events below. SDK consumers (sdk/typescript/src/run.ts) treat
-        // `done` as a hard stream-stop signal — emitting it before the
-        // assistant message races the SDK into closing the stream too
-        // early and dropping the final assistant text.
+    /// Build a `TurnContext`, run the kernel, and return the outcome.
+    ///
+    /// Spawns a forwarder task that withholds `TurnFinished` until after all
+    /// assistant/tool `MessageAppended` events have been emitted (prevents SDK
+    /// consumers from closing their stream before receiving the final text).
+    async fn execute_kernel_turn(&mut self) -> Result<crate::kernel::TurnOutcome> {
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::event::AgentEvent>();
         let sink = self.event_sink.clone();
@@ -294,9 +306,6 @@ impl AgentRuntime {
             let mut deferred_finished: Option<crate::event::AgentEvent> = None;
             while let Some(ev) = event_rx.recv().await {
                 if matches!(ev, AgentEvent::TurnFinished { .. }) {
-                    // Hold onto the most recent TurnFinished — overwrite if
-                    // the kernel emits more than one (only the last is
-                    // meaningful for downstream consumers).
                     deferred_finished = Some(ev);
                     continue;
                 }
@@ -305,54 +314,48 @@ impl AgentRuntime {
             deferred_finished
         });
 
-        // Build turn context with the AgentEvent channel.
         let ctx = TurnContext {
             messages: self.transcript.clone(),
             tool_specs: self.kernel.tools().specs(),
-            event_sink: None,
             step_events_tx: Some(event_tx.clone()),
             plan_confirmed: self.plan_confirmed,
             plan_buffer: self.pending_plan_calls.clone(),
             streaming: self.streaming,
             permission_hook: self.permission_hook.clone(),
             planning_mode: self.planning_mode.clone(),
-            // Goal-165: share the plan mode flag so RunCore can gate write tools.
             exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
-            // Goal-190: share the permission mode so RunCore can check plan-mode tools.
             permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
         };
 
-        // Execute turn
         let turn_outcome = self.kernel.run(ctx).await?;
-
-        // Drop the sender to signal the forwarder to stop, then wait for it.
         drop(event_tx);
-        let deferred_finished = forwarder.await.ok().flatten();
+        // Wait for forwarder; stash the deferred TurnFinished for emit_turn_messages.
+        self.deferred_turn_finished = forwarder.await.ok().flatten();
+        Ok(turn_outcome)
+    }
 
-        // Handle plan confirmation state
-        if turn_outcome.finish_reason == crate::agent::FinishReason::PlanPending {
-            // Store pending plan calls from the kernel's response
-            self.pending_plan_calls = turn_outcome.plan_buffer.clone();
+    /// Update plan-confirmation state from a completed turn outcome.
+    fn update_plan_state(&mut self, outcome: &crate::kernel::TurnOutcome) {
+        if outcome.finish_reason == crate::agent::FinishReason::PlanPending {
+            self.pending_plan_calls = outcome.plan_buffer.clone();
         }
-
-        // Reset plan confirmation state after the turn
         let was_confirmed = self.plan_confirmed;
         self.plan_confirmed = false;
         if was_confirmed {
-            // If plan was confirmed, clear the pending calls
             self.pending_plan_calls = None;
         }
+    }
 
-        // Append new messages to transcript and emit MessageAppended for each.
-        // For assistant messages, attach the turn's token usage (g156).
-        let new_messages = turn_outcome.new_messages.clone();
-        let turn_usage = crate::session::UsageMeta::from_token_usage(&turn_outcome.usage);
-        let mut tool_audits = turn_outcome.tool_audits.clone();
+    /// Append new kernel messages to the transcript and emit `MessageAppended`
+    /// (or `MessageAppendedWithAudit`) for each, then flush the deferred
+    /// `TurnFinished` event.
+    async fn emit_turn_messages(&mut self, outcome: &crate::kernel::TurnOutcome) {
+        let new_messages = outcome.new_messages.clone();
+        let turn_usage = crate::session::UsageMeta::from_token_usage(&outcome.usage);
+        let mut tool_audits = outcome.tool_audits.clone();
         self.transcript.extend(new_messages.iter().cloned());
         for msg in &new_messages {
-            // Goal-153: emit MessageAppendedWithAudit for tool messages that
-            // have a matching audit record keyed by tool_call_id.
             let event = if msg.role == crate::message::Role::Tool {
                 if let Some(tcid) = &msg.tool_call_id {
                     if let Some(audit) = tool_audits.remove(tcid) {
@@ -382,36 +385,16 @@ impl AgentRuntime {
                 };
                 AgentEvent::MessageAppended {
                     message: msg.clone(),
-                    parent_uuid: None, // g155: SessionWriter manages the chain
-                    usage,             // g156
+                    parent_uuid: None,
+                    usage,
                 }
             };
             self.event_sink.emit(event).await;
         }
-
-        // Now that every assistant/tool message is on the wire, emit the
-        // terminal `TurnFinished` that the forwarder held back. Without
-        // this, SDK clients see `done` before the final assistant text
-        // and close their stream early.
-        if let Some(ev) = deferred_finished {
+        // Emit TurnFinished after all messages are on the wire (SDK ordering guarantee).
+        if let Some(ev) = self.deferred_turn_finished.take() {
             self.event_sink.emit(ev).await;
         }
-
-        // ── Checkpoint: post-turn snapshot + record ────────────────────
-        let mut outcome: RuntimeOutcome = turn_outcome.into();
-        let post_id = self.snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
-        outcome.checkpoint_id = post_id;
-
-        tracing::info!(
-            steps = outcome.steps,
-            finish_reason = ?outcome.finish_reason,
-            "agent.turn: finished"
-        );
-
-        // Advance turn counter only if we actually ran a turn (we did).
-        self.turn_index += 1;
-
-        Ok(outcome)
     }
 
     // ── Goal-181: message queue ────────────────────────────────────────────
@@ -573,19 +556,9 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        if self.transcript.len() < compactor.keep_recent_n + 2 {
-            return Ok(());
-        }
-        let summary_msg = compactor
-            .compact(self.kernel.llm().as_ref(), &self.transcript)
+        compactor
+            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript)
             .await?;
-        let keep = compactor.keep_recent_n;
-        let mut split = self.transcript.len().saturating_sub(keep);
-        while split > 0 && matches!(self.transcript[split].role, crate::message::Role::Tool) {
-            split -= 1;
-        }
-        self.transcript.drain(..split);
-        self.transcript.insert(0, summary_msg);
         Ok(())
     }
 
@@ -1271,6 +1244,7 @@ impl AgentRuntimeBuilder {
             plan_mode_request_gate,
             goal_state: Arc::new(RwLock::new(None)),
             message_queue: std::collections::VecDeque::new(),
+            deferred_turn_finished: None,
         })
     }
 }
