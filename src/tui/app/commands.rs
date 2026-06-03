@@ -65,19 +65,31 @@ impl App {
             return None;
         }
 
-        // ── Ctrl+B / Ctrl+F: transcript paged scroll ─────────────────
-        // Terminal-independent fallbacks for PgUp/PgDn. Some macOS
-        // terminals don't deliver a true PageUp keycode (they map
-        // fn+↑ to ESC sequences crossterm doesn't surface as PageUp)
-        // and don't preserve the SHIFT modifier on Shift+↑. Plain
-        // Ctrl+letter codes are the most portable scroll keys we
-        // can offer.
+        // ── Ctrl+B / Ctrl+F / Ctrl+P / Ctrl+N: emacs-style cursor motion
+        // ─────────────────────────────────────────────
+        // The previous binding for B/F was "page-scroll the
+        // transcript by 10 lines" as a fallback for terminals
+        // without reliable PageUp/PageDown. macOS users on
+        // iTerm2 / Terminal.app / WezTerm all deliver PageUp and
+        // PageDown properly today, so we re-purpose B/F for the
+        // emacs / readline convention (cursor left / right). P/N
+        // are emacs previous-line / next-line. The transcript
+        // scroll still works via PageUp/PageDown, Shift+↑/↓,
+        // and the mouse wheel.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
-            self.scroll_offset = self.scroll_offset.saturating_add(10);
+            self.prompt.move_left();
             return None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
-            self.scroll_offset = self.scroll_offset.saturating_sub(10);
+            self.prompt.move_right();
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.prompt.move_prev_line();
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            self.prompt.move_next_line();
             return None;
         }
 
@@ -135,8 +147,22 @@ impl App {
         match key.code {
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT) =>
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
+                // Shift+Enter / Alt+Enter / Ctrl+Enter all insert a
+                // literal newline instead of submitting. macOS
+                // Terminal.app often intercepts Option+Enter before
+                // the app sees it, so we offer Ctrl+Enter as a
+                // terminal-independent alternative.
+                self.prompt.insert_char('\n');
+                None
+            }
+            // Ctrl+J (emacs "line feed"): insert a newline, never
+            // submit. Bound separately from `Enter` because
+            // crossterm delivers Ctrl+J as a Char('j') keypress
+            // with the CONTROL modifier set, not as KeyCode::Enter.
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt.insert_char('\n');
                 None
             }
@@ -1180,32 +1206,16 @@ mod tests {
         assert_eq!(app.scroll_offset, 10);
     }
 
-    /// Goal 150 follow-up: terminal-independent scroll fallbacks.
-    #[test]
-    fn ctrl_b_and_ctrl_f_scroll_transcript() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        let _ = app.handle_key(ctrl('b'));
-        assert_eq!(app.scroll_offset, 10);
-        let _ = app.handle_key(ctrl('b'));
-        assert_eq!(app.scroll_offset, 20);
-        let _ = app.handle_key(ctrl('f'));
-        assert_eq!(app.scroll_offset, 10);
-        let _ = app.handle_key(ctrl('f'));
-        assert_eq!(app.scroll_offset, 0);
-        // Stops at zero — no underflow.
-        let _ = app.handle_key(ctrl('f'));
-        assert_eq!(app.scroll_offset, 0);
-    }
-
-    #[test]
-    fn ctrl_b_scrolls_even_when_buffer_not_empty() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.set_input("typing some text");
-        let _ = app.handle_key(ctrl('b'));
-        assert_eq!(app.scroll_offset, 10);
-    }
+    /// Goal 150 follow-up: terminal-independent scroll fallbacks
+    /// were once provided by Ctrl+B / Ctrl+F. After switching to
+    /// emacs-style cursor motion (the macOS Terminal crowd asked
+    /// for B/F as left/right arrows, and modern terminals all
+    /// deliver PageUp/PageDown reliably), the transcript scroll
+    /// path now lives on `PageUp` / `PageDown` / `Shift+↑↓` /
+    /// mouse wheel — covered by the tests in `keymap.rs` under
+    /// `dispatch_ctrl_b_moves_cursor_left` and friends. The
+    /// two tests that used to live here asserted the old scroll
+    /// behaviour and are intentionally removed.
 
     // ── Plan Mode (Goal 147) ───────────────────────────────────────
 

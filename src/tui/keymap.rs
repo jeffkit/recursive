@@ -74,4 +74,102 @@ mod tests {
             other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
     }
+
+    // ── emacs-style cursor motion (Ctrl+B/F/P/N) ───────────────
+
+    #[test]
+    fn dispatch_ctrl_b_moves_cursor_left() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("abc");
+        let _ = dispatch(&mut app, ctrl('b'));
+        assert_eq!(app.prompt.cursor, 2);
+    }
+
+    #[test]
+    fn dispatch_ctrl_f_moves_cursor_right() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("abc");
+        app.prompt.cursor = 0;
+        let _ = dispatch(&mut app, ctrl('f'));
+        assert_eq!(app.prompt.cursor, 1);
+    }
+
+    #[test]
+    fn dispatch_ctrl_b_does_not_scroll_transcript() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("hello");
+        let before = app.scroll_offset;
+        let _ = dispatch(&mut app, ctrl('b'));
+        assert_eq!(
+            app.scroll_offset, before,
+            "Ctrl+B should not change scroll_offset"
+        );
+    }
+
+    #[test]
+    fn dispatch_ctrl_p_moves_cursor_to_previous_line() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("abc\ndef");
+        app.prompt.cursor = 6; // end of buffer; on "def" line, col 3
+        let _ = dispatch(&mut app, ctrl('p'));
+        assert_eq!(app.prompt.cursor, 2, "should land on 'ab|c'");
+    }
+
+    #[test]
+    fn dispatch_ctrl_n_moves_cursor_to_next_line() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("abc\ndef");
+        app.prompt.cursor = 2; // on "abc" line, col 2
+        let _ = dispatch(&mut app, ctrl('n'));
+        assert_eq!(app.prompt.cursor, 6, "should land on 'de|f'");
+    }
+
+    #[test]
+    fn dispatch_ctrl_n_in_single_line_is_noop() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("hello");
+        app.prompt.cursor = 2;
+        let _ = dispatch(&mut app, ctrl('n'));
+        assert_eq!(app.prompt.cursor, 2, "single line is a no-op");
+    }
+
+    // ── Ctrl+J newline + Ctrl+Enter newline ─────────────────────
+
+    #[test]
+    fn dispatch_ctrl_j_inserts_newline_without_submitting() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("hello");
+        let action = dispatch(&mut app, ctrl('j'));
+        assert!(action.is_none(), "Ctrl+J must not submit");
+        assert_eq!(app.prompt.buffer, "hello\n");
+    }
+
+    #[test]
+    fn dispatch_ctrl_enter_inserts_newline_without_submitting() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("hello");
+        let action = dispatch(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(action.is_none(), "Ctrl+Enter must not submit");
+        assert_eq!(app.prompt.buffer, "hello\n");
+    }
+
+    #[test]
+    fn dispatch_plain_enter_still_submits() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.set_input("ping");
+        let action = dispatch(&mut app, k(KeyCode::Enter));
+        assert!(matches!(action, Some(UserAction::SendMessage(s)) if s == "ping"));
+    }
 }
