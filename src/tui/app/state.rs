@@ -21,9 +21,11 @@ impl App {
             crate::tui::commands::CommandRegistry::default_set().with_skill_commands(skills);
         Self {
             prompt: PromptInputState::new(),
-            blocks: vec![TranscriptBlock::System {
-                text: "Welcome to Recursive TUI. Type a message and press Enter.".into(),
-            }],
+            // Empty transcript — the bordered "Messages" panel and the
+            // "Welcome to Recursive TUI…" system block were removed;
+            // the chat starts on a clean canvas. New turns push their
+            // own User block via the message-submit path.
+            blocks: Vec::new(),
             should_quit: false,
             session_id: None,
             connected: false,
@@ -146,7 +148,7 @@ impl Default for App {
 mod tests {
     use std::time::Duration;
 
-    use crate::tui::app::{App, AppScreen, TranscriptBlock};
+    use crate::tui::app::{App, AppScreen};
     use crate::tui::cost::{default_pricing_table, detect_model_name, estimate_cost};
 
     // ── construction ────────────────────────────────────────────────
@@ -155,7 +157,9 @@ mod tests {
     fn app_new_creates_empty_state() {
         let app = App::new();
         assert!(app.input().is_empty());
-        assert!(!app.blocks.is_empty());
+        // The welcome system block was removed; a fresh App starts
+        // with an empty transcript so the chat opens on a clean canvas.
+        assert!(app.blocks.is_empty());
         assert!(!app.should_quit);
     }
 
@@ -173,11 +177,16 @@ mod tests {
     }
 
     #[test]
-    fn app_no_session_shows_system_message() {
+    fn app_new_starts_with_empty_transcript() {
+        // The "Welcome to Recursive TUI" block was removed so the chat
+        // opens on a clean canvas — the first system block is whatever
+        // a `/clear` resets to.
         let app = App::new();
         assert!(app.session_id.is_none());
         assert!(
-            matches!(&app.blocks[0], TranscriptBlock::System { text } if text.contains("Welcome"))
+            app.blocks.is_empty(),
+            "fresh App::new() should not seed a welcome block; got {:?}",
+            app.blocks
         );
     }
 
