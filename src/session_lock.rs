@@ -134,20 +134,23 @@ fn is_pid_alive(pid: u32) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // tasklist /FI "PID eq <pid>" /NH /FO CSV prints a CSV row
-        // when the process exists and "INFO: No tasks are running which
-        // match the specified criteria." when it does not. Exit code
-        // alone is ambiguous (no-match is still exit 0), so inspect
-        // stdout. If `tasklist` itself is unavailable we fall back to
-        // the conservative "assume alive" policy: better to refuse a
-        // resume than to overwrite a live session's sentinel.
+        // tasklist /FI "PID eq <pid>" /NH /FO CSV prints a CSV row like
+        //   "name.exe","<pid>","..."
+        // when the process exists.  When no process matches it prints
+        // "INFO: No tasks are running …".  For out-of-range or otherwise
+        // unrecognised PIDs (e.g. u32::MAX) the output may be empty or
+        // contain only an error line — not the "INFO: No tasks" sentinel.
+        // Use a positive check (look for the PID as a quoted CSV field)
+        // instead of the fragile negative check so that all non-matching
+        // output is treated as dead.  If `tasklist` is unavailable fall
+        // back to the conservative "assume alive" policy.
         let output = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output();
         match output {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                !stdout.contains("INFO: No tasks")
+                stdout.contains(&format!("\"{pid}\""))
             }
             Err(_) => true,
         }

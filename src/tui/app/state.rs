@@ -195,12 +195,15 @@ mod tests {
     /// runtime is actually using. Extended for the preset-config goal
     /// to also cover `provider.preset` resolution.
     ///
-    /// All checks share one test body so they share the `PinnedHome`
-    /// lock (HOME mutation is process-global; cf. lesson 17).
+    /// All checks share one test body so they share the env lock
+    /// (env mutation is process-global; cf. lesson 17).
+    /// Uses PinnedRecursiveHome (sets RECURSIVE_HOME) rather than PinnedHome
+    /// because on Windows dirs::home_dir() resolves via SHGetKnownFolderPath
+    /// and does not respond to runtime USERPROFILE / HOME changes.
     #[test]
     fn detect_model_name_falls_back_to_config_file() {
         let home = tempfile::tempdir().expect("tempdir");
-        let _pin = crate::test_util::PinnedHome::new(home.path());
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
 
         // Snapshot env so we can clear / restore.
         let prev_recursive_model = std::env::var("RECURSIVE_MODEL").ok();
