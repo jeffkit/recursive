@@ -75,8 +75,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let messages_area = chunks[0];
     let todo_area = chunks[1];
-    let inner_width = messages_area.width.saturating_sub(2); // borders
-    let visible_rows = messages_area.height.saturating_sub(2);
+    // The messages panel no longer wraps in a bordered `Block`, so the
+    // area is the chunk itself — no border rows / columns to subtract.
+    let inner_width = messages_area.width;
+    let visible_rows = messages_area.height;
 
     // Compute the *visual* (post-wrap) row count for proper scroll
     // capping. Counting `lines.len()` (logical rows) under-counts when
@@ -107,7 +109,6 @@ pub fn render(frame: &mut Frame, app: &App) {
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
 
     let messages_widget = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Messages "))
         .wrap(Wrap { trim: false })
         .scroll((effective_scroll, 0));
     frame.render_widget(messages_widget, messages_area);
