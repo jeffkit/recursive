@@ -40,6 +40,12 @@ pub struct Config {
     pub thinking_budget: Option<u32>,
     /// Optional display name for the session, shown in the /resume picker.
     pub session_name: Option<String>,
+    /// Maximum total API spend in USD for this run. Checked after each turn.
+    /// `None` = no limit.
+    pub max_budget_usd: Option<f64>,
+    /// Additional workspace-root directories the agent is allowed to access
+    /// (sandbox expansion via `--add-dir`). Empty = only `workspace`.
+    pub extra_dirs: Vec<std::path::PathBuf>,
 }
 
 impl Config {
@@ -251,6 +257,8 @@ impl Config {
             memory_summary_limit,
             thinking_budget: None,
             session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
         })
     }
 
@@ -505,6 +513,8 @@ mod tests {
             memory_summary_limit: 5,
             thinking_budget: None,
             session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
