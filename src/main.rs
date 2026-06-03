@@ -314,6 +314,22 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run diagnostics: verify API key, config, workspace, and MCP servers.
+    /// Exits 0 if everything looks healthy, 1 if any check fails.
+    Doctor,
+    /// Configure and manage MCP servers for the current workspace.
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
+    /// Check for a newer release and print upgrade instructions.
+    /// Uses the GitHub releases API; requires internet access.
+    Update,
+    /// Alias for `update`.
+    Upgrade,
+    /// List active agent sessions (sessions in the current workspace
+    /// whose status is "active" or whose lock file is live).
+    Agents,
 }
 
 #[derive(Subcommand, Debug)]
@@ -382,6 +398,28 @@ enum ConfigCmd {
     },
     /// Print the config file path.
     Path,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// List all MCP servers discovered from the workspace.
+    List,
+    /// Add an MCP server to `.mcp.json` in the workspace root.
+    Add {
+        /// Server name (used as the key in `.mcp.json`).
+        name: String,
+        /// For stdio servers: the command to run (e.g. `npx`, `uvx`, binary path).
+        /// For HTTP+SSE servers: start the name with `http://` or `https://`.
+        command_or_url: String,
+        /// Additional arguments for stdio servers (ignored for HTTP+SSE).
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Remove an MCP server from `.mcp.json` by name.
+    Remove {
+        /// Name of the server to remove.
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -1035,7 +1073,327 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Cmd::Migrate { dry_run } => cli::session::cmd_migrate(&config.workspace, dry_run),
+        Cmd::Doctor => cmd_doctor(&config, cli.mcp_config).await,
+        Cmd::Mcp { cmd } => cmd_mcp(cmd, &config.workspace).await,
+        Cmd::Update | Cmd::Upgrade => cmd_update().await,
+        Cmd::Agents => cmd_agents(&config.workspace),
     }
+}
+
+// ─── doctor ──────────────────────────────────────────────────────────────────
+
+/// Run diagnostics and print a health report. Returns Ok if all checks pass.
+async fn cmd_doctor(config: &Config, mcp_config: Option<PathBuf>) -> anyhow::Result<()> {
+    let mut any_fail = false;
+
+    macro_rules! check {
+        ($label:expr, $ok:expr, $detail:expr) => {{
+            let passed = $ok;
+            let icon = if passed { "✓" } else { "✗" };
+            if passed {
+                println!("  {icon}  {}", $label);
+            } else {
+                println!("  {icon}  {}  — {}", $label, $detail);
+                any_fail = true;
+            }
+        }};
+    }
+
+    println!("\nRecursive diagnostics\n");
+
+    // 1. API key
+    check!(
+        "API key is set",
+        config.api_key.is_some(),
+        "set RECURSIVE_API_KEY or run `recursive init`"
+    );
+
+    // 2. Model
+    check!(
+        format!("Model: {}", config.model),
+        !config.model.is_empty(),
+        "model is empty; set RECURSIVE_MODEL or run `recursive init`"
+    );
+
+    // 3. Provider type
+    check!(
+        format!("Provider: {}", config.provider_type),
+        matches!(config.provider_type.as_str(), "openai" | "anthropic"),
+        format!("unknown provider type '{}'", config.provider_type)
+    );
+
+    // 4. Workspace
+    let ws_ok = config.workspace.exists();
+    check!(
+        format!("Workspace: {}", config.workspace.display()),
+        ws_ok,
+        "workspace directory not found"
+    );
+
+    // 5. MCP config
+    if let Some(ref path) = mcp_config {
+        let mcp_ok = path.exists();
+        check!(
+            format!("MCP config: {}", path.display()),
+            mcp_ok,
+            "file not found"
+        );
+        if mcp_ok {
+            match recursive::mcp::load_mcp_config(path) {
+                Ok(servers) => {
+                    println!("       {} MCP server(s) configured", servers.len());
+                }
+                Err(e) => {
+                    println!("  ✗  MCP config parse error  — {e}");
+                    any_fail = true;
+                }
+            }
+        }
+    } else {
+        // Check auto-discovered .mcp.json
+        let discovered = recursive::mcp::discover_mcp_servers(&config.workspace).await;
+        match discovered {
+            Ok(servers) if !servers.is_empty() => {
+                println!(
+                    "  ✓  Auto-discovered {} MCP server(s) from workspace .mcp.json",
+                    servers.len()
+                );
+            }
+            Ok(_) => {
+                println!("  ·  No MCP servers configured (optional)");
+            }
+            Err(e) => {
+                println!("  ✗  MCP discovery error  — {e}");
+                any_fail = true;
+            }
+        }
+    }
+
+    // 6. Config file
+    let config_path = recursive::config_file::config_file_path();
+    if let Some(ref p) = config_path {
+        check!(
+            format!("Config file: {}", p.display()),
+            p.exists(),
+            "not found — using defaults (run `recursive init` to create one)"
+        );
+    } else {
+        println!("  ·  Config file: not yet created");
+    }
+
+    println!();
+    if any_fail {
+        eprintln!("One or more checks failed.");
+        std::process::exit(1);
+    } else {
+        println!("All checks passed.");
+    }
+    Ok(())
+}
+
+// ─── mcp ─────────────────────────────────────────────────────────────────────
+
+async fn cmd_mcp(cmd: McpCmd, workspace: &std::path::Path) -> anyhow::Result<()> {
+    match cmd {
+        McpCmd::List => {
+            let servers = recursive::mcp::discover_mcp_servers(workspace).await?;
+            if servers.is_empty() {
+                println!("No MCP servers configured.");
+                println!(
+                    "hint: add servers with `recursive mcp add <name> <command>` \
+                     (they are stored in `<workspace>/.mcp.json`)"
+                );
+            } else {
+                println!("MCP servers ({}):", servers.len());
+                for s in &servers {
+                    if let Some(ref url) = s.url {
+                        println!("  {}  (http+sse)  {}", s.name, url);
+                    } else {
+                        let args = s.args.join(" ");
+                        let cmd_str = if args.is_empty() {
+                            s.command.clone()
+                        } else {
+                            format!("{} {}", s.command, args)
+                        };
+                        println!("  {}  (stdio)  {}", s.name, cmd_str);
+                    }
+                }
+            }
+            Ok(())
+        }
+        McpCmd::Add {
+            name,
+            command_or_url,
+            args,
+        } => {
+            let mcp_json = workspace.join(".mcp.json");
+            // Read existing config or start fresh.
+            let mut obj: serde_json::Map<String, serde_json::Value> = if mcp_json.exists() {
+                let s = std::fs::read_to_string(&mcp_json)?;
+                serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .and_then(|v| {
+                        if let serde_json::Value::Object(m) = v {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                serde_json::Map::new()
+            };
+
+            let servers_obj = obj
+                .entry("mcpServers")
+                .or_insert(serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!(".mcp.json mcpServers is not an object"))?;
+
+            let entry = if command_or_url.starts_with("http://")
+                || command_or_url.starts_with("https://")
+            {
+                serde_json::json!({"url": command_or_url})
+            } else if args.is_empty() {
+                serde_json::json!({"command": command_or_url})
+            } else {
+                serde_json::json!({"command": command_or_url, "args": args})
+            };
+
+            servers_obj.insert(name.clone(), entry);
+            let json = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
+            std::fs::write(&mcp_json, json)?;
+            println!("Added MCP server '{name}' to {}", mcp_json.display());
+            Ok(())
+        }
+        McpCmd::Remove { name } => {
+            let mcp_json = workspace.join(".mcp.json");
+            if !mcp_json.exists() {
+                anyhow::bail!(".mcp.json not found at {}", mcp_json.display());
+            }
+            let s = std::fs::read_to_string(&mcp_json)?;
+            let mut obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .and_then(|v| {
+                        if let serde_json::Value::Object(m) = v {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
+            if let Some(servers_obj) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+                if servers_obj.remove(&name).is_some() {
+                    let json = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
+                    std::fs::write(&mcp_json, json)?;
+                    println!("Removed MCP server '{name}' from {}", mcp_json.display());
+                } else {
+                    anyhow::bail!("Server '{name}' not found in .mcp.json");
+                }
+            } else {
+                anyhow::bail!(".mcp.json has no 'mcpServers' key");
+            }
+            Ok(())
+        }
+    }
+}
+
+// ─── update / upgrade ─────────────────────────────────────────────────────────
+
+async fn cmd_update() -> anyhow::Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("Current version: v{current}");
+    println!("Checking for updates…");
+
+    // Use GitHub API to find the latest release (if the repo is public).
+    // Gracefully handle network failures.
+    let client = reqwest::Client::builder()
+        .user_agent(format!("recursive-agent/{current}"))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp = client
+        .get("https://api.github.com/repos/recursive-ai/recursive/releases/latest")
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            #[derive(serde::Deserialize)]
+            struct Release {
+                tag_name: String,
+                html_url: String,
+            }
+            if let Ok(release) = r.json::<Release>().await {
+                let latest = release.tag_name.trim_start_matches('v');
+                if latest == current {
+                    println!("You are on the latest version.");
+                } else {
+                    println!("New version available: v{latest}");
+                    println!("Release page: {}", release.html_url);
+                    println!();
+                    println!("To upgrade, rebuild from source:");
+                    println!("  cargo install --path . --features tui");
+                }
+            } else {
+                println!("Could not parse release info.");
+            }
+        }
+        Ok(r) => {
+            println!("GitHub API returned status {}", r.status());
+            println!("Check manually: https://github.com/recursive-ai/recursive/releases");
+        }
+        Err(e) => {
+            println!("Could not reach GitHub ({e}).");
+            println!("Check manually: https://github.com/recursive-ai/recursive/releases");
+        }
+    }
+    Ok(())
+}
+
+// ─── agents ──────────────────────────────────────────────────────────────────
+
+fn cmd_agents(workspace: &std::path::Path) -> anyhow::Result<()> {
+    let sessions = recursive::session::SessionReader::list_sessions(workspace).unwrap_or_default();
+
+    let active: Vec<_> = sessions
+        .iter()
+        .filter_map(|dir| {
+            let meta = recursive::session::SessionReader::load_meta(dir).ok()?;
+            if meta.status == "active" {
+                Some((dir, meta))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if active.is_empty() {
+        println!("No active agent sessions.");
+        println!("hint: start a session with `recursive run <goal>` or `recursive repl`");
+    } else {
+        println!("Active agent sessions ({}):", active.len());
+        for (dir, meta) in &active {
+            let label = meta
+                .name
+                .as_deref()
+                .map(|n| format!("  «{n}»"))
+                .unwrap_or_default();
+            let prompt = meta
+                .last_prompt
+                .as_deref()
+                .or(Some(meta.goal.as_str()))
+                .unwrap_or("(no prompt)");
+            println!(
+                "  {}{}  [{}]  {}",
+                meta.session_id, label, meta.updated_at, prompt
+            );
+            println!("    dir: {}", dir.display());
+        }
+    }
+    Ok(())
 }
 
 /// Returns a [`CancellationToken`] that fires on SIGINT (Ctrl+C) or SIGTERM.
