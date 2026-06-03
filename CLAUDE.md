@@ -99,7 +99,7 @@ so editing one does not touch the other.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Recursive** (7103 symbols, 18601 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **blocker-permission-and-unwrap** (7001 symbols, 17990 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -122,10 +122,10 @@ This project is indexed by GitNexus as **Recursive** (7103 symbols, 18601 relati
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/Recursive/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/Recursive/clusters` | All functional areas |
-| `gitnexus://repo/Recursive/processes` | All execution flows |
-| `gitnexus://repo/Recursive/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/blocker-permission-and-unwrap/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/blocker-permission-and-unwrap/clusters` | All functional areas |
+| `gitnexus://repo/blocker-permission-and-unwrap/processes` | All execution flows |
+| `gitnexus://repo/blocker-permission-and-unwrap/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
