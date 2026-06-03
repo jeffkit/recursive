@@ -33,6 +33,7 @@ mod v050_integration {
             api_key: Some("test-key".into()),
             model: "test-model".into(),
             provider_type: "openai".into(),
+            preset: None,
             max_steps: 10,
             temperature: 0.2,
             system_prompt: "You are a helpful assistant.".into(),

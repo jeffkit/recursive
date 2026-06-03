@@ -325,20 +325,21 @@ fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
 }
 
 fn render_model_body(model: &str) -> Vec<Line<'static>> {
-    let api_base = std::env::var("RECURSIVE_API_BASE")
-        .or_else(|_| std::env::var("OPENAI_API_BASE"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let provider = if model.starts_with("deepseek") {
-        "deepseek"
-    } else if model.starts_with("glm") {
-        "zhipu"
-    } else if model.starts_with("claude") {
-        "anthropic"
-    } else if model.starts_with("gpt") {
-        "openai"
-    } else {
-        "unknown"
-    };
+    // Pull from Config so the modal shows the same endpoint the runtime
+    // will use, including the `provider.preset` chain. Previously this
+    // read RECURSIVE_API_BASE directly and used a `model.starts_with(...)`
+    // heuristic — both bypassed preset resolution and displayed wrong
+    // values when the user set `provider.preset = "deepseek"`.
+    let cfg = crate::config::Config::from_env().ok();
+    let api_base = cfg
+        .as_ref()
+        .map(|c| c.api_base.clone())
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    let provider = cfg
+        .as_ref()
+        .and_then(|c| c.preset.clone())
+        .or_else(|| crate::providers::find_preset_by_api_base(&api_base).map(|p| p.id.to_string()))
+        .unwrap_or_else(|| "custom".to_string());
 
     let header = Style::default()
         .fg(Color::Yellow)

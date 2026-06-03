@@ -347,11 +347,13 @@ pub(crate) async fn run_resumed(
             );
             Some(w)
         } else if session {
-            match SessionWriter::create(
+            match SessionWriter::create_with_tools(
                 &config.workspace,
                 &goal,
                 &config.model,
                 &config.provider_type,
+                &[],
+                config.preset.as_deref(),
             ) {
                 Ok(writer) => {
                     eprintln!("session: recording to {}", writer.session_dir().display());
