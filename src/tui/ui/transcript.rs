@@ -202,7 +202,11 @@ fn render_tool_result(
 
     let collected: Vec<&str> = output.lines().collect();
     let n = collected.len();
-    let body_color = if success { th.status_fg } else { th.tool_err_fg };
+    let body_color = if success {
+        th.status_fg
+    } else {
+        th.tool_err_fg
+    };
 
     let visible: Vec<&&str> = if expanded || n <= 6 {
         collected.iter().collect()
