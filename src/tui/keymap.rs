@@ -22,7 +22,7 @@ pub fn dispatch(app: &mut App, key: KeyEvent) -> Option<UserAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{AppScreen, TranscriptBlock};
+    use crate::tui::app::{AppScreen, ToolResultData, TranscriptBlock};
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn k(code: KeyCode) -> KeyEvent {
@@ -55,17 +55,23 @@ mod tests {
     fn dispatch_ctrl_e_toggles_last_tool_result() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.blocks.push(TranscriptBlock::ToolResult {
+        app.blocks.push(TranscriptBlock::ToolCall {
             id: "1".into(),
             name: "read_file".into(),
-            success: true,
-            output: "abc".into(),
-            expanded: false,
+            args_preview: String::new(),
+            result: Some(ToolResultData {
+                success: true,
+                output: "abc".into(),
+                expanded: false,
+            }),
         });
         let _ = dispatch(&mut app, ctrl('e'));
         match app.blocks.last() {
-            Some(TranscriptBlock::ToolResult { expanded, .. }) => assert!(*expanded),
-            other => panic!("expected ToolResult, got {other:?}"),
+            Some(TranscriptBlock::ToolCall {
+                result: Some(ToolResultData { expanded, .. }),
+                ..
+            }) => assert!(*expanded),
+            other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
     }
 }

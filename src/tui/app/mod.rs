@@ -35,7 +35,9 @@ pub use crate::tui::input_state::{
     double_press_window, strip_history_prefix, DoublePressTracker, InputMode, PromptInputState,
     DOUBLE_PRESS_WINDOW, HISTORY_CAPACITY,
 };
-pub use crate::tui::model::{AppScreen, DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
+pub use crate::tui::model::{
+    AppScreen, DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock,
+};
 pub use render::{parse_apply_patch_input, parse_v4a_patch, preview_args, verb_for_tool};
 
 // ──────────────────────────────────────────────────────────────────────

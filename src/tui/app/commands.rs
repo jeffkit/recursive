@@ -1005,7 +1005,7 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::tui::app::{App, AppScreen, InputMode, TranscriptBlock};
+    use crate::tui::app::{App, AppScreen, InputMode, ToolResultData, TranscriptBlock};
     use crate::tui::events::{UiEvent, UserAction};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1026,6 +1026,9 @@ mod tests {
     fn ctrl_e_toggles_expanded_on_last_tool_result() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
+        // No prior ToolCall — the ToolResult handler falls back to
+        // synthesising a ToolCall block with Some(result). The test
+        // still drives the toggle path.
         app.handle_ui_event(UiEvent::ToolResult {
             id: "1".into(),
             name: "read_file".into(),
@@ -1034,13 +1037,19 @@ mod tests {
         });
         let _ = app.handle_key(ctrl('e'));
         match app.blocks.last() {
-            Some(TranscriptBlock::ToolResult { expanded, .. }) => assert!(*expanded),
-            other => panic!("expected ToolResult, got {other:?}"),
+            Some(TranscriptBlock::ToolCall {
+                result: Some(ToolResultData { expanded, .. }),
+                ..
+            }) => assert!(*expanded),
+            other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
         let _ = app.handle_key(ctrl('e'));
         match app.blocks.last() {
-            Some(TranscriptBlock::ToolResult { expanded, .. }) => assert!(!*expanded),
-            other => panic!("expected ToolResult, got {other:?}"),
+            Some(TranscriptBlock::ToolCall {
+                result: Some(ToolResultData { expanded, .. }),
+                ..
+            }) => assert!(!*expanded),
+            other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
     }
 
@@ -1652,7 +1661,7 @@ mod prompt_input_tests {
 
     #[test]
     fn ctrl_e_with_empty_buffer_toggles_tool_result() {
-        use crate::tui::app::TranscriptBlock;
+        use crate::tui::app::{ToolResultData, TranscriptBlock};
         use crate::tui::events::UiEvent;
         let mut app = fresh_app();
         app.handle_ui_event(UiEvent::ToolResult {
@@ -1663,8 +1672,11 @@ mod prompt_input_tests {
         });
         let _ = app.handle_key(ctrl('e'));
         match app.blocks.last() {
-            Some(TranscriptBlock::ToolResult { expanded, .. }) => assert!(*expanded),
-            other => panic!("expected ToolResult, got {other:?}"),
+            Some(TranscriptBlock::ToolCall {
+                result: Some(ToolResultData { expanded, .. }),
+                ..
+            }) => assert!(*expanded),
+            other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
     }
 

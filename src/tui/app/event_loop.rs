@@ -3,7 +3,9 @@
 use crate::tui::events::UiEvent;
 
 use super::render::extract_write_file_path_from_result;
-use super::{parse_apply_patch_input, preview_args, verb_for_tool, App, TranscriptBlock};
+use super::{
+    parse_apply_patch_input, preview_args, verb_for_tool, App, ToolResultData, TranscriptBlock,
+};
 
 impl App {
     /// Apply an event coming from the backend worker.
@@ -34,6 +36,7 @@ impl App {
                     id: id.clone(),
                     name: name.clone(),
                     args_preview: preview,
+                    result: None,
                 });
                 if name == "apply_patch" {
                     if let Some((path, hunks)) = parse_apply_patch_input(&arguments) {
@@ -50,26 +53,79 @@ impl App {
                 success,
             } => {
                 // For write_file, render a synthesised Diff stub
-                // ("Created/Updated path (N bytes)") instead of a
-                // ToolResult block. apply_patch already emitted a
-                // Diff block at ToolCall time, so we still want a
-                // ToolResult for it (the success ✓/✗ marker).
+                // ("Created/Updated path (N bytes)") alongside the
+                // existing ToolCall. We also stamp the ToolCall as
+                // completed (empty output) so its bullet turns green
+                // instead of staying yellow. The Diff block below
+                // carries the actual file change.
                 if name == "write_file" && success {
                     if let Some(path) = extract_write_file_path_from_result(&output) {
                         self.blocks.push(TranscriptBlock::Diff {
                             path,
                             hunks: vec![],
                         });
+                        if let Some(TranscriptBlock::ToolCall { result, .. }) = self
+                            .blocks
+                            .iter_mut()
+                            .rev()
+                            .find(|b| {
+                                matches!(b, TranscriptBlock::ToolCall { id: cid, .. } if cid == &id)
+                            }) {
+                            *result = Some(ToolResultData {
+                                success: true,
+                                output: String::new(),
+                                expanded: false,
+                            });
+                        }
                         return;
                     }
                 }
-                self.blocks.push(TranscriptBlock::ToolResult {
-                    id,
-                    name,
-                    success,
-                    output,
-                    expanded: false,
-                });
+                // Find the matching ToolCall (most recent first) and
+                // fill in its result. Falls back to pushing a new
+                // ToolCall block if no match is found — this can
+                // happen when ToolResult arrives before ToolCall
+                // (shouldn't, but be defensive).
+                let mut filled = false;
+                for block in self.blocks.iter_mut().rev() {
+                    if let TranscriptBlock::ToolCall {
+                        id: cid,
+                        result,
+                        name: cname,
+                        args_preview,
+                    } = block
+                    {
+                        if cid == &id {
+                            *result = Some(ToolResultData {
+                                success,
+                                output: output.clone(),
+                                expanded: false,
+                            });
+                            // Backfill name/args if the matching
+                            // ToolCall was synthesised by the
+                            // fallback path.
+                            if cname.is_empty() {
+                                *cname = name.clone();
+                            }
+                            if args_preview.is_empty() {
+                                *args_preview = String::new();
+                            }
+                            filled = true;
+                            break;
+                        }
+                    }
+                }
+                if !filled {
+                    self.blocks.push(TranscriptBlock::ToolCall {
+                        id,
+                        name,
+                        args_preview: String::new(),
+                        result: Some(ToolResultData {
+                            success,
+                            output,
+                            expanded: false,
+                        }),
+                    });
+                }
             }
             UiEvent::Usage {
                 input_tokens,
@@ -345,10 +401,17 @@ impl App {
         });
     }
 
-    /// Toggle the most recent ToolResult or Diff block's expanded flag.
+    /// Toggle the most recent completed tool call's expanded flag.
+    /// Walks back over `ToolCall` blocks that have a `result` (i.e.
+    /// the tool has finished) and flips its `expanded` field. Tool
+    /// calls still running (no result yet) are skipped.
     pub(crate) fn toggle_last_expandable(&mut self) {
         for block in self.blocks.iter_mut().rev() {
-            if let TranscriptBlock::ToolResult { expanded, .. } = block {
+            if let TranscriptBlock::ToolCall {
+                result: Some(ToolResultData { expanded, .. }),
+                ..
+            } = block
+            {
                 *expanded = !*expanded;
                 return;
             }
@@ -441,17 +504,29 @@ mod tests {
             success: true,
         });
 
-        let mut call_id = None;
-        let mut result_id = None;
-        for b in &app.blocks {
-            match b {
-                TranscriptBlock::ToolCall { id, .. } => call_id = Some(id.clone()),
-                TranscriptBlock::ToolResult { id, .. } => result_id = Some(id.clone()),
-                _ => {}
+        // ToolResult now merges into the matching ToolCall block
+        // rather than producing a sibling ToolResult block. We
+        // expect exactly one ToolCall block for "abc" with a
+        // Some(result).
+        let tool_calls: Vec<_> = app
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, TranscriptBlock::ToolCall { id, .. } if id == "abc"))
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "ToolResult must merge into ToolCall");
+        let block = tool_calls[0];
+        match block {
+            TranscriptBlock::ToolCall {
+                id,
+                result: Some(r),
+                ..
+            } => {
+                assert_eq!(id, "abc");
+                assert!(r.success);
+                assert_eq!(r.output, "ok");
             }
+            other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
-        assert_eq!(call_id.as_deref(), Some("abc"));
-        assert_eq!(result_id.as_deref(), Some("abc"));
     }
 
     #[test]

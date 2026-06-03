@@ -48,6 +48,24 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
+/// Result payload of a tool execution. Lives inside a
+/// [`TranscriptBlock::ToolCall`] once the runtime delivers the
+/// matching `UiEvent::ToolResult`.
+///
+/// The UI used to keep `ToolCall` and `ToolResult` as two separate
+/// blocks, but Claude-Code-style renderings pair them into a single
+/// "function call" unit: one bullet, then the result on the next
+/// line. `None` on the call side means the tool is still running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolResultData {
+    pub success: bool,
+    pub output: String,
+    /// `false` = collapsed (first 3 lines + "… N more" hint),
+    /// `true` = full output. Toggled by Ctrl+E on the chat
+    /// surface when the input buffer is empty.
+    pub expanded: bool,
+}
+
 /// One renderable transcript block.
 ///
 /// The chat screen renders a `Vec<TranscriptBlock>` in order, with one
@@ -63,17 +81,17 @@ pub enum TranscriptBlock {
         streaming: bool,
         latency_ms: Option<u64>,
     },
+    /// Tool call (paired with its result once available).
+    ///
+    /// While the tool is still running, `result` is `None`; the
+    /// renderer shows the call in a "running" state (yellow ⏺,
+    /// `Running…` placeholder). When the runtime pushes the
+    /// matching `UiEvent::ToolResult`, the field is filled in.
     ToolCall {
         id: String,
         name: String,
         args_preview: String,
-    },
-    ToolResult {
-        id: String,
-        name: String,
-        success: bool,
-        output: String,
-        expanded: bool,
+        result: Option<ToolResultData>,
     },
     Diff {
         path: String,

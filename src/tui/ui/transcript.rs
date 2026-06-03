@@ -7,7 +7,7 @@
 
 use ratatui::prelude::*;
 
-use crate::tui::app::{TranscriptBlock, UsageStats};
+use crate::tui::app::{ToolResultData, TranscriptBlock, UsageStats};
 use crate::tui::ui::theme::Theme;
 use crate::tui::ui::{diff, markdown};
 
@@ -39,15 +39,11 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme) -> Vec<Line<'static>> {
             latency_ms,
         } => render_assistant(text, *streaming, *latency_ms, th),
         TranscriptBlock::ToolCall {
-            name, args_preview, ..
-        } => render_tool_call(name, args_preview, th),
-        TranscriptBlock::ToolResult {
             name,
-            success,
-            output,
-            expanded,
+            args_preview,
+            result,
             ..
-        } => render_tool_result(name, *success, output, *expanded, th),
+        } => render_tool_call(name, args_preview, result, th),
         TranscriptBlock::Diff { path, hunks } => render_diff(path, hunks),
         TranscriptBlock::Compacted { removed, kept } => render_compacted(*removed, *kept),
         TranscriptBlock::System { text } => render_system(text),
@@ -64,172 +60,208 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme) -> Vec<Line<'static>> {
 
 // ── User ──────────────────────────────────────────────────────────────
 
-fn render_user(text: &str, th: &Theme) -> Vec<Line<'static>> {
-    let gutter_style = Style::default().fg(th.system_bar);
-    let mut out = vec![Line::from(vec![
-        Span::styled("▎ ", Style::default().fg(th.user_bar)),
-        Span::styled(
-            "You".to_string(),
-            Style::default()
-                .fg(th.user_bar)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])];
-    for line in text.lines() {
+/// Render a user message in Claude-Code style: `> text` with a
+/// white foreground on a dim grey background highlight. Multi-line
+/// messages stay stacked, one `>` per line, so the visual shape
+/// mirrors the indentation of a quoted block reply.
+fn render_user(text: &str, _th: &Theme) -> Vec<Line<'static>> {
+    let prefix_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let body_bg = Color::Rgb(50, 50, 55);
+    let body_style = Style::default().bg(body_bg).fg(Color::White);
+
+    let prefix = Span::styled("> ", prefix_style);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+
+    if lines.is_empty() {
+        // Empty placeholder: a bare `> ` with a single background
+        // pixel so the row still picks up the highlight.
         out.push(Line::from(vec![
-            Span::styled("│  ", gutter_style),
-            Span::styled(line.to_string(), Style::default().fg(th.status_fg)),
+            prefix,
+            Span::styled(" ".to_string(), body_style),
         ]));
+        return out;
     }
-    if text.is_empty() {
-        out.push(Line::from(vec![Span::styled(
-            "│  ".to_string(),
-            gutter_style,
-        )]));
+
+    for line in lines {
+        out.push(Line::from(vec![
+            prefix.clone(),
+            Span::styled(format!(" {line}"), body_style),
+        ]));
     }
     out
 }
 
 // ── Assistant ─────────────────────────────────────────────────────────
 
+/// Render an assistant message in Claude-Code style: one cyan
+/// bullet, then a `  ` indent for the body. The legacy "▎ Agent"
+/// header, inline `⏱` latency, and `…streaming` text are removed;
+/// streaming and latency are now expressed through the in-flight
+/// bullet colour and the status bar respectively. Empty text
+/// collapses to a bare bullet.
 fn render_assistant(
     text: &str,
-    streaming: bool,
-    latency_ms: Option<u64>,
-    th: &Theme,
+    _streaming: bool,
+    _latency_ms: Option<u64>,
+    _th: &Theme,
 ) -> Vec<Line<'static>> {
-    let gutter_style = Style::default().fg(th.system_bar);
-    let mut header = vec![
-        Span::styled("▎ ", Style::default().fg(th.assistant_bar)),
-        Span::styled(
-            "Agent".to_string(),
-            Style::default()
-                .fg(th.assistant_bar)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(ms) = latency_ms {
-        header.push(Span::raw("  "));
-        header.push(Span::styled(
-            format!("⏱ {:.1}s", ms as f64 / 1000.0),
-            Style::default().fg(th.system_bar),
-        ));
-    }
-    if streaming {
-        header.push(Span::raw("  "));
-        header.push(Span::styled(
-            "…streaming".to_string(),
-            Style::default()
-                .fg(th.system_bar)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    }
-    let mut out = vec![Line::from(header)];
+    let bullet_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let indent = Span::raw("  ");
+    let mut out: Vec<Line<'static>> = Vec::new();
 
     if text.is_empty() {
-        out.push(Line::from(vec![Span::styled(
-            "│  ".to_string(),
-            gutter_style,
-        )]));
+        out.push(Line::from(vec![
+            Span::styled("•", bullet_style),
+            indent,
+        ]));
         return out;
     }
 
-    // Use the full pulldown-cmark based renderer for proper markdown parsing
-    // (handles multi-paragraph blocks, nested lists, fenced code with syntax
-    // highlighting, etc.).  We wrap each resulting line with the gutter prefix.
+    // Use the full pulldown-cmark based renderer for proper markdown
+    // parsing (handles multi-paragraph blocks, nested lists, fenced
+    // code with syntax highlighting, etc.). The first line picks up
+    // the bullet prefix; subsequent lines share the 2-space indent
+    // so wrapping reads naturally.
     let md_lines = markdown::render_markdown(text, 0);
-    for md_line in md_lines {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(md_line.spans.len() + 1);
-        spans.push(Span::styled("│  ", gutter_style));
-        spans.extend(md_line.spans);
+    let mut iter = md_lines.into_iter();
+    if let Some(first) = iter.next() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(first.spans.len() + 2);
+        spans.push(Span::styled("•", bullet_style));
+        spans.push(indent.clone());
+        spans.extend(first.spans);
+        out.push(Line::from(spans));
+    } else {
+        // Empty markdown output (only whitespace): a bare bullet.
+        out.push(Line::from(vec![
+            Span::styled("•", bullet_style),
+            indent.clone(),
+        ]));
+        return out;
+    }
+    for line in iter {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+        spans.push(indent.clone());
+        spans.extend(line.spans);
         out.push(Line::from(spans));
     }
     out
 }
 
-// ── ToolCall ──────────────────────────────────────────────────────────
+// ── ToolCall (with paired result) ─────────────────────────────────────
 
-fn render_tool_call(name: &str, args_preview: &str, th: &Theme) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        Span::raw("  "),
-        Span::styled("🔧", Style::default().fg(th.tool_call_icon)),
-        Span::raw(" "),
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(th.tool_call_icon)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            args_preview.to_string(),
-            Style::default()
-                .fg(th.system_bar)
-                .add_modifier(Modifier::DIM),
-        ),
-    ])]
-}
-
-// ── ToolResult ────────────────────────────────────────────────────────
-
-fn render_tool_result(
+/// Render a tool call in Claude-Code style: one `⏺` bullet whose
+/// colour reflects the tool state, followed by the args in a
+/// function-call style (`name(args)`). Below the bullet sits an
+/// indented result block (`⎿`) when the tool has finished; while
+/// the tool is still running, the result line shows `Running…`.
+///
+/// States:
+/// - `result == None`        → bullet Yellow, body `Running…`
+/// - `result.success == true` → bullet Green,  body output (collapsed/expanded)
+/// - `result.success == false`→ bullet Red,    body output in error colour
+fn render_tool_call(
     name: &str,
-    success: bool,
-    output: &str,
-    expanded: bool,
+    args_preview: &str,
+    result: &Option<ToolResultData>,
     th: &Theme,
 ) -> Vec<Line<'static>> {
-    let (sigil, sigil_color) = if success {
-        ("✓", th.tool_ok_fg)
-    } else {
-        ("✗", th.tool_err_fg)
+    let bullet_color = match result {
+        None => Color::Yellow,
+        Some(ToolResultData { success: false, .. }) => Color::Red,
+        Some(_) => Color::Green,
     };
-    let size = format_size(output.len());
+    let body_color = match result {
+        Some(ToolResultData { success: false, .. }) => th.tool_err_fg,
+        _ => th.status_fg,
+    };
+    let size = result
+        .as_ref()
+        .map(|r| format_size(r.output.len()))
+        .unwrap_or_default();
+    let args_display = if args_preview.is_empty() {
+        String::new()
+    } else {
+        format!("({args_preview})")
+    };
 
     let mut out = vec![Line::from(vec![
         Span::raw("  "),
-        Span::styled(sigil.to_string(), Style::default().fg(sigil_color)),
+        Span::styled(
+            "⏺".to_string(),
+            Style::default()
+                .fg(bullet_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled(
             name.to_string(),
             Style::default()
-                .fg(sigil_color)
+                .fg(bullet_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
-        Span::styled(format!("({size})"), Style::default().fg(th.system_bar)),
+        Span::styled(args_display, Style::default().fg(th.system_bar)),
     ])];
 
-    let collected: Vec<&str> = output.lines().collect();
-    let n = collected.len();
-    let body_color = if success {
-        th.status_fg
-    } else {
-        th.tool_err_fg
-    };
+    match result {
+        None => {
+            out.push(Line::from(vec![
+                Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                Span::styled(
+                    "Running…".to_string(),
+                    Style::default()
+                        .fg(th.system_bar)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+        Some(ToolResultData {
+            success: _,
+            output,
+            expanded,
+        }) => {
+            if !size.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled(
+                        size,
+                        Style::default()
+                            .fg(th.system_bar)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+            let collected: Vec<&str> = output.lines().collect();
+            let n = collected.len();
+            let visible: Vec<&&str> = if *expanded || n <= 6 {
+                collected.iter().collect()
+            } else {
+                collected.iter().take(3).collect()
+            };
+            for line in visible {
+                out.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled((*line).to_string(), Style::default().fg(body_color)),
+                ]));
+            }
+            if !*expanded && n > 6 {
+                out.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled(
+                        format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
+                        Style::default()
+                            .fg(th.system_bar)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+        }
+    }
 
-    let visible: Vec<&&str> = if expanded || n <= 6 {
-        collected.iter().collect()
-    } else {
-        collected.iter().take(3).collect()
-    };
-    for line in visible {
-        out.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(th.system_bar)),
-            Span::styled((*line).to_string(), Style::default().fg(body_color)),
-        ]));
-    }
-    if !expanded && n > 6 {
-        out.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(th.system_bar)),
-            Span::styled(
-                format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
-                Style::default()
-                    .fg(th.system_bar)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-    }
     out
 }
 
@@ -556,68 +588,145 @@ fn render_plan_mode_request(reason: &str, approved: Option<bool>) -> Vec<Line<'s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
+    use crate::tui::app::{DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock};
     use crate::tui::ui::theme;
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn full_text(lines: &[Line]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
-    fn user_block_renders_label_and_body() {
+    fn user_block_renders_quote_prefix_and_body() {
         let lines = render_block(
             &TranscriptBlock::User {
                 text: "hello world".into(),
             },
             &theme::DARK,
         );
-        assert!(line_text(&lines[0]).contains("You"));
-        assert!(line_text(&lines[1]).contains("hello world"));
+        let txt = line_text(&lines[0]);
+        assert!(txt.starts_with("> "), "first line should start with `> `");
+        assert!(txt.contains("hello world"));
     }
 
     #[test]
-    fn assistant_block_includes_latency_when_set() {
+    fn user_block_multiline_stacks_with_quote_prefix() {
         let lines = render_block(
-            &TranscriptBlock::Assistant {
-                text: "ok".into(),
-                streaming: false,
-                latency_ms: Some(1234),
+            &TranscriptBlock::User {
+                text: "line1\nline2".into(),
             },
             &theme::DARK,
         );
-        let header = line_text(&lines[0]);
-        assert!(header.contains("Agent"));
-        assert!(header.contains("⏱"));
-        assert!(header.contains("1.2s"));
+        assert_eq!(lines.len(), 2);
+        assert!(line_text(&lines[0]).starts_with("> "));
+        assert!(line_text(&lines[1]).starts_with("> "));
+        assert!(line_text(&lines[1]).contains("line2"));
     }
 
     #[test]
-    fn assistant_streaming_marker_present_when_streaming() {
+    fn user_block_carries_background_highlight() {
+        let lines = render_block(
+            &TranscriptBlock::User {
+                text: "hi".into(),
+            },
+            &theme::DARK,
+        );
+        let has_bg = lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.bg.is_some() && s.style.bg != Some(Color::Reset));
+        assert!(has_bg, "user message should have a background highlight");
+    }
+
+    #[test]
+    fn assistant_block_renders_bullet_no_label() {
         let lines = render_block(
             &TranscriptBlock::Assistant {
-                text: "hel".into(),
-                streaming: true,
+                text: "hello".into(),
+                streaming: false,
                 latency_ms: None,
             },
             &theme::DARK,
         );
-        let header = line_text(&lines[0]);
-        assert!(header.contains("streaming"));
+        let txt = line_text(&lines[0]);
+        assert!(txt.contains("•"), "assistant must lead with a bullet");
+        assert!(
+            !txt.contains("Agent"),
+            "old `Agent` label should be gone"
+        );
+        assert!(!txt.contains("⏱"), "latency should not be in the block");
+        assert!(!txt.contains("streaming"), "no streaming label anymore");
     }
 
     #[test]
-    fn tool_call_block_includes_name_and_preview() {
+    fn tool_call_without_result_shows_running_in_yellow() {
         let lines = render_block(
             &TranscriptBlock::ToolCall {
                 id: "1".into(),
                 name: "read_file".into(),
                 args_preview: "path=\"foo\"".into(),
+                result: None,
             },
             &theme::DARK,
         );
-        let s = line_text(&lines[0]);
-        assert!(s.contains("read_file"));
-        assert!(s.contains("path"));
+        let header = &lines[0];
+        assert!(line_text(header).contains("⏺"));
+        assert!(line_text(header).contains("read_file"));
+        // Bullet must be yellow.
+        let bullet_yellow = header
+            .spans
+            .iter()
+            .any(|s| s.content == "⏺" && s.style.fg == Some(Color::Yellow));
+        assert!(bullet_yellow, "running bullet should be yellow");
+        // Second line should be the Running… placeholder.
+        assert!(line_text(&lines[1]).contains("Running"));
+    }
+
+    #[test]
+    fn tool_call_with_successful_result_turns_bullet_green() {
+        let lines = render_block(
+            &TranscriptBlock::ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                args_preview: String::new(),
+                result: Some(ToolResultData {
+                    success: true,
+                    output: "abc".into(),
+                    expanded: false,
+                }),
+            },
+            &theme::DARK,
+        );
+        let header = &lines[0];
+        let bullet_green = header
+            .spans
+            .iter()
+            .any(|s| s.content == "⏺" && s.style.fg == Some(Color::Green));
+        assert!(bullet_green, "successful bullet should be green");
+        assert!(full_text(&lines).contains("abc"));
+    }
+
+    #[test]
+    fn tool_call_with_failed_result_turns_bullet_red() {
+        let lines = render_block(
+            &TranscriptBlock::ToolCall {
+                id: "1".into(),
+                name: "x".into(),
+                args_preview: String::new(),
+                result: Some(ToolResultData {
+                    success: false,
+                    output: "boom".into(),
+                    expanded: false,
+                }),
+            },
+            &theme::DARK,
+        );
+        let header = &lines[0];
+        let has_red = header.spans.iter().any(|s| s.style.fg == Some(Color::Red));
+        assert!(has_red, "failed bullet should be red");
     }
 
     #[test]
@@ -627,20 +736,21 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let lines = render_block(
-            &TranscriptBlock::ToolResult {
+            &TranscriptBlock::ToolCall {
                 id: "1".into(),
                 name: "read_file".into(),
-                success: true,
-                output,
-                expanded: false,
+                args_preview: String::new(),
+                result: Some(ToolResultData {
+                    success: true,
+                    output,
+                    expanded: false,
+                }),
             },
             &theme::DARK,
         );
-        // header + 3 lines + ellipsis = 5 lines
-        assert_eq!(lines.len(), 5);
-        let last = line_text(lines.last().unwrap());
-        assert!(last.contains("Ctrl+E"));
-        assert!(last.contains("more lines"));
+        let txt = full_text(&lines);
+        assert!(txt.contains("Ctrl+E"));
+        assert!(txt.contains("more lines"));
     }
 
     #[test]
@@ -650,38 +760,21 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let lines = render_block(
-            &TranscriptBlock::ToolResult {
+            &TranscriptBlock::ToolCall {
                 id: "1".into(),
                 name: "read_file".into(),
-                success: true,
-                output,
-                expanded: true,
+                args_preview: String::new(),
+                result: Some(ToolResultData {
+                    success: true,
+                    output,
+                    expanded: true,
+                }),
             },
             &theme::DARK,
         );
-        // header + 10 body lines
-        assert_eq!(lines.len(), 11);
-    }
-
-    #[test]
-    fn tool_result_failure_uses_error_color() {
-        let lines = render_block(
-            &TranscriptBlock::ToolResult {
-                id: "1".into(),
-                name: "x".into(),
-                success: false,
-                output: "boom".into(),
-                expanded: false,
-            },
-            &theme::DARK,
-        );
-        let header = &lines[0];
-        // In the DARK theme, tool_err_fg = Color::Red
-        let has_err_color = header
-            .spans
-            .iter()
-            .any(|s| s.style.fg == Some(theme::DARK.tool_err_fg));
-        assert!(has_err_color);
+        for i in 0..10 {
+            assert!(full_text(&lines).contains(&format!("line {i}")));
+        }
     }
 
     #[test]
