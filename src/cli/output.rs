@@ -1,34 +1,13 @@
 //! Output helpers: usage printing, transcript saving, cost tracking, event streaming.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use recursive::llm::{pricing_for, ModelPricing, TokenUsage};
+use recursive::llm::{pricing_for, TokenUsage};
 use recursive::{AgentEvent, FinishReason, SessionFile, SessionWriter, TranscriptFile};
 use tokio::sync::mpsc;
 
-/// Get pricing for a model: external pricing takes precedence, then falls back
-/// to hardcoded pricing_for().
-pub(crate) fn get_pricing(
-    model: &str,
-    external: &Option<HashMap<String, ModelPricing>>,
-) -> Option<ModelPricing> {
-    if let Some(ext) = external {
-        if let Some(pricing) = ext.get(model) {
-            return Some(*pricing);
-        }
-    }
-    pricing_for(model)
-}
-
-pub(crate) fn print_usage(
-    usage: TokenUsage,
-    model: &str,
-    total_llm_latency_ms: u64,
-    steps: usize,
-    external_pricing: &Option<HashMap<String, ModelPricing>>,
-) {
+pub(crate) fn print_usage(usage: TokenUsage, model: &str, total_llm_latency_ms: u64, steps: usize) {
     if usage.total_tokens > 0 {
         eprintln!(
             "tokens: prompt={} completion={} total={}",
@@ -46,7 +25,7 @@ pub(crate) fn print_usage(
                 usage.cache_hit_tokens, usage.cache_miss_tokens, hit_rate
             );
         }
-        if let Some(pricing) = get_pricing(model, external_pricing) {
+        if let Some(pricing) = pricing_for(model) {
             let cost = pricing.cost_usd(usage);
             eprintln!("cost: ${:.4} ({})", cost, model);
         }

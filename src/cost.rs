@@ -8,15 +8,12 @@
 //! # Usage
 //!
 //! ```ignore
-//! let tracker = CostTracker::new(
-//!     &workspace, "gpt-4o", "openai", &external_pricing,
-//! )?;
+//! let tracker = CostTracker::new(&workspace, "gpt-4o", "openai");
 //! // after runtime.run(...):
 //! tracker.record_usage(outcome.total_usage, outcome.llm_latency_ms);
 //! tracker.finish()?;
 //! ```
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -81,15 +78,9 @@ impl CostTracker {
     /// Create a new `CostTracker` for the given session directory.
     ///
     /// `session_dir` should be the same directory used by `SessionWriter`.
-    /// `external_pricing` is an optional map of model → pricing that takes
-    /// precedence over the built-in pricing table.
-    pub fn new(
-        session_dir: PathBuf,
-        model: &str,
-        provider: &str,
-        external_pricing: &Option<HashMap<String, ModelPricing>>,
-    ) -> Self {
-        let pricing = get_pricing(model, external_pricing);
+    /// Pricing is looked up from the bundled `providers.toml` via `pricing_for()`.
+    pub fn new(session_dir: PathBuf, model: &str, provider: &str) -> Self {
+        let pricing = pricing_for(model);
         Self {
             session_dir,
             model: model.to_string(),
@@ -235,20 +226,6 @@ impl CostTracker {
     }
 }
 
-/// Get pricing for a model: external pricing takes precedence, then falls back
-/// to hardcoded `pricing_for()`.
-fn get_pricing(
-    model: &str,
-    external: &Option<HashMap<String, ModelPricing>>,
-) -> Option<ModelPricing> {
-    if let Some(ext) = external {
-        if let Some(pricing) = ext.get(model) {
-            return Some(*pricing);
-        }
-    }
-    pricing_for(model)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,7 +234,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_new() {
         let dir = tempfile::tempdir().unwrap();
-        let tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
         assert_eq!(tracker.model, "deepseek-chat");
         assert_eq!(tracker.provider, "openai");
         assert!(tracker.pricing.is_some());
@@ -268,8 +245,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_record_usage() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage1 = TokenUsage {
             prompt_tokens: 100,
@@ -303,8 +279,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_cost_usd() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         // deepseek-chat pricing: $0.27/M input, $1.10/M output
         let usage = TokenUsage {
@@ -326,57 +301,15 @@ mod tests {
     #[test]
     fn test_cost_tracker_unknown_model() {
         let dir = tempfile::tempdir().unwrap();
-        let tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "nonexistent-model-v42",
-            "openai",
-            &None,
-        );
+        let tracker = CostTracker::new(dir.path().to_path_buf(), "nonexistent-model-v42", "openai");
         assert!(tracker.pricing.is_none());
         assert!(tracker.cost_usd().is_none());
     }
 
     #[test]
-    fn test_cost_tracker_external_pricing() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut external = HashMap::new();
-        external.insert(
-            "my-custom-model".to_string(),
-            ModelPricing {
-                input_per_million: 1.0,
-                output_per_million: 2.0,
-                cache_hit_input_per_million: 0.1,
-            },
-        );
-
-        let mut tracker = CostTracker::new(
-            dir.path().to_path_buf(),
-            "my-custom-model",
-            "openai",
-            &Some(external),
-        );
-
-        let usage = TokenUsage {
-            prompt_tokens: 1_000_000,
-            completion_tokens: 1_000_000,
-            total_tokens: 2_000_000,
-            cache_hit_tokens: 0,
-            cache_miss_tokens: 1_000_000,
-        };
-        tracker.record_usage(usage, 0);
-
-        let cost = tracker.cost_usd().unwrap();
-        // input: 1M * 1.00/1M = $1.00
-        // output: 1M * 2.00/1M = $2.00
-        // total: $3.00
-        assert!((cost - 3.00).abs() < 0.001);
-    }
-
-    #[test]
     fn test_cost_tracker_write_cost_json() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
             prompt_tokens: 1000,
@@ -427,8 +360,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
             prompt_tokens: 500,
@@ -470,8 +402,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_finish_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
             prompt_tokens: 100,
@@ -494,8 +425,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_no_meta_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
             prompt_tokens: 100,
@@ -552,8 +482,7 @@ mod tests {
     #[test]
     fn test_cost_tracker_cache_hit_discount() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai", &None);
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         // deepseek-chat: $0.27/M input, $1.10/M output, $0.027/M cache hit
         let usage = TokenUsage {

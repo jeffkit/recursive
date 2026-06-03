@@ -11,7 +11,7 @@
 //! - [`commands`]  — keyboard dispatch, modals, atfile, history search, permissions
 //! - [`render`]    — standalone helper functions (preview_args, verb_for_tool, parse_*)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
@@ -28,9 +28,7 @@ pub use crate::tui::completion::{
     collect_files, default_offline_tool_catalog, glob_workspace_files, search_history,
     MAX_ATFILE_SUGGESTIONS, MAX_HSEARCH_RESULTS,
 };
-pub use crate::tui::cost::{
-    default_pricing_table, detect_model_name, estimate_cost, TurnState, UsageStats,
-};
+pub use crate::tui::cost::{detect_model_name, estimate_cost, TurnState, UsageStats};
 pub use crate::tui::input_state::{
     double_press_window, strip_history_prefix, DoublePressTracker, InputMode, PromptInputState,
     DOUBLE_PRESS_WINDOW, HISTORY_CAPACITY,
@@ -59,7 +57,6 @@ pub struct App {
     pub turn: TurnState,
     pub turn_count: u64,
     pub pending_latency_ms: Option<u64>,
-    pub pricing: HashMap<&'static str, (f64, f64)>,
     pub model_name: String,
     pub spinner_frame: usize,
     /// Goal-146: stack of overlay modals. The topmost (last) modal

@@ -291,7 +291,7 @@ impl AgentKernel {
         let core = RunCore {
             messages: ctx.messages,
             llm: self.llm.clone(),
-            tools: self.tools.clone(),
+            tools: Arc::new(self.tools.clone()),
             max_steps: self.max_steps,
             max_transcript_chars: self.max_transcript_chars,
             events: ctx.step_events_tx,
