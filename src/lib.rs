@@ -23,6 +23,7 @@ pub mod hooks;
 pub mod http;
 pub mod kernel;
 pub mod llm;
+pub mod logging;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 #[cfg(feature = "mcp")]
