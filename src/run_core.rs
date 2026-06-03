@@ -598,6 +598,20 @@ impl<'a> RunCore<'a> {
                 final_message = Some(completion.content.clone());
             }
 
+            // Surface reasoning / thinking content to UI consumers
+            // (TUI) as a separate event so it can be rendered as a
+            // `thinking…` block. Providers that stream reasoning
+            // tokens accumulate them into the final string before
+            // this point; we emit exactly once per step.
+            if let Some(reasoning) = &completion.reasoning_content {
+                if !reasoning.is_empty() {
+                    self.emit(AgentEvent::Reasoning {
+                        text: reasoning.clone(),
+                        step,
+                    });
+                }
+            }
+
             // ---- no tool calls → finish -------------------------------------------
             if completion.tool_calls.is_empty() {
                 if matches!(completion.finish_reason.as_deref(), Some("length")) {

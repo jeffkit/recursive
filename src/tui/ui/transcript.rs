@@ -38,6 +38,7 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme) -> Vec<Line<'static>> {
             streaming,
             latency_ms,
         } => render_assistant(text, *streaming, *latency_ms, th),
+        TranscriptBlock::Reasoning { text } => render_reasoning(text),
         TranscriptBlock::ToolCall {
             name,
             args_preview,
@@ -149,6 +150,40 @@ fn render_assistant(
         spans.extend(line.spans);
         out.push(Line::from(spans));
     }
+    out
+}
+
+// ── Reasoning / thinking ──────────────────────────────────────────────
+
+/// Render a reasoning / thinking block in Claude-Code style:
+/// a small `thinking…` header in dim yellow, followed by the
+/// reasoning text in dim grey italics. Empty / whitespace-only
+/// reasoning collapses to just the header.
+fn render_reasoning(text: &str) -> Vec<Line<'static>> {
+    let header_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let indent = Span::raw("  ");
+
+    let mut out = vec![Line::from(vec![
+        indent,
+        Span::styled("thinking…".to_string(), header_style),
+    ])];
+
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push(Line::raw(""));
+        } else {
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line.to_string(), body_style),
+            ]));
+        }
+    }
+
     out
 }
 
@@ -639,6 +674,36 @@ mod tests {
             .iter()
             .any(|s| s.style.bg.is_some() && s.style.bg != Some(Color::Reset));
         assert!(has_bg, "user message should have a background highlight");
+    }
+
+    #[test]
+    fn reasoning_block_has_thinking_header_and_italic_body() {
+        let lines = render_block(
+            &TranscriptBlock::Reasoning {
+                text: "let me think about this\nmaybe this way".into(),
+            },
+            &theme::DARK,
+        );
+        let header = line_text(&lines[0]);
+        assert!(header.contains("thinking"), "missing thinking header");
+        let body = full_text(&lines);
+        assert!(body.contains("let me think about this"));
+        assert!(body.contains("maybe this way"));
+        // body lines should be italic
+        let has_italic = lines[1..]
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(has_italic, "reasoning body should be italic");
+    }
+
+    #[test]
+    fn reasoning_block_empty_text_still_shows_header() {
+        let lines = render_block(
+            &TranscriptBlock::Reasoning { text: String::new() },
+            &theme::DARK,
+        );
+        assert!(line_text(&lines[0]).contains("thinking"));
     }
 
     #[test]

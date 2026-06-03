@@ -14,6 +14,14 @@ impl App {
             UiEvent::AssistantPartial { text } => {
                 self.append_streaming_assistant(&text);
             }
+            UiEvent::Reasoning { content } => {
+                // Each step's reasoning arrives as a single block.
+                // Push a new TranscriptBlock::Reasoning; the renderer
+                // draws a `thinking…` header followed by the
+                // reasoning text in dim grey italics.
+                self.blocks
+                    .push(TranscriptBlock::Reasoning { text: content });
+            }
             UiEvent::AssistantMessage { content } => {
                 // Goal-147: the legacy `"plan:"` / `"## plan"` text
                 // sniff is gone — plan-mode now arrives through the

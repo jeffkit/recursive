@@ -52,6 +52,17 @@ pub enum AgentEvent {
     },
     /// Partial token from streaming response (if streaming enabled).
     PartialToken { text: String, step: usize },
+    /// Reasoning / thinking content from a model that exposes an
+    /// explicit reasoning channel (DeepSeek R1, OpenAI o1, etc.).
+    /// Carries the full reasoning text for the current step;
+    /// providers that stream reasoning tokens (DeepSeek's
+    /// `reasoning_content` SSE deltas) accumulate them and emit
+    /// the final, fully-joined string in this event. UI layers
+    /// render it as a `thinking…` block separate from the
+    /// assistant message body. Emitted exactly once per step
+    /// that produced reasoning content; steps without reasoning
+    /// skip the event.
+    Reasoning { text: String, step: usize },
     /// Transcript was compacted to fit size constraints.
     Compacted {
         removed: usize,

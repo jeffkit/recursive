@@ -89,6 +89,7 @@ impl EventSink for TuiEventSink {
 pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
     match event {
         AgentEvent::PartialToken { text, .. } => Some(UiEvent::AssistantPartial { text }),
+        AgentEvent::Reasoning { text, .. } => Some(UiEvent::Reasoning { content: text }),
         AgentEvent::AssistantText { text, .. } => Some(UiEvent::AssistantMessage { content: text }),
         AgentEvent::ToolCall {
             id,
