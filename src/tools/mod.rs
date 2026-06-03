@@ -663,20 +663,16 @@ impl ToolRegistry {
                     let mut c = classifier.lock().await;
                     match c.classify(name, &args_summary, "").await {
                         Ok((true, _reason)) => {
-                            let reason_enum = DecisionReason::Mode(PermissionMode::Auto);
                             if c.tracker.is_over_limit() {
                                 return ToolDispatch {
-                                    result: Err(Error::PermissionDenied {
-                                        name: name.into(),
-                                        reason: reason_enum,
-                                    }),
+                                    result: Err(Error::PermissionDeniedLimit { name: name.into() }),
                                     audit: AuditMeta::synthetic_unknown_tool(name),
                                 };
                             }
                             return ToolDispatch {
                                 result: Err(Error::PermissionDenied {
                                     name: name.into(),
-                                    reason: reason_enum,
+                                    reason: DecisionReason::Mode(PermissionMode::Auto),
                                 }),
                                 audit: AuditMeta::synthetic_unknown_tool(name),
                             };

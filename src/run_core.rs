@@ -390,6 +390,9 @@ impl<'a> RunCore<'a> {
                         let dispatch = tools.invoke_with_audit(&name, args.clone()).await;
                         let result = match dispatch.result {
                             Ok(output) => output,
+                            Err(crate::error::Error::PermissionDeniedLimit { .. }) => {
+                                "ERROR_DENIAL_LIMIT:".to_string()
+                            }
                             Err(err) => format!("ERROR: {err}"),
                         };
                         let duration_ms = tool_start.elapsed().as_millis() as u64;
@@ -407,14 +410,21 @@ impl<'a> RunCore<'a> {
                 );
                 let mut batch_results: Vec<BatchRow> = Vec::new();
                 while let Some(res) = join_set.join_next().await {
-                    batch_results.push(res.unwrap());
+                    match res {
+                        Ok(row) => batch_results.push(row),
+                        Err(e) => {
+                            tracing::error!(target: "recursive::agent", "parallel tool task panicked: {e}");
+                        }
+                    }
                 }
 
                 for pc in &batch {
-                    let (_, _, result, _, audit, duration_ms) = batch_results
+                    let Some((_, _, result, _, audit, duration_ms)) = batch_results
                         .iter()
                         .find(|(id, _, _, _, _, _)| id == &pc.id)
-                        .unwrap();
+                    else {
+                        continue;
+                    };
                     results.push((
                         pc.id.clone(),
                         pc.name.clone(),
@@ -438,6 +448,9 @@ impl<'a> RunCore<'a> {
                     .await;
                 let result = match dispatch.result {
                     Ok(output) => output,
+                    Err(crate::error::Error::PermissionDeniedLimit { .. }) => {
+                        "ERROR_DENIAL_LIMIT:".to_string()
+                    }
                     Err(err) => format!("ERROR: {err}"),
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
@@ -579,6 +592,24 @@ impl<'a> RunCore<'a> {
                 if let Some(calls) = self.plan_buffer.take() {
                     let results = self.execute_tool_calls(&calls).await;
                     for (id, name, output, _args, _audit) in results {
+                        if output == "ERROR_DENIAL_LIMIT:" {
+                            let finish = FinishReason::PermissionDenialLimit;
+                            self.emit(AgentEvent::TurnFinished {
+                                reason: finish_reason_str(&finish),
+                                steps: step,
+                            });
+                            return Ok(RunInnerOutcome {
+                                messages: self.messages,
+                                final_message,
+                                finish_reason: finish,
+                                total_usage,
+                                total_llm_latency_ms: self.total_llm_latency_ms,
+                                steps: step,
+                                plan_buffer: self.plan_buffer,
+                                plan_confirmed: self.plan_confirmed,
+                                tool_audits,
+                            });
+                        }
                         self.emit(AgentEvent::ToolResult {
                             id: id.clone(),
                             name: name.clone(),
@@ -767,6 +798,26 @@ impl<'a> RunCore<'a> {
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
             for (id, name, result, args, audit) in &results {
+                // B1 fix: auto-classifier denial limit — stop the agent immediately.
+                if result == "ERROR_DENIAL_LIMIT:" {
+                    let finish = FinishReason::PermissionDenialLimit;
+                    self.emit(AgentEvent::TurnFinished {
+                        reason: finish_reason_str(&finish),
+                        steps: step,
+                    });
+                    return Ok(RunInnerOutcome {
+                        messages: self.messages,
+                        final_message,
+                        finish_reason: finish,
+                        total_usage,
+                        total_llm_latency_ms: self.total_llm_latency_ms,
+                        steps: step,
+                        plan_buffer: self.plan_buffer,
+                        plan_confirmed: self.plan_confirmed,
+                        tool_audits,
+                    });
+                }
+
                 self.emit(AgentEvent::ToolResult {
                     id: id.clone(),
                     name: name.clone(),

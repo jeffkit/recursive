@@ -40,6 +40,10 @@ pub enum Error {
         reason: DecisionReason,
     },
 
+    /// Auto-classifier denial limit exceeded — agent should stop
+    #[error("permission denial limit exceeded for tool {name}")]
+    PermissionDeniedLimit { name: String },
+
     /// LLM response truncated by provider
     #[error("llm response truncated by provider (finish_reason = {0:?})")]
     ProviderTruncated(String),
