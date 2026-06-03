@@ -27,8 +27,8 @@ Most agent frameworks sprawl into frameworks — opinionated pipelines, LangChai
 - **HTTP API**: axum-based REST server with sessions and SSE streaming
 - **Terminal UI**: ratatui-based TUI with streaming tool indicators and plan mode
 - **Multi-Agent**: agent pool, shared memory, messaging bus, pipeline & team orchestration
-- **Python SDK**: `pip install recursive-client`
-- **TypeScript SDK**: `npm install recursive-client`
+- **Python SDK**: `pip install recursive-sdk`
+- **TypeScript SDK**: `npm install @recursive/sdk`
 - **Loop Mode**: self-scheduling autonomous agent runs
 
 ## Quick navigation

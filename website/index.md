@@ -3,15 +3,15 @@ layout: home
 
 hero:
   name: "Recursive"
-  text: "Coding Agent Kernel"
-  tagline: A minimal, orthogonal, embeddable agent loop in Rust. Wire together any LLM + any tools in minutes.
+  text: "v0.6.0"
+  tagline: A minimal, orthogonal, embeddable coding agent kernel in Rust — wire together any LLM + any tools in under 20 lines.
   image:
     src: /logo.svg
     alt: Recursive
   actions:
     - theme: brand
-      text: Get Started
-      link: /en/guide/
+      text: Get Started in 5 min →
+      link: /en/guide/quickstart
     - theme: alt
       text: View on GitHub
       link: https://github.com/jeffkit/recursive
@@ -20,27 +20,27 @@ hero:
       link: /zh/guide/
 
 features:
-  - icon: 🦀
-    title: Rust-native
-    details: Built in Rust for performance and safety. Zero GC pauses, predictable latency, tiny binary.
+  - icon: ⚡
+    title: 20 lines to a working agent
+    details: Install with cargo, set an API key, call agent.run("your goal"). Works with OpenAI, DeepSeek, Claude, Ollama, and any OpenAI-compatible endpoint.
 
   - icon: 🔌
-    title: Truly orthogonal
-    details: New tool? Implement Tool, register it. New model? Implement LlmProvider. New UI? Subscribe to StepEvent. Zero coupling.
-
-  - icon: 📦
-    title: Embeddable library
-    details: Use it as a CLI, HTTP server, or embed the loop directly in your own Rust program. Same kernel, any shell.
+    title: Add a tool without touching the agent
+    details: Implement the Tool trait, register it — done. No agent code changes. Add read_file, run_shell, web_fetch, or any custom tool you can imagine.
 
   - icon: 🌐
-    title: Any OpenAI-compatible LLM
-    details: Works with OpenAI, Anthropic, GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Ollama, vLLM, and more.
+    title: HTTP API in one command
+    details: Run `recursive http` to get a production-ready REST server with sessions, SSE streaming, and an OpenAPI spec. Connect Python, TypeScript, or any HTTP client.
+
+  - icon: 🤖
+    title: Build multi-agent pipelines
+    details: Chain agents into pipelines, delegate tasks across specialist roles, share memory across agents. All from the same orthogonal building blocks.
 
   - icon: 🛡️
     title: Sandboxed by default
-    details: Every filesystem and shell tool resolves paths through resolve_within. No escaping the workspace root.
+    details: Every filesystem and shell operation is path-checked against the workspace root. No accidental escapes. Upgrade to Docker or E2B microVM isolation in one env var.
 
-  - icon: 🤖
-    title: Multi-Agent ready
-    details: Agent pools, shared memory, messaging bus, pipeline and team orchestration — all built in.
+  - icon: 🔄
+    title: Self-improving loop
+    details: Recursive runs its own development loop — agents read goals, write code, and ship features. Use the same loop for your own projects.
 ---

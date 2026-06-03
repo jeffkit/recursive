@@ -1,17 +1,33 @@
 # Python SDK
 
-Python SDK 为 Recursive HTTP API 提供轻量级客户端。
+Python SDK 为 Recursive HTTP API 提供客户端，兼容 Claude Agent SDK 接口风格。
+
+::: tip 包名
+包发布名为 `recursive-sdk`，通过 `pip install recursive-sdk` 安装。
+如尚未发布，可从源码本地安装：
+```bash
+pip install -e sdk/python   # 从项目根目录执行
+```
+:::
 
 ## 安装
 
 ```bash
-pip install recursive-client
+pip install recursive-sdk
+```
+
+## 前置条件
+
+先启动 Recursive HTTP 服务器：
+
+```bash
+recursive http --addr 127.0.0.1:3000
 ```
 
 ## 快速开始
 
 ```python
-from recursive_client import RecursiveClient
+from recursive_sdk import RecursiveClient
 
 client = RecursiveClient("http://127.0.0.1:3000")
 
@@ -55,9 +71,7 @@ for event in session.run_stream("列出所有工具"):
         break
 ```
 
-## API 参考
-
-### `AgentResult`
+## AgentResult
 
 | 属性 | 类型 | 说明 |
 |---|---|---|

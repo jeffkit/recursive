@@ -25,6 +25,35 @@ let pool = AgentPool::new()
 pool.run("实现功能 X").await?;
 ```
 
+## SharedMemory（共享内存）
+
+```rust
+use recursive::multi::SharedMemory;
+
+let memory = SharedMemory::new();
+
+// 写入
+memory.set("current_task", "review src/agent.rs").await;
+
+// 读取
+let task = memory.get("current_task").await;
+```
+
+## MessageBus（消息总线）
+
+```rust
+use recursive::multi::MessageBus;
+
+let bus = MessageBus::new();
+let mut rx = bus.subscribe("results");
+
+bus.publish("results", "Agent A 完成：发现 3 个 bug").await;
+
+while let Some(msg) = rx.recv().await {
+    println!("收到：{msg}");
+}
+```
+
 ## Pipeline（流水线）
 
 ```rust
@@ -49,5 +78,8 @@ let team = Team::new(orchestrator_agent)
     .specialist("coder", coder_agent)
     .specialist("reviewer", reviewer_agent);
 
-team.run("构建用户管理 REST API").await?;
+let outcome = team.run("构建用户管理 REST API").await?;
+println!("{}", outcome.final_message.unwrap_or_default());
 ```
+
+协调 Agent 会分析目标，将子任务分配给各专家 Agent，再整合所有结果。
