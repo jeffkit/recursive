@@ -341,6 +341,13 @@ impl App {
                 self.blocks.push(TranscriptBlock::System { text });
                 self.scroll_to_bottom();
             }
+
+            #[cfg(feature = "weixin")]
+            UiEvent::WeixinMessage { user_id, text } => {
+                self.blocks
+                    .push(TranscriptBlock::WeixinMessage { user_id, text });
+                self.scroll_to_bottom();
+            }
         }
         // Sticky-scroll: when the user is already at the bottom
         // (scroll_offset == 0), keep them pinned as new content

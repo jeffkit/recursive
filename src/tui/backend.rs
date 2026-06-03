@@ -17,8 +17,17 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::tui::bash::{build_bash_registry, resolve_workspace_root, run_bash_command};
+#[cfg(feature = "weixin")]
+use crate::tui::events::WeixinBackendRequest;
 use crate::tui::events::{PermissionRequest, UiEvent, UserAction};
 use crate::tui::runtime_builder::{build_runtime, RuntimeBuild};
+
+/// Local helper to fan-out from two channels in the worker loop.
+enum Either<L, R> {
+    Left(L),
+    #[allow(dead_code)]
+    Right(R),
+}
 
 /// A handle to the agent worker task.
 pub struct Backend {
@@ -34,6 +43,10 @@ pub struct Backend {
     /// Goal-161: shared flag that enables/disables the runtime permission
     /// hook. The UI thread can flip this via `/permissions on|off`.
     pub permission_enabled: Arc<AtomicBool>,
+    /// WeChat side-channel: the daemon sends `WeixinBackendRequest`s here.
+    /// The UI loop passes this into [`Backend::weixin_tx`] to the daemon.
+    #[cfg(feature = "weixin")]
+    pub weixin_tx: mpsc::UnboundedSender<WeixinBackendRequest>,
     _worker: JoinHandle<()>,
 }
 
@@ -52,6 +65,8 @@ impl Backend {
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let permission_enabled = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "weixin")]
+        let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
 
         let worker = tokio::spawn(worker_loop(
             state,
@@ -60,6 +75,8 @@ impl Backend {
             perm_tx,
             cancel_flag.clone(),
             permission_enabled.clone(),
+            #[cfg(feature = "weixin")]
+            weixin_rx,
         ));
 
         Self {
@@ -68,6 +85,8 @@ impl Backend {
             perm_rx,
             cancel_flag,
             permission_enabled,
+            #[cfg(feature = "weixin")]
+            weixin_tx,
             _worker: worker,
         }
     }
@@ -229,6 +248,7 @@ async fn worker_loop(
     perm_tx: mpsc::UnboundedSender<PermissionRequest>,
     cancel_flag: Arc<AtomicBool>,
     permission_enabled: Arc<AtomicBool>,
+    #[cfg(feature = "weixin")] mut weixin_rx: mpsc::UnboundedReceiver<WeixinBackendRequest>,
 ) {
     if let RuntimeBuild::Ready(rt_opt) = &mut state {
         let rt = rt_opt.as_mut().unwrap();
@@ -245,7 +265,76 @@ async fn worker_loop(
     let bash_registry = build_bash_registry(&resolve_workspace_root());
     let bash_seq = AtomicU64::new(0);
 
-    while let Some(action) = action_rx.recv().await {
+    loop {
+        // Select on both the user-action channel and the WeChat side-channel.
+        // WeChat messages processed here behave like SendMessage turns but
+        // without plan-mode interaction.
+        let action = {
+            #[cfg(feature = "weixin")]
+            {
+                tokio::select! {
+                    action = action_rx.recv() => {
+                        match action {
+                            Some(a) => Either::Left(a),
+                            None => break,
+                        }
+                    }
+                    wx_req = weixin_rx.recv() => {
+                        match wx_req {
+                            Some(r) => Either::Right(r),
+                            None => continue,
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "weixin"))]
+            {
+                match action_rx.recv().await {
+                    Some(a) => Either::<UserAction, ()>::Left(a),
+                    None => break,
+                }
+            }
+        };
+
+        #[cfg(feature = "weixin")]
+        if let Either::Right(wx_req) = action {
+            // Notify TUI of the incoming WeChat message.
+            let _ = event_tx.send(UiEvent::WeixinMessage {
+                user_id: wx_req.user_id.clone(),
+                text: wx_req.text.clone(),
+            });
+            // Run the turn and send response back to WeChat daemon.
+            if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                let text = wx_req.text.clone();
+                let rt = rt_opt.take().unwrap();
+                let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
+                let rt_clone = rt_shared.clone();
+                let handle = tokio::task::spawn(async move {
+                    let mut g = rt_clone.lock().await;
+                    g.enqueue(text).await
+                });
+                let result = handle.await;
+                let recovered = Arc::try_unwrap(rt_shared)
+                    .expect("single owner after weixin task")
+                    .into_inner();
+                *rt_opt = Some(recovered);
+                let _ = event_tx.send(UiEvent::TurnFinished);
+                let final_text = match result {
+                    Ok(Ok(Some(outcome))) => outcome.final_text,
+                    _ => None,
+                };
+                let _ = wx_req.reply_tx.send(final_text);
+            } else {
+                let _ = wx_req.reply_tx.send(None);
+            }
+            continue;
+        }
+
+        let action = match action {
+            Either::Left(a) => a,
+            Either::Right(_) => unreachable!("weixin Right handled above"),
+        };
+
         match action {
             UserAction::Shutdown => break,
 
