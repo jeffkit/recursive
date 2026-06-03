@@ -524,6 +524,10 @@ mod tests {
 
     #[test]
     fn retry_env_overrides_apply() {
+        // Hold the env lock — this test mutates RECURSIVE_RETRY_*, RECURSIVE_MODEL,
+        // RECURSIVE_API_KEY, which race with provider_preset_resolution_chain and
+        // similar tests without the lock.
+        let _env_lock = crate::test_util::env_lock();
         // Save original env values
         let original_max = std::env::var("RECURSIVE_RETRY_MAX");
         let original_initial = std::env::var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS");
@@ -570,6 +574,10 @@ mod tests {
     // AGENTS.md section 5.
     #[test]
     fn shell_timeout_default_and_env_override() {
+        // This test mutates RECURSIVE_MODEL / RECURSIVE_API_KEY /
+        // RECURSIVE_SHELL_TIMEOUT_SECS — hold the env lock so we don't race
+        // with other tests that read or write the same vars.
+        let _env_lock = crate::test_util::env_lock();
         let original = std::env::var("RECURSIVE_SHELL_TIMEOUT_SECS").ok();
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
@@ -745,6 +753,9 @@ mod tests {
 
     #[test]
     fn headless_env_var_sets_config() {
+        // Mutates RECURSIVE_MODEL / RECURSIVE_API_KEY / RECURSIVE_HEADLESS —
+        // hold the env lock to serialise with other env-mutating tests.
+        let _env_lock = crate::test_util::env_lock();
         let original_headless = std::env::var("RECURSIVE_HEADLESS").ok();
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
