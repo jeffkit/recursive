@@ -1,11 +1,9 @@
 //! Resume helpers: cmd_resume, run_resumed, orphan policy, target resolution.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use recursive::llm::ModelPricing;
 use recursive::{
     ChannelSink, CompositeSink, EventSink, FinishReason, SessionPersistenceSink, SessionWriter,
 };
@@ -156,7 +154,6 @@ pub(crate) async fn cmd_resume(
     json_mode: bool,
     plan_first: bool,
     mcp_config: Option<PathBuf>,
-    external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     session_recording: bool,
 ) -> anyhow::Result<()> {
@@ -305,7 +302,6 @@ pub(crate) async fn cmd_resume(
         json_mode,
         plan_first,
         mcp_config,
-        external_pricing,
         hook_timing,
         false, // session_recording — we already opened the writer below
         shutdown,
@@ -325,7 +321,6 @@ pub(crate) async fn run_resumed(
     json_mode: bool,
     plan_first: bool,
     mcp_config: Option<PathBuf>,
-    external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     session: bool,
     shutdown: tokio_util::sync::CancellationToken,
@@ -375,7 +370,6 @@ pub(crate) async fn run_resumed(
                 session_dir,
                 &config.model,
                 &config.provider_type,
-                &external_pricing,
             ))
         })
     } else {
@@ -451,7 +445,6 @@ pub(crate) async fn run_resumed(
             &config.model,
             outcome.llm_latency_ms,
             outcome.steps,
-            &external_pricing,
         );
         print_finish_note(&outcome.finish_reason);
     }

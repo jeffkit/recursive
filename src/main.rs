@@ -7,7 +7,6 @@
 
 mod cli;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +21,7 @@ use recursive::SessionFile;
 use recursive::SessionWriter;
 use recursive::{
     config::Config,
-    llm::{load_pricing_from_yaml, AnthropicProvider, LlmProvider, ModelPricing, OpenAiProvider},
+    llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::{ScheduleWakeup, WakeupSlot},
     AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink, FinishReason, NullSink,
     PlanningMode, RetryPolicy, SessionPersistenceSink, ToolRegistry,
@@ -109,12 +108,6 @@ struct Cli {
     /// Enable plan-first mode: agent proposes a plan, user confirms before execution.
     #[arg(long = "plan-first")]
     plan_first: bool,
-
-    /// Path to external pricing YAML file. If provided, pricing from this file
-    /// takes precedence over hardcoded values. Models not in the file fall back
-    /// to hardcoded rates.
-    #[arg(long, env = "RECURSIVE_PRICING_FILE")]
-    pricing_file: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -345,26 +338,6 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("reading system prompt: {}", p.display()))?;
     }
 
-    // Load external pricing if provided
-    let external_pricing: Option<HashMap<String, ModelPricing>> =
-        if let Some(path) = &cli.pricing_file {
-            match load_pricing_from_yaml(path) {
-                Ok(pricing) => {
-                    eprintln!(
-                        "pricing: loaded {} model(s) from {}",
-                        pricing.len(),
-                        path.display()
-                    );
-                    Some(pricing)
-                }
-                Err(e) => {
-                    anyhow::bail!("failed to load pricing file {}: {}", path.display(), e);
-                }
-            }
-        } else {
-            None
-        };
-
     // Determine effective command:
     // - Explicit subcommand → use it
     // - `-p "goal"` → one-shot run (like `claude -p`)
@@ -530,7 +503,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.stream,
                 cli.plan_first,
                 cli.mcp_config,
-                external_pricing,
                 cli.hook_timing,
                 !cli.no_session,
                 shutdown,
@@ -544,7 +516,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.json,
                 cli.plan_first,
                 cli.mcp_config,
-                external_pricing,
                 cli.stream,
                 cli.hook_timing,
             )
@@ -560,7 +531,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.stream,
                 cli.plan_first,
                 cli.mcp_config,
-                external_pricing,
                 cli.hook_timing,
                 shutdown,
             )
@@ -613,7 +583,6 @@ async fn main() -> anyhow::Result<()> {
                         cli.json,
                         cli.plan_first,
                         cli.mcp_config,
-                        external_pricing,
                         cli.hook_timing,
                         !cli.no_session,
                         shutdown,
@@ -639,7 +608,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.json,
                 cli.plan_first,
                 cli.mcp_config,
-                external_pricing,
                 cli.hook_timing,
                 !cli.no_session,
             )
@@ -950,7 +918,6 @@ async fn run_loop(
     stream: bool,
     plan_first: bool,
     mcp_config: Option<PathBuf>,
-    _external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
@@ -1057,7 +1024,6 @@ async fn run_once(
     stream: bool,
     plan_first: bool,
     mcp_config: Option<PathBuf>,
-    external_pricing: Option<HashMap<String, ModelPricing>>,
     hook_timing: bool,
     session: bool,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1096,7 +1062,6 @@ async fn run_once(
                 session_dir,
                 &config.model,
                 &config.provider_type,
-                &external_pricing,
             ))
         })
     } else {
@@ -1199,7 +1164,6 @@ async fn run_once(
             &config.model,
             outcome.llm_latency_ms,
             outcome.steps,
-            &external_pricing,
         );
         cli::output::print_finish_note(&outcome.finish_reason);
     }
@@ -1243,7 +1207,6 @@ async fn repl(
     json_mode: bool,
     plan_first: bool,
     mcp_config: Option<PathBuf>,
-    external_pricing: Option<HashMap<String, ModelPricing>>,
     stream: bool,
     hook_timing: bool,
 ) -> anyhow::Result<()> {
@@ -1327,7 +1290,6 @@ async fn repl(
                         &config.model,
                         outcome.llm_latency_ms,
                         outcome.steps,
-                        &external_pricing,
                     );
                     cli::output::print_finish_note(&outcome.finish_reason);
                 }

@@ -2,12 +2,23 @@
 
 use serde::Deserialize;
 
+/// Per-million-token pricing embedded in a provider preset model entry. USD.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ModelPricingSpec {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    /// Cache-hit input price per million tokens. Defaults to input_per_million when absent.
+    pub cache_hit_input_per_million: Option<f64>,
+}
+
 /// A single model entry within a provider preset.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelSpec {
     pub name: String,
     /// Maximum input context window in tokens for this model.
     pub context_window: usize,
+    /// Optional pricing. When present, used by `pricing_for()` instead of hard-coded values.
+    pub pricing: Option<ModelPricingSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +61,19 @@ pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
 /// of guessing the model from URL substrings.
 pub fn find_preset_by_api_base(url: &str) -> Option<&'static ProviderPreset> {
     all_presets().iter().find(|p| p.api_base == url)
+}
+
+/// Look up pricing for a model name across all presets.
+/// Returns `None` if the model is not listed or has no pricing field.
+pub fn find_model_pricing(model: &str) -> Option<&'static ModelPricingSpec> {
+    for preset in all_presets() {
+        for spec in &preset.models {
+            if spec.name == model {
+                return spec.pricing.as_ref();
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
