@@ -1,211 +1,15 @@
-//! Application state for the Recursive TUI.
-//!
-//! [`App`] owns everything visible to the user: the transcript blocks,
-//! the input buffer, the current screen, scroll position, and bookkeeping
-//! for streaming, usage, and per-turn timing.
-//!
-//! Rendering lives in [`crate::ui`]; this file is *only* state plus the
-//! reducers that mutate it in response to [`UiEvent`]s and key events.
-
-use std::collections::{HashMap, HashSet};
-use std::sync::{atomic::AtomicBool, Arc};
-use std::time::Instant;
+//! Keyboard dispatch, modal handlers, @file autocomplete, history search,
+//! and slash-command execution.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde_json::Value;
 
-use crate::runtime::GoalState;
-use crate::tui::events::{UiEvent, UserAction};
+use crate::tui::events::UserAction;
 
-// Re-export from sub-modules so the rest of the codebase can still do
-// `use crate::tui::app::Foo` without any changes.
-pub use crate::tui::completion::{
-    collect_files, default_offline_tool_catalog, glob_workspace_files, search_history,
-    MAX_ATFILE_SUGGESTIONS, MAX_HSEARCH_RESULTS,
+use super::{
+    double_press_window, glob_workspace_files, search_history, App, InputMode, TranscriptBlock,
 };
-pub use crate::tui::cost::{
-    default_pricing_table, detect_model_name, estimate_cost, TurnState, UsageStats,
-};
-pub use crate::tui::input_state::{
-    double_press_window, strip_history_prefix, DoublePressTracker, InputMode, PromptInputState,
-    DOUBLE_PRESS_WINDOW, HISTORY_CAPACITY,
-};
-pub use crate::tui::model::{AppScreen, DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
-
-// ──────────────────────────────────────────────────────────────────────
-// Top-level App
-// ──────────────────────────────────────────────────────────────────────
-
-pub struct App {
-    /// Multi-mode input state (Goal 145).
-    pub prompt: PromptInputState,
-    pub blocks: Vec<TranscriptBlock>,
-    pub should_quit: bool,
-    pub session_id: Option<String>,
-    pub connected: bool,
-    pub scroll_offset: u16,
-    pub screen: AppScreen,
-    pub splash_start: Instant,
-    pub usage: UsageStats,
-    pub turn: TurnState,
-    pub turn_count: u64,
-    pub pending_latency_ms: Option<u64>,
-    pub pricing: HashMap<&'static str, (f64, f64)>,
-    pub model_name: String,
-    pub spinner_frame: usize,
-    /// Goal-146: stack of overlay modals. The topmost (last) modal
-    /// receives keys; an empty stack means chat keys are active.
-    pub modals: Vec<crate::tui::ui::modal::Modal>,
-    /// Goal-146: registry of `/`-prefixed slash commands. Lazily
-    /// initialised in [`App::new`] with [`CommandRegistry::default_set`].
-    pub commands: crate::tui::commands::CommandRegistry,
-    /// Goal-146: list of tools the runtime has registered. Populated
-    /// by `main.rs` from `Backend::tool_specs()` after the worker
-    /// boots, and read by the `/tools` command. Defaults to a static
-    /// list when running offline.
-    pub tool_catalog: Vec<(String, String)>,
-    /// Goal-146: cursor / selected index into the command-menu
-    /// completion popup. `None` means the user hasn't navigated
-    /// (Enter executes the literal buffer).
-    pub command_menu_selected: Option<usize>,
-    /// Goal-146: planning-mode flag mirrored on the UI side. Reflects
-    /// the latest `/plan on|off` invocation. Used to render an
-    /// indicator and to seed `/status`.
-    pub planning_mode_on: bool,
-    /// Set when the agent has proposed a plan via `exit_plan_mode` and we are
-    /// waiting for the user to approve or reject it. Cleared by
-    /// `PlanConfirmed` / `PlanRejected` events. Used to show a status-bar
-    /// indicator so the user knows input is expected.
-    pub plan_awaiting_approval: bool,
-    /// Goal-202: set when the agent has called `request_plan_mode` and we are
-    /// waiting for the user to allow or skip planning. Cleared by
-    /// `PlanModeApproved` / `PlanModeRejected` events.
-    pub plan_mode_request_pending: bool,
-    /// Goal-147: tracks the most recent Esc / Ctrl+C presses so the
-    /// second press within [`double_press_window`] can promote a soft
-    /// action (interrupt / clear) into a real exit. See
-    /// [`App::handle_key`].
-    pub double_press: DoublePressTracker,
-    // ── Goal-158: @file autocomplete ─────────────────────────────────
-    /// The text the user has typed after `@` while in AtFile mode.
-    pub atfile_query: String,
-    /// Candidate file paths matching [`atfile_query`]. Refreshed on
-    /// every keystroke in AtFile mode. Contains at most
-    /// [`MAX_ATFILE_SUGGESTIONS`] entries.
-    pub atfile_suggestions: Vec<String>,
-    /// Currently highlighted row in the AtFile popup. `None` means
-    /// nothing is highlighted yet (typing narrows the list).
-    pub atfile_selected: Option<usize>,
-    // ── Goal-160: Ctrl+R history search ──────────────────────────────
-    /// Current search query in HistorySearch mode.
-    pub hsearch_query: String,
-    /// Indices into `prompt.history` that match [`hsearch_query`],
-    /// in priority order (prefix matches first). Capped at
-    /// [`MAX_HSEARCH_RESULTS`].
-    pub hsearch_matches: Vec<usize>,
-    /// Currently highlighted row in the history-search popup.
-    pub hsearch_selected: usize,
-    // ── Goal-161: Permission Request Modal ───────────────────────────
-    /// A pending tool-permission request delivered from the backend
-    /// worker via the side-channel. `None` means no permission dialog
-    /// is open. When `Some`, the modal is rendered and all keys are
-    /// routed to `handle_permission_key`.
-    pub pending_permission: Option<PendingPermission>,
-    /// Set of tool names the user has chosen to "Allow All" for the
-    /// current session. Requests for these tools skip the modal.
-    pub auto_allowed_tools: HashSet<String>,
-    /// Whether the runtime permission hook is currently active.
-    /// Toggled by `/permissions on|off`. Shared with the backend worker.
-    pub permission_hook_enabled: Arc<AtomicBool>,
-    /// Goal-167: current task list maintained by `todo_write` calls.
-    /// Empty when no task list has been set this session.
-    pub current_todos: Vec<crate::tools::todo::TodoItem>,
-    /// Goal-168: mirrored goal state, updated by `UiEvent::Goal*` events.
-    pub active_goal: Option<GoalState>,
-    /// Goal-171: workspace root path, used by /resume to list sessions.
-    pub workspace_path: std::path::PathBuf,
-    /// Goal-174: active colour palette. Defaults to [`DARK`]; switchable
-    /// via `/theme <name>` without restart.
-    pub theme: &'static crate::tui::ui::theme::Theme,
-}
-
-// ── Goal-161: PendingPermission ──────────────────────────────────────────────
-
-/// Holds the state for the permission-request modal while it is open.
-/// The `reply` sender is consumed exactly once when the user presses Y or N.
-pub struct PendingPermission {
-    pub tool_name: String,
-    pub args_preview: String,
-    pub reply: tokio::sync::oneshot::Sender<bool>,
-}
 
 impl App {
-    pub fn new() -> Self {
-        // Goal-169: load workspace skill commands at startup.
-        let workspace = crate::config::Config::from_env()
-            .map(|c| c.workspace)
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let skills = crate::tui::skill_commands::SkillCommandLoader::load(&workspace);
-        let commands =
-            crate::tui::commands::CommandRegistry::default_set().with_skill_commands(skills);
-        Self {
-            prompt: PromptInputState::new(),
-            blocks: vec![TranscriptBlock::System {
-                text: "Welcome to Recursive TUI. Type a message and press Enter.".into(),
-            }],
-            should_quit: false,
-            session_id: None,
-            connected: false,
-            scroll_offset: 0,
-            screen: AppScreen::Splash,
-            splash_start: Instant::now(),
-            usage: UsageStats::default(),
-            turn: TurnState::default(),
-            turn_count: 0,
-            pending_latency_ms: None,
-            pricing: default_pricing_table(),
-            model_name: detect_model_name(),
-            spinner_frame: 0,
-            modals: Vec::new(),
-            commands,
-            tool_catalog: default_offline_tool_catalog(),
-            command_menu_selected: None,
-            planning_mode_on: false,
-            plan_awaiting_approval: false,
-            plan_mode_request_pending: false,
-            double_press: DoublePressTracker::default(),
-            atfile_query: String::new(),
-            atfile_suggestions: Vec::new(),
-            atfile_selected: None,
-            hsearch_query: String::new(),
-            hsearch_matches: Vec::new(),
-            hsearch_selected: 0,
-            pending_permission: None,
-            auto_allowed_tools: HashSet::new(),
-            permission_hook_enabled: Arc::new(AtomicBool::new(false)),
-            current_todos: Vec::new(),
-            active_goal: None,
-            workspace_path: workspace,
-            theme: &crate::tui::ui::theme::DARK,
-        }
-    }
-
-    /// Backwards-compat shim for legacy code paths that still expect
-    /// a single `input` string. Reads the prompt buffer.
-    pub fn input(&self) -> &str {
-        &self.prompt.buffer
-    }
-
-    /// Replace the prompt buffer (used by PlanReview's `e`-edit path
-    /// and a handful of unit tests). Resets cursor to end and mode to
-    /// Prompt.
-    pub fn set_input<S: Into<String>>(&mut self, value: S) {
-        self.prompt.buffer = value.into();
-        self.prompt.cursor = self.prompt.buffer.len();
-        self.prompt.mode = InputMode::Prompt;
-        self.prompt.history_idx = None;
-    }
-
     /// Process one key event. Returns an optional [`UserAction`] that
     /// the caller must forward to the backend worker.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UserAction> {
@@ -426,6 +230,8 @@ impl App {
     /// has no escalation path; we update the timestamp anyway so
     /// future enhancements can read it without re-plumbing.
     fn handle_esc(&mut self) -> Option<UserAction> {
+        use std::time::Instant;
+
         let now = Instant::now();
         let _within_window = self
             .double_press
@@ -462,6 +268,8 @@ impl App {
     ///   4. Turn running → `UserAction::Interrupt` + System block.
     ///   5. Idle and empty → arm the "press again to exit" hint.
     fn handle_ctrl_c(&mut self) -> Option<UserAction> {
+        use std::time::Instant;
+
         let now = Instant::now();
         let within_window = self
             .double_press
@@ -660,7 +468,7 @@ impl App {
                 "Running skill /{}: {}",
                 skill.name, skill.description
             ));
-            self.blocks.push(crate::tui::app::TranscriptBlock::User {
+            self.blocks.push(TranscriptBlock::User {
                 text: prompt.clone(),
             });
             self.scroll_to_bottom();
@@ -672,331 +480,7 @@ impl App {
         None
     }
 
-    /// Apply an event coming from the backend worker.
-    pub fn handle_ui_event(&mut self, event: UiEvent) {
-        match event {
-            UiEvent::AssistantPartial { text } => {
-                self.append_streaming_assistant(&text);
-            }
-            UiEvent::AssistantMessage { content } => {
-                // Goal-147: the legacy `"plan:"` / `"## plan"` text
-                // sniff is gone — plan-mode now arrives through the
-                // structured `UiEvent::PlanProposed` channel. Any
-                // assistant text that looks like a plan prefix is now
-                // just displayed as-is.
-                self.finalise_streaming_assistant(content);
-            }
-            UiEvent::ToolCall {
-                id,
-                name,
-                arguments,
-            } => {
-                let preview = preview_args(&arguments);
-                // Try to also synthesise a Diff block when the tool
-                // looks like an edit. For apply_patch we'll create the
-                // Diff alongside the ToolCall; for write_file we wait
-                // for the ToolResult so the byte count is accurate.
-                self.blocks.push(TranscriptBlock::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args_preview: preview,
-                });
-                if name == "apply_patch" {
-                    if let Some((path, hunks)) = parse_apply_patch_input(&arguments) {
-                        self.blocks.push(TranscriptBlock::Diff { path, hunks });
-                    }
-                }
-                // Refine spinner verb based on tool category.
-                self.turn.spinner_verb = verb_for_tool(&name);
-            }
-            UiEvent::ToolResult {
-                id,
-                name,
-                output,
-                success,
-            } => {
-                // For write_file, render a synthesised Diff stub
-                // ("Created/Updated path (N bytes)") instead of a
-                // ToolResult block. apply_patch already emitted a
-                // Diff block at ToolCall time, so we still want a
-                // ToolResult for it (the success ✓/✗ marker).
-                if name == "write_file" && success {
-                    if let Some(path) = extract_write_file_path_from_result(&output) {
-                        self.blocks.push(TranscriptBlock::Diff {
-                            path,
-                            hunks: vec![],
-                        });
-                        return;
-                    }
-                }
-                self.blocks.push(TranscriptBlock::ToolResult {
-                    id,
-                    name,
-                    success,
-                    output,
-                    expanded: false,
-                });
-            }
-            UiEvent::Usage {
-                input_tokens,
-                output_tokens,
-            } => {
-                self.usage.record(input_tokens, output_tokens);
-            }
-            UiEvent::Latency { llm_ms } => {
-                self.usage.last_latency_ms = llm_ms;
-                self.pending_latency_ms = Some(llm_ms);
-                // Stamp any in-flight streaming assistant block.
-                if let Some(TranscriptBlock::Assistant {
-                    streaming: true,
-                    latency_ms,
-                    ..
-                }) = self.blocks.last_mut()
-                {
-                    *latency_ms = Some(llm_ms);
-                }
-            }
-            UiEvent::Compacted { removed, kept } => {
-                self.blocks
-                    .push(TranscriptBlock::Compacted { removed, kept });
-            }
-            UiEvent::TurnFinished => {
-                // Make sure the last streaming assistant block is
-                // closed in case the provider never emitted a final
-                // AssistantText (some providers stream tokens then
-                // stop without a synthesised final).
-                if let Some(TranscriptBlock::Assistant { streaming, .. }) = self.blocks.last_mut() {
-                    *streaming = false;
-                }
-                self.turn.finish();
-                self.pending_latency_ms = None;
-            }
-            UiEvent::Error { message } => {
-                self.blocks.push(TranscriptBlock::Error {
-                    text: format!("Error: {message}"),
-                });
-            }
-            UiEvent::PlanProposed {
-                plan_text,
-                tool_calls,
-            } => {
-                // Fix-E: show the plan inline in the transcript rather
-                // than as a floating modal.  The dedicated
-                // `TranscriptBlock::PlanProposal` variant is rendered
-                // as a bordered box inside the message stream, and the
-                // status bar already shows "plan: y/n" to signal that
-                // the input layer is awaiting a decision.
-                self.blocks.push(TranscriptBlock::PlanProposal {
-                    plan_text,
-                    tool_calls,
-                });
-                self.plan_awaiting_approval = true;
-            }
-            UiEvent::PlanConfirmed => {
-                self.close_plan_review_modal();
-                self.blocks.push(TranscriptBlock::System {
-                    text: "Plan approved".into(),
-                });
-                self.plan_awaiting_approval = false;
-            }
-            UiEvent::PlanRejected { reason } => {
-                self.close_plan_review_modal();
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!("Plan rejected: {reason}"),
-                });
-                self.plan_awaiting_approval = false;
-            }
-
-            // ── Goal-202: plan-mode pre-confirmation events ─────────────────
-            UiEvent::PlanModeRequested { reason } => {
-                // Render the request inline in the transcript so the user can
-                // read the reason and decide without a modal obscuring context.
-                self.blocks.push(TranscriptBlock::PlanModeRequest {
-                    reason,
-                    approved: None,
-                });
-                self.plan_mode_request_pending = true;
-            }
-            UiEvent::PlanModeApproved => {
-                // Mark the last PlanModeRequest block as approved.
-                for block in self.blocks.iter_mut().rev() {
-                    if let TranscriptBlock::PlanModeRequest { approved, .. } = block {
-                        *approved = Some(true);
-                        break;
-                    }
-                }
-                self.plan_mode_request_pending = false;
-            }
-            UiEvent::PlanModeRejected { reason: _ } => {
-                // Mark the last PlanModeRequest block as rejected.
-                for block in self.blocks.iter_mut().rev() {
-                    if let TranscriptBlock::PlanModeRequest { approved, .. } = block {
-                        *approved = Some(false);
-                        break;
-                    }
-                }
-                self.plan_mode_request_pending = false;
-            }
-
-            // Goal-167: replace the task list whenever the agent calls todo_write.
-            UiEvent::TodoUpdated { todos } => {
-                self.current_todos = todos;
-            }
-
-            // ── Goal-168: goal-loop events ──────────────────────────────────
-            UiEvent::GoalContinuing { reason, turns } => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!("Goal continuing (turn {turns}): {reason}"),
-                });
-                // Update mirrored state.
-                if let Some(ref mut gs) = self.active_goal {
-                    gs.turns = turns;
-                    gs.last_reason = Some(reason);
-                }
-            }
-            UiEvent::GoalAchieved { condition, turns } => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!("Goal achieved after {turns} turns: \"{condition}\""),
-                });
-                self.active_goal = None;
-            }
-            UiEvent::GoalCleared => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: "Goal cleared.".into(),
-                });
-                self.active_goal = None;
-            }
-            // ── Goal-170: turn abort ──────────────────────────────────────────
-            UiEvent::Interrupted => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: "[Interrupted]".into(),
-                });
-                self.turn.finish();
-                self.pending_latency_ms = None;
-                self.plan_awaiting_approval = false;
-            }
-            UiEvent::McpServersLoaded { entries } => {
-                self.modals.push(crate::tui::ui::modal::Modal::McpServers {
-                    entries,
-                    selected: 0,
-                });
-            }
-            UiEvent::SessionResumed {
-                session_id,
-                turn_count,
-            } => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!("▶ Resumed session {session_id} ({turn_count} messages)"),
-                });
-                self.turn.finish();
-                self.scroll_to_bottom();
-            }
-
-            // Goal-210: hook progress events → status-bar style System blocks.
-            UiEvent::HookStarted {
-                hook_event,
-                hook_name,
-                ..
-            } => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!("⚡ hook [{hook_event}] {hook_name} started"),
-                });
-                self.scroll_to_bottom();
-            }
-            UiEvent::HookProgress {
-                hook_name,
-                last_line,
-                ..
-            } => {
-                // Update the last System block if it was a hook block; otherwise push a new one.
-                let hook_prefix = "⚡ hook".to_string();
-                let should_update = self
-                    .blocks
-                    .last()
-                    .map(|b| matches!(b, TranscriptBlock::System { text } if text.starts_with(&hook_prefix)))
-                    .unwrap_or(false);
-                let text = format!("⚡ hook {hook_name}: {last_line}");
-                if should_update {
-                    if let Some(TranscriptBlock::System { text: t }) = self.blocks.last_mut() {
-                        *t = text;
-                    }
-                } else {
-                    self.blocks.push(TranscriptBlock::System { text });
-                }
-                self.scroll_to_bottom();
-            }
-            UiEvent::HookFinished {
-                hook_event,
-                hook_name,
-                outcome,
-                duration_ms,
-            } => {
-                self.blocks.push(TranscriptBlock::System {
-                    text: format!(
-                        "✓ hook [{hook_event}] {hook_name} → {outcome} ({duration_ms}ms)"
-                    ),
-                });
-                self.scroll_to_bottom();
-            }
-            UiEvent::HookSystemMessage { text } => {
-                self.blocks.push(TranscriptBlock::System { text });
-                self.scroll_to_bottom();
-            }
-        }
-        // Sticky-scroll: when the user is already at the bottom
-        // (scroll_offset == 0), keep them pinned as new content
-        // arrives. If they've explicitly scrolled up (Shift+↑ /
-        // PgUp set scroll_offset > 0), preserve their position so
-        // streaming tokens don't yank them back down mid-read.
-        if self.scroll_offset == 0 {
-            self.scroll_to_bottom();
-        }
-    }
-
-    /// If the topmost modal is a `PlanReview`, pop it. No-op
-    /// otherwise — the runtime may emit `PlanConfirmed` after the
-    /// user already dismissed the modal manually, in which case we
-    /// only want to push the System block.
-    fn close_plan_review_modal(&mut self) {
-        if matches!(
-            self.modals.last(),
-            Some(crate::tui::ui::modal::Modal::PlanReview { .. })
-        ) {
-            self.modals.pop();
-        }
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
-    }
-
-    /// Push a System block onto the transcript and scroll to bottom.
-    /// Public so [`crate::commands`] handlers can use it directly.
-    pub fn push_system(&mut self, text: impl Into<String>) {
-        self.blocks
-            .push(TranscriptBlock::System { text: text.into() });
-        self.scroll_to_bottom();
-    }
-
-    /// Push an Error block onto the transcript and scroll to bottom.
-    pub fn push_error(&mut self, text: impl Into<String>) {
-        self.blocks
-            .push(TranscriptBlock::Error { text: text.into() });
-        self.scroll_to_bottom();
-    }
-
-    /// Reset the transcript to a single fresh welcome block and zero
-    /// out per-session usage. Called by `/clear`.
-    pub fn reset_transcript(&mut self) {
-        self.blocks.clear();
-        self.blocks.push(TranscriptBlock::System {
-            text: "Conversation cleared.".into(),
-        });
-        self.usage = UsageStats::default();
-        self.turn_count = 0;
-        self.pending_latency_ms = None;
-        self.scroll_to_bottom();
-    }
+    // ── Goal-146: command-menu ────────────────────────────────────────
 
     /// Handle a key in command-completion-menu context. Returns
     /// `Some(action)` (with `action` itself optional) if the key was
@@ -1267,28 +751,6 @@ impl App {
 
     // ── Goal-161: permission modal ────────────────────────────────────
 
-    /// Receive a pending permission request from the backend side-channel.
-    /// Auto-allow if the tool is in the `auto_allowed_tools` set;
-    /// otherwise store it so the UI can display the modal on the next render.
-    pub fn set_pending_permission(&mut self, req: crate::tui::events::PermissionRequest) {
-        if self.auto_allowed_tools.contains(&req.tool_name) {
-            // Auto-allow: resolve immediately without showing the modal.
-            let _ = req.reply.send(true);
-            return;
-        }
-        // If a previous request is somehow still pending (shouldn't happen
-        // in practice — the backend serialises tool calls), deny it so the
-        // oneshot is consumed and the worker can unblock.
-        if let Some(old) = self.pending_permission.take() {
-            let _ = old.reply.send(false);
-        }
-        self.pending_permission = Some(PendingPermission {
-            tool_name: req.tool_name,
-            args_preview: req.args_preview,
-            reply: req.reply,
-        });
-    }
-
     /// Handle a key while a permission modal is active.
     /// - `y` / `Y` / `Enter` → allow once
     /// - `n` / `N` / `Esc`   → deny
@@ -1308,6 +770,8 @@ impl App {
         }
         None
     }
+
+    // ── Modal dispatch ────────────────────────────────────────────────
 
     /// Handle a key event when at least one modal is on the stack.
     /// Returns `Some(action)` if the modal layer wants to forward a
@@ -1529,211 +993,6 @@ impl App {
         }
         true
     }
-
-    fn start_turn(&mut self) {
-        self.turn.start();
-        self.turn_count = self.turn_count.saturating_add(1);
-    }
-
-    fn append_streaming_assistant(&mut self, chunk: &str) {
-        if let Some(TranscriptBlock::Assistant {
-            text,
-            streaming: true,
-            ..
-        }) = self.blocks.last_mut()
-        {
-            text.push_str(chunk);
-        } else {
-            self.blocks.push(TranscriptBlock::Assistant {
-                text: chunk.to_string(),
-                streaming: true,
-                latency_ms: self.pending_latency_ms,
-            });
-        }
-    }
-
-    fn finalise_streaming_assistant(&mut self, content: String) {
-        if let Some(TranscriptBlock::Assistant {
-            text,
-            streaming,
-            latency_ms,
-        }) = self.blocks.last_mut()
-        {
-            if *streaming {
-                *text = content;
-                *streaming = false;
-                if latency_ms.is_none() {
-                    *latency_ms = self.pending_latency_ms;
-                }
-                return;
-            }
-        }
-        self.blocks.push(TranscriptBlock::Assistant {
-            text: content,
-            streaming: false,
-            latency_ms: self.pending_latency_ms,
-        });
-    }
-
-    /// Toggle the most recent ToolResult or Diff block's expanded flag.
-    fn toggle_last_expandable(&mut self) {
-        for block in self.blocks.iter_mut().rev() {
-            if let TranscriptBlock::ToolResult { expanded, .. } = block {
-                *expanded = !*expanded;
-                return;
-            }
-        }
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────────
-
-/// Produce a short preview of a JSON-encoded arguments string.
-///
-/// Picks up to two top-level fields, formats them as `k=v`, and clamps
-/// to ~60 characters with an ellipsis.
-pub fn preview_args(arguments: &str) -> String {
-    let parsed: Result<Value, _> = serde_json::from_str(arguments);
-    let Ok(Value::Object(map)) = parsed else {
-        // Not JSON-y; just clamp the raw string.
-        return clamp(arguments, 60);
-    };
-
-    let mut parts = Vec::new();
-    for (k, v) in map.iter().take(2) {
-        let v_str = match v {
-            Value::String(s) => format!("\"{}\"", clamp(s, 30)),
-            other => clamp(&other.to_string(), 30),
-        };
-        parts.push(format!("{k}={v_str}"));
-    }
-    clamp(&parts.join(" "), 60)
-}
-
-fn clamp(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
-    }
-}
-
-/// Pick a spinner verb based on the tool name.
-pub fn verb_for_tool(name: &str) -> &'static str {
-    match name {
-        "read_file" | "list_dir" | "search_files" => "Reading",
-        "apply_patch" | "write_file" => "Editing",
-        "run_shell" => "Running",
-        _ => "Calling tool",
-    }
-}
-
-/// Parse a V4A patch envelope from an `apply_patch` arguments JSON.
-///
-/// Returns `(path, hunks)` for the first `*** Update File:` /
-/// `*** Add File:` block found, or `None` if the input is not parseable
-/// as a V4A patch.
-pub fn parse_apply_patch_input(arguments: &str) -> Option<(String, Vec<DiffHunk>)> {
-    let v: Value = serde_json::from_str(arguments).ok()?;
-    let input = v.get("input")?.as_str()?;
-    parse_v4a_patch(input)
-}
-
-/// Pure parser for a V4A patch string.
-pub fn parse_v4a_patch(input: &str) -> Option<(String, Vec<DiffHunk>)> {
-    let mut path: Option<String> = None;
-    let mut current = Vec::new();
-    let mut hunks: Vec<DiffHunk> = Vec::new();
-
-    for line in input.lines() {
-        if let Some(rest) = line
-            .strip_prefix("*** Update File: ")
-            .or_else(|| line.strip_prefix("*** Add File: "))
-        {
-            if path.is_some() {
-                // Multiple update sections — only the first is used,
-                // per goal scope.
-                break;
-            }
-            path = Some(rest.trim().to_string());
-            continue;
-        }
-        if line.starts_with("*** Begin Patch")
-            || line.starts_with("*** End Patch")
-            || line.starts_with("*** End of File")
-        {
-            continue;
-        }
-        if path.is_none() {
-            continue;
-        }
-        // @@ anchor lines start a new hunk.
-        if let Some(stripped) = line.strip_prefix("@@") {
-            if !current.is_empty() {
-                hunks.push(DiffHunk {
-                    lines: std::mem::take(&mut current),
-                });
-            }
-            let text = stripped.trim_start().to_string();
-            if !text.is_empty() {
-                current.push(DiffLine {
-                    kind: DiffLineKind::Context,
-                    text,
-                });
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('+') {
-            current.push(DiffLine {
-                kind: DiffLineKind::Add,
-                text: rest.to_string(),
-            });
-        } else if let Some(rest) = line.strip_prefix('-') {
-            current.push(DiffLine {
-                kind: DiffLineKind::Remove,
-                text: rest.to_string(),
-            });
-        } else if let Some(rest) = line.strip_prefix(' ') {
-            current.push(DiffLine {
-                kind: DiffLineKind::Context,
-                text: rest.to_string(),
-            });
-        }
-    }
-    if !current.is_empty() {
-        hunks.push(DiffHunk { lines: current });
-    }
-
-    let path = path?;
-    if hunks.is_empty() {
-        return None;
-    }
-    Some((path, hunks))
-}
-
-/// Best-effort path extraction from a write_file ToolResult output.
-///
-/// The `WriteFile` tool emits something like
-/// `"Wrote 42 bytes to crates/foo/bar.rs"`. We parse that pattern and
-/// fall back to the entire trimmed output if it doesn't match.
-fn extract_write_file_path_from_result(output: &str) -> Option<String> {
-    let trimmed = output.trim();
-    if let Some(idx) = trimmed.rfind(" to ") {
-        let candidate = &trimmed[idx + 4..];
-        if !candidate.is_empty() {
-            return Some(candidate.to_string());
-        }
-    }
-    None
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1742,8 +1001,12 @@ fn extract_write_file_path_from_result(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::tui::app::{App, AppScreen, InputMode, TranscriptBlock};
+    use crate::tui::events::{UiEvent, UserAction};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1755,212 +1018,6 @@ mod tests {
 
     fn shift(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
-    }
-
-    // ── construction ────────────────────────────────────────────────
-
-    #[test]
-    fn app_new_creates_empty_state() {
-        let app = App::new();
-        assert!(app.input().is_empty());
-        assert!(!app.blocks.is_empty());
-        assert!(!app.should_quit);
-    }
-
-    #[test]
-    fn app_new_starts_in_splash_screen() {
-        let app = App::new();
-        assert_eq!(app.screen, AppScreen::Splash);
-    }
-
-    #[test]
-    fn splash_auto_transitions_after_elapsed() {
-        let app = App::new();
-        assert!(app.splash_start.elapsed() < Duration::from_secs(2));
-        assert_eq!(app.screen, AppScreen::Splash);
-    }
-
-    #[test]
-    fn app_no_session_shows_system_message() {
-        let app = App::new();
-        assert!(app.session_id.is_none());
-        assert!(
-            matches!(&app.blocks[0], TranscriptBlock::System { text } if text.contains("Welcome"))
-        );
-    }
-
-    // ── streaming assistant ────────────────────────────────────────
-
-    #[test]
-    fn transcript_apply_partial_token_appends_to_streaming_assistant() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::AssistantPartial { text: "hel".into() });
-        app.handle_ui_event(UiEvent::AssistantPartial { text: "lo".into() });
-
-        match app.blocks.last() {
-            Some(TranscriptBlock::Assistant {
-                text, streaming, ..
-            }) => {
-                assert_eq!(text, "hello");
-                assert!(*streaming);
-            }
-            other => panic!("expected streaming Assistant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn transcript_apply_assistant_text_finalizes_streaming() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::AssistantPartial { text: "hel".into() });
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "hello world".into(),
-        });
-
-        match app.blocks.last() {
-            Some(TranscriptBlock::Assistant {
-                text, streaming, ..
-            }) => {
-                assert_eq!(text, "hello world");
-                assert!(!*streaming);
-            }
-            other => panic!("expected finalised Assistant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn transcript_assistant_text_without_prior_stream_creates_block() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "single shot".into(),
-        });
-        match app.blocks.last() {
-            Some(TranscriptBlock::Assistant {
-                text, streaming, ..
-            }) => {
-                assert_eq!(text, "single shot");
-                assert!(!*streaming);
-            }
-            other => panic!("expected non-streaming Assistant, got {other:?}"),
-        }
-    }
-
-    // ── tool call / result ─────────────────────────────────────────
-
-    #[test]
-    fn tool_call_and_result_pair_by_id() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::ToolCall {
-            id: "abc".into(),
-            name: "read_file".into(),
-            arguments: r#"{"path":"src/agent.rs"}"#.into(),
-        });
-        app.handle_ui_event(UiEvent::ToolResult {
-            id: "abc".into(),
-            name: "read_file".into(),
-            output: "ok".into(),
-            success: true,
-        });
-
-        let mut call_id = None;
-        let mut result_id = None;
-        for b in &app.blocks {
-            match b {
-                TranscriptBlock::ToolCall { id, .. } => call_id = Some(id.clone()),
-                TranscriptBlock::ToolResult { id, .. } => result_id = Some(id.clone()),
-                _ => {}
-            }
-        }
-        assert_eq!(call_id.as_deref(), Some("abc"));
-        assert_eq!(result_id.as_deref(), Some("abc"));
-    }
-
-    #[test]
-    fn tool_call_args_preview_extracts_path() {
-        let preview = preview_args(r#"{"path":"src/agent.rs"}"#);
-        assert!(preview.contains("path"));
-        assert!(preview.contains("src/agent.rs"));
-    }
-
-    #[test]
-    fn apply_patch_call_emits_diff_block() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        let patch = "*** Begin Patch\n*** Update File: src/foo.rs\n@@ pub fn bar()\n pub fn bar() {\n-    let x = 1;\n+    let x = 2;\n }\n*** End Patch";
-        let arguments = serde_json::json!({"input": patch}).to_string();
-        app.handle_ui_event(UiEvent::ToolCall {
-            id: "1".into(),
-            name: "apply_patch".into(),
-            arguments,
-        });
-        let has_diff = app
-            .blocks
-            .iter()
-            .any(|b| matches!(b, TranscriptBlock::Diff { path, .. } if path == "src/foo.rs"));
-        assert!(has_diff, "expected Diff block, got {:?}", app.blocks);
-    }
-
-    #[test]
-    fn write_file_result_renders_diff_block() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::ToolCall {
-            id: "1".into(),
-            name: "write_file".into(),
-            arguments: r#"{"path":"src/new.rs","contents":"x"}"#.into(),
-        });
-        app.handle_ui_event(UiEvent::ToolResult {
-            id: "1".into(),
-            name: "write_file".into(),
-            output: "Wrote 42 bytes to src/new.rs".into(),
-            success: true,
-        });
-        let has_diff = app.blocks.iter().any(
-            |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),
-        );
-        assert!(has_diff, "expected Diff block from write_file");
-    }
-
-    // ── compacted ──────────────────────────────────────────────────
-
-    #[test]
-    fn compacted_event_creates_compacted_block() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::Compacted {
-            removed: 12,
-            kept: 1,
-        });
-        assert!(matches!(
-            app.blocks.last(),
-            Some(TranscriptBlock::Compacted {
-                removed: 12,
-                kept: 1
-            })
-        ));
-    }
-
-    // ── usage stats ────────────────────────────────────────────────
-
-    #[test]
-    fn usage_stats_accumulate_across_turns() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::Usage {
-            input_tokens: 100,
-            output_tokens: 50,
-        });
-        app.handle_ui_event(UiEvent::Usage {
-            input_tokens: 30,
-            output_tokens: 20,
-        });
-        assert_eq!(app.usage.total_input, 130);
-        assert_eq!(app.usage.total_output, 70);
-        assert_eq!(app.usage.input_tokens, 30);
-        assert_eq!(app.usage.output_tokens, 20);
     }
 
     // ── Ctrl+E ─────────────────────────────────────────────────────
@@ -1987,75 +1044,6 @@ mod tests {
         }
     }
 
-    // ── pricing / model detection ──────────────────────────────────
-
-    #[test]
-    fn pricing_table_includes_required_models() {
-        let p = default_pricing_table();
-        assert!(p.contains_key("deepseek-chat"));
-        assert!(p.contains_key("gpt-4o"));
-        assert!(p.contains_key("glm-4-plus"));
-        assert!(p.contains_key("claude-sonnet"));
-    }
-
-    /// Goal-150: status bar must read `~/.recursive/config.toml` when
-    /// no env var is set, otherwise it lies about the model the
-    /// runtime is actually using.
-    ///
-    /// Both checks share one test body so they share the `PinnedHome`
-    /// lock (HOME mutation is process-global; cf. lesson 17).
-    #[test]
-    fn detect_model_name_falls_back_to_config_file() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let _pin = crate::test_util::PinnedHome::new(home.path());
-
-        // Snapshot env so we can clear / restore.
-        let prev_recursive_model = std::env::var("RECURSIVE_MODEL").ok();
-        let prev_openai_model = std::env::var("OPENAI_MODEL").ok();
-        std::env::remove_var("RECURSIVE_MODEL");
-        std::env::remove_var("OPENAI_MODEL");
-
-        // Part A: no env, no config.toml → hardcoded default
-        assert_eq!(detect_model_name(), "gpt-4o-mini");
-
-        // Part B: write a config.toml under HOME → that wins
-        let cfg_dir = home.path().join(".recursive");
-        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
-        std::fs::write(
-            cfg_dir.join("config.toml"),
-            "[provider]\nmodel = \"deepseek-v4-flash\"\n",
-        )
-        .expect("write");
-        assert_eq!(detect_model_name(), "deepseek-v4-flash");
-
-        // Part C: env var overrides config.toml
-        std::env::set_var("RECURSIVE_MODEL", "from-env");
-        assert_eq!(detect_model_name(), "from-env");
-
-        // Restore env.
-        std::env::remove_var("RECURSIVE_MODEL");
-        if let Some(v) = prev_recursive_model {
-            std::env::set_var("RECURSIVE_MODEL", v);
-        }
-        if let Some(v) = prev_openai_model {
-            std::env::set_var("OPENAI_MODEL", v);
-        }
-    }
-
-    #[test]
-    fn estimate_cost_for_known_model() {
-        let p = default_pricing_table();
-        let c = estimate_cost("gpt-4o-mini", 1000, 1000, &p).unwrap();
-        // 1000 in @ 0.00015 + 1000 out @ 0.0006 = 0.00015 + 0.0006 = 0.00075
-        assert!((c - 0.00075).abs() < 1e-9);
-    }
-
-    #[test]
-    fn estimate_cost_unknown_model_is_none() {
-        let p = default_pricing_table();
-        assert!(estimate_cost("foo-9000", 1000, 1000, &p).is_none());
-    }
-
     // ── chat key handling ──────────────────────────────────────────
 
     #[test]
@@ -2080,16 +1068,6 @@ mod tests {
         let _ = app.handle_key(key(KeyCode::Enter));
         assert!(app.turn.running);
         assert_eq!(app.turn_count, 1);
-    }
-
-    #[test]
-    fn turn_finished_stops_turn() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.set_input("hi");
-        let _ = app.handle_key(key(KeyCode::Enter));
-        app.handle_ui_event(UiEvent::TurnFinished);
-        assert!(!app.turn.running);
     }
 
     #[test]
@@ -2183,9 +1161,7 @@ mod tests {
         assert_eq!(app.scroll_offset, 5);
     }
 
-    /// PgUp/PgDn now work regardless of buffer state — they have no
-    /// editing semantics, so claiming them for transcript scroll is
-    /// safe. (Goal 150 relaxed the previous "buffer empty" guard.)
+    /// PgUp/PgDn now work regardless of buffer state.
     #[test]
     fn page_up_scrolls_even_when_buffer_not_empty() {
         let mut app = App::new();
@@ -2196,16 +1172,10 @@ mod tests {
     }
 
     /// Goal 150 follow-up: terminal-independent scroll fallbacks.
-    /// macOS Terminal often strips SHIFT from arrow keys, so
-    /// Shift+↑/↓ reaches us as plain Up/Down (which fires history
-    /// walk). Ctrl+B / Ctrl+F bypass that — they're plain ASCII
-    /// control codes every terminal forwards verbatim.
     #[test]
     fn ctrl_b_and_ctrl_f_scroll_transcript() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        // Buffer is empty → without our explicit handler, Ctrl+B
-        // could be claimed by some other readline-style binding.
         let _ = app.handle_key(ctrl('b'));
         assert_eq!(app.scroll_offset, 10);
         let _ = app.handle_key(ctrl('b'));
@@ -2228,110 +1198,7 @@ mod tests {
         assert_eq!(app.scroll_offset, 10);
     }
 
-    /// Sticky-scroll: when the user has explicitly scrolled up,
-    /// new events should NOT yank them back to the bottom.
-    /// (Without this guard, every streaming PartialToken or
-    /// ToolCall would reset scroll_offset to 0 mid-read.)
-    #[test]
-    fn new_event_keeps_scroll_offset_when_user_scrolled_up() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.scroll_offset = 5; // user pressed Ctrl+B / PgUp etc.
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "hello".into(),
-        });
-        assert_eq!(app.scroll_offset, 5);
-    }
-
-    /// Sticky-scroll counterpart: when the user is at the bottom,
-    /// new events DO scroll-to-bottom (i.e. confirm offset stays 0
-    /// rather than getting bumped by content arriving above the
-    /// visible window — chat.rs's effective_scroll handles this
-    /// already, but we keep the explicit reset for clarity).
-    #[test]
-    fn new_event_at_bottom_keeps_user_at_bottom() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.scroll_offset = 0;
-        app.handle_ui_event(UiEvent::AssistantMessage {
-            content: "hello".into(),
-        });
-        assert_eq!(app.scroll_offset, 0);
-    }
-
-    #[test]
-    fn error_event_pushes_error_block() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::Error {
-            message: "boom".into(),
-        });
-        assert!(matches!(
-            app.blocks.last(),
-            Some(TranscriptBlock::Error { text }) if text.contains("boom")
-        ));
-    }
-
     // ── Plan Mode (Goal 147) ───────────────────────────────────────
-
-    #[test]
-    fn plan_proposed_event_opens_plan_review_modal() {
-        // Fix-E: PlanProposed now renders inline as a TranscriptBlock
-        // instead of opening a floating modal.
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.handle_ui_event(UiEvent::PlanProposed {
-            plan_text: "1. read_file\n2. apply_patch".into(),
-            tool_calls: vec![serde_json::json!({
-                "name": "read_file",
-                "id": "1",
-                "arguments": { "path": "src/foo.rs" }
-            })],
-        });
-        // No modal should be opened — plan is inline in the transcript.
-        assert!(app.modals.is_empty());
-        // The plan proposal block should be in the transcript.
-        assert!(app.blocks.iter().any(|b| matches!(b,
-            TranscriptBlock::PlanProposal { plan_text, .. }
-                if plan_text.contains("read_file"))));
-        assert!(app.plan_awaiting_approval);
-    }
-
-    #[test]
-    fn plan_confirmed_closes_modal_and_pushes_system_block() {
-        use crate::tui::ui::modal::Modal;
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.modals.push(Modal::PlanReview {
-            plan_text: "do".into(),
-            tool_calls: vec![],
-            edited_text: None,
-        });
-        app.handle_ui_event(UiEvent::PlanConfirmed);
-        assert!(app.modals.is_empty());
-        assert!(app
-            .blocks
-            .iter()
-            .any(|b| matches!(b, TranscriptBlock::System { text } if text == "Plan approved")));
-    }
-
-    #[test]
-    fn plan_rejected_pushes_system_block_with_reason() {
-        use crate::tui::ui::modal::Modal;
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        app.modals.push(Modal::PlanReview {
-            plan_text: "do".into(),
-            tool_calls: vec![],
-            edited_text: None,
-        });
-        app.handle_ui_event(UiEvent::PlanRejected {
-            reason: "user rejected".into(),
-        });
-        assert!(app.modals.is_empty());
-        assert!(app.blocks.iter().any(|b| matches!(b,
-            TranscriptBlock::System { text } if text == "Plan rejected: user rejected")));
-    }
 
     #[test]
     fn plan_review_y_dispatches_confirm_plan_action() {
@@ -2345,9 +1212,7 @@ mod tests {
         });
         let action = app.handle_key(key(KeyCode::Char('y')));
         assert!(matches!(action, Some(UserAction::ConfirmPlan)));
-        // Fix-E: the modal is now optimistically closed on 'y' so the
-        // user immediately sees the plan was accepted instead of waiting
-        // for the PlanConfirmed round-trip event.
+        // Fix-E: the modal is now optimistically closed on 'y'.
         assert!(app.modals.is_empty());
     }
 
@@ -2411,8 +1276,7 @@ mod tests {
     }
 
     /// Goal §5: Esc does **not** quit even on a second press inside
-    /// the double-press window. (Quitting is owned exclusively by
-    /// Ctrl+C×2 and the explicit `/exit` / `q-in-modal` paths.)
+    /// the double-press window.
     #[test]
     fn esc_does_not_quit_after_double_press_when_idle() {
         let mut app = App::new();
@@ -2451,8 +1315,7 @@ mod tests {
     }
 
     /// Goal §5: Ctrl+C×2 inside the window quits regardless of the
-    /// soft action the first press kicked off (interrupt / clear /
-    /// modal-pop).
+    /// soft action the first press kicked off.
     #[test]
     fn ctrl_c_double_press_within_window_quits() {
         let mut app = App::new();
@@ -2465,10 +1328,10 @@ mod tests {
     }
 
     /// Goal §5: a Ctrl+C press outside the double-press window
-    /// resets the counter, so the *next* press starts a fresh round
-    /// of soft actions instead of immediately quitting.
+    /// resets the counter.
     #[test]
     fn ctrl_c_outside_window_resets_counter() {
+        use std::time::Instant;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         // Backdate last_ctrl_c_at so the next press is "outside".
@@ -2480,30 +1343,6 @@ mod tests {
         assert!(app.blocks.iter().any(|b| matches!(b,
             TranscriptBlock::System { text } if text.contains("Press Ctrl+C again"))));
     }
-
-    // ── verb / patch parser ────────────────────────────────────────
-
-    #[test]
-    fn verb_for_tool_categorises_tools() {
-        assert_eq!(verb_for_tool("read_file"), "Reading");
-        assert_eq!(verb_for_tool("apply_patch"), "Editing");
-        assert_eq!(verb_for_tool("run_shell"), "Running");
-        assert_eq!(verb_for_tool("custom_xyz"), "Calling tool");
-    }
-
-    #[test]
-    fn parse_v4a_patch_extracts_path_and_pm_lines() {
-        let patch = "*** Begin Patch\n*** Update File: src/foo.rs\n@@ pub fn bar()\n pub fn bar() {\n-    let x = 1;\n+    let x = 2;\n }\n*** End Patch";
-        let (path, hunks) = parse_v4a_patch(patch).unwrap();
-        assert_eq!(path, "src/foo.rs");
-        assert!(!hunks.is_empty());
-        let kinds: Vec<_> = hunks
-            .iter()
-            .flat_map(|h| h.lines.iter().map(|l| l.kind.clone()))
-            .collect();
-        assert!(kinds.contains(&DiffLineKind::Add));
-        assert!(kinds.contains(&DiffLineKind::Remove));
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2512,7 +1351,10 @@ mod tests {
 
 #[cfg(test)]
 mod prompt_input_tests {
-    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::tui::app::{App, AppScreen, InputMode, HISTORY_CAPACITY};
+    use crate::tui::input_state::strip_history_prefix;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2689,8 +1531,7 @@ mod prompt_input_tests {
         let mut app = fresh_app();
         app.set_input("alpha");
         let _ = app.handle_key(k(KeyCode::Enter));
-        // Type some draft, then walk history. Note: history walk
-        // only triggers when buffer is empty (per goal §5).
+        // Walk history: only triggers when buffer is empty.
         let _ = app.handle_key(k(KeyCode::Up));
         assert_eq!(app.prompt.buffer, "alpha");
         let _ = app.handle_key(k(KeyCode::Down));
@@ -2729,6 +1570,7 @@ mod prompt_input_tests {
 
     #[test]
     fn submit_in_bash_mode_dispatches_run_shell() {
+        use crate::tui::events::UserAction;
         let mut app = fresh_app();
         let _ = app.handle_key(k(KeyCode::Char('!')));
         for c in "ls".chars() {
@@ -2744,6 +1586,7 @@ mod prompt_input_tests {
 
     #[test]
     fn submit_in_note_mode_appends_system_block() {
+        use crate::tui::app::TranscriptBlock;
         let mut app = fresh_app();
         let _ = app.handle_key(k(KeyCode::Char('#')));
         for c in "remember this".chars() {
@@ -2809,6 +1652,8 @@ mod prompt_input_tests {
 
     #[test]
     fn ctrl_e_with_empty_buffer_toggles_tool_result() {
+        use crate::tui::app::TranscriptBlock;
+        use crate::tui::events::UiEvent;
         let mut app = fresh_app();
         app.handle_ui_event(UiEvent::ToolResult {
             id: "1".into(),
@@ -2863,10 +1708,13 @@ mod prompt_input_tests {
 }
 
 // ── Goal-158: @file autocomplete tests ───────────────────────────────────────
+
 #[cfg(test)]
 mod atfile_tests {
-    use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::tui::app::{App, InputMode, MAX_ATFILE_SUGGESTIONS};
+    use crate::tui::completion::glob_workspace_files;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3002,10 +1850,14 @@ mod atfile_tests {
     }
 }
 
+// ── Goal-160: Ctrl+R history search tests ────────────────────────────────────
+
 #[cfg(test)]
 mod hsearch_tests {
-    use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::tui::app::{App, InputMode, MAX_HSEARCH_RESULTS};
+    use crate::tui::completion::search_history;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3123,7 +1975,10 @@ mod hsearch_tests {
 
 #[cfg(test)]
 mod perm_tests {
-    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::tui::app::{App, PendingPermission};
+    use crate::tui::events::UiEvent;
 
     fn make_perm(tool: &str, args: &str) -> (App, tokio::sync::oneshot::Receiver<bool>) {
         let mut app = App::new();
@@ -3138,7 +1993,7 @@ mod perm_tests {
     }
 
     fn k(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
@@ -3232,6 +2087,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_requested_event_sets_pending_flag() {
+        use crate::tui::app::TranscriptBlock;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "This task is complex".into(),
@@ -3244,6 +2100,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_request_y_dispatches_approve_action() {
+        use crate::tui::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "need to plan".into(),
@@ -3256,6 +2113,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_request_n_dispatches_reject_action() {
+        use crate::tui::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "need to plan".into(),
@@ -3267,6 +2125,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_approved_event_marks_block() {
+        use crate::tui::app::TranscriptBlock;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "complex".into(),
@@ -3284,6 +2143,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_rejected_event_marks_block() {
+        use crate::tui::app::TranscriptBlock;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "complex".into(),
