@@ -22,15 +22,33 @@ use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::tools::ToolRegistry;
 
-use crate::agent::{
-    FinishReason, OnMessageFn, PermissionDecision, PermissionHook, PlanningMode, StepEvent,
-};
+use crate::agent::{FinishReason, OnMessageFn, PermissionDecision, PermissionHook, PlanningMode};
+use crate::event::AgentEvent;
 
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
 pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
 /// Threshold for consecutive identical failing tool calls before declaring stuck.
 const STUCK_THRESHOLD: usize = 3;
+
+/// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
+///
+/// The old `From<StepEvent>` bridge used a hard-coded `"finished"` placeholder
+/// (see `event::From<StepEvent>` prior to Goal 219), which made the reason
+/// unobservable downstream. This helper restores per-variant text so SDK and
+/// TUI consumers can distinguish termination causes.
+fn finish_reason_str(reason: &FinishReason) -> String {
+    match reason {
+        FinishReason::NoMoreToolCalls => "no_more_tool_calls".to_string(),
+        FinishReason::BudgetExceeded => "budget_exceeded".to_string(),
+        FinishReason::ProviderStop(s) => format!("provider_stop({s})"),
+        FinishReason::Stuck { .. } => "stuck".to_string(),
+        FinishReason::TranscriptLimit { .. } => "transcript_limit".to_string(),
+        FinishReason::PlanPending => "plan_pending".to_string(),
+        FinishReason::Cancelled => "cancelled".to_string(),
+        FinishReason::PermissionDenialLimit => "permission_denial_limit".to_string(),
+    }
+}
 
 /// Outcome returned by the stateless [`run_inner`] loop.
 pub(crate) struct RunInnerOutcome {
@@ -59,7 +77,7 @@ pub(crate) struct RunCore<'a> {
     pub(crate) tools: ToolRegistry,
     pub(crate) max_steps: usize,
     pub(crate) max_transcript_chars: Option<usize>,
-    pub(crate) events: Option<mpsc::UnboundedSender<StepEvent>>,
+    pub(crate) events: Option<mpsc::UnboundedSender<AgentEvent>>,
     pub(crate) streaming: bool,
     pub(crate) compactor: Option<Compactor>,
     pub(crate) permission_hook: Option<PermissionHook>,
@@ -89,7 +107,7 @@ pub(crate) struct RunCore<'a> {
 }
 
 impl<'a> RunCore<'a> {
-    fn emit(&self, event: StepEvent) {
+    fn emit(&self, event: AgentEvent) {
         if let Some(ref tx) = self.events {
             let _ = tx.send(event);
         }
@@ -132,7 +150,7 @@ impl<'a> RunCore<'a> {
                 trimmed_count,
                 if trimmed_count == 1 { "" } else { "s" }
             );
-            self.emit(StepEvent::AssistantText { text: note, step });
+            self.emit(AgentEvent::AssistantText { text: note, step });
         }
     }
 
@@ -177,7 +195,7 @@ impl<'a> RunCore<'a> {
             summary_chars,
         });
 
-        self.emit(StepEvent::Compacted {
+        self.emit(AgentEvent::Compacted {
             removed,
             kept,
             summary_chars,
@@ -446,8 +464,8 @@ impl<'a> RunCore<'a> {
                 if token.is_cancelled() {
                     let finished_steps = step.saturating_sub(1);
                     let finish = FinishReason::Cancelled;
-                    self.emit(StepEvent::Finished {
-                        reason: finish.clone(),
+                    self.emit(AgentEvent::TurnFinished {
+                        reason: finish_reason_str(&finish),
                         steps: finished_steps,
                     });
                     tracing::info!(
@@ -496,8 +514,8 @@ impl<'a> RunCore<'a> {
                 let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
                 if chars >= limit {
                     let finish = FinishReason::TranscriptLimit { chars, limit };
-                    self.emit(StepEvent::Finished {
-                        reason: finish.clone(),
+                    self.emit(AgentEvent::TurnFinished {
+                        reason: finish_reason_str(&finish),
                         steps: step,
                     });
                     tracing::info!(
@@ -535,7 +553,7 @@ impl<'a> RunCore<'a> {
                 if let Some(calls) = self.plan_buffer.take() {
                     let results = self.execute_tool_calls(&calls).await;
                     for (id, name, output, _args, _audit) in results {
-                        self.emit(StepEvent::ToolResult {
+                        self.emit(AgentEvent::ToolResult {
                             id: id.clone(),
                             name: name.clone(),
                             output: output.clone(),
@@ -557,7 +575,7 @@ impl<'a> RunCore<'a> {
                 tokio::spawn(async move {
                     while let Some(text) = delta_rx.recv().await {
                         if let Some(ref tx) = events_tx {
-                            let _ = tx.send(StepEvent::PartialToken { text, step });
+                            let _ = tx.send(AgentEvent::PartialToken { text, step });
                         }
                     }
                 });
@@ -567,15 +585,19 @@ impl<'a> RunCore<'a> {
             };
             let llm_ms = start.elapsed().as_millis() as u64;
             self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
-            self.emit(StepEvent::Latency { step, llm_ms });
+            self.emit(AgentEvent::Latency { step, llm_ms });
 
             if let Some(u) = completion.usage {
                 total_usage = total_usage.accumulate(u);
-                self.emit(StepEvent::Usage { usage: u, step });
+                self.emit(AgentEvent::Usage {
+                    input_tokens: u.prompt_tokens,
+                    output_tokens: u.completion_tokens,
+                    step,
+                });
             }
 
             if !completion.content.is_empty() {
-                self.emit(StepEvent::AssistantText {
+                self.emit(AgentEvent::AssistantText {
                     text: completion.content.clone(),
                     step,
                 });
@@ -585,8 +607,9 @@ impl<'a> RunCore<'a> {
             // ---- no tool calls → finish -------------------------------------------
             if completion.tool_calls.is_empty() {
                 if matches!(completion.finish_reason.as_deref(), Some("length")) {
-                    self.emit(StepEvent::Finished {
-                        reason: FinishReason::ProviderStop("length".into()),
+                    let finish = FinishReason::ProviderStop("length".into());
+                    self.emit(AgentEvent::TurnFinished {
+                        reason: finish_reason_str(&finish),
                         steps: step,
                     });
                     return Err(Error::ProviderTruncated("length".into()));
@@ -602,8 +625,8 @@ impl<'a> RunCore<'a> {
                     Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
                     _ => FinishReason::NoMoreToolCalls,
                 };
-                self.emit(StepEvent::Finished {
-                    reason: finish.clone(),
+                self.emit(AgentEvent::TurnFinished {
+                    reason: finish_reason_str(&finish),
                     steps: step,
                 });
                 let outcome = RunInnerOutcome {
@@ -631,8 +654,10 @@ impl<'a> RunCore<'a> {
             }
 
             for call in &completion.tool_calls {
-                self.emit(StepEvent::ToolCall {
-                    call: call.clone(),
+                self.emit(AgentEvent::ToolCall {
+                    name: call.name.clone(),
+                    id: call.id.clone(),
+                    arguments: call.arguments.to_string(),
                     step,
                 });
             }
@@ -655,9 +680,19 @@ impl<'a> RunCore<'a> {
                     plan_text
                 );
 
-                self.emit(StepEvent::PlanProposed {
+                self.emit(AgentEvent::PlanProposed {
                     plan_text: plan_text.clone(),
-                    tool_calls: completion.tool_calls.clone(),
+                    tool_calls: completion
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "name": tc.name,
+                                "id": tc.id,
+                                "arguments": tc.arguments,
+                            })
+                        })
+                        .collect(),
                 });
 
                 tracing::info!(
@@ -686,7 +721,7 @@ impl<'a> RunCore<'a> {
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
             for (id, name, result, args, audit) in &results {
-                self.emit(StepEvent::ToolResult {
+                self.emit(AgentEvent::ToolResult {
                     id: id.clone(),
                     name: name.clone(),
                     output: result.clone(),
@@ -722,8 +757,8 @@ impl<'a> RunCore<'a> {
                         repeated_call,
                         repeats,
                     };
-                    self.emit(StepEvent::Finished {
-                        reason: finish.clone(),
+                    self.emit(AgentEvent::TurnFinished {
+                        reason: finish_reason_str(&finish),
                         steps: step,
                     });
                     let outcome = RunInnerOutcome {
@@ -746,8 +781,8 @@ impl<'a> RunCore<'a> {
 
         warn!(target: "recursive::agent", "step budget exceeded");
         let finish = FinishReason::BudgetExceeded;
-        self.emit(StepEvent::Finished {
-            reason: finish.clone(),
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
             steps: self.max_steps,
         });
         let outcome = RunInnerOutcome {

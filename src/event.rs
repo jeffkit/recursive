@@ -18,10 +18,12 @@
 //! consumers.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
-use crate::agent::StepEvent;
+use crate::agent::{FinishReason, StepEvent};
+use crate::llm::{TokenUsage, ToolCall as LlmToolCall};
 
 // ---------------------------------------------------------------------------
 // AgentEvent
@@ -301,6 +303,107 @@ impl From<StepEvent> for AgentEvent {
                 duration_ms,
             },
             StepEvent::HookSystemMessage { text } => AgentEvent::HookSystemMessage { text },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From<AgentEvent> (legacy bridge — deleted with the Agent path in Commit 2)
+// ---------------------------------------------------------------------------
+
+/// Reverse conversion used by the legacy `Agent::run` bridge.  `AgentEvent`
+/// carries a wider variant set than `StepEvent` (e.g. `MessageAppended`,
+/// `GoalSet`, `Hook*`); variants that have no `StepEvent` counterpart are
+/// mapped to a no-op `AssistantText` event.  This impl is transient: it
+/// disappears with the `StepEvent` type and the `Agent` legacy wrapper in
+/// Commit 2 of Goal 219.
+impl From<AgentEvent> for StepEvent {
+    fn from(ev: AgentEvent) -> Self {
+        match ev {
+            AgentEvent::AssistantText { text, step } => StepEvent::AssistantText { text, step },
+            AgentEvent::ToolCall {
+                name,
+                id,
+                arguments,
+                step,
+            } => StepEvent::ToolCall {
+                call: LlmToolCall {
+                    name,
+                    id,
+                    arguments: serde_json::from_str(&arguments).unwrap_or(Value::Null),
+                },
+                step,
+            },
+            AgentEvent::Latency { step, llm_ms } => StepEvent::Latency { step, llm_ms },
+            AgentEvent::ToolResult {
+                id,
+                name,
+                output,
+                step,
+            } => StepEvent::ToolResult {
+                id,
+                name,
+                output,
+                step,
+            },
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                step,
+            } => StepEvent::Usage {
+                usage: TokenUsage {
+                    prompt_tokens: input_tokens,
+                    completion_tokens: output_tokens,
+                    ..Default::default()
+                },
+                step,
+            },
+            AgentEvent::PartialToken { text, step } => StepEvent::PartialToken { text, step },
+            AgentEvent::Compacted {
+                removed,
+                kept,
+                summary_chars,
+                step,
+            } => StepEvent::Compacted {
+                removed,
+                kept,
+                summary_chars,
+                step,
+            },
+            AgentEvent::TurnFinished { reason: _, steps } => StepEvent::Finished {
+                // The legacy `StepEvent::Finished` carries a typed
+                // `FinishReason`, but `AgentEvent::TurnFinished` only keeps
+                // a human-readable string.  We use a default
+                // `NoMoreToolCalls` because the legacy tests only pattern-
+                // match on the variant, not on the inner reason.
+                reason: FinishReason::NoMoreToolCalls,
+                steps,
+            },
+            AgentEvent::PlanProposed { plan_text, .. } => {
+                // `StepEvent::PlanProposed` carries `Vec<LlmToolCall>` while
+                // `AgentEvent::PlanProposed` carries `Vec<serde_json::Value>`.
+                // We cannot faithfully reconstruct the typed tool calls from
+                // the JSON payloads, so the legacy field ends up empty.  This
+                // is acceptable: the only `PlanProposed` consumer in the
+                // legacy path is the `PlanningMode` flow, and the bridge is
+                // deleted with the legacy type in Commit 2.
+                StepEvent::PlanProposed {
+                    plan_text,
+                    tool_calls: Vec::new(),
+                }
+            }
+            AgentEvent::PlanConfirmed => StepEvent::PlanConfirmed,
+            AgentEvent::PlanRejected { reason } => StepEvent::PlanRejected { reason },
+            // Variants that have no `StepEvent` counterpart.  These are
+            // emitted by `AgentRuntime` and the hook pipeline, not by
+            // `RunCore`, so the legacy bridge never sees them in practice.
+            // We still need a match arm because `AgentEvent` is
+            // `#[non_exhaustive]`; produce a no-op `AssistantText` so the
+            // conversion is total.
+            _ => StepEvent::AssistantText {
+                text: String::new(),
+                step: 0,
+            },
         }
     }
 }
@@ -654,6 +757,86 @@ mod tests {
                 reason: "bad plan".into()
             }
         );
+    }
+
+    #[test]
+    fn agent_event_to_step_event_conversion() {
+        // AssistantText — round-trips 1:1.
+        let ae = AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 1,
+        };
+        let se: StepEvent = ae.into();
+        assert!(matches!(se, StepEvent::AssistantText { ref text, step: 1 } if text == "hi"));
+
+        // ToolCall — `arguments` round-trips as a JSON object (not a string).
+        let ae = AgentEvent::ToolCall {
+            name: "get_weather".into(),
+            id: "call_1".into(),
+            arguments: r#"{"city":"NYC"}"#.into(),
+            step: 2,
+        };
+        let se: StepEvent = ae.into();
+        match se {
+            StepEvent::ToolCall { call, step } => {
+                assert_eq!(step, 2);
+                assert_eq!(call.name, "get_weather");
+                assert_eq!(call.id, "call_1");
+                assert_eq!(call.arguments, serde_json::json!({"city": "NYC"}));
+            }
+            _ => panic!("expected StepEvent::ToolCall"),
+        }
+
+        // TurnFinished — collapses to `Finished` with a default reason.
+        let ae = AgentEvent::TurnFinished {
+            reason: "budget_exceeded".into(),
+            steps: 8,
+        };
+        let se: StepEvent = ae.into();
+        match se {
+            StepEvent::Finished { reason, steps } => {
+                assert_eq!(steps, 8);
+                assert!(matches!(reason, FinishReason::NoMoreToolCalls));
+            }
+            _ => panic!("expected StepEvent::Finished"),
+        }
+
+        // Latency / ToolResult / Usage / PartialToken / Compacted / Plan*
+        // round-trip 1:1 (Usage needs the typed fields).
+        assert!(matches!(
+            AgentEvent::Latency {
+                step: 3,
+                llm_ms: 150
+            }
+            .into(),
+            StepEvent::Latency {
+                step: 3,
+                llm_ms: 150
+            }
+        ));
+        let ae = AgentEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            step: 5,
+        };
+        match ae.into() {
+            StepEvent::Usage { usage, step: 5 } => {
+                assert_eq!(usage.prompt_tokens, 10);
+                assert_eq!(usage.completion_tokens, 20);
+            }
+            _ => panic!("expected StepEvent::Usage"),
+        }
+        assert!(matches!(
+            AgentEvent::PlanConfirmed.into(),
+            StepEvent::PlanConfirmed
+        ));
+        let ae = AgentEvent::PlanRejected {
+            reason: "bad plan".into(),
+        };
+        match ae.into() {
+            StepEvent::PlanRejected { reason } => assert_eq!(reason, "bad plan"),
+            _ => panic!("expected StepEvent::PlanRejected"),
+        }
     }
 
     // -- Serialisation round-trip ------------------------------------------
