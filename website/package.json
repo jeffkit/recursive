@@ -1,0 +1,17 @@
+{
+  "name": "recursive-docs",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Documentation site for Recursive agent kernel",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
