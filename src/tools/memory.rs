@@ -16,10 +16,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::memory::{EmbeddingProvider, MemoryEntry, NoopEmbedding, NoopVectorStore, VectorStore};
 use crate::tools::Tool;
 
 /// A single memory note.
@@ -244,6 +245,10 @@ pub struct Remember {
     workspace: PathBuf,
     /// Mutex for thread-safe access to the memory file.
     lock: Mutex<()>,
+    /// Optional vector store for semantic indexing.
+    vector_store: Arc<dyn VectorStore>,
+    /// Optional embedding provider for generating vectors.
+    embedding_provider: Arc<dyn EmbeddingProvider>,
 }
 
 impl Remember {
@@ -251,7 +256,23 @@ impl Remember {
         Self {
             workspace: workspace.into(),
             lock: Mutex::new(()),
+            vector_store: Arc::new(NoopVectorStore::new()),
+            embedding_provider: Arc::new(NoopEmbedding),
         }
+    }
+
+    /// Inject a vector store + embedding provider for semantic indexing.
+    ///
+    /// When set, every `remember` call will also embed the text and upsert the
+    /// vector into the store, enabling semantic `recall` queries.
+    pub fn with_vector_store(
+        mut self,
+        store: Arc<dyn VectorStore>,
+        embedding: Arc<dyn EmbeddingProvider>,
+    ) -> Self {
+        self.vector_store = store;
+        self.embedding_provider = embedding;
+        self
     }
 }
 
@@ -303,22 +324,57 @@ impl Tool for Remember {
 
         let _guard = self.lock.lock().unwrap();
         let path = memory_path(&self.workspace);
-        let mut store = MemoryStore::load(&path)?;
-        let id = store.add(text, tags);
-        store.save(&path)?;
+        let mut file_store = MemoryStore::load(&path)?;
+        let id = file_store.add(text.clone(), tags.clone());
+        file_store.save(&path)?;
+        drop(_guard);
+
+        // Also index in the vector store if one is configured.
+        let ts = chrono::Utc::now().to_rfc3339();
+        let entry = MemoryEntry {
+            id: id.clone(),
+            text: text.clone(),
+            tags,
+            ts,
+        };
+        let vector = self.embedding_provider.embed(&text).await;
+        if let Err(e) = self.vector_store.upsert(&entry, vector).await {
+            tracing::warn!(error = %e, note_id = %id, "remember: vector upsert failed");
+        }
+
         Ok(format!("saved note {id}"))
     }
 }
 
 pub struct Recall {
     workspace: PathBuf,
+    /// Optional vector store for semantic retrieval.
+    vector_store: Arc<dyn VectorStore>,
+    /// Optional embedding provider for query vectorisation.
+    embedding_provider: Arc<dyn EmbeddingProvider>,
 }
 
 impl Recall {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            vector_store: Arc::new(NoopVectorStore::new()),
+            embedding_provider: Arc::new(NoopEmbedding),
         }
+    }
+
+    /// Inject a vector store + embedding provider for semantic retrieval.
+    ///
+    /// When set, `recall` will embed the query and perform cosine-similarity
+    /// search instead of keyword substring search.
+    pub fn with_vector_store(
+        mut self,
+        store: Arc<dyn VectorStore>,
+        embedding: Arc<dyn EmbeddingProvider>,
+    ) -> Self {
+        self.vector_store = store;
+        self.embedding_provider = embedding;
+        self
     }
 }
 
@@ -354,13 +410,52 @@ impl Tool for Recall {
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {
-        let query = arguments["query"].as_str();
+        let query = arguments["query"].as_str().unwrap_or("");
         let tag = arguments["tag"].as_str();
         let limit = arguments["limit"].as_i64().unwrap_or(10) as usize;
 
+        // Try vector search first; fall back to file-based keyword search
+        // when the vector store or embedding provider is a no-op.
+        let query_vec = self.embedding_provider.embed(query).await;
+        let use_vector = !query_vec.is_empty();
+
+        if use_vector || tag.is_none() {
+            // Use the vector store (semantic or keyword fallback inside the store).
+            match self.vector_store.search(query_vec, query, limit).await {
+                Ok(entries) if !entries.is_empty() => {
+                    // Apply tag filter if requested.
+                    let filtered: Vec<_> = entries
+                        .iter()
+                        .filter(|e| tag.map_or(true, |t| e.tags.iter().any(|et| et == t)))
+                        .take(limit)
+                        .collect();
+                    if !filtered.is_empty() {
+                        let lines: Vec<String> = filtered
+                            .iter()
+                            .map(|e| {
+                                let tags_str = if e.tags.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" [{}]", e.tags.join(","))
+                                };
+                                format!("{}{} {}", e.id, tags_str, e.text)
+                            })
+                            .collect();
+                        return Ok(lines.join("\n"));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "recall: vector search failed, falling back to file");
+                }
+            }
+        }
+
+        // File-based fallback (or when only tag filter is used).
         let path = memory_path(&self.workspace);
-        let store = MemoryStore::load(&path)?;
-        let results = store.search(query, tag, limit);
+        let file_store = MemoryStore::load(&path)?;
+        let query_opt = if query.is_empty() { None } else { Some(query) };
+        let results = file_store.search(query_opt, tag, limit);
 
         if results.is_empty() {
             return Ok("no matching notes found".to_string());
