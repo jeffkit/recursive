@@ -65,7 +65,10 @@ mod tests {
     #[tokio::test]
     async fn offline_mode_and_config_file_resolution() {
         let empty_home = tempfile::tempdir().expect("tempdir");
-        let _pin = crate::test_util::PinnedHome::new(empty_home.path());
+        // Use PinnedRecursiveHome (sets RECURSIVE_HOME) rather than PinnedHome
+        // because on Windows dirs::home_dir() resolves via SHGetKnownFolderPath
+        // and does not respond to runtime USERPROFILE / HOME changes.
+        let _pin = crate::test_util::PinnedRecursiveHome::new(empty_home.path());
 
         let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
         let prev_openai = std::env::var("OPENAI_API_KEY").ok();
