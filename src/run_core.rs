@@ -622,19 +622,17 @@ impl<'a> RunCore<'a> {
                 });
             }
 
-            if !completion.content.is_empty() {
-                self.emit(AgentEvent::AssistantText {
-                    text: completion.content.clone(),
-                    step,
-                });
-                final_message = Some(completion.content.clone());
-            }
-
             // Surface reasoning / thinking content to UI consumers
             // (TUI) as a separate event so it can be rendered as a
             // `thinking…` block. Providers that stream reasoning
             // tokens accumulate them into the final string before
             // this point; we emit exactly once per step.
+            //
+            // Emit this BEFORE AssistantText so the TUI's
+            // `Reasoning { text }` block lands above the matching
+            // `Assistant { text }` block in the transcript — the
+            // model thinks first, then speaks, and the visual order
+            // should match.
             if let Some(reasoning) = &completion.reasoning_content {
                 if !reasoning.is_empty() {
                     self.emit(AgentEvent::Reasoning {
@@ -642,6 +640,14 @@ impl<'a> RunCore<'a> {
                         step,
                     });
                 }
+            }
+
+            if !completion.content.is_empty() {
+                self.emit(AgentEvent::AssistantText {
+                    text: completion.content.clone(),
+                    step,
+                });
+                final_message = Some(completion.content.clone());
             }
 
             // ---- no tool calls → finish -------------------------------------------
