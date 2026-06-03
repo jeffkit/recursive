@@ -116,10 +116,7 @@ fn render_assistant(
     let mut out: Vec<Line<'static>> = Vec::new();
 
     if text.is_empty() {
-        out.push(Line::from(vec![
-            Span::styled("•", bullet_style),
-            indent,
-        ]));
+        out.push(Line::from(vec![Span::styled("•", bullet_style), indent]));
         return out;
     }
 
@@ -663,12 +660,7 @@ mod tests {
 
     #[test]
     fn user_block_carries_background_highlight() {
-        let lines = render_block(
-            &TranscriptBlock::User {
-                text: "hi".into(),
-            },
-            &theme::DARK,
-        );
+        let lines = render_block(&TranscriptBlock::User { text: "hi".into() }, &theme::DARK);
         let has_bg = lines[0]
             .spans
             .iter()
@@ -700,7 +692,9 @@ mod tests {
     #[test]
     fn reasoning_block_empty_text_still_shows_header() {
         let lines = render_block(
-            &TranscriptBlock::Reasoning { text: String::new() },
+            &TranscriptBlock::Reasoning {
+                text: String::new(),
+            },
             &theme::DARK,
         );
         assert!(line_text(&lines[0]).contains("thinking"));
@@ -718,10 +712,7 @@ mod tests {
         );
         let txt = line_text(&lines[0]);
         assert!(txt.contains("•"), "assistant must lead with a bullet");
-        assert!(
-            !txt.contains("Agent"),
-            "old `Agent` label should be gone"
-        );
+        assert!(!txt.contains("Agent"), "old `Agent` label should be gone");
         assert!(!txt.contains("⏱"), "latency should not be in the block");
         assert!(!txt.contains("streaming"), "no streaming label anymore");
     }
