@@ -74,6 +74,18 @@ impl ShadowRepo {
             name: "checkpoint".into(),
             message: format!("cannot canonicalize workspace: {e}"),
         })?;
+        // On Windows, std::fs::canonicalize() returns extended-length UNC paths
+        // (\\?\C:\...) which git does not accept as GIT_WORK_TREE values.
+        // Strip the prefix so git receives a plain drive-letter path.
+        #[cfg(windows)]
+        let workspace = {
+            let s = workspace.to_string_lossy();
+            if s.starts_with(r"\\?\") {
+                PathBuf::from(&s[4..])
+            } else {
+                workspace
+            }
+        };
         let shadow_dir = crate::paths::user_shadow_git_dir(&workspace)?;
         Self::open_at(workspace, shadow_dir)
     }
