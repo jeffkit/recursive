@@ -7,8 +7,6 @@
 //! When Goal 219 Commit 2 deletes the deprecated `Agent` path, this
 //! module will be the sole owner of these four types.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
 /// Decision returned by a permission hook to allow, deny, or transform a tool call.
@@ -22,16 +20,6 @@ pub enum PermissionDecision {
     /// Replace the arguments before execution.
     Transform(serde_json::Value),
 }
-
-/// Signature for a permission hook: `Fn(&tool_name, &arguments) -> PermissionDecision`.
-///
-/// The hook is invoked just before each tool execution. It can:
-/// - `Allow` the call unchanged,
-/// - `Deny` it with a reason (fed back as a tool error),
-/// - `Transform` the arguments before execution.
-///
-/// Hooks must be `Send + Sync` because the agent loop is `Send`.
-pub type PermissionHook = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionDecision + Send + Sync>;
 
 /// Controls whether the agent executes tools immediately or presents a plan first.
 #[derive(Debug, Clone, PartialEq, Default)]

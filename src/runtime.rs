@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::agent::{FinishReason, PlanningMode};
 use crate::checkpoint::{CheckpointId, ShadowRepo};
 use crate::checkpoint_log::{CheckpointLogWriter, CheckpointRecord, TouchedVia};
 use crate::error::Result;
@@ -34,6 +34,7 @@ use crate::message::Message;
 use crate::tools::plan_mode::{
     EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanModeRequestGate, RequestPlanModeTool,
 };
+use crate::tools::PermissionHook;
 use crate::tools::{TodoItem, TodoWriteTool, ToolRegistry, TouchedFiles};
 use crate::Compactor;
 
@@ -85,6 +86,121 @@ impl From<TurnOutcome> for RuntimeOutcome {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// CheckpointState
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Checkpoint subsystem state, grouped to reduce field count on [`AgentRuntime`].
+///
+/// When `shadow` and `session_id` are both `Some`, snapshotting is active.
+/// When `None`, all snapshot/log operations are no-ops.
+struct CheckpointState {
+    shadow: Option<Arc<ShadowRepo>>,
+    session_id: Option<String>,
+    /// 0-indexed turn counter used for checkpoint labels.
+    turn_index: usize,
+    writer: Option<CheckpointLogWriter>,
+    touched_files: Option<Arc<Mutex<TouchedFiles>>>,
+}
+
+impl CheckpointState {
+    fn disabled() -> Self {
+        Self {
+            shadow: None,
+            session_id: None,
+            turn_index: 0,
+            writer: None,
+            touched_files: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.shadow.is_some() && self.session_id.is_some()
+    }
+
+    /// Take a snapshot just before a turn begins. Errors are logged
+    /// as warnings and swallowed so a checkpoint failure cannot brick a run.
+    fn snapshot_pre_turn(&self, user_text: &str) -> Option<CheckpointId> {
+        let (repo, sid) = (self.shadow.as_ref()?, self.session_id.as_ref()?);
+        let label = format!(
+            "turn {} pre: {}",
+            self.turn_index,
+            truncate_label(user_text)
+        );
+        match repo.snapshot_for_session(sid, &label) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("checkpoint pre-snapshot failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Take a snapshot at the end of a turn, compute the touched-file set,
+    /// and append a [`CheckpointRecord`] to the log.
+    fn snapshot_post_turn(
+        &self,
+        user_text: &str,
+        pre: Option<&CheckpointId>,
+        started_at: i64,
+    ) -> Option<CheckpointId> {
+        let (repo, sid) = (self.shadow.as_ref()?, self.session_id.as_ref()?);
+        let label = format!(
+            "turn {} post: {}",
+            self.turn_index,
+            truncate_label(user_text)
+        );
+        let post = match repo.snapshot_for_session(sid, &label) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("checkpoint post-snapshot failed: {e}");
+                return None;
+            }
+        };
+
+        let (mut paths, saw_shell) = match &self.touched_files {
+            Some(slot) => match slot.lock() {
+                Ok(t) => (t.paths_sorted(), t.saw_shell),
+                Err(_) => (vec![], false),
+            },
+            None => (vec![], true),
+        };
+
+        let mut via = TouchedVia::Structured;
+        if saw_shell {
+            via = TouchedVia::ShellDiff;
+            if let Some(pre_id) = pre {
+                if let Ok(diff_paths) = repo.changed_paths(pre_id, &post) {
+                    let mut set: std::collections::HashSet<String> = paths.into_iter().collect();
+                    for p in diff_paths {
+                        set.insert(p);
+                    }
+                    let mut v: Vec<String> = set.into_iter().collect();
+                    v.sort();
+                    paths = v;
+                }
+            }
+        }
+
+        if let Some(writer) = &self.writer {
+            let rec = CheckpointRecord {
+                turn: self.turn_index,
+                pre: pre.cloned(),
+                post: post.clone(),
+                touched_files: paths,
+                touched_via: via,
+                started_at,
+                finished_at: unix_now(),
+            };
+            if let Err(e) = writer.append(&rec) {
+                tracing::warn!("checkpoint log append failed: {e}");
+            }
+        }
+
+        Some(post)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // AgentRuntime
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -108,26 +224,14 @@ pub struct AgentRuntime {
     /// Whether to request streaming responses from the LLM.
     streaming: bool,
     /// Optional permission hook for tool-call interception.
-    permission_hook: Option<PermissionHook>,
+    permission_hook: Option<Arc<dyn PermissionHook>>,
     /// Planning mode (immediate vs plan-first).
     planning_mode: PlanningMode,
     /// Optional compactor for cross-turn transcript summarization.
     compactor: Option<Compactor>,
-    /// Shadow git repo for per-turn workspace snapshots. `None` if
-    /// checkpoints are disabled (e.g. git unavailable, or the caller
-    /// chose not to wire it up).
-    shadow: Option<Arc<ShadowRepo>>,
-    /// Session id used as the checkpoint chain ref. Required for
-    /// checkpoints; without it `shadow` is ignored.
-    session_id: Option<String>,
-    /// 0-indexed turn counter, used to label checkpoint records.
-    turn_index: usize,
-    /// Append-only writer for `checkpoints.jsonl`.
-    checkpoint_writer: Option<CheckpointLogWriter>,
-    /// Touched-files collector shared with the tool registry. One
-    /// instance lives for the runtime's lifetime; it's cleared at
-    /// the start of every turn.
-    touched_files: Option<Arc<Mutex<TouchedFiles>>>,
+    /// Checkpoint subsystem (snapshot, session-id, writer, touched-files).
+    /// Grouped to reduce field count; inactive when checkpoints are disabled.
+    checkpoints: CheckpointState,
     /// Goal-167: shared task-list state written by `todo_write` calls.
     /// Read back via [`current_todos`](AgentRuntime::current_todos).
     todo_list: Arc<RwLock<Vec<TodoItem>>>,
@@ -195,15 +299,18 @@ impl AgentRuntime {
     pub async fn run(&mut self, user_text: impl Into<String>) -> Result<RuntimeOutcome> {
         let user_text = user_text.into();
 
-        tracing::Span::current().record("session_id", self.session_id.as_deref().unwrap_or(""));
+        tracing::Span::current().record(
+            "session_id",
+            self.checkpoints.session_id.as_deref().unwrap_or(""),
+        );
         tracing::debug!(
-            session_id = self.session_id.as_deref().unwrap_or(""),
-            turn = self.turn_index,
+            session_id = self.checkpoints.session_id.as_deref().unwrap_or(""),
+            turn = self.checkpoints.turn_index,
             "agent.turn: starting"
         );
 
         let started_at = unix_now();
-        let pre_id = self.snapshot_pre_turn(&user_text);
+        let pre_id = self.checkpoints.snapshot_pre_turn(&user_text);
         self.reset_touched_files();
         self.append_user_message(&user_text).await;
         self.maybe_compact_cross_turn().await?;
@@ -213,21 +320,23 @@ impl AgentRuntime {
         self.emit_turn_messages(&turn_outcome).await;
 
         let mut outcome: RuntimeOutcome = turn_outcome.into();
-        outcome.checkpoint_id = self.snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
+        outcome.checkpoint_id =
+            self.checkpoints
+                .snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
 
         tracing::info!(
             steps = outcome.steps,
             finish_reason = ?outcome.finish_reason,
             "agent.turn: finished"
         );
-        self.turn_index += 1;
+        self.checkpoints.turn_index += 1;
 
         Ok(outcome)
     }
 
     /// Reset the touched-files collector at the start of a turn.
     fn reset_touched_files(&self) {
-        if let Some(slot) = &self.touched_files {
+        if let Some(slot) = &self.checkpoints.touched_files {
             if let Ok(mut t) = slot.lock() {
                 *t = TouchedFiles::new();
             }
@@ -276,7 +385,7 @@ impl AgentRuntime {
         });
         self.event_sink
             .emit(AgentEvent::CompactionBoundary {
-                turn: self.turn_index as u32,
+                turn: self.checkpoints.turn_index as u32,
                 compacted_count: removed,
                 summary_uuid: None,
             })
@@ -488,7 +597,7 @@ impl AgentRuntime {
     /// and OTEL/Datadog traces can be filtered per session via
     /// `RUST_LOG=recursive[{session_id}]=debug` or the `session_id` label.
     pub fn set_session_id(&mut self, id: impl Into<String>) {
-        self.session_id = Some(id.into());
+        self.checkpoints.session_id = Some(id.into());
     }
 
     /// Set a new event sink (useful for REPL mode between turns).
@@ -869,115 +978,22 @@ impl AgentRuntime {
         tools.register_mut(Arc::new(crate::tools::CheckpointList::new(ctx.clone())));
         tools.register_mut(Arc::new(crate::tools::CheckpointDiff::new(ctx)));
 
-        self.shadow = Some(shadow);
-        self.session_id = Some(session_id);
-        self.checkpoint_writer = Some(writer);
-        self.touched_files = touched_slot;
+        self.checkpoints.shadow = Some(shadow);
+        self.checkpoints.session_id = Some(session_id);
+        self.checkpoints.writer = Some(writer);
+        self.checkpoints.touched_files = touched_slot;
         Ok(())
     }
 
     /// Whether checkpoint snapshots are active.
     pub fn checkpoints_enabled(&self) -> bool {
-        self.shadow.is_some() && self.session_id.is_some()
+        self.checkpoints.enabled()
     }
 
     /// Returns the 0-indexed counter that will be assigned to the
     /// *next* turn (i.e. the count of turns already executed).
     pub fn turn_index(&self) -> usize {
-        self.turn_index
-    }
-
-    /// Take a snapshot just before a turn begins. Errors are logged
-    /// as warnings and swallowed so that a checkpoint failure cannot
-    /// brick a run.
-    fn snapshot_pre_turn(&self, user_text: &str) -> Option<CheckpointId> {
-        let (repo, sid) = match (self.shadow.as_ref(), self.session_id.as_ref()) {
-            (Some(r), Some(s)) => (r, s),
-            _ => return None,
-        };
-        let label = format!(
-            "turn {} pre: {}",
-            self.turn_index,
-            truncate_label(user_text)
-        );
-        match repo.snapshot_for_session(sid, &label) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::warn!("checkpoint pre-snapshot failed: {e}");
-                None
-            }
-        }
-    }
-
-    /// Take a snapshot at the end of a turn, compute the touched-file
-    /// set, and append a `CheckpointRecord` to the log.
-    fn snapshot_post_turn(
-        &self,
-        user_text: &str,
-        pre: Option<&CheckpointId>,
-        started_at: i64,
-    ) -> Option<CheckpointId> {
-        let (repo, sid) = match (self.shadow.as_ref(), self.session_id.as_ref()) {
-            (Some(r), Some(s)) => (r, s),
-            _ => return None,
-        };
-
-        let label = format!(
-            "turn {} post: {}",
-            self.turn_index,
-            truncate_label(user_text)
-        );
-        let post = match repo.snapshot_for_session(sid, &label) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!("checkpoint post-snapshot failed: {e}");
-                return None;
-            }
-        };
-
-        // Determine touched files.
-        let (mut paths, saw_shell) = match &self.touched_files {
-            Some(slot) => match slot.lock() {
-                Ok(t) => (t.paths_sorted(), t.saw_shell),
-                Err(_) => (vec![], false),
-            },
-            None => (vec![], true), // No collector → conservative fallback.
-        };
-
-        let mut via = TouchedVia::Structured;
-        if saw_shell {
-            via = TouchedVia::ShellDiff;
-            // Fall back to diffing pre vs post and unioning with structured paths.
-            if let Some(pre_id) = pre {
-                if let Ok(diff_paths) = repo.changed_paths(pre_id, &post) {
-                    let mut set: std::collections::HashSet<String> = paths.into_iter().collect();
-                    for p in diff_paths {
-                        set.insert(p);
-                    }
-                    let mut v: Vec<String> = set.into_iter().collect();
-                    v.sort();
-                    paths = v;
-                }
-            }
-        }
-
-        // Append record.
-        if let Some(writer) = &self.checkpoint_writer {
-            let rec = CheckpointRecord {
-                turn: self.turn_index,
-                pre: pre.cloned(),
-                post: post.clone(),
-                touched_files: paths,
-                touched_via: via,
-                started_at,
-                finished_at: unix_now(),
-            };
-            if let Err(e) = writer.append(&rec) {
-                tracing::warn!("checkpoint log append failed: {e}");
-            }
-        }
-
-        Some(post)
+        self.checkpoints.turn_index
     }
 }
 
@@ -1015,7 +1031,7 @@ pub struct AgentRuntimeBuilder {
     system_prompt: Option<String>,
     seed: Vec<Message>,
     streaming: bool,
-    permission_hook: Option<PermissionHook>,
+    permission_hook: Option<Arc<dyn PermissionHook>>,
     planning_mode: PlanningMode,
     saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
@@ -1150,7 +1166,7 @@ impl AgentRuntimeBuilder {
     }
 
     /// Set an optional permission hook for tool-call interception.
-    pub fn permission_hook(mut self, hook: PermissionHook) -> Self {
+    pub fn permission_hook(mut self, hook: Arc<dyn PermissionHook>) -> Self {
         self.permission_hook = Some(hook);
         self
     }
@@ -1234,11 +1250,7 @@ impl AgentRuntimeBuilder {
             permission_hook: self.permission_hook,
             planning_mode: self.planning_mode,
             compactor: self.compactor,
-            shadow: None,
-            session_id: None,
-            turn_index: 0,
-            checkpoint_writer: None,
-            touched_files: None,
+            checkpoints: CheckpointState::disabled(),
             todo_list,
             plan_approval_gate,
             plan_mode_request_gate,

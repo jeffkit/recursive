@@ -195,20 +195,30 @@ struct TuiPermissionHook {
 
 #[async_trait]
 impl PermissionHook for TuiPermissionHook {
-    async fn ask_permission(&self, tool_name: &str, args_preview: &str) -> bool {
+    async fn check(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> crate::agent::PermissionDecision {
+        use crate::agent::PermissionDecision;
         if !self.enabled.load(Ordering::Relaxed) {
-            return true;
+            return PermissionDecision::Allow;
         }
+        let args_preview = crate::tools::args_preview_for_permission(args);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<bool>();
         let req = PermissionRequest {
             tool_name: tool_name.to_string(),
-            args_preview: args_preview.to_string(),
+            args_preview,
             reply: reply_tx,
         };
         if self.tx.send(req).is_err() {
-            return true; // UI dropped — allow so agent isn't stuck.
+            return PermissionDecision::Allow; // UI dropped — allow so agent isn't stuck.
         }
-        reply_rx.await.unwrap_or(false)
+        if reply_rx.await.unwrap_or(false) {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny("denied by user".to_string())
+        }
     }
 }
 
