@@ -115,7 +115,13 @@ pub(crate) fn current_hostname() -> String {
 /// would rather refuse a resume than corrupt a session. Power
 /// users on those platforms can remove `.lock` manually.
 fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, /proc/<pid> exists iff the process is alive.
+        // This avoids the ambiguity of kill(1) exit codes for out-of-range PIDs.
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         std::process::Command::new("/bin/kill")
             .arg("-0")

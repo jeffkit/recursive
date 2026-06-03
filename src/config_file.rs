@@ -306,13 +306,27 @@ temperature = 0.5
     #[test]
     fn test_load_layered_permissions_session_layer_always_present() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = load_layered_permissions(tmp.path());
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let fake_home = tmp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        // Isolate HOME so a concurrent test's HOME mutation can't add a User layer.
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &fake_home);
+        let config = load_layered_permissions(&workspace);
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
         // Session layer is always present
         assert!(config
             .layers
             .iter()
             .any(|l| l.source == RuleSource::Session));
-        // Even with no config files, we get the session layer
+        // Even with no config files, we get only the session layer
         assert_eq!(config.layers.len(), 1);
         assert_eq!(config.layers[0].source, RuleSource::Session);
     }

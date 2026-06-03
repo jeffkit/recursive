@@ -989,21 +989,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn discover_collects_executable() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let exec = tmp.path().join("hook.sh");
         std::fs::write(&exec, "#!/bin/sh\necho '{\"action\":\"continue\"}'").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&exec).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&exec, perms).unwrap();
-        }
+        let mut perms = std::fs::metadata(&exec).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&exec, perms).unwrap();
         let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
-        #[cfg(unix)]
         assert_eq!(runner.len(), 1);
-        // On non-Unix, nothing is executable so we expect 0.
     }
 
     #[test]
@@ -1025,7 +1021,9 @@ mod tests {
     // ── Integration test: run a real shell script ───────────────
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn dispatch_runs_executable_hook_and_returns_decision() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hook_path = tmp.path().join("my-hook.sh");
 
@@ -1035,27 +1033,19 @@ read -r line
 echo '{"action":"skip","message":"blocked by test hook"}'
 "#;
         std::fs::write(&hook_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_path, perms).unwrap();
-        }
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
 
         let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
-
-        #[cfg(unix)]
-        {
-            assert_eq!(runner.len(), 1);
-            let input = make_tool_input(
-                HookEvent::PreToolCall,
-                "run_shell",
-                serde_json::json!({"command": "ls"}),
-            );
-            let result = runner.dispatch(&input).await;
-            assert!(matches!(result.action, HookAction::Skip));
-        }
+        assert_eq!(runner.len(), 1);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "run_shell",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        assert!(matches!(result.action, HookAction::Skip));
     }
 
     #[tokio::test]
@@ -1071,71 +1061,61 @@ echo '{"action":"skip","message":"blocked by test hook"}'
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn dispatch_treats_timeout_as_continue() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hook_path = tmp.path().join("hang.sh");
 
         // A hook that hangs (sleeps 30s — longer than the 5s timeout).
         let script = "#!/bin/sh\nsleep 30\n";
         std::fs::write(&hook_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_path, perms).unwrap();
-        }
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
 
         let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
-
-        #[cfg(unix)]
-        {
-            assert_eq!(runner.len(), 1);
-            let input = make_tool_input(
-                HookEvent::PreToolCall,
-                "run_shell",
-                serde_json::json!({"command": "ls"}),
-            );
-            let result = runner.dispatch(&input).await;
-            // Timeout → fail-open → Continue.
-            assert!(matches!(result.action, HookAction::Continue));
-        }
+        assert_eq!(runner.len(), 1);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "run_shell",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        // Timeout → fail-open → Continue.
+        assert!(matches!(result.action, HookAction::Continue));
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn dispatch_treats_bad_output_as_continue() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hook_path = tmp.path().join("bad.sh");
 
         // A hook that outputs invalid JSON.
         let script = "#!/bin/sh\necho 'not json'\n";
         std::fs::write(&hook_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_path, perms).unwrap();
-        }
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
 
         let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
-
-        #[cfg(unix)]
-        {
-            assert_eq!(runner.len(), 1);
-            let input = make_tool_input(
-                HookEvent::PreToolCall,
-                "run_shell",
-                serde_json::json!({"command": "ls"}),
-            );
-            let result = runner.dispatch(&input).await;
-            // Bad output → fail-open → Continue.
-            assert!(matches!(result.action, HookAction::Continue));
-        }
+        assert_eq!(runner.len(), 1);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "run_shell",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        // Bad output → fail-open → Continue.
+        assert!(matches!(result.action, HookAction::Continue));
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn dispatch_short_circuits_on_first_non_continue() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
 
         // Hook 1: returns skip.
@@ -1148,29 +1128,21 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         let s2 = "#!/bin/sh\nread -r line\necho '{\"action\":\"continue\"}'\n";
         std::fs::write(&h2, s2).unwrap();
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for p in [&h1, &h2] {
-                let mut perms = std::fs::metadata(p).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(p, perms).unwrap();
-            }
+        for p in [&h1, &h2] {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).unwrap();
         }
 
         let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
-
-        #[cfg(unix)]
-        {
-            assert_eq!(runner.len(), 2);
-            let input = make_tool_input(
-                HookEvent::PreToolCall,
-                "write_file",
-                serde_json::json!({"path": "test.txt"}),
-            );
-            let result = runner.dispatch(&input).await;
-            assert!(matches!(result.action, HookAction::Skip));
-        }
+        assert_eq!(runner.len(), 2);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "write_file",
+            serde_json::json!({"path": "test.txt"}),
+        );
+        let result = runner.dispatch(&input).await;
+        assert!(matches!(result.action, HookAction::Skip));
     }
 
     // ── Goal 204 new tests ──────────────────────────────────────
