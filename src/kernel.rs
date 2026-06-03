@@ -26,7 +26,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::agent::{FinishReason, PlanningMode};
 use crate::compact::Compactor;
 use crate::event::AgentEvent;
 use crate::hooks::HookRegistry;
@@ -35,6 +35,7 @@ use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::storage::{NoopSessionStore, SessionStore, StorageBackend};
 use crate::tool_set_provider::ToolSetProvider;
+use crate::tools::PermissionHook;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ pub struct TurnContext {
     pub streaming: bool,
 
     /// Optional permission hook for gating tool calls.
-    pub permission_hook: Option<PermissionHook>,
+    pub permission_hook: Option<Arc<dyn PermissionHook>>,
 
     /// Planning mode (execute immediately vs buffer for confirmation).
     pub planning_mode: PlanningMode,

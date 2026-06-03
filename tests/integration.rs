@@ -8,12 +8,13 @@
 use std::sync::Arc;
 
 use recursive::{
-    agent::{FinishReason, PermissionDecision, PermissionHook},
+    agent::{FinishReason, PermissionDecision},
     compact::Compactor,
     hooks::{Hook, HookAction, HookEvent},
     llm::{Completion, MockProvider, ToolCall},
     message::Message,
     runtime::AgentRuntime,
+    tools::PermissionHook,
     tools::{LocalTransport, ToolRegistry, ToolTransport},
 };
 use serde_json::json;
@@ -329,19 +330,23 @@ async fn permission_hook_and_sub_agent() {
         )));
 
     // Permission hook: deny run_shell, allow everything else.
-    let permission_hook: PermissionHook = Arc::new(|name, _args| {
-        if name == "run_shell" {
-            PermissionDecision::Deny("run_shell is not allowed".into())
-        } else {
-            PermissionDecision::Allow
+    struct DenyShellHook;
+    #[async_trait::async_trait]
+    impl PermissionHook for DenyShellHook {
+        async fn check(&self, tool_name: &str, _args: &serde_json::Value) -> PermissionDecision {
+            if tool_name == "run_shell" {
+                PermissionDecision::Deny("run_shell is not allowed".into())
+            } else {
+                PermissionDecision::Allow
+            }
         }
-    });
+    }
     let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(all_tools)
         .system_prompt("you are a test agent with permission hook")
         .max_steps(10)
-        .permission_hook(permission_hook)
+        .permission_hook(Arc::new(DenyShellHook))
         .build()
         .unwrap();
 

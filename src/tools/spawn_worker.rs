@@ -23,12 +23,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::agent::{FinishReason, PlanningMode};
 use crate::error::{Error, Result};
 use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
+use crate::tools::PermissionHook;
 use crate::tools::{Tool, ToolRegistry, ToolSideEffect};
 
 // ---------------------------------------------------------------------------
@@ -126,7 +127,7 @@ pub struct SpawnWorkerTool {
     all_tools: ToolRegistry,
     max_depth: usize,
     current_depth: usize,
-    permission_hook: Option<PermissionHook>,
+    permission_hook: Option<Arc<dyn PermissionHook>>,
     /// Optional registry — when set, each spawned worker is registered so
     /// a coordinator can send mid-run messages via `send_message`.
     registry: Option<crate::tools::send_message::WorkerRegistry>,
@@ -139,7 +140,7 @@ impl SpawnWorkerTool {
         all_tools: ToolRegistry,
         max_depth: usize,
         current_depth: usize,
-        permission_hook: Option<PermissionHook>,
+        permission_hook: Option<Arc<dyn PermissionHook>>,
     ) -> Self {
         Self {
             workspace: workspace.into(),
