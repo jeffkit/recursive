@@ -36,3 +36,6 @@ e2e/plugins/node_modules/
 e2e/plugins/dist/
 e2e/.argusai/
 .gitnexus
+
+# macOS Finder metadata (per-directory, never project state)
+.DS_Store

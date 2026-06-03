@@ -776,6 +776,15 @@ mod tests {
     #[test]
     fn provider_preset_resolution_chain() {
         use std::sync::OnceLock;
+        // Hold the process-wide env lock for the whole test body. The
+        // test mutates RECURSIVE_API_KEY / RECURSIVE_MODEL /
+        // DEEPSEEK_API_KEY / etc. via raw std::env::set_var — those
+        // are not protected by PinnedRecursiveHome (which only pins
+        // RECURSIVE_HOME), so without this lock the test races with
+        // state::tests::detect_model_name_falls_back_to_config_file
+        // and runtime_builder::tests::offline_mode_and_config_file_resolution
+        // under parallel test load.
+        let _env_lock = crate::test_util::env_lock();
         // One PinnedRecursiveHome for the whole test; sequential sections
         // mutate env under its lock. We use PinnedRecursiveHome (not
         // PinnedHome) so the test reads its own config.toml via the
