@@ -434,12 +434,15 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                     current_table_row.push(std::mem::take(&mut current_table_cell));
                 }
                 TagEnd::TableHead => {
-                    table_rows.push(std::mem::take(&mut current_table_row));
-                    // Insert a separator row so render_table draws a header line.
-                    let sep_row: Vec<String> = (0..table_rows.last().map_or(0, |r| r.len()))
-                        .map(|_| "---".to_string())
-                        .collect();
-                    table_rows.push(sep_row);
+                    // NOTE: TagEnd::TableRow fires BEFORE TagEnd::TableHead for
+                    // the header row, so `current_table_row` is already empty and
+                    // the header row is already in `table_rows`. Do NOT push
+                    // current_table_row again — that would add a spurious empty row.
+                    // Just append the separator row based on the header's column count.
+                    let ncols = table_rows.last().map_or(0, |r| r.len());
+                    if ncols > 0 {
+                        table_rows.push((0..ncols).map(|_| "---".to_string()).collect());
+                    }
                 }
                 TagEnd::TableRow => {
                     table_rows.push(std::mem::take(&mut current_table_row));
