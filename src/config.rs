@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::providers::{find_preset, ProviderPreset};
 use crate::tools::episodic_recall::episodic_recall_summary;
 use crate::tools::facts::facts_summary;
 use crate::tools::memory::memory_summary;
@@ -19,6 +20,9 @@ pub struct Config {
     pub api_key: Option<String>,
     pub model: String,
     pub provider_type: String,
+    /// Preset id resolved from `provider.preset` in the config file.
+    /// `None` when the user did not opt in (or the file was absent).
+    pub preset: Option<String>,
     pub max_steps: usize,
     pub temperature: f64,
     pub system_prompt: String,
@@ -35,7 +39,24 @@ pub struct Config {
 
 impl Config {
     /// Load from environment, with config file (~/.recursive/config.toml) as fallback.
-    /// Priority: env var > config file > hardcoded default.
+    ///
+    /// Precedence (highest first), applied to `api_base` / `api_key` / `model` /
+    /// `provider_type`:
+    ///
+    ///   1. env var (e.g. `RECURSIVE_API_BASE`, `OPENAI_API_KEY`)
+    ///   2. explicit field in the file's `[provider]` section
+    ///   3. preset field — `provider.preset = "<id>"` looks up the bundled
+    ///      `providers.toml` and takes its `api_base` / `default_model` /
+    ///      `provider_type`. For `api_key`, step 3 instead consults
+    ///      `std::env::var(preset.key_env)` (e.g. `DEEPSEEK_API_KEY`).
+    ///   4. hardcoded default
+    ///
+    /// The api_key chain is asymmetric: the *generic* env vars in step 1
+    /// (`RECURSIVE_API_KEY` / `OPENAI_API_KEY`) rank above the file's explicit
+    /// `api_key`, but a preset's *specific* env var in step 3 ranks below it.
+    /// Inverting step 3 would silently override a user's `api_key = "sk-old"`
+    /// whenever `DEEPSEEK_API_KEY` happened to be in their shell.
+    ///
     /// The API key is optional here so commands that don't need the LLM
     /// (e.g. `tools`, `config`) still run.
     pub fn from_env() -> Result<Self> {
@@ -48,6 +69,26 @@ impl Config {
         let file_provider = file_config.provider.as_ref();
         let file_agent = file_config.agent.as_ref();
 
+        // Resolve preset (if any). Unknown id is a hard error so users
+        // see a typo at startup rather than silent default-fallback.
+        let preset: Option<&'static ProviderPreset> =
+            match file_provider.and_then(|p| p.preset.as_deref()) {
+                None => None,
+                Some(id) => Some(find_preset(id).ok_or_else(|| {
+                    let known: Vec<&str> = crate::providers::all_presets()
+                        .iter()
+                        .map(|p| p.id.as_str())
+                        .collect();
+                    Error::Config {
+                        message: format!(
+                            "provider.preset = {:?} not found in providers.toml. Valid ids: {}",
+                            id,
+                            known.join(", "),
+                        ),
+                    }
+                })?),
+            };
+
         let workspace = std::env::var("RECURSIVE_WORKSPACE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -56,17 +97,26 @@ impl Config {
             .or_else(|_| std::env::var("OPENAI_API_BASE"))
             .ok()
             .or_else(|| file_provider.and_then(|p| p.api_base.clone()))
+            .or_else(|| preset.map(|p| p.api_base.clone()))
             .unwrap_or_else(|| "https://api.anthropic.com".into());
 
+        // api_key chain: generic env (above file) → file explicit → preset's
+        // key_env (below file, so explicit file wins) → None.
         let api_key = std::env::var("RECURSIVE_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok()
-            .or_else(|| file_provider.and_then(|p| p.api_key.clone()));
+            .or_else(|| file_provider.and_then(|p| p.api_key.clone()))
+            .or_else(|| {
+                preset
+                    .filter(|p| !p.key_env.is_empty())
+                    .and_then(|p| std::env::var(&p.key_env).ok())
+            });
 
         let model = std::env::var("RECURSIVE_MODEL")
             .or_else(|_| std::env::var("OPENAI_MODEL"))
             .ok()
             .or_else(|| file_provider.and_then(|p| p.model.clone()))
+            .or_else(|| preset.map(|p| p.default_model.clone()))
             .unwrap_or_else(|| "claude-sonnet-4-6".into());
 
         let max_steps = std::env::var("RECURSIVE_MAX_STEPS")
@@ -114,6 +164,7 @@ impl Config {
         let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
             .ok()
             .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
+            .or_else(|| preset.map(|p| p.provider_type.clone()))
             .unwrap_or_else(|| "anthropic".into());
 
         let memory_summary_limit = std::env::var("RECURSIVE_MEMORY_SUMMARY_LIMIT")
@@ -183,6 +234,7 @@ impl Config {
             api_key,
             model,
             provider_type,
+            preset: preset.map(|p| p.id.clone()),
             max_steps,
             temperature,
             system_prompt,
@@ -198,7 +250,7 @@ impl Config {
     /// Return the API key or a descriptive error if none was configured.
     pub fn require_api_key(&self) -> Result<&str> {
         self.api_key.as_deref().ok_or_else(|| Error::Config {
-            message: "set RECURSIVE_API_KEY (or OPENAI_API_KEY)".into(),
+            message: "set RECURSIVE_API_KEY (or OPENAI_API_KEY), or set RECURSIVE_PROVIDER_TYPE and the matching provider's *_API_KEY env var".into(),
         })
     }
 
@@ -214,9 +266,12 @@ Set one of:
   RECURSIVE_API_KEY=<KEY>
   OPENAI_API_KEY=<KEY>
 
-Or create ~/.recursive/config.toml:
+Or use a preset (auto-fills api_base / model / type, pulls the key from
+the preset's env var like DEEPSEEK_API_KEY):
+  recursive init --provider deepseek
+  # or write ~/.recursive/config.toml:
   [provider]
-  api_key = \"your-key-here\"
+  preset = \"deepseek\"
 
 Example:
   recursive --api-key sk-xxx --model deepseek-chat run \"hello\"
@@ -229,7 +284,8 @@ Example:
 Error: Unknown provider type '{}'.
 
 Supported providers: openai, anthropic
-Set via --provider or RECURSIVE_PROVIDER_TYPE.
+Set via --provider, RECURSIVE_PROVIDER_TYPE, or by using
+`provider.preset = \"<id>\"` in ~/.recursive/config.toml.
 ",
                 self.provider_type
             ));
@@ -430,6 +486,7 @@ mod tests {
             api_key: None,
             model: String::new(),
             provider_type: "openai".into(),
+            preset: None,
             max_steps: 32,
             temperature: 0.2,
             system_prompt: String::new(),
@@ -706,6 +763,179 @@ mod tests {
         std::env::remove_var("RECURSIVE_API_KEY");
         if let Some(v) = original_headless {
             std::env::set_var("RECURSIVE_HEADLESS", v);
+        }
+    }
+
+    // ── Goal: provider.preset resolution chain ─────────────────────────
+    //
+    // ONE consolidated test on purpose. Per .dev/AGENTS.md §5 and the
+    // `shell_timeout_default_and_env_override` precedent at lines 495-514,
+    // env-mutating tests cannot be split: `set_var` / `remove_var` are
+    // process-global and parallel tests would race on them. PinnedHome
+    // (test_util) holds the env lock for the whole body.
+    #[test]
+    fn provider_preset_resolution_chain() {
+        use std::sync::OnceLock;
+        // One PinnedRecursiveHome for the whole test; sequential sections
+        // mutate env under its lock. We use PinnedRecursiveHome (not
+        // PinnedHome) so the test reads its own config.toml via the
+        // RECURSIVE_HOME short-circuit in `config_file_path` — pinning
+        // HOME alone still races with tests that mutate HOME without
+        // holding the env lock, because `dirs::home_dir` re-resolves
+        // through getpwuid_r on macOS.
+        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let tmp = HOME.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let _g = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("mkdir");
+
+        // Save originals so we can restore on Drop-ish (test exit).
+        let orig_api_key = std::env::var("RECURSIVE_API_KEY").ok();
+        let orig_openai_key = std::env::var("OPENAI_API_KEY").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_openai_model = std::env::var("OPENAI_MODEL").ok();
+        let orig_api_base = std::env::var("RECURSIVE_API_BASE").ok();
+        let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+        let orig_provider = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
+
+        // Write a config that says: use the deepseek preset.
+        std::fs::write(
+            &config_path,
+            r#"[provider]
+preset = "deepseek"
+"#,
+        )
+        .expect("write config");
+
+        // Clear everything we touch.
+        for v in &[
+            "RECURSIVE_API_KEY",
+            "OPENAI_API_KEY",
+            "RECURSIVE_MODEL",
+            "OPENAI_MODEL",
+            "RECURSIVE_API_BASE",
+            "DEEPSEEK_API_KEY",
+            "RECURSIVE_PROVIDER_TYPE",
+        ] {
+            std::env::remove_var(v);
+        }
+
+        // Case 1: preset fills all four fields when no env / no explicit file.
+        {
+            let c = Config::from_env().expect("case 1");
+            assert_eq!(c.preset.as_deref(), Some("deepseek"));
+            assert_eq!(c.provider_type, "openai");
+            assert_eq!(c.api_base, "https://api.deepseek.com/v1");
+            assert_eq!(c.model, "deepseek-chat");
+            assert!(
+                c.api_key.is_none(),
+                "no key_env set, no env, no file → None"
+            );
+        }
+
+        // Case 2: explicit `api_key` in file beats preset's key_env env var.
+        // This is the asymmetric step-3-bellow-file-explicit guarantee.
+        {
+            std::env::set_var("DEEPSEEK_API_KEY", "sk-from-env");
+            std::fs::write(
+                &config_path,
+                r#"[provider]
+preset = "deepseek"
+api_key = "sk-from-file"
+"#,
+            )
+            .expect("rewrite config");
+            let c = Config::from_env().expect("case 2");
+            assert_eq!(
+                c.api_key.as_deref(),
+                Some("sk-from-file"),
+                "file api_key must win over preset.key_env env var"
+            );
+        }
+
+        // Case 3: RECURSIVE_API_KEY (generic, step 1) beats explicit file api_key.
+        // This is pre-existing behavior — regression guard.
+        {
+            std::env::set_var("RECURSIVE_API_KEY", "sk-generic-env");
+            let c = Config::from_env().expect("case 3");
+            assert_eq!(
+                c.api_key.as_deref(),
+                Some("sk-generic-env"),
+                "RECURSIVE_API_KEY must win over file api_key (existing behavior)"
+            );
+        }
+
+        // Case 4: preset's key_env env var is consulted only when file
+        // api_key is absent AND no generic env is set.
+        {
+            std::env::remove_var("RECURSIVE_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::fs::write(
+                &config_path,
+                r#"[provider]
+preset = "deepseek"
+"#,
+            )
+            .expect("rewrite config");
+            let c = Config::from_env().expect("case 4");
+            assert_eq!(
+                c.api_key.as_deref(),
+                Some("sk-from-env"),
+                "preset.key_env env var should be used when no explicit key anywhere"
+            );
+        }
+
+        // Case 5: unknown preset id → Error::Config with id list.
+        {
+            std::env::remove_var("DEEPSEEK_API_KEY");
+            std::fs::write(
+                &config_path,
+                r#"[provider]
+preset = "this-is-not-a-preset"
+"#,
+            )
+            .expect("rewrite config");
+            let err = Config::from_env().expect_err("case 5 should fail");
+            let msg = format!("{err}");
+            assert!(msg.contains("this-is-not-a-preset"), "msg was: {msg}");
+            assert!(msg.contains("deepseek"), "msg should list valid ids: {msg}");
+        }
+
+        // Case 6: ollama (key_env == "") skips env lookup, api_key stays None.
+        {
+            std::env::remove_var("DEEPSEEK_API_KEY");
+            std::env::set_var("OLLAMA_API_KEY", "should-be-ignored");
+            std::fs::write(
+                &config_path,
+                r#"[provider]
+preset = "ollama"
+"#,
+            )
+            .expect("rewrite config");
+            let c = Config::from_env().expect("case 6");
+            assert_eq!(c.preset.as_deref(), Some("ollama"));
+            assert!(
+                c.api_key.is_none(),
+                "ollama has key_env='' so the OLLAMA_API_KEY env must not be consulted"
+            );
+        }
+        std::env::remove_var("OLLAMA_API_KEY");
+
+        // Restore originals.
+        for (name, prev) in [
+            ("RECURSIVE_API_KEY", orig_api_key.as_deref()),
+            ("OPENAI_API_KEY", orig_openai_key.as_deref()),
+            ("RECURSIVE_MODEL", orig_model.as_deref()),
+            ("OPENAI_MODEL", orig_openai_model.as_deref()),
+            ("RECURSIVE_API_BASE", orig_api_base.as_deref()),
+            ("DEEPSEEK_API_KEY", orig_deepseek.as_deref()),
+            ("RECURSIVE_PROVIDER_TYPE", orig_provider.as_deref()),
+        ] {
+            if let Some(v) = prev {
+                std::env::set_var(name, v);
+            } else {
+                std::env::remove_var(name);
+            }
         }
     }
 }

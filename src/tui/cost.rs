@@ -89,27 +89,15 @@ pub fn default_pricing_table() -> HashMap<&'static str, (f64, f64)> {
 
 /// Return the model name to display in the status bar.
 ///
-/// Honours the same priority chain `Backend::build_runtime` does:
-/// `RECURSIVE_MODEL` / `OPENAI_MODEL` env vars, then
-/// `~/.recursive/config.toml`'s `[provider].model`, then the
-/// hardcoded `gpt-4o-mini` default. Without this fallback the
-/// status bar would show "gpt-4o-mini" even when the runtime is
-/// actually talking to DeepSeek/etc.
+/// Delegates to `Config::from_env()` so the TUI shows the same model the
+/// runtime will actually use — including the `provider.preset` chain added
+/// for the preset-config goal. Without this, a user with
+/// `provider.preset = "deepseek"` would see "claude-sonnet-4-6" in the
+/// status bar while the agent talked to DeepSeek.
 pub fn detect_model_name() -> String {
-    if let Ok(m) = std::env::var("RECURSIVE_MODEL") {
-        return m;
-    }
-    if let Ok(m) = std::env::var("OPENAI_MODEL") {
-        return m;
-    }
-    if let Ok(Some(cfg)) = crate::config_file::FileConfig::load() {
-        if let Some(m) = cfg.provider.and_then(|p| p.model) {
-            if !m.is_empty() {
-                return m;
-            }
-        }
-    }
-    "gpt-4o-mini".to_string()
+    crate::config::Config::from_env()
+        .map(|c| c.model)
+        .unwrap_or_else(|_| "gpt-4o-mini".to_string())
 }
 
 /// Compute estimated cost in USD given accumulated tokens and a

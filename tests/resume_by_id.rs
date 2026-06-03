@@ -58,7 +58,8 @@ fn resume_by_full_id_round_trips_seed() {
 
     let specs = make_specs("read_file");
     let mut w =
-        SessionWriter::create_with_tools(&ws, "round trip", "model", "openai", &specs).unwrap();
+        SessionWriter::create_with_tools(&ws, "round trip", "model", "openai", &specs, None)
+            .unwrap();
     let dir = w.session_dir().to_path_buf();
     w.append(&Message::user("hello".to_string()), None, None)
         .unwrap();
@@ -202,7 +203,7 @@ fn tool_registry_hash_round_trip_via_create_with_tools() {
     let _h = HomeOverride::new();
     let ws = workspace();
     let specs = make_specs("write_file");
-    let w = SessionWriter::create_with_tools(&ws, "hashed", "m", "p", &specs).unwrap();
+    let w = SessionWriter::create_with_tools(&ws, "hashed", "m", "p", &specs, None).unwrap();
     let dir = w.session_dir().to_path_buf();
     drop(w);
 

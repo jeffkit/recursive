@@ -147,7 +147,23 @@ enum Cmd {
         addr: String,
     },
     /// Interactive setup wizard — configure provider, model, and API key.
-    Init,
+    /// Non-interactive: pass all three of `--provider` / `--model` / `--api-key`
+    /// to skip the prompts and write the config directly. With only some set,
+    /// the missing fields are still prompted for.
+    Init {
+        /// Provider preset id from providers.toml (e.g. "deepseek", "anthropic").
+        /// Writes `provider.preset` to the config so the runtime can resolve
+        /// api_base / model / type from the catalog.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model name. Defaults to the preset's `default_model`.
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+        /// API key. If omitted, falls back to the preset's `key_env` env var,
+        /// then prompts.
+        #[arg(long, short = 'k', hide_env_values = true)]
+        api_key: Option<String>,
+    },
     /// Print registered tool specs as JSON (sanity check).
     Tools,
     /// Pretty-print a previously saved transcript JSON file, or resume a
@@ -497,7 +513,11 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("shutdown: HTTP server stopped gracefully");
             Ok(())
         }
-        Cmd::Init => cli::init::run_init().await,
+        Cmd::Init {
+            provider,
+            model,
+            api_key,
+        } => cli::init::run_init(provider, model, api_key).await,
         Cmd::Run { goal } => {
             let shutdown = shutdown_signal();
             run_once(
@@ -673,6 +693,9 @@ async fn main() -> anyhow::Result<()> {
                     println!("  goal:            {}", meta.goal);
                     println!("  model:           {}", meta.model);
                     println!("  provider:        {}", meta.provider);
+                    if let Some(preset) = meta.preset.as_deref() {
+                        println!("  preset:          {preset}");
+                    }
                     println!("  created_at:      {}", meta.created_at);
                     println!("  updated_at:      {}", meta.updated_at);
                     println!("  message_count:   {}", meta.message_count);
@@ -794,6 +817,37 @@ async fn main() -> anyhow::Result<()> {
                 println!("model:         {}", config.model);
                 println!("api_base:      {}", config.api_base);
                 println!("api_key:       {}", mask_key(config.api_key.as_deref()));
+                // Preset resolution: `provider.preset` from the file wins; if
+                // absent, fall back to a catalog match against the resolved
+                // api_base. Surfaces the preset chain added by the
+                // preset-config goal — without it, a user with
+                // `preset = "deepseek"` would only see the raw fields and
+                // have to manually re-derive that they're on DeepSeek.
+                let preset_label = config
+                    .preset
+                    .clone()
+                    .or_else(|| {
+                        recursive::providers::find_preset_by_api_base(&config.api_base)
+                            .map(|p| p.id.to_string())
+                    })
+                    .unwrap_or_else(|| "(none)".to_string());
+                println!("preset:        {preset_label}");
+                if let Some(preset) = config
+                    .preset
+                    .as_deref()
+                    .and_then(recursive::providers::find_preset)
+                    .or_else(|| recursive::providers::find_preset_by_api_base(&config.api_base))
+                {
+                    let key_env = if preset.key_env.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        preset.key_env.clone()
+                    };
+                    println!(
+                        "preset resolves to: type={}, model={}, key_env={key_env}",
+                        preset.provider_type, preset.default_model
+                    );
+                }
                 println!("workspace:     {}", config.workspace.display());
                 println!("max_steps:     {}", config.max_steps);
                 println!("temperature:   {}", config.temperature);
@@ -1014,11 +1068,13 @@ async fn run_once(
     }
 
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
-        match SessionWriter::create(
+        match SessionWriter::create_with_tools(
             &config.workspace,
             &goal,
             &config.model,
             &config.provider_type,
+            &[],
+            config.preset.as_deref(),
         ) {
             Ok(writer) => {
                 eprintln!("session: recording to {}", writer.session_dir().display());
@@ -1462,6 +1518,7 @@ mod tests {
             api_key: Some("dummy-test-key".into()),
             model: "test-model".into(),
             provider_type: "openai".into(),
+            preset: None,
             max_steps: 1,
             temperature: 0.0,
             system_prompt: "test".into(),
