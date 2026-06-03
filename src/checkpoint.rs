@@ -80,8 +80,8 @@ impl ShadowRepo {
         #[cfg(windows)]
         let workspace = {
             let s = workspace.to_string_lossy();
-            if s.starts_with(r"\\?\") {
-                PathBuf::from(&s[4..])
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                PathBuf::from(stripped)
             } else {
                 workspace
             }
