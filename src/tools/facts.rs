@@ -494,19 +494,29 @@ pub fn load_facts(workspace: &std::path::Path, scope: &str) -> Result<FactStore>
 }
 
 /// Build a facts summary string for injection into the system prompt.
-/// Returns the top N most recently accessed facts as a formatted block.
+/// Merges workspace-scoped and global-scoped facts, then returns the top N
+/// most recently accessed facts as a formatted block.
 pub fn facts_summary(workspace: &std::path::Path, limit: usize) -> String {
-    let store = match load_facts(workspace, "workspace") {
-        Ok(s) => s,
-        Err(_) => return String::new(),
-    };
-    let active: Vec<&Fact> = store.active_facts();
-    if active.is_empty() {
+    // Load both scopes; silently ignore missing files.
+    let workspace_store = load_facts(workspace, "workspace").unwrap_or_default();
+    let global_store = load_facts(workspace, "global").unwrap_or_default();
+
+    // Merge active facts from both scopes; global facts come first so that
+    // user-identity facts survive even when workspace has many project facts.
+    let mut all_facts: Vec<Fact> = global_store
+        .active_facts()
+        .into_iter()
+        .chain(workspace_store.active_facts())
+        .cloned()
+        .collect();
+
+    if all_facts.is_empty() {
         return String::new();
     }
+
     // Sort by last_accessed descending (most recently accessed first)
-    let mut sorted: Vec<&Fact> = active;
-    sorted.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed));
+    all_facts.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed));
+    let sorted: Vec<&Fact> = all_facts.iter().collect();
 
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
@@ -1286,6 +1296,12 @@ mod tests {
     #[test]
     fn test_m_facts_summary_empty() {
         let (_tmp, ws) = tmp_workspace();
+        // Pin HOME to an empty temp dir so global facts on the developer's
+        // real machine don't leak into this test (facts_summary now merges
+        // both workspace and global scopes).
+        let fake_home = _tmp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _pin = crate::test_util::PinnedHome::new(&fake_home);
         let summary = facts_summary(&ws, 5);
         assert_eq!(summary, "");
     }
