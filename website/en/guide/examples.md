@@ -9,9 +9,9 @@ Build an agent that reviews a pull request or code change and produces a structu
 ```rust
 use std::sync::Arc;
 use recursive::{
-    Agent, ToolRegistry,
+    runtime::AgentRuntime,
+    tools::{ListDir, ReadFile, RunShell, SearchFiles, ToolRegistry},
     llm::OpenAiProvider,
-    tools::{ListDir, ReadFile, RunShell, SearchFiles},
 };
 
 #[tokio::main]
@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .register(Arc::new(SearchFiles::new(&workspace)))
         .register(Arc::new(RunShell::new(&workspace)));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .max_steps(30)
@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     // Run git diff to get the current changes
-    let outcome = agent
+    let outcome = runtime
         .run(
             "Run `git diff HEAD~1` to see the latest changes. \
              Then review all modified files in detail. \
@@ -53,16 +53,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    println!("{}", outcome.final_message.unwrap_or_default());
+    println!("{}", outcome.final_text.unwrap_or_default());
     Ok(())
 }
-```
-
-**Run it:**
-```bash
-export RECURSIVE_API_KEY="..."
-export RECURSIVE_WORKSPACE="/path/to/your/project"
-cargo run --example code-review
 ```
 
 ---
@@ -72,7 +65,7 @@ cargo run --example code-review
 An agent that scans a messy directory, proposes a new structure, and reorganizes files.
 
 ```rust
-let mut agent = Agent::builder()
+let mut runtime = AgentRuntime::builder()
     .llm(llm)
     .tools(tools)
     .max_steps(50)
@@ -84,7 +77,7 @@ let mut agent = Agent::builder()
     )
     .build()?;
 
-let outcome = agent
+let outcome = runtime
     .run(
         "Scan the ~/Downloads directory. \
          List all files, identify patterns (documents, images, code, etc.), \
@@ -100,7 +93,7 @@ let outcome = agent
 Generate documentation for a Rust crate by reading source files and producing Markdown.
 
 ```rust
-let mut agent = Agent::builder()
+let mut runtime = AgentRuntime::builder()
     .llm(llm)
     .tools(tools)
     .max_steps(40)
@@ -111,7 +104,7 @@ let mut agent = Agent::builder()
     )
     .build()?;
 
-let outcome = agent
+let outcome = runtime
     .run(
         "Read all .rs files in src/. \
          For each public struct, enum, and function, write a documentation comment. \
@@ -128,7 +121,7 @@ An agent that reads CI failure logs, diagnoses the root cause, and suggests a fi
 
 ```rust
 // First, save the CI log to a file, then:
-let outcome = agent
+let outcome = runtime
     .run(
         "Read ci-failure.log. \
          Identify the failing test or build step. \
@@ -143,11 +136,21 @@ let outcome = agent
 
 ## Running the examples
 
-All these recipes are available in the [`examples/`](https://github.com/jeffkit/recursive/tree/main/examples) directory of the repository:
+Copy any recipe above, set your environment variables, and run:
+
+```bash
+export RECURSIVE_API_KEY="your-key"
+export RECURSIVE_API_BASE="https://api.openai.com/v1"
+export RECURSIVE_MODEL="gpt-4o"
+cargo run
+```
+
+The `examples/` directory in the repository also contains runnable examples:
 
 ```bash
 git clone https://github.com/jeffkit/recursive.git
 cd recursive
 export RECURSIVE_API_KEY="your-key"
-cargo run --example code-review
+cargo run --example basic
+cargo run --example with_tools
 ```

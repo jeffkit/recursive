@@ -70,9 +70,9 @@ pub trait Tool: Send + Sync {
 | `web_fetch` | HTTP GET 并提取 HTML 文本（可选） |
 | `remember` / `recall` | 持久化键值内存 |
 
-## 4. Agent（Agent 循环）
+## 4. AgentRuntime（Agent 运行时）
 
-**位置**：`src/agent.rs`（循环本体在 `src/run_core.rs`）
+**位置**：`src/runtime.rs`
 
 核心循环。接收目标字符串，交替调用模型和工具，直到满足终止条件：
 
@@ -84,28 +84,35 @@ pub trait Tool: Send + Sync {
 
 | 原因 | 含义 |
 |---|---|
-| `Done` | 模型给出了最终文本答案 |
+| `NoMoreToolCalls` | 模型停止调用工具（正常完成） |
+| `ProviderStop(s)` | LLM 返回停止信号 |
 | `BudgetExceeded` | 达到 `max_steps` 限制 |
-| `Stuck` | 同一工具调用重复 3 次 |
-| `NoMoreToolCalls` | 模型停止调用工具 |
-| `Error` | 不可恢复的错误 |
+| `Stuck { .. }` | 同一工具调用循环重复 |
+| `TranscriptLimit { .. }` | 对话记录过大 |
+| `PlanPending` | Agent 等待计划审批 |
+| `Cancelled` | 外部取消 |
+| `PermissionDenialLimit` | 权限拒绝次数过多 |
+
+运行期间的错误通过 `runtime.run()` 的 `Err(...)` 返回。
 
 循环**故意不可扩展**——新能力应该以工具或 Provider 的形式添加，而不是在循环内部分支。
 
-## 5. StepEvent（步骤事件）
+## 5. AgentEvent（步骤事件）
 
 **位置**：`src/event.rs`
 
-每一步执行后发出的观察者通道。订阅它可以驱动 UI、日志、回放或测试，无需修改循环。
+每一步执行后发出的观察者通道。通过 `EventSink` 订阅可以驱动 UI、日志、回放或测试，无需修改循环。
 
 ```rust
-pub enum StepEvent {
-    LlmStart { step: usize, messages: Vec<Message> },
-    LlmEnd { step: usize, message: Message },
-    ToolStart { step: usize, name: String, args: Value },
-    ToolEnd { step: usize, name: String, result: ToolResult },
-    Compacted { removed: usize, summary_chars: usize },
-    Done { finish_reason: FinishReason, final_message: Option<String> },
+#[non_exhaustive]
+pub enum AgentEvent {
+    AssistantText { text: String, step: usize },
+    ToolCall { name: String, id: String, arguments: String, step: usize },
+    ToolResult { id: String, name: String, output: String, step: usize },
+    Usage { input_tokens: u32, output_tokens: u32, step: usize },
+    Compacted { removed: usize, kept: usize, summary_chars: usize, step: usize },
+    TurnFinished { reason: String, steps: usize },
+    // ...
 }
 ```
 
@@ -113,12 +120,12 @@ pub enum StepEvent {
 
 ```
 ┌─────────────────────────────────────────┐
-│                  Agent                  │
+│              AgentRuntime               │
 │  ┌─────────┐         ┌───────────────┐  │
 │  │   LLM   │◄────────│ ToolRegistry  │  │
 │  │Provider │         │  (Tool × N)   │  │
 │  └────┬────┘         └───────────────┘  │
-│       │  StepEvent 流                   │
+│       │  AgentEvent 流                  │
 └───────┼─────────────────────────────────┘
         ▼
    ┌────────────┐  ┌──────────┐  ┌──────────┐

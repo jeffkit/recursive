@@ -15,9 +15,9 @@ tokio = { version = "1", features = ["full"] }
 ```rust
 use std::sync::Arc;
 use recursive::{
-    Agent, ToolRegistry,
+    runtime::AgentRuntime,
+    tools::{ApplyPatch, ListDir, ReadFile, RunShell, ToolRegistry, WriteFile},
     llm::OpenAiProvider,
-    tools::{ApplyPatch, ListDir, ReadFile, RunShell, WriteFile},
 };
 
 #[tokio::main]
@@ -35,14 +35,14 @@ async fn main() -> anyhow::Result<()> {
         .register(Arc::new(ListDir::new(".")))
         .register(Arc::new(RunShell::new(".")));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .max_steps(20)
         .build()?;
 
-    let outcome = agent.run("list the files in src and summarise them").await?;
-    println!("{}", outcome.final_message.unwrap_or_default());
+    let outcome = runtime.run("list the files in src and summarise them").await?;
+    println!("{}", outcome.final_text.unwrap_or_default());
     Ok(())
 }
 ```
@@ -51,18 +51,18 @@ async fn main() -> anyhow::Result<()> {
 
 The library exposes:
 
-- `Agent` + `AgentBuilder` — the main entry point
+- `AgentRuntime` + `AgentRuntimeBuilder` — the main entry point
 - `ToolRegistry` — registers and dispatches tools
 - `LlmProvider` trait — implement your own backend
 - `Tool` trait — implement your own tools
-- `StepEvent` — subscribe to the event stream
+- `AgentEvent` — subscribe to the event stream via an `EventSink`
 - `FinishReason` — why the agent stopped
 - `Message`, `Role` — transcript primitives
-- `AgentOutcome` — what the agent returned
+- `RuntimeOutcome` — what the agent returned
 
 See also:
 - [Agent Builder](./agent) — builder options
 - [Custom Tools](./tools) — implementing the `Tool` trait
 - [Custom Providers](./providers) — implementing `LlmProvider`
-- [Events & Observers](./events) — the `StepEvent` stream
+- [Events & Observers](./events) — the `AgentEvent` stream
 - [Multi-Agent](./multi-agent) — pools, messaging, orchestration

@@ -76,21 +76,38 @@ When `apply_patch` fails (ambiguous context lines), the correct response is to w
 
 ## Monitoring a run
 
-Watch the `StepEvent` stream to monitor what the agent is doing:
+Subscribe to the `AgentEvent` stream via a `ChannelSink` to monitor what the agent is doing:
 
 ```rust
-agent.builder()
-    .on_event(|e| match e {
-        StepEvent::ToolStart { name, args, .. } => {
-            if name == "apply_patch" {
-                println!("📝 Patching: {}", args["path"]);
-            } else if name == "run_shell" {
-                println!("🔧 Shell: {}", args["command"]);
+use recursive::event::{AgentEvent, ChannelSink};
+use std::sync::Arc;
+
+let (sink, mut rx) = ChannelSink::new(128);
+
+let mut runtime = AgentRuntime::builder()
+    .llm(llm)
+    .tools(tools)
+    .event_sink(Arc::new(sink))
+    .build()?;
+
+// Spawn a task to consume events
+tokio::spawn(async move {
+    while let Ok(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolCall { name, arguments, .. } => {
+                if name == "apply_patch" {
+                    println!("Patching…");
+                } else if name == "run_shell" {
+                    println!("Shell: {}", arguments);
+                }
             }
+            AgentEvent::TurnFinished { reason, steps } => {
+                println!("Done after {} steps: {}", steps, reason);
+            }
+            _ => {}
         }
-        StepEvent::Done { finish_reason, .. } => {
-            println!("✅ Done: {:?}", finish_reason);
-        }
-        _ => {}
-    })
+    }
+});
+
+let outcome = runtime.run("implement the next goal").await?;
 ```

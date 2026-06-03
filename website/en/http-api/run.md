@@ -9,7 +9,7 @@ POST /run
 Content-Type: application/json
 
 {
-  "message": "What files are in the current directory?",
+  "goal": "What files are in the current directory?",
   "system_prompt": "You are a helpful assistant.",
   "max_steps": 10
 }
@@ -18,58 +18,80 @@ Content-Type: application/json
 **Response** (JSON):
 ```json
 {
-  "finish_reason": "done",
-  "final_message": "The directory contains: src/, tests/, Cargo.toml, README.md",
-  "steps": 2,
-  "token_usage": { "prompt": 512, "completion": 128, "total": 640 }
+  "status": "finished",
+  "finish_reason": "NoMoreToolCalls",
+  "messages": [...],
+  "usage": { "total_steps": 2, "total_tokens": 640 }
 }
 ```
 
 ## Session run (SSE streaming)
 
-Send a message to an existing session and receive a stream of Server-Sent Events:
+Send a message to an existing session and subscribe to Server-Sent Events on the `/sessions/:id/events` endpoint:
 
 ```http
 POST /sessions/:id/run
 Content-Type: application/json
 
-{
-  "message": "List the files in src/"
-}
+{ "goal": "List the files in src/" }
 ```
 
-**Response** (`text/event-stream`):
+Then consume the SSE stream on `/sessions/:id/events`:
 
 ```
-event: llm_start
-data: {"step":1}
+event: tool_call
+data: {"name":"list_dir","step":1}
 
-event: tool_start
-data: {"step":1,"name":"list_dir","args":{"path":"src/"}}
+event: tool_result
+data: {"name":"list_dir","success":true}
 
-event: tool_end
-data: {"step":1,"name":"list_dir","result":"agent.rs\nlib.rs\ntools/\n..."}
-
-event: llm_end
-data: {"step":1,"message":"The src/ directory contains..."}
+event: message
+data: {"role":"assistant","content":[{"type":"text","text":"The src/ directory contains..."}]}
 
 event: done
-data: {"finish_reason":"done","final_message":"The src/ directory contains...","steps":1}
+data: {"finish_reason":"NoMoreToolCalls","total_steps":1}
 ```
+
+## SSE event types
+
+| Event | Data fields |
+|---|---|
+| `message` | `{ role, content: ContentBlock[] }` |
+| `partial_message` | `{ text, step }` — streaming text delta |
+| `tool_call` | `{ name, step }` |
+| `tool_result` | `{ name, success }` |
+| `done` | `{ finish_reason, total_steps }` |
+| `error` | `{ message }` |
+| `plan_proposed` | `{ plan }` — agent awaiting plan approval |
 
 ## Consuming SSE in JavaScript
 
 ```javascript
-const evtSource = new EventSource('/sessions/abc123/run');
+// First POST to trigger the run
+await fetch('/sessions/abc123/run', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ goal: 'list files' }),
+});
 
-evtSource.addEventListener('tool_start', (e) => {
+// Then subscribe to events
+const evtSource = new EventSource('/sessions/abc123/events');
+
+evtSource.addEventListener('tool_call', (e) => {
   const data = JSON.parse(e.data);
   console.log(`[tool] ${data.name}`);
 });
 
+evtSource.addEventListener('message', (e) => {
+  const data = JSON.parse(e.data);
+  for (const block of data.content) {
+    if (block.type === 'text') console.log(block.text);
+  }
+});
+
 evtSource.addEventListener('done', (e) => {
   const data = JSON.parse(e.data);
-  console.log(data.final_message);
+  console.log('Done:', data.finish_reason);
   evtSource.close();
 });
 ```
@@ -77,14 +99,27 @@ evtSource.addEventListener('done', (e) => {
 ## Consuming SSE in Python
 
 ```python
-import sseclient, requests
+import json, sseclient, requests
 
-resp = requests.post(
+# Trigger the run
+requests.post(
     'http://localhost:3000/sessions/abc123/run',
-    json={'message': 'list files'},
+    json={'goal': 'list files'},
+)
+
+# Subscribe to events
+resp = requests.get(
+    'http://localhost:3000/sessions/abc123/events',
     stream=True,
 )
 client = sseclient.SSEClient(resp)
 for event in client.events():
-    print(event.event, event.data)
+    data = json.loads(event.data)
+    if event.event == 'message':
+        for block in data.get('content', []):
+            if block.get('type') == 'text':
+                print(block['text'])
+    elif event.event == 'done':
+        print('Done:', data['finish_reason'])
+        break
 ```

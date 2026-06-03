@@ -42,7 +42,7 @@ recursive run --json "2+2等于几" | jq .finish_reason
 
 | 代码 | 含义 |
 |---|---|
-| `0` | `FinishReason::Done` |
-| `1` | `FinishReason::Error` |
+| `0` | `FinishReason::NoMoreToolCalls` 或 `FinishReason::ProviderStop` |
+| `1` | 运行时错误（作为 `Err(...)` 返回） |
 | `2` | `FinishReason::BudgetExceeded` |
 | `3` | `FinishReason::Stuck` |

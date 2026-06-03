@@ -1,12 +1,11 @@
 # TypeScript SDK
 
-The TypeScript SDK provides a typed client for the Recursive HTTP API, compatible with Claude Agent SDK patterns.
+The TypeScript SDK (`@recursive/sdk`) provides a typed client for the Recursive HTTP API, compatible with Claude Agent SDK patterns.
 
 ::: tip Package name
-The package is published as `@recursive/sdk` on npm. Install with `npm install @recursive/sdk`.
-If the published version is not yet available, install directly from source:
+The package is published as `@recursive/sdk` on npm. If it is not yet available, install directly from source:
 ```bash
-pnpm install   # from sdk/typescript/
+cd sdk/typescript && pnpm install && pnpm build
 ```
 :::
 
@@ -26,84 +25,112 @@ Start the Recursive HTTP server first:
 recursive http --addr 127.0.0.1:3000
 ```
 
-## Quick start
+## Quick start — one-shot
 
 ```typescript
-import { RecursiveClient } from '@recursive/sdk';
+import { Agent } from '@recursive/sdk';
 
-const client = new RecursiveClient({ baseUrl: 'http://localhost:3000' });
+const result = await Agent.prompt(
+  'List the files in the current directory.',
+  { baseUrl: 'http://localhost:3000', maxSteps: 5 },
+);
 
-// Health check
-const status = await client.health();
-console.log(status); // "ok"
-
-// Stateless run
-const result = await client.run({ message: 'list files in src/' });
-console.log(result.finish_reason);
-console.log(result.final_message);
+console.log('status       :', result.status);
+console.log('finish_reason:', result.finishReason);
+if (result.result) {
+  console.log('answer       :', result.result);
+}
 ```
 
-## Session management
+## Multi-turn session
 
 ```typescript
-// Create a session
-const session = await client.createSession({
-  systemPrompt: 'You are a helpful Rust assistant.',
-  workspace: '/path/to/project',
-});
+import { Agent } from '@recursive/sdk';
 
-// Send a message
-const result = await session.run('what does agent.rs do?');
-console.log(result.finalMessage);
+// await using (TypeScript 5.2+) auto-closes the session
+await using agent = await Agent.create({ baseUrl: 'http://localhost:3000' });
+console.log('session:', agent.sessionId);
 
-// Continue the conversation
-const result2 = await session.run('what are the main entry points?');
-
-// Clean up
-await session.delete();
-```
-
-## Streaming
-
-```typescript
-for await (const event of session.runStream('list all tools')) {
-  if (event.type === 'tool_start') {
-    console.log(`[tool] ${event.data.name}`);
-  } else if (event.type === 'done') {
-    console.log(event.data.finalMessage);
-    break;
+// First turn
+const run = await agent.send('What does agent.rs do?');
+for await (const msg of run.stream()) {
+  if (msg.type === 'assistant') {
+    for (const block of msg.content) {
+      if (block.type === 'text') process.stdout.write(block.text);
+    }
   }
 }
+const result = await run.wait();
+console.log('\n[finish:', result.finishReason, ']');
+
+// Second turn (same session — context preserved)
+const run2 = await agent.send('What are the main entry points?');
+const result2 = await run2.wait();
+console.log(result2.result);
+```
+
+## Streaming events
+
+```typescript
+import { Agent } from '@recursive/sdk';
+
+await using agent = await Agent.create({ baseUrl: 'http://localhost:3000' });
+const run = await agent.send('Summarise src/');
+
+for await (const msg of run.stream()) {
+  if (msg.type === 'assistant') {
+    for (const block of msg.content) {
+      if (block.type === 'text') process.stdout.write(block.text);
+    }
+  } else if (msg.type === 'tool_call') {
+    console.log(`\n[tool] ${msg.name}`);
+  }
+}
+
+const result = await run.wait();
+console.log(`\nDone in ${result.numTurns} turns`);
 ```
 
 ## API Reference
 
-### `RecursiveClient`
-
-```typescript
-const client = new RecursiveClient({
-  baseUrl: 'http://localhost:3000',
-  apiKey?: string,
-  timeout?: number,   // ms, default 60000
-});
-```
+### `Agent` (static methods)
 
 | Method | Description |
 |---|---|
-| `client.health()` | Returns `"ok"` if healthy |
-| `client.tools()` | Returns tool definitions |
-| `client.run(options)` | Stateless run |
-| `client.createSession(options)` | Create a session |
-| `client.listSessions()` | List sessions |
-| `client.getSession(id)` | Get session by ID |
+| `Agent.prompt(message, options?)` | One-shot: create session, send, wait, delete. Returns `RunResult`. |
+| `Agent.create(options?)` | Create a persistent `AgentSession`. Use `await using` for cleanup. |
+| `Agent.resume(sessionId, options?)` | Attach to an existing session. |
+| `Agent.listSessions(options?)` | List active sessions. |
+| `Agent.deleteSession(sessionId, options?)` | Delete a session. |
 
-### `AgentResult`
+### `AgentSession`
+
+| Method | Description |
+|---|---|
+| `agent.send(message)` | Send a message and return a `Run`. |
+| `agent.sessionId` | The session ID. |
+| `agent[Symbol.asyncDispose]()` | Auto-called by `await using`. |
+
+### `Run`
+
+| Method | Description |
+|---|---|
+| `run.wait()` | Resolves when the run completes. Returns `RunResult`. |
+| `run.stream()` | `AsyncIterableIterator` of streaming message events. |
+
+### `RunResult`
 
 ```typescript
-interface AgentResult {
-  finish_reason: 'done' | 'budget_exceeded' | 'stuck' | 'error';
-  final_message: string | null;
-  steps: number;
-  token_usage?: { prompt: number; completion: number; total: number };
+interface RunResult {
+  id: string;
+  status: 'finished' | 'error' | 'cancelled';
+  subtype: 'success' | 'error_max_turns' | 'error_during_execution' | 'cancelled';
+  finishReason?: string;
+  usage?: UsageMeta;
+  error?: string;
+  result?: string;          // Concatenated final assistant text
+  numTurns?: number;
+  durationMs?: number;
+  ok: boolean;              // true when status === 'finished'
 }
 ```

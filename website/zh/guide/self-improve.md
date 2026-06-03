@@ -73,3 +73,41 @@ recursive loop "读取 .dev/goals/ 并实现下一个未完成的目标"
 - 低比率 = Agent 频繁在 `apply_patch` 失败后退回到重写整个文件 → 说明补丁锚点不精确
 
 当 `apply_patch` 因上下文行歧义而失败时，正确的处理是扩大锚点范围，而不是退回到 `write_file`。
+
+## 监控运行过程
+
+通过 `ChannelSink` 订阅 `AgentEvent` 流，实时监控 Agent 的行为：
+
+```rust
+use recursive::event::{AgentEvent, ChannelSink};
+use std::sync::Arc;
+
+let (sink, mut rx) = ChannelSink::new(128);
+
+let mut runtime = AgentRuntime::builder()
+    .llm(llm)
+    .tools(tools)
+    .event_sink(Arc::new(sink))
+    .build()?;
+
+// 启动任务消费事件
+tokio::spawn(async move {
+    while let Ok(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolCall { name, arguments, .. } => {
+                if name == "apply_patch" {
+                    println!("正在打补丁…");
+                } else if name == "run_shell" {
+                    println!("执行命令：{}", arguments);
+                }
+            }
+            AgentEvent::TurnFinished { reason, steps } => {
+                println!("完成，共 {} 步，原因：{}", steps, reason);
+            }
+            _ => {}
+        }
+    }
+});
+
+let outcome = runtime.run("实现下一个目标").await?;
+```

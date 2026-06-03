@@ -1,10 +1,9 @@
 # Python SDK
 
-The Python SDK provides a client for the Recursive HTTP API, compatible with Claude Agent SDK patterns.
+The Python SDK (`recursive-sdk`) provides a high-level client for the Recursive HTTP API, compatible with Claude Agent SDK patterns.
 
 ::: tip Package name
-The package is published as `recursive-sdk` on PyPI. Install with `pip install recursive-sdk`.
-If the published version is not yet available, install directly from source:
+The package is published as `recursive-sdk` on PyPI. If it is not yet available, install directly from source:
 ```bash
 pip install -e sdk/python   # from project root
 ```
@@ -24,88 +23,99 @@ Start the Recursive HTTP server first:
 recursive http --addr 127.0.0.1:3000
 ```
 
-## Quick start
+## Quick start — one-shot
 
 ```python
-from recursive_sdk import RecursiveClient
+from recursive_sdk import Agent
 
-client = RecursiveClient("http://127.0.0.1:3000")
-
-# Health check
-print(client.health())  # "ok"
-
-# Stateless run
-result = client.run("list files in src/")
-print(result.finish_reason)
-print(result.final_message)
-```
-
-## Session management
-
-```python
-# Create a session
-session = client.create_session(
-    system_prompt="You are a helpful Rust assistant.",
-    workspace="/path/to/project",
+result = Agent.prompt(
+    "List the files in the current directory.",
+    base_url="http://127.0.0.1:3000",
+    max_steps=5,
 )
-print(session.session_id)
 
-# Send a message
-result = session.run("what does agent.rs do?")
-print(result.final_message)
-
-# Continue the conversation
-result = session.run("what are the main entry points?")
-
-# Clean up
-session.delete()
+print("status       :", result.status)
+print("finish_reason:", result.finish_reason)
+if result.result:
+    print("answer       :", result.result)
 ```
 
-## Streaming
+## Multi-turn session
 
 ```python
-for event in session.run_stream("list all tools"):
-    if event.type == "tool_start":
-        print(f"[tool] {event.data['name']}")
-    elif event.type == "done":
-        print(event.data['final_message'])
-        break
+from recursive_sdk import Agent
+
+with Agent.create(base_url="http://127.0.0.1:3000") as agent:
+    print("session:", agent.session_id)
+
+    # First turn
+    run = agent.send("What does agent.rs do?")
+    for msg in run.messages():
+        if msg.type == "assistant":
+            print(msg.text(), end="", flush=True)
+    result = run.wait()
+    print(f"\n[finish: {result.finish_reason}]")
+
+    # Second turn (same session — context preserved)
+    run2 = agent.send("What are the main entry points?")
+    result2 = run2.wait()
+    print(result2.result)
+```
+
+## Streaming events
+
+```python
+from recursive_sdk import Agent
+
+with Agent.create(base_url="http://127.0.0.1:3000") as agent:
+    run = agent.send("Summarise src/")
+
+    # Stream assistant text and tool calls as they arrive
+    for msg in run.stream():
+        if msg.type == "assistant":
+            print(msg.text(), end="", flush=True)
+        elif msg.type == "tool_call":
+            print(f"\n[tool] {msg.name}")
+
+    result = run.wait()
+    print(f"\nDone in {result.num_turns} turns")
 ```
 
 ## API Reference
 
-### `RecursiveClient`
-
-```python
-client = RecursiveClient(
-    base_url="http://localhost:3000",
-    api_key=None,          # optional X-API-Key header
-    timeout=60,
-)
-```
+### `Agent` (static methods)
 
 | Method | Description |
 |---|---|
-| `client.health()` | Returns `"ok"` if the server is healthy |
-| `client.tools()` | Returns list of tool definitions |
-| `client.run(message, **kwargs)` | Stateless single-shot run |
-| `client.create_session(**kwargs)` | Create a new session |
-| `client.list_sessions()` | List all sessions |
-| `client.get_session(session_id)` | Get a session by ID |
+| `Agent.prompt(message, *, base_url, ...)` | One-shot: create session, send, wait, delete. Returns `RunResult`. |
+| `Agent.create(*, base_url, ...)` | Create a persistent session. Use as context manager. |
+| `Agent.resume(session_id, *, base_url, ...)` | Attach to an existing session. |
+| `Agent.list_sessions(*, base_url, ...)` | List active sessions. |
+| `Agent.delete_session(session_id, *, base_url, ...)` | Delete a session. |
 
-### `Session`
+### `AgentSession`
 
 | Method | Description |
 |---|---|
-| `session.run(message)` | Send a message, return `AgentResult` |
-| `session.run_stream(message)` | Returns an iterator of `StepEvent` |
-| `session.delete()` | Delete this session |
+| `agent.send(message)` | Send a message and return a `Run`. |
+| `agent.session_id` | The session ID. |
 
-### `AgentResult`
+### `Run`
+
+| Method | Description |
+|---|---|
+| `run.wait()` | Block until the run completes. Returns `RunResult`. |
+| `run.messages()` | Iterator of streaming message events. |
+| `run.stream()` | Same as `messages()`. |
+
+### `RunResult`
 
 | Attribute | Type | Description |
 |---|---|---|
-| `finish_reason` | `str` | `"done"`, `"budget_exceeded"`, `"stuck"`, etc. |
-| `final_message` | `str \| None` | The agent's final answer |
-| `steps` | `int` | Number of steps taken |
-| `token_usage` | `dict \| None` | `{"prompt": N, "completion": N, "total": N}` |
+| `status` | `str` | `"finished"` \| `"error"` \| `"cancelled"` |
+| `finish_reason` | `str \| None` | Rust `FinishReason` debug string |
+| `result` | `str \| None` | Concatenated final assistant text |
+| `usage` | `UsageMeta \| None` | Token usage stats |
+| `num_turns` | `int` | Number of assistant turns |
+| `ok` | `bool` | `True` when `status == "finished"` |
+| `subtype` | `str` | Claude Agent SDK-compatible label (`"success"`, `"error_max_turns"`, etc.) |

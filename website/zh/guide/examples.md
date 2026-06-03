@@ -9,9 +9,9 @@
 ```rust
 use std::sync::Arc;
 use recursive::{
-    Agent, ToolRegistry,
+    runtime::AgentRuntime,
+    tools::{ListDir, ReadFile, RunShell, SearchFiles, ToolRegistry},
     llm::OpenAiProvider,
-    tools::{ListDir, ReadFile, RunShell, SearchFiles},
 };
 
 #[tokio::main]
@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .register(Arc::new(SearchFiles::new(&workspace)))
         .register(Arc::new(RunShell::new(&workspace)));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .max_steps(30)
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .build()?;
 
-    let outcome = agent
+    let outcome = runtime
         .run(
             "运行 `git diff HEAD~1` 获取最新变更。\
              然后详细审查所有修改的文件。\
@@ -52,16 +52,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    println!("{}", outcome.final_message.unwrap_or_default());
+    println!("{}", outcome.final_text.unwrap_or_default());
     Ok(())
 }
-```
-
-**运行：**
-```bash
-export RECURSIVE_API_KEY="..."
-export RECURSIVE_WORKSPACE="/path/to/your/project"
-cargo run --example code-review
 ```
 
 ---
@@ -71,7 +64,7 @@ cargo run --example code-review
 扫描杂乱目录，提出新结构方案，并自动整理文件的 Agent。
 
 ```rust
-let mut agent = Agent::builder()
+let mut runtime = AgentRuntime::builder()
     .llm(llm)
     .tools(tools)
     .max_steps(50)
@@ -82,7 +75,7 @@ let mut agent = Agent::builder()
     )
     .build()?;
 
-let outcome = agent
+let outcome = runtime
     .run(
         "扫描 ~/Downloads 目录。\
          列出所有文件，识别规律（文档、图片、代码等），\
@@ -98,7 +91,7 @@ let outcome = agent
 读取 Rust crate 源文件并生成 Markdown 文档。
 
 ```rust
-let mut agent = Agent::builder()
+let mut runtime = AgentRuntime::builder()
     .llm(llm)
     .tools(tools)
     .max_steps(40)
@@ -108,7 +101,7 @@ let mut agent = Agent::builder()
     )
     .build()?;
 
-let outcome = agent
+let outcome = runtime
     .run(
         "阅读 src/ 中的所有 .rs 文件。\
          为每个公开的 struct、enum 和函数编写文档注释。\
@@ -121,11 +114,21 @@ let outcome = agent
 
 ## 运行示例
 
-所有示例都在仓库的 [`examples/`](https://github.com/jeffkit/recursive/tree/main/examples) 目录中：
+复制上面任意示例，设置环境变量后运行：
+
+```bash
+export RECURSIVE_API_KEY="your-key"
+export RECURSIVE_API_BASE="https://api.openai.com/v1"
+export RECURSIVE_MODEL="gpt-4o"
+cargo run
+```
+
+仓库的 `examples/` 目录也包含可直接运行的示例：
 
 ```bash
 git clone https://github.com/jeffkit/recursive.git
 cd recursive
 export RECURSIVE_API_KEY="your-key"
-cargo run --example code-review
+cargo run --example basic
+cargo run --example with_tools
 ```
