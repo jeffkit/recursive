@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::session::SessionWriter;
 use crate::tools::PermissionHook;
 use crate::{AgentEvent, AgentRuntime, EventSink};
 use async_trait::async_trait;
@@ -265,6 +266,13 @@ async fn worker_loop(
     let bash_registry = build_bash_registry(&resolve_workspace_root());
     let bash_seq = AtomicU64::new(0);
 
+    // Lazily-created session writer for TUI interactive sessions.
+    // Created on the first SendMessage so that sessions without any
+    // actual user messages don't leave empty files on disk.
+    let mut session_writer: Option<SessionWriter> = None;
+    // Index into the runtime transcript up to which we have already saved.
+    let mut saved_transcript_len: usize = 0;
+
     loop {
         // Select on both the user-action channel and the WeChat side-channel.
         // WeChat messages processed here behave like SendMessage turns but
@@ -336,11 +344,30 @@ async fn worker_loop(
         };
 
         match action {
-            UserAction::Shutdown => break,
+            UserAction::Shutdown => {
+                if let Some(mut sw) = session_writer.take() {
+                    let _ = sw.finish("success");
+                }
+                break;
+            }
 
             UserAction::SendMessage(text) => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+
+                    // Create session writer on the first user message.
+                    if session_writer.is_none() {
+                        let ws = resolve_workspace_root();
+                        let goal: String = text.chars().take(200).collect();
+                        let model = crate::tui::cost::detect_model_name();
+                        if let Ok(sw) = SessionWriter::create(&ws, &goal, &model, "tui") {
+                            // Save any pre-existing transcript (system prompt, etc.)
+                            // so the session file is complete from the start.
+                            saved_transcript_len = pre_turn_len;
+                            session_writer = Some(sw);
+                        }
+                    }
+
                     let rt = rt_opt.take().unwrap();
                     // Clone the gate before moving the runtime into the spawned task.
                     // This lets us signal plan approval/rejection via action_rx while
@@ -368,6 +395,15 @@ async fn worker_loop(
                         .into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
+                    } else if let Some(ref mut sw) = session_writer {
+                        // Persist any new transcript entries added during this turn.
+                        // append() automatically updates .meta.json (last_prompt, etc.)
+                        // for user and assistant messages, so no separate flush needed.
+                        let transcript = recovered.transcript();
+                        for msg in &transcript[saved_transcript_len..] {
+                            let _ = sw.append(msg, None, None);
+                        }
+                        saved_transcript_len = transcript.len();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);

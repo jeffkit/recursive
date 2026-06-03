@@ -69,10 +69,13 @@ fn print_startup_banner(workspace: &std::path::Path) {
     // Dot separator (fake-cc style)
     println!("{DARK_GRAY}  ……………………………………………………………………………………………………{RESET}");
 
-    // Recent user-initiated sessions (last_prompt only — skip goal-only entries)
+    // Recent user-initiated sessions — show newest first, skip self-improve runs
+    // (those have a `goal` but no `last_prompt`; TUI sessions set `last_prompt`).
     let mut shown = 0;
-    if let Ok(sessions) = crate::session::SessionReader::list_sessions(workspace) {
-        for dir in sessions.iter() {
+    if let Ok(mut sessions) = crate::session::SessionReader::list_sessions(workspace) {
+        // list_sessions returns alphabetical (oldest first); reverse for newest first.
+        sessions.reverse();
+        for dir in &sessions {
             if shown >= 3 {
                 break;
             }
@@ -80,7 +83,11 @@ fn print_startup_banner(workspace: &std::path::Path) {
                 // Only show sessions that have a human prompt (not internal goal runs)
                 if let Some(ref prompt) = meta.last_prompt {
                     let short: String = prompt.chars().take(60).collect();
-                    let ellipsis = if prompt.len() > 60 { "…" } else { "" };
+                    let ellipsis = if prompt.chars().count() > 60 {
+                        "…"
+                    } else {
+                        ""
+                    };
                     println!("{DARK_GRAY}  › {short}{ellipsis}{RESET}");
                     shown += 1;
                 }
