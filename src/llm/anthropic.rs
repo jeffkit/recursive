@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
-use super::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall, ToolSpec};
+use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
 
 /// The name of the `ToolSearchTool` we register as a regular tool
 /// in the eager list. The model calls it like any other function
@@ -26,47 +26,6 @@ pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
 const MAX_SEARCH_ROUNDS: usize = 3;
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
-
-/// Retry policy for transient failures (network timeouts, 5xx errors).
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    pub max_retries: usize,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(8),
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Decide whether the caller should wait and try again.
-    pub fn backoff_for(
-        &self,
-        attempt: usize,
-        status: Option<u16>,
-        is_network_error: bool,
-    ) -> Option<Duration> {
-        if attempt >= self.max_retries {
-            return None;
-        }
-
-        let is_transient = is_network_error || status.is_some_and(|s| (500..600).contains(&s));
-
-        if !is_transient {
-            return None;
-        }
-
-        let backoff = self.initial_backoff * 2u32.pow(attempt as u32);
-        Some(backoff.min(self.max_backoff))
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -358,10 +317,7 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let (system, messages) = extract_system_message(messages);
-
-        // Anthropic requires messages to not start with assistant role
         let messages = filter_leading_assistant(&messages);
-
         let body = build_request(
             &self.model,
             self.temperature,
@@ -371,78 +327,10 @@ impl LlmProvider for AnthropicProvider {
             tools,
         );
         let url = format!("{}/v1/messages", self.base_url);
-
-        let mut attempt = 0;
-        loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {}", url);
-            let result = self
-                .client
-                .post(&url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let is_network_error = false;
-
-                    if status.is_success() {
-                        let text = resp.text().await?;
-                        let parsed: AnthropicResponse =
-                            serde_json::from_str(&text).map_err(|e| {
-                                self.make_err(format!(
-                                    "failed to parse response: {e}; body: {text}"
-                                ))
-                            })?;
-                        return Ok(parse_completion(parsed));
-                    }
-
-                    // Non-2xx response: check if it's transient (5xx)
-                    let text = resp.text().await?;
-                    tracing::debug!(target: "recursive::llm", body = %text, "error response");
-
-                    if let Some(backoff) =
-                        self.retry
-                            .backoff_for(attempt, Some(status.as_u16()), is_network_error)
-                    {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            status = status.as_u16(),
-                            "transient HTTP error, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    // Non-transient (4xx or other)
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
-                }
-                Err(e) => {
-                    // Network error
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            error = %e,
-                            "network error, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    return Err(self.make_err(format!("request failed: {e}")));
-                }
-            }
-        }
+        let text = self.post_with_retry(&url, &body).await?;
+        let parsed: AnthropicResponse = serde_json::from_str(&text)
+            .map_err(|e| self.make_err(format!("failed to parse response: {e}; body: {text}")))?;
+        Ok(parse_completion(parsed))
     }
 
     async fn stream(

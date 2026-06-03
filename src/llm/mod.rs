@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::Error;
 use crate::error::Result;
@@ -32,6 +33,51 @@ pub use openai::OpenAiProvider;
 /// Channel sender for streaming partial tokens during a streaming LLM call.
 /// Each `String` is a delta chunk (partial token) emitted by the provider.
 pub type StreamSender = mpsc::UnboundedSender<String>;
+
+// ── Shared retry policy ────────────────────────────────────────────────────
+
+/// Retry policy for transient LLM provider failures (network timeouts, 5xx).
+///
+/// Shared across all provider implementations to keep retry semantics
+/// consistent. Each provider stores one instance in its struct and calls
+/// [`RetryPolicy::backoff_for`] after every failed HTTP attempt.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_retries: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Returns `Some(backoff)` if the caller should sleep-and-retry, or `None`
+    /// to propagate the error. `attempt` is 0-indexed (0 = after the first failure).
+    pub fn backoff_for(
+        &self,
+        attempt: usize,
+        status: Option<u16>,
+        is_network_error: bool,
+    ) -> Option<Duration> {
+        if attempt >= self.max_retries {
+            return None;
+        }
+        let is_transient = is_network_error || status.is_some_and(|s| (500..600).contains(&s));
+        if !is_transient {
+            return None;
+        }
+        let backoff = self.initial_backoff * 2u32.pow(attempt as u32);
+        Some(backoff.min(self.max_backoff))
+    }
+}
 
 /// Token usage data from an LLM response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

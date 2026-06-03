@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use crate::agent::{FinishReason, PermissionHook, PlanningMode};
 use crate::compact::Compactor;
-use crate::event::{AgentEvent, EventSink};
+use crate::event::AgentEvent;
 use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, TokenUsage, ToolSpec};
 use crate::message::Message;
@@ -48,9 +48,6 @@ use crate::tools::ToolRegistry;
 pub struct TurnContext {
     /// The full message list to send to the LLM (system + history + new user msg).
     pub messages: Vec<Message>,
-
-    /// Where to emit real-time events during execution.
-    pub event_sink: Option<Box<dyn EventSink>>,
 
     /// Channel to send agent events to the caller (runtime or test harness).
     ///

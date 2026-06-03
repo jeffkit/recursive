@@ -20,53 +20,9 @@ use serde_json::Value;
 use std::time::Duration;
 
 use super::StructuredRequest;
-use super::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall, ToolSpec};
+use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
-
-/// Retry policy for transient failures (network timeouts, 5xx errors).
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    pub max_retries: usize,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(8),
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Decide whether the caller should wait and try again.
-    /// `attempt` is 0-indexed (0 = the first retry decision after the
-    /// initial try has failed). Returns `Some(backoff)` to retry,
-    /// `None` to give up and propagate the error.
-    pub fn backoff_for(
-        &self,
-        attempt: usize,
-        status: Option<u16>,
-        is_network_error: bool,
-    ) -> Option<Duration> {
-        if attempt >= self.max_retries {
-            return None;
-        }
-
-        let is_transient = is_network_error || status.is_some_and(|s| (500..600).contains(&s));
-
-        if !is_transient {
-            return None;
-        }
-
-        let backoff = self.initial_backoff * 2u32.pow(attempt as u32);
-        Some(backoff.min(self.max_backoff))
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -137,6 +93,85 @@ impl OpenAiProvider {
         self.retry = policy;
         self
     }
+
+    /// POST `body` to `url` with retry, returning the raw response text on success.
+    ///
+    /// Handles: network errors, 5xx transient errors, and HTTP 200 with empty body
+    /// (MiniMax transient failure). All three are retried with exponential back-off
+    /// according to `self.retry`. Non-transient 4xx errors are returned immediately.
+    async fn post_json_with_retry(&self, url: &str, body: &Value, label: &str) -> Result<String> {
+        let mut attempt = 0;
+        loop {
+            tracing::debug!(target: "recursive::llm", request = %body, "POST {url} ({label})");
+            let result = self
+                .client
+                .post(url)
+                .bearer_auth(&self.api_key)
+                .json(body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let text = resp.text().await?;
+                        if text.trim().is_empty() {
+                            if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                                tracing::warn!(
+                                    target: "recursive::llm",
+                                    attempt,
+                                    backoff_ms = backoff.as_millis(),
+                                    "HTTP 200 but empty body ({label}), retrying"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                attempt += 1;
+                                continue;
+                            }
+                            return Err(self.make_err("HTTP 200 but response body is empty"));
+                        }
+                        return Ok(text);
+                    }
+
+                    let text = resp.text().await?;
+                    tracing::debug!(target: "recursive::llm", body = %text, "error response ({label})");
+
+                    if let Some(backoff) =
+                        self.retry
+                            .backoff_for(attempt, Some(status.as_u16()), false)
+                    {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            status = status.as_u16(),
+                            "transient HTTP error, retrying ({label})"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(self.make_err(format!("HTTP {status}: {text}")));
+                }
+                Err(e) => {
+                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            error = %e,
+                            "network error, retrying ({label})"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(self.make_err(format!("request failed: {e}")));
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -154,94 +189,15 @@ impl LlmProvider for OpenAiProvider {
             tools,
         );
         let url = format!("{}/chat/completions", self.base_url);
-
-        let mut attempt = 0;
-        loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {}", url);
-            let result = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let is_network_error = false;
-
-                    if status.is_success() {
-                        let text = resp.text().await?;
-                        // Guard: some providers (e.g. MiniMax) occasionally return
-                        // HTTP 200 with an empty body. Treat as transient and retry.
-                        if text.trim().is_empty() {
-                            if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
-                                tracing::warn!(
-                                    target: "recursive::llm",
-                                    attempt,
-                                    backoff_ms = backoff.as_millis(),
-                                    "HTTP 200 but empty body, retrying"
-                                );
-                                tokio::time::sleep(backoff).await;
-                                attempt += 1;
-                                continue;
-                            }
-                            return Err(self.make_err("HTTP 200 but response body is empty"));
-                        }
-                        let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-                            self.make_err(format!("failed to parse response: {e}; body: {text}"))
-                        })?;
-                        let choice = parsed
-                            .choices
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| self.make_err("response had no choices"))?;
-                        return Ok(parse_completion(choice, parsed.usage));
-                    }
-
-                    // Non-2xx response: check if it's transient (5xx)
-                    let text = resp.text().await?;
-                    tracing::debug!(target: "recursive::llm", body = %text, "error response");
-
-                    if let Some(backoff) =
-                        self.retry
-                            .backoff_for(attempt, Some(status.as_u16()), is_network_error)
-                    {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            status = status.as_u16(),
-                            "transient HTTP error, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    // Non-transient (4xx or other)
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
-                }
-                Err(e) => {
-                    // Network error
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            error = %e,
-                            "network error, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    return Err(self.make_err(format!("request failed: {e}")));
-                }
-            }
-        }
+        let text = self.post_json_with_retry(&url, &body, "complete").await?;
+        let parsed: ChatResponse = serde_json::from_str(&text)
+            .map_err(|e| self.make_err(format!("failed to parse response: {e}; body: {text}")))?;
+        let choice = parsed
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| self.make_err("response had no choices"))?;
+        Ok(parse_completion(choice, parsed.usage))
     }
 
     async fn complete_structured(&self, req: StructuredRequest) -> Result<Value> {
@@ -260,106 +216,25 @@ impl LlmProvider for OpenAiProvider {
                 "schema": req.schema,
             }
         });
-
         let url = format!("{}/chat/completions", self.base_url);
-
-        let mut attempt = 0;
-        loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (structured)", url);
-            let result = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let is_network_error = false;
-
-                    if status.is_success() {
-                        let text = resp.text().await?;
-                        // Guard: empty body on HTTP 200 (MiniMax transient failure)
-                        if text.trim().is_empty() {
-                            if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
-                                tracing::warn!(
-                                    target: "recursive::llm",
-                                    attempt,
-                                    backoff_ms = backoff.as_millis(),
-                                    "HTTP 200 but empty body (structured), retrying"
-                                );
-                                tokio::time::sleep(backoff).await;
-                                attempt += 1;
-                                continue;
-                            }
-                            return Err(self.make_err("HTTP 200 but response body is empty"));
-                        }
-                        let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-                            self.make_err(format!("failed to parse response: {e}; body: {text}"))
-                        })?;
-                        let choice = parsed
-                            .choices
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| self.make_err("response had no choices"))?;
-                        let completion = parse_completion(choice, parsed.usage);
-                        // Parse the content as JSON
-                        if completion.content.trim().is_empty() {
-                            return Err(
-                                self.make_err("structured response had empty content".to_string())
-                            );
-                        }
-                        let parsed_json: Value = serde_json::from_str(&completion.content)
-                            .map_err(|e| {
-                                self.make_err(format!(
-                                    "failed to parse structured response as JSON: {e}; content: {}",
-                                    completion.content
-                                ))
-                            })?;
-                        return Ok(parsed_json);
-                    }
-
-                    let text = resp.text().await?;
-                    tracing::debug!(target: "recursive::llm", body = %text, "error response (structured)");
-
-                    if let Some(backoff) =
-                        self.retry
-                            .backoff_for(attempt, Some(status.as_u16()), is_network_error)
-                    {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            status = status.as_u16(),
-                            "transient HTTP error, retrying (structured)"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
-                }
-                Err(e) => {
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            error = %e,
-                            "network error, retrying (structured)"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    return Err(self.make_err(format!("request failed: {e}")));
-                }
-            }
+        let text = self.post_json_with_retry(&url, &body, "structured").await?;
+        let parsed: ChatResponse = serde_json::from_str(&text)
+            .map_err(|e| self.make_err(format!("failed to parse response: {e}; body: {text}")))?;
+        let choice = parsed
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| self.make_err("response had no choices"))?;
+        let completion = parse_completion(choice, parsed.usage);
+        if completion.content.trim().is_empty() {
+            return Err(self.make_err("structured response had empty content"));
         }
+        serde_json::from_str(&completion.content).map_err(|e| {
+            self.make_err(format!(
+                "failed to parse structured response as JSON: {e}; content: {}",
+                completion.content
+            ))
+        })
     }
 
     async fn stream(
@@ -389,12 +264,14 @@ impl OpenAiProvider {
             tools,
         );
         body["stream"] = Value::Bool(true);
-
         let url = format!("{}/chat/completions", self.base_url);
 
+        // Stream requests need the raw Response object for SSE parsing, so we
+        // can't use post_json_with_retry (which returns text). Retry only on
+        // non-2xx and network errors; a successful 2xx hands off to parse_sse_stream.
         let mut attempt = 0;
         loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (stream)", url);
+            tracing::debug!(target: "recursive::llm", request = %body, "POST {url} (stream)");
             let result = self
                 .client
                 .post(&url)
@@ -409,11 +286,8 @@ impl OpenAiProvider {
                     if status.is_success() {
                         return self.parse_sse_stream(resp, stream_tx.clone()).await;
                     }
-
-                    // Non-2xx: read body and check retry
                     let text = resp.text().await?;
                     tracing::debug!(target: "recursive::llm", body = %text, "error response (stream)");
-
                     if let Some(backoff) =
                         self.retry
                             .backoff_for(attempt, Some(status.as_u16()), false)
@@ -429,8 +303,7 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
-
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
+                    return Err(self.make_err(format!("HTTP {status}: {text}")));
                 }
                 Err(e) => {
                     if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
@@ -445,7 +318,6 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
-
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }

@@ -12,6 +12,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+/// Maximum number of automatic retries for retryable LLM errors (rate limits, timeouts).
+const LLM_MAX_RETRIES: u32 = 3;
+/// Base delay for exponential back-off on LLM retries (milliseconds).
+const LLM_RETRY_BASE_MS: u64 = 1_000;
+
 use crate::compact::Compactor;
 use crate::error::{Error, Result};
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
@@ -114,6 +119,50 @@ impl<'a> RunCore<'a> {
         self.messages.push(msg);
     }
 
+    /// Call the LLM with exponential back-off retry for retryable errors.
+    ///
+    /// Retries up to `LLM_MAX_RETRIES` times on `RateLimited` or `Timeout`.
+    /// For `RateLimited` with a `retry_after_ms` hint, waits exactly that
+    /// duration; otherwise uses `LLM_RETRY_BASE_MS * 2^attempt`.
+    async fn call_llm_with_retry(
+        &self,
+        specs: &[crate::llm::ToolSpec],
+        stream_sender: Option<crate::llm::StreamSender>,
+        step: usize,
+    ) -> crate::error::Result<Completion> {
+        let mut attempt = 0u32;
+        loop {
+            let result = if let Some(ref tx) = stream_sender {
+                self.llm
+                    .stream(&self.messages, specs, Some(tx.clone()))
+                    .await
+            } else {
+                self.llm.complete(&self.messages, specs).await
+            };
+            match result {
+                Ok(c) => return Ok(c),
+                Err(e) if e.is_retryable() && attempt < LLM_MAX_RETRIES => {
+                    let wait_ms =
+                        if let crate::error::Error::RateLimited { retry_after_ms, .. } = &e {
+                            *retry_after_ms
+                        } else {
+                            LLM_RETRY_BASE_MS << attempt
+                        };
+                    warn!(
+                        step,
+                        attempt,
+                        wait_ms,
+                        error = %e,
+                        "llm retryable error — backing off"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Trim old tool results to fit the transcript under `limit` chars.
     fn maybe_trim_transcript(&mut self, limit: usize, step: usize) {
         let mut chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
@@ -161,40 +210,23 @@ impl<'a> RunCore<'a> {
             return Ok(());
         }
 
-        let min_messages = compactor.keep_recent_n + 2;
-        if self.messages.len() < min_messages {
-            return Ok(());
+        let kept_before = self.messages.len();
+        if let Some((removed, summary_chars)) = compactor
+            .apply_to_transcript(self.llm.as_ref(), &mut self.messages)
+            .await?
+        {
+            let kept = kept_before - removed;
+            self.hooks.dispatch(HookEvent::PostCompact {
+                removed,
+                summary_chars,
+            });
+            self.emit(AgentEvent::Compacted {
+                removed,
+                kept,
+                summary_chars,
+                step,
+            });
         }
-
-        let summary_msg = compactor.compact(self.llm.as_ref(), &self.messages).await?;
-        let summary_chars = summary_msg.content.len();
-
-        let keep = compactor.keep_recent_n;
-        let mut split = self.messages.len().saturating_sub(keep);
-
-        // Invariant: every `Role::Tool` message must be immediately preceded by
-        // an `Role::Assistant` message containing the matching `tool_calls`.
-        while split > 0 && matches!(self.messages[split].role, crate::message::Role::Tool) {
-            split -= 1;
-        }
-
-        let removed = split;
-        let kept = self.messages.len() - split;
-
-        self.messages.drain(..split);
-        self.messages.insert(0, summary_msg);
-
-        self.hooks.dispatch(HookEvent::PostCompact {
-            removed,
-            summary_chars,
-        });
-
-        self.emit(AgentEvent::Compacted {
-            removed,
-            kept,
-            summary_chars,
-            step,
-        });
 
         Ok(())
     }
@@ -559,12 +591,11 @@ impl<'a> RunCore<'a> {
                 }
             }
 
-            // ---- LLM call ---------------------------------------------------------
+            // ---- LLM call (with retry) --------------------------------------------
             debug!(target: "recursive::agent", step, "calling llm");
             let start = std::time::Instant::now();
-            let completion: Completion = if self.streaming {
+            let stream_tx: Option<StreamSender> = if self.streaming {
                 let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
-                let stream_tx: Option<StreamSender> = Some(delta_tx);
                 let events_tx = self.events.clone();
                 tokio::spawn(async move {
                     while let Some(text) = delta_rx.recv().await {
@@ -573,10 +604,11 @@ impl<'a> RunCore<'a> {
                         }
                     }
                 });
-                self.llm.stream(&self.messages, &specs, stream_tx).await?
+                Some(delta_tx)
             } else {
-                self.llm.complete(&self.messages, &specs).await?
+                None
             };
+            let completion: Completion = self.call_llm_with_retry(&specs, stream_tx, step).await?;
             let llm_ms = start.elapsed().as_millis() as u64;
             self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
             self.emit(AgentEvent::Latency { step, llm_ms });

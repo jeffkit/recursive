@@ -194,7 +194,6 @@ async fn send_message_tool_spec_has_required_fields() {
 #[tokio::test]
 async fn worker_receives_coordinator_message_via_mailbox() {
     use recursive::agent::PlanningMode;
-    use recursive::event::NullSink;
     use recursive::kernel::{AgentKernel, TurnContext};
     use recursive::message::Message;
     use recursive::permissions::PermissionMode;
@@ -221,7 +220,6 @@ async fn worker_receives_coordinator_message_via_mailbox() {
             Message::system("You are a test worker."),
             Message::user("Do the task."),
         ],
-        event_sink: Some(Box::new(NullSink)),
         step_events_tx: None,
         plan_confirmed: false,
         plan_buffer: None,

@@ -1,7 +1,6 @@
 //! Multi-agent orchestration: agent pool, role definitions, and message bus.
 
 use crate::agent::PlanningMode;
-use crate::event::NullSink;
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
@@ -303,7 +302,6 @@ impl AgentPool {
                 Message::system(system_prompt),
                 Message::user(goal.to_string()),
             ],
-            event_sink: Some(Box::new(NullSink)),
             step_events_tx: None,
             plan_confirmed: false,
             plan_buffer: None,
