@@ -330,6 +330,10 @@ pub struct SessionMeta {
     /// session files round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// Optional human-readable display name for this session, set via `--name`.
+    /// Shown in the /resume picker and `sessions list` output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A portable exported transcript for sharing and analysis.
@@ -489,6 +493,8 @@ pub struct SessionWriter {
     /// `SessionWriter::open_existing` (or `create`) on the same
     /// `session_dir` is refused. Cleaned up on `Drop`.
     _lock: Option<SessionLock>,
+    /// Optional human-readable display name for this session.
+    name: Option<String>,
 }
 
 impl SessionWriter {
@@ -573,6 +579,7 @@ impl SessionWriter {
             last_prompt: None,
             cost: None,
             preset: preset.map(|s| s.to_string()),
+            name: None,
         };
 
         // Write initial meta file
@@ -591,6 +598,7 @@ impl SessionWriter {
             first_prompt: None,
             last_prompt: None,
             _lock: Some(lock),
+            name: None,
         })
     }
 
@@ -635,6 +643,7 @@ impl SessionWriter {
             first_prompt: meta.first_prompt,
             last_prompt: meta.last_prompt,
             _lock: Some(lock),
+            name: meta.name,
         })
     }
 
@@ -833,10 +842,20 @@ impl SessionWriter {
             cost.accumulate(&self.cumulative_usage);
             meta.cost = Some(cost);
         }
+        // Persist the display name if one was set.
+        if self.name.is_some() {
+            meta.name = self.name.clone();
+        }
 
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&meta_path, meta_json)
+    }
+
+    /// Set an optional human-readable display name for this session.
+    /// The name is persisted to `.meta.json` on the next `finish()` call.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = Some(name.into());
     }
 
     /// Return the session ID.
