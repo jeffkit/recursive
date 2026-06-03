@@ -1,22 +1,21 @@
-//! End-to-end smoke: agent + real filesystem tools + scripted mock model.
+//! End-to-end smoke: runtime + real filesystem tools + scripted mock model.
 //!
 //! Verifies that the kernel can actually drive a coding-style task to
 //! completion using only its public API, with no network and no real LLM.
-// Allow deprecated Agent usage until test is migrated.
-#![allow(deprecated)]
 
 use std::sync::Arc;
 
 use recursive::{
     llm::{Completion, MockProvider, ToolCall},
+    runtime::AgentRuntime,
     tools::{ListDir, LocalTransport, ReadFile, ToolTransport, WriteFile},
-    Agent, ToolRegistry,
+    ToolRegistry,
 };
 use serde_json::json;
 use tempfile::TempDir;
 
 #[tokio::test]
-async fn agent_writes_reads_and_summarises() {
+async fn runtime_writes_reads_and_summarises() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
@@ -70,24 +69,20 @@ async fn agent_writes_reads_and_summarises() {
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(ListDir::new(root)));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
-        .system_prompt("you are a test agent")
+        .system_prompt("you are a test runtime")
         .max_steps(10)
         .build()
         .unwrap();
 
-    let outcome = agent.run("create greet.txt and confirm").await.unwrap();
+    let outcome = runtime.run("create greet.txt and confirm").await.unwrap();
 
     assert_eq!(outcome.steps, 4);
-    assert!(outcome
-        .final_message
-        .as_deref()
-        .unwrap()
-        .contains("greet.txt"));
+    assert!(outcome.final_text.as_deref().unwrap().contains("greet.txt"));
 
-    // The agent actually wrote the file via the real fs tool.
+    // The runtime actually wrote the file via the real fs tool.
     let on_disk = std::fs::read_to_string(root.join("greet.txt")).unwrap();
     assert_eq!(on_disk, "hello recursive");
 }

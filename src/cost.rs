@@ -1,9 +1,7 @@
 //! Cost tracking for agent runs.
-// Uses OnMessageFn for the cost callback helper; allow deprecated type.
-#![allow(deprecated)]
 //!
-//! `CostTracker` observes messages flowing through the agent and accumulates
-//! token usage and cost data. It writes a `cost.json` file into the session
+//! `CostTracker` observes token usage flowing through the agent and accumulates
+//! cost data. It writes a `cost.json` file into the session
 //! directory alongside the JSONL transcript, and can update the session meta
 //! file with cost summary fields.
 //!
@@ -13,10 +11,9 @@
 //! let tracker = CostTracker::new(
 //!     &workspace, "gpt-4o", "openai", &external_pricing,
 //! )?;
-//! let cb = tracker.on_message_callback();
-//! // pass `cb` as the OnMessageFn to the agent builder
-//! // ... after agent.run(...):
-//! tracker.finish(&outcome.total_usage, outcome.total_llm_latency_ms, "success")?;
+//! // after runtime.run(...):
+//! tracker.record_usage(outcome.total_usage, outcome.llm_latency_ms);
+//! tracker.finish()?;
 //! ```
 
 use std::collections::HashMap;
@@ -25,7 +22,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{pricing_for, ModelPricing, TokenUsage};
-use crate::message::Message;
 
 /// Accumulated cost data for a single agent run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,9 +103,9 @@ impl CostTracker {
 
     /// Record token usage and latency from a single LLM call.
     ///
-    /// This is called internally by the `on_message` callback when it detects
-    /// assistant messages with token usage metadata. You can also call it
-    /// directly if you have usage data from another source.
+    /// Call this from the integration layer after each `runtime.run()`,
+    /// passing `outcome.total_usage` and `outcome.llm_latency_ms` from
+    /// the [`RuntimeOutcome`](crate::runtime::RuntimeOutcome).
     pub fn record_usage(&mut self, usage: TokenUsage, latency_ms: u64) {
         self.accumulated_usage = self.accumulated_usage.accumulate(usage);
         self.accumulated_latency_ms = self.accumulated_latency_ms.saturating_add(latency_ms);
@@ -236,30 +232,6 @@ impl CostTracker {
         self.write_cost_json()?;
         self.update_meta_with_cost()?;
         Ok(())
-    }
-
-    /// Create an `OnMessageFn` callback that records token usage from
-    /// assistant messages.
-    ///
-    /// The callback inspects each message for embedded token usage metadata.
-    /// Currently, token usage is extracted from the `reasoning_content` field
-    /// which some providers use to pass usage data. In the future, this may
-    /// be extended to read from a dedicated metadata field.
-    ///
-    /// Note: This is a best-effort approach. The primary mechanism for
-    /// recording usage is to call `record_usage()` directly with the values
-    /// from `AgentOutcome.total_usage` after the run completes.
-    pub fn on_message_callback(&self) -> crate::agent::OnMessageFn {
-        // For now, return a no-op callback. The primary usage path is:
-        // 1. Create CostTracker before the run
-        // 2. After agent.run(), call tracker.record_usage(outcome.total_usage, ...)
-        // 3. Call tracker.finish()
-        //
-        // A future enhancement could parse token usage from message metadata.
-        Box::new(move |_msg: &Message| {
-            // Token usage is not currently embedded in individual messages.
-            // It's available in AgentOutcome.total_usage after the run.
-        })
     }
 }
 

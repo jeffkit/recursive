@@ -3,15 +3,14 @@
 //! Verifies that the AnthropicProvider plumbing works end-to-end with a
 //! mock HTTP server, exercising the full request/response cycle including
 //! tool calls and tool results.
-// Allow deprecated Agent usage until test is migrated.
-#![allow(deprecated)]
 
 use std::sync::Arc;
 
 use recursive::{
     llm::AnthropicProvider,
+    runtime::AgentRuntime,
     tools::{LocalTransport, ReadFile, ToolTransport, WriteFile},
-    Agent, ToolRegistry,
+    ToolRegistry,
 };
 use tempfile::TempDir;
 
@@ -28,21 +27,21 @@ async fn anthropic_smoke_constructs_with_minimum_config() {
 }
 
 #[tokio::test]
-async fn anthropic_full_agent_loop_with_mock_provider() {
+async fn anthropic_full_runtime_loop_with_mock_provider() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
-    // The agent will make two LLM calls:
+    // The runtime will make two LLM calls:
     // 1. First call: model says "I'll write a file" and calls write_file
     // 2. Second call: model says "Done" and stops
     //
-    // We need two mock responses. The agent loop calls complete() once per
+    // We need two mock responses. The runtime loop calls complete() once per
     // step, so we set up a mock server that returns the first response,
-    // then the agent calls complete again and we return the second.
+    // then the runtime calls complete again and we return the second.
 
     // For this test we use a simpler approach: spawn a mock server that
     // returns a tool_use response, then another for the final response.
-    // Since the agent loop calls complete() sequentially, we use a shared
+    // Since the runtime loop calls complete() sequentially, we use a shared
     // counter to serve different responses.
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,26 +95,22 @@ async fn anthropic_full_agent_loop_with_mock_provider() {
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ReadFile::new(root)));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(provider)
         .tools(tools)
-        .system_prompt("you are a test agent using Anthropic API")
+        .system_prompt("you are a test runtime using Anthropic API")
         .max_steps(5)
         .build()
         .unwrap();
 
-    let outcome = agent.run("create hello.txt with content").await.unwrap();
+    let outcome = runtime.run("create hello.txt with content").await.unwrap();
 
     handle.join().unwrap();
 
     assert_eq!(outcome.steps, 2);
-    assert!(outcome
-        .final_message
-        .as_deref()
-        .unwrap()
-        .contains("hello.txt"));
+    assert!(outcome.final_text.as_deref().unwrap().contains("hello.txt"));
 
-    // The agent actually wrote the file via the real fs tool.
+    // The runtime actually wrote the file via the real fs tool.
     let on_disk = std::fs::read_to_string(root.join("hello.txt")).unwrap();
     assert_eq!(on_disk, "Hello from Anthropic");
 }

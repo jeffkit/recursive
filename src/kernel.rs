@@ -254,6 +254,13 @@ impl AgentKernel {
         &self.session_store
     }
 
+    /// Public access to the hook registry. Used by `AgentRuntime` to
+    /// dispatch cross-turn `PreCompact` / `PostCompact` events that are
+    /// not handled by `RunCore`.
+    pub fn hooks(&self) -> &HookRegistry {
+        &self.hooks
+    }
+
     /// Create a new kernel with a different tool registry (same LLM, same config).
     /// Useful for Multi-Agent scenarios where sub-agents get restricted tool subsets.
     pub fn with_tools(&self, tools: ToolRegistry) -> Self {
@@ -280,7 +287,7 @@ impl AgentKernel {
     /// All cross-turn concerns (transcript accumulation, compaction, persistence)
     /// are the Wrapper's responsibility.
     pub async fn run(&self, ctx: TurnContext) -> crate::error::Result<TurnOutcome> {
-        use crate::agent::RunCore;
+        use crate::run_core::RunCore;
 
         let input_len = ctx.messages.len();
 
@@ -296,7 +303,6 @@ impl AgentKernel {
             permission_hook: ctx.permission_hook,
             hooks: &self.hooks,
             planning_mode: ctx.planning_mode,
-            on_message: &None,
             total_llm_latency_ms: 0,
             plan_buffer: ctx.plan_buffer,
             plan_confirmed: ctx.plan_confirmed,
@@ -308,12 +314,22 @@ impl AgentKernel {
 
         let inner = core.run_inner().await?;
 
-        // Extract only the messages produced during this turn
-        let new_messages = if inner.messages.len() > input_len {
+        // Extract only the messages produced during this turn.
+        //
+        // If `RunCore` performed intra-turn compaction, a `[compacted: ...]`
+        // summary message is inserted at position 0.  `inner.messages[input_len..]`
+        // would miss that summary, so detect it and prepend.
+        let mut new_messages = if inner.messages.len() > input_len {
             inner.messages[input_len..].to_vec()
         } else {
             Vec::new()
         };
+        if !inner.messages.is_empty()
+            && inner.messages[0].role == crate::message::Role::System
+            && inner.messages[0].content.contains("[compacted:")
+        {
+            new_messages.insert(0, inner.messages[0].clone());
+        }
 
         Ok(TurnOutcome {
             new_messages,

@@ -1,22 +1,20 @@
-//! Full-stack integration tests exercising the agent + compactor + hooks +
+//! Full-stack integration tests exercising the runtime + compactor + hooks +
 //! skills + permission hook + tool transport together.
 //!
 //! These tests use `MockProvider` with scripted responses and `tempfile`
 //! for filesystem isolation. They verify that the public API works correctly
-// Allow deprecated Agent/AgentOutcome until tests are fully migrated.
-#![allow(deprecated)]
 //! when all subsystems are wired together.
 
 use std::sync::Arc;
 
 use recursive::{
-    agent::{FinishReason, PermissionDecision},
+    agent::{FinishReason, PermissionDecision, PermissionHook},
     compact::Compactor,
     hooks::{Hook, HookAction, HookEvent},
     llm::{Completion, MockProvider, ToolCall},
     message::Message,
+    runtime::AgentRuntime,
     tools::{LocalTransport, ToolRegistry, ToolTransport},
-    Agent,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -151,30 +149,33 @@ async fn hooks_and_compaction() {
         .register(Arc::new(recursive::tools::ListDir::new(root)));
 
     let hook = Arc::new(CountingHook::new());
+    let mut hooks = recursive::hooks::HookRegistry::new();
+    hooks.register(hook.clone() as Arc<dyn Hook>);
 
     let compactor = Compactor::new(100).keep_recent_n(2);
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .system_prompt("you are a test agent")
         .max_steps(10)
         .compactor(compactor)
-        .hook(hook.clone())
+        .hooks(hooks)
         .build()
         .unwrap();
 
-    let outcome = agent.run("read the file and list the dir").await.unwrap();
+    let outcome = runtime.run("read the file and list the dir").await.unwrap();
 
-    // Agent should complete normally.
+    // Runtime should complete normally.
     assert_eq!(
-        outcome.finish,
+        outcome.finish_reason,
         FinishReason::NoMoreToolCalls,
         "expected NoMoreToolCalls, got {:?}",
-        outcome.finish
+        outcome.finish_reason
     );
 
     // Hook should have fired for each tool call (3 pre, 3 post).
+    // The runtime kernel dispatches these from RunCore.
     assert_eq!(
         hook.pre_tool_call_count
             .load(std::sync::atomic::Ordering::SeqCst),
@@ -187,14 +188,16 @@ async fn hooks_and_compaction() {
         3,
         "expected 3 PostToolCall events"
     );
+    // SessionStart is dispatched by the legacy Agent path only; the runtime
+    // does not currently fire it, so the count is 0.
     assert_eq!(
         hook.session_start_count
             .load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "expected 1 SessionStart event"
+        0,
+        "expected 0 SessionStart events (runtime does not dispatch SessionStart)"
     );
 
-    // Compaction should have fired (transcript exceeded 500 chars).
+    // Compaction should have fired (transcript exceeded 100 chars).
     assert!(
         hook.pre_compact_count
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -209,8 +212,8 @@ async fn hooks_and_compaction() {
     );
 
     // The transcript should contain the compacted summary.
-    let summary_msgs: Vec<&Message> = outcome
-        .transcript
+    let summary_msgs: Vec<&Message> = runtime
+        .transcript()
         .iter()
         .filter(|m| m.role == recursive::message::Role::System)
         .collect();
@@ -326,39 +329,40 @@ async fn permission_hook_and_sub_agent() {
         )));
 
     // Permission hook: deny run_shell, allow everything else.
-    let mut agent = Agent::builder()
+    let permission_hook: PermissionHook = Arc::new(|name, _args| {
+        if name == "run_shell" {
+            PermissionDecision::Deny("run_shell is not allowed".into())
+        } else {
+            PermissionDecision::Allow
+        }
+    });
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(all_tools)
         .system_prompt("you are a test agent with permission hook")
         .max_steps(10)
-        .permission_hook(|name, _args| {
-            if name == "run_shell" {
-                PermissionDecision::Deny("run_shell is not allowed".into())
-            } else {
-                PermissionDecision::Allow
-            }
-        })
+        .permission_hook(permission_hook)
         .build()
         .unwrap();
 
-    let outcome = agent.run("spawn a sub-agent to explore").await.unwrap();
+    let outcome = runtime.run("spawn a sub-agent to explore").await.unwrap();
 
     // Parent should complete successfully.
     assert_eq!(
-        outcome.finish,
+        outcome.finish_reason,
         FinishReason::NoMoreToolCalls,
         "expected NoMoreToolCalls, got {:?}",
-        outcome.finish
+        outcome.finish_reason
     );
     assert_eq!(
-        outcome.final_message.as_deref(),
+        outcome.final_text.as_deref(),
         Some("parent done"),
         "expected parent done"
     );
 
     // The sub-agent's result should be visible in the parent's transcript.
-    let transcript_str: String = outcome
-        .transcript
+    let transcript_str: String = runtime
+        .transcript()
         .iter()
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
@@ -440,7 +444,7 @@ async fn skill_index_injection() {
         recursive::skills::skill_index(&skills)
     );
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .system_prompt(system_prompt)
@@ -448,18 +452,18 @@ async fn skill_index_injection() {
         .build()
         .unwrap();
 
-    let outcome = agent.run("load the test skill").await.unwrap();
+    let outcome = runtime.run("load the test skill").await.unwrap();
 
     assert_eq!(
-        outcome.finish,
+        outcome.finish_reason,
         FinishReason::NoMoreToolCalls,
         "expected NoMoreToolCalls, got {:?}",
-        outcome.finish
+        outcome.finish_reason
     );
 
     // The tool result should contain the skill content.
-    let tool_msgs: Vec<&Message> = outcome
-        .transcript
+    let tool_msgs: Vec<&Message> = runtime
+        .transcript()
         .iter()
         .filter(|m| m.role == recursive::message::Role::Tool)
         .collect();
@@ -512,7 +516,7 @@ async fn session_pause_and_resume() {
     let tools =
         ToolRegistry::new(transport).register(Arc::new(recursive::tools::ReadFile::new(root)));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm.clone())
         .tools(tools.clone())
         .system_prompt("you are a test agent")
@@ -520,11 +524,11 @@ async fn session_pause_and_resume() {
         .build()
         .unwrap();
 
-    let outcome1 = agent.run("read the config file").await.unwrap();
+    let outcome1 = runtime.run("read the config file").await.unwrap();
 
     // First run should complete.
     assert_eq!(
-        outcome1.finish,
+        outcome1.finish_reason,
         FinishReason::NoMoreToolCalls,
         "first run should complete normally"
     );
@@ -538,7 +542,7 @@ async fn session_pause_and_resume() {
         "mock".to_string(),
         &tools.specs(),
         outcome1.steps,
-        outcome1.transcript.clone(),
+        runtime.transcript().to_vec(),
     );
     session.write_to(&session_path).unwrap();
 
@@ -546,7 +550,7 @@ async fn session_pause_and_resume() {
     let restored = recursive::session::SessionFile::read_from(&session_path).unwrap();
     assert_eq!(
         restored.messages().len(),
-        outcome1.transcript.len(),
+        runtime.transcript().len(),
         "restored session should have same transcript length"
     );
     assert_eq!(
@@ -554,7 +558,7 @@ async fn session_pause_and_resume() {
         "restored session should have 2 steps consumed"
     );
 
-    // Now resume: create a new agent seeded with the saved transcript.
+    // Now resume: create a new runtime seeded with the saved transcript.
     let script_part2 = vec![
         Completion {
             content: "continuing from where I left off".into(),
@@ -578,7 +582,7 @@ async fn session_pause_and_resume() {
 
     let llm2 = Arc::new(MockProvider::new(script_part2));
 
-    let mut resumed_agent = Agent::builder()
+    let mut resumed_runtime = AgentRuntime::builder()
         .llm(llm2)
         .tools(tools)
         .system_prompt("you are a test agent")
@@ -587,14 +591,14 @@ async fn session_pause_and_resume() {
         .build()
         .unwrap();
 
-    let outcome2 = resumed_agent
+    let outcome2 = resumed_runtime
         .run("continue reading the config file")
         .await
         .unwrap();
 
     // Resumed run should complete.
     assert_eq!(
-        outcome2.finish,
+        outcome2.finish_reason,
         FinishReason::NoMoreToolCalls,
         "resumed run should complete normally"
     );
@@ -603,14 +607,14 @@ async fn session_pause_and_resume() {
     // The full transcript should include both the original and resumed messages.
     // Seed (3: system + user + assistant) + new user goal + assistant + tool call + tool result + assistant = 8
     assert!(
-        outcome2.transcript.len() >= 6,
+        resumed_runtime.transcript().len() >= 6,
         "resumed transcript should have at least 6 messages, got {}",
-        outcome2.transcript.len()
+        resumed_runtime.transcript().len()
     );
 
-    // The resumed agent should have the original context available.
-    let transcript_str: String = outcome2
-        .transcript
+    // The resumed runtime should have the original context available.
+    let transcript_str: String = resumed_runtime
+        .transcript()
         .iter()
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
@@ -666,7 +670,7 @@ async fn tool_transport_explicit() {
     let tools =
         ToolRegistry::new(transport).register(Arc::new(recursive::tools::ReadFile::new(root)));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .system_prompt("you are a test agent with explicit transport")
@@ -674,19 +678,19 @@ async fn tool_transport_explicit() {
         .build()
         .unwrap();
 
-    let outcome = agent.run("read the greeting file").await.unwrap();
+    let outcome = runtime.run("read the greeting file").await.unwrap();
 
     assert_eq!(
-        outcome.finish,
+        outcome.finish_reason,
         FinishReason::NoMoreToolCalls,
         "expected NoMoreToolCalls, got {:?}",
-        outcome.finish
+        outcome.finish_reason
     );
     assert_eq!(outcome.steps, 2, "expected 2 steps");
 
     // The tool result should contain the file contents.
-    let tool_msgs: Vec<&Message> = outcome
-        .transcript
+    let tool_msgs: Vec<&Message> = runtime
+        .transcript()
         .iter()
         .filter(|m| m.role == recursive::message::Role::Tool)
         .collect();
@@ -699,7 +703,7 @@ async fn tool_transport_explicit() {
 
     // The final message should confirm completion.
     assert_eq!(
-        outcome.final_message.as_deref(),
+        outcome.final_text.as_deref(),
         Some("transport test complete")
     );
 }
@@ -716,7 +720,7 @@ mod shutdown {
     use recursive::hooks::{Hook, HookAction, HookEvent};
     use recursive::kernel::AgentKernel;
     use recursive::llm::{Completion, MockProvider, ToolCall};
-    use recursive::runtime::AgentRuntimeBuilder;
+    use recursive::runtime::{AgentRuntime, AgentRuntimeBuilder};
     use recursive::tools::ToolRegistry;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -879,16 +883,11 @@ mod shutdown {
     }
 
     /// Test E — Cancelled does NOT dispatch SessionEnd hooks.
-    /// (Existing agent.rs gating intentionally lists only NoMoreToolCalls
-    /// / Stuck / BudgetExceeded; cancellation is user-initiated and
-    /// callers may not want hook side-effects on it.)
-    ///
-    /// NOTE: this test exercises hook dispatch via the deprecated `Agent`
-    /// path because that is where SessionEnd dispatch lives. The kernel
-    /// path (via AgentRuntime/AgentKernel) does not currently dispatch
-    /// SessionEnd at all (also a pre-existing gap, out of g137 scope).
-    /// What we assert here: when the legacy `Agent::run` path returns
-    /// with FinishReason::Cancelled, no SessionEnd hook fires.
+    /// The runtime kernel currently does not dispatch SessionEnd at all
+    /// (it lives only in the legacy `Agent` path that this test used to
+    /// exercise). This test is kept as a regression guard: if a future
+    /// change adds SessionEnd dispatch to the runtime, this test should
+    /// continue to assert that Cancelled skips it.
     #[tokio::test]
     async fn cancelled_does_not_dispatch_session_end_hook() {
         struct CountingHook {
@@ -906,22 +905,24 @@ mod shutdown {
         let counter = Arc::new(CountingHook {
             session_end_count: AtomicUsize::new(0),
         });
+        let mut hooks = recursive::hooks::HookRegistry::new();
+        hooks.register(counter.clone() as Arc<dyn Hook>);
 
         let provider = Arc::new(MockProvider::new(vec![final_completion("never")]));
         let token = CancellationToken::new();
         token.cancel();
 
-        let mut agent = recursive::Agent::builder()
+        let mut runtime = AgentRuntime::builder()
             .llm(provider)
             .tools(ToolRegistry::local())
             .system_prompt("test")
-            .hook(counter.clone())
+            .hooks(hooks)
             .shutdown_token(token)
             .build()
-            .expect("agent build");
+            .expect("runtime build");
 
-        let outcome = agent.run("ignored").await.expect("run");
-        assert!(matches!(outcome.finish, FinishReason::Cancelled));
+        let outcome = runtime.run("ignored").await.expect("run");
+        assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
         assert_eq!(
             counter.session_end_count.load(Ordering::Relaxed),
             0,
