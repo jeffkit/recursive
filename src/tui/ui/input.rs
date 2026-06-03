@@ -163,20 +163,19 @@ pub fn cursor_visual_position(buffer: &str, cursor: usize) -> (u16, u16) {
 }
 
 /// Single-line hint shown below the input frame.
+///
+/// Note: the previous `ctrl+b/f or wheel scroll` segment was dropped
+/// — `Ctrl+B` / `Ctrl+F` now move the cursor by one char (emacs
+/// readline), and the remaining transcript-scroll affordances
+/// (PageUp/PageDown, Shift+ArrowUp/Down, trackpad / mouse wheel) are
+/// left implicit because the status bar already advertises the
+/// mode and the scroll behaviour is terminal-native.
 pub fn footer_hint(mode: InputMode) -> String {
     match mode {
-        InputMode::Prompt => {
-            "⏎ submit  shift+tab mode  ↑↓ history  ctrl+b/f or wheel scroll  esc clear".into()
-        }
-        InputMode::Bash => {
-            "⏎ run shell  shift+tab mode  ↑↓ history  ctrl+b/f or wheel scroll  esc clear".into()
-        }
-        InputMode::Note => {
-            "⏎ save note  shift+tab mode  ↑↓ history  ctrl+b/f or wheel scroll  esc clear".into()
-        }
-        InputMode::Command => {
-            "⏎ run command  tab autocomplete  ↑↓ history  ctrl+b/f or wheel scroll".into()
-        }
+        InputMode::Prompt => "⏎ submit  shift+tab mode  ↑↓ history  esc clear".into(),
+        InputMode::Bash => "⏎ run shell  shift+tab mode  ↑↓ history  esc clear".into(),
+        InputMode::Note => "⏎ save note  shift+tab mode  ↑↓ history  esc clear".into(),
+        InputMode::Command => "⏎ run command  tab autocomplete  ↑↓ history".into(),
         InputMode::AtFile => "⏎/tab confirm  ↑↓ select  backspace edit  esc cancel".into(),
         InputMode::HistorySearch => {
             "⏎ confirm  ↑↓ select  ctrl+r next  backspace edit  esc cancel".into()

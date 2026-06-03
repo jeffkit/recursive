@@ -116,10 +116,7 @@ fn render_assistant(
     let mut out: Vec<Line<'static>> = Vec::new();
 
     if text.is_empty() {
-        out.push(Line::from(vec![
-            Span::styled("•", bullet_style),
-            indent,
-        ]));
+        out.push(Line::from(vec![Span::styled("•", bullet_style), indent]));
         return out;
     }
 
@@ -239,17 +236,20 @@ fn render_tool_call(
                 .fg(bullet_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(args_display, Style::default().fg(th.system_bar)),
+        // Args preview shares the body color so the whole tool line
+        // reads in one tone; the bullet and tool name still pop in
+        // the status colour.
+        Span::styled(args_display, Style::default().fg(body_color)),
     ])];
 
     match result {
         None => {
             out.push(Line::from(vec![
-                Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                Span::styled("    ⎿  ", Style::default().fg(body_color)),
                 Span::styled(
                     "Running…".to_string(),
                     Style::default()
-                        .fg(th.system_bar)
+                        .fg(body_color)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -261,11 +261,11 @@ fn render_tool_call(
         }) => {
             if !size.is_empty() {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
                     Span::styled(
                         size,
                         Style::default()
-                            .fg(th.system_bar)
+                            .fg(body_color)
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
@@ -279,17 +279,17 @@ fn render_tool_call(
             };
             for line in visible {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
                     Span::styled((*line).to_string(), Style::default().fg(body_color)),
                 ]));
             }
             if !*expanded && n > 6 {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
                     Span::styled(
                         format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
                         Style::default()
-                            .fg(th.system_bar)
+                            .fg(body_color)
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
@@ -663,12 +663,7 @@ mod tests {
 
     #[test]
     fn user_block_carries_background_highlight() {
-        let lines = render_block(
-            &TranscriptBlock::User {
-                text: "hi".into(),
-            },
-            &theme::DARK,
-        );
+        let lines = render_block(&TranscriptBlock::User { text: "hi".into() }, &theme::DARK);
         let has_bg = lines[0]
             .spans
             .iter()
@@ -700,7 +695,9 @@ mod tests {
     #[test]
     fn reasoning_block_empty_text_still_shows_header() {
         let lines = render_block(
-            &TranscriptBlock::Reasoning { text: String::new() },
+            &TranscriptBlock::Reasoning {
+                text: String::new(),
+            },
             &theme::DARK,
         );
         assert!(line_text(&lines[0]).contains("thinking"));
@@ -718,10 +715,7 @@ mod tests {
         );
         let txt = line_text(&lines[0]);
         assert!(txt.contains("•"), "assistant must lead with a bullet");
-        assert!(
-            !txt.contains("Agent"),
-            "old `Agent` label should be gone"
-        );
+        assert!(!txt.contains("Agent"), "old `Agent` label should be gone");
         assert!(!txt.contains("⏱"), "latency should not be in the block");
         assert!(!txt.contains("streaming"), "no streaming label anymore");
     }
