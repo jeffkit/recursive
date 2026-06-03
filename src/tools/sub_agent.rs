@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use crate::agent::{FinishReason, PermissionHook, PlanningMode};
 use crate::error::{Error, Result};
-use crate::event::NullSink;
 use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
@@ -268,7 +267,6 @@ impl Tool for SubAgent {
                 Message::system(agent_type.system_prompt_hint().to_string()),
                 Message::user(prompt.to_string()),
             ],
-            event_sink: Some(Box::new(NullSink)),
             step_events_tx: None,
             plan_confirmed: false,
             plan_buffer: None,

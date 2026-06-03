@@ -147,6 +147,35 @@ impl Compactor {
         Some(Self::render_structured(&summary, &kept_facts, &next_steps))
     }
 
+    /// Apply compaction in-place to `transcript`, returning `(removed, summary_chars)`.
+    ///
+    /// Finds the correct split point (never splits inside a tool-call pair),
+    /// calls `compact()` to get the summary message, splices the transcript,
+    /// and returns how many messages were removed and the summary char count.
+    ///
+    /// Returns `None` when the transcript is too short to compact
+    /// (`< keep_recent_n + 2` messages).
+    pub async fn apply_to_transcript(
+        &self,
+        provider: &dyn LlmProvider,
+        transcript: &mut Vec<Message>,
+    ) -> Result<Option<(usize, usize)>> {
+        if transcript.len() < self.keep_recent_n + 2 {
+            return Ok(None);
+        }
+        let summary_msg = self.compact(provider, transcript).await?;
+        let summary_chars = summary_msg.content.len();
+        let keep = self.keep_recent_n;
+        let mut split = transcript.len().saturating_sub(keep);
+        while split > 0 && matches!(transcript[split].role, crate::message::Role::Tool) {
+            split -= 1;
+        }
+        let removed = split;
+        transcript.drain(..split);
+        transcript.insert(0, summary_msg);
+        Ok(Some((removed, summary_chars)))
+    }
+
     /// Compact the transcript: summarize older messages into a single system
     /// message, keeping the last `keep_recent_n` messages verbatim.
     ///
