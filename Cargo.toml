@@ -36,6 +36,11 @@ e2b-sandbox = []
 aws-sdk-s3 = ["dep:aws-sdk-s3"]
 aws-config = ["dep:aws-config"]
 bollard = ["dep:bollard"]
+# Semantic vector memory: OpenAI embedding API call.
+openai-embedding = []
+# Full vector memory: SQLite-backed ANN store (pure rusqlite, no C extensions required).
+# Cosine similarity is computed in Rust; suitable for typical agent memory sizes (<10k entries).
+vector-memory = ["openai-embedding", "dep:rusqlite"]
 
 [lib]
 name = "recursive"
@@ -90,6 +95,8 @@ uuid = { version = "1", features = ["v4", "v7"] }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 bollard = { version = "0.18", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }

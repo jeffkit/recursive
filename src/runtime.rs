@@ -189,6 +189,16 @@ impl AgentRuntime {
     pub async fn run(&mut self, user_text: impl Into<String>) -> Result<RuntimeOutcome> {
         let user_text = user_text.into();
 
+        // Record turn-level fields on the *current* span (the caller's span,
+        // or the root span in a standalone executor). Using `tracing::Span::record`
+        // avoids creating a new async span guard (which is !Send across awaits).
+        tracing::Span::current().record("session_id", self.session_id.as_deref().unwrap_or(""));
+        tracing::debug!(
+            session_id = self.session_id.as_deref().unwrap_or(""),
+            turn = self.turn_index,
+            "agent.turn: starting"
+        );
+
         // ── Checkpoint: pre-turn snapshot ──────────────────────────────
         let started_at = unix_now();
         let pre_id = self.snapshot_pre_turn(&user_text);
@@ -384,6 +394,12 @@ impl AgentRuntime {
         let post_id = self.snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
         outcome.checkpoint_id = post_id;
 
+        tracing::info!(
+            steps = outcome.steps,
+            finish_reason = ?outcome.finish_reason,
+            "agent.turn: finished"
+        );
+
         // Advance turn counter only if we actually ran a turn (we did).
         self.turn_index += 1;
 
@@ -472,6 +488,16 @@ impl AgentRuntime {
     /// token — call it before each `run()` so a fresh token is in place.
     pub fn set_interrupt_token(&mut self, token: tokio_util::sync::CancellationToken) {
         self.kernel.shutdown_token = Some(token);
+    }
+
+    /// Set the session id used for tracing-span labels and turn log lines.
+    ///
+    /// After this is called, every `run()` emits a tracing span record with
+    /// `session_id=<id>` and an info log line carrying the same field, so logs
+    /// and OTEL/Datadog traces can be filtered per session via
+    /// `RUST_LOG=recursive[{session_id}]=debug` or the `session_id` label.
+    pub fn set_session_id(&mut self, id: impl Into<String>) {
+        self.session_id = Some(id.into());
     }
 
     /// Set a new event sink (useful for REPL mode between turns).

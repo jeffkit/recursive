@@ -27,6 +27,7 @@ pub mod llm;
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
+pub mod memory;
 pub mod message;
 pub mod migrate;
 pub mod multi;

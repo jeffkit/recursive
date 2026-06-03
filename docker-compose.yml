@@ -1,0 +1,109 @@
+# docker-compose.yml — Local cloud-stack for Recursive
+#
+# Spins up three services:
+#   recursive  — the agent HTTP gateway (recursive serve)
+#   redis      — hot session state (AgentCheckpointState via RedisSessionStore)
+#   localstack — AWS-compatible S3 emulation for transcript/memory storage
+#
+# Usage:
+#   docker compose up          # start all services
+#   docker compose up recursive # start only the agent (requires external Redis/S3 or defaults)
+#
+# Build the image first (or rely on published image):
+#   docker build -t recursive:dev --target runtime .
+#
+# Minimum required env:
+#   RECURSIVE_API_KEY — your LLM provider API key (passed via .env or -e)
+
+version: "3.9"
+
+services:
+  # ── Recursive Agent Gateway ──────────────────────────────────────────────
+  recursive:
+    image: recursive:dev
+    build:
+      context: .
+      target: runtime
+      args:
+        RUST_VERSION: "1.86"
+    ports:
+      - "3000:3000"
+    environment:
+      # ── LLM provider (required) ──
+      RECURSIVE_API_BASE: "${RECURSIVE_API_BASE:-https://api.openai.com/v1}"
+      RECURSIVE_API_KEY: "${RECURSIVE_API_KEY:?Set RECURSIVE_API_KEY}"
+      RECURSIVE_MODEL: "${RECURSIVE_MODEL:-gpt-4o-mini}"
+      RECURSIVE_PROVIDER_TYPE: "${RECURSIVE_PROVIDER_TYPE:-openai}"
+
+      # ── Agent behaviour ──
+      RECURSIVE_MAX_STEPS: "${RECURSIVE_MAX_STEPS:-32}"
+      RECURSIVE_TEMPERATURE: "${RECURSIVE_TEMPERATURE:-0.2}"
+      RECURSIVE_SYSTEM_PROMPT_FILE: "${RECURSIVE_SYSTEM_PROMPT_FILE:-}"
+
+      # ── HTTP server ──
+      RECURSIVE_HTTP_AUTH_KEYS: "${RECURSIVE_HTTP_AUTH_KEYS:-}"
+
+      # ── Cloud storage backend (Redis) ──
+      RECURSIVE_REDIS_URL: "redis://redis:6379"
+      RECURSIVE_REDIS_KEY_PREFIX: "recursive:dev:"
+      RECURSIVE_REDIS_SESSION_TTL_SECS: "7200"
+
+      # ── Cloud storage backend (S3 via LocalStack) ──
+      RECURSIVE_S3_BUCKET: "recursive-dev"
+      RECURSIVE_S3_PREFIX: "transcripts"
+      RECURSIVE_S3_TENANT_ID: "local"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+      AWS_ENDPOINT_URL: "http://localstack:4566"
+    depends_on:
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  # ── Redis — hot session state ─────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ── LocalStack — S3-compatible object storage ─────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+      LOCALSTACK_VOLUME_DIR: /var/lib/localstack
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+
+volumes:
+  redis_data:
+  localstack_data:
