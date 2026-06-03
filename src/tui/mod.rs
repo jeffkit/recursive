@@ -137,6 +137,14 @@ fn make_inline_terminal(
 /// sessions) is printed to stdout before the TUI starts and remains
 /// visible in the scrollback above the viewport.
 pub async fn run() -> io::Result<()> {
+    run_with_backend(Backend::spawn()).await
+}
+
+/// Launch the TUI with a pre-constructed [`Backend`].
+///
+/// Used by `--weixin` mode where the backend is created before the TUI
+/// starts so the WeChat channel can be wired up.
+pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     // Suppress global tracing output for the duration of the TUI.
     let _quiet_guard = crate::logging::suppress_tracing_for_tui();
 
@@ -154,7 +162,7 @@ pub async fn run() -> io::Result<()> {
     let mut terminal = make_inline_terminal(INLINE_HEIGHT_NORMAL)?;
     let mut current_inline_height = INLINE_HEIGHT_NORMAL;
 
-    let mut backend = Backend::spawn();
+    let mut backend = backend;
     let mut app = App::new();
     app.permission_hook_enabled = backend.permission_enabled.clone();
 
