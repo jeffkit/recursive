@@ -498,7 +498,13 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(s) => {
-                if in_code_block {
+                if in_table {
+                    // Inline code inside a table cell: accumulate as plain text
+                    // (table renderer doesn't support per-cell spans).
+                    current_table_cell.push('`');
+                    current_table_cell.push_str(&s);
+                    current_table_cell.push('`');
+                } else if in_code_block {
                     // Should not happen in well-formed input.
                     code_block_buffer.push(s.into_string());
                 } else {
@@ -509,7 +515,9 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 }
             }
             Event::SoftBreak => {
-                if in_code_block {
+                if in_table {
+                    current_table_cell.push(' ');
+                } else if in_code_block {
                     // Treat as hard break inside code blocks.
                     code_block_buffer.push(String::new());
                 } else {
@@ -517,7 +525,10 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 }
             }
             Event::HardBreak => {
-                if in_code_block {
+                if in_table {
+                    // Table cells are single-line; treat as space.
+                    current_table_cell.push(' ');
+                } else if in_code_block {
                     code_block_buffer.push(String::new());
                 } else {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
@@ -1099,6 +1110,22 @@ mod tests {
         );
     }
 }
+
+    /// Inline code `` `x` `` inside a table cell must appear in the rendered
+    /// output (with surrounding backticks) rather than being swallowed.
+    #[test]
+    fn render_markdown_table_with_inline_code_in_cell() {
+        let text = "| File | Desc |\n|------|------|\n| `foo.rs` | new file |\n| `bar.rs` | updated |";
+        let lines = render_markdown(text, 80);
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Both file names must survive rendering.
+        assert!(all_text.contains("foo.rs"), "inline code 'foo.rs' missing");
+        assert!(all_text.contains("bar.rs"), "inline code 'bar.rs' missing");
+    }
 
     /// Verify that render_markdown produces a properly boxed table for a
     /// standard GFM table (header + separator + data rows).
