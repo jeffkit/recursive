@@ -148,7 +148,7 @@ impl Default for App {
 mod tests {
     use std::time::Duration;
 
-    use crate::tui::app::{App, AppScreen, TranscriptBlock};
+    use crate::tui::app::{App, AppScreen};
     use crate::tui::cost::{default_pricing_table, detect_model_name, estimate_cost};
 
     // ── construction ────────────────────────────────────────────────

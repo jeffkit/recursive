@@ -236,17 +236,20 @@ fn render_tool_call(
                 .fg(bullet_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(args_display, Style::default().fg(th.system_bar)),
+        // Args preview shares the body color so the whole tool line
+        // reads in one tone; the bullet and tool name still pop in
+        // the status colour.
+        Span::styled(args_display, Style::default().fg(body_color)),
     ])];
 
     match result {
         None => {
             out.push(Line::from(vec![
-                Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                Span::styled("    ⎿  ", Style::default().fg(body_color)),
                 Span::styled(
                     "Running…".to_string(),
                     Style::default()
-                        .fg(th.system_bar)
+                        .fg(body_color)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -258,11 +261,11 @@ fn render_tool_call(
         }) => {
             if !size.is_empty() {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
                     Span::styled(
                         size,
                         Style::default()
-                            .fg(th.system_bar)
+                            .fg(body_color)
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
@@ -276,17 +279,17 @@ fn render_tool_call(
             };
             for line in visible {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
                     Span::styled((*line).to_string(), Style::default().fg(body_color)),
                 ]));
             }
             if !*expanded && n > 6 {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(th.system_bar)),
+                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
                     Span::styled(
                         format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
                         Style::default()
-                            .fg(th.system_bar)
+                            .fg(body_color)
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
