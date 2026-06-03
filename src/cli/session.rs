@@ -151,9 +151,15 @@ pub(crate) fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyho
         .with_context(|| format!("reading legacy session: {}", path.display()))?;
 
     // Open a fresh JSONL session, then patch in the carried-over hash.
-    let mut writer =
-        SessionWriter::create(workspace, &legacy.goal, &legacy.model, &legacy.provider)
-            .with_context(|| "creating new JSONL session for migration")?;
+    let mut writer = SessionWriter::create_with_tools(
+        workspace,
+        &legacy.goal,
+        &legacy.model,
+        &legacy.provider,
+        &[],
+        legacy.preset.as_deref(),
+    )
+    .with_context(|| "creating new JSONL session for migration")?;
 
     // Replay the legacy transcript through `append` (no filter —
     // we keep system messages for round-trip fidelity).

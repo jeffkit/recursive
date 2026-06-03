@@ -240,6 +240,7 @@ mod tests {
             api_key: None,
             model: "mock".into(),
             provider_type: "mock".into(),
+            preset: None,
             max_steps: 30,
             temperature: 0.0,
             system_prompt: String::new(),

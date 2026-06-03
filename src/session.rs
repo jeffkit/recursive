@@ -40,6 +40,11 @@ pub struct SessionFile {
     pub steps_consumed: usize,
     /// The full transcript so far (system prompt + user goal + all exchanges).
     pub transcript: Vec<Message>,
+    /// Resolved provider preset id (e.g. "deepseek") at session creation
+    /// time. `None` when the user did not configure a preset — kept
+    /// optional for back-compat with pre-preset-config session files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 impl SessionFile {
@@ -61,6 +66,7 @@ impl SessionFile {
             tool_registry_hash,
             steps_consumed,
             transcript,
+            preset: None,
         }
     }
 
@@ -318,6 +324,12 @@ pub struct SessionMeta {
     /// Cumulative token usage for this session (g156).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<SessionCost>,
+    /// Resolved provider preset id (e.g. "deepseek") at session creation
+    /// time. `None` for pre-preset-config sessions or when the user did
+    /// not configure a preset. Optional + skipped on serialize so old
+    /// session files round-trip cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 /// A portable exported transcript for sharing and analysis.
@@ -495,7 +507,7 @@ impl SessionWriter {
         model: &str,
         provider: &str,
     ) -> std::io::Result<Self> {
-        Self::create_with_tools(workspace, goal, model, provider, &[])
+        Self::create_with_tools(workspace, goal, model, provider, &[], None)
     }
 
     /// Create a new session, stamping a BLAKE3 hash of `tool_specs`
@@ -506,12 +518,19 @@ impl SessionWriter {
     /// Pass `&[]` for `tool_specs` if the caller has no registry
     /// (e.g. tests, ad-hoc tools), in which case the hash is `None`
     /// and resume will warn but not abort.
+    ///
+    /// `preset` is the resolved provider preset id (e.g. "deepseek")
+    /// from the active `Config`. Pass `None` for pre-preset-config
+    /// callers or when the user did not opt in; the field is
+    /// `Option<String>` and `skip_serializing_if = "Option::is_none"`
+    /// keeps the on-disk format clean.
     pub fn create_with_tools(
         workspace: &Path,
         goal: &str,
         model: &str,
         provider: &str,
         tool_specs: &[ToolSpec],
+        preset: Option<&str>,
     ) -> std::io::Result<Self> {
         let slug = workspace_slug(workspace);
         let session_id = format!("{}-{}", filesystem_safe_timestamp(), slug);
@@ -553,6 +572,7 @@ impl SessionWriter {
             first_prompt: None,
             last_prompt: None,
             cost: None,
+            preset: preset.map(|s| s.to_string()),
         };
 
         // Write initial meta file
@@ -1798,6 +1818,56 @@ mod tests {
         assert_eq!(meta.status, "completed");
     }
 
+    /// Preset-config goal: the `preset` field is recorded on
+    /// `SessionMeta` so a future reader can see "this run was on
+    /// deepseek" without re-deriving from `api_base`. Verifies the
+    /// round-trip: create with `Some("deepseek")`, reload, assert
+    /// the field is preserved. Also confirms the default (None)
+    /// path is not serialized at all (`skip_serializing_if`) so
+    /// pre-preset-config session files stay byte-compat on read.
+    #[test]
+    fn session_meta_preserves_preset_field() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        // With a preset — should round-trip. The writer is dropped
+        // before the second writer is created so the per-session
+        // lock is released; otherwise the second `create_with_tools`
+        // would fail with SessionLockBusy when both session_ids
+        // collide on the same second.
+        let (_session_dir, preset_after) = {
+            let mut writer = SessionWriter::create_with_tools(
+                ws,
+                "preset run",
+                "deepseek-chat",
+                "openai",
+                &[],
+                Some("deepseek"),
+            )
+            .unwrap();
+            let dir = writer.session_dir().to_path_buf();
+            writer.finish("completed").unwrap();
+            let meta = SessionReader::load_meta(&dir).unwrap();
+            (dir, meta.preset)
+        };
+        assert_eq!(preset_after.as_deref(), Some("deepseek"));
+
+        // Without a preset — `None` is kept on read, and the JSON
+        // should not include a `preset` key (skip_serializing_if).
+        let writer2 =
+            SessionWriter::create_with_tools(ws, "no preset run", "gpt-4o", "openai", &[], None)
+                .unwrap();
+        let session_dir2 = writer2.session_dir().to_path_buf();
+        drop(writer2);
+        let meta2 = SessionReader::load_meta(&session_dir2).unwrap();
+        assert!(meta2.preset.is_none());
+        let raw = std::fs::read_to_string(session_dir2.join(".meta.json")).unwrap();
+        assert!(
+            !raw.contains("\"preset\""),
+            "preset key should be absent when None, got: {raw}"
+        );
+    }
+
     #[test]
     fn list_sessions_finds_sessions() {
         let tmp = crate::test_util::IsolatedWorkspace::new();
@@ -1988,7 +2058,8 @@ mod tests {
             parameters: serde_json::json!({"type":"object"}),
         }];
         let writer =
-            SessionWriter::create_with_tools(ws, "with hash", "model", "openai", &specs).unwrap();
+            SessionWriter::create_with_tools(ws, "with hash", "model", "openai", &specs, None)
+                .unwrap();
         let session_dir = writer.session_dir().to_path_buf();
         drop(writer);
 

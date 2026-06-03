@@ -203,9 +203,10 @@ mod tests {
 
     /// Goal-150: status bar must read `~/.recursive/config.toml` when
     /// no env var is set, otherwise it lies about the model the
-    /// runtime is actually using.
+    /// runtime is actually using. Extended for the preset-config goal
+    /// to also cover `provider.preset` resolution.
     ///
-    /// Both checks share one test body so they share the `PinnedHome`
+    /// All checks share one test body so they share the `PinnedHome`
     /// lock (HOME mutation is process-global; cf. lesson 17).
     #[test]
     fn detect_model_name_falls_back_to_config_file() {
@@ -218,8 +219,10 @@ mod tests {
         std::env::remove_var("RECURSIVE_MODEL");
         std::env::remove_var("OPENAI_MODEL");
 
-        // Part A: no env, no config.toml → hardcoded default
-        assert_eq!(detect_model_name(), "gpt-4o-mini");
+        // Part A: no env, no config.toml → Config::from_env hardcoded default
+        // (changed from the legacy "gpt-4o-mini" placeholder — the status
+        // bar now shows what the runtime will actually use).
+        assert_eq!(detect_model_name(), "claude-sonnet-4-6");
 
         // Part B: write a config.toml under HOME → that wins
         let cfg_dir = home.path().join(".recursive");
@@ -234,6 +237,15 @@ mod tests {
         // Part C: env var overrides config.toml
         std::env::set_var("RECURSIVE_MODEL", "from-env");
         assert_eq!(detect_model_name(), "from-env");
+
+        // Part D: preset resolves default_model when no explicit field
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[provider]\npreset = \"deepseek\"\n",
+        )
+        .expect("rewrite");
+        assert_eq!(detect_model_name(), "deepseek-chat");
 
         // Restore env.
         std::env::remove_var("RECURSIVE_MODEL");
