@@ -1,6 +1,7 @@
 //! Event-loop reducers: `handle_ui_event` and streaming helpers.
 
 use crate::tui::events::UiEvent;
+use crate::tui::ui::transcript::render_block;
 
 use super::render::extract_write_file_path_from_result;
 use super::{
@@ -274,7 +275,7 @@ impl App {
                 self.plan_awaiting_approval = false;
             }
             UiEvent::McpServersLoaded { entries } => {
-                self.modals.push(crate::tui::ui::modal::Modal::McpServers {
+                self.push_modal(crate::tui::ui::modal::Modal::McpServers {
                     entries,
                     selected: 0,
                 });
@@ -407,6 +408,52 @@ impl App {
             streaming: false,
             latency_ms: self.pending_latency_ms,
         });
+    }
+
+    /// Scan `blocks[last_printed_idx..]` and push any "finalized"
+    /// blocks into `print_queue` so the main loop can flush them to
+    /// the terminal's scrollback buffer via `terminal.insert_before()`.
+    ///
+    /// A block is considered finalized when:
+    /// - `User` — always
+    /// - `Assistant` — when `!streaming`
+    /// - `ToolCall` — when `result.is_some()`
+    /// - `Reasoning` — only when the immediately following block is NOT
+    ///   a streaming `Assistant` (prevents the reasoning from being
+    ///   separated from its answer in the scrollback)
+    /// - All other variants — always
+    ///
+    /// This is idempotent and safe to call after every event.
+    pub fn flush_ready_blocks(&mut self) {
+        loop {
+            let i = self.last_printed_idx;
+            if i >= self.blocks.len() {
+                break;
+            }
+            let ready = match &self.blocks[i] {
+                TranscriptBlock::User { .. } => true,
+                TranscriptBlock::Assistant { streaming, .. } => !streaming,
+                TranscriptBlock::ToolCall { result, .. } => result.is_some(),
+                TranscriptBlock::Reasoning { .. } => {
+                    // Defer until the following Assistant is finalized so
+                    // reasoning and its answer always appear together.
+                    !matches!(
+                        self.blocks.get(i + 1),
+                        Some(TranscriptBlock::Assistant {
+                            streaming: true,
+                            ..
+                        })
+                    )
+                }
+                _ => true,
+            };
+            if !ready {
+                break;
+            }
+            let lines = render_block(&self.blocks[i], self.theme);
+            self.print_queue.push(lines);
+            self.last_printed_idx += 1;
+        }
     }
 
     /// Toggle the most recent completed tool call's expanded flag.

@@ -161,7 +161,7 @@ fn render_reasoning(text: &str) -> Vec<Line<'static>> {
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let body_style = Style::default()
-        .fg(Color::DarkGray)
+        .fg(Color::Gray)
         .add_modifier(Modifier::ITALIC);
     let indent = Span::raw("  ");
 

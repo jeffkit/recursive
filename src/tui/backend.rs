@@ -700,6 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
     async fn run_shell_action_dispatches_tool_and_emits_events() {
         let tmp = tempfile::TempDir::new().unwrap();
         let registry = build_bash_registry(tmp.path());

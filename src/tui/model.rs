@@ -12,11 +12,11 @@
 ///
 /// Goal 147 removed the `PlanReview` variant — the plan-mode
 /// confirmation now lives on the modal stack as
-/// [`crate::tui::ui::modal::Modal::PlanReview`], so we are down to two
-/// screens: the brief splash and the chat surface.
+/// [`crate::tui::ui::modal::Modal::PlanReview`], so we are down to one
+/// screen: the chat surface. The splash screen was replaced by a
+/// startup banner printed to stdout before the inline TUI starts.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppScreen {
-    Splash,
     Chat,
 }
 

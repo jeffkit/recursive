@@ -471,7 +471,7 @@ impl App {
                     match f(self, &args) {
                         CommandOutcome::Done => {}
                         CommandOutcome::Error(msg) => self.push_error(msg),
-                        CommandOutcome::OpenModal(modal) => self.modals.push(modal),
+                        CommandOutcome::OpenModal(modal) => self.push_modal(modal),
                     }
                     None
                 }
@@ -898,18 +898,28 @@ impl App {
                 None
             }
             KeyCode::Up => {
+                let mut new_sel: Option<usize> = None;
                 if let Some(Modal::ResumePicker { selected, .. }) = self.modals.last_mut() {
                     if *selected > 0 {
                         *selected -= 1;
                     }
+                    new_sel = Some(*selected);
+                }
+                if let Some(sel) = new_sel {
+                    self.modal_scroll_follow_selection(sel);
                 }
                 None
             }
             KeyCode::Down => {
+                let mut new_sel: Option<usize> = None;
                 if let Some(Modal::ResumePicker { entries, selected }) = self.modals.last_mut() {
                     if *selected + 1 < entries.len() {
                         *selected += 1;
                     }
+                    new_sel = Some(*selected);
+                }
+                if let Some(sel) = new_sel {
+                    self.modal_scroll_follow_selection(sel);
                 }
                 None
             }
@@ -937,18 +947,28 @@ impl App {
                 None
             }
             KeyCode::Up => {
+                let mut new_sel: Option<usize> = None;
                 if let Some(Modal::McpServers { selected, .. }) = self.modals.last_mut() {
                     if *selected > 0 {
                         *selected -= 1;
                     }
+                    new_sel = Some(*selected);
+                }
+                if let Some(sel) = new_sel {
+                    self.modal_scroll_follow_selection(sel);
                 }
                 None
             }
             KeyCode::Down => {
+                let mut new_sel: Option<usize> = None;
                 if let Some(Modal::McpServers { entries, selected }) = self.modals.last_mut() {
                     if *selected + 1 < entries.len() {
                         *selected += 1;
                     }
+                    new_sel = Some(*selected);
+                }
+                if let Some(sel) = new_sel {
+                    self.modal_scroll_follow_selection(sel);
                 }
                 None
             }
@@ -961,18 +981,15 @@ impl App {
     /// (so the caller should skip the chat key path).
     pub fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
         use crate::tui::ui::modal::{ConfirmAction, Modal};
-        let Some(top) = self.modals.last_mut() else {
+        if self.modals.is_empty() {
             return false;
-        };
+        }
         match key.code {
-            KeyCode::Esc => {
-                self.modals.pop();
-            }
-            KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 self.modals.pop();
             }
             KeyCode::Char('y') => {
-                if let Modal::Confirm { on_yes, .. } = top.clone() {
+                if let Some(Modal::Confirm { on_yes, .. }) = self.modals.last().cloned() {
                     self.modals.pop();
                     match on_yes {
                         ConfirmAction::Exit => {
@@ -985,12 +1002,12 @@ impl App {
                 }
             }
             KeyCode::Char('n') => {
-                if matches!(top, Modal::Confirm { .. }) {
+                if matches!(self.modals.last(), Some(Modal::Confirm { .. })) {
                     self.modals.pop();
                 }
             }
             KeyCode::Enter => {
-                if let Modal::Confirm { on_yes, .. } = top.clone() {
+                if let Some(Modal::Confirm { on_yes, .. }) = self.modals.last().cloned() {
                     self.modals.pop();
                     match on_yes {
                         ConfirmAction::Exit => self.should_quit = true,
@@ -1001,23 +1018,59 @@ impl App {
                     self.modals.pop();
                 }
             }
-            KeyCode::Up => {
-                if let Modal::Journal { selected, .. } = top {
+            KeyCode::Up | KeyCode::PageUp => {
+                let step: u16 = if key.code == KeyCode::PageUp { 10 } else { 1 };
+                // Journal: move selection up and auto-scroll to keep it visible.
+                let mut journal_new_sel: Option<usize> = None;
+                if let Some(Modal::Journal { selected, .. }) = self.modals.last_mut() {
                     if *selected > 0 {
                         *selected -= 1;
                     }
+                    journal_new_sel = Some(*selected);
+                }
+                if let Some(sel) = journal_new_sel {
+                    self.modal_scroll_follow_selection(sel);
+                } else {
+                    // Generic text scroll (Help, ToolList, PlanReview, …).
+                    self.modal_scroll = self.modal_scroll.saturating_sub(step);
                 }
             }
-            KeyCode::Down => {
-                if let Modal::Journal { entries, selected } = top {
+            KeyCode::Down | KeyCode::PageDown => {
+                let step: u16 = if key.code == KeyCode::PageDown { 10 } else { 1 };
+                // Journal: move selection down and auto-scroll to keep it visible.
+                let mut journal_new_sel: Option<usize> = None;
+                if let Some(Modal::Journal { entries, selected }) = self.modals.last_mut() {
                     if *selected + 1 < entries.len() {
                         *selected += 1;
                     }
+                    journal_new_sel = Some(*selected);
+                }
+                if let Some(sel) = journal_new_sel {
+                    self.modal_scroll_follow_selection(sel);
+                } else {
+                    // Generic text scroll (Help, ToolList, PlanReview, …).
+                    self.modal_scroll = self.modal_scroll.saturating_add(step);
                 }
             }
             _ => {}
         }
         true
+    }
+
+    /// Approximate number of visible content rows inside the expanded modal
+    /// (40-row viewport × 90% height − 2 border − 3 header lines).
+    const MODAL_LIST_VISIBLE: u16 = 28;
+
+    /// Auto-adjust `modal_scroll` so that the item at position `selected`
+    /// (0-based) is always within the visible window of a list modal.
+    /// Accounts for the 2-line header (title + blank) above the list.
+    fn modal_scroll_follow_selection(&mut self, selected: usize) {
+        let row = selected as u16 + 2; // +2 for header lines
+        if row < self.modal_scroll {
+            self.modal_scroll = row.saturating_sub(1);
+        } else if row + 1 > self.modal_scroll + Self::MODAL_LIST_VISIBLE {
+            self.modal_scroll = row + 1 - Self::MODAL_LIST_VISIBLE;
+        }
     }
 }
 

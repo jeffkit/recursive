@@ -53,7 +53,8 @@ pub struct App {
     pub connected: bool,
     pub scroll_offset: u16,
     pub screen: AppScreen,
-    pub splash_start: Instant,
+    /// Tracks when the TUI session started. Used by `/status` to report uptime.
+    pub start_time: Instant,
     pub usage: UsageStats,
     pub turn: TurnState,
     pub turn_count: u64,
@@ -135,6 +136,24 @@ pub struct App {
     /// Goal-174: active colour palette. Defaults to [`DARK`]; switchable
     /// via `/theme <name>` without restart.
     pub theme: &'static crate::tui::ui::theme::Theme,
+
+    // ── Progressive output ───────────────────────────────────────────────
+    /// Blocks from `self.blocks[0..last_printed_idx]` have already been
+    /// flushed to the terminal's scrollback buffer via
+    /// `terminal.insert_before()`. The inline viewport only renders
+    /// blocks at index `>= last_printed_idx` (in-flight content).
+    pub last_printed_idx: usize,
+    /// Queue of rendered lines waiting to be pushed to the scrollback
+    /// buffer in the next event-loop iteration. Drained by the main
+    /// loop using `terminal.insert_before()`.
+    pub print_queue: Vec<Vec<ratatui::text::Line<'static>>>,
+
+    // ── Modal scroll ─────────────────────────────────────────────────────
+    /// Vertical scroll offset (in lines) for the currently-active modal.
+    /// Reset to 0 whenever a new modal is pushed. For list-based modals
+    /// (ResumePicker, McpServers, Journal) the key handler auto-updates
+    /// this to keep the selection visible.
+    pub modal_scroll: u16,
 }
 
 // ── Goal-161: PendingPermission ──────────────────────────────────────────────
