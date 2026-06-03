@@ -79,22 +79,40 @@ impl Drop for PinnedRecursiveHome {
 }
 
 /// Same as [`PinnedRecursiveHome`] but for `HOME`.
+///
+/// On Windows the `dirs::home_dir()` crate (used by
+/// `config_file::config_file_path`) resolves via `SHGetKnownFolderPath`
+/// / `%USERPROFILE%` and ignores `%HOME%`. Pinning `HOME` alone on
+/// Windows leaves config-file resolution pointing at the real user
+/// profile, so we also pin `USERPROFILE` there.
 pub struct PinnedHome {
     _guard: MutexGuard<'static, ()>,
-    prev: Option<std::ffi::OsString>,
+    prev_home: Option<std::ffi::OsString>,
+    prev_userprofile: Option<std::ffi::OsString>,
 }
 
 impl PinnedHome {
     pub fn new(path: impl AsRef<std::path::Path>) -> Self {
         let guard = env_lock();
-        let prev = std::env::var_os("HOME");
+        let prev_home = std::env::var_os("HOME");
         // SAFETY: see `PinnedRecursiveHome::new`.
         unsafe {
             std::env::set_var("HOME", path.as_ref().as_os_str());
         }
+        let prev_userprofile = if cfg!(windows) {
+            let prev = std::env::var_os("USERPROFILE");
+            // SAFETY: still under the env lock.
+            unsafe {
+                std::env::set_var("USERPROFILE", path.as_ref().as_os_str());
+            }
+            prev
+        } else {
+            None
+        };
         Self {
             _guard: guard,
-            prev,
+            prev_home,
+            prev_userprofile,
         }
     }
 }
@@ -103,9 +121,15 @@ impl Drop for PinnedHome {
     fn drop(&mut self) {
         // SAFETY: still hold the lock until `_guard` drops after this.
         unsafe {
-            match self.prev.take() {
+            match self.prev_home.take() {
                 Some(v) => std::env::set_var("HOME", v),
                 None => std::env::remove_var("HOME"),
+            }
+            if cfg!(windows) {
+                match self.prev_userprofile.take() {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
             }
         }
     }

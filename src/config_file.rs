@@ -311,15 +311,11 @@ temperature = 0.5
         let fake_home = tmp.path().join("home");
         std::fs::create_dir_all(&fake_home).unwrap();
 
-        // Isolate HOME so a concurrent test's HOME mutation can't add a User layer.
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
+        // Pin HOME (under env_lock) so a concurrent test can't interleave
+        // its own HOME mutation and have its User layer leak into the
+        // "exactly one Session layer" assertion.
+        let _pin = crate::test_util::PinnedHome::new(&fake_home);
         let config = load_layered_permissions(&workspace);
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
 
         // Session layer is always present
         assert!(config
