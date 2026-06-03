@@ -35,7 +35,7 @@
 - 每节用一张对照表，"备注"列给出 Goal 编号或 `file_path:line_number`
   指针。✅ 行**必须**有 Goal 引用或源码引用。🟡/🔴 行**必须**给出
   "未实现原因"或"简化方式"。⛔ 行只标符号，rationale 集中在末节。
-- 引用 Recursive 源码用绝对相对路径（如 `crates/recursive-tui/src/app.rs:248`）。
+- 引用 Recursive 源码用绝对相对路径（如 `src/tui/app.rs:248`）。
 - 引用 fake-cc 源码用 `~/Downloads/fake-cc/src/...` 前缀。
 - 不复制 fake-cc 源代码原文，只引指针；fake-cc 是闭源参考样本，授权
   上更安全。
@@ -49,20 +49,20 @@
 fake-cc 的 REPL 屏（`src/screens/REPL.tsx`）是一个 Ink 应用，
 通过 `<FullscreenLayout>` 占满终端，子组件包括 Header、Messages
 （虚拟滚动）、PromptInput、Notifications、各种 Dialog。Recursive 是
-ratatui 的 `Frame.draw` 模型，每帧重渲，由 `crates/recursive-tui/src/ui/mod.rs`
+ratatui 的 `Frame.draw` 模型，每帧重渲，由 `src/tui/ui/mod.rs`
 派发到 `splash` / `chat` 子模块。
 
 | 能力 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| 屏幕模式数 | Splash / REPL / Doctor / Resume / Onboarding / Teleport / Bridge / Setup / 7+ 子屏 | Splash / Chat | 🟡 | Goal 143 简化为 2 态 (`crates/recursive-tui/src/app.rs:29-32`)，Doctor / Resume / Onboarding 全缺，因为对应能力未实现 |
-| Splash 屏 | LogoV2 + tagline + 启动诊断（`src/components/LogoV2/`） | ASCII logo + tagline + 自动 2s 进入 chat | 🟡 | Goal 143 (`crates/recursive-tui/src/ui/splash.rs:1-41`)；只剩 logo，没有诊断输出 |
+| 屏幕模式数 | Splash / REPL / Doctor / Resume / Onboarding / Teleport / Bridge / Setup / 7+ 子屏 | Splash / Chat | 🟡 | Goal 143 简化为 2 态 (`src/tui/app.rs:29-32`)，Doctor / Resume / Onboarding 全缺，因为对应能力未实现 |
+| Splash 屏 | LogoV2 + tagline + 启动诊断（`src/components/LogoV2/`） | ASCII logo + tagline + 自动 2s 进入 chat | 🟡 | Goal 143 (`src/tui/ui/splash.rs:1-41`)；只剩 logo，没有诊断输出 |
 | Header 区域 | Onboarding hint / Stash notice / Issue banner / Channel downgrade / Trust dialog hint，多组件叠加 | 无固定 header；状态栏在底部 | 🔴 | 简化方式：所有运行时元信息塞到底部 status bar；上半屏全部留给 transcript |
-| Footer / 状态栏 | StatusLine（`src/components/StatusLine.tsx`）+ PromptInputFooter（按模式切换） | 单行 5 段状态栏 + 输入框下 1 行 hint | 🟡 | Goal 144 (`crates/recursive-tui/src/ui/status.rs:23-93`)，Goal 145 (`crates/recursive-tui/src/ui/input.rs`)；无 IDE / network / auto-update segment |
+| Footer / 状态栏 | StatusLine（`src/components/StatusLine.tsx`）+ PromptInputFooter（按模式切换） | 单行 5 段状态栏 + 输入框下 1 行 hint | 🟡 | Goal 144 (`src/tui/ui/status.rs:23-93`)，Goal 145 (`src/tui/ui/input.rs`)；无 IDE / network / auto-update segment |
 | Transcript 渲染策略 | VirtualMessageList 虚拟滚动 + OffscreenFreeze（`src/components/VirtualMessageList.tsx`、`OffscreenFreeze.tsx`），按可视区按需渲染 | 全量渲染 + scroll_offset | 🔴 | 长会话（>500 块）会变慢；短期可接受。简化方式：依赖 ratatui 的 `Paragraph` 自动剪裁 |
-| Modal 栈 | Dialog 通过 React 组件树挂载，多个并存 | `Vec<Modal>` 后入先出（topmost 接键） | ✅ | Goal 146 (`crates/recursive-tui/src/app.rs:564`、`crates/recursive-tui/src/ui/modal.rs:43-71`)；6 + 1 个 Modal 变体（Plan 来自 Goal 147） |
-| 输入框位置 | 底部固定，自适应 1-N 行 | 底部固定，1-6 行 (`min(buffer_lines+1, 6)`) | ✅ | Goal 145 (`crates/recursive-tui/src/ui/input.rs`) |
-| 输入框上方浮层 | HelpMenu / 命令补全 / 历史搜索 / 文件补全 多种浮层 | 命令补全菜单（≤8 行） | 🟡 | Goal 146 (`crates/recursive-tui/src/ui/command_menu.rs`)；只有 `/` 命令补全一种浮层 |
-| 全屏 dialog 占用方式 | Ink 的组件树：dialog 一旦挂载就遮蔽 | `Clear` widget + 居中 Block | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs`)，半屏居中 + 暗背景 |
+| Modal 栈 | Dialog 通过 React 组件树挂载，多个并存 | `Vec<Modal>` 后入先出（topmost 接键） | ✅ | Goal 146 (`src/tui/app.rs:564`、`src/tui/ui/modal.rs:43-71`)；6 + 1 个 Modal 变体（Plan 来自 Goal 147） |
+| 输入框位置 | 底部固定，自适应 1-N 行 | 底部固定，1-6 行 (`min(buffer_lines+1, 6)`) | ✅ | Goal 145 (`src/tui/ui/input.rs`) |
+| 输入框上方浮层 | HelpMenu / 命令补全 / 历史搜索 / 文件补全 多种浮层 | 命令补全菜单（≤8 行） | 🟡 | Goal 146 (`src/tui/ui/command_menu.rs`)；只有 `/` 命令补全一种浮层 |
+| 全屏 dialog 占用方式 | Ink 的组件树：dialog 一旦挂载就遮蔽 | `Clear` widget + 居中 Block | ✅ | Goal 146 (`src/tui/ui/modal.rs`)，半屏居中 + 暗背景 |
 | 启动诊断 | doctor 命令 + 启动时的 setup 检查 | 无 | 🔴 | 未实现原因：Recursive 未做 doctor 命令；建议路径：把现有的 LLM 配置探测错误以 toast 形式渲染到 splash |
 | 多 panel 并排 | 实验性 TerminalPanel（`feature('TERMINAL_PANEL')`）—— 在右侧开 shell pane | 无 | ⛔ | 与终端 Agent 单聚焦定位不符 |
 | 屏幕重绘 | Ctrl+L | 无显式键，每帧重绘已经够 | 🟡 | 简化方式：crossterm 自动响应 `Resize` 事件触发重绘；无显式 `Ctrl+L` 绑定 |
@@ -75,34 +75,34 @@ fake-cc 的 PromptInput 是其交互"灵魂"——单文件
 `src/components/PromptInput/PromptInput.tsx` + 同目录 14 个辅助
 组件（`HistorySearchInput.tsx`、`PromptInputFooter*.tsx`、
 `inputModes.ts` 等）。Recursive 的对应实现是 `crates/recursive-tui/
-src/app.rs::PromptInputState`（`crates/recursive-tui/src/app.rs:303-516`）
-+ `crates/recursive-tui/src/ui/input.rs`。
+src/app.rs::PromptInputState`（`src/tui/app.rs:303-516`）
++ `src/tui/ui/input.rs`。
 
 | 能力 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| 默认 Prompt 模式 | `❯` 提示符 | `❯` 提示符（Cyan） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs:262-268`、`crates/recursive-tui/src/ui/input.rs`) |
-| Bash 模式 (`!`) | 直接 run shell，不经 LLM；命令历史染色 | 同；通过独立 `ToolRegistry` 调 `run_shell`，不进 runtime transcript | ✅ | Goal 145 (`crates/recursive-tui/src/backend.rs::build_bash_registry`、`crates/recursive-tui/src/app.rs::submit_prompt`)；运行 offline 也能用 |
+| 默认 Prompt 模式 | `❯` 提示符 | `❯` 提示符（Cyan） | ✅ | Goal 145 (`src/tui/app.rs:262-268`、`src/tui/ui/input.rs`) |
+| Bash 模式 (`!`) | 直接 run shell，不经 LLM；命令历史染色 | 同；通过独立 `ToolRegistry` 调 `run_shell`，不进 runtime transcript | ✅ | Goal 145 (`src/tui/backend.rs::build_bash_registry`、`src/tui/app.rs::submit_prompt`)；运行 offline 也能用 |
 | Note 模式 (`#`) | 本地标注，写入 memdir 记录 | 本地标注，作为 `TranscriptBlock::System` 入 transcript，不发后端 | 🟡 | Goal 145；fake-cc 会把笔记落到磁盘 `src/memdir/`，Recursive 仅当前会话可见，简化方式：等 session 持久化做完再补 |
-| Command 模式 (`/`) | 弹补全菜单 + ContextSuggestions | 弹补全菜单 | ✅ | Goal 146 (`crates/recursive-tui/src/ui/command_menu.rs`)；`ContextSuggestions` 不在范围（用于 @file） |
-| 模式自动识别（buf 空 + 首字符） | 是 | 是 | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::handle_char_input`) |
-| Shift+Tab 循环模式 | 是（Prompt → Bash → Note → Prompt，跳过 Command） | 同 | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs:284-292`) |
+| Command 模式 (`/`) | 弹补全菜单 + ContextSuggestions | 弹补全菜单 | ✅ | Goal 146 (`src/tui/ui/command_menu.rs`)；`ContextSuggestions` 不在范围（用于 @file） |
+| 模式自动识别（buf 空 + 首字符） | 是 | 是 | ✅ | Goal 145 (`src/tui/app.rs::handle_char_input`) |
+| Shift+Tab 循环模式 | 是（Prompt → Bash → Note → Prompt，跳过 Command） | 同 | ✅ | Goal 145 (`src/tui/app.rs:284-292`) |
 | Backspace 退出模式 | buf 空时 Backspace 回 Prompt | 同 | ✅ | Goal 145 |
-| 多行输入（Shift+Enter） | 是 | 是（仅在终端支持时；Alt+Enter 备选） | 🟡 | Goal 145；某些终端送不出 Shift+Enter，文档 (`crates/recursive-tui/src/app.rs::handle_key`) 留有 Alt+Enter fallback |
-| 多行高度自适应 | 是（n 行内部滚动） | `min(buffer_lines + 1, 6)`，超过 6 行内部滚动 | ✅ | Goal 145 (`crates/recursive-tui/src/ui/input.rs`) |
-| 光标移动 ←/→ | 是（按 char） | 是（按 char，UTF-8 安全） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::move_left/move_right`)；`cursor_handles_multibyte_chars` 测试覆盖 |
-| Home / End | 是（按视觉行） | 是（按视觉行） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::move_home/move_end`) |
+| 多行输入（Shift+Enter） | 是 | 是（仅在终端支持时；Alt+Enter 备选） | 🟡 | Goal 145；某些终端送不出 Shift+Enter，文档 (`src/tui/app.rs::handle_key`) 留有 Alt+Enter fallback |
+| 多行高度自适应 | 是（n 行内部滚动） | `min(buffer_lines + 1, 6)`，超过 6 行内部滚动 | ✅ | Goal 145 (`src/tui/ui/input.rs`) |
+| 光标移动 ←/→ | 是（按 char） | 是（按 char，UTF-8 安全） | ✅ | Goal 145 (`src/tui/app.rs::move_left/move_right`)；`cursor_handles_multibyte_chars` 测试覆盖 |
+| Home / End | 是（按视觉行） | 是（按视觉行） | ✅ | Goal 145 (`src/tui/app.rs::move_home/move_end`) |
 | Ctrl+A / Ctrl+E（行首尾） | 是 | Ctrl+A 是；Ctrl+E 仅在 buf 空时给 transcript（展开），buf 非空时给输入框（行尾） | 🟡 | Goal 145；冲突解：buf 非空时优先输入框，buf 空时优先 transcript expand。简化方式：避免引入 readline 模式，靠状态分流 |
 | 历史回溯 ↑/↓ | 是 + 模糊搜索（Ctrl+R 弹 `HistorySearchDialog`） | ↑/↓ 翻页 + Ctrl+R 模糊搜索 | ✅ | Goal 145 + Goal-160（`src/tui/app.rs:640`）；Ctrl+R 弹 `InputMode::HistorySearch` popup |
-| 历史回溯保留模式前缀 | 是 | 是（`!`/`#`/`/` 前缀重新解析） | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::strip_history_prefix`) |
+| 历史回溯保留模式前缀 | 是 | 是（`!`/`#`/`/` 前缀重新解析） | ✅ | Goal 145 (`src/tui/app.rs::strip_history_prefix`) |
 | 历史持久化（跨会话） | 是（写到 history.ts 的本地存储） | 否 | 🔴 | 未实现原因：Recursive 没有 session 持久化层；建议路径：先做 session 磁盘存储（Resume modal 复用） |
-| 草稿暂存（进入历史时） | 是 | 是 (`PromptInputState.draft` + `draft_mode`) | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs:317-321`) |
+| 草稿暂存（进入历史时） | 是 | 是 (`PromptInputState.draft` + `draft_mode`) | ✅ | Goal 145 (`src/tui/app.rs:317-321`) |
 | @file 自动补全 | 是（`src/components/ContextSuggestions.tsx`） | 是 | ✅ | Goal-158 落地：`InputMode::AtFile`，`@` 触发弹 popup，↑/↓/Tab/Enter 选择（`src/tui/app.rs:621`、`src/tui/ui/command_menu.rs:134`） |
 | @symbol 补全（LSP） | 是（仅启用 `LspRecommendation` 时） | 否 | 🔴 | 依赖 LSP 集成 |
 | 外部编辑器 Ctrl+G / `Ctrl+X Ctrl+E` | 是（`$EDITOR` 调用） | 否 | 🔴 | 未实现原因：crossterm 切换 raw mode 临时 spawn 子进程的逻辑未写；建议路径：`tokio::process::Command` + 暂停渲染循环 |
 | 图片粘贴（Ctrl+V/Alt+V） | 是 | 否 | ⛔ | Recursive 短期内不接多模态 |
 | Voice / 语音（按住空格） | 是（`feature('VOICE_MODE')`） | 否 | ⛔ | 与终端 Agent 工程定位不符 |
 | Vim 模式（motion / operator / text-object） | 完整（`src/vim/{motions,operators,textObjects,transitions}.ts`） | 否 | 🔴 | 候选下一期；建议路径：把 InputMode enum 升级为状态机，引入 `vim::Mode { Insert, Normal, Visual }`，复用 fake-cc 的状态转移表 |
-| Footer hint（动态按模式） | 是（`PromptInputFooter*.tsx` 多组件） | 是（按 mode 切换 hint 文本） | ✅ | Goal 145 (`crates/recursive-tui/src/ui/input.rs`)；3-4 段 hint，按模式调整 |
+| Footer hint（动态按模式） | 是（`PromptInputFooter*.tsx` 多组件） | 是（按 mode 切换 hint 文本） | ✅ | Goal 145 (`src/tui/ui/input.rs`)；3-4 段 hint，按模式调整 |
 | 队列命令显示（`PromptInputQueuedCommands.tsx`） | 是 | 否 | 🔴 | fake-cc 在 Agent 跑动时允许排队下一条；Recursive 当前 turn-running 时输入框冻结（无显式排队） |
 | Stash notice（`PromptInputStashNotice.tsx`） | 是（输入框上方浮短行通知） | 否 | 🔴 | 与 stash 命令绑定，stash 未实现 |
 | Sandbox 提示（`SandboxPromptFooterHint.tsx`） | 是 | 否（Recursive 默认 sandbox 模式无切换） | ⛔ | Recursive 工具箱里 sandbox 行为是配置时定的，无运行时 toggle |
@@ -119,25 +119,25 @@ src/app.rs::PromptInputState`（`crates/recursive-tui/src/app.rs:303-516`）
 fake-cc 把消息切成 `Message`（user / assistant / tool_use / tool_result）
 + React 组件树（`src/components/Message.tsx`、`MessageRow.tsx`、
 `Messages.tsx`、`StructuredDiff.tsx` 等）。Recursive 用枚举
-`TranscriptBlock`（`crates/recursive-tui/src/app.rs:67-103`）+
-`crates/recursive-tui/src/ui/transcript.rs` 一渲染函数对应一变体。
+`TranscriptBlock`（`src/tui/app.rs:67-103`）+
+`src/tui/ui/transcript.rs` 一渲染函数对应一变体。
 
 | 能力 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| User 块 | 圆角气泡 + 时间戳 | `▎ You` 标题 + `│  ` 缩进多行内容 | ✅ | Goal 144 (`crates/recursive-tui/src/ui/transcript.rs:55-78`) |
-| Assistant 块 | Markdown 渲染气泡 + 模型 / 时间戳 | `▎ Agent` 标题 + 可选 `⏱ Xs` 延迟 + `│  ` 缩进 | 🟡 | Goal 144 (`crates/recursive-tui/src/ui/transcript.rs:82-122`)；标题段对齐，但下文 Markdown 简化为纯文本 |
-| 流式 PartialToken | 是（`assistant`/`server` SSE 增量） | 是（`AgentEvent::PartialToken` → `UiEvent::AssistantPartial`） | ✅ | Goal 144 (`crates/recursive-tui/src/events.rs:19`，`crates/recursive-tui/src/app.rs::apply_event`)；末尾 streaming Assistant 块持续追加 |
+| User 块 | 圆角气泡 + 时间戳 | `▎ You` 标题 + `│  ` 缩进多行内容 | ✅ | Goal 144 (`src/tui/ui/transcript.rs:55-78`) |
+| Assistant 块 | Markdown 渲染气泡 + 模型 / 时间戳 | `▎ Agent` 标题 + 可选 `⏱ Xs` 延迟 + `│  ` 缩进 | 🟡 | Goal 144 (`src/tui/ui/transcript.rs:82-122`)；标题段对齐，但下文 Markdown 简化为纯文本 |
+| 流式 PartialToken | 是（`assistant`/`server` SSE 增量） | 是（`AgentEvent::PartialToken` → `UiEvent::AssistantPartial`） | ✅ | Goal 144 (`src/tui/events.rs:19`，`src/tui/app.rs::apply_event`)；末尾 streaming Assistant 块持续追加 |
 | 流式终态对齐 | 是（最终 `AssistantText` 覆写） | 是（`AssistantMessage` 用整段覆盖最后 streaming 块） | ✅ | Goal 144 |
-| ToolCall 块 | `🔧 name(arg1=..., arg2=...)`；可点击展开 | `🔧 name  args_preview`（前 60 字符） | 🟡 | Goal 144 (`crates/recursive-tui/src/ui/transcript.rs::render_tool_call`)；不可点击；JSON 解析仅取前 1-2 个字段 |
-| ToolResult 块 | ✓/✗ 图标 + 折叠 + Ctrl+E 展开 + size 标记 | ✓/✗ 图标 + 6 行折叠 + Ctrl+E 展开 | ✅ | Goal 144 (`crates/recursive-tui/src/ui/transcript.rs::render_tool_result`)；阈值 6 行 + 展开提示 |
-| Diff 渲染（apply_patch） | 完整 syntax-aware（`StructuredDiff*.tsx`、`HighlightedCode.tsx`） | V4A 解析 + 红绿着色（`+`/`-`） | 🟡 | Goal 144 (`crates/recursive-tui/src/ui/diff.rs`)；无 syntax highlighting，按行染色 |
+| ToolCall 块 | `🔧 name(arg1=..., arg2=...)`；可点击展开 | `🔧 name  args_preview`（前 60 字符） | 🟡 | Goal 144 (`src/tui/ui/transcript.rs::render_tool_call`)；不可点击；JSON 解析仅取前 1-2 个字段 |
+| ToolResult 块 | ✓/✗ 图标 + 折叠 + Ctrl+E 展开 + size 标记 | ✓/✗ 图标 + 6 行折叠 + Ctrl+E 展开 | ✅ | Goal 144 (`src/tui/ui/transcript.rs::render_tool_result`)；阈值 6 行 + 展开提示 |
+| Diff 渲染（apply_patch） | 完整 syntax-aware（`StructuredDiff*.tsx`、`HighlightedCode.tsx`） | V4A 解析 + 红绿着色（`+`/`-`） | 🟡 | Goal 144 (`src/tui/ui/diff.rs`)；无 syntax highlighting，按行染色 |
 | Diff 渲染（write_file） | 是（diff against previous） | 简化为 `📝 Updated path (N bytes)` | 🟡 | Goal 144 显式允许的 fallback；diff against previous 需要先读旧版本 |
 | 文件编辑 reject 提示 | 专门组件（`FileEditToolUseRejectedMessage.tsx`） | 通用 `Error` 块 | 🟡 | 简化方式：拒绝/失败统一 `✗` + 错误文本；fake-cc 给文件编辑专属图标 |
 | Markdown 渲染（粗 / 斜 / 列表） | 是（`Markdown.tsx`） | 否 | 🔴 | 候选下一期；建议路径：引入纯 Rust markdown 解析器（`pulldown-cmark`），按 token 转 Span |
 | 表格渲染（`MarkdownTable.tsx`） | 是 | 否 | 🔴 | 同上；ratatui 有 `Table` widget 可直接复用 |
 | Syntax highlighting | 是（`HighlightedCode/`） | 否 | 🔴 | 候选；建议路径：`syntect` crate（已是 Rust 生态成熟方案） |
 | 代码块复制按钮 | 是（鼠标点击） | 否 | 🔴 | 终端鼠标事件需要额外注册；候选 |
-| Compacted 通知 | 是（`CompactSummary.tsx`） | 是（`⊕ Conversation compacted: N → 1 (S chars)`） | ✅ | Goal 144 (`crates/recursive-tui/src/ui/transcript.rs::render_compacted`) |
+| Compacted 通知 | 是（`CompactSummary.tsx`） | 是（`⊕ Conversation compacted: N → 1 (S chars)`） | ✅ | Goal 144 (`src/tui/ui/transcript.rs::render_compacted`) |
 | "N new messages" 折线 | 是（在虚拟滚动断点处） | 否 | 🔴 | 简化方式：scroll_offset 一旦回到底部就自动滚动；非底部时无视觉提示 |
 | Reasoning / thinking 展示 | 是（`ThinkingToggle.tsx`，可 toggle） | 否 | 🔴 | 未实现原因：`AgentEvent` 没有 reasoning channel；候选：等 LLM 抽象层暴露 reasoning 字段 |
 | Effort indicator（思考强度） | 是（`EffortIndicator.ts`、`EffortCallout.tsx`） | 否 | 🔴 | 同 reasoning，依赖 provider 暴露 effort token |
@@ -146,7 +146,7 @@ fake-cc 把消息切成 `Message`（user / assistant / tool_use / tool_result）
 | 链接打开 | 是（终端 OSC 8 + click） | 否 | 🔴 | 候选；ratatui 不直接支持，需要写 OSC 8 转义 |
 | 复制消息内容（鼠标 / 快捷键） | 是（`messageActions.tsx`） | 否 | 🔴 | 候选；选区由终端处理，键盘复制需要单独命令 |
 | 折线 / 折叠组（多消息分组） | 是（`MessageSelector.tsx`） | 否 | 🔴 | 候选 |
-| 滚动到底部自动跟随 | 是 | 是（scroll_offset 在 0 时自动跟随） | ✅ | Goal 143/144 (`crates/recursive-tui/src/app.rs::handle_ui_event`) |
+| 滚动到底部自动跟随 | 是 | 是（scroll_offset 在 0 时自动跟随） | ✅ | Goal 143/144 (`src/tui/app.rs::handle_ui_event`) |
 | PgUp / PgDn / ↑↓ 滚动 | 是 | 是（PgUp/PgDn；↑↓ 让给输入框历史） | 🟡 | Goal 143；冲突简化：↑↓ 在输入框抢，PgUp/PgDn 给 transcript |
 | 复制路径链接（`FilePathLink.tsx`） | 是（点击在 IDE 打开） | 否 | 🔴 | 候选；与"链接打开"同实现路径 |
 | Agent progress line（`AgentProgressLine.tsx`） | 是（多 agent 任务进度） | 否 | 🔴 | 与 multi-agent 集成绑定，未实现 |
@@ -162,20 +162,20 @@ src/ui/status.rs`，单行 5 段。
 
 | 能力 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| 模型名 | 是（`MessageModel.tsx` 也显示） | 是 | ✅ | Goal 144 (`crates/recursive-tui/src/ui/status.rs:46-50`)；从 `RECURSIVE_MODEL`/`OPENAI_MODEL` 读取，`crates/recursive-tui/src/app.rs::detect_model_name` |
-| token 累计（input / output） | 是（`↑I ↓O`） | 是（`↑1.2k ↓342`） | ✅ | Goal 144 (`crates/recursive-tui/src/ui/status.rs:52-61`、`human_count`) |
-| cost 估算 | 是（按模型费率） | 是（4 个模型硬编码费率） | 🟡 | Goal 144 (`crates/recursive-tui/src/app.rs::default_pricing_table:205-214`、`estimate_cost:225`)；模型不在表内则不显示 |
-| 当前 turn 计时 | 是 | 是（仅运行中 `⏱ Xs`） | ✅ | Goal 144 (`crates/recursive-tui/src/ui/status.rs:83-90`) |
-| 累计 turn 计数 | 是 | 是（`turn N`） | ✅ | Goal 144 (`crates/recursive-tui/src/ui/status.rs:76-80`) |
-| Spinner 动词（thinking / running tool） | 是（多种 verb） | 是（Thinking / Calling tool / Reading / Editing / Running） | ✅ | Goal 144 (`crates/recursive-tui/src/ui/spinner.rs`、`crates/recursive-tui/src/app.rs::TurnState.spinner_verb`) |
-| Spinner 帧动画 | 是 | 是（10 帧 braille，每帧 100ms） | ✅ | Goal 144 (`crates/recursive-tui/src/ui/spinner.rs`) |
+| 模型名 | 是（`MessageModel.tsx` 也显示） | 是 | ✅ | Goal 144 (`src/tui/ui/status.rs:46-50`)；从 `RECURSIVE_MODEL`/`OPENAI_MODEL` 读取，`src/tui/app.rs::detect_model_name` |
+| token 累计（input / output） | 是（`↑I ↓O`） | 是（`↑1.2k ↓342`） | ✅ | Goal 144 (`src/tui/ui/status.rs:52-61`、`human_count`) |
+| cost 估算 | 是（按模型费率） | 是（4 个模型硬编码费率） | 🟡 | Goal 144 (`src/tui/app.rs::default_pricing_table:205-214`、`estimate_cost:225`)；模型不在表内则不显示 |
+| 当前 turn 计时 | 是 | 是（仅运行中 `⏱ Xs`） | ✅ | Goal 144 (`src/tui/ui/status.rs:83-90`) |
+| 累计 turn 计数 | 是 | 是（`turn N`） | ✅ | Goal 144 (`src/tui/ui/status.rs:76-80`) |
+| Spinner 动词（thinking / running tool） | 是（多种 verb） | 是（Thinking / Calling tool / Reading / Editing / Running） | ✅ | Goal 144 (`src/tui/ui/spinner.rs`、`src/tui/app.rs::TurnState.spinner_verb`) |
+| Spinner 帧动画 | 是 | 是（10 帧 braille，每帧 100ms） | ✅ | Goal 144 (`src/tui/ui/spinner.rs`) |
 | Context 占用百分比 | 是（`TokenWarning.tsx`、`ContextVisualization.tsx`） | 否 | 🔴 | 未实现原因：`AgentEvent::Usage` 不带 context window 大小；建议路径：从 LLM provider 抽象暴露 max_tokens |
 | IDE 连接状态 | 是（`IdeStatusIndicator.tsx`） | 否 | ⛔ | 不是 Recursive 定位 |
 | Auto-update 提示 | 是（`AutoUpdater.tsx`、`PackageManagerAutoUpdater.tsx`） | 否 | ⛔ | 由 cargo / brew 处理 |
 | 网络状态指示 | 是 | 否 | 🔴 | 候选；建议路径：监听 reqwest 报错频率，连续失败时显示 `network: down` |
 | Effort indicator | 是（`EffortIndicator.ts`） | 否 | 🔴 | 同 §3 reasoning |
 | Stalled 提示（"Agent stalled"） | 是 | 否 | 🔴 | 未实现原因：runtime 未暴露 stuck detection；候选 |
-| 连接类型（local / remote） | 是 | 是（固定 `local`，因为 in-process） | ✅ | Goal 143/144 (`crates/recursive-tui/src/ui/status.rs:36-43`) |
+| 连接类型（local / remote） | 是 | 是（固定 `local`，因为 in-process） | ✅ | Goal 143/144 (`src/tui/ui/status.rs:36-43`) |
 | 内存占用（`MemoryUsageIndicator.tsx`） | 是 | 否 | 🔴 | 候选；Rust 进程 RSS 容易拿，但价值低 |
 | Kairos / Brief 集成 | 是（`feature('KAIROS')`） | 否 | ⛔ | 商用功能 |
 | Stash 状态 | 是 | 否 | 🔴 | 与 stash 命令绑定，未实现 |
@@ -190,17 +190,17 @@ src/ui/status.rs`，单行 5 段。
 
 fake-cc 的键位通过 `src/keybindings/{defaultBindings,resolver,match}.ts`
 注入；用户可通过 `keybindings` 命令编辑（覆盖映射）。Recursive 的
-键位散布在 `crates/recursive-tui/src/keymap.rs` + `App::handle_key`
-（`crates/recursive-tui/src/app.rs::handle_key`），不可由用户配置。
+键位散布在 `src/tui/keymap.rs` + `App::handle_key`
+（`src/tui/app.rs::handle_key`），不可由用户配置。
 
 | 键位 | fake-cc 行为 | Recursive 行为 | 状态 | 备注 |
 |---|---|---|---|---|
-| Enter | 提交输入 | 提交输入 | ✅ | Goal 143 (`crates/recursive-tui/src/keymap.rs:18-20`) |
+| Enter | 提交输入 | 提交输入 | ✅ | Goal 143 (`src/tui/keymap.rs:18-20`) |
 | Shift+Enter / Alt+Enter | 插入 `\n` | 插入 `\n`（终端支持时） | ✅ | Goal 145 |
-| Shift+Tab | 循环输入模式 | 同 | ✅ | Goal 145 (`crates/recursive-tui/src/app.rs::handle_key`) |
-| Esc 第一次 | 取消 modal / 清缓冲 / 中断 turn（按 fake-cc 上下文） | 同优先级：modal → buf 清空 → 中断 turn → 无操作 | ✅ | Goal 147 (`crates/recursive-tui/src/app.rs::handle_esc`) |
+| Shift+Tab | 循环输入模式 | 同 | ✅ | Goal 145 (`src/tui/app.rs::handle_key`) |
+| Esc 第一次 | 取消 modal / 清缓冲 / 中断 turn（按 fake-cc 上下文） | 同优先级：modal → buf 清空 → 中断 turn → 无操作 | ✅ | Goal 147 (`src/tui/app.rs::handle_esc`) |
 | Esc 第二次（2s 内） | 通常退出 | **不退出** | 🟡 | Goal 147 显式选择：Esc 永不退出，避免误操作；和 fake-cc 行为差异 |
-| Ctrl+C 第一次 | 中断 turn / 弹出确认 | 中断 turn / 清 buf / 弹 modal / push "press again" | ✅ | Goal 147 (`crates/recursive-tui/src/app.rs::handle_ctrl_c`) |
+| Ctrl+C 第一次 | 中断 turn / 弹出确认 | 中断 turn / 清 buf / 弹 modal / push "press again" | ✅ | Goal 147 (`src/tui/app.rs::handle_ctrl_c`) |
 | Ctrl+C 第二次（2s 内） | 真退出 | 真退出（`should_quit`） | ✅ | Goal 147；窗口可由 `RECURSIVE_TUI_DOUBLE_MS` 环境变量调（默认 2000ms） |
 | Ctrl+D（input 空时） | 退出 | 退出 | ✅ | Goal 143 |
 | Ctrl+L | 重绘屏幕 | 无显式键 | 🟡 | crossterm `Resize` 自动重绘；显式 `Ctrl+L` 候选 |
@@ -210,7 +210,7 @@ fake-cc 的键位通过 `src/keybindings/{defaultBindings,resolver,match}.ts`
 | Ctrl+Shift+P | Quick Open（命令 / 文件） | 无 | 🔴 | 候选；可参考 `/` 命令补全扩展 |
 | Ctrl+Shift+F | 全局搜索（消息 + 工作区） | 无 | 🔴 | 候选 |
 | Ctrl+B | Background tasks panel | 无 | 🔴 | 与 task 系统绑定 |
-| Ctrl+E | （在输入框）行尾 | buf 空 → toggle 最后 ToolResult expand；buf 非空 → 行尾 | 🟡 | Goal 144/145；冲突解：上下文敏感分流，`crates/recursive-tui/src/keymap.rs:55-69` |
+| Ctrl+E | （在输入框）行尾 | buf 空 → toggle 最后 ToolResult expand；buf 非空 → 行尾 | 🟡 | Goal 144/145；冲突解：上下文敏感分流，`src/tui/keymap.rs:55-69` |
 | Ctrl+G | 外部编辑器 | 无 | 🔴 | 候选下一期 |
 | Ctrl+X Ctrl+E | readline 风格外部编辑器 | 无 | 🔴 | 同 Ctrl+G |
 | Ctrl+S | Stash 当前 buffer | 无 | 🔴 | 候选 |
@@ -219,12 +219,12 @@ fake-cc 的键位通过 `src/keybindings/{defaultBindings,resolver,match}.ts`
 | Ctrl+X Ctrl+K | Kill agents（多 agent） | 无 | ⛔ | 多 agent swarm 不在 Recursive 范围 |
 | Tab | 自动补全 | 在 Command 模式补全唯一前缀；AtFile 模式确认选择 | ✅ | Goal 146 + Goal-158；@file 补全在 `AtFile` 模式下 Tab/Enter 确认 |
 | ↑/↓（buf 空 + 无 modal） | 历史回溯 | 历史回溯 | ✅ | Goal 145 |
-| ↑/↓（modal 中） | 选择项 | 选择项（Journal modal） | ✅ | Goal 146 (`crates/recursive-tui/src/app.rs::handle_modal_key`) |
+| ↑/↓（modal 中） | 选择项 | 选择项（Journal modal） | ✅ | Goal 146 (`src/tui/app.rs::handle_modal_key`) |
 | PgUp / PgDn | transcript 滚动 | transcript 滚动（每页半屏） | ✅ | Goal 143 |
 | Home / End（输入框） | 行首 / 行尾 | 行首 / 行尾 | ✅ | Goal 145 |
 | q（modal 中） | 关闭 modal | 关闭 modal | ✅ | Goal 146 |
-| y / n / Enter（Confirm modal） | 确认 / 取消 | 确认 / 取消 | ✅ | Goal 146 (`crates/recursive-tui/src/app.rs::handle_modal_key`) |
-| y / n / e（PlanReview modal） | Approve / Reject / Edit | 同 | ✅ | Goal 147 (`crates/recursive-tui/src/app.rs::handle_plan_review_key`) |
+| y / n / Enter（Confirm modal） | 确认 / 取消 | 确认 / 取消 | ✅ | Goal 146 (`src/tui/app.rs::handle_modal_key`) |
+| y / n / e（PlanReview modal） | Approve / Reject / Edit | 同 | ✅ | Goal 147 (`src/tui/app.rs::handle_plan_review_key`) |
 | Voice push-to-talk（空格按住） | 是 | 否 | ⛔ | Voice 不做 |
 | 用户自定义键位 | 是（`keybindings` 命令） | 否 | 🔴 | 候选；建议路径：引入 `~/.recursive/keybindings.toml` 解析层 |
 | Reserved shortcuts validation | 是（`reservedShortcuts.ts`） | 否 | 🔴 | 与上同绑定 |
@@ -237,7 +237,7 @@ fake-cc 的键位通过 `src/keybindings/{defaultBindings,resolver,match}.ts`
 fake-cc 的 `src/commands/` 目录下有 **101** 项（见 `ls
 ~/Downloads/fake-cc/src/commands | wc -l`），覆盖 auth / session /
 model / workflow / dev / tools / IDE / 商用 / 实验等十多个类目。
-Recursive 的 `crates/recursive-tui/src/commands.rs` 实现了 **10**
+Recursive 的 `src/tui/commands.rs` 实现了 **10**
 个核心命令，覆盖会话操作、状态查询和退出。
 
 下面按类目挑代表命令对照。"全部 101 项"不逐一列出（绝大多数在
@@ -247,28 +247,28 @@ Recursive 是 ⛔，详见末节），重点在每类的 ✅/🔴 决断。
 
 | 命令 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| `/help` | 列命令 + 键位 | 列命令 + 键位（Help modal） | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs:80-85`、`crates/recursive-tui/src/ui/modal.rs::render_help`) |
-| `/clear` (`/cls`) | 清 transcript | 清 transcript + 重置 UsageStats + push "Conversation cleared" | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::cmd_clear`) |
+| `/help` | 列命令 + 键位 | 列命令 + 键位（Help modal） | ✅ | Goal 146 (`src/tui/commands.rs:80-85`、`src/tui/ui/modal.rs::render_help`) |
+| `/clear` (`/cls`) | 清 transcript | 清 transcript + 重置 UsageStats + push "Conversation cleared" | ✅ | Goal 146 (`src/tui/commands.rs::cmd_clear`) |
 | `/compact` | 触发 compactor | `UserAction::Compact` → `runtime.compact_now()` | ✅ | Goal 146（核心库新增 `AgentRuntime::compact_now`：`src/runtime.rs`） |
-| `/cost` | token + cost detail | CostDetail modal | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::cmd_cost`、`crates/recursive-tui/src/ui/modal.rs::render_cost_detail`) |
+| `/cost` | token + cost detail | CostDetail modal | ✅ | Goal 146 (`src/tui/commands.rs::cmd_cost`、`src/tui/ui/modal.rs::render_cost_detail`) |
 | `/model` | 显示当前模型 | ModelInfo modal（仅显示，不切换） | 🟡 | Goal 146；fake-cc 的 `/model` 是 picker（可切换），Recursive 是只读视图 |
-| `/status` | 推送一条状态 | 推送 System 块（turn / 消息数 / token / planning_mode） | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::cmd_status`) |
-| `/tools` | 列工具 | ToolList modal（6 个核心工具） | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::cmd_tools`、`crates/recursive-tui/src/app.rs::default_offline_tool_catalog`) |
+| `/status` | 推送一条状态 | 推送 System 块（turn / 消息数 / token / planning_mode） | ✅ | Goal 146 (`src/tui/commands.rs::cmd_status`) |
+| `/tools` | 列工具 | ToolList modal（6 个核心工具） | ✅ | Goal 146 (`src/tui/commands.rs::cmd_tools`、`src/tui/app.rs::default_offline_tool_catalog`) |
 | `/plan` (on/off) | 切 plan-first 模式 | 同（`UserAction::SetPlanningMode`） | ✅ | Goal 146（核心库新增 `AgentRuntime::set_planning_mode`：`src/runtime.rs`） |
-| `/journal` | — | 读 `.dev/journal/*.md` 最近 5 个，每个前 30 行 | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::cmd_journal`、`crates/recursive-tui/src/ui/modal.rs::JournalEntry`)；Recursive 独有 |
-| `/exit` (`/quit`, `/q`) | 退出 | `should_quit = true` | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::cmd_exit`) |
+| `/journal` | — | 读 `.dev/journal/*.md` 最近 5 个，每个前 30 行 | ✅ | Goal 146 (`src/tui/commands.rs::cmd_journal`、`src/tui/ui/modal.rs::JournalEntry`)；Recursive 独有 |
+| `/exit` (`/quit`, `/q`) | 退出 | `should_quit = true` | ✅ | Goal 146 (`src/tui/commands.rs::cmd_exit`) |
 
 ### 6.2 命令执行机制
 
 | 能力 | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| 命令注册表 | TS 工厂函数批量挂载 | `CommandRegistry::default_set()` 静态 Vec | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs:73-151`) |
-| 命令别名 | 是 | 是（`/?` `/cls` `/quit` `/q`） | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs::lookup`) |
+| 命令注册表 | TS 工厂函数批量挂载 | `CommandRegistry::default_set()` 静态 Vec | ✅ | Goal 146 (`src/tui/commands.rs:73-151`) |
+| 命令别名 | 是 | 是（`/?` `/cls` `/quit` `/q`） | ✅ | Goal 146 (`src/tui/commands.rs::lookup`) |
 | 前缀模糊匹配（补全） | 是 | 是（`CommandRegistry::search`） | ✅ | Goal 146 |
-| 同步 / 异步 handler 区分 | 是 | 是（`CommandHandler::Sync` / `Async`） | ✅ | Goal 146 (`crates/recursive-tui/src/commands.rs:44-54`) |
-| 未知命令提示 | 是 | 是（"Unknown command" Error 块） | ✅ | Goal 146 (`crates/recursive-tui/src/app.rs::dispatch_slash_command`) |
+| 同步 / 异步 handler 区分 | 是 | 是（`CommandHandler::Sync` / `Async`） | ✅ | Goal 146 (`src/tui/commands.rs:44-54`) |
+| 未知命令提示 | 是 | 是（"Unknown command" Error 块） | ✅ | Goal 146 (`src/tui/app.rs::dispatch_slash_command`) |
 | 命令插件 / 用户自定义 | 是（`plugins/` 目录） | 否 | 🔴 | 候选；建议路径：扫描 `~/.recursive/commands/*.toml` 注入 Vec |
-| Help 自动生成 | 是 | 是（Help modal 列出所有命令） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::render_help`) |
+| Help 自动生成 | 是 | 是（Help modal 列出所有命令） | ✅ | Goal 146 (`src/tui/ui/modal.rs::render_help`) |
 
 ### 6.3 商用 / 账户体系类
 
@@ -374,18 +374,18 @@ Recursive 是 ⛔，详见末节），重点在每类的 ✅/🔴 决断。
 
 fake-cc 的 dialog 系统是 Ink 组件树自然形成的：每个 dialog 是一个
 React 组件，挂载即遮蔽。Recursive 的对应是 `Vec<Modal>` 后入先出栈
-（`crates/recursive-tui/src/app.rs:564`，`crates/recursive-tui/src/
+（`src/tui/app.rs:564`，`src/tui/
 ui/modal.rs:43-71`）。
 
 | Modal | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
-| Help | 是（HelpV2/） | 是（`Modal::Help`） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::render_help`) |
-| Cost detail | 是（多组件） | 是（`Modal::CostDetail`） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::render_cost_detail`) |
+| Help | 是（HelpV2/） | 是（`Modal::Help`） | ✅ | Goal 146 (`src/tui/ui/modal.rs::render_help`) |
+| Cost detail | 是（多组件） | 是（`Modal::CostDetail`） | ✅ | Goal 146 (`src/tui/ui/modal.rs::render_cost_detail`) |
 | Model picker | 是（`ModelPicker.tsx`，可切换） | `Modal::ModelInfo`（只读） | 🟡 | Goal 146；不切换，因为没有运行时 LLM 切换 API |
-| Tool list | 是 | 是（`Modal::ToolList`） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::render_tool_list`) |
-| Journal viewer | — | 是（`Modal::Journal`，Recursive 独有） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::render_journal`) |
-| Confirm（y/n） | 是 | 是（`Modal::Confirm`，Exit / Clear 两种 ConfirmAction） | ✅ | Goal 146 (`crates/recursive-tui/src/ui/modal.rs::ConfirmAction`) |
-| Plan review | 是 | 是（`Modal::PlanReview`，Goal 147 替代旧 PlanReview screen） | ✅ | Goal 147 (`crates/recursive-tui/src/ui/modal.rs:66-71`、`crates/recursive-tui/src/ui/modal.rs::render_plan_review`) |
+| Tool list | 是 | 是（`Modal::ToolList`） | ✅ | Goal 146 (`src/tui/ui/modal.rs::render_tool_list`) |
+| Journal viewer | — | 是（`Modal::Journal`，Recursive 独有） | ✅ | Goal 146 (`src/tui/ui/modal.rs::render_journal`) |
+| Confirm（y/n） | 是 | 是（`Modal::Confirm`，Exit / Clear 两种 ConfirmAction） | ✅ | Goal 146 (`src/tui/ui/modal.rs::ConfirmAction`) |
+| Plan review | 是 | 是（`Modal::PlanReview`，Goal 147 替代旧 PlanReview screen） | ✅ | Goal 147 (`src/tui/ui/modal.rs:66-71`、`src/tui/ui/modal.rs::render_plan_review`) |
 | Resume picker | 是（`ResumeConversation.tsx`） | 是 | ✅ | Goal-171 落地：`Modal::ResumePicker`，`/resume` 命令，`SessionReader` 驱动 |
 | History search | 是（`HistorySearchDialog.tsx`） | 是 | ✅ | Goal-160：Ctrl+R，`InputMode::HistorySearch` |
 | Quick open | 是（`QuickOpenDialog.tsx`） | 否 | 🔴 | 候选；与 Ctrl+Shift+P 绑定 |
@@ -418,7 +418,7 @@ ui/modal.rs:43-71`）。
 | Log selector | 是（`LogSelector.tsx`） | 否 | 🔴 | 候选；与 observation 系统绑定 |
 | Skill improvement survey | 是 | 否 | ⛔ | 商用 |
 | Stash modal（拉起 stash） | 是 | 否 | 🔴 | 候选 |
-| Modal 栈优先级 | 是（多 modal 堆叠） | 是（`Vec<Modal>` 顶层抢键） | ✅ | Goal 146 (`crates/recursive-tui/src/app.rs::handle_key`) |
+| Modal 栈优先级 | 是（多 modal 堆叠） | 是（`Vec<Modal>` 顶层抢键） | ✅ | Goal 146 (`src/tui/app.rs::handle_key`) |
 | Modal 居中 + 暗背景 | 是 | 是（`Clear` widget + `Block`） | ✅ | Goal 146 |
 | Modal 内 ↑/↓ 选择 | 是 | 是（Journal / 命令补全） | ✅ | Goal 146 |
 | Modal Esc 弹栈 | 是 | 是 | ✅ | Goal 146/147 |
@@ -583,7 +583,7 @@ roadmap 决定。
 
 - Goal 文档：`.dev/goals/{143,144,145,146,147,148}-*.md`
 - Goal journal：`.dev/journal/run-20260529T*-manual-goal14[3-7].md`
-- Recursive TUI 源码：`crates/recursive-tui/src/`
+- Recursive TUI 源码：`src/tui/`
   - `app.rs` —— App / TranscriptBlock / PromptInputState / DoublePressTracker
   - `backend.rs` —— Backend worker、TuiEventSink、cancel_flag
   - `commands.rs` —— CommandRegistry、10 个核心命令
