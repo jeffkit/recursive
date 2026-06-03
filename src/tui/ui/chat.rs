@@ -59,7 +59,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     // Messages panel.
-    let mut lines = transcript::render_blocks(&app.blocks, &app.usage);
+    let mut lines = transcript::render_blocks(&app.blocks, &app.usage, app.theme);
     if app.turn.running {
         let elapsed = app
             .turn
