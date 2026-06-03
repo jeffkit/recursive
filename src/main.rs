@@ -110,6 +110,22 @@ struct Cli {
     #[arg(long = "plan-first")]
     plan_first: bool,
 
+    /// Start WeChat iLink daemon alongside the TUI (or in headless mode with `weixin-daemon`).
+    /// On first run, a QR code is displayed for login.
+    #[cfg(feature = "weixin")]
+    #[arg(long = "weixin", env = "RECURSIVE_WEIXIN")]
+    weixin: bool,
+
+    /// Override the iLink API base URL (e.g. when using an ilink-hub proxy).
+    #[cfg(feature = "weixin")]
+    #[arg(long = "weixin-base-url", env = "RECURSIVE_WEIXIN_BASE_URL")]
+    weixin_base_url: Option<String>,
+
+    /// Path to store WeChat bot credentials (default: ~/.recursive/<workspace>/weixin_creds.json).
+    #[cfg(feature = "weixin")]
+    #[arg(long = "weixin-cred-path")]
+    weixin_cred_path: Option<PathBuf>,
+
     /// Path to external pricing YAML file. If provided, pricing from this file
     /// takes precedence over hardcoded values. Models not in the file fall back
     /// to hardcoded rates.
@@ -133,6 +149,9 @@ enum Cmd {
     },
     /// Interactive multi-turn REPL (default when no command is given).
     Repl,
+    /// Run as a headless WeChat daemon — no TUI, agent driven by WeChat messages.
+    #[cfg(feature = "weixin")]
+    WeixinDaemon,
     /// Start as an MCP server (stdio transport).
     Serve {
         /// Workspace path for tool sandboxing.
@@ -359,6 +378,15 @@ async fn main() -> anyhow::Result<()> {
             if let Some(prompt) = cli.prompt {
                 Cmd::Run { goal: vec![prompt] }
             } else {
+                #[cfg(all(feature = "tui", feature = "weixin"))]
+                if cli.weixin {
+                    return run_tui_with_weixin(
+                        cli.weixin_base_url.clone(),
+                        cli.weixin_cred_path.clone(),
+                        config.workspace.clone(),
+                    )
+                    .await;
+                }
                 #[cfg(feature = "tui")]
                 {
                     return recursive::tui::run().await.map_err(Into::into);
@@ -386,6 +414,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match effective_cmd {
+        #[cfg(feature = "weixin")]
+        Cmd::WeixinDaemon => {
+            return run_weixin_headless_daemon(
+                config,
+                cli.mcp_config,
+                cli.weixin_base_url,
+                cli.weixin_cred_path,
+            )
+            .await;
+        }
+
         Cmd::Tools => {
             let tools = cli::builder::build_tools(&config).await;
             let specs = tools.specs();
@@ -1448,6 +1487,117 @@ async fn dispatch_request_via_registry(
         )),
         _ => Some(JsonRpcResponse::method_not_found(id, &request.method)),
     }
+}
+
+// ── WeChat helpers ────────────────────────────────────────────────────────────
+
+/// Run TUI with a WeChat iLink daemon running in the background.
+///
+/// Starts the WeChat daemon, connects its request channel to the TUI backend,
+/// then runs the TUI event loop as normal.
+#[cfg(all(feature = "tui", feature = "weixin"))]
+async fn run_tui_with_weixin(
+    base_url: Option<String>,
+    cred_path: Option<PathBuf>,
+    workspace: PathBuf,
+) -> anyhow::Result<()> {
+    use recursive::tui::backend::Backend;
+    use recursive::weixin::{WeixinDaemon, WeixinDaemonOptions};
+
+    let mut opts = WeixinDaemonOptions::new(&workspace);
+    opts.base_url = base_url;
+    opts.cred_path = cred_path;
+
+    let daemon = WeixinDaemon::new(opts);
+    daemon.login(false).await?;
+
+    let (_polling_handle, mut weixin_req_rx) = daemon.start();
+
+    // Spawn bridge: forward WeixinRequests to the TUI backend.
+    let backend = Backend::spawn();
+    let weixin_tx = backend.weixin_tx.clone();
+    tokio::spawn(async move {
+        use recursive::tui::events::WeixinBackendRequest;
+        while let Some(req) = weixin_req_rx.recv().await {
+            let backend_req = WeixinBackendRequest {
+                user_id: req.user_id,
+                text: req.text,
+                reply_tx: req.reply_tx,
+            };
+            if weixin_tx.send(backend_req).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Run TUI with the already-spawned backend.
+    recursive::tui::run_with_backend(backend)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// Run as a headless WeChat-only daemon (no TUI).
+///
+/// All interaction happens through WeChat messages. The agent runs in a
+/// simple request-response loop.
+#[cfg(feature = "weixin")]
+async fn run_weixin_headless_daemon(
+    config: recursive::config::Config,
+    mcp_config: Option<PathBuf>,
+    base_url: Option<String>,
+    cred_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use recursive::weixin::{WeixinDaemon, WeixinDaemonOptions};
+    use tracing::info;
+
+    let workspace = config.workspace.clone();
+    if let Err(msg) = config.validate_for_agent() {
+        anyhow::bail!("{msg}");
+    }
+
+    let mut opts = WeixinDaemonOptions::new(&workspace);
+    opts.base_url = base_url;
+    opts.cred_path = cred_path;
+
+    let daemon = WeixinDaemon::new(opts);
+    daemon.login(false).await?;
+    let (_polling_handle, mut weixin_req_rx) = daemon.start();
+
+    info!("WeChat daemon started — waiting for messages");
+    eprintln!("📱 Recursive WeChat daemon running. Send a message to get started.");
+
+    // Build runtime.
+    let mut runtime = cli::builder::build_runtime(
+        &config,
+        None,       // max_transcript_chars
+        Vec::new(), // seed messages
+        false,      // stream
+        false,      // plan_first
+        mcp_config,
+        false, // hook_timing
+        None,  // goal
+        None,  // event_sink (WeChat responses come from enqueue return value)
+        None,  // shutdown_token
+    )
+    .await?;
+
+    while let Some(req) = weixin_req_rx.recv().await {
+        info!("WeChat: processing message from {}", req.user_id);
+        match runtime.enqueue(&req.text).await {
+            Ok(Some(outcome)) => {
+                let _ = req.reply_tx.send(outcome.final_text);
+            }
+            Ok(None) => {
+                let _ = req.reply_tx.send(None);
+            }
+            Err(e) => {
+                tracing::error!("WeChat runtime error: {e}");
+                let _ = req.reply_tx.send(Some(format!("❌ 处理出错: {e}")));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
