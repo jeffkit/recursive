@@ -63,10 +63,9 @@ pub use hooks::ExternalHookRunner;
 pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
 pub use kernel::{AgentKernel, AgentKernelBuilder, SideEffect, TurnContext, TurnOutcome};
-pub use llm::openai::RetryPolicy;
 pub use llm::{
     context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, Completion,
-    LlmProvider, ModelPricing, TokenUsage, ToolCall, ToolSpec,
+    LlmProvider, ModelPricing, RetryPolicy, TokenUsage, ToolCall, ToolSpec,
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{
