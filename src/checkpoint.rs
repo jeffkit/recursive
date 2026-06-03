@@ -149,21 +149,24 @@ impl ShadowRepo {
 
         // We exclude the `.recursive/` directory entirely so the shadow
         // repo never snapshots its own internals or sibling sessions'
-        // state files. The pathspec `:!.recursive` is git's
-        // exclude-pathspec syntax; it applies relative to the
-        // work-tree root.
+        // state files. Use `current_dir` so that pathspecs are resolved
+        // relative to the workspace even on Windows where git may not
+        // honour GIT_WORK_TREE for pathspec resolution.  The short-form
+        // `:!` exclude is more portable across git versions and platforms
+        // than the long-form `:(exclude,glob)` magic.
         let add_out = git_cmd()
             .env("GIT_INDEX_FILE", &tmp_index)
             .env("GIT_DIR", &self.shadow_dir)
             .env("GIT_WORK_TREE", &self.workspace)
+            .current_dir(&self.workspace)
             .args([
                 "add",
                 "-A",
                 "--force",
                 "--",
                 ".",
-                ":(exclude,glob).recursive/**",
-                ":(exclude,glob).recursive",
+                ":!.recursive/**",
+                ":!.recursive",
             ])
             .output()
             .map_err(git_err)?;
@@ -480,14 +483,15 @@ impl ShadowRepo {
             .env("GIT_INDEX_FILE", &tmp_index)
             .env("GIT_DIR", &self.shadow_dir)
             .env("GIT_WORK_TREE", &self.workspace)
+            .current_dir(&self.workspace)
             .args([
                 "add",
                 "-A",
                 "--force",
                 "--",
                 ".",
-                ":(exclude,glob).recursive/**",
-                ":(exclude,glob).recursive",
+                ":!.recursive/**",
+                ":!.recursive",
             ])
             .output();
 
