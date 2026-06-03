@@ -14,7 +14,8 @@ pub fn render(frame: &mut Frame) {
         Line::from("   ╱╲    Recursive Agent".to_string()).style(Style::default().fg(Color::Cyan)),
         Line::from("  ╱  ╲   ─────────────────".to_string())
             .style(Style::default().fg(Color::Cyan)),
-        Line::from(" ╱ ╱╲ ╲  v0.4.0".to_string()).style(Style::default().fg(Color::White)),
+        Line::from(format!(" ╱ ╱╲ ╲  v{}", env!("CARGO_PKG_VERSION")))
+            .style(Style::default().fg(Color::White)),
         Line::from(" ╲ ╲╱ ╱".to_string()).style(Style::default().fg(Color::Cyan)),
         Line::from("  ╲  ╱   Self-improving AI agent".to_string())
             .style(Style::default().fg(Color::Cyan)),
