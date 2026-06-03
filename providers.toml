@@ -1,5 +1,6 @@
 # Recursive provider presets — auto-loaded at startup.
 # Fields: id, name, provider_type, api_base, default_model, models[], mainland_accessible, key_env, key_url
+# Each model entry: {name = "...", context_window = <tokens>}
 
 [[providers]]
 id = "anthropic"
@@ -7,7 +8,11 @@ name = "Anthropic"
 provider_type = "anthropic"
 api_base = "https://api.anthropic.com"
 default_model = "claude-sonnet-4-6"
-models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
+models = [
+  {name = "claude-opus-4-7",  context_window = 200000},
+  {name = "claude-sonnet-4-6", context_window = 200000},
+  {name = "claude-haiku-4-5", context_window = 200000},
+]
 mainland_accessible = false
 key_env = "ANTHROPIC_API_KEY"
 key_url = "https://console.anthropic.com/settings/keys"
@@ -18,7 +23,12 @@ name = "OpenAI"
 provider_type = "openai"
 api_base = "https://api.openai.com/v1"
 default_model = "gpt-4o"
-models = ["gpt-4o", "gpt-4o-mini", "o3", "o4-mini"]
+models = [
+  {name = "gpt-4o",       context_window = 128000},
+  {name = "gpt-4o-mini",  context_window = 128000},
+  {name = "o3",           context_window = 200000},
+  {name = "o4-mini",      context_window = 200000},
+]
 mainland_accessible = false
 key_env = "OPENAI_API_KEY"
 key_url = "https://platform.openai.com/api-keys"
@@ -29,7 +39,10 @@ name = "DeepSeek"
 provider_type = "openai"
 api_base = "https://api.deepseek.com/v1"
 default_model = "deepseek-chat"
-models = ["deepseek-chat", "deepseek-reasoner"]
+models = [
+  {name = "deepseek-chat",      context_window = 64000},
+  {name = "deepseek-reasoner",  context_window = 64000},
+]
 mainland_accessible = true
 key_env = "DEEPSEEK_API_KEY"
 key_url = "https://platform.deepseek.com/api_keys"
@@ -40,7 +53,10 @@ name = "MiniMax"
 provider_type = "openai"
 api_base = "https://api.minimax.io/v1"
 default_model = "MiniMax-M3"
-models = ["MiniMax-M3", "MiniMax-Text-01"]
+models = [
+  {name = "MiniMax-M3",       context_window = 1000000},
+  {name = "MiniMax-Text-01",  context_window = 1000000},
+]
 mainland_accessible = true
 key_env = "MINIMAX_API_KEY"
 key_url = "https://platform.minimax.io/user-center/basic-information/interface-key"
@@ -51,7 +67,11 @@ name = "智谱 AI (GLM)"
 provider_type = "openai"
 api_base = "https://open.bigmodel.cn/api/paas/v4"
 default_model = "glm-4-plus"
-models = ["glm-4-plus", "glm-4-air", "glm-z1-flash"]
+models = [
+  {name = "glm-4-plus",    context_window = 128000},
+  {name = "glm-4-air",     context_window = 128000},
+  {name = "glm-z1-flash",  context_window = 128000},
+]
 mainland_accessible = true
 key_env = "ZHIPU_API_KEY"
 key_url = "https://open.bigmodel.cn/usercenter/apikeys"
@@ -62,7 +82,10 @@ name = "月之暗面 (Kimi)"
 provider_type = "openai"
 api_base = "https://api.moonshot.ai/v1"
 default_model = "moonshot-v1-128k"
-models = ["moonshot-v1-128k", "moonshot-v1-8k"]
+models = [
+  {name = "moonshot-v1-128k", context_window = 128000},
+  {name = "moonshot-v1-8k",   context_window = 8000},
+]
 mainland_accessible = true
 key_env = "MOONSHOT_API_KEY"
 key_url = "https://platform.moonshot.ai/console/api-keys"
@@ -73,7 +96,11 @@ name = "字节跳动 Doubao (火山引擎 Ark)"
 provider_type = "openai"
 api_base = "https://ark.cn-beijing.volces.com/api/v3"
 default_model = "doubao-seed-2-0-250615"
-models = ["doubao-seed-2-0-250615", "doubao-1-5-pro-256k", "doubao-1-5-lite-32k"]
+models = [
+  {name = "doubao-seed-2-0-250615",  context_window = 128000},
+  {name = "doubao-1-5-pro-256k",     context_window = 256000},
+  {name = "doubao-1-5-lite-32k",     context_window = 32000},
+]
 mainland_accessible = true
 key_env = "ARK_API_KEY"
 key_url = "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey"
@@ -84,7 +111,11 @@ name = "阿里云通义千问 (DashScope)"
 provider_type = "openai"
 api_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 default_model = "qwen-max"
-models = ["qwen-max", "qwen-plus", "qwen3-235b-a22b"]
+models = [
+  {name = "qwen-max",         context_window = 32768},
+  {name = "qwen-plus",        context_window = 131072},
+  {name = "qwen3-235b-a22b",  context_window = 131072},
+]
 mainland_accessible = true
 key_env = "DASHSCOPE_API_KEY"
 key_url = "https://bailian.console.aliyun.com/?apiKey=1"
@@ -95,7 +126,11 @@ name = "腾讯混元 (Hunyuan)"
 provider_type = "openai"
 api_base = "https://api.hunyuan.cloud.tencent.com/v1"
 default_model = "hunyuan-turbos"
-models = ["hunyuan-turbos", "hunyuan-t1", "hunyuan-lite"]
+models = [
+  {name = "hunyuan-turbos", context_window = 256000},
+  {name = "hunyuan-t1",     context_window = 128000},
+  {name = "hunyuan-lite",   context_window = 256000},
+]
 mainland_accessible = true
 key_env = "HUNYUAN_API_KEY"
 key_url = "https://console.cloud.tencent.com/hunyuan/api-key"
@@ -106,7 +141,11 @@ name = "阶跃星辰 (StepFun)"
 provider_type = "openai"
 api_base = "https://api.stepfun.com/v1"
 default_model = "step-3-5-flash"
-models = ["step-3-7-flash", "step-3-5-flash", "step-1-8k"]
+models = [
+  {name = "step-3-7-flash", context_window = 256000},
+  {name = "step-3-5-flash", context_window = 256000},
+  {name = "step-1-8k",      context_window = 8000},
+]
 mainland_accessible = true
 key_env = "STEPFUN_API_KEY"
 key_url = "https://platform.stepfun.com/account-info"
@@ -117,7 +156,11 @@ name = "Google Gemini"
 provider_type = "openai"
 api_base = "https://generativelanguage.googleapis.com/v1beta/openai"
 default_model = "gemini-2.5-pro"
-models = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+models = [
+  {name = "gemini-2.5-pro",        context_window = 1048576},
+  {name = "gemini-2.5-flash",      context_window = 1048576},
+  {name = "gemini-2.5-flash-lite", context_window = 1048576},
+]
 mainland_accessible = false
 key_env = "GEMINI_API_KEY"
 key_url = "https://aistudio.google.com/app/apikey"
@@ -128,7 +171,11 @@ name = "Groq"
 provider_type = "openai"
 api_base = "https://api.groq.com/openai/v1"
 default_model = "llama-3.3-70b-versatile"
-models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "moonshotai/Kimi-K2-Instruct"]
+models = [
+  {name = "llama-3.3-70b-versatile",          context_window = 128000},
+  {name = "llama-3.1-8b-instant",             context_window = 128000},
+  {name = "moonshotai/Kimi-K2-Instruct",      context_window = 128000},
+]
 mainland_accessible = false
 key_env = "GROQ_API_KEY"
 key_url = "https://console.groq.com/keys"
@@ -139,7 +186,11 @@ name = "Mistral AI"
 provider_type = "openai"
 api_base = "https://api.mistral.ai/v1"
 default_model = "mistral-large-latest"
-models = ["mistral-large-latest", "mistral-small-latest", "codestral-latest"]
+models = [
+  {name = "mistral-large-latest",  context_window = 131072},
+  {name = "mistral-small-latest",  context_window = 32000},
+  {name = "codestral-latest",      context_window = 32000},
+]
 mainland_accessible = false
 key_env = "MISTRAL_API_KEY"
 key_url = "https://console.mistral.ai/api-keys"
@@ -150,7 +201,11 @@ name = "xAI (Grok)"
 provider_type = "openai"
 api_base = "https://api.x.ai/v1"
 default_model = "grok-3"
-models = ["grok-4", "grok-3", "grok-3-mini"]
+models = [
+  {name = "grok-4",      context_window = 256000},
+  {name = "grok-3",      context_window = 131072},
+  {name = "grok-3-mini", context_window = 131072},
+]
 mainland_accessible = false
 key_env = "XAI_API_KEY"
 key_url = "https://console.x.ai/"
@@ -161,7 +216,12 @@ name = "Ollama (本地)"
 provider_type = "openai"
 api_base = "http://localhost:11434/v1"
 default_model = "qwen2.5-coder"
-models = ["qwen2.5-coder", "llama3.2", "deepseek-r1", "mistral"]
+models = [
+  {name = "qwen2.5-coder",  context_window = 32768},
+  {name = "llama3.2",       context_window = 131072},
+  {name = "deepseek-r1",    context_window = 65536},
+  {name = "mistral",        context_window = 32768},
+]
 mainland_accessible = true
 key_env = ""
 key_url = "https://ollama.ai/"

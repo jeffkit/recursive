@@ -2,6 +2,14 @@
 
 use serde::Deserialize;
 
+/// A single model entry within a provider preset.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelSpec {
+    pub name: String,
+    /// Maximum input context window in tokens for this model.
+    pub context_window: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderPreset {
     pub id: String,
@@ -9,7 +17,7 @@ pub struct ProviderPreset {
     pub provider_type: String,
     pub api_base: String,
     pub default_model: String,
-    pub models: Vec<String>,
+    pub models: Vec<ModelSpec>,
     pub mainland_accessible: bool,
     pub key_env: String,
     pub key_url: String,
