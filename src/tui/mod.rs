@@ -48,6 +48,15 @@ impl Drop for TerminalGuard {
 
 /// Launch the TUI and run until the user quits.
 pub async fn run() -> io::Result<()> {
+    // Suppress global `tracing` output for the duration of the TUI.
+    // `tracing-subscriber` was already initialised in `main.rs` and
+    // is configured to write to stderr; without this guard, every
+    // `tracing::info!` from the runtime lands *inside* the alternate
+    // screen (typically right next to the input box, since that's
+    // where the cursor was last parked). The guard restores stderr
+    // on every exit path — including panics — so the user can
+    // still see panic messages after `LeaveAlternateScreen`.
+    let _quiet_guard = crate::logging::suppress_tracing_for_tui();
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableMouseCapture)?;

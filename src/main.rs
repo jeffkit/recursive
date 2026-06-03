@@ -877,7 +877,7 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
     let mut layer = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(recursive::logging::StderrOrNullMaker)
         .compact();
     if trace_spans {
         layer = layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
