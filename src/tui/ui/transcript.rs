@@ -22,9 +22,20 @@ pub fn render_blocks(
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 {
+            // Always insert one blank line between consecutive blocks.
             lines.push(Line::raw(""));
+            // Add a second blank line before User blocks so the conversation
+            // has clear visual breathing room between turns.
+            if matches!(b, TranscriptBlock::User { .. }) {
+                lines.push(Line::raw(""));
+            }
         }
         lines.extend(render_block(b, th));
+        // Add a trailing blank line after each User block so the AI response
+        // that follows feels spacious (same two-line gap on both sides).
+        if matches!(b, TranscriptBlock::User { .. }) {
+            lines.push(Line::raw(""));
+        }
     }
     lines
 }
@@ -153,21 +164,23 @@ fn render_assistant(
 // ── Reasoning / thinking ──────────────────────────────────────────────
 
 /// Render a reasoning / thinking block in Claude-Code style:
-/// a small `thinking…` header in dim yellow, followed by the
-/// reasoning text in dim grey italics. Empty / whitespace-only
+/// a `∴ Thinking…` header in dim yellow, followed by the
+/// reasoning text in a slightly muted gray. Empty / whitespace-only
 /// reasoning collapses to just the header.
 fn render_reasoning(text: &str) -> Vec<Line<'static>> {
     let header_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
+    // Slightly muted gray-white so thinking content is visually distinct
+    // from regular assistant text (which is pure white).
     let body_style = Style::default()
-        .fg(Color::Gray)
+        .fg(Color::Rgb(170, 170, 170))
         .add_modifier(Modifier::ITALIC);
     let indent = Span::raw("  ");
 
     let mut out = vec![Line::from(vec![
         indent,
-        Span::styled("thinking…".to_string(), header_style),
+        Span::styled("∴ Thinking…".to_string(), header_style),
     ])];
 
     for line in text.lines() {
@@ -680,7 +693,10 @@ mod tests {
             &theme::DARK,
         );
         let header = line_text(&lines[0]);
-        assert!(header.contains("thinking"), "missing thinking header");
+        assert!(
+            header.contains("Thinking") || header.contains("∴"),
+            "missing thinking header"
+        );
         let body = full_text(&lines);
         assert!(body.contains("let me think about this"));
         assert!(body.contains("maybe this way"));
@@ -700,7 +716,8 @@ mod tests {
             },
             &theme::DARK,
         );
-        assert!(line_text(&lines[0]).contains("thinking"));
+        let h = line_text(&lines[0]);
+        assert!(h.contains("Thinking") || h.contains("∴"));
     }
 
     #[test]
