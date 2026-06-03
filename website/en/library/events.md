@@ -1,87 +1,81 @@
 # Events & Observers
 
-Subscribe to the `StepEvent` stream to build UIs, logging systems, replay mechanisms, or tests — without touching the agent loop.
+Subscribe to the `AgentEvent` stream via an `EventSink` to build UIs, logging systems, replay mechanisms, or tests — without touching the agent loop.
 
-## StepEvent variants
+## AgentEvent variants
 
 ```rust
-pub enum StepEvent {
-    LlmStart {
-        step: usize,
-        messages: Vec<Message>,
-    },
-    LlmEnd {
-        step: usize,
-        message: Message,
-    },
-    ToolStart {
-        step: usize,
-        name: String,
-        args: Value,
-    },
-    ToolEnd {
-        step: usize,
-        name: String,
-        result: ToolResult,
-    },
-    Compacted {
-        removed: usize,
-        summary_chars: usize,
-    },
-    Done {
-        finish_reason: FinishReason,
-        final_message: Option<String>,
-    },
+#[non_exhaustive]
+pub enum AgentEvent {
+    AssistantText { text: String, step: usize },
+    ToolCall { name: String, id: String, arguments: String, step: usize },
+    ToolResult { id: String, name: String, output: String, step: usize },
+    Latency { step: usize, llm_ms: u64 },
+    Usage { input_tokens: u32, output_tokens: u32, step: usize },
+    PartialToken { text: String, step: usize },
+    Reasoning { text: String, step: usize },
+    Compacted { removed: usize, kept: usize, summary_chars: usize, step: usize },
+    TurnFinished { reason: String, steps: usize },
+    // ... additional variants
 }
 ```
 
-## Subscribing via builder
+## Subscribing via ChannelSink
 
 ```rust
-let mut agent = Agent::builder()
+use recursive::event::{AgentEvent, ChannelSink};
+use std::sync::Arc;
+
+let (sink, mut rx) = ChannelSink::new(128);
+
+let mut runtime = AgentRuntime::builder()
     .llm(llm)
     .tools(tools)
-    .on_event(|event| match event {
-        StepEvent::ToolStart { name, args, .. } => {
-            println!("[tool] {} {:?}", name, args);
-        }
-        StepEvent::Done { finish_reason, .. } => {
-            println!("[done] {:?}", finish_reason);
-        }
-        _ => {}
-    })
-    .build()?;
-```
-
-## Subscribing via channel
-
-```rust
-use tokio::sync::mpsc;
-
-let (tx, mut rx) = mpsc::unbounded_channel();
-
-let mut agent = Agent::builder()
-    .llm(llm)
-    .tools(tools)
-    .event_sender(tx)
+    .event_sink(Arc::new(sink))
     .build()?;
 
 // Spawn a task to consume events
 tokio::spawn(async move {
-    while let Some(event) = rx.recv().await {
-        // handle event
+    while let Ok(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolCall { name, arguments, .. } => {
+                println!("[tool] {} {}", name, arguments);
+            }
+            AgentEvent::TurnFinished { reason, steps } => {
+                println!("[done] {} steps, reason: {}", steps, reason);
+            }
+            _ => {}
+        }
     }
 });
 
-let outcome = agent.run("your goal").await?;
+let outcome = runtime.run("your goal").await?;
+```
+
+## Subscribing via BroadcastSink
+
+```rust
+use recursive::event::BroadcastSink;
+use std::sync::Arc;
+
+let (sink, rx) = BroadcastSink::new(128);
+// Clone rx for multiple subscribers
+let rx2 = sink.subscribe();
+
+let mut runtime = AgentRuntime::builder()
+    .llm(llm)
+    .event_sink(Arc::new(sink))
+    .build()?;
 ```
 
 ## Use cases
 
 | Use case | Events to watch |
 |---|---|
-| Progress indicator | `LlmStart`, `ToolStart`, `Done` |
-| Cost tracking | `Done` (check `outcome.token_usage`) |
+| Progress indicator | `ToolCall`, `TurnFinished` |
+| Streaming output | `PartialToken`, `AssistantText` |
+| Cost tracking | `Usage` (accumulate token counts) |
+| Latency monitoring | `Latency` |
 | Audit logging | All events |
 | Replay | All events (serialize to JSONL) |
-| Testing | `ToolStart` / `ToolEnd` (assert tool calls) |
+| Testing | `ToolCall` / `ToolResult` (assert tool calls) |

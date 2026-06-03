@@ -70,9 +70,9 @@ pub trait Tool: Send + Sync {
 | `web_fetch` | HTTP GET with HTML extraction (optional) |
 | `remember` / `recall` | Persistent key-value memory |
 
-## 4. Agent
+## 4. AgentRuntime
 
-**Location**: `src/agent.rs` (the loop itself is `src/run_core.rs`)
+**Location**: `src/runtime.rs`
 
 The loop. Receives a goal string, alternates model ↔ tools, and runs until a finish condition:
 
@@ -84,28 +84,35 @@ goal → [LLM] → tool_calls? → [Tools] → [LLM] → tool_calls? → ... →
 
 | Reason | Meaning |
 |---|---|
-| `Done` | Model produced a final text answer |
+| `NoMoreToolCalls` | Model stopped calling tools (normal completion) |
+| `ProviderStop(s)` | LLM returned an explicit stop signal |
 | `BudgetExceeded` | `max_steps` reached |
-| `Stuck` | Same tool call repeated 3× |
-| `NoMoreToolCalls` | Model stopped calling tools |
-| `Error` | Unrecoverable error |
+| `Stuck { .. }` | Same tool call looping |
+| `TranscriptLimit { .. }` | Transcript too large |
+| `PlanPending` | Agent paused for plan approval |
+| `Cancelled` | Run cancelled externally |
+| `PermissionDenialLimit` | Too many permission denials |
+
+Errors during the run are returned as `Err(...)` from `runtime.run()`.
 
 The loop is **intentionally not extensible** — new capabilities belong in tools or providers, not inside the loop.
 
-## 5. StepEvent
+## 5. AgentEvent
 
 **Location**: `src/event.rs`
 
-An observer channel emitted after every step. Subscribe to drive UIs, logging, replay, or testing without touching the loop.
+An observer channel emitted after every step. Subscribe via an `EventSink` to drive UIs, logging, replay, or testing without touching the loop.
 
 ```rust
-pub enum StepEvent {
-    LlmStart { step: usize, messages: Vec<Message> },
-    LlmEnd { step: usize, message: Message },
-    ToolStart { step: usize, name: String, args: Value },
-    ToolEnd { step: usize, name: String, result: ToolResult },
-    Compacted { removed: usize, summary_chars: usize },
-    Done { finish_reason: FinishReason, final_message: Option<String> },
+#[non_exhaustive]
+pub enum AgentEvent {
+    AssistantText { text: String, step: usize },
+    ToolCall { name: String, id: String, arguments: String, step: usize },
+    ToolResult { id: String, name: String, output: String, step: usize },
+    Usage { input_tokens: u32, output_tokens: u32, step: usize },
+    Compacted { removed: usize, kept: usize, summary_chars: usize, step: usize },
+    TurnFinished { reason: String, steps: usize },
+    // ...
 }
 ```
 
@@ -113,12 +120,12 @@ pub enum StepEvent {
 
 ```
 ┌─────────────────────────────────────────┐
-│                  Agent                  │
+│              AgentRuntime               │
 │  ┌─────────┐         ┌───────────────┐  │
 │  │   LLM   │◄────────│ ToolRegistry  │  │
 │  │Provider │         │  (Tool × N)   │  │
 │  └────┬────┘         └───────────────┘  │
-│       │  StepEvent stream               │
+│       │  AgentEvent stream              │
 └───────┼─────────────────────────────────┘
         ▼
    ┌────────────┐  ┌──────────┐  ┌──────────┐

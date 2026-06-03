@@ -79,7 +79,7 @@ let team = Team::new(orchestrator_agent)
     .specialist("reviewer", reviewer_agent);
 
 let outcome = team.run("构建用户管理 REST API").await?;
-println!("{}", outcome.final_message.unwrap_or_default());
+println!("{}", outcome.final_text.unwrap_or_default());
 ```
 
 协调 Agent 会分析目标，将子任务分配给各专家 Agent，再整合所有结果。

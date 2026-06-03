@@ -123,9 +123,9 @@ tokio = { version = "1", features = ["full"] }
 ```rust
 use std::sync::Arc;
 use recursive::{
-    Agent, ToolRegistry,
+    runtime::AgentRuntime,
+    tools::{ApplyPatch, ListDir, ReadFile, RunShell, ToolRegistry, WriteFile},
     llm::OpenAiProvider,
-    tools::{ApplyPatch, ListDir, ReadFile, RunShell, WriteFile},
 };
 
 #[tokio::main]
@@ -143,14 +143,14 @@ async fn main() -> anyhow::Result<()> {
         .register(Arc::new(ListDir::new(".")))
         .register(Arc::new(RunShell::new(".")));
 
-    let mut agent = Agent::builder()
+    let mut runtime = AgentRuntime::builder()
         .llm(llm)
         .tools(tools)
         .max_steps(20)
         .build()?;
 
-    let outcome = agent.run("列出 src 目录的文件并总结").await?;
-    println!("{}", outcome.final_message.unwrap_or_default());
+    let outcome = runtime.run("列出 src 目录的文件并总结").await?;
+    println!("{}", outcome.final_text.unwrap_or_default());
     Ok(())
 }
 ```

@@ -6,7 +6,7 @@
 
 - **LLM Provider**（默认为 OpenAI 兼容 HTTP——支持 OpenAI、GLM/智谱、DeepSeek、Moonshot、MiniMax、Together、Ollama、vLLM 等）
 - **工具注册表**（内置 `read_file`、`write_file`、`apply_patch`、`list_dir`、`run_shell`，可轻松扩展）
-- **对话记录**（transcript）以及可订阅的 `StepEvent` 流
+- **对话记录**（transcript）以及可订阅的 `AgentEvent` 流
 
 整个内核设计得足够精简，一次就能读完。
 
@@ -18,7 +18,7 @@
 |---|---|
 | 新工具 | 实现 `Tool`，注册即用。无需修改 Agent。 |
 | 新模型后端 | 实现 `LlmProvider`。无需修改工具/Agent。 |
-| 新 UI 或日志 | 订阅 `StepEvent` 通道。无需修改循环。 |
+| 新 UI 或日志 | 通过 `EventSink` 订阅 `AgentEvent` 通道。无需修改循环。 |
 | 自定义终止条件 | 添加 `FinishReason` 变体。 |
 
 ## 功能概览

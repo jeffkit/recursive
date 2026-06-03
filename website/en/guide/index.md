@@ -6,7 +6,7 @@ It wires together:
 
 - An **LLM provider** (OpenAI-compatible HTTP by default — works with OpenAI, GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, and more)
 - A **tool registry** (`read_file`, `write_file`, `apply_patch`, `list_dir`, `run_shell` out of the box; trivially extensible)
-- A **transcript** plus a `StepEvent` stream you can observe
+- A **transcript** plus an `AgentEvent` stream you can observe
 
 The whole kernel is intentionally small enough to read in one sitting.
 
@@ -18,7 +18,7 @@ Most agent frameworks sprawl into frameworks — opinionated pipelines, LangChai
 |---|---|
 | New tool | Implement `Tool`, register it. No agent changes. |
 | New model backend | Implement `LlmProvider`. No tool/agent changes. |
-| New UI or logging | Subscribe to the `StepEvent` channel. No loop changes. |
+| New UI or logging | Subscribe to the `AgentEvent` channel via an `EventSink`. No loop changes. |
 | Custom finish condition | Add a `FinishReason` variant. |
 
 ## What's inside

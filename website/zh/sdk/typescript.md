@@ -1,12 +1,11 @@
 # TypeScript SDK
 
-TypeScript SDK 为 Recursive HTTP API 提供类型化客户端，兼容 Claude Agent SDK 接口风格。
+TypeScript SDK（`@recursive/sdk`）为 Recursive HTTP API 提供类型化客户端，兼容 Claude Agent SDK 模式。
 
 ::: tip 包名
-包发布名为 `@recursive/sdk`，通过 `npm install @recursive/sdk` 安装。
-如尚未发布，可从源码本地安装：
+包在 npm 上发布为 `@recursive/sdk`。如尚未发布，可从源码安装：
 ```bash
-pnpm install   # 在 sdk/typescript/ 目录下执行
+cd sdk/typescript && pnpm install && pnpm build
 ```
 :::
 
@@ -20,52 +19,118 @@ pnpm add @recursive/sdk
 
 ## 前置条件
 
-先启动 Recursive HTTP 服务器：
+先启动 Recursive HTTP 服务：
 
 ```bash
 recursive http --addr 127.0.0.1:3000
 ```
 
-## 快速开始
+## 快速开始 — 一次性运行
 
 ```typescript
-import { RecursiveClient } from '@recursive/sdk';
+import { Agent } from '@recursive/sdk';
 
-const client = new RecursiveClient({ baseUrl: 'http://localhost:3000' });
+const result = await Agent.prompt(
+  '列出当前目录中的文件。',
+  { baseUrl: 'http://localhost:3000', maxSteps: 5 },
+);
 
-// 健康检查
-const status = await client.health();
-console.log(status); // "ok"
-
-// 无状态运行
-const result = await client.run({ message: '列出 src/ 的文件' });
-console.log(result.finish_reason);
-console.log(result.final_message);
+console.log('状态        :', result.status);
+console.log('finish_reason:', result.finishReason);
+if (result.result) {
+  console.log('答案        :', result.result);
+}
 ```
 
-## 会话管理
+## 多轮会话
 
 ```typescript
-const session = await client.createSession({
-  systemPrompt: '你是一个有用的 Rust 助手。',
-  workspace: '/path/to/project',
-});
+import { Agent } from '@recursive/sdk';
 
-const result = await session.run('agent.rs 是做什么的？');
-console.log(result.finalMessage);
+// await using（TypeScript 5.2+）会话结束后自动关闭
+await using agent = await Agent.create({ baseUrl: 'http://localhost:3000' });
+console.log('session:', agent.sessionId);
 
-await session.delete();
-```
-
-## 流式输出
-
-```typescript
-for await (const event of session.runStream('列出所有工具')) {
-  if (event.type === 'tool_start') {
-    console.log(`[工具] ${event.data.name}`);
-  } else if (event.type === 'done') {
-    console.log(event.data.finalMessage);
-    break;
+// 第一轮
+const run = await agent.send('agent.rs 是做什么的？');
+for await (const msg of run.stream()) {
+  if (msg.type === 'assistant') {
+    for (const block of msg.content) {
+      if (block.type === 'text') process.stdout.write(block.text);
+    }
   }
+}
+const result = await run.wait();
+console.log('\n[完成:', result.finishReason, ']');
+
+// 第二轮（同一会话——上下文保留）
+const run2 = await agent.send('主要入口点有哪些？');
+const result2 = await run2.wait();
+console.log(result2.result);
+```
+
+## 流式事件
+
+```typescript
+import { Agent } from '@recursive/sdk';
+
+await using agent = await Agent.create({ baseUrl: 'http://localhost:3000' });
+const run = await agent.send('总结 src/ 目录');
+
+for await (const msg of run.stream()) {
+  if (msg.type === 'assistant') {
+    for (const block of msg.content) {
+      if (block.type === 'text') process.stdout.write(block.text);
+    }
+  } else if (msg.type === 'tool_call') {
+    console.log(`\n[工具] ${msg.name}`);
+  }
+}
+
+const result = await run.wait();
+console.log(`\n完成，共 ${result.numTurns} 轮`);
+```
+
+## API 参考
+
+### `Agent`（静态方法）
+
+| 方法 | 说明 |
+|---|---|
+| `Agent.prompt(message, options?)` | 一次性：创建会话、发送、等待、删除。返回 `RunResult`。 |
+| `Agent.create(options?)` | 创建持久 `AgentSession`，用 `await using` 自动清理。 |
+| `Agent.resume(sessionId, options?)` | 附加到现有会话。 |
+| `Agent.listSessions(options?)` | 列出活跃会话。 |
+| `Agent.deleteSession(sessionId, options?)` | 删除会话。 |
+
+### `AgentSession`
+
+| 方法 | 说明 |
+|---|---|
+| `agent.send(message)` | 发送消息，返回 `Run`。 |
+| `agent.sessionId` | 会话 ID。 |
+| `agent[Symbol.asyncDispose]()` | 由 `await using` 自动调用。 |
+
+### `Run`
+
+| 方法 | 说明 |
+|---|---|
+| `run.wait()` | 运行完成时 resolve，返回 `RunResult`。 |
+| `run.stream()` | 流式消息事件的 `AsyncIterableIterator`。 |
+
+### `RunResult`
+
+```typescript
+interface RunResult {
+  id: string;
+  status: 'finished' | 'error' | 'cancelled';
+  subtype: 'success' | 'error_max_turns' | 'error_during_execution' | 'cancelled';
+  finishReason?: string;
+  usage?: UsageMeta;
+  error?: string;
+  result?: string;          // 累积的最终助手文本
+  numTurns?: number;
+  durationMs?: number;
+  ok: boolean;              // status === 'finished' 时为 true
 }
 ```

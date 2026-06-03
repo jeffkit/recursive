@@ -42,7 +42,7 @@ recursive run --json "what is 2+2" | jq .finish_reason
 
 | Code | Meaning |
 |---|---|
-| `0` | `FinishReason::Done` |
-| `1` | `FinishReason::Error` |
+| `0` | `FinishReason::NoMoreToolCalls` or `FinishReason::ProviderStop` |
+| `1` | Runtime error (returned as `Err(...)`) |
 | `2` | `FinishReason::BudgetExceeded` |
 | `3` | `FinishReason::Stuck` |
