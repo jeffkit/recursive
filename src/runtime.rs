@@ -1611,6 +1611,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
     async fn runtime_falls_back_to_diff_for_run_shell() {
         if !has_git() {
             return;

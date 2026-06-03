@@ -132,7 +132,27 @@ fn is_pid_alive(pid: u32) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        // tasklist /FI "PID eq <pid>" /NH /FO CSV prints a CSV row
+        // when the process exists and "INFO: No tasks are running which
+        // match the specified criteria." when it does not. Exit code
+        // alone is ambiguous (no-match is still exit 0), so inspect
+        // stdout. If `tasklist` itself is unavailable we fall back to
+        // the conservative "assume alive" policy: better to refuse a
+        // resume than to overwrite a live session's sentinel.
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output();
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                !stdout.contains("INFO: No tasks")
+            }
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = pid;
         true
