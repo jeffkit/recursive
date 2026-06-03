@@ -31,6 +31,19 @@ const enSidebar = {
         { text: 'Configuration', link: '/en/guide/config' },
       ],
     },
+    {
+      text: 'Going Deeper',
+      items: [
+        { text: 'Examples & Recipes', link: '/en/guide/examples' },
+        { text: 'Self-Improving Agents', link: '/en/guide/self-improve' },
+      ],
+    },
+    {
+      text: 'More',
+      items: [
+        { text: 'Changelog', link: '/en/changelog' },
+      ],
+    },
   ],
   '/en/cli/': [
     {
@@ -102,6 +115,19 @@ const zhSidebar = {
         { text: '快速开始', link: '/zh/guide/quickstart' },
         { text: '核心概念', link: '/zh/guide/concepts' },
         { text: '配置参考', link: '/zh/guide/config' },
+      ],
+    },
+    {
+      text: '深入使用',
+      items: [
+        { text: '示例与教程', link: '/zh/guide/examples' },
+        { text: '自我改进 Agent', link: '/zh/guide/self-improve' },
+      ],
+    },
+    {
+      text: '其他',
+      items: [
+        { text: '更新日志', link: '/zh/changelog' },
       ],
     },
   ],

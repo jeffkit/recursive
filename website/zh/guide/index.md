@@ -27,8 +27,8 @@
 - **HTTP API**：基于 axum 的 REST 服务，支持会话和 SSE 流式输出
 - **终端 UI**：基于 ratatui 的 TUI，支持流式工具指示和计划模式
 - **多 Agent**：Agent 池、共享内存、消息总线、流水线与团队编排
-- **Python SDK**：`pip install recursive-client`
-- **TypeScript SDK**：`npm install recursive-client`
+- **Python SDK**：`pip install recursive-sdk`
+- **TypeScript SDK**：`npm install @recursive/sdk`
 - **Loop 模式**：自调度自主 Agent 运行
 
 ## 快速导航

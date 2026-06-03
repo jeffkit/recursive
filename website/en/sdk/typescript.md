@@ -1,19 +1,35 @@
 # TypeScript SDK
 
-The TypeScript SDK provides a typed client for the Recursive HTTP API.
+The TypeScript SDK provides a typed client for the Recursive HTTP API, compatible with Claude Agent SDK patterns.
+
+::: tip Package name
+The package is published as `@recursive/sdk` on npm. Install with `npm install @recursive/sdk`.
+If the published version is not yet available, install directly from source:
+```bash
+pnpm install   # from sdk/typescript/
+```
+:::
 
 ## Installation
 
 ```bash
-npm install recursive-client
+npm install @recursive/sdk
 # or
-pnpm add recursive-client
+pnpm add @recursive/sdk
+```
+
+## Prerequisites
+
+Start the Recursive HTTP server first:
+
+```bash
+recursive http --addr 127.0.0.1:3000
 ```
 
 ## Quick start
 
 ```typescript
-import { RecursiveClient } from 'recursive-client';
+import { RecursiveClient } from '@recursive/sdk';
 
 const client = new RecursiveClient({ baseUrl: 'http://localhost:3000' });
 
@@ -67,8 +83,8 @@ for await (const event of session.runStream('list all tools')) {
 ```typescript
 const client = new RecursiveClient({
   baseUrl: 'http://localhost:3000',
-  apiKey?: string,      // optional X-API-Key header
-  timeout?: number,     // request timeout in ms (default 60000)
+  apiKey?: string,
+  timeout?: number,   // ms, default 60000
 });
 ```
 
@@ -81,21 +97,13 @@ const client = new RecursiveClient({
 | `client.listSessions()` | List sessions |
 | `client.getSession(id)` | Get session by ID |
 
-### `Session`
-
-| Method | Description |
-|---|---|
-| `session.run(message)` | Send message, return `AgentResult` |
-| `session.runStream(message)` | Returns `AsyncIterator<StepEvent>` |
-| `session.delete()` | Delete this session |
-
 ### `AgentResult`
 
 ```typescript
 interface AgentResult {
-  finishReason: 'done' | 'budget_exceeded' | 'stuck' | 'error';
-  finalMessage: string | null;
+  finish_reason: 'done' | 'budget_exceeded' | 'stuck' | 'error';
+  final_message: string | null;
   steps: number;
-  tokenUsage?: { prompt: number; completion: number; total: number };
+  token_usage?: { prompt: number; completion: number; total: number };
 }
 ```

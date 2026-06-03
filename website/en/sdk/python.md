@@ -1,24 +1,33 @@
 # Python SDK
 
-The Python SDK provides a lightweight client for the Recursive HTTP API.
+The Python SDK provides a client for the Recursive HTTP API, compatible with Claude Agent SDK patterns.
+
+::: tip Package name
+The package is published as `recursive-sdk` on PyPI. Install with `pip install recursive-sdk`.
+If the published version is not yet available, install directly from source:
+```bash
+pip install -e sdk/python   # from project root
+```
+:::
 
 ## Installation
 
 ```bash
-pip install recursive-client
+pip install recursive-sdk
 ```
 
-Or for the latest development version:
+## Prerequisites
+
+Start the Recursive HTTP server first:
 
 ```bash
-cd sdk/python
-pip install -e .
+recursive http --addr 127.0.0.1:3000
 ```
 
 ## Quick start
 
 ```python
-from recursive_client import RecursiveClient
+from recursive_sdk import RecursiveClient
 
 client = RecursiveClient("http://127.0.0.1:3000")
 
@@ -45,17 +54,16 @@ print(session.session_id)
 result = session.run("what does agent.rs do?")
 print(result.final_message)
 
-# Send another message (conversation continues)
+# Continue the conversation
 result = session.run("what are the main entry points?")
 
-# Delete the session
+# Clean up
 session.delete()
 ```
 
 ## Streaming
 
 ```python
-# Stream events in real time
 for event in session.run_stream("list all tools"):
     if event.type == "tool_start":
         print(f"[tool] {event.data['name']}")
@@ -72,7 +80,7 @@ for event in session.run_stream("list all tools"):
 client = RecursiveClient(
     base_url="http://localhost:3000",
     api_key=None,          # optional X-API-Key header
-    timeout=60,            # request timeout in seconds
+    timeout=60,
 )
 ```
 

@@ -3,15 +3,15 @@ layout: home
 
 hero:
   name: "Recursive"
-  text: "编码 Agent 内核"
-  tagline: 极简、正交、可嵌入的 Rust Agent 循环。几分钟内接入任意 LLM + 任意工具。
+  text: "v0.6.0"
+  tagline: 极简、正交、可嵌入的 Rust Agent 内核 — 不到 20 行代码接入任意 LLM + 任意工具。
   image:
     src: /logo.svg
     alt: Recursive
   actions:
     - theme: brand
-      text: 快速开始
-      link: /zh/guide/
+      text: 5 分钟快速开始 →
+      link: /zh/guide/quickstart
     - theme: alt
       text: 查看 GitHub
       link: https://github.com/jeffkit/recursive
@@ -20,27 +20,27 @@ hero:
       link: /en/guide/
 
 features:
-  - icon: 🦀
-    title: Rust 原生
-    details: 用 Rust 构建，性能卓越、内存安全。无 GC 停顿、延迟可预测、二进制体积极小。
+  - icon: ⚡
+    title: 20 行代码跑起来一个 Agent
+    details: cargo 安装，设置 API Key，调用 agent.run("你的目标")。支持 OpenAI、DeepSeek、Claude、Ollama 及所有 OpenAI 兼容接口。
 
   - icon: 🔌
-    title: 真正正交
-    details: 新工具？实现 Tool，注册即用。新模型？实现 LlmProvider。新 UI？订阅 StepEvent。零耦合。
-
-  - icon: 📦
-    title: 可嵌入库
-    details: 可用作 CLI、HTTP 服务，也可直接将 loop 嵌入你自己的 Rust 程序。同一内核，任意外壳。
+    title: 新增工具不动 Agent 一行代码
+    details: 实现 Tool trait，注册即用。无需修改 Agent 代码。内置 read_file、run_shell、web_fetch，也可自由扩展任意工具。
 
   - icon: 🌐
-    title: 兼容所有 OpenAI API 模型
-    details: 支持 OpenAI、Anthropic、GLM/智谱、DeepSeek、Moonshot、MiniMax、Ollama、vLLM 等。
+    title: 一条命令启动 HTTP API
+    details: 运行 `recursive http` 即可获得带会话、SSE 流式输出和 OpenAPI 规范的生产级 REST 服务器。Python、TypeScript 或任意 HTTP 客户端均可接入。
+
+  - icon: 🤖
+    title: 构建多 Agent 流水线
+    details: 将 Agent 串联成流水线，在专家角色间委派任务，跨 Agent 共享内存。一切都基于相同的正交构件。
 
   - icon: 🛡️
     title: 默认沙箱隔离
-    details: 所有文件系统和 Shell 工具通过 resolve_within 解析路径，阻止逃逸工作区根目录。
+    details: 所有文件系统和 Shell 操作均经过工作区根目录路径检查，杜绝意外逃逸。只需一个环境变量即可升级到 Docker 或 E2B 微虚拟机隔离。
 
-  - icon: 🤖
-    title: 多 Agent 就绪
-    details: 内置 Agent 池、共享内存、消息总线、流水线与团队编排。
+  - icon: 🔄
+    title: 自我改进循环
+    details: Recursive 用自己的 Agent 驱动自身开发——Agent 读取目标、写代码、发布功能。同样的循环可以用于你自己的项目。
 ---
