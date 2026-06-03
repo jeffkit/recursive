@@ -260,13 +260,10 @@ fn render_help_body(registry: &CommandRegistry) -> Vec<Line<'static>> {
 }
 
 fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
-    let pricing = crate::tui::app::default_pricing_table();
-    let cost_in = pricing
-        .get(model)
-        .map(|(rate, _)| (usage.total_input as f64) / 1000.0 * rate);
-    let cost_out = pricing
-        .get(model)
-        .map(|(_, rate)| (usage.total_output as f64) / 1000.0 * rate);
+    let pricing = crate::llm::pricing_for(model);
+    let cost_in = pricing.map(|p| (usage.total_input as f64) * p.input_per_million / 1_000_000.0);
+    let cost_out =
+        pricing.map(|p| (usage.total_output as f64) * p.output_per_million / 1_000_000.0);
     let cost_total = cost_in.zip(cost_out).map(|(a, b)| a + b);
 
     let fmt_cost = |c: Option<f64>| match c {

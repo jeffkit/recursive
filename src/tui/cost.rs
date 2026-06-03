@@ -4,7 +4,6 @@
 //! for in-flight turn tracking, and helpers to detect the active model and
 //! estimate dollar cost from token counts.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -70,22 +69,8 @@ impl TurnState {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Pricing table
+// Cost estimation
 // ──────────────────────────────────────────────────────────────────────
-
-/// (input_per_1k, output_per_1k) USD prices for the four models the
-/// goal explicitly calls out. Models not in this table render no `$…`
-/// segment in the status bar.
-pub fn default_pricing_table() -> HashMap<&'static str, (f64, f64)> {
-    let mut m = HashMap::new();
-    // Source: published list prices as of mid-2025; not authoritative.
-    m.insert("deepseek-chat", (0.00027, 0.00110));
-    m.insert("gpt-4o", (0.00250, 0.01000));
-    m.insert("gpt-4o-mini", (0.00015, 0.00060));
-    m.insert("glm-4-plus", (0.00050, 0.00150));
-    m.insert("claude-sonnet", (0.00300, 0.01500));
-    m
-}
 
 /// Return the model name to display in the status bar.
 ///
@@ -100,15 +85,12 @@ pub fn detect_model_name() -> String {
         .unwrap_or_else(|_| "gpt-4o-mini".to_string())
 }
 
-/// Compute estimated cost in USD given accumulated tokens and a
-/// pricing table. Returns `None` when the model is not known.
-pub fn estimate_cost(
-    model: &str,
-    total_input: u64,
-    total_output: u64,
-    pricing: &HashMap<&'static str, (f64, f64)>,
-) -> Option<f64> {
-    pricing.get(model).map(|(in_rate, out_rate)| {
-        (total_input as f64) / 1000.0 * in_rate + (total_output as f64) / 1000.0 * out_rate
-    })
+/// Compute estimated cost in USD given accumulated tokens.
+/// Delegates to `pricing_for()` from the bundled provider catalog.
+/// Returns `None` when the model has no pricing entry in `providers.toml`.
+pub fn estimate_cost(model: &str, total_input: u64, total_output: u64) -> Option<f64> {
+    let pricing = crate::llm::pricing_for(model)?;
+    let in_cost = (total_input as f64) * pricing.input_per_million / 1_000_000.0;
+    let out_cost = (total_output as f64) * pricing.output_per_million / 1_000_000.0;
+    Some(in_cost + out_cost)
 }
