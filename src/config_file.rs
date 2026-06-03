@@ -11,7 +11,17 @@ use std::path::{Path, PathBuf};
 
 /// Return the path to the global config file: ~/.recursive/config.toml.
 /// Returns None if the home directory cannot be determined.
+///
+/// Honours `RECURSIVE_HOME` for tests (matching `paths::user_data_dir`)
+/// before falling back to `dirs::home_dir()`. Without the
+/// `RECURSIVE_HOME` short-circuit, tests that pin HOME via
+/// `PinnedHome` still race with tests that mutate `HOME` directly
+/// (without holding the env lock) on macOS, where `dirs::home_dir`
+/// can re-resolve through `getpwuid_r` mid-test.
 pub fn config_file_path() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("RECURSIVE_HOME") {
+        return Some(PathBuf::from(custom).join(".recursive").join("config.toml"));
+    }
     dirs::home_dir().map(|h| h.join(".recursive").join("config.toml"))
 }
 
@@ -34,6 +44,12 @@ pub struct ProviderSection {
     pub api_key: Option<String>,
     pub api_base: Option<String>,
     pub model: Option<String>,
+    /// Preset id from the bundled `providers.toml` (e.g. `"deepseek"`).
+    /// When set, `Config::from_env` uses it as the base for `type` / `api_base` /
+    /// `model` / `api_key`; explicit fields above still win. Resolved at load
+    /// time — not persisted back via `set_value`.
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 /// [agent] section.
@@ -269,6 +285,58 @@ temperature = 0.5
         assert_eq!(smart_value("0.5"), toml::Value::Float(0.5));
         assert_eq!(smart_value("true"), toml::Value::Boolean(true));
         assert_eq!(smart_value("hello"), toml::Value::String("hello".into()));
+    }
+
+    #[test]
+    fn parse_provider_section_with_preset() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[provider]
+preset = "deepseek"
+"#,
+        )
+        .unwrap();
+
+        let config = FileConfig::load_from(tmp.path()).unwrap().unwrap();
+        let p = config.provider.unwrap();
+        assert_eq!(p.preset.as_deref(), Some("deepseek"));
+        // Other fields are absent — preset resolution happens in Config::from_env.
+        assert!(p.provider_type.is_none());
+        assert!(p.api_base.is_none());
+        assert!(p.model.is_none());
+        assert!(p.api_key.is_none());
+    }
+
+    #[test]
+    fn set_value_preset_round_trips() {
+        // The dotted-key writer must handle the new `provider.preset` field.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(&path, "[provider]\nmodel = \"x\"\n").unwrap();
+
+        // Manually invoke the same dotted-key logic the public set_value uses,
+        // since set_value writes to ~/.recursive/config.toml via HOME.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut doc: toml::Table = content.parse().unwrap();
+        let parts: Vec<&str> = "provider.preset".splitn(2, '.').collect();
+        if let [section, field] = parts.as_slice() {
+            let table = doc
+                .entry(*section)
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(t) = table {
+                t.insert(field.to_string(), smart_value("anthropic"));
+            }
+        }
+        std::fs::write(&path, toml::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let loaded = FileConfig::load_from(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.provider.unwrap().preset.as_deref(),
+            Some("anthropic")
+        );
     }
 
     #[test]

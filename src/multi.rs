@@ -602,6 +602,7 @@ mod tests {
             api_key: None,
             model: String::new(),
             provider_type: "openai".into(),
+            preset: None,
             max_steps: 32,
             temperature: 0.2,
             system_prompt: String::new(),

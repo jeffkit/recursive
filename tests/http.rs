@@ -26,6 +26,7 @@ mod http_tests {
             api_key: Some("test-key".into()),
             model: "mock".into(),
             provider_type: "openai".into(),
+            preset: None,
             max_steps: 32,
             temperature: 0.0,
             system_prompt: "You are a test assistant.".into(),

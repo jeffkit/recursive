@@ -44,6 +44,14 @@ pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
     all_presets().iter().find(|p| p.id == id)
 }
 
+/// Look up a preset by its API base URL. Used to recover the preset id
+/// from a config file that only stores `api_base` (e.g. `recursive config show`)
+/// and to pick sensible defaults in the manual branch of `recursive init` instead
+/// of guessing the model from URL substrings.
+pub fn find_preset_by_api_base(url: &str) -> Option<&'static ProviderPreset> {
+    all_presets().iter().find(|p| p.api_base == url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +93,17 @@ mod tests {
     fn find_preset_deepseek_api_base() {
         let preset = find_preset("deepseek").unwrap();
         assert_eq!(preset.api_base, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn find_preset_by_api_base_known() {
+        let preset =
+            find_preset_by_api_base("https://api.deepseek.com/v1").expect("deepseek preset");
+        assert_eq!(preset.id, "deepseek");
+    }
+
+    #[test]
+    fn find_preset_by_api_base_unknown() {
+        assert!(find_preset_by_api_base("https://example.com/v1").is_none());
     }
 }
