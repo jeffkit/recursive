@@ -36,6 +36,8 @@ mod http_tests {
             shell_timeout_secs: 5,
             headless: false,
             memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
         }
     }
 

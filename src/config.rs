@@ -35,6 +35,11 @@ pub struct Config {
     /// the tool is auto-denied.
     pub headless: bool,
     pub memory_summary_limit: usize,
+    /// Extended thinking budget for models that support it (e.g. Anthropic claude-3-7).
+    /// `None` = model default; `Some(0)` = disable thinking; `Some(n)` = budget_tokens.
+    pub thinking_budget: Option<u32>,
+    /// Optional display name for the session, shown in the /resume picker.
+    pub session_name: Option<String>,
 }
 
 impl Config {
@@ -244,6 +249,8 @@ impl Config {
             shell_timeout_secs,
             headless,
             memory_summary_limit,
+            thinking_budget: None,
+            session_name: None,
         })
     }
 
@@ -496,6 +503,8 @@ mod tests {
             shell_timeout_secs: 300,
             headless: false,
             memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);

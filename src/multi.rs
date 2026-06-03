@@ -612,6 +612,8 @@ mod tests {
             shell_timeout_secs: 300,
             headless: false,
             memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
         }
     }
 
