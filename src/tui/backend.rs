@@ -10,7 +10,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::session::SessionWriter;
+use crate::event::CompositeSink;
+use crate::session::{SessionPersistenceSink, SessionWriter};
 use crate::tools::PermissionHook;
 use crate::{AgentEvent, AgentRuntime, EventSink};
 use async_trait::async_trait;
@@ -269,9 +270,9 @@ async fn worker_loop(
     // Lazily-created session writer for TUI interactive sessions.
     // Created on the first SendMessage so that sessions without any
     // actual user messages don't leave empty files on disk.
-    let mut session_writer: Option<SessionWriter> = None;
-    // Index into the runtime transcript up to which we have already saved.
-    let mut saved_transcript_len: usize = 0;
+    // Wrapped in Arc<Mutex<>> so SessionPersistenceSink can share it
+    // and write to disk in real-time on every MessageAppended event.
+    let mut session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = None;
 
     loop {
         // Select on both the user-action channel and the WeChat side-channel.
@@ -345,8 +346,10 @@ async fn worker_loop(
 
         match action {
             UserAction::Shutdown => {
-                if let Some(mut sw) = session_writer.take() {
-                    let _ = sw.finish("success");
+                if let Some(sw_arc) = session_writer.take() {
+                    if let Ok(mut sw) = sw_arc.lock() {
+                        let _ = sw.finish("success");
+                    }
                 }
                 break;
             }
@@ -355,16 +358,24 @@ async fn worker_loop(
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
 
-                    // Create session writer on the first user message.
+                    // On the first user message, create a SessionWriter and wire
+                    // it into the runtime's event sink via SessionPersistenceSink
+                    // so every MessageAppended event is written to disk in real-time.
                     if session_writer.is_none() {
                         let ws = resolve_workspace_root();
                         let goal: String = text.chars().take(200).collect();
                         let model = crate::tui::cost::detect_model_name();
                         if let Ok(sw) = SessionWriter::create(&ws, &goal, &model, "tui") {
-                            // Save any pre-existing transcript (system prompt, etc.)
-                            // so the session file is complete from the start.
-                            saved_transcript_len = pre_turn_len;
-                            session_writer = Some(sw);
+                            let sw_arc = Arc::new(std::sync::Mutex::new(sw));
+                            // Build a composite sink: TUI display + session persistence.
+                            let composite = Arc::new(CompositeSink::new([
+                                Box::new(TuiEventSink {
+                                    tx: event_tx.clone(),
+                                }) as Box<dyn EventSink>,
+                                Box::new(SessionPersistenceSink::new(sw_arc.clone())),
+                            ]));
+                            rt_opt.as_mut().unwrap().set_event_sink(composite);
+                            session_writer = Some(sw_arc);
                         }
                     }
 
@@ -395,15 +406,6 @@ async fn worker_loop(
                         .into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
-                    } else if let Some(ref mut sw) = session_writer {
-                        // Persist any new transcript entries added during this turn.
-                        // append() automatically updates .meta.json (last_prompt, etc.)
-                        // for user and assistant messages, so no separate flush needed.
-                        let transcript = recovered.transcript();
-                        for msg in &transcript[saved_transcript_len..] {
-                            let _ = sw.append(msg, None, None);
-                        }
-                        saved_transcript_len = transcript.len();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
