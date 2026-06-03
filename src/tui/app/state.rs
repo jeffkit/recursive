@@ -5,9 +5,8 @@ use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
 use super::{
-    default_offline_tool_catalog, default_pricing_table, detect_model_name, App, AppScreen,
-    DoublePressTracker, InputMode, PendingPermission, PromptInputState, TranscriptBlock, TurnState,
-    UsageStats,
+    default_offline_tool_catalog, detect_model_name, App, AppScreen, DoublePressTracker, InputMode,
+    PendingPermission, PromptInputState, TranscriptBlock, TurnState, UsageStats,
 };
 
 impl App {
@@ -36,7 +35,6 @@ impl App {
             turn: TurnState::default(),
             turn_count: 0,
             pending_latency_ms: None,
-            pricing: default_pricing_table(),
             model_name: detect_model_name(),
             spinner_frame: 0,
             modals: Vec::new(),
@@ -156,7 +154,7 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use crate::tui::app::{App, AppScreen};
-    use crate::tui::cost::{default_pricing_table, detect_model_name, estimate_cost};
+    use crate::tui::cost::{detect_model_name, estimate_cost};
 
     // ── construction ────────────────────────────────────────────────
 
@@ -191,15 +189,6 @@ mod tests {
     }
 
     // ── pricing / model detection ──────────────────────────────────
-
-    #[test]
-    fn pricing_table_includes_required_models() {
-        let p = default_pricing_table();
-        assert!(p.contains_key("deepseek-chat"));
-        assert!(p.contains_key("gpt-4o"));
-        assert!(p.contains_key("glm-4-plus"));
-        assert!(p.contains_key("claude-sonnet"));
-    }
 
     /// Goal-150: status bar must read `~/.recursive/config.toml` when
     /// no env var is set, otherwise it lies about the model the
@@ -259,15 +248,19 @@ mod tests {
 
     #[test]
     fn estimate_cost_for_known_model() {
-        let p = default_pricing_table();
-        let c = estimate_cost("gpt-4o-mini", 1000, 1000, &p).unwrap();
-        // 1000 in @ 0.00015 + 1000 out @ 0.0006 = 0.00015 + 0.0006 = 0.00075
+        // gpt-4o-mini: $0.15/M in, $0.60/M out
+        // 1000 in = 0.00015, 1000 out = 0.00060 → total 0.00075
+        let c = estimate_cost("gpt-4o-mini", 1000, 1000).unwrap();
         assert!((c - 0.00075).abs() < 1e-9);
     }
 
     #[test]
     fn estimate_cost_unknown_model_is_none() {
-        let p = default_pricing_table();
-        assert!(estimate_cost("foo-9000", 1000, 1000, &p).is_none());
+        assert!(estimate_cost("foo-9000", 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn estimate_cost_minimax_m3_is_known() {
+        assert!(estimate_cost("MiniMax-M3", 1000, 1000).is_some());
     }
 }

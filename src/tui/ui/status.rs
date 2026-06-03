@@ -11,9 +11,8 @@
 //!  local │ deepseek-chat │ ↑1.2k ↓342  $0.0024 │ turn 3 │ ⏱ 2.3s
 //! ```
 //!
-//! Cost is omitted when the model is not in
-//! [`crate::tui::app::default_pricing_table`]; elapsed time is shown only
-//! while a turn is running.
+//! Cost is omitted when the model has no pricing entry in `providers.toml`;
+//! elapsed time is shown only while a turn is running.
 
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -63,7 +62,6 @@ pub fn build_line(app: &App) -> Line<'static> {
         &app.model_name,
         app.usage.total_input,
         app.usage.total_output,
-        &app.pricing,
     ) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(

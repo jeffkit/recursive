@@ -77,7 +77,7 @@ pub(crate) struct RunInnerOutcome {
 pub(crate) struct RunCore<'a> {
     pub(crate) messages: Vec<Message>,
     pub(crate) llm: Arc<dyn LlmProvider>,
-    pub(crate) tools: ToolRegistry,
+    pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) max_steps: usize,
     pub(crate) max_transcript_chars: Option<usize>,
     pub(crate) events: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -384,7 +384,7 @@ impl<'a> RunCore<'a> {
                     let name = pc.name.clone();
                     let id = pc.id.clone();
                     let args = pc.args.clone();
-                    let tools = self.tools.clone();
+                    let tools = Arc::clone(&self.tools);
                     join_set.spawn(async move {
                         let tool_start = std::time::Instant::now();
                         let dispatch = tools.invoke_with_audit(&name, args.clone()).await;
