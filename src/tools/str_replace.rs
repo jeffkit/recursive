@@ -164,16 +164,21 @@ fn desanitize(s: &str) -> String {
         ("< EOT >", "<EOT>"),
         ("< META >", "<META>"),
         ("< SOS >", "<SOS>"),
-        ("
+        (
+            "
 
 H:", "
 
-Human:"),
-        ("
+Human:",
+        ),
+        (
+            "
 
-A:", "
+A:",
+            "
 
-Assistant:"),
+Assistant:",
+        ),
     ];
     for &(from, to) in pairs {
         if out.contains(from) {
@@ -209,11 +214,7 @@ fn try_match(haystack: &str, needle: &str) -> Option<String> {
 
     // 4. Quote normalization + trailing whitespace strip combined
     let qn_tws = strip_trailing_whitespace(&qn);
-    if qn_tws != needle
-        && qn_tws != qn
-        && qn_tws != tws
-        && haystack.contains(qn_tws.as_str())
-    {
+    if qn_tws != needle && qn_tws != qn && qn_tws != tws && haystack.contains(qn_tws.as_str()) {
         return Some(qn_tws);
     }
 
@@ -250,7 +251,8 @@ explicitly required.\n\
 string with more surrounding context to make it unique or use `replace_all` to change \
 every instance of `old_string`.\n\
 - Use `replace_all` for replacing and renaming strings across the file. This parameter is \
-useful if you want to rename a variable for instance.".into(),
+useful if you want to rename a variable for instance."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -347,9 +349,7 @@ useful if you want to rename a variable for instance.".into(),
         // ── Find old_string via fuzzy-match chain ───────────────────────
         let actual_old = try_match(&content, old_string).ok_or_else(|| Error::Tool {
             name: "str_replace".into(),
-            message: format!(
-                "String to replace not found in `{file_path}`.\nString: {old_string}"
-            ),
+            message: format!("String to replace not found in `{file_path}`.\nString: {old_string}"),
         })?;
 
         // ── Count occurrences ───────────────────────────────────────────
