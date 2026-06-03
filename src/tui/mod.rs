@@ -32,11 +32,27 @@ use crate::tui::app::App;
 use crate::tui::backend::Backend;
 use crate::tui::events::UserAction;
 
+/// RAII guard that restores the terminal to its original state on drop.
+///
+/// Ensures cleanup happens even if the TUI panics or returns early with an
+/// error, preventing the terminal from being left in raw/alternate-screen mode.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = io::stdout().execute(DisableMouseCapture);
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+    }
+}
+
 /// Launch the TUI and run until the user quits.
 pub async fn run() -> io::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableMouseCapture)?;
+    // RAII guard: restores terminal on any exit path (normal, error, or panic).
+    let _guard = TerminalGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut backend = Backend::spawn();
@@ -85,9 +101,8 @@ pub async fn run() -> io::Result<()> {
     }
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
-    let _ = io::stdout().execute(DisableMouseCapture);
-    disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
+    // Terminal cleanup is handled by TerminalGuard drop when _guard goes out
+    // of scope here. No need for explicit cleanup.
     Ok(())
 }
 
