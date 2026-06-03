@@ -42,9 +42,8 @@ Understanding what agents do in production.
 | 15.1 | Structured logging (tracing spans per step) | S | ✅ Batch 36 (Goal 115) |
 | 15.2 | Metrics endpoint (Prometheus-compatible) | M | ✅ Batch 37-38 (Goal 122 implementation, 01792b7; Goal 134 test coverage) |
 | 15.3 | Cost tracking (per-session persistence) | M | ✅ Batch 36-37 (Goal 116 + wired in main.rs via Goal H, 190b6e16) |
-| 15.4 | Replay viewer (web-based transcript replay) | M | 🔴 |
 
-**Total**: ~2 batches → 3 done (15.1, 15.2, 15.3); 15.4 remains
+**Total**: ~2 batches → 3/4 done (15.1, 15.2, 15.3); 15.4 dropped 2026-06-03 — see journal entry.
 
 ---
 
@@ -119,6 +118,55 @@ Make Recursive accessible to a wider audience.
 
 ---
 
+## Phase 20 — v0.7 Refactor & Hardening (Priority: Critical, breaking)
+
+v0.7 is a **收尾 release** — accept API breakage, fix accumulated weight debt from 0.4→0.6. The 0.7 version bump signals intentional SemVer-major change. Goals are split by execution mode:
+
+- **A (architectural, human/Claude 主导)**: 219, 220, 221, 222, 223, 226 (设计阶段)
+- **B (mechanical, self-improve)**: 225, 226 (抽出阶段), 229-01..229-NN
+- **C (meta/policy, self-improve)**: 224, 227, 228
+
+| ID | Feature | Mode | Status |
+|----|---------|------|--------|
+| 20.1 | Delete deprecated `Agent`/`StepEvent`/`AgentOutcome` (Goal 219) | A | 🔴 |
+| 20.2 | Split `tui/app.rs` 3303 → 4 files (Goal 220) | A | 🔴 |
+| 20.3 | Split `session.rs` 2214 → 5 files (Goal 221) | A | 🔴 |
+| 20.4 | Split `LlmProvider` → `ChatProvider` + helpers (Goal 222) | A | 🔴 |
+| 20.5 | Narrow `Error` granularity: drop `Other`, add `call_id` to `Tool`, classify `Storage` (Goal 223) | A | 🔴 |
+| 20.6 | `#![deny(clippy::unwrap_used, expect_used)]` ship gate (Goal 224) | C | 🔴 |
+| 20.7 | Split `tools/mod.rs` 1377 → 4 files (Goal 225) | B | 🔴 |
+| 20.8 | Extract `recursive-tui` sub-crate (Goal 226) | A→B | 🔴 |
+| 20.9 | E2E guard tests for the 8 `AGENTS.md` invariants (Goal 227) | C | 🔴 |
+| 20.10 | Goal dependency graph + file size budget enforcer (Goal 228) | C | 🔴 |
+| 20.11 | `unwrap()/expect()` batch cleanup (Goal 229-01..229-NN) | B | 🔴 |
+
+**Total**: 11 顶层 goal + 6 e2e invariant 子 goal + 8-15 unwrap 批次。预期 6-8 batches。
+
+### 依赖图（粗）
+
+```
+219 (我) ──┬─→ 220 (我) ──→ 226 (loop 抽 crate)
+          ├─→ 221 (我)
+          ├─→ 222 (我)
+          ├─→ 223 (我)
+          └─→ 229-01 ──→ 229-02 ──→ ... ──→ 229-NN ──→ 224 (loop deny)
+                                                          ↑
+220、221、225、226、227、228 全部合并 ─────────────────────┘
+```
+
+**关键路径**: 224 是收尾 goal，必须最后跑；229-NN 不能与 224 并行（会让仓库编译失败）。
+
+### 版本与 breaking change 范围
+
+- `Agent`、`AgentOutcome`、`StepEvent`、`OnMessageFn`、`AgentBuilder` 删除
+- `LlmProvider` 改名 `ChatProvider`（`Arc<dyn LlmProvider>` 全部需替换）
+- `Error::Other` 删除；`Error::Tool` 加 `call_id` 字段
+- 文件级 `lib.rs` 顶部加 deny lint
+
+所有改动在 CHANGELOG 里以 `**BREAKING**` 标记，附带迁移 cookbook。
+
+---
+
 ## Execution Order (Revised)
 
 ```
@@ -143,6 +191,13 @@ Batch 40: Phase 18 (Agent Patterns) — reflection, tool learning,
                                         MCP + OpenAI/Anthropic-shaped
                                         gateways cover the use case)
 Batch 41+: Phase 19 (Ecosystem) — SDKs, installers, docs site
+Batch 42: Phase 20.1-20.5 (A 类架构重构，人/Claude 主导)
+           Goals: 219, 220, 221, 222, 223
+Batch 43-44: Phase 20.7-20.11 (B 类机械拆分 + C 类元策略，self-improve 主导)
+             Goals: 229-01..229-NN, 225, 228, 227
+Batch 45: Phase 20.6 + 20.8 (收尾)
+           Goals: 226 (tui sub-crate), 224 (deny lint — last)
+Batch 46: 0.7.0 release — CHANGELOG、迁移 cookbook、tag
 ```
 
 ---
