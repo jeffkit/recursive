@@ -136,6 +136,42 @@ struct Cli {
     #[arg(long = "plan-first")]
     plan_first: bool,
 
+    /// System prompt string to use for this session. Overrides the default system prompt.
+    /// Mutually exclusive with --system-prompt-file; if both are given, --system-prompt wins.
+    #[arg(long = "system-prompt", env = "RECURSIVE_SYSTEM_PROMPT")]
+    system_prompt: Option<String>,
+
+    /// Resume a conversation by session ID (or unique substring), or open interactive picker.
+    /// Shorthand for `recursive resume <value>`. Cannot be combined with a subcommand.
+    #[arg(short = 'r', long = "resume")]
+    resume: Option<Option<String>>,
+
+    /// Output format for non-interactive (`-p`) mode.
+    /// - text: human-readable trace (default)
+    /// - json: emit StepEvents as newline-delimited JSON (supersedes --json)
+    /// - stream-json: same as json but also enables token streaming (supersedes --stream)
+    #[arg(long = "output-format", value_parser = ["text", "json", "stream-json"])]
+    output_format: Option<String>,
+
+    /// Maximum total API spend in USD for this run. The run aborts once the
+    /// cumulative cost exceeds this limit. Only checked after each completed turn.
+    #[arg(long = "max-budget-usd")]
+    max_budget_usd: Option<f64>,
+
+    /// Enable debug logging with optional category filter (e.g. "api,hooks" or "trace").
+    /// Shorthand for `--log debug`. If a filter is supplied it is set as the log filter.
+    #[arg(short = 'd', long = "debug")]
+    debug: Option<Option<String>>,
+
+    /// Enable verbose output (equivalent to --log debug without a category filter).
+    #[arg(long = "verbose")]
+    verbose: bool,
+
+    /// Additional workspace directories the agent is allowed to read and write.
+    /// Repeatable: --add-dir /path/a --add-dir /path/b
+    #[arg(long = "add-dir", num_args = 1)]
+    add_dir: Vec<PathBuf>,
+
     /// Start WeChat iLink daemon alongside the TUI (or in headless mode with `weixin-daemon`).
     /// On first run, a QR code is displayed for login.
     #[cfg(feature = "weixin")]
@@ -351,7 +387,18 @@ enum ConfigCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_logging(&cli.log)?;
+    // Resolve log level early (before Config::from_env) so init_logging sees
+    // --debug / --verbose before any config-file processing happens.
+    let early_log = if cli.verbose {
+        "debug".to_string()
+    } else if let Some(Some(ref filter)) = cli.debug {
+        filter.clone()
+    } else if cli.debug.is_some() {
+        "debug".to_string()
+    } else {
+        cli.log.clone()
+    };
+    init_logging(&early_log)?;
 
     if cli.session_out.is_some() {
         eprintln!(
@@ -384,7 +431,10 @@ async fn main() -> anyhow::Result<()> {
     if cli.headless {
         config.headless = true;
     }
-    if let Some(p) = cli.system_prompt_file {
+    // --system-prompt wins over --system-prompt-file when both are supplied.
+    if let Some(prompt_str) = cli.system_prompt {
+        config.system_prompt = prompt_str;
+    } else if let Some(p) = cli.system_prompt_file {
         config.system_prompt = std::fs::read_to_string(&p)
             .with_context(|| format!("reading system prompt: {}", p.display()))?;
     }
@@ -411,16 +461,40 @@ async fn main() -> anyhow::Result<()> {
     if let Some(name) = cli.name {
         config.session_name = Some(name);
     }
+    // --max-budget-usd: store for cost gate (checked after each turn).
+    if let Some(budget) = cli.max_budget_usd {
+        config.max_budget_usd = Some(budget);
+    }
+    // --add-dir: extra allowed sandbox roots.
+    if !cli.add_dir.is_empty() {
+        config.extra_dirs = cli.add_dir.clone();
+    }
+    // --output-format: supersedes --json and --stream.
+    let effective_json = cli.json
+        || matches!(
+            cli.output_format.as_deref(),
+            Some("json") | Some("stream-json")
+        );
+    let effective_stream =
+        cli.stream || matches!(cli.output_format.as_deref(), Some("stream-json"));
+    // Log level was already resolved and applied at startup (early_log above).
 
     // Determine effective command:
     // - Explicit subcommand → use it
+    // - `-r/--resume` → resume by ID or pick latest
     // - `-c/--continue` → resume the latest session (like `recursive resume`)
     // - `-p "goal"` → one-shot run (like `claude -p`)
     // - Nothing → TUI (if compiled in), else REPL
     let effective_cmd = match cli.cmd {
         Some(cmd) => cmd,
         None => {
-            if cli.continue_session {
+            if let Some(resume_val) = cli.resume {
+                Cmd::Resume {
+                    session: resume_val,
+                    from_file: None,
+                    orphans: None,
+                }
+            } else if cli.continue_session {
                 Cmd::Resume {
                     session: None,
                     from_file: None,
@@ -600,8 +674,8 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,
-                cli.json,
-                cli.stream,
+                effective_json,
+                effective_stream,
                 effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
@@ -614,10 +688,10 @@ async fn main() -> anyhow::Result<()> {
             repl(
                 config,
                 cli.max_transcript_chars,
-                cli.json,
+                effective_json,
                 effective_plan_first,
                 cli.mcp_config,
-                cli.stream,
+                effective_stream,
                 cli.hook_timing,
             )
             .await
@@ -628,8 +702,8 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 goal.join(" "),
                 cli.max_transcript_chars,
-                cli.json,
-                cli.stream,
+                effective_json,
+                effective_stream,
                 effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
@@ -681,7 +755,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.max_transcript_chars,
                         cli.transcript_out,
                         cli.session_out,
-                        cli.json,
+                        effective_json,
                         effective_plan_first,
                         cli.mcp_config,
                         cli.hook_timing,
@@ -706,7 +780,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,
-                cli.json,
+                effective_json,
                 effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
@@ -1718,6 +1792,8 @@ mod tests {
             memory_summary_limit: 5,
             thinking_budget: None,
             session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
         }
     }
 

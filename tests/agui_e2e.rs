@@ -83,6 +83,8 @@ fn mock_config(workspace: PathBuf) -> Config {
         memory_summary_limit: 5,
         thinking_budget: None,
         session_name: None,
+        max_budget_usd: None,
+        extra_dirs: Vec::new(),
     }
 }
 
