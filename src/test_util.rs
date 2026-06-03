@@ -78,6 +78,46 @@ impl Drop for PinnedRecursiveHome {
     }
 }
 
+/// Pins `RECURSIVE_HOME` **without acquiring `env_lock`**.
+///
+/// For use in tests that already hold the env lock via an explicit
+/// [`env_lock`] call and also need to pin `RECURSIVE_HOME`.  Using the
+/// regular [`PinnedRecursiveHome`] in that situation would deadlock because
+/// `std::sync::Mutex` is not re-entrant.
+///
+/// The caller **must** ensure the env lock is held for the entire lifetime
+/// of this guard.  Passing `&_held` (the live [`MutexGuard`]) to [`new`]
+/// makes that contract visible at the call site.
+///
+/// [`new`]: PinnedRecursiveHomeNoLock::new
+pub struct PinnedRecursiveHomeNoLock {
+    prev: Option<std::ffi::OsString>,
+}
+
+impl PinnedRecursiveHomeNoLock {
+    /// Pin `RECURSIVE_HOME` to `path`.  `_held` proves the env lock is held.
+    pub fn new(path: impl AsRef<std::path::Path>, _held: &MutexGuard<'static, ()>) -> Self {
+        let prev = std::env::var_os("RECURSIVE_HOME");
+        // SAFETY: caller holds the env lock via `_held`.
+        unsafe {
+            std::env::set_var("RECURSIVE_HOME", path.as_ref().as_os_str());
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for PinnedRecursiveHomeNoLock {
+    fn drop(&mut self) {
+        // SAFETY: the env lock is held by our caller's guard.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+                None => std::env::remove_var("RECURSIVE_HOME"),
+            }
+        }
+    }
+}
+
 /// Same as [`PinnedRecursiveHome`] but for `HOME`.
 ///
 /// On Windows the `dirs::home_dir()` crate (used by
