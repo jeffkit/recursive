@@ -265,6 +265,8 @@ fn test_config() -> recursive::Config {
         shell_timeout_secs: 30,
         headless: false,
         memory_summary_limit: 5,
+        thinking_budget: None,
+        session_name: None,
     }
 }
 

@@ -105,7 +105,34 @@ struct Cli {
     #[arg(long = "no-session", env = "RECURSIVE_NO_SESSION")]
     no_session: bool,
 
+    /// Continue the most recent conversation in the current workspace.
+    /// Equivalent to `recursive resume` without arguments (picks the latest session).
+    #[arg(short = 'c', long = "continue")]
+    continue_session: bool,
+
+    /// Display name for this session (shown in the /resume picker and sessions list).
+    #[arg(short = 'n', long = "name")]
+    name: Option<String>,
+
+    /// Reasoning effort level: low (no extended thinking), normal (default), high (max budget).
+    /// Currently effective for Anthropic models that support extended thinking.
+    #[arg(long = "effort", value_parser = ["low", "normal", "high"])]
+    effort: Option<String>,
+
+    /// Append text to the default system prompt instead of replacing it entirely.
+    /// Useful for adding per-run instructions without discarding built-in guidance.
+    #[arg(long = "append-system-prompt")]
+    append_system_prompt: Option<String>,
+
+    /// Permission mode for tool execution.
+    /// - default: prompt as configured (respect config.headless)
+    /// - plan: buffer all tool calls and present a plan before executing (like --plan-first)
+    /// - auto: approve all tool calls without prompting (headless, use in trusted envs)
+    #[arg(long = "permission-mode", value_parser = ["default", "plan", "auto"])]
+    permission_mode: Option<String>,
+
     /// Enable plan-first mode: agent proposes a plan, user confirms before execution.
+    /// Equivalent to --permission-mode=plan. Kept for backward compatibility.
     #[arg(long = "plan-first")]
     plan_first: bool,
 
@@ -361,15 +388,45 @@ async fn main() -> anyhow::Result<()> {
         config.system_prompt = std::fs::read_to_string(&p)
             .with_context(|| format!("reading system prompt: {}", p.display()))?;
     }
+    // --append-system-prompt: tack additional text onto whatever system prompt is active.
+    if let Some(extra) = &cli.append_system_prompt {
+        config.system_prompt.push('\n');
+        config.system_prompt.push_str(extra);
+    }
+    // --permission-mode / --plan-first: resolve to the canonical plan_first bool.
+    let effective_plan_first =
+        cli.plan_first || matches!(cli.permission_mode.as_deref(), Some("plan"));
+    if matches!(cli.permission_mode.as_deref(), Some("auto")) {
+        config.headless = true;
+    }
+    // --effort: map to thinking_budget (low=0 disables, normal=default, high=max).
+    if let Some(effort) = &cli.effort {
+        config.thinking_budget = match effort.as_str() {
+            "low" => Some(0),
+            "high" => Some(16000),
+            _ => None, // "normal" → leave as default
+        };
+    }
+    // --name: optional display name for the session.
+    if let Some(name) = cli.name {
+        config.session_name = Some(name);
+    }
 
     // Determine effective command:
     // - Explicit subcommand → use it
+    // - `-c/--continue` → resume the latest session (like `recursive resume`)
     // - `-p "goal"` → one-shot run (like `claude -p`)
     // - Nothing → TUI (if compiled in), else REPL
     let effective_cmd = match cli.cmd {
         Some(cmd) => cmd,
         None => {
-            if let Some(prompt) = cli.prompt {
+            if cli.continue_session {
+                Cmd::Resume {
+                    session: None,
+                    from_file: None,
+                    orphans: None,
+                }
+            } else if let Some(prompt) = cli.prompt {
                 Cmd::Run { goal: vec![prompt] }
             } else {
                 #[cfg(all(feature = "tui", feature = "weixin"))]
@@ -545,7 +602,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.session_out,
                 cli.json,
                 cli.stream,
-                cli.plan_first,
+                effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
                 !cli.no_session,
@@ -558,7 +615,7 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 cli.max_transcript_chars,
                 cli.json,
-                cli.plan_first,
+                effective_plan_first,
                 cli.mcp_config,
                 cli.stream,
                 cli.hook_timing,
@@ -573,7 +630,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 cli.json,
                 cli.stream,
-                cli.plan_first,
+                effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
                 shutdown,
@@ -625,7 +682,7 @@ async fn main() -> anyhow::Result<()> {
                         cli.transcript_out,
                         cli.session_out,
                         cli.json,
-                        cli.plan_first,
+                        effective_plan_first,
                         cli.mcp_config,
                         cli.hook_timing,
                         !cli.no_session,
@@ -650,7 +707,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.transcript_out,
                 cli.session_out,
                 cli.json,
-                cli.plan_first,
+                effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
                 !cli.no_session,
@@ -681,7 +738,18 @@ async fn main() -> anyhow::Result<()> {
                                 .as_deref()
                                 .or(Some(meta.goal.as_str()))
                                 .unwrap_or("(no prompt)");
-                            println!("  {}  [{}] {}", s.display(), meta.status, label);
+                            let name_suffix = meta
+                                .name
+                                .as_deref()
+                                .map(|n| format!("  «{n}»"))
+                                .unwrap_or_default();
+                            println!(
+                                "  {}  [{}]{} {}",
+                                s.display(),
+                                meta.status,
+                                name_suffix,
+                                label
+                            );
                         } else {
                             println!("  {}  (JSONL)", s.display());
                         }
@@ -1086,7 +1154,10 @@ async fn run_once(
             &[],
             config.preset.as_deref(),
         ) {
-            Ok(writer) => {
+            Ok(mut writer) => {
+                if let Some(ref name) = config.session_name {
+                    writer.set_name(name.as_str());
+                }
                 eprintln!("session: recording to {}", writer.session_dir().display());
                 Some(Arc::new(std::sync::Mutex::new(writer)))
             }
@@ -1645,6 +1716,8 @@ mod tests {
             shell_timeout_secs: 5,
             headless: false,
             memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
         }
     }
 
