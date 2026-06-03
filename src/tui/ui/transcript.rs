@@ -67,7 +67,42 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme) -> Vec<Line<'static>> {
         TranscriptBlock::PlanModeRequest { reason, approved } => {
             render_plan_mode_request(reason, *approved)
         }
+        #[cfg(feature = "weixin")]
+        TranscriptBlock::WeixinMessage { user_id, text } => render_weixin_message(user_id, text),
     }
+}
+
+#[cfg(feature = "weixin")]
+fn render_weixin_message(user_id: &str, text: &str) -> Vec<Line<'static>> {
+    use ratatui::{
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+    };
+    let prefix_style = Style::default()
+        .fg(Color::Rgb(0, 190, 100))
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(Color::White);
+
+    let prefix = Span::styled(format!("📱 {user_id}: "), prefix_style);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        out.push(Line::from(vec![prefix]));
+        return out;
+    }
+    let first = lines[0];
+    out.push(Line::from(vec![
+        prefix.clone(),
+        Span::styled(first.to_string(), body_style),
+    ]));
+    for line in &lines[1..] {
+        let indent = " ".repeat(user_id.len() + 6); // align continuation lines
+        out.push(Line::from(vec![
+            Span::styled(indent, Style::default()),
+            Span::styled(line.to_string(), body_style),
+        ]));
+    }
+    out
 }
 
 // ── User ──────────────────────────────────────────────────────────────

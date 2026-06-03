@@ -141,6 +141,18 @@ pub enum UiEvent {
     },
     /// The hook produced a system message to surface to the user.
     HookSystemMessage { text: String },
+
+    // ── WeChat channel ───────────────────────────────────────────────────────
+    /// An incoming WeChat message from the iLink daemon.
+    /// Displayed in the TUI with a 📱 prefix so the user can see
+    /// what WeChat users are asking.
+    #[cfg(feature = "weixin")]
+    WeixinMessage {
+        /// WeChat user ID of the sender.
+        user_id: String,
+        /// The raw message text.
+        text: String,
+    },
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
@@ -228,4 +240,20 @@ pub enum UserAction {
     // ── Goal-173: MCP server list ────────────────────────────────────────────
     /// List configured MCP servers.
     ListMcpServers,
+}
+
+// ── WeChat side-channel ───────────────────────────────────────────────────────
+
+/// A WeChat message request from the iLink daemon to the backend worker.
+///
+/// Carried on a dedicated side-channel (separate from [`UserAction`]) because
+/// `oneshot::Sender` is not `Clone` or `PartialEq`.
+#[cfg(feature = "weixin")]
+pub struct WeixinBackendRequest {
+    /// WeChat user ID of the sender.
+    pub user_id: String,
+    /// The message text to pass to the agent runtime.
+    pub text: String,
+    /// Channel for the backend to return the agent's final text response.
+    pub reply_tx: tokio::sync::oneshot::Sender<Option<String>>,
 }

@@ -48,6 +48,8 @@ pub mod tools;
 pub mod transcript;
 #[cfg(feature = "tui")]
 pub mod tui;
+#[cfg(feature = "weixin")]
+pub mod weixin;
 
 pub use agent::PlanningMode;
 pub use agent::{FinishReason, PermissionDecision};

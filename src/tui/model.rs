@@ -128,4 +128,11 @@ pub enum TranscriptBlock {
         /// Set to `Some(true/false)` after the user decides.
         approved: Option<bool>,
     },
+    /// Incoming message from a WeChat user, forwarded through the iLink channel.
+    /// Rendered with a 📱 prefix so it is visually distinct from local TUI input.
+    #[cfg(feature = "weixin")]
+    WeixinMessage {
+        user_id: String,
+        text: String,
+    },
 }
