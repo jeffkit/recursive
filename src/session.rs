@@ -2211,4 +2211,49 @@ mod tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].content, "after poison");
     }
+
+    // ── chrono_lite_now / epoch_day_to_ymd ──────────────────────────────────
+
+    #[test]
+    fn epoch_day_to_ymd_unix_epoch() {
+        // Day 0 = 1970-01-01
+        assert_eq!(epoch_day_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn epoch_day_to_ymd_known_dates() {
+        // 2024-01-01 = day 19723 since epoch
+        assert_eq!(epoch_day_to_ymd(19723), (2024, 1, 1));
+        // 2000-02-29 (leap day) = day 11016
+        assert_eq!(epoch_day_to_ymd(11016), (2000, 2, 29));
+        // 2100-03-01 (2100 is NOT a leap year, so 2100-02-29 doesn't exist)
+        // 2100-01-01 = day 47482
+        assert_eq!(epoch_day_to_ymd(47482), (2100, 1, 1));
+    }
+
+    #[test]
+    fn chrono_lite_now_format() {
+        let ts = chrono_lite_now();
+        // Must match YYYY-MM-DDTHH:MM:SSZ
+        assert_eq!(ts.len(), 20, "unexpected length: {ts}");
+        assert_eq!(&ts[4..5], "-", "missing first dash: {ts}");
+        assert_eq!(&ts[7..8], "-", "missing second dash: {ts}");
+        assert_eq!(&ts[10..11], "T", "missing T separator: {ts}");
+        assert_eq!(&ts[13..14], ":", "missing first colon: {ts}");
+        assert_eq!(&ts[16..17], ":", "missing second colon: {ts}");
+        assert_eq!(&ts[19..20], "Z", "missing Z suffix: {ts}");
+        // All digit fields must parse as numbers
+        let year: u32 = ts[0..4].parse().expect("year");
+        let month: u32 = ts[5..7].parse().expect("month");
+        let day: u32 = ts[8..10].parse().expect("day");
+        let hour: u32 = ts[11..13].parse().expect("hour");
+        let min: u32 = ts[14..16].parse().expect("minute");
+        let sec: u32 = ts[17..19].parse().expect("second");
+        assert!(year >= 2024, "year looks wrong: {year}");
+        assert!((1..=12).contains(&month), "month out of range: {month}");
+        assert!((1..=31).contains(&day), "day out of range: {day}");
+        assert!(hour < 24, "hour out of range: {hour}");
+        assert!(min < 60, "minute out of range: {min}");
+        assert!(sec < 60, "second out of range: {sec}");
+    }
 }

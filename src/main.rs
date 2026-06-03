@@ -423,7 +423,7 @@ async fn main() -> anyhow::Result<()> {
             let provider: Arc<dyn recursive::llm::LlmProvider> = match config.provider_type.as_str()
             {
                 "anthropic" => {
-                    let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
+                    let anthropic_retry = recursive::llm::RetryPolicy {
                         max_retries: config.retry_max,
                         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
@@ -924,7 +924,7 @@ async fn run_loop(
     };
     let provider: Arc<dyn LlmProvider> = match config.provider_type.as_str() {
         "anthropic" => {
-            let anthropic_retry = recursive::llm::anthropic::RetryPolicy {
+            let anthropic_retry = recursive::llm::RetryPolicy {
                 max_retries: config.retry_max,
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
