@@ -107,6 +107,18 @@ async fn rewind_undoes_turn_and_restores_files_and_transcript() {
     let session_dir = sw.session_dir().to_path_buf();
     let log_path = session_dir.join("checkpoints.jsonl");
     let shadow = Arc::new(ShadowRepo::open(dir.path()).unwrap());
+    // Diagnostic: verify snapshot_for_session works before enabling
+    // checkpoints.  If this panics the CI log will show the actual
+    // git error rather than a silent "0 checkpoints" failure.
+    shadow
+        .snapshot_for_session(sw.session_id(), "diagnostic-pre-enable")
+        .unwrap_or_else(|e| {
+            panic!(
+                "snapshot_for_session diagnostic failed (workspace={}, session={}):\n{e}",
+                dir.path().display(),
+                sw.session_id()
+            )
+        });
     runtime
         .enable_checkpoints(
             Arc::clone(&shadow),
@@ -212,6 +224,16 @@ async fn rewind_does_not_touch_other_workspace_files() {
     let session_dir = sw.session_dir().to_path_buf();
     let log_path = session_dir.join("checkpoints.jsonl");
     let shadow = Arc::new(ShadowRepo::open(dir.path()).unwrap());
+    // Diagnostic: verify snapshot_for_session works before enabling checkpoints.
+    shadow
+        .snapshot_for_session(sw.session_id(), "diagnostic-pre-enable")
+        .unwrap_or_else(|e| {
+            panic!(
+                "snapshot_for_session diagnostic failed (workspace={}, session={}):\n{e}",
+                dir.path().display(),
+                sw.session_id()
+            )
+        });
     runtime
         .enable_checkpoints(
             Arc::clone(&shadow),
