@@ -2,8 +2,9 @@
 //!
 //! A modal is a transient overlay drawn on top of the chat screen.
 //! [`crate::tui::app::App`] owns a `Vec<Modal>`; the topmost element (the
-//! "active" modal) is rendered centred over a half-screen window and
-//! consumes all key events until popped.
+//! "active" modal) is rendered as a full-width left-accent panel (inspired
+//! by Claude Code's `/mcp` panel style) that covers the conversation area
+//! and consumes all key events until popped.
 //!
 //! Modals never mutate runtime state directly — they are pure
 //! read-only views over [`App`]. Side-effects (clear / exit /
@@ -128,20 +129,21 @@ impl Modal {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the topmost modal centred on the frame area.
+/// Render the topmost modal as a full-width left-accent panel.
 ///
-/// The dim backdrop is drawn first via [`Clear`]; the modal frame
-/// occupies roughly two-thirds of the screen. The caller (chat
-/// renderer) skips its own input cursor when a modal is active.
+/// The panel covers the conversation area (full width, top-anchored)
+/// and leaves the status bar + input rows visible below. The clear
+/// backdrop is applied only to the panel area, so the persistent
+/// status / input chrome beneath remains usable.
 pub fn render(frame: &mut Frame, app: &App) {
     let Some(modal) = app.modals.last() else {
         return;
     };
-    // Use 88% width and 90% height so the expanded viewport (40 rows)
-    // gives roughly 33 usable content rows inside the border.
-    let area = centred_rect(frame.area(), 88, 90);
+    // Full-width panel: cover the whole frame width, leave the bottom
+    // rows for the status bar and input box.
+    let area = panel_rect(frame.area());
 
-    // Dim backdrop.
+    // Clear the background behind the panel.
     frame.render_widget(Clear, area);
 
     let body = match modal {
@@ -160,10 +162,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         } => render_plan_review(plan_text, tool_calls),
     };
 
+    // Left-accent panel style (Claude Code /mcp inspired):
+    // - single LEFT border as a cyan accent bar — no enclosing box
+    // - title embedded in the body content, not in the border
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::LEFT)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(modal.title())
         .style(Style::default().bg(Color::Black));
     let para = Paragraph::new(body)
         .block(block)
@@ -172,16 +176,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(para, area);
 }
 
-/// Carve a centred rectangle out of `outer`, taking the requested
-/// percentage of width and height.
-fn centred_rect(outer: Rect, pct_w: u16, pct_h: u16) -> Rect {
-    let w = outer.width.saturating_mul(pct_w) / 100;
-    let h = outer.height.saturating_mul(pct_h) / 100;
+/// Build the panel rect: full terminal width, top-anchored, reserving
+/// the bottom rows for the persistent status bar and input widget.
+fn panel_rect(outer: Rect) -> Rect {
+    // Reserve 4 rows: 1 for the status bar and ~3 for the input box.
+    // `saturating_sub` keeps the height ≥ 0 for very small terminals.
+    const BOTTOM_RESERVED: u16 = 4;
     Rect {
-        x: outer.x + (outer.width.saturating_sub(w)) / 2,
-        y: outer.y + (outer.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
+        x: outer.x,
+        y: outer.y,
+        width: outer.width,
+        height: outer.height.saturating_sub(BOTTOM_RESERVED),
     }
 }
 
@@ -275,6 +280,7 @@ fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let body = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
 
     let mut out = vec![Line::from(Span::styled(
         "Token usage (this session)".to_string(),
@@ -318,6 +324,11 @@ fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
         Span::raw("  "),
         Span::raw(format!("Provider         : {model}")),
     ]));
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "  Esc / q to close".to_string(),
+        dim,
+    )));
     out
 }
 
@@ -341,6 +352,7 @@ fn render_model_body(model: &str) -> Vec<Line<'static>> {
     let header = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
     let mut out = vec![Line::from(Span::styled(
         "Current model".to_string(),
         header,
@@ -351,8 +363,13 @@ fn render_model_body(model: &str) -> Vec<Line<'static>> {
     out.push(Line::from(format!("  Endpoint : {api_base}")));
     out.push(Line::raw(""));
     out.push(Line::from(Span::styled(
-        "(read-only — switching models requires restart)".to_string(),
-        Style::default().fg(Color::DarkGray),
+        "  (read-only — switching models requires restart)".to_string(),
+        dim,
+    )));
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "  Esc / q to close".to_string(),
+        dim,
     )));
     out
 }
@@ -362,6 +379,7 @@ fn render_tool_body(entries: &[(String, String)]) -> Vec<Line<'static>> {
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let key = Style::default().fg(Color::Cyan);
+    let dim = Style::default().fg(Color::DarkGray);
     let mut out = vec![Line::from(Span::styled(
         format!("Available tools ({})", entries.len()),
         header,
@@ -370,7 +388,7 @@ fn render_tool_body(entries: &[(String, String)]) -> Vec<Line<'static>> {
     if entries.is_empty() {
         out.push(Line::from(Span::styled(
             "  (no tools registered)".to_string(),
-            Style::default().fg(Color::DarkGray),
+            dim,
         )));
     } else {
         for (name, desc) in entries {
@@ -382,6 +400,11 @@ fn render_tool_body(entries: &[(String, String)]) -> Vec<Line<'static>> {
             ]));
         }
     }
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "  Esc / q to close".to_string(),
+        dim,
+    )));
     out
 }
 
