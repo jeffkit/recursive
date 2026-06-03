@@ -48,7 +48,7 @@ pub enum PlanApprovalResult {
 /// * [`EnterPlanModeTool`] — sets `exploring_plan_mode`
 /// * [`ExitPlanModeTool`] — clears flag, emits event, awaits decision
 /// * [`AgentRuntime`] — calls [`approve`](Self::approve) / [`reject`](Self::reject)
-/// * [`RunCore`](crate::agent::RunCore) — reads `exploring_plan_mode` to gate writes
+/// * [`RunCore`](crate::run_core::RunCore) — reads `exploring_plan_mode` to gate writes
 pub struct PlanApprovalGate {
     /// `true` while the agent is in exploring (read-only plan) mode.
     pub exploring_plan_mode: Arc<AtomicBool>,

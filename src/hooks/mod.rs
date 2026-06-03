@@ -1,6 +1,4 @@
 //! Lifecycle hooks for the agent loop.
-// Uses AgentOutcome for the SessionEnd hook; allow deprecated type.
-#![allow(deprecated)]
 //!
 //! Hooks are callbacks invoked at well-defined points during an agent run.
 //! They allow consumers to observe, log, gate, or transform behaviour without
@@ -8,12 +6,13 @@
 //!
 //! # Hook points
 //!
-//! - `SessionStart` — at the top of `Agent::run()`, before any LLM call.
+//! - `SessionStart` — at the top of an agent run, before any LLM call.
 //! - `PreToolCall` — before each tool dispatch (after the permission hook).
 //! - `PostToolCall` — after each tool returns.
 //! - `PreCompact` — before compaction fires.
 //! - `PostCompact` — after compaction completes.
-//! - `SessionEnd` — just before returning from `Agent::run()`.
+//! - `SessionEnd` — at terminal finishes (currently only on the legacy
+//!   `Agent` path; the `AgentRuntime` does not dispatch this yet).
 //!
 //! # Usage
 //!
@@ -47,7 +46,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::agent::AgentOutcome;
+use crate::runtime::RuntimeOutcome;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -69,9 +68,9 @@ pub enum HookAction {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum HookEvent<'a> {
-    /// Fired at the start of `Agent::run()`, before any LLM call.
+    /// Fired at the start of an agent run, before any LLM call.
     SessionStart {
-        /// The goal text passed to `Agent::run()`.
+        /// The goal text passed to `AgentRuntime::run()`.
         goal: &'a str,
     },
     /// Fired before a tool is dispatched (after the permission hook).
@@ -104,10 +103,13 @@ pub enum HookEvent<'a> {
         /// Character count of the summary message added.
         summary_chars: usize,
     },
-    /// Fired just before returning from `Agent::run()`.
+    /// Fired at the end of an agent run, before returning.
+    ///
+    /// Currently only dispatched by the legacy `Agent` path (deleted in
+    /// Goal 219). The `AgentRuntime` does not yet dispatch `SessionEnd`.
     SessionEnd {
         /// The outcome that will be returned.
-        outcome: &'a AgentOutcome,
+        outcome: &'a RuntimeOutcome,
     },
     /// Fired after the user submits a message, before the LLM processes it.
     UserPromptSubmit {
@@ -117,7 +119,7 @@ pub enum HookEvent<'a> {
     /// Fired when the agent completes normally (`NoMoreToolCalls`).
     Stop {
         /// The final outcome.
-        outcome: &'a AgentOutcome,
+        outcome: &'a RuntimeOutcome,
     },
     /// Fired before a sub-agent is dispatched.
     SubagentStart {
@@ -129,7 +131,7 @@ pub enum HookEvent<'a> {
     /// Fired after a sub-agent completes.
     SubagentStop {
         /// The sub-agent's outcome.
-        outcome: &'a AgentOutcome,
+        outcome: &'a RuntimeOutcome,
         /// Nesting depth.
         depth: usize,
     },
@@ -459,7 +461,7 @@ mod tests {
     fn session_end_receives_outcome() {
         let captured = Arc::new(std::sync::Mutex::new(None));
         let c = captured.clone();
-        struct CaptureOutcome(Arc<std::sync::Mutex<Option<AgentOutcome>>>);
+        struct CaptureOutcome(Arc<std::sync::Mutex<Option<RuntimeOutcome>>>);
         impl Hook for CaptureOutcome {
             fn on_event(&self, event: HookEvent) -> HookAction {
                 if let HookEvent::SessionEnd { outcome } = event {
@@ -468,19 +470,19 @@ mod tests {
                 HookAction::Continue
             }
         }
-        let outcome = AgentOutcome {
-            final_message: Some("done".into()),
-            transcript: vec![],
-            steps: 3,
-            finish: crate::agent::FinishReason::NoMoreToolCalls,
+        let outcome = RuntimeOutcome {
+            final_text: Some("done".into()),
+            finish_reason: crate::agent::FinishReason::NoMoreToolCalls,
             total_usage: crate::llm::TokenUsage::default(),
-            total_llm_latency_ms: 100,
+            steps: 3,
+            llm_latency_ms: 100,
+            checkpoint_id: None,
         };
         let mut reg = HookRegistry::new();
         reg.register(Arc::new(CaptureOutcome(c)));
         reg.dispatch(HookEvent::SessionEnd { outcome: &outcome });
         let captured = captured.lock().unwrap().take().unwrap();
-        assert_eq!(captured.final_message.as_deref(), Some("done"));
+        assert_eq!(captured.final_text.as_deref(), Some("done"));
         assert_eq!(captured.steps, 3);
     }
 
@@ -543,13 +545,13 @@ mod tests {
     #[test]
     fn new_events_compile_and_dispatch() {
         let reg = HookRegistry::new();
-        let outcome = AgentOutcome {
-            final_message: None,
-            transcript: vec![],
-            steps: 0,
-            finish: crate::agent::FinishReason::NoMoreToolCalls,
+        let outcome = RuntimeOutcome {
+            final_text: None,
+            finish_reason: crate::agent::FinishReason::NoMoreToolCalls,
             total_usage: crate::llm::TokenUsage::default(),
-            total_llm_latency_ms: 0,
+            steps: 0,
+            llm_latency_ms: 0,
+            checkpoint_id: None,
         };
         let empty_args = serde_json::json!({});
 
@@ -661,13 +663,13 @@ mod tests {
         });
         assert!(matches!(action, HookAction::Continue));
 
-        let outcome = AgentOutcome {
-            final_message: Some("done".into()),
-            transcript: vec![],
-            steps: 1,
-            finish: crate::agent::FinishReason::NoMoreToolCalls,
+        let outcome = RuntimeOutcome {
+            final_text: Some("done".into()),
+            finish_reason: crate::agent::FinishReason::NoMoreToolCalls,
             total_usage: crate::llm::TokenUsage::default(),
-            total_llm_latency_ms: 0,
+            steps: 1,
+            llm_latency_ms: 0,
+            checkpoint_id: None,
         };
         let action = hook.on_event(HookEvent::SessionEnd { outcome: &outcome });
         assert!(matches!(action, HookAction::Continue));

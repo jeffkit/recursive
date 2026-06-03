@@ -50,9 +50,6 @@ pub mod tui;
 
 pub use agent::PlanningMode;
 pub use agent::{FinishReason, PermissionDecision, PermissionHook};
-// Legacy API — kept for backward compatibility; new code should use AgentRuntime.
-#[allow(deprecated)]
-pub use agent::{Agent, AgentOutcome, OnMessageFn, StepEvent};
 pub use checkpoint::{CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};
 pub use checkpoint_log::{
     read_log as read_checkpoint_log, truncate_to_turn as truncate_checkpoint_log,

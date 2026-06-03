@@ -2,10 +2,8 @@
 //!
 //! Extracted from `src/agent.rs` (Goal 213).  `RunCore` owns all the state
 //! needed for one ReAct loop iteration and is consumed by `run_inner()`.
-//! The containing `Agent` / `AgentKernel` construct a `RunCore`, call
-//! `run_inner()`, and integrate the returned `RunInnerOutcome`.
-// Allow deprecated types (StepEvent, OnMessageFn) used in RunCore's interface.
-#![allow(deprecated)]
+//! The containing `AgentKernel` constructs a `RunCore`, calls `run_inner()`,
+//! and integrates the returned `RunInnerOutcome`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,7 +20,7 @@ use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::tools::ToolRegistry;
 
-use crate::agent::{FinishReason, OnMessageFn, PermissionDecision, PermissionHook, PlanningMode};
+use crate::agent::{FinishReason, PermissionDecision, PermissionHook, PlanningMode};
 use crate::event::AgentEvent;
 
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
@@ -83,7 +81,6 @@ pub(crate) struct RunCore<'a> {
     pub(crate) permission_hook: Option<PermissionHook>,
     pub(crate) hooks: &'a HookRegistry,
     pub(crate) planning_mode: PlanningMode,
-    pub(crate) on_message: &'a Option<OnMessageFn>,
     pub(crate) total_llm_latency_ms: u64,
     pub(crate) plan_buffer: Option<Vec<ToolCall>>,
     pub(crate) plan_confirmed: bool,
@@ -114,9 +111,6 @@ impl<'a> RunCore<'a> {
     }
 
     fn push_message(&mut self, msg: Message) {
-        if let Some(ref cb) = self.on_message {
-            cb(&msg);
-        }
         self.messages.push(msg);
     }
 

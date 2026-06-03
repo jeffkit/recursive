@@ -27,7 +27,7 @@ use crate::checkpoint::{CheckpointId, ShadowRepo};
 use crate::checkpoint_log::{CheckpointLogWriter, CheckpointRecord, TouchedVia};
 use crate::error::Result;
 use crate::event::{AgentEvent, EventSink, NullSink};
-use crate::hooks::HookRegistry;
+use crate::hooks::{HookEvent, HookRegistry};
 use crate::kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 use crate::llm::{LlmProvider, TokenUsage};
 use crate::message::Message;
@@ -229,12 +229,16 @@ impl AgentRuntime {
         // drain/insert does not retroactively rewrite it).
         // A `CompactionBoundary` event is also emitted (g157) so the reader can
         // skip pre-compaction messages on resume.
-        let mut compaction_event: Option<(Message, usize)> = None;
+        let mut compaction_event: Option<(Message, usize, usize)> = None;
         if let Some(ref compactor) = self.compactor {
             let chars = Compactor::estimate_chars(&self.transcript);
             if chars >= compactor.threshold_chars
                 && self.transcript.len() >= compactor.keep_recent_n + 2
             {
+                let summary_chars = Compactor::estimate_chars(&self.transcript);
+                self.kernel.hooks().dispatch(HookEvent::PreCompact {
+                    transcript_len: summary_chars,
+                });
                 let summary_msg = compactor
                     .compact(self.kernel.llm().as_ref(), &self.transcript)
                     .await?;
@@ -245,12 +249,16 @@ impl AgentRuntime {
                     split -= 1;
                 }
                 let removed = split;
-                compaction_event = Some((summary_msg.clone(), removed));
+                compaction_event = Some((summary_msg.clone(), removed, summary_chars));
                 self.transcript.drain(..split);
                 self.transcript.insert(0, summary_msg);
+                self.kernel.hooks().dispatch(HookEvent::PostCompact {
+                    removed,
+                    summary_chars,
+                });
             }
         }
-        if let Some((summary, removed)) = compaction_event {
+        if let Some((summary, removed, _summary_chars)) = compaction_event {
             // g157: emit the boundary marker FIRST so the reader knows to discard
             // everything before it in the JSONL. The summary message that follows
             // immediately after the marker is the first post-compaction entry.
@@ -1133,6 +1141,10 @@ impl AgentRuntimeBuilder {
 
     /// Set an optional compactor for summarising old messages.
     pub fn compactor(mut self, compactor: Compactor) -> Self {
+        // Also pass the compactor to the kernel so `RunCore` can perform
+        // intra-turn compaction (which dispatches `PreCompact` / `PostCompact`
+        // hooks). Cross-turn compaction is performed by the runtime itself.
+        self.kernel_builder = self.kernel_builder.compactor(compactor.clone());
         self.compactor = Some(compactor);
         self
     }

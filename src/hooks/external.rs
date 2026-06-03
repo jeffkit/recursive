@@ -27,8 +27,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::StepEvent;
 use crate::error::{Error, Result};
+use crate::event::AgentEvent;
 use crate::hooks::config::{matches_hook, HookCommand, HookCommandType, HooksConfig};
 use crate::llm::LlmProvider;
 use crate::message::Message;
@@ -123,7 +123,7 @@ struct HookOutput {
     /// Override tool arguments (PreToolCall only).
     #[serde(default)]
     updated_input: Option<serde_json::Value>,
-    /// Warning message shown to the user (via StepEvent).
+    /// Warning message shown to the user (via AgentEvent).
     #[serde(default)]
     system_message: Option<String>,
     /// When true, suppress writing hook stdout to the transcript.
@@ -285,7 +285,7 @@ pub struct ExternalHookRunner {
     /// Optional cancellation token for `asyncRewake` hooks.
     pub cancel_token: Option<CancellationToken>,
     /// Optional event channel for TUI progress events.
-    event_tx: Option<mpsc::UnboundedSender<StepEvent>>,
+    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
 impl ExternalHookRunner {
@@ -362,14 +362,14 @@ impl ExternalHookRunner {
         self
     }
 
-    /// Attach a `StepEvent` channel for TUI progress events.
-    pub fn with_event_tx(mut self, tx: mpsc::UnboundedSender<StepEvent>) -> Self {
+    /// Attach an `AgentEvent` channel for TUI progress events.
+    pub fn with_event_tx(mut self, tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
         self.event_tx = Some(tx);
         self
     }
 
-    /// Emit a `StepEvent` if an event channel is registered.
-    fn emit(&self, event: StepEvent) {
+    /// Emit an `AgentEvent` if an event channel is registered.
+    fn emit(&self, event: AgentEvent) {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(event);
         }
@@ -508,7 +508,7 @@ impl ExternalHookRunner {
                 ResolvedHookKind::Http { url, .. } => url.clone(),
                 ResolvedHookKind::Prompt { .. } => "prompt-hook".to_string(),
             };
-            self.emit(StepEvent::HookStarted {
+            self.emit(AgentEvent::HookStarted {
                 hook_event: event_str.clone(),
                 hook_name: hook_display_name.clone(),
                 status_message: None,
@@ -525,9 +525,9 @@ impl ExternalHookRunner {
                     HookAction::Error(reason) => format!("error: {reason}"),
                 };
                 if let Some(msg) = &result.system_message {
-                    self.emit(StepEvent::HookSystemMessage { text: msg.clone() });
+                    self.emit(AgentEvent::HookSystemMessage { text: msg.clone() });
                 }
-                self.emit(StepEvent::HookFinished {
+                self.emit(AgentEvent::HookFinished {
                     hook_event: event_str.clone(),
                     hook_name: hook_display_name.clone(),
                     outcome,

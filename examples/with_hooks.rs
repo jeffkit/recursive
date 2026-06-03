@@ -1,7 +1,5 @@
-//! Agent with lifecycle hooks: observe and log agent events.
+//! Runtime with lifecycle hooks: observe and log agent events.
 //! Uses `MockProvider` so no API key is needed.
-// HookEvent::SessionEnd still carries AgentOutcome (legacy); allow deprecated.
-#![allow(deprecated)]
 
 use recursive::hooks::{Hook, HookAction, HookEvent, HookRegistry};
 use recursive::llm::{Completion, MockProvider};
@@ -38,7 +36,7 @@ impl Hook for LoggingHook {
             HookEvent::SessionEnd { outcome } => {
                 println!(
                     "[hook] Session ended — steps: {}, finish: {:?}",
-                    outcome.steps, outcome.finish
+                    outcome.steps, outcome.finish_reason
                 );
             }
             _ => {}
