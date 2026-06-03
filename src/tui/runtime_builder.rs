@@ -42,6 +42,8 @@ pub fn build_runtime() -> RuntimeBuild {
     match AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
+        .system_prompt(&config.system_prompt)
+        .max_steps(config.max_steps)
         .build()
     {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),

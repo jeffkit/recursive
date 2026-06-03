@@ -8,45 +8,50 @@
 use ratatui::prelude::*;
 
 use crate::tui::app::{TranscriptBlock, UsageStats};
+use crate::tui::ui::theme::Theme;
 use crate::tui::ui::{diff, markdown};
 
 /// Convert the entire transcript into a flat `Vec<Line>` with one
 /// blank line between adjacent blocks. Folded ToolResult blocks
 /// honour the `expanded` flag.
-pub fn render_blocks(blocks: &[TranscriptBlock], _usage: &UsageStats) -> Vec<Line<'static>> {
+pub fn render_blocks(
+    blocks: &[TranscriptBlock],
+    _usage: &UsageStats,
+    th: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 {
             lines.push(Line::raw(""));
         }
-        lines.extend(render_block(b));
+        lines.extend(render_block(b, th));
     }
     lines
 }
 
 /// Render a single block. Exposed for unit tests.
-pub fn render_block(block: &TranscriptBlock) -> Vec<Line<'static>> {
+pub fn render_block(block: &TranscriptBlock, th: &Theme) -> Vec<Line<'static>> {
     match block {
-        TranscriptBlock::User { text } => render_user(text),
+        TranscriptBlock::User { text } => render_user(text, th),
         TranscriptBlock::Assistant {
             text,
             streaming,
             latency_ms,
-        } => render_assistant(text, *streaming, *latency_ms),
+        } => render_assistant(text, *streaming, *latency_ms, th),
         TranscriptBlock::ToolCall {
             name, args_preview, ..
-        } => render_tool_call(name, args_preview),
+        } => render_tool_call(name, args_preview, th),
         TranscriptBlock::ToolResult {
             name,
             success,
             output,
             expanded,
             ..
-        } => render_tool_result(name, *success, output, *expanded),
+        } => render_tool_result(name, *success, output, *expanded, th),
         TranscriptBlock::Diff { path, hunks } => render_diff(path, hunks),
         TranscriptBlock::Compacted { removed, kept } => render_compacted(*removed, *kept),
         TranscriptBlock::System { text } => render_system(text),
-        TranscriptBlock::Error { text } => render_error(text),
+        TranscriptBlock::Error { text } => render_error(text, th),
         TranscriptBlock::PlanProposal {
             plan_text,
             tool_calls,
@@ -59,21 +64,21 @@ pub fn render_block(block: &TranscriptBlock) -> Vec<Line<'static>> {
 
 // ── User ──────────────────────────────────────────────────────────────
 
-fn render_user(text: &str) -> Vec<Line<'static>> {
-    let gutter_style = Style::default().fg(Color::Gray);
+fn render_user(text: &str, th: &Theme) -> Vec<Line<'static>> {
+    let gutter_style = Style::default().fg(th.system_bar);
     let mut out = vec![Line::from(vec![
-        Span::styled("▎ ", Style::default().fg(Color::LightBlue)),
+        Span::styled("▎ ", Style::default().fg(th.user_bar)),
         Span::styled(
             "You".to_string(),
             Style::default()
-                .fg(Color::LightBlue)
+                .fg(th.user_bar)
                 .add_modifier(Modifier::BOLD),
         ),
     ])];
     for line in text.lines() {
         out.push(Line::from(vec![
             Span::styled("│  ", gutter_style),
-            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+            Span::styled(line.to_string(), Style::default().fg(th.status_fg)),
         ]));
     }
     if text.is_empty() {
@@ -87,14 +92,19 @@ fn render_user(text: &str) -> Vec<Line<'static>> {
 
 // ── Assistant ─────────────────────────────────────────────────────────
 
-fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec<Line<'static>> {
-    let gutter_style = Style::default().fg(Color::Gray);
+fn render_assistant(
+    text: &str,
+    streaming: bool,
+    latency_ms: Option<u64>,
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let gutter_style = Style::default().fg(th.system_bar);
     let mut header = vec![
-        Span::styled("▎ ", Style::default().fg(Color::LightCyan)),
+        Span::styled("▎ ", Style::default().fg(th.assistant_bar)),
         Span::styled(
             "Agent".to_string(),
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(th.assistant_bar)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -102,7 +112,7 @@ fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec
         header.push(Span::raw("  "));
         header.push(Span::styled(
             format!("⏱ {:.1}s", ms as f64 / 1000.0),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(th.system_bar),
         ));
     }
     if streaming {
@@ -110,65 +120,52 @@ fn render_assistant(text: &str, streaming: bool, latency_ms: Option<u64>) -> Vec
         header.push(Span::styled(
             "…streaming".to_string(),
             Style::default()
-                .fg(Color::Gray)
+                .fg(th.system_bar)
                 .add_modifier(Modifier::ITALIC),
         ));
     }
     let mut out = vec![Line::from(header)];
-
-    let all_lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    let mut md_state = markdown::MdState::default();
-
-    while i < all_lines.len() {
-        let line = all_lines[i];
-
-        // Detect a table block (consecutive `|…` lines) only outside code blocks.
-        if !md_state.in_code_block && markdown::is_table_line(line) {
-            let table_start = i;
-            while i < all_lines.len() && markdown::is_table_line(all_lines[i]) {
-                i += 1;
-            }
-            let table_rows = &all_lines[table_start..i];
-            out.extend(markdown::render_table(table_rows, "│  ", gutter_style));
-            continue;
-        }
-
-        let rendered = markdown::render_inline(line, Color::White, md_state);
-        md_state = rendered.state;
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(rendered.spans.len() + 1);
-        spans.push(Span::styled("│  ", gutter_style));
-        spans.extend(rendered.spans);
-        out.push(Line::from(spans));
-        i += 1;
-    }
 
     if text.is_empty() {
         out.push(Line::from(vec![Span::styled(
             "│  ".to_string(),
             gutter_style,
         )]));
+        return out;
+    }
+
+    // Use the full pulldown-cmark based renderer for proper markdown parsing
+    // (handles multi-paragraph blocks, nested lists, fenced code with syntax
+    // highlighting, etc.).  We wrap each resulting line with the gutter prefix.
+    let md_lines = markdown::render_markdown(text, 0);
+    for md_line in md_lines {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(md_line.spans.len() + 1);
+        spans.push(Span::styled("│  ", gutter_style));
+        spans.extend(md_line.spans);
+        out.push(Line::from(spans));
     }
     out
 }
 
 // ── ToolCall ──────────────────────────────────────────────────────────
 
-fn render_tool_call(name: &str, args_preview: &str) -> Vec<Line<'static>> {
+fn render_tool_call(name: &str, args_preview: &str, th: &Theme) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::raw("  "),
-        Span::styled("🔧", Style::default().fg(Color::Yellow)),
+        Span::styled("🔧", Style::default().fg(th.tool_call_icon)),
         Span::raw(" "),
         Span::styled(
             name.to_string(),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(th.tool_call_icon)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             args_preview.to_string(),
-            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(th.system_bar)
+                .add_modifier(Modifier::DIM),
         ),
     ])]
 }
@@ -180,11 +177,12 @@ fn render_tool_result(
     success: bool,
     output: &str,
     expanded: bool,
+    th: &Theme,
 ) -> Vec<Line<'static>> {
     let (sigil, sigil_color) = if success {
-        ("✓", Color::Green)
+        ("✓", th.tool_ok_fg)
     } else {
-        ("✗", Color::Red)
+        ("✗", th.tool_err_fg)
     };
     let size = format_size(output.len());
 
@@ -199,12 +197,16 @@ fn render_tool_result(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(format!("({size})"), Style::default().fg(Color::Gray)),
+        Span::styled(format!("({size})"), Style::default().fg(th.system_bar)),
     ])];
 
     let collected: Vec<&str> = output.lines().collect();
     let n = collected.len();
-    let body_color = if success { Color::White } else { Color::Red };
+    let body_color = if success {
+        th.status_fg
+    } else {
+        th.tool_err_fg
+    };
 
     let visible: Vec<&&str> = if expanded || n <= 6 {
         collected.iter().collect()
@@ -213,17 +215,17 @@ fn render_tool_result(
     };
     for line in visible {
         out.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(Color::Gray)),
+            Span::styled("    │ ", Style::default().fg(th.system_bar)),
             Span::styled((*line).to_string(), Style::default().fg(body_color)),
         ]));
     }
     if !expanded && n > 6 {
         out.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(Color::Gray)),
+            Span::styled("    │ ", Style::default().fg(th.system_bar)),
             Span::styled(
                 format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
                 Style::default()
-                    .fg(Color::Gray)
+                    .fg(th.system_bar)
                     .add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -278,10 +280,10 @@ fn render_system(text: &str) -> Vec<Line<'static>> {
     )])]
 }
 
-fn render_error(text: &str) -> Vec<Line<'static>> {
+fn render_error(text: &str, th: &Theme) -> Vec<Line<'static>> {
     vec![Line::from(vec![Span::styled(
         text.to_string(),
-        Style::default().fg(Color::Red),
+        Style::default().fg(th.tool_err_fg),
     )])]
 }
 
@@ -555,6 +557,7 @@ fn render_plan_mode_request(reason: &str, approved: Option<bool>) -> Vec<Line<'s
 mod tests {
     use super::*;
     use crate::tui::app::{DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
+    use crate::tui::ui::theme;
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -562,20 +565,26 @@ mod tests {
 
     #[test]
     fn user_block_renders_label_and_body() {
-        let lines = render_block(&TranscriptBlock::User {
-            text: "hello world".into(),
-        });
+        let lines = render_block(
+            &TranscriptBlock::User {
+                text: "hello world".into(),
+            },
+            &theme::DARK,
+        );
         assert!(line_text(&lines[0]).contains("You"));
         assert!(line_text(&lines[1]).contains("hello world"));
     }
 
     #[test]
     fn assistant_block_includes_latency_when_set() {
-        let lines = render_block(&TranscriptBlock::Assistant {
-            text: "ok".into(),
-            streaming: false,
-            latency_ms: Some(1234),
-        });
+        let lines = render_block(
+            &TranscriptBlock::Assistant {
+                text: "ok".into(),
+                streaming: false,
+                latency_ms: Some(1234),
+            },
+            &theme::DARK,
+        );
         let header = line_text(&lines[0]);
         assert!(header.contains("Agent"));
         assert!(header.contains("⏱"));
@@ -584,22 +593,28 @@ mod tests {
 
     #[test]
     fn assistant_streaming_marker_present_when_streaming() {
-        let lines = render_block(&TranscriptBlock::Assistant {
-            text: "hel".into(),
-            streaming: true,
-            latency_ms: None,
-        });
+        let lines = render_block(
+            &TranscriptBlock::Assistant {
+                text: "hel".into(),
+                streaming: true,
+                latency_ms: None,
+            },
+            &theme::DARK,
+        );
         let header = line_text(&lines[0]);
         assert!(header.contains("streaming"));
     }
 
     #[test]
     fn tool_call_block_includes_name_and_preview() {
-        let lines = render_block(&TranscriptBlock::ToolCall {
-            id: "1".into(),
-            name: "read_file".into(),
-            args_preview: "path=\"foo\"".into(),
-        });
+        let lines = render_block(
+            &TranscriptBlock::ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                args_preview: "path=\"foo\"".into(),
+            },
+            &theme::DARK,
+        );
         let s = line_text(&lines[0]);
         assert!(s.contains("read_file"));
         assert!(s.contains("path"));
@@ -611,13 +626,16 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = render_block(&TranscriptBlock::ToolResult {
-            id: "1".into(),
-            name: "read_file".into(),
-            success: true,
-            output,
-            expanded: false,
-        });
+        let lines = render_block(
+            &TranscriptBlock::ToolResult {
+                id: "1".into(),
+                name: "read_file".into(),
+                success: true,
+                output,
+                expanded: false,
+            },
+            &theme::DARK,
+        );
         // header + 3 lines + ellipsis = 5 lines
         assert_eq!(lines.len(), 5);
         let last = line_text(lines.last().unwrap());
@@ -631,29 +649,39 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = render_block(&TranscriptBlock::ToolResult {
-            id: "1".into(),
-            name: "read_file".into(),
-            success: true,
-            output,
-            expanded: true,
-        });
+        let lines = render_block(
+            &TranscriptBlock::ToolResult {
+                id: "1".into(),
+                name: "read_file".into(),
+                success: true,
+                output,
+                expanded: true,
+            },
+            &theme::DARK,
+        );
         // header + 10 body lines
         assert_eq!(lines.len(), 11);
     }
 
     #[test]
-    fn tool_result_failure_uses_red_sigil() {
-        let lines = render_block(&TranscriptBlock::ToolResult {
-            id: "1".into(),
-            name: "x".into(),
-            success: false,
-            output: "boom".into(),
-            expanded: false,
-        });
+    fn tool_result_failure_uses_error_color() {
+        let lines = render_block(
+            &TranscriptBlock::ToolResult {
+                id: "1".into(),
+                name: "x".into(),
+                success: false,
+                output: "boom".into(),
+                expanded: false,
+            },
+            &theme::DARK,
+        );
         let header = &lines[0];
-        let has_red = header.spans.iter().any(|s| s.style.fg == Some(Color::Red));
-        assert!(has_red);
+        // In the DARK theme, tool_err_fg = Color::Red
+        let has_err_color = header
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(theme::DARK.tool_err_fg));
+        assert!(has_err_color);
     }
 
     #[test]
@@ -667,9 +695,9 @@ mod tests {
                 }],
             }],
         };
-        let lines = render_block(&block);
+        let lines = render_block(&block, &theme::DARK);
         assert!(line_text(&lines[0]).contains("src/x.rs"));
-        // body should have at least one Green span
+        // body should have at least one Green span (diff adds are always green)
         let has_green = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -683,16 +711,19 @@ mod tests {
             path: "src/x.rs".into(),
             hunks: vec![],
         };
-        let lines = render_block(&block);
+        let lines = render_block(&block, &theme::DARK);
         assert!(lines.iter().any(|l| line_text(l).contains("Updated")));
     }
 
     #[test]
     fn compacted_block_renders_with_summary() {
-        let lines = render_block(&TranscriptBlock::Compacted {
-            removed: 12,
-            kept: 1,
-        });
+        let lines = render_block(
+            &TranscriptBlock::Compacted {
+                removed: 12,
+                kept: 1,
+            },
+            &theme::DARK,
+        );
         let s = line_text(&lines[0]);
         assert!(s.contains("12"));
         assert!(s.contains("compacted"));
