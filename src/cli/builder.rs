@@ -397,12 +397,23 @@ pub(crate) async fn build_runtime(
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
     }
-    if let Ok(threshold) = std::env::var("RECURSIVE_COMPACT_THRESHOLD") {
-        if let Ok(n) = threshold.parse::<usize>() {
-            if n > 0 {
-                builder = builder.compactor(recursive::Compactor::new(n));
+    // Determine the compaction threshold (chars):
+    //   RECURSIVE_COMPACT_THRESHOLD=<n>  → explicit override (0 = disabled)
+    //   RECURSIVE_COMPACT_THRESHOLD unset → auto-compute from model context window
+    //   RECURSIVE_COMPACT_THRESHOLD=0    → explicitly disabled
+    let compact_threshold: Option<usize> =
+        match std::env::var("RECURSIVE_COMPACT_THRESHOLD").as_deref() {
+            Ok("0") | Ok("off") | Ok("false") => None, // explicitly disabled
+            Ok(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
+            Err(_) => {
+                // Auto-compute: mirrors fake-cc's getAutoCompactThreshold.
+                Some(recursive::llm::default_compact_threshold_chars(
+                    &config.model,
+                ))
             }
-        }
+        };
+    if let Some(n) = compact_threshold {
+        builder = builder.compactor(recursive::Compactor::new(n));
     }
     if hook_timing {
         use recursive::hooks::HookRegistry;
