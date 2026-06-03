@@ -795,22 +795,22 @@ mod tests {
     #[test]
     fn provider_preset_resolution_chain() {
         use std::sync::OnceLock;
-        // Hold the process-wide env lock for the whole test body. The
-        // test mutates RECURSIVE_API_KEY / RECURSIVE_MODEL /
-        // DEEPSEEK_API_KEY / etc. via raw std::env::set_var — those
-        // are not protected by PinnedRecursiveHome (which only pins
-        // RECURSIVE_HOME), so without this lock the test races with
-        // state::tests::detect_model_name_falls_back_to_config_file
-        // and runtime_builder::tests::offline_mode_and_config_file_resolution
-        // under parallel test load.
-        let _env_lock = crate::test_util::env_lock();
-        // One PinnedRecursiveHome for the whole test; sequential sections
-        // mutate env under its lock. We use PinnedRecursiveHome (not
-        // PinnedHome) so the test reads its own config.toml via the
-        // RECURSIVE_HOME short-circuit in `config_file_path` — pinning
-        // HOME alone still races with tests that mutate HOME without
-        // holding the env lock, because `dirs::home_dir` re-resolves
-        // through getpwuid_r on macOS.
+        // PinnedRecursiveHome holds the process-wide env lock for the whole
+        // test body. The test mutates RECURSIVE_API_KEY / RECURSIVE_MODEL /
+        // DEEPSEEK_API_KEY / etc. via raw std::env::set_var — all env
+        // mutations happen under this single lock, which is sufficient to
+        // serialise with state::tests::detect_model_name_falls_back_to_config_file
+        // and runtime_builder::tests::offline_mode_and_config_file_resolution.
+        //
+        // We use PinnedRecursiveHome (not PinnedHome) so the test reads its
+        // own config.toml via the RECURSIVE_HOME short-circuit in
+        // `config_file_path` — pinning HOME alone still races with tests
+        // that mutate HOME without holding the env lock.
+        //
+        // NOTE: do NOT call env_lock() separately here — PinnedRecursiveHome
+        // already acquires it. Calling env_lock() first and then creating
+        // PinnedRecursiveHome would deadlock because std::sync::Mutex is not
+        // re-entrant.
         static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
         let tmp = HOME.get_or_init(|| tempfile::tempdir().expect("tempdir"));
         let _g = crate::test_util::PinnedRecursiveHome::new(tmp.path());
