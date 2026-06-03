@@ -1111,43 +1111,45 @@ mod tests {
     }
 }
 
-    /// Inline code `` `x` `` inside a table cell must appear in the rendered
-    /// output (with surrounding backticks) rather than being swallowed.
-    #[test]
-    fn render_markdown_table_with_inline_code_in_cell() {
-        let text = "| File | Desc |\n|------|------|\n| `foo.rs` | new file |\n| `bar.rs` | updated |";
-        let lines = render_markdown(text, 80);
-        let all_text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect();
-        // Both file names must survive rendering.
-        assert!(all_text.contains("foo.rs"), "inline code 'foo.rs' missing");
-        assert!(all_text.contains("bar.rs"), "inline code 'bar.rs' missing");
-    }
+/// Inline code `` `x` `` inside a table cell must appear in the rendered
+/// output (with surrounding backticks) rather than being swallowed.
+#[test]
+fn render_markdown_table_with_inline_code_in_cell() {
+    let text = "| File | Desc |\n|------|------|\n| `foo.rs` | new file |\n| `bar.rs` | updated |";
+    let lines = render_markdown(text, 80);
+    let all_text: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    // Both file names must survive rendering.
+    assert!(all_text.contains("foo.rs"), "inline code 'foo.rs' missing");
+    assert!(all_text.contains("bar.rs"), "inline code 'bar.rs' missing");
+}
 
-    /// Verify that render_markdown produces a properly boxed table for a
-    /// standard GFM table (header + separator + data rows).
-    #[test]
-    fn render_markdown_table_end_to_end() {
-        let text = "| Name | Value |\n|------|-------|\n| foo | 42 |\n| bar | 99 |";
-        let lines = render_markdown(text, 80);
-        let all_text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect();
-        // Should contain box-drawing chars and cell content.
-        assert!(all_text.contains("Name"), "header 'Name' missing");
-        assert!(all_text.contains("Value"), "header 'Value' missing");
-        assert!(all_text.contains("foo"), "data 'foo' missing");
-        assert!(all_text.contains("42"), "data '42' missing");
-        assert!(all_text.contains("bar"), "data 'bar' missing");
-        assert!(all_text.contains("99"), "data '99' missing");
-        // Box borders should be present.
-        assert!(all_text.contains('┌') || all_text.contains('─'),
-            "no box-drawing chars found");
-        // Should be more than 3 lines (top + header + divider + 2 data + bottom = 6).
-        assert!(lines.len() >= 6, "expected ≥6 lines, got {}", lines.len());
-    }
+/// Verify that render_markdown produces a properly boxed table for a
+/// standard GFM table (header + separator + data rows).
+#[test]
+fn render_markdown_table_end_to_end() {
+    let text = "| Name | Value |\n|------|-------|\n| foo | 42 |\n| bar | 99 |";
+    let lines = render_markdown(text, 80);
+    let all_text: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    // Should contain box-drawing chars and cell content.
+    assert!(all_text.contains("Name"), "header 'Name' missing");
+    assert!(all_text.contains("Value"), "header 'Value' missing");
+    assert!(all_text.contains("foo"), "data 'foo' missing");
+    assert!(all_text.contains("42"), "data '42' missing");
+    assert!(all_text.contains("bar"), "data 'bar' missing");
+    assert!(all_text.contains("99"), "data '99' missing");
+    // Box borders should be present.
+    assert!(
+        all_text.contains('┌') || all_text.contains('─'),
+        "no box-drawing chars found"
+    );
+    // Should be more than 3 lines (top + header + divider + 2 data + bottom = 6).
+    assert!(lines.len() >= 6, "expected ≥6 lines, got {}", lines.len());
+}
