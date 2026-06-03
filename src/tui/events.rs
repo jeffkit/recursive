@@ -46,6 +46,12 @@ pub enum UiEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// Reasoning / thinking content produced by the model for the
+    /// current step (DeepSeek R1, OpenAI o1, …). Carries the full
+    /// reasoning text; the TUI renders it as a `thinking…` block
+    /// above the corresponding assistant message. Steps that did
+    /// not produce reasoning never emit this event.
+    Reasoning { content: String },
     /// Latency (ms) of the latest LLM call.
     Latency { llm_ms: u64 },
     /// Transcript compaction notification.
