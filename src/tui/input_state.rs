@@ -238,6 +238,64 @@ impl PromptInputState {
             .unwrap_or(self.buffer.len());
     }
 
+    /// Move cursor to the same column on the previous visual line.
+    /// No-op when the cursor is already on the first line. If the
+    /// previous line is shorter than the current column, the cursor
+    /// lands at the end of the previous line (emacs `previous-line`
+    /// semantics).
+    pub fn move_prev_line(&mut self) {
+        if self.cursor_on_first_line() {
+            return;
+        }
+        // Start of the line the cursor is currently on.
+        let cur_line_start = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let col = self.cursor - cur_line_start;
+        // End of the previous line (the `\n` just before
+        // `cur_line_start` minus one).
+        let prev_line_end = cur_line_start - 1;
+        let prev_line_start = self.buffer[..prev_line_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line_len = prev_line_end - prev_line_start;
+        self.cursor = prev_line_start + col.min(prev_line_len);
+    }
+
+    /// Move cursor to the same column on the next visual line.
+    /// No-op when the cursor is already on the last line. If the
+    /// next line is shorter than the current column, the cursor
+    /// lands at the end of the next line (emacs `next-line`
+    /// semantics).
+    pub fn move_next_line(&mut self) {
+        if self.cursor_on_last_line() {
+            return;
+        }
+        let cur_line_start = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let col = self.cursor - cur_line_start;
+        // End of the current line (where its `\n` lives).
+        let cur_line_end = self.buffer[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.buffer.len());
+        // Start of the next line is one past the `\n`.
+        let next_line_start = cur_line_end + 1;
+        if next_line_start > self.buffer.len() {
+            return;
+        }
+        let next_line_end = self.buffer[next_line_start..]
+            .find('\n')
+            .map(|i| next_line_start + i)
+            .unwrap_or(self.buffer.len());
+        let next_line_len = next_line_end - next_line_start;
+        self.cursor = next_line_start + col.min(next_line_len);
+    }
+
     /// True when the cursor sits on the **first** visual line.
     pub fn cursor_on_first_line(&self) -> bool {
         !self.buffer[..self.cursor].contains('\n')
@@ -331,5 +389,112 @@ pub fn strip_history_prefix(raw: &str) -> (InputMode, &str) {
         (InputMode::Command, rest)
     } else {
         (InputMode::Prompt, raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(buf: &str, cursor: usize) -> PromptInputState {
+        PromptInputState {
+            buffer: buf.to_string(),
+            cursor,
+            ..PromptInputState::default()
+        }
+    }
+
+    #[test]
+    fn prev_line_moves_to_same_column() {
+        let mut p = s("abc\ndef\nghi", 6); // on "def|" col 2
+        p.move_prev_line();
+        assert_eq!(p.cursor, 2, "should land on 'ab|c' of the first line");
+    }
+
+    #[test]
+    fn next_line_moves_to_same_column() {
+        let mut p = s("abc\ndef\nghi", 2); // on "ab|c" col 2
+        p.move_next_line();
+        assert_eq!(p.cursor, 6, "should land on 'de|f' of the second line");
+    }
+
+    #[test]
+    fn prev_line_handles_short_target_line() {
+        // Layout: "ab" 0..2, '\n' @ 2, "def" 3..6, '\n' @ 6, "ghi" 7..10.
+        // Cursor at 8 sits on "gh|i" (col 1 on the third line).
+        // The second line is "def" (3 chars), so col 1 stays col 1.
+        let mut p = s("ab\ndef\nghi", 8);
+        p.move_prev_line();
+        assert_eq!(p.cursor, 4, "should land on 'd|ef' of the second line");
+    }
+
+    #[test]
+    fn next_line_clamps_to_shorter_line() {
+        // Layout: "abc" 0..3, '\n' @ 3, "de" 4..6, '\n' @ 6, "ghi" 7..10.
+        // Cursor at 3 is the end of "abc|" (col 3).
+        // The second line is "de" (2 chars); col 3 clamps to 2.
+        let mut p = s("abc\nde\nghi", 3);
+        p.move_next_line();
+        assert_eq!(p.cursor, 6, "clamped to end of 'de|'");
+    }
+
+    #[test]
+    fn prev_line_noop_on_first_line() {
+        let mut p = s("hello", 3);
+        p.move_prev_line();
+        assert_eq!(p.cursor, 3, "first line is a no-op");
+    }
+
+    #[test]
+    fn next_line_noop_on_last_line() {
+        let mut p = s("hello", 3);
+        p.move_next_line();
+        assert_eq!(p.cursor, 3, "last line is a no-op");
+    }
+
+    #[test]
+    fn prev_line_three_lines_walks_back_step_by_step() {
+        // Layout: "first" 0..5, '\n' @ 5, "second" 6..12,
+        // '\n' @ 12, "third" 13..18.
+        // Cursor at 14 sits on "th|ird" (col 1 on the third line).
+        let mut p = s("first\nsecond\nthird", 14);
+        p.move_prev_line();
+        assert_eq!(p.cursor, 7, "second line, col 1 ('s|econd')");
+        p.move_prev_line();
+        assert_eq!(p.cursor, 1, "first line, col 1 ('f|irst')");
+        p.move_prev_line();
+        assert_eq!(p.cursor, 1, "first line is a no-op");
+    }
+
+    #[test]
+    fn next_line_three_lines_walks_forward_step_by_step() {
+        // Cursor at 2 sits on "fi|rst" (col 2 on the first line).
+        let mut p = s("first\nsecond\nthird", 2);
+        p.move_next_line();
+        assert_eq!(p.cursor, 8, "second line, col 2 ('seco|nd')");
+        p.move_next_line();
+        assert_eq!(p.cursor, 15, "third line, col 2 ('thi|rd')");
+        p.move_next_line();
+        assert_eq!(p.cursor, 15, "last line is a no-op");
+    }
+
+    #[test]
+    fn prev_line_handles_empty_intermediate_line() {
+        // Layout: "abc" 0..3, '\n' @ 3, "" 4..4, '\n' @ 4, "def" 5..8.
+        // Cursor at 7 sits on "de|f" (col 2 on the third line).
+        let mut p = s("abc\n\ndef", 7);
+        p.move_prev_line();
+        // Middle line is empty; col 2 clamps to 0.
+        assert_eq!(p.cursor, 4, "empty line, col 0 (just past '\\n')");
+    }
+
+    #[test]
+    fn next_line_handles_empty_intermediate_line() {
+        // Layout: "abc" 0..3, '\n' @ 3, "" 4..4, '\n' @ 4, "def" 5..8.
+        // Cursor at 1 sits on "a|bc" (col 1 on the first line).
+        let mut p = s("abc\n\ndef", 1);
+        p.move_next_line();
+        // Middle line is empty; col 1 clamps to 0.
+        assert_eq!(p.cursor, 4, "empty line, col 0");
     }
 }
