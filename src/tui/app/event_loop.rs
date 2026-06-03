@@ -450,8 +450,31 @@ impl App {
             if !ready {
                 break;
             }
+            let is_user = matches!(&self.blocks[i], TranscriptBlock::User { .. });
+            let is_first = i == 0;
+
+            // Mirror the spacing from render_blocks(): add blank lines between
+            // blocks and extra blank lines around User blocks so the scrollback
+            // has the same visual breathing room as the live viewport.
+            if !is_first {
+                let mut pre: Vec<ratatui::text::Line<'static>> =
+                    vec![ratatui::text::Line::raw("")];
+                if is_user {
+                    // Extra blank before User turns.
+                    pre.push(ratatui::text::Line::raw(""));
+                }
+                self.print_queue.push(pre);
+            }
+
             let lines = render_block(&self.blocks[i], self.theme);
             self.print_queue.push(lines);
+
+            // Extra blank after User turns (same as render_blocks).
+            if is_user {
+                self.print_queue
+                    .push(vec![ratatui::text::Line::raw("")]);
+            }
+
             self.last_printed_idx += 1;
         }
     }

@@ -434,11 +434,11 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                     current_table_row.push(std::mem::take(&mut current_table_cell));
                 }
                 TagEnd::TableHead => {
-                    // NOTE: TagEnd::TableRow fires BEFORE TagEnd::TableHead for
-                    // the header row, so `current_table_row` is already empty and
-                    // the header row is already in `table_rows`. Do NOT push
-                    // current_table_row again — that would add a spurious empty row.
-                    // Just append the separator row based on the header's column count.
+                    // In pulldown-cmark 0.12 the header cells are NOT wrapped in a
+                    // TableRow event — TableHead directly contains TableCells.
+                    // Push the accumulated header row, then add the separator.
+                    table_rows.push(std::mem::take(&mut current_table_row));
+                    // Insert a separator row so render_table draws a header divider.
                     let ncols = table_rows.last().map_or(0, |r| r.len());
                     if ncols > 0 {
                         table_rows.push((0..ncols).map(|_| "---".to_string()).collect());
@@ -1099,3 +1099,28 @@ mod tests {
         );
     }
 }
+
+    /// Verify that render_markdown produces a properly boxed table for a
+    /// standard GFM table (header + separator + data rows).
+    #[test]
+    fn render_markdown_table_end_to_end() {
+        let text = "| Name | Value |\n|------|-------|\n| foo | 42 |\n| bar | 99 |";
+        let lines = render_markdown(text, 80);
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Should contain box-drawing chars and cell content.
+        assert!(all_text.contains("Name"), "header 'Name' missing");
+        assert!(all_text.contains("Value"), "header 'Value' missing");
+        assert!(all_text.contains("foo"), "data 'foo' missing");
+        assert!(all_text.contains("42"), "data '42' missing");
+        assert!(all_text.contains("bar"), "data 'bar' missing");
+        assert!(all_text.contains("99"), "data '99' missing");
+        // Box borders should be present.
+        assert!(all_text.contains('┌') || all_text.contains('─'),
+            "no box-drawing chars found");
+        // Should be more than 3 lines (top + header + divider + 2 data + bottom = 6).
+        assert!(lines.len() >= 6, "expected ≥6 lines, got {}", lines.len());
+    }
