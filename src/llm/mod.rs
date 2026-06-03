@@ -92,28 +92,21 @@ impl ModelPricing {
 
 /// Returns the context window size in tokens for the given model.
 ///
-/// Values are the input-token limits published in each provider's documentation.
-/// Unknown models fall back to a conservative 128 K token default (the minimum
-/// window common to all current-generation frontier models).
+/// The value is looked up from the bundled `providers.toml` preset catalog.
+/// Unknown models (not listed in any preset) fall back to a conservative
+/// 128 K token default — the minimum window common to all current-generation
+/// frontier models.
 pub fn context_window_tokens_for_model(model: &str) -> usize {
-    let m = model.to_lowercase();
-    if m.contains("claude") {
-        // All Claude 3+ models have 200 K input context.
-        200_000
-    } else if m.contains("minimax") || m.contains("m2") {
-        1_000_000
-    } else if m.contains("deepseek") {
-        64_000
-    } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("gpt-4") {
-        128_000
-    } else if m.contains("gpt-3.5") {
-        16_385
-    } else if m.contains("glm") {
-        128_000
-    } else {
-        // Conservative fallback for unknown models.
-        128_000
+    use crate::providers::all_presets;
+    for preset in all_presets() {
+        for spec in &preset.models {
+            if spec.name == model {
+                return spec.context_window;
+            }
+        }
     }
+    // Conservative fallback for models not listed in providers.toml.
+    128_000
 }
 
 /// Compute the default compaction character-count threshold for a model.
@@ -827,22 +820,29 @@ models:
 
     #[test]
     fn context_window_known_models() {
+        // Names must exactly match providers.toml entries.
         assert_eq!(
-            context_window_tokens_for_model("claude-3-5-sonnet"),
+            context_window_tokens_for_model("claude-sonnet-4-6"),
             200_000
         );
-        assert_eq!(context_window_tokens_for_model("claude-opus-4"), 200_000);
-        assert_eq!(context_window_tokens_for_model("MiniMax-M2"), 1_000_000);
+        assert_eq!(context_window_tokens_for_model("claude-opus-4-7"), 200_000);
+        assert_eq!(context_window_tokens_for_model("MiniMax-M3"), 1_000_000);
         assert_eq!(context_window_tokens_for_model("deepseek-chat"), 64_000);
-        assert_eq!(context_window_tokens_for_model("deepseek-v4-flash"), 64_000);
+        assert_eq!(context_window_tokens_for_model("deepseek-reasoner"), 64_000);
         assert_eq!(context_window_tokens_for_model("gpt-4o"), 128_000);
-        assert_eq!(context_window_tokens_for_model("gpt-4-turbo"), 128_000);
-        assert_eq!(context_window_tokens_for_model("gpt-3.5-turbo"), 16_385);
-        assert_eq!(context_window_tokens_for_model("glm-5.1"), 128_000);
+        assert_eq!(context_window_tokens_for_model("gpt-4o-mini"), 128_000);
+        assert_eq!(context_window_tokens_for_model("glm-4-plus"), 128_000);
+        assert_eq!(context_window_tokens_for_model("moonshot-v1-8k"), 8_000);
+        assert_eq!(
+            context_window_tokens_for_model("doubao-1-5-pro-256k"),
+            256_000
+        );
+        assert_eq!(context_window_tokens_for_model("gemini-2.5-pro"), 1_048_576);
     }
 
     #[test]
     fn context_window_unknown_model_fallback() {
+        // A model not listed in providers.toml → conservative 128 K default.
         assert_eq!(
             context_window_tokens_for_model("some-future-model"),
             128_000
@@ -851,17 +851,17 @@ models:
 
     #[test]
     fn default_compact_threshold_is_reasonable() {
-        // deepseek: 64 K tokens → 64000 - 16000(25%) = 48000 → 80% = 38400 → *4 = 153600 chars
+        // deepseek-chat: 64 K tokens → threshold should be in the 50K–300K char range
         let ds = default_compact_threshold_chars("deepseek-chat");
         assert!(ds > 50_000, "deepseek threshold too small: {ds}");
         assert!(ds < 300_000, "deepseek threshold suspiciously large: {ds}");
 
-        // claude: 200 K tokens → threshold should be much larger
-        let cl = default_compact_threshold_chars("claude-3-5-sonnet");
+        // claude-sonnet-4-6: 200 K tokens → threshold should be much larger
+        let cl = default_compact_threshold_chars("claude-sonnet-4-6");
         assert!(cl > 400_000, "claude threshold too small: {cl}");
         assert!(cl < 1_000_000, "claude threshold suspiciously large: {cl}");
 
-        // unknown model: threshold must be positive
+        // unknown model: threshold must be positive (falls back to 128K window)
         let unk = default_compact_threshold_chars("unknown-model");
         assert!(unk > 0);
     }
