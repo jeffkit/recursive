@@ -25,8 +25,9 @@ use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::tools::ToolRegistry;
 
-use crate::agent::{FinishReason, PermissionDecision, PermissionHook, PlanningMode};
+use crate::agent::{FinishReason, PermissionDecision, PlanningMode};
 use crate::event::AgentEvent;
+use crate::tools::PermissionHook;
 
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
 pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
@@ -83,7 +84,7 @@ pub(crate) struct RunCore<'a> {
     pub(crate) events: Option<mpsc::UnboundedSender<AgentEvent>>,
     pub(crate) streaming: bool,
     pub(crate) compactor: Option<Compactor>,
-    pub(crate) permission_hook: Option<PermissionHook>,
+    pub(crate) permission_hook: Option<Arc<dyn PermissionHook>>,
     pub(crate) hooks: &'a HookRegistry,
     pub(crate) planning_mode: PlanningMode,
     pub(crate) total_llm_latency_ms: u64,
@@ -306,7 +307,7 @@ impl<'a> RunCore<'a> {
             }
 
             let effective_args = if let Some(ref hook) = self.permission_hook {
-                match hook(&call.name, &call.arguments) {
+                match hook.check(&call.name, &call.arguments).await {
                     PermissionDecision::Allow => call.arguments.clone(),
                     PermissionDecision::Deny(reason) => {
                         let result = format!("ERROR: {reason}");

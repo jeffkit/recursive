@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::Instrument;
 
+use crate::agent::PermissionDecision;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::permissions::auto_classifier::AutoClassifier;
@@ -245,12 +246,17 @@ pub trait Tool: Send + Sync {
 }
 
 /// Goal-161: runtime permission hook. Implement this trait to intercept
-/// every tool invocation before it runs. Return `true` to allow or
-/// `false` to deny. When no hook is registered, all tools are allowed.
+/// every tool invocation before it runs.
+///
+/// - [`PermissionDecision::Allow`] — let the call proceed unchanged.
+/// - [`PermissionDecision::Deny(reason)`] — block and return the reason as a tool error.
+/// - [`PermissionDecision::Transform(args)`] — replace the arguments before execution.
+///
+/// When no hook is registered all tools are allowed.
 #[async_trait]
 pub trait PermissionHook: Send + Sync {
     /// Called before every tool dispatch.
-    async fn ask_permission(&self, tool_name: &str, args_preview: &str) -> bool;
+    async fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision;
 }
 
 #[derive(Clone)]
@@ -622,23 +628,28 @@ impl ToolRegistry {
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
         // Goal-161: runtime permission hook — checked first, before static
         // config, so the user gets the chance to allow/deny at call time.
-        if let Some(hook) = &self.permission_hook {
-            let preview = args_preview_for_permission(&arguments);
-            if !hook.ask_permission(name, &preview).await {
-                return Err(Error::PermissionDenied {
-                    name: name.into(),
-                    reason: DecisionReason::Hook { name: name.into() },
-                });
+        let effective_args = if let Some(hook) = &self.permission_hook {
+            match hook.check(name, &arguments).await {
+                PermissionDecision::Allow => arguments,
+                PermissionDecision::Transform(new_args) => new_args,
+                PermissionDecision::Deny(reason) => {
+                    return Err(Error::PermissionDenied {
+                        name: name.into(),
+                        reason: DecisionReason::Hook { name: reason },
+                    });
+                }
             }
-        }
-        self.invoke_with_audit(name, arguments).await.result
+        } else {
+            arguments
+        };
+        self.invoke_with_audit(name, effective_args).await.result
     }
 
     /// Invoke a tool and return both its result and a populated
     /// [`AuditMeta`]. Callers that need to persist audit data should
     /// use this method; callers that don't can call `invoke` which
     /// discards the audit half.
-    pub async fn invoke_with_audit(&self, name: &str, arguments: Value) -> ToolDispatch {
+    pub async fn invoke_with_audit(&self, name: &str, mut arguments: Value) -> ToolDispatch {
         // Static permission check before any tool execution.
         // Goal-196: extract the file-path "content" from arguments and
         // pass it to `check_static` so the safety check (protected paths
@@ -718,20 +729,23 @@ impl ToolRegistry {
             // Explicitly Allowed tools skip this check to avoid double-asking.
             if perm_is_unknown && !self.headless && is_interactive_tool {
                 if let Some(hook) = &self.permission_hook {
-                    let preview = args_preview_for_permission(&arguments);
                     drop(guard);
-                    if !hook.ask_permission(name, &preview).await {
-                        return ToolDispatch {
-                            result: Err(Error::PermissionDenied {
-                                name: name.into(),
-                                reason: DecisionReason::Hook {
-                                    name: "interactive-unknown".into(),
-                                },
-                            }),
-                            audit: AuditMeta::synthetic_unknown_tool(name),
-                        };
+                    match hook.check(name, &arguments).await {
+                        PermissionDecision::Deny(reason) => {
+                            return ToolDispatch {
+                                result: Err(Error::PermissionDenied {
+                                    name: name.into(),
+                                    reason: DecisionReason::Hook { name: reason },
+                                }),
+                                audit: AuditMeta::synthetic_unknown_tool(name),
+                            };
+                        }
+                        PermissionDecision::Transform(new_args) => {
+                            arguments = new_args;
+                        }
+                        PermissionDecision::Allow => {}
                     }
-                    // Hook allowed; guard already dropped, skip headless block.
+                    // Hook allowed/transformed; guard already dropped, skip headless block.
                 } else {
                     // No hook registered — non-headless library caller → allow.
                     drop(guard);
@@ -842,7 +856,7 @@ impl ToolRegistry {
 
 /// Build a short human-readable preview of tool arguments for the
 /// permission dialog. Extracts up to 80 characters.
-fn args_preview_for_permission(arguments: &Value) -> String {
+pub fn args_preview_for_permission(arguments: &Value) -> String {
     let s = match arguments {
         Value::Object(map) => {
             let parts: Vec<String> = map
@@ -1099,15 +1113,15 @@ mod tests {
 
     #[async_trait]
     impl PermissionHook for AllowHook {
-        async fn ask_permission(&self, _name: &str, _args: &str) -> bool {
-            true
+        async fn check(&self, _name: &str, _args: &serde_json::Value) -> PermissionDecision {
+            PermissionDecision::Allow
         }
     }
 
     #[async_trait]
     impl PermissionHook for DenyHook {
-        async fn ask_permission(&self, _name: &str, _args: &str) -> bool {
-            false
+        async fn check(&self, _name: &str, _args: &serde_json::Value) -> PermissionDecision {
+            PermissionDecision::Deny("denied by test hook".to_string())
         }
     }
 

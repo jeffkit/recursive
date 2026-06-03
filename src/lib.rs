@@ -50,7 +50,7 @@ pub mod transcript;
 pub mod tui;
 
 pub use agent::PlanningMode;
-pub use agent::{FinishReason, PermissionDecision, PermissionHook};
+pub use agent::{FinishReason, PermissionDecision};
 pub use checkpoint::{CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};
 pub use checkpoint_log::{
     read_log as read_checkpoint_log, truncate_to_turn as truncate_checkpoint_log,
@@ -121,6 +121,7 @@ pub use tool_set_provider::{
     LocalToolSetProvider, PolicyToolSetProvider, SandboxMode, ToolSetProvider,
 };
 pub use tools::policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
+pub use tools::PermissionHook;
 pub use tools::{
     build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
     PlanApprovalGate, PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult,

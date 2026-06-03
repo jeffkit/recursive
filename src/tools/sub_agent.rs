@@ -22,12 +22,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::agent::{FinishReason, PermissionHook, PlanningMode};
+use crate::agent::{FinishReason, PlanningMode};
 use crate::error::{Error, Result};
 use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
+use crate::tools::PermissionHook;
 use crate::tools::{Tool, ToolRegistry};
 
 // ---------------------------------------------------------------------------
@@ -107,7 +108,7 @@ pub struct SubAgent {
     all_tools: ToolRegistry,
     max_depth: usize,
     current_depth: usize,
-    permission_hook: Option<PermissionHook>,
+    permission_hook: Option<Arc<dyn PermissionHook>>,
 }
 
 impl SubAgent {
@@ -117,7 +118,7 @@ impl SubAgent {
         all_tools: ToolRegistry,
         max_depth: usize,
         current_depth: usize,
-        permission_hook: Option<PermissionHook>,
+        permission_hook: Option<Arc<dyn PermissionHook>>,
     ) -> Self {
         Self {
             workspace: workspace.into(),
