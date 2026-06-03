@@ -1276,13 +1276,19 @@ fn workspace_slug(workspace: &Path) -> String {
         std::env::current_dir().unwrap_or_default().join(workspace)
     };
 
+    // Only keep characters that are valid in a session_id:
+    // ASCII alphanumeric, '-', '_', '.'.  Everything else (path
+    // separators, Windows drive colons, 8.3 tildes like RUNNER~1,
+    // spaces, non-ASCII) becomes '-'.
     let s: String = abs
         .to_string_lossy()
         .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' => '-',
-            c if c.is_control() => '-',
-            c => c,
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
         })
         .collect();
     // Strip leading dashes (from root slash / drive letter)
