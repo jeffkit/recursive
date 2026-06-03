@@ -30,8 +30,8 @@ impl App {
             session_id: None,
             connected: false,
             scroll_offset: 0,
-            screen: AppScreen::Splash,
-            splash_start: Instant::now(),
+            screen: AppScreen::Chat,
+            start_time: Instant::now(),
             usage: UsageStats::default(),
             turn: TurnState::default(),
             turn_count: 0,
@@ -60,7 +60,16 @@ impl App {
             active_goal: None,
             workspace_path: workspace,
             theme: &crate::tui::ui::theme::DARK,
+            last_printed_idx: 0,
+            print_queue: Vec::new(),
+            modal_scroll: 0,
         }
+    }
+
+    /// Push a modal onto the stack and reset the modal scroll to the top.
+    pub fn push_modal(&mut self, modal: crate::tui::ui::modal::Modal) {
+        self.modal_scroll = 0;
+        self.modals.push(modal);
     }
 
     /// Backwards-compat shim for legacy code paths that still expect
@@ -146,8 +155,6 @@ impl Default for App {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use crate::tui::app::{App, AppScreen};
     use crate::tui::cost::{default_pricing_table, detect_model_name, estimate_cost};
 
@@ -164,16 +171,9 @@ mod tests {
     }
 
     #[test]
-    fn app_new_starts_in_splash_screen() {
+    fn app_new_starts_in_chat_screen() {
         let app = App::new();
-        assert_eq!(app.screen, AppScreen::Splash);
-    }
-
-    #[test]
-    fn splash_auto_transitions_after_elapsed() {
-        let app = App::new();
-        assert!(app.splash_start.elapsed() < Duration::from_secs(2));
-        assert_eq!(app.screen, AppScreen::Splash);
+        assert_eq!(app.screen, AppScreen::Chat);
     }
 
     #[test]

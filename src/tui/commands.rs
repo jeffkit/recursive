@@ -304,7 +304,7 @@ fn cmd_model(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
 }
 
 fn cmd_status(app: &mut AppState, _args: &[String]) -> CommandOutcome {
-    let uptime_secs = app.splash_start.elapsed().as_secs();
+    let uptime_secs = app.start_time.elapsed().as_secs();
     let total_tokens = app.usage.total_input.saturating_add(app.usage.total_output);
     let plan = if app.planning_mode_on { "on" } else { "off" };
     let text = format!(

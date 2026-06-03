@@ -1,16 +1,13 @@
 //! Top-level rendering dispatch.
 //!
-//! The single entry point [`render`] picks a screen renderer based on
-//! the current [`AppScreen`]. Each renderer lives in its own
-//! sub-module so future iterations can extend layouts without bloating
-//! the chat view.
-//!
-//! Goal 147 collapsed the dedicated `PlanReview` screen into the
-//! modal stack — see [`modal::render_plan_review`].
+//! The single entry point [`render`] delegates to the chat renderer.
+//! The splash screen was removed in favour of a startup banner printed
+//! to stdout before the inline TUI viewport starts — see
+//! [`crate::tui::print_startup_banner`].
 
 use ratatui::Frame;
 
-use crate::tui::app::{App, AppScreen};
+use crate::tui::app::App;
 
 pub mod chat;
 pub mod command_menu;
@@ -19,7 +16,6 @@ pub mod input;
 pub mod markdown;
 pub mod modal;
 pub mod spinner;
-pub mod splash;
 pub mod status;
 pub mod theme;
 pub mod transcript;
@@ -28,8 +24,5 @@ pub use theme::{find_theme, Theme, DARK};
 
 /// Render the current screen onto `frame`.
 pub fn render(frame: &mut Frame, app: &App) {
-    match &app.screen {
-        AppScreen::Splash => splash::render(frame),
-        AppScreen::Chat => chat::render(frame, app),
-    }
+    chat::render(frame, app);
 }

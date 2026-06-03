@@ -283,7 +283,7 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
         return text.lines().map(|l| Line::from(l.to_string())).collect();
     }
 
-    let parser = Parser::new_ext(text, Options::empty());
+    let parser = Parser::new_ext(text, Options::ENABLE_TABLES);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut pending_text: String = String::new();
@@ -292,6 +292,11 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
     let mut in_code_block = false;
     let mut code_block_lang: String = String::new();
     let mut code_block_buffer: Vec<String> = Vec::new();
+    // Table accumulation state.
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut current_table_row: Vec<String> = Vec::new();
+    let mut current_table_cell = String::new();
 
     // Helper: append `pending_text` to `current` with the active style.
     let flush_pending =
@@ -370,9 +375,27 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
                     let _ = level; // currently we render heading body as bold+cyan.
                 }
+                Tag::Table(_) => {
+                    flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                    in_table = true;
+                    table_rows.clear();
+                    current_table_row.clear();
+                    current_table_cell.clear();
+                }
+                Tag::TableHead => {
+                    current_table_row.clear();
+                    current_table_cell.clear();
+                }
+                Tag::TableRow => {
+                    current_table_row.clear();
+                    current_table_cell.clear();
+                }
+                Tag::TableCell => {
+                    current_table_cell.clear();
+                }
                 _ => {
-                    // Tags we don't render specially (links, images, tables,
-                    // block quotes, footnote defs, html blocks, def lists,
+                    // Tags we don't render specially (links, images, block
+                    // quotes, footnote defs, html blocks, def lists,
                     // strikethrough, metadata, math): fall through; their
                     // children become plain text.
                 }
@@ -407,11 +430,53 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 TagEnd::Heading(_) => {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
                 }
+                TagEnd::TableCell => {
+                    current_table_row.push(std::mem::take(&mut current_table_cell));
+                }
+                TagEnd::TableHead => {
+                    table_rows.push(std::mem::take(&mut current_table_row));
+                    // Insert a separator row so render_table draws a header line.
+                    let sep_row: Vec<String> = (0..table_rows.last().map_or(0, |r| r.len()))
+                        .map(|_| "---".to_string())
+                        .collect();
+                    table_rows.push(sep_row);
+                }
+                TagEnd::TableRow => {
+                    table_rows.push(std::mem::take(&mut current_table_row));
+                }
+                TagEnd::Table => {
+                    // Rebuild raw |-delimited rows and pass them to render_table.
+                    let raw_rows: Vec<String> = table_rows
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "|{}|",
+                                row.iter()
+                                    .map(|c| format!(" {c} "))
+                                    .collect::<Vec<_>>()
+                                    .join("|")
+                            )
+                        })
+                        .collect();
+                    let row_refs: Vec<&str> = raw_rows.iter().map(String::as_str).collect();
+                    out.extend(render_table(
+                        &row_refs,
+                        "  ",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    in_table = false;
+                    table_rows.clear();
+                    current_table_row.clear();
+                    current_table_cell.clear();
+                }
                 _ => {}
             },
             Event::Text(s) => {
                 let text = s.into_string();
-                if in_code_block {
+                if in_table {
+                    // Accumulate plain text into the current table cell.
+                    current_table_cell.push_str(&text);
+                } else if in_code_block {
                     // Code block text is line-delimited; split on '\n' so
                     // each physical line becomes a separate `Line` later.
                     // We skip a trailing empty element (the natural result

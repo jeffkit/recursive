@@ -137,7 +137,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     let Some(modal) = app.modals.last() else {
         return;
     };
-    let area = centred_rect(frame.area(), 70, 70);
+    // Use 88% width and 90% height so the expanded viewport (40 rows)
+    // gives roughly 33 usable content rows inside the border.
+    let area = centred_rect(frame.area(), 88, 90);
 
     // Dim backdrop.
     frame.render_widget(Clear, area);
@@ -163,7 +165,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(modal.title())
         .style(Style::default().bg(Color::Black));
-    let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(body)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.modal_scroll, 0));
     frame.render_widget(para, area);
 }
 
@@ -418,8 +423,16 @@ fn render_journal_body(entries: &[JournalEntry], selected: usize) -> Vec<Line<'s
             format!("── {} ──", active.name),
             Style::default().fg(Color::DarkGray),
         )));
-        for line in active.preview.lines() {
+        // Limit preview to 12 lines; use modal_scroll (↑/↓) to read more.
+        for line in active.preview.lines().take(12) {
             out.push(Line::from(format!("  {line}")));
+        }
+        let total = active.preview.lines().count();
+        if total > 12 {
+            out.push(Line::from(Span::styled(
+                format!("  … ({} more lines, ↑/↓ to scroll)", total - 12),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
     out.push(Line::raw(""));

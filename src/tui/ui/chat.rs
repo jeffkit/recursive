@@ -58,8 +58,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel.
-    let mut lines = transcript::render_blocks(&app.blocks, &app.usage, app.theme);
+    // Messages panel: only render in-flight blocks (index >= last_printed_idx).
+    // Completed blocks have already been pushed to the terminal's native
+    // scrollback buffer via `terminal.insert_before()` in the main loop.
+    let inflight = &app.blocks[app.last_printed_idx..];
+    let mut lines = transcript::render_blocks(inflight, &app.usage, app.theme);
     if app.turn.running {
         let elapsed = app
             .turn
