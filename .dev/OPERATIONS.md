@@ -120,6 +120,29 @@ Each launch creates a worktree at `.worktrees/<id>/` on a branch
 `self-improve/<id>`, runs `self-improve.sh` inside, redirects output
 to `.dev/runs/<id>.log`, and stores the PID at `.dev/runs/<id>.pid`.
 
+#### 3.2.1 Parallelism safety rule
+
+Before running two goals in parallel, verify their expected file
+touch-sets do not overlap. Goals that both modify any of the following
+files **MUST be serialized**:
+
+- `src/main.rs`
+- `src/lib.rs`
+- `src/agent.rs`
+- `Cargo.toml`
+
+How to check: read each goal file and grep for these file names in the
+scope section. When in doubt, serialize.
+
+Rationale: parallel worktrees merge cleanly when they touch disjoint
+files. Conflicts in high-contention files like `main.rs` require
+manual resolution and stall the loop.
+
+> **Tip**: mark complex or high-contention goals with
+> `## Complexity: hard` in the goal file — `self-improve.sh` will
+> automatically escalate to the pro-tier model and double the step
+> budget for those goals.
+
 ### 3.3 Wait for completion
 
 Monitor `.dev/runs/<id>.log` for terminal markers:
