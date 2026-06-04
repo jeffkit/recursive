@@ -50,7 +50,7 @@ pub enum TouchedVia {
 }
 
 /// Append-only writer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CheckpointLogWriter {
     path: PathBuf,
 }

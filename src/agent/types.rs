@@ -71,3 +71,23 @@ pub enum FinishReason {
     /// calls are blocked to prevent denial loops.
     PermissionDenialLimit,
 }
+
+impl std::fmt::Display for FinishReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FinishReason::NoMoreToolCalls => write!(f, "no_more_tool_calls"),
+            FinishReason::BudgetExceeded => write!(f, "budget_exceeded"),
+            FinishReason::ProviderStop(reason) => write!(f, "provider_stop:{reason}"),
+            FinishReason::Stuck {
+                repeated_call,
+                repeats,
+            } => write!(f, "stuck:{repeated_call}:{repeats}"),
+            FinishReason::TranscriptLimit { chars, limit } => {
+                write!(f, "transcript_limit:{chars}/{limit}")
+            }
+            FinishReason::PlanPending => write!(f, "plan_pending"),
+            FinishReason::Cancelled => write!(f, "cancelled"),
+            FinishReason::PermissionDenialLimit => write!(f, "permission_denial_limit"),
+        }
+    }
+}
