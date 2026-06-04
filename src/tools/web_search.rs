@@ -357,6 +357,84 @@ impl WebSearch {
             .collect())
     }
 
+    /// Zero-config fallback using Jina AI Search (`s.jina.ai`).
+    ///
+    /// Does not require an API key — Jina provides a free anonymous tier.
+    /// Optionally, set `RECURSIVE_WEB_SEARCH_JINA_KEY` for a higher quota.
+    /// Returns the raw Markdown content from Jina (not a structured list).
+    async fn search_jina_fallback(&self, query: &str) -> Result<String> {
+        let jina_base = self
+            .test_base_url
+            .as_deref()
+            .unwrap_or("https://s.jina.ai")
+            .trim_end_matches('/');
+
+        // URL-encode the query
+        let encoded: String = query
+            .chars()
+            .flat_map(|c| {
+                if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | ' ') {
+                    if c == ' ' {
+                        vec!['+']
+                    } else {
+                        vec![c]
+                    }
+                } else {
+                    // percent-encode
+                    format!("%{:02X}", c as u32).chars().collect()
+                }
+            })
+            .collect();
+
+        let url = format!("{jina_base}/{encoded}");
+
+        let mut req = self
+            .client
+            .get(&url)
+            .header("Accept", "text/markdown")
+            .header("X-No-Cache", "true");
+
+        // Optional: use a Jina API key for higher quota
+        if let Ok(key) = std::env::var("RECURSIVE_WEB_SEARCH_JINA_KEY") {
+            if !key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            message: format!("Jina Search request failed: {e}"),
+        })?;
+
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            message: format!("Jina Search response read failed: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(Error::Tool {
+                name: "WebSearch".into(),
+                message: format!("Jina Search HTTP {status}"),
+            });
+        }
+
+        // Truncate to avoid flooding the context
+        const JINA_MAX_CHARS: usize = 4096;
+        if body.len() > JINA_MAX_CHARS {
+            let mut end = JINA_MAX_CHARS;
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            Ok(format!(
+                "{}\n\n[...truncated at {JINA_MAX_CHARS} chars]",
+                &body[..end]
+            ))
+        } else {
+            Ok(body)
+        }
+    }
+
     /// Format results as a numbered list.
     fn format_results(results: &[SearchResult]) -> String {
         if results.is_empty() {
@@ -391,10 +469,13 @@ impl Tool for WebSearch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "WebSearch".into(),
-            description: "Search the web and return a list of relevant results (title, URL, \
-                           summary). Requires RECURSIVE_WEB_SEARCH_PROVIDER and \
-                           RECURSIVE_WEB_SEARCH_API_KEY environment variables. \
-                           Supported providers: brave, tavily, serper, bocha, bing."
+            description: "Search the web and return relevant results. When \
+                           RECURSIVE_WEB_SEARCH_PROVIDER and RECURSIVE_WEB_SEARCH_API_KEY are \
+                           set, returns a structured list (title, URL, summary) via the \
+                           configured provider (brave | tavily | serper | bocha | bing). \
+                           When no provider is configured, falls back to Jina AI Search \
+                           (zero-config, free) which returns Markdown-formatted results. \
+                           Optionally set RECURSIVE_WEB_SEARCH_JINA_KEY for a higher Jina quota."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -436,10 +517,9 @@ impl Tool for WebSearch {
             .unwrap_or(DEFAULT_NUM_RESULTS)
             .clamp(1, MAX_NUM_RESULTS);
 
+        // If no provider is configured, fall back to Jina AI Search (zero-config).
         let Some((provider, api_key)) = Self::load_config() else {
-            return Ok("WebSearch unavailable: set RECURSIVE_WEB_SEARCH_PROVIDER \
-                 (brave | tavily | serper | bocha | bing) and RECURSIVE_WEB_SEARCH_API_KEY."
-                .to_string());
+            return self.search_jina_fallback(query).await;
         };
 
         let results = match provider {
@@ -521,6 +601,7 @@ mod tests {
         let spec = WebSearch::new().spec();
         assert_eq!(spec.name, "WebSearch");
         assert!(spec.description.contains("RECURSIVE_WEB_SEARCH_PROVIDER"));
+        assert!(spec.description.contains("Jina"));
     }
 
     // ── Integration tests with mockito (no real API key needed) ─────────────
@@ -654,5 +735,49 @@ mod tests {
         let tool = WebSearch::with_test_base(server.url());
         let err = tool.search_brave("rust", 5, "bad-key").await.unwrap_err();
         assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn jina_fallback_returns_markdown_content() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/rust+programming+language")
+            .with_status(200)
+            .with_header("content-type", "text/markdown")
+            .with_body("# Rust Programming Language\n\nRust is a systems language...")
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .search_jina_fallback("rust programming language")
+            .await
+            .expect("jina fallback mock");
+        assert!(out.contains("Rust"));
+    }
+
+    #[tokio::test]
+    async fn jina_fallback_truncates_long_response() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let long_body = "x".repeat(5000);
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "text/markdown")
+            .with_body(long_body.as_str())
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .search_jina_fallback("anything")
+            .await
+            .expect("jina truncation mock");
+        assert!(out.contains("truncated"));
+        assert!(out.len() < 5000);
     }
 }
