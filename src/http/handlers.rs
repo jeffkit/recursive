@@ -8,7 +8,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::broadcast;
@@ -119,7 +119,7 @@ pub(super) async fn run_agent(
         .filter_map(|msg| serde_json::to_value(msg).ok())
         .collect();
 
-    let finish_reason = format!("{:?}", outcome.finish_reason);
+    let finish_reason = outcome.finish_reason.to_string();
 
     Ok(Json(RunResponse {
         status: "success".into(),
@@ -134,18 +134,9 @@ pub(super) async fn run_agent(
 
 // ── Session endpoints ──────────────────────────────────────────────────────
 
-/// Generate a session ID using blake3 hash of timestamp + counter.
+/// Generate a session ID using UUID v7 (time-ordered, globally unique).
 fn generate_session_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let input = format!("{}-{}", now.as_nanos(), count);
-    let hash = blake3::hash(input.as_bytes());
-    // Use first 16 hex chars for a short-ish but unique ID
-    hash.to_hex()[..16].to_string()
+    uuid::Uuid::now_v7().to_string()
 }
 
 /// Format a SystemTime as a basic ISO-8601 string (without chrono).
