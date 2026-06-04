@@ -52,6 +52,8 @@ impl App {
             hsearch_matches: Vec::new(),
             hsearch_selected: 0,
             pending_permission: None,
+            #[cfg(feature = "skill-hub")]
+            pending_skill_install: None,
             auto_allowed_tools: HashSet::new(),
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
             current_todos: Vec::new(),
@@ -138,6 +140,65 @@ impl App {
             args_preview: req.args_preview,
             reply: req.reply,
         });
+    }
+
+    /// Goal-230: receive a skill-install search request from the tool
+    /// side-channel and push the Results modal.
+    pub fn handle_skill_search_request(&mut self, req: crate::tui::events::SkillSearchRequest) {
+        use crate::tui::app::PendingSkillInstall;
+        use crate::tui::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
+
+        // Deny any lingering install reply so the previous tool call unblocks.
+        if let Some(old) = self.pending_skill_install.take() {
+            match old {
+                PendingSkillInstall::Search(tx) => {
+                    let _ = tx.send(None);
+                }
+                PendingSkillInstall::Files(tx) => {
+                    let _ = tx.send(false);
+                }
+            }
+        }
+
+        self.push_modal(Modal::SkillInstall(SkillInstallState {
+            query: req.query,
+            results: req.results,
+            slug: None,
+            files: vec![],
+            page: SkillInstallPage::Results { selected: 0 },
+        }));
+
+        self.pending_skill_install = Some(PendingSkillInstall::Search(req.reply));
+    }
+
+    /// Goal-230: receive a skill-install files request from the tool
+    /// side-channel and advance the open modal to the Files page.
+    pub fn handle_skill_files_request(&mut self, req: crate::tui::events::SkillFilesRequest) {
+        use crate::tui::app::PendingSkillInstall;
+        use crate::tui::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
+
+        // Update or push the modal with file data.
+        if let Some(Modal::SkillInstall(state)) = self.modals.last_mut() {
+            state.slug = Some(req.slug.clone());
+            state.files = req.files;
+            state.page = SkillInstallPage::Files { selected: 0 };
+        } else {
+            // Shouldn't happen, but handle gracefully.
+            self.push_modal(Modal::SkillInstall(SkillInstallState {
+                query: String::new(),
+                results: vec![],
+                slug: Some(req.slug.clone()),
+                files: req.files,
+                page: SkillInstallPage::Files { selected: 0 },
+            }));
+        }
+
+        // Swap in the phase-2 reply sender.
+        if let Some(PendingSkillInstall::Search(tx)) = self.pending_skill_install.take() {
+            // Phase 1 sender is no longer needed; drop it gracefully.
+            drop(tx);
+        }
+        self.pending_skill_install = Some(PendingSkillInstall::Files(req.reply));
     }
 }
 
