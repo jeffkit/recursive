@@ -690,7 +690,8 @@ fi
 # Disable with RECURSIVE_SMOKE_TEST=0 for debugging or when Docker is unavailable.
 if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
    && command -v argusai >/dev/null 2>&1 \
-   && [[ -f "e2e/e2e.yaml" ]]; then
+   && [[ -f "e2e/e2e.yaml" ]] \
+   && [[ -f "e2e/plugins/dist/index.js" ]]; then
   echo "[self-improve] running E2E smoke gate..."
   # Rebuild binary from modified src (agent was running the OLD binary;
   # we need to test the NEW binary that includes this goal's changes)
@@ -747,7 +748,7 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
     fi
   fi
 elif [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]; then
-  echo "[self-improve] WARN: E2E smoke skipped (argusai not found or e2e/e2e.yaml missing)"
+  echo "[self-improve] WARN: E2E smoke skipped (argusai not found, e2e/e2e.yaml missing, or plugins not built)"
 fi
 
 # ---- Self-review pipeline (default ON since batch 36) ----------------------
