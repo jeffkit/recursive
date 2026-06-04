@@ -60,6 +60,21 @@ else
   GOAL_TAG="inline"
 fi
 
+# ---- Complexity hint -------------------------------------------------------
+# If the goal file contains "## Complexity: hard" (case-insensitive),
+# escalate to the pro-tier model and double the step budget — unless the
+# caller has already set these explicitly.
+if echo "$GOAL_BODY" | grep -qiE '^##[[:space:]]*Complexity:[[:space:]]*hard'; then
+  if [[ -z "${RECURSIVE_PROVIDER:-}" && -z "${RECURSIVE_PROVIDERS:-}" && -z "${RECURSIVE_API_KEY:-}" ]]; then
+    export RECURSIVE_PROVIDER="deepseek-pro"
+    echo "[self-improve] Complexity: hard — escalating to pro tier"
+  fi
+  if [[ -z "${RECURSIVE_MAX_STEPS:-}" ]]; then
+    export RECURSIVE_MAX_STEPS=400
+    echo "[self-improve] Complexity: hard — step budget set to 400"
+  fi
+fi
+
 # ---- Git safety net pre-flight ---------------------------------------------
 
 if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
