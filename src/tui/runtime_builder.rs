@@ -53,6 +53,80 @@ pub fn build_runtime() -> RuntimeBuild {
     }
 }
 
+/// Build the agent runtime for TUI mode, returning both the runtime state and
+/// a skill-install event channel receiver so the TUI loop can handle
+/// interactive `install_skill` tool requests.
+///
+/// When the `skill-hub` feature is disabled this is identical to
+/// [`build_runtime`] plus a dummy `()` receiver; the caller must not rely on
+/// the receiver type unless the feature is enabled.
+#[cfg(feature = "skill-hub")]
+pub fn build_runtime_for_tui() -> (
+    RuntimeBuild,
+    tokio::sync::mpsc::UnboundedReceiver<crate::tui::events::SkillInstallEvent>,
+) {
+    use crate::tui::events::SkillInstallEvent;
+    use tokio::sync::mpsc;
+
+    let (skill_tx, skill_rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
+
+    let state = build_runtime_with_skill_tx(Some(skill_tx));
+    (state, skill_rx)
+}
+
+/// Inner helper: build a runtime with optional skill-hub tool injection.
+#[cfg(feature = "skill-hub")]
+fn build_runtime_with_skill_tx(
+    skill_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::events::SkillInstallEvent>>,
+) -> RuntimeBuild {
+    let config = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            return RuntimeBuild::Offline {
+                reason: format!("failed to load configuration: {e}"),
+            };
+        }
+    };
+
+    let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => {
+            return RuntimeBuild::Offline {
+                reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
+                         OPENAI_API_KEY, or run `recursive config set \
+                         provider.api_key <KEY>` to populate \
+                         ~/.recursive/config.toml."
+                    .to_string(),
+            };
+        }
+    };
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(
+        crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)
+            .with_temperature(config.temperature),
+    );
+
+    let mut tools =
+        crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
+
+    // Register skill-hub tools: find_skills (always) and install_skill (TUI only).
+    tools = tools.register(Arc::new(crate::tools::FindSkills::new(vec![])));
+    tools = tools.register(Arc::new(crate::tools::InstallSkill::new(skill_tx)));
+
+    match AgentRuntimeBuilder::new()
+        .llm(provider)
+        .tools(tools)
+        .system_prompt(&config.system_prompt)
+        .max_steps(config.max_steps)
+        .build()
+    {
+        Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
+        Err(e) => RuntimeBuild::Offline {
+            reason: format!("failed to build agent runtime: {e}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -359,6 +359,17 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
             Some(perm_req) = backend.perm_rx.recv() => {
                 app.set_pending_permission(perm_req);
             }
+            Some(skill_ev) = backend.skill_install_rx.recv() => {
+                use crate::tui::events::SkillInstallEvent;
+                match skill_ev {
+                    SkillInstallEvent::Search(req) => {
+                        app.handle_skill_search_request(req);
+                    }
+                    SkillInstallEvent::Files(req) => {
+                        app.handle_skill_files_request(req);
+                    }
+                }
+            }
         }
 
         if app.should_quit {
