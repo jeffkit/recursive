@@ -14,7 +14,9 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
+use crate::agent::PlanningMode;
 use crate::event::{AgentEvent, ChannelSink, NullSink};
+use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
 
 use super::{
@@ -52,15 +54,33 @@ pub(super) async fn run_agent(
     }
 
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
-    let system_prompt = body
-        .system_prompt
-        .unwrap_or_else(|| state.config.system_prompt.clone());
+    let system_prompt = match body.system_prompt {
+        Some(s) => s,
+        None => {
+            let mut p = state.config.system_prompt.clone();
+            if let Some(extra) = &body.append_system_prompt {
+                p.push('\n');
+                p.push_str(extra);
+            }
+            p
+        }
+    };
+    let planning_mode = parse_planning_mode(body.planning_mode.as_deref());
+    let mut tool_registry = state.tool_registry.clone();
+    if let Some(mode_str) = body.permission_mode.as_deref() {
+        let perm_mode = parse_permission_mode(mode_str);
+        tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
+            mode: perm_mode,
+            layers: Vec::new(),
+        });
+    }
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
-        .tools(state.tool_registry.clone())
+        .tools(tool_registry)
         .system_prompt(system_prompt)
         .max_steps(max_steps)
+        .planning_mode(planning_mode)
         .build()
         .map_err(|e| {
             (
@@ -132,6 +152,34 @@ pub(super) async fn run_agent(
     }))
 }
 
+// ── Request parsing helpers ────────────────────────────────────────────────
+
+/// Parse `planning_mode` string from an API request body.
+///
+/// Accepted values (case-insensitive): `"immediate"` (default), `"plan_first"`.
+/// Unknown values fall back to `Immediate`.
+fn parse_planning_mode(s: Option<&str>) -> PlanningMode {
+    match s {
+        Some(v) if v.eq_ignore_ascii_case("plan_first") || v.eq_ignore_ascii_case("planfirst") => {
+            PlanningMode::PlanFirst
+        }
+        _ => PlanningMode::Immediate,
+    }
+}
+
+/// Parse `permission_mode` string from an API request body.
+///
+/// Accepted values (case-insensitive): `"default"`, `"auto"`, `"strict"`,
+/// `"bypass"` / `"bypass_permissions"`. Unknown values fall back to `Default`.
+fn parse_permission_mode(s: &str) -> PermissionMode {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => PermissionMode::Auto,
+        "strict" => PermissionMode::Strict,
+        "bypass" | "bypass_permissions" => PermissionMode::BypassPermissions,
+        _ => PermissionMode::Default,
+    }
+}
+
 // ── Session endpoints ──────────────────────────────────────────────────────
 
 /// Generate a session ID using UUID v7 (time-ordered, globally unique).
@@ -199,15 +247,37 @@ pub(super) async fn create_session(
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
-    let system_prompt = body
-        .system_prompt
-        .unwrap_or_else(|| state.config.system_prompt.clone());
+    let system_prompt = match body.system_prompt {
+        Some(s) => s,
+        None => {
+            let mut p = state.config.system_prompt.clone();
+            if let Some(extra) = &body.append_system_prompt {
+                p.push('\n');
+                p.push_str(extra);
+            }
+            p
+        }
+    };
+    let max_steps = body
+        .max_steps
+        .map(|n| n as usize)
+        .unwrap_or(state.config.max_steps);
+    let planning_mode = parse_planning_mode(body.planning_mode.as_deref());
+    let mut tool_registry = state.tool_registry.clone();
+    if let Some(mode_str) = body.permission_mode.as_deref() {
+        let perm_mode = parse_permission_mode(mode_str);
+        tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
+            mode: perm_mode,
+            layers: Vec::new(),
+        });
+    }
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
-        .tools(state.tool_registry.clone())
+        .tools(tool_registry)
         .system_prompt(system_prompt)
-        .max_steps(state.config.max_steps)
+        .max_steps(max_steps)
+        .planning_mode(planning_mode)
         .build()
         .map_err(|e| {
             (
@@ -230,7 +300,7 @@ pub(super) async fn create_session(
     let session = SessionState {
         id: id.clone(),
         created_at: created_at.clone(),
-        title: None,
+        title: body.session_name,
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
