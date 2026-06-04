@@ -765,12 +765,23 @@ fi
 # feeds back issues for one revision round, then re-verifies.
 # Set RECURSIVE_SELF_REVIEW=0 to disable for debugging or cost-sensitive runs.
 if [[ "${RECURSIVE_SELF_REVIEW:-1}" == "1" ]]; then
-  echo "[self-improve] running code review..."
-  REVIEW_JSON=$(.dev/scripts/review-changes.sh "$SELECTED_PROVIDER" 2>/dev/null || echo '{"verdict":"approve"}')
-  VERDICT=$(echo "$REVIEW_JSON" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('verdict','approve'))" 2>/dev/null || echo "approve")
+  MAX_REVISION_ROUNDS="${RECURSIVE_MAX_REVISION_ROUNDS:-2}"
+  REVISION_ROUND=0
+  VERDICT="approve"
 
-  if [[ "$VERDICT" == "request_changes" ]]; then
-    echo "[self-improve] review rejected, feeding back..."
+  while [[ "$REVISION_ROUND" -lt "$MAX_REVISION_ROUNDS" ]]; do
+    echo "[self-improve] running code review..."
+    REVIEW_JSON=$(.dev/scripts/review-changes.sh "$SELECTED_PROVIDER" 2>/dev/null || echo '{"verdict":"approve"}')
+    VERDICT=$(echo "$REVIEW_JSON" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('verdict','approve'))" 2>/dev/null || echo "approve")
+
+    if [[ "$VERDICT" != "request_changes" ]]; then
+      echo "[self-improve] review approved"
+      break
+    fi
+
+    REVISION_ROUND=$(( REVISION_ROUND + 1 ))
+    echo "[self-improve] review rejected (round ${REVISION_ROUND}/${MAX_REVISION_ROUNDS}), feeding back..."
+
     # Extract issues as a bullet list
     ISSUES=$(echo "$REVIEW_JSON" | python3 -c "
 import sys, json
@@ -788,11 +799,10 @@ $(cat "$GOAL_SOURCE" 2>/dev/null || echo "$GOAL_BODY")
 
 Fix ONLY the issues listed above. Do not rewrite other code."
 
-    # Re-run in same worktree (up to 1 revision round)
     set +e
     "$BIN" --workspace . \
       --system-prompt-file "$SYSPROMPT_FILE" \
-      --transcript-out "${TRANSCRIPT_OUT%.json}-revision.json" \
+      --transcript-out "${TRANSCRIPT_OUT%.json}-revision-${REVISION_ROUND}.json" \
       $PRICING_FLAG \
       --log warn \
       run "$REVISION_GOAL" 2>&1 | tee -a "$LOG"
@@ -804,14 +814,16 @@ Fix ONLY the issues listed above. Do not rewrite other code."
       verdict_and_exit "rolled-back" "revision agent exited with status ${REVISION_STATUS}"
     fi
 
-    # Re-verify after revision
+    # Re-verify after each revision; bail immediately on failure
     if ! cargo test --quiet >/dev/null 2>&1; then
-      verdict_and_exit "rolled-back" "post-revision cargo test failed"
+      verdict_and_exit "rolled-back" "post-revision cargo test failed (round ${REVISION_ROUND})"
     fi
 
-    echo "[self-improve] revision applied successfully"
-  else
-    echo "[self-improve] review approved"
+    echo "[self-improve] revision round ${REVISION_ROUND} applied successfully"
+  done
+
+  if [[ "$VERDICT" == "request_changes" ]]; then
+    echo "[self-improve] review still rejecting after ${MAX_REVISION_ROUNDS} rounds — committing with warnings"
   fi
 fi
 
