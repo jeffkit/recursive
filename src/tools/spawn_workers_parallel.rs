@@ -34,7 +34,9 @@ use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::multi::AgentPool;
 use crate::permissions::PermissionMode;
+use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 use crate::tools::spawn_worker::WorkerType;
+use crate::tools::team_manage::{SharedMemoryRead, SharedMemoryWrite};
 use crate::tools::PermissionHook;
 use crate::tools::{Tool, ToolRegistry, ToolSideEffect};
 
@@ -101,6 +103,8 @@ pub struct SpawnWorkersParallel {
     current_depth: usize,
     permission_hook: Option<Arc<dyn PermissionHook>>,
     pool: Option<Arc<RwLock<AgentPool>>>,
+    /// Optional registry for inter-worker messaging via `send_message`.
+    registry: Option<WorkerRegistry>,
 }
 
 impl SpawnWorkersParallel {
@@ -120,12 +124,21 @@ impl SpawnWorkersParallel {
             current_depth,
             permission_hook,
             pool: None,
+            registry: None,
         }
     }
 
     /// Attach an `AgentPool` so workers can use custom roles via `role_name`.
     pub fn with_pool(mut self, pool: Arc<RwLock<AgentPool>>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Attach a `WorkerRegistry` for inter-worker messaging.
+    /// When set, all parallel workers are registered and given `send_message` +
+    /// `list_workers` tools so they can communicate with each other mid-run.
+    pub fn with_registry(mut self, registry: WorkerRegistry) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -145,6 +158,7 @@ impl SpawnWorkersParallel {
         index: usize,
         task: TaskDescriptor,
         pool_role: Option<(String, usize, Vec<String>)>,
+        mailbox: Option<WorkerMailbox>,
     ) -> (usize, String) {
         // Resolve system prompt
         let sys_prompt = if let Some(override_p) = &task.system_prompt_override {
@@ -164,6 +178,18 @@ impl SpawnWorkersParallel {
             task.max_steps
         };
 
+        // Resolve system prompt: inject SharedMemory context if pool is set
+        let memory_ctx = if let Some(pool) = &self.pool {
+            pool.read().await.memory().to_context_string().await
+        } else {
+            String::new()
+        };
+        let sys_prompt = if memory_ctx.is_empty() {
+            sys_prompt
+        } else {
+            format!("{sys_prompt}\n\n{memory_ctx}")
+        };
+
         // Resolve tool access
         let role_tools = pool_role.as_ref().and_then(|(_, _, tools)| {
             if tools.is_empty() {
@@ -174,10 +200,30 @@ impl SpawnWorkersParallel {
         });
         let tool_names = role_tools.or_else(|| task.worker_type.allowed_tool_names());
 
-        let sub_registry = match &tool_names {
+        let mut sub_registry = match &tool_names {
             Some(names) => self.build_sub_registry(names),
             None => self.all_tools.clone(),
         };
+
+        // Gap-2 (parallel): inject SharedMemory read/write tools when pool is available
+        if let Some(pool) = &self.pool {
+            let memory = pool.read().await.memory().clone();
+            let author = task
+                .role_name
+                .clone()
+                .or_else(|| task.worker_id.clone())
+                .unwrap_or_else(|| index.to_string());
+            sub_registry = sub_registry
+                .register(Arc::new(SharedMemoryWrite::new(memory.clone(), author)))
+                .register(Arc::new(SharedMemoryRead::new(memory)));
+        }
+
+        // Gap-4: inject send_message + list_workers tools for inter-worker communication
+        if let Some(reg) = &self.registry {
+            sub_registry = sub_registry
+                .register(Arc::new(SendMessageTool::new(reg.clone())))
+                .register(Arc::new(ListWorkersTool::new(reg.clone())));
+        }
 
         let kernel = match AgentKernel::builder()
             .llm(self.provider.clone())
@@ -205,7 +251,7 @@ impl SpawnWorkersParallel {
             planning_mode: PlanningMode::default(),
             exploring_plan_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             permission_mode: PermissionMode::Default,
-            mailbox: None,
+            mailbox,
         };
 
         let outcome = match kernel.run(ctx).await {
@@ -371,14 +417,43 @@ impl Tool for SpawnWorkersParallel {
             resolved_roles.push(role);
         }
 
+        // Pre-register all workers in the registry so they can receive messages
+        // from each other via send_message. Each worker gets a stable ID.
+        let mut mailboxes: Vec<Option<WorkerMailbox>> = Vec::with_capacity(tasks.len());
+        let mut worker_ids: Vec<String> = Vec::with_capacity(tasks.len());
+        for (_, task) in &tasks {
+            let wid = task
+                .worker_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let mailbox = if let Some(reg) = &self.registry {
+                Some(reg.register(&wid).await)
+            } else {
+                None
+            };
+            worker_ids.push(wid);
+            mailboxes.push(mailbox);
+        }
+
         // Spawn all workers concurrently
         let futures: Vec<_> = tasks
             .into_iter()
             .zip(resolved_roles)
-            .map(|((index, task), pool_role)| self.run_task(index, task, pool_role))
+            .zip(mailboxes)
+            .map(|(((index, task), pool_role), mailbox)| {
+                self.run_task(index, task, pool_role, mailbox)
+            })
             .collect();
 
         let mut results = join_all(futures).await;
+
+        // Deregister all workers from the registry
+        if let Some(reg) = &self.registry {
+            for wid in &worker_ids {
+                reg.deregister(wid).await;
+            }
+        }
+
         // Sort by original index to maintain consistent output ordering
         results.sort_by_key(|(i, _)| *i);
 

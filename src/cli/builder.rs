@@ -14,11 +14,11 @@ use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::EpisodicRecall,
     tools::{
-        ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool,
-        LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
-        RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
-        SpawnWorkerTool, SpawnWorkersParallel, SubAgent, TodoWriteTool, ToolTransport, WebFetch,
-        WorkingMemoryTool, WriteFile,
+        BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool, LoadSkill,
+        LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell, RunSkillScript,
+        ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles, SpawnWorkerTool,
+        SpawnWorkersParallel, SubAgent, TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool,
+        WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, PlanningMode, RetryPolicy,
@@ -291,7 +291,9 @@ pub(crate) async fn build_runtime(
         recursive::TouchedFiles::new(),
     )));
 
-    let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1");
+    // Accept both the old name (backward compat) and the clearer new name
+    let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1")
+        || std::env::var("RECURSIVE_TEAM_ENABLED").as_deref() == Ok("1");
     if sub_agent_enabled {
         let max_depth: usize = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
             .ok()
