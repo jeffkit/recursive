@@ -63,16 +63,25 @@ fi
 # ---- Complexity hint -------------------------------------------------------
 # If the goal file contains "## Complexity: hard" (case-insensitive),
 # escalate to the pro-tier model and double the step budget — unless the
-# caller has already set these explicitly.
+# caller has already set these explicitly. The marker is advisory: respect
+# any explicit RECURSIVE_PROVIDER/RECURSIVE_PROVIDERS/RECURSIVE_MAX_STEPS
+# the caller has chosen, and emit a single combined log line.
 if echo "$GOAL_BODY" | grep -qiE '^##[[:space:]]*Complexity:[[:space:]]*hard'; then
-  if [[ -z "${RECURSIVE_PROVIDER:-}" && -z "${RECURSIVE_PROVIDERS:-}" && -z "${RECURSIVE_API_KEY:-}" ]]; then
+  COMPLEXITY_HARD=0
+  PRO_TIER_ESCALATED=0
+  DOUBLE_BUDGET=0
+  if [[ -z "${RECURSIVE_PROVIDER:-}" && -z "${RECURSIVE_PROVIDERS:-}" ]]; then
     export RECURSIVE_PROVIDER="deepseek-pro"
-    echo "[self-improve] Complexity: hard — escalating to pro tier"
+    PRO_TIER_ESCALATED=1
   fi
   if [[ -z "${RECURSIVE_MAX_STEPS:-}" ]]; then
     export RECURSIVE_MAX_STEPS=400
-    echo "[self-improve] Complexity: hard — step budget set to 400"
+    DOUBLE_BUDGET=1
   fi
+  if [[ $PRO_TIER_ESCALATED -eq 1 || $DOUBLE_BUDGET -eq 1 ]]; then
+    echo "[self-improve] Complexity: hard — using pro tier, 400 steps"
+  fi
+  COMPLEXITY_HARD=1
 fi
 
 # ---- Git safety net pre-flight ---------------------------------------------
