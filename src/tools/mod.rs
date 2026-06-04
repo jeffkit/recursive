@@ -721,6 +721,17 @@ impl ToolRegistry {
                 Permission::Allowed(_) => {}
             }
 
+            // In Strict mode, any tool without an explicit allow rule is denied.
+            if perm_is_unknown && matches!(guard.mode, PermissionMode::Strict) {
+                return ToolDispatch {
+                    result: Err(Error::PermissionDenied {
+                        name: name.into(),
+                        reason: DecisionReason::Mode(PermissionMode::Strict),
+                    }),
+                    audit: AuditMeta::synthetic_unknown_tool(name),
+                };
+            }
+
             // Goal-212: When no rule explicitly matched (Unknown) and the tool
             // is in the interactive list, delegate to the registered
             // PermissionHook as a safety net for non-headless callers (e.g.
@@ -793,6 +804,17 @@ impl ToolRegistry {
                 }
             } else {
                 // Drop guard before tool execution (not holding across await).
+                if perm_is_unknown {
+                    // No explicit rule matched for this tool. It is being allowed
+                    // implicitly because the current permission mode is not Strict.
+                    // Consider using PermissionMode::Strict or adding an explicit
+                    // allow rule to silence this warning.
+                    tracing::warn!(
+                        tool = %name,
+                        "tool has no explicit permission rule; \
+                         allowing implicitly (use strict mode to deny by default)"
+                    );
+                }
                 drop(guard);
             }
         }

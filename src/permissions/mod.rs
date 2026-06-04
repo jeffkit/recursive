@@ -121,6 +121,14 @@ pub enum PermissionMode {
     /// A denial tracker prevents runaway loops (3 consecutive / 10 total
     /// denials → all subsequent calls denied).
     Auto,
+
+    /// Strict mode: treat `Permission::Unknown` as `Denied`.
+    ///
+    /// Any tool that does not have an explicit allow rule is blocked.
+    /// This is the safest default for untrusted or audited environments.
+    /// Use `bypassPermissions` to skip all checks, or `default` to restore
+    /// the lenient "unknown = allowed" semantics.
+    Strict,
 }
 
 // Custom Deserialize to handle both old and new string names as well as
@@ -156,6 +164,7 @@ impl<'de> Deserialize<'de> for PermissionMode {
                     }
                     "dontAsk" | "dont_ask" | "deny" | "interactive" => Ok(PermissionMode::DontAsk),
                     "auto" => Ok(PermissionMode::Auto),
+                    "strict" => Ok(PermissionMode::Strict),
                     "plan" => Ok(PermissionMode::Plan {
                         pre_plan_mode: Box::new(PermissionMode::Default),
                         bypass_available: false,
@@ -169,6 +178,7 @@ impl<'de> Deserialize<'de> for PermissionMode {
                             "auto",
                             "dontAsk",
                             "plan",
+                            "strict",
                         ],
                     )),
                 }
