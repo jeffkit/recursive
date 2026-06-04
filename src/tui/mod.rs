@@ -83,6 +83,17 @@ fn pad_to(s: &str, width: usize, reset: &str) -> String {
     }
 }
 
+/// Compute (left_col, right_col) for the banner at the given terminal width.
+///
+/// Splits the terminal at a fixed 40/60 ratio so the right "Recent sessions"
+/// column gets a comfortable width even on wide terminals. The left column
+/// is floored at 30 so the 28-char logo + 2 indent always fits.
+fn compute_column_widths(term_width: usize) -> (usize, usize) {
+    let left_col = (term_width * 40 / 100).max(30);
+    let right_col = term_width.saturating_sub(left_col + 1);
+    (left_col, right_col)
+}
+
 /// Print the startup banner in Claude Code style: two-column layout.
 ///
 /// Left column  — logo (3 lines), version · model, workspace path.
@@ -103,10 +114,10 @@ fn print_startup_banner(workspace: &std::path::Path) {
         .unwrap_or(100)
         .max(60);
 
-    // Left column gets ~46% of the terminal width (logo is 28 chars wide + indent)
-    let left_col = (term_width * 46 / 100).clamp(36, 52);
-    // Separator is 1 char, right column takes the rest.
-    let right_col = term_width.saturating_sub(left_col + 1);
+    // 40/60 split: left col holds the logo + meta, right col holds the
+    // session list. The split scales with terminal width so wide
+    // terminals don't leave 100+ chars of empty space on the right.
+    let (left_col, right_col) = compute_column_widths(term_width);
 
     // ── Left column lines ─────────────────────────────────────────────
     let model = crate::tui::cost::detect_model_name();
@@ -255,6 +266,11 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
 
     let mut terminal = make_inline_terminal(INLINE_HEIGHT_NORMAL)?;
     let mut current_inline_height = INLINE_HEIGHT_NORMAL;
+    // Track the terminal size so we can rebuild the inline viewport when
+    // the user resizes the window. Crossterm's `Event::Resize` is not
+    // reliably delivered across all terminals, so we poll `terminal::size`
+    // and rebuild whenever it changes.
+    let mut last_size: (u16, u16) = crossterm::terminal::size().unwrap_or((100, 30));
 
     let mut backend = backend;
     let mut app = App::new();
@@ -327,6 +343,15 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
                         }
                     }
                 }
+                // Detect terminal resize: rebuild the inline viewport so
+                // chat / status / input span the new full width instead
+                // of staying locked to the size at startup.
+                if let Ok(cur) = crossterm::terminal::size() {
+                    if cur != last_size {
+                        last_size = cur;
+                        terminal = make_inline_terminal(current_inline_height)?;
+                    }
+                }
             }
             Some(ui_event) = backend.event_rx.recv() => {
                 app.handle_ui_event(ui_event);
@@ -343,4 +368,72 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_len_strips_ansi_sequences() {
+        assert_eq!(visible_len("hello"), 5);
+        assert_eq!(visible_len("\x1b[36mhello\x1b[0m"), 5);
+        assert_eq!(visible_len("\x1b[1mRECURSIVE\x1b[0m"), 9);
+    }
+
+    #[test]
+    fn visible_len_counts_cjk_as_two_columns() {
+        // Two CJK characters = 4 visual columns.
+        assert_eq!(visible_len("中文"), 4);
+        assert_eq!(visible_len("\x1b[1m中文\x1b[0m"), 4);
+    }
+
+    #[test]
+    fn pad_to_appends_spaces_to_visible_width() {
+        let s = pad_to("abc", 10, "\x1b[0m");
+        assert_eq!(visible_len(&s), 10);
+        assert!(s.starts_with("abc"));
+    }
+
+    #[test]
+    fn pad_to_is_noop_when_already_wide() {
+        let s = pad_to("abcdef", 3, "\x1b[0m");
+        assert_eq!(s, "abcdef");
+    }
+
+    #[test]
+    fn column_widths_40_60_split() {
+        // 40% of 100 = 40 left, 59 right (separator takes 1 char).
+        let (l, r) = compute_column_widths(100);
+        assert_eq!(l, 40);
+        assert_eq!(r, 59);
+    }
+
+    #[test]
+    fn column_widths_scale_with_wide_terminals() {
+        // 200-char terminal: no longer hard-capped at 52.
+        let (l, r) = compute_column_widths(200);
+        assert_eq!(l, 80);
+        assert_eq!(r, 119);
+        assert!(l >= 52, "left_col should exceed the old 52-char cap");
+    }
+
+    #[test]
+    fn column_widths_floor_left_at_30() {
+        // Very narrow terminal: left_col floored at 30 so the 28-char
+        // logo + 2 indent always fits.
+        let (l, r) = compute_column_widths(60);
+        assert_eq!(l, 30);
+        assert_eq!(r, 29);
+    }
+
+    #[test]
+    fn column_widths_sum_with_separator() {
+        for w in [60, 80, 100, 120, 150, 200, 250] {
+            let (l, r) = compute_column_widths(w);
+            assert_eq!(l + r + 1, w, "l={l} r={r} w={w}");
+        }
+    }
 }
