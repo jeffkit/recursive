@@ -44,6 +44,7 @@ pub fn build_runtime() -> RuntimeBuild {
         .tools(tools)
         .system_prompt(&config.system_prompt)
         .max_steps(config.max_steps)
+        .with_plan_mode_tools(true)
         .build()
     {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
@@ -118,6 +119,7 @@ fn build_runtime_with_skill_tx(
         .tools(tools)
         .system_prompt(&config.system_prompt)
         .max_steps(config.max_steps)
+        .with_plan_mode_tools(true)
         .build()
     {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),

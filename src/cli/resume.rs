@@ -396,6 +396,7 @@ pub(crate) async fn run_resumed(
         Some(&goal),
         Some(event_sink),
         Some(shutdown.clone()),
+        true, // interactive resume — plan mode tools enabled
     )
     .await?;
 

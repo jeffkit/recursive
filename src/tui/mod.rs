@@ -34,15 +34,15 @@ use crate::tui::events::UserAction;
 
 // ── Startup banner ────────────────────────────────────────────────────────────
 
-/// Normal inline viewport height (input + status bar + in-flight streaming).
-/// Completed messages are pushed to the terminal's native scrollback via
-/// `terminal.insert_before()` so they remain readable above this region.
-const INLINE_HEIGHT_NORMAL: u16 = 10;
-
-/// Expanded inline viewport height used while a modal or permission popup is
-/// visible.  70% of 40 ≈ 28 rows — plenty for Help, ResumePicker, etc.
-/// When the modal closes the viewport shrinks back to `INLINE_HEIGHT_NORMAL`.
-const INLINE_HEIGHT_EXPANDED: u16 = 40;
+/// Inline viewport height.  A single fixed height is used for both normal
+/// chat and modal/permission popups so the viewport never needs to be
+/// resized.  Resizing (expand then shrink) pushes stale content into the
+/// terminal's native scrollback buffer and causes dismissed modals to appear
+/// as residue that scrolls up with subsequent chat messages.  Using a single
+/// 40-row height avoids this entirely: modals render in the upper portion,
+/// the input and status bar sit at the bottom, and completed messages are
+/// still pushed to native scrollback via `terminal.insert_before()`.
+const INLINE_HEIGHT_NORMAL: u16 = 40;
 
 /// Strip ANSI escape sequences from a string and return the visible character count.
 fn visible_len(s: &str) -> usize {
@@ -265,7 +265,6 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     let _guard = RawModeGuard;
 
     let mut terminal = make_inline_terminal(INLINE_HEIGHT_NORMAL)?;
-    let mut current_inline_height = INLINE_HEIGHT_NORMAL;
     // Track the terminal size so we can rebuild the inline viewport when
     // the user resizes the window. Crossterm's `Event::Resize` is not
     // reliably delivered across all terminals, so we poll `terminal::size`
@@ -315,28 +314,11 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
             })?;
         }
 
-        // ── Dynamic viewport height (fake-cc style) ───────────────────────
-        // Expand the viewport when modals / permission popups are open so
-        // they have room to render.  Shrink back once everything is closed.
-        let needs_expanded = !app.modals.is_empty() || app.pending_permission.is_some();
-        let desired_height = if needs_expanded {
-            INLINE_HEIGHT_EXPANDED
-        } else {
-            INLINE_HEIGHT_NORMAL
-        };
-        if desired_height != current_inline_height {
-            if desired_height < current_inline_height {
-                // When shrinking the viewport (e.g. after a modal is dismissed),
-                // render a blank frame with the expanded terminal first.  This
-                // overwrites the stale modal content so it does not remain
-                // visible above the new smaller inline viewport.
-                terminal.draw(|frame| {
-                    frame.render_widget(ratatui::widgets::Clear, frame.area());
-                })?;
-            }
-            terminal = make_inline_terminal(desired_height)?;
-            current_inline_height = desired_height;
-        }
+        // ── Viewport height ────────────────────────────────────────────────
+        // INLINE_HEIGHT_NORMAL == INLINE_HEIGHT_EXPANDED (both 40), so the
+        // viewport never needs to be resized for modals.  This eliminates the
+        // expand/shrink bug where dismissed modal content was pushed into the
+        // terminal's native scrollback and remained visible as residue.
 
         terminal.draw(|frame| ui::chat::render(frame, &app))?;
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
@@ -358,7 +340,7 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
                 if let Ok(cur) = crossterm::terminal::size() {
                     if cur != last_size {
                         last_size = cur;
-                        terminal = make_inline_terminal(current_inline_height)?;
+                        terminal = make_inline_terminal(INLINE_HEIGHT_NORMAL)?;
                     }
                 }
             }
