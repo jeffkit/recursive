@@ -23,6 +23,13 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_NUM_RESULTS: u64 = 5;
 const MAX_NUM_RESULTS: u64 = 10;
 
+// Default base URLs — overridable in tests via `WebSearch::with_test_base`.
+const BRAVE_BASE: &str = "https://api.search.brave.com";
+const TAVILY_BASE: &str = "https://api.tavily.com";
+const SERPER_BASE: &str = "https://google.serper.dev";
+const BOCHA_BASE: &str = "https://api.bochaai.com";
+const BING_BASE: &str = "https://api.bing.microsoft.com";
+
 /// Supported search providers.
 #[derive(Debug, Clone, PartialEq)]
 enum Provider {
@@ -49,6 +56,10 @@ impl Provider {
 #[derive(Debug, Clone)]
 pub struct WebSearch {
     client: Client,
+    /// When set (tests only), replaces the provider's real base URL.
+    /// A single override is sufficient because integration tests run one
+    /// provider at a time against a mockito server.
+    test_base_url: Option<String>,
 }
 
 impl WebSearch {
@@ -60,7 +71,34 @@ impl WebSearch {
             .user_agent(format!("recursive-agent/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client build");
-        Self { client }
+        Self {
+            client,
+            test_base_url: None,
+        }
+    }
+
+    /// Test-only constructor that redirects all provider requests to `base_url`.
+    #[cfg(test)]
+    fn with_test_base(base_url: impl Into<String>) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
+            .user_agent("recursive-test")
+            .build()
+            .expect("reqwest client build");
+        Self {
+            client,
+            test_base_url: Some(base_url.into()),
+        }
+    }
+
+    /// Resolve the effective base URL for a provider.
+    fn base_url(&self, default: &str) -> String {
+        self.test_base_url
+            .as_deref()
+            .unwrap_or(default)
+            .trim_end_matches('/')
+            .to_string()
     }
 
     /// Read provider + api_key from env. Returns `None` if not configured.
@@ -80,9 +118,10 @@ impl WebSearch {
         num: u64,
         api_key: &str,
     ) -> Result<Vec<SearchResult>> {
+        let url = format!("{}/res/v1/web/search", self.base_url(BRAVE_BASE));
         let resp = self
             .client
-            .get("https://api.search.brave.com/res/v1/web/search")
+            .get(&url)
             .header("Accept", "application/json")
             .header("Accept-Encoding", "gzip")
             .header("X-Subscription-Token", api_key)
@@ -128,6 +167,7 @@ impl WebSearch {
         num: u64,
         api_key: &str,
     ) -> Result<Vec<SearchResult>> {
+        let url = format!("{}/search", self.base_url(TAVILY_BASE));
         let body = json!({
             "api_key": api_key,
             "query": query,
@@ -138,7 +178,7 @@ impl WebSearch {
 
         let resp = self
             .client
-            .post("https://api.tavily.com/search")
+            .post(&url)
             .json(&body)
             .send()
             .await
@@ -177,6 +217,7 @@ impl WebSearch {
         num: u64,
         api_key: &str,
     ) -> Result<Vec<SearchResult>> {
+        let url = format!("{}/search", self.base_url(SERPER_BASE));
         let body = json!({
             "q": query,
             "num": num,
@@ -184,7 +225,7 @@ impl WebSearch {
 
         let resp = self
             .client
-            .post("https://google.serper.dev/search")
+            .post(&url)
             .header("X-API-KEY", api_key)
             .header("Content-Type", "application/json")
             .json(&body)
@@ -226,6 +267,7 @@ impl WebSearch {
         num: u64,
         api_key: &str,
     ) -> Result<Vec<SearchResult>> {
+        let url = format!("{}/v1/web-search", self.base_url(BOCHA_BASE));
         let body = json!({
             "query": query,
             "count": num,
@@ -233,7 +275,7 @@ impl WebSearch {
 
         let resp = self
             .client
-            .post("https://api.bochaai.com/v1/web-search")
+            .post(&url)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -274,9 +316,10 @@ impl WebSearch {
     }
 
     async fn search_bing(&self, query: &str, num: u64, api_key: &str) -> Result<Vec<SearchResult>> {
+        let url = format!("{}/v7.0/search", self.base_url(BING_BASE));
         let resp = self
             .client
-            .get("https://api.bing.microsoft.com/v7.0/search")
+            .get(&url)
             .header("Ocp-Apim-Subscription-Key", api_key)
             .query(&[("q", query), ("count", &num.to_string())])
             .send()
@@ -336,6 +379,7 @@ impl WebSearch {
     }
 }
 
+#[derive(Debug)]
 struct SearchResult {
     title: String,
     url: String,
@@ -414,6 +458,8 @@ impl Tool for WebSearch {
 mod tests {
     use super::*;
 
+    // ── Unit tests (no network) ──────────────────────────────────────────────
+
     #[test]
     fn provider_from_str_recognises_all() {
         assert_eq!(Provider::from_str("brave"), Some(Provider::Brave));
@@ -451,18 +497,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_unconfigured_message_when_no_env() {
-        // Ensure env vars are absent for this test by using a fresh env state.
-        // We can't unset global env safely in parallel tests, so we call load_config
-        // directly with a known-absent key name and verify the tool response path.
-        // Instead, test the format_results path + spec.
-        let tool = WebSearch::new();
-        let spec = tool.spec();
-        assert_eq!(spec.name, "WebSearch");
-        assert!(spec.description.contains("RECURSIVE_WEB_SEARCH_PROVIDER"));
-    }
-
-    #[tokio::test]
     async fn rejects_empty_query() {
         let tool = WebSearch::new();
         let err = tool.execute(json!({"query": ""})).await.unwrap_err();
@@ -478,26 +512,147 @@ mod tests {
 
     #[test]
     fn num_results_clamped_to_max() {
-        // Verify the clamping logic: MAX_NUM_RESULTS = 10
         let clamped = 100u64.clamp(1, MAX_NUM_RESULTS);
         assert_eq!(clamped, 10);
     }
 
     #[test]
-    fn load_config_returns_none_without_env() {
-        // When env vars are absent load_config returns None
-        // (we don't set them in this test scope)
-        // This test is deliberately lightweight — it checks the happy path
-        // where both vars are missing.
-        // Full env manipulation would race with other tests (AGENTS.md §env-var tests).
-        let provider_set = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").is_ok();
-        let key_set = std::env::var("RECURSIVE_WEB_SEARCH_API_KEY").is_ok();
-        if !provider_set || !key_set {
-            // At least one var absent → load_config should return None
-            // (we can assert this only when we know neither is set)
-            if !provider_set && !key_set {
-                assert!(WebSearch::load_config().is_none());
-            }
-        }
+    fn spec_name_and_description() {
+        let spec = WebSearch::new().spec();
+        assert_eq!(spec.name, "WebSearch");
+        assert!(spec.description.contains("RECURSIVE_WEB_SEARCH_PROVIDER"));
+    }
+
+    // ── Integration tests with mockito (no real API key needed) ─────────────
+    //
+    // Per AGENTS.md: env-var tests MUST be ONE test function to avoid races.
+    // This single test covers all 5 providers sequentially.
+
+    #[tokio::test]
+    async fn mock_providers_return_expected_results() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let base = server.url();
+
+        // ── Brave ──
+        let brave_mock = server
+            .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"web":{"results":[{"title":"Rust","url":"https://rust-lang.org","description":"A systems language"}]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(&base);
+        let out = tool
+            .search_brave("rust lang", 5, "test-key")
+            .await
+            .expect("brave mock");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Rust");
+        assert_eq!(out[0].url, "https://rust-lang.org");
+        assert_eq!(out[0].snippet, "A systems language");
+        brave_mock.assert_async().await;
+
+        // ── Tavily ──
+        let tavily_mock = server
+            .mock("POST", "/search")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"results":[{"title":"Tavily","url":"https://tavily.com","content":"AI search"}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let out = tool
+            .search_tavily("ai search", 5, "test-key")
+            .await
+            .expect("tavily mock");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Tavily");
+        assert_eq!(out[0].snippet, "AI search");
+        tavily_mock.assert_async().await;
+
+        // ── Serper ──
+        let serper_mock = server
+            .mock("POST", "/search")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"organic":[{"title":"Google","link":"https://google.com","snippet":"Search engine"}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let out = tool
+            .search_serper("google", 5, "test-key")
+            .await
+            .expect("serper mock");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://google.com");
+        serper_mock.assert_async().await;
+
+        // ── Bocha ──
+        let bocha_mock = server
+            .mock("POST", "/v1/web-search")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"webPages":{"value":[{"name":"Bocha","url":"https://bochaai.com","snippet":"National AI search"}]}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let out = tool
+            .search_bocha("bocha", 5, "test-key")
+            .await
+            .expect("bocha mock");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Bocha");
+        bocha_mock.assert_async().await;
+
+        // ── Bing ──
+        let bing_mock = server
+            .mock("GET", "/v7.0/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"webPages":{"value":[{"name":"Bing","url":"https://bing.com","snippet":"Microsoft search"}]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let out = tool
+            .search_bing("bing", 5, "test-key")
+            .await
+            .expect("bing mock");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].snippet, "Microsoft search");
+        bing_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn mock_provider_http_error_propagates() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"Unauthorized"}"#)
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let err = tool.search_brave("rust", 5, "bad-key").await.unwrap_err();
+        assert!(err.to_string().contains("401"));
     }
 }
