@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use recursive::config::{load_project_context, Config};
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
+use recursive::multi::coordinator_system_prompt;
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
 #[cfg(feature = "web_search")]
 use recursive::tools::WebSearch;
@@ -332,23 +333,41 @@ pub(crate) async fn build_runtime(
 
     let skills = discover_loaded_skills(config);
     let project_context = load_project_context(&config.workspace);
+
+    // Gap-3: When sub-agent / worker mode is enabled, append the coordinator
+    // workflow prompt so the agent knows how to design and orchestrate a team.
+    let coordinator_suffix = if sub_agent_enabled {
+        format!(
+            "\n\n---\n\n## Coordinator workflow\n\n{}",
+            coordinator_system_prompt()
+        )
+    } else {
+        String::new()
+    };
+
     let mut system_prompt = match (&project_context, skills.is_empty()) {
         (Some(ctx), true) => {
             format!(
-                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}",
-                ctx, config.system_prompt
+                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}{}",
+                ctx, config.system_prompt, coordinator_suffix
             )
         }
         (Some(ctx), false) => {
             format!(
-                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}\n{}",
+                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}\n{}{}",
                 ctx,
                 config.system_prompt,
-                skill_index(&skills)
+                skill_index(&skills),
+                coordinator_suffix
             )
         }
-        (None, true) => config.system_prompt.clone(),
-        (None, false) => format!("{}\n{}", config.system_prompt, skill_index(&skills)),
+        (None, true) => format!("{}{}", config.system_prompt, coordinator_suffix),
+        (None, false) => format!(
+            "{}\n{}{}",
+            config.system_prompt,
+            skill_index(&skills),
+            coordinator_suffix
+        ),
     };
     let injected = skills_for_injection(&skills, goal.unwrap_or(""));
     if !injected.is_empty() {

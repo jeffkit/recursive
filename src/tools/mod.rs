@@ -214,7 +214,9 @@ pub use spawn_worker::{SpawnWorkerTool, WorkerType};
 pub use spawn_workers_parallel::SpawnWorkersParallel;
 pub use str_replace::StrReplaceTool;
 pub use sub_agent::SubAgent;
-pub use team_manage::{TeamAddRole, TeamListRoles, TeamRemoveRole};
+pub use team_manage::{
+    SharedMemoryRead, SharedMemoryWrite, TeamAddRole, TeamListRoles, TeamRemoveRole,
+};
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
