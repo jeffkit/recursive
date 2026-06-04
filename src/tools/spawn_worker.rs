@@ -31,6 +31,7 @@ use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::multi::AgentPool;
 use crate::permissions::PermissionMode;
+use crate::tools::team_manage::{SharedMemoryRead, SharedMemoryWrite};
 use crate::tools::PermissionHook;
 use crate::tools::{Tool, ToolRegistry, ToolSideEffect};
 
@@ -295,7 +296,7 @@ impl Tool for SpawnWorkerTool {
         };
 
         // System prompt priority: explicit arg > pool role > worker_type default
-        let sys_prompt = if let Some(override_prompt) =
+        let base_prompt = if let Some(override_prompt) =
             arguments.get("system_prompt").and_then(|v| v.as_str())
         {
             override_prompt.to_string()
@@ -303,6 +304,19 @@ impl Tool for SpawnWorkerTool {
             role_prompt.clone()
         } else {
             worker_type.system_prompt().to_string()
+        };
+
+        // Gap-1: Inject SharedMemory context from the pool so workers can see
+        // state published by other workers or the coordinator.
+        let memory_ctx = if let Some(pool) = &self.pool {
+            pool.read().await.memory().to_context_string().await
+        } else {
+            String::new()
+        };
+        let sys_prompt = if memory_ctx.is_empty() {
+            base_prompt
+        } else {
+            format!("{base_prompt}\n\n{memory_ctx}")
         };
 
         // Assign a stable worker_id and optionally register in the registry so
@@ -329,7 +343,7 @@ impl Tool for SpawnWorkerTool {
         });
         let tool_names = role_tools.or_else(|| worker_type.allowed_tool_names());
 
-        let sub_registry = match &tool_names {
+        let mut sub_registry = match &tool_names {
             Some(names) => self.build_sub_registry(names),
             None => {
                 // Full access: give worker all parent tools.
@@ -353,6 +367,18 @@ impl Tool for SpawnWorkerTool {
                 reg
             }
         };
+
+        // Gap-2: Register shared memory tools when pool is available so workers can
+        // publish intermediate results and read state from other workers.
+        if let Some(pool) = &self.pool {
+            let memory = pool.read().await.memory().clone();
+            let author = role_name_opt
+                .map(str::to_string)
+                .unwrap_or_else(|| worker_id.clone());
+            sub_registry = sub_registry
+                .register(Arc::new(SharedMemoryWrite::new(memory.clone(), author)))
+                .register(Arc::new(SharedMemoryRead::new(memory)));
+        }
 
         let kernel = AgentKernel::builder()
             .llm(self.provider.clone())
