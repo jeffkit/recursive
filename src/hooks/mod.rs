@@ -105,8 +105,7 @@ pub enum HookEvent<'a> {
     },
     /// Fired at the end of an agent run, before returning.
     ///
-    /// Currently only dispatched by the legacy `Agent` path (deleted in
-    /// Goal 219). The `AgentRuntime` does not yet dispatch `SessionEnd`.
+    /// Dispatched by `AgentRuntime::run()` after every turn completes.
     SessionEnd {
         /// The outcome that will be returned.
         outcome: &'a RuntimeOutcome,

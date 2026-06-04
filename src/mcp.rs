@@ -58,6 +58,9 @@ pub struct McpServer {
     /// URL for HTTP+SSE transport, or None if using stdio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Extra environment variables to set when spawning a stdio subprocess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
 }
 
 /// Optional 2025-03-26 MCP tool annotations that carry hints about
@@ -269,16 +272,18 @@ impl McpClient {
 
     /// Spawn via stdio subprocess.
     async fn spawn_stdio(server: &McpServer, read_timeout: Duration) -> Result<Self> {
-        let mut child = Command::new(&server.command)
-            .args(&server.args)
+        let mut cmd = Command::new(&server.command);
+        cmd.args(&server.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| Error::Mcp {
-                server: server.name.clone(),
-                message: format!("failed to spawn: {e}"),
-            })?;
+            .stderr(std::process::Stdio::null());
+        if let Some(env) = &server.env {
+            cmd.envs(env);
+        }
+        let mut child = cmd.spawn().map_err(|e| Error::Mcp {
+            server: server.name.clone(),
+            message: format!("failed to spawn: {e}"),
+        })?;
 
         let stdin = child.stdin.take().ok_or_else(|| Error::Mcp {
             server: server.name.clone(),
@@ -1511,6 +1516,7 @@ async fn load_mcp_discovery_config(path: &Path) -> Result<Vec<McpServer>> {
             command: config.command,
             args: config.args,
             url: config.url,
+            env: config.env,
         })
         .collect();
 

@@ -59,9 +59,8 @@ impl Compactor {
 
     /// Render a structured compaction result into the message format.
     fn render_structured(summary: &str, kept_facts: &[String], next_steps: &[String]) -> String {
-        let mut rendered = format!(
-            "[Context compacted at step N]\n\nSummary: {summary}\n\nKey facts to remember:\n"
-        );
+        let mut rendered =
+            format!("[compacted: structured]\n\nSummary: {summary}\n\nKey facts to remember:\n");
         for fact in kept_facts {
             rendered.push_str(&format!("- {fact}\n"));
         }
@@ -89,10 +88,16 @@ impl Compactor {
              Conversation to summarize:\n{older_text}"
         );
 
+        let schema = match serde_json::from_str(Self::COMPACT_SCHEMA) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "COMPACT_SCHEMA is invalid JSON, falling back");
+                return None;
+            }
+        };
         let structured_req = StructuredRequest {
             messages: vec![Message::user(structured_prompt)],
-            schema: serde_json::from_str(Self::COMPACT_SCHEMA)
-                .expect("COMPACT_SCHEMA is valid JSON"),
+            schema,
             schema_name: "compaction_result".to_string(),
         };
 
@@ -376,9 +381,7 @@ mod tests {
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should contain the structured rendering format
-        assert!(summary_msg
-            .content
-            .contains("[Context compacted at step N]"));
+        assert!(summary_msg.content.contains("[compacted: structured]"));
         assert!(summary_msg.content.contains("Summary: Added adder tool"));
         assert!(summary_msg.content.contains("Key facts to remember:"));
         assert!(summary_msg.content.contains("- goal=add_adder_tool"));

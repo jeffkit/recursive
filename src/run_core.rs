@@ -18,7 +18,7 @@ const LLM_MAX_RETRIES: u32 = 3;
 const LLM_RETRY_BASE_MS: u64 = 1_000;
 
 use crate::compact::Compactor;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
 use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
@@ -424,6 +424,18 @@ impl<'a> RunCore<'a> {
                         .iter()
                         .find(|(id, _, _, _, _, _)| id == &pc.id)
                     else {
+                        // Task panicked — push a placeholder error result so
+                        // the tool-call ↔ tool-result pairing invariant (#8)
+                        // is preserved. Without this, the next LLM request
+                        // would include an orphaned tool_call with no matching
+                        // tool result and be rejected with HTTP 400.
+                        results.push((
+                            pc.id.clone(),
+                            pc.name.clone(),
+                            "ERROR: tool task panicked during parallel execution".to_string(),
+                            pc.args.clone(),
+                            None,
+                        ));
                         continue;
                     };
                     results.push((
@@ -684,15 +696,6 @@ impl<'a> RunCore<'a> {
 
             // ---- no tool calls → finish -------------------------------------------
             if completion.tool_calls.is_empty() {
-                if matches!(completion.finish_reason.as_deref(), Some("length")) {
-                    let finish = FinishReason::ProviderStop("length".into());
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: step,
-                    });
-                    return Err(Error::ProviderTruncated("length".into()));
-                }
-
                 self.push_message(Message::assistant(completion.content.clone()));
                 if completion.reasoning_content.is_some() {
                     if let Some(msg) = self.messages.last_mut() {
