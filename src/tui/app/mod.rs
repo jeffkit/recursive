@@ -123,6 +123,11 @@ pub struct App {
     /// Whether the runtime permission hook is currently active.
     /// Toggled by `/permissions on|off`. Shared with the backend worker.
     pub permission_hook_enabled: Arc<AtomicBool>,
+    /// Goal-230: pending skill-install reply channel. Holds the
+    /// `oneshot::Sender` for the current phase of an `install_skill` modal
+    /// interaction. `None` when no install is in progress.
+    #[cfg(feature = "skill-hub")]
+    pub pending_skill_install: Option<PendingSkillInstall>,
     /// Goal-167: current task list maintained by `todo_write` calls.
     /// Empty when no task list has been set this session.
     pub current_todos: Vec<crate::tools::todo::TodoItem>,
@@ -151,6 +156,18 @@ pub struct App {
     /// (ResumePicker, McpServers, Journal) the key handler auto-updates
     /// this to keep the selection visible.
     pub modal_scroll: u16,
+}
+
+// ── Goal-230: PendingSkillInstall ────────────────────────────────────────────
+
+/// Holds the active oneshot reply sender for the ongoing `install_skill`
+/// modal interaction. Consumed exactly once; becomes `None` once consumed.
+#[cfg(feature = "skill-hub")]
+pub enum PendingSkillInstall {
+    /// Phase 1 — waiting for the user to choose a slug from the results list.
+    Search(tokio::sync::oneshot::Sender<Option<String>>),
+    /// Phase 2 — waiting for the user to confirm (or cancel) installation.
+    Files(tokio::sync::oneshot::Sender<bool>),
 }
 
 // ── Goal-161: PendingPermission ──────────────────────────────────────────────

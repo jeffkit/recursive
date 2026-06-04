@@ -21,8 +21,8 @@ use tokio::task::JoinHandle;
 use crate::tui::bash::{build_bash_registry, resolve_workspace_root, run_bash_command};
 #[cfg(feature = "weixin")]
 use crate::tui::events::WeixinBackendRequest;
-use crate::tui::events::{PermissionRequest, UiEvent, UserAction};
-use crate::tui::runtime_builder::{build_runtime, RuntimeBuild};
+use crate::tui::events::{PermissionRequest, SkillInstallEvent, UiEvent, UserAction};
+use crate::tui::runtime_builder::RuntimeBuild;
 
 /// Local helper to fan-out from two channels in the worker loop.
 enum Either<L, R> {
@@ -45,6 +45,10 @@ pub struct Backend {
     /// Goal-161: shared flag that enables/disables the runtime permission
     /// hook. The UI thread can flip this via `/permissions on|off`.
     pub permission_enabled: Arc<AtomicBool>,
+    /// Goal-230: side-channel for skill-hub install requests from `install_skill`.
+    /// Always present; when the `skill-hub` feature is disabled the receiver is
+    /// backed by a channel whose sender is immediately dropped, so it never fires.
+    pub skill_install_rx: mpsc::UnboundedReceiver<SkillInstallEvent>,
     /// WeChat side-channel: the daemon sends `WeixinBackendRequest`s here.
     /// The UI loop passes this into [`Backend::weixin_tx`] to the daemon.
     #[cfg(feature = "weixin")]
@@ -54,7 +58,15 @@ pub struct Backend {
 
 impl Backend {
     pub fn spawn() -> Self {
-        Self::spawn_with_state(build_runtime())
+        #[cfg(feature = "skill-hub")]
+        {
+            let (state, skill_install_rx) = crate::tui::runtime_builder::build_runtime_for_tui();
+            Self::spawn_with_state_and_skill_rx(state, skill_install_rx)
+        }
+        #[cfg(not(feature = "skill-hub"))]
+        {
+            Self::spawn_with_state(build_runtime())
+        }
     }
 
     pub fn spawn_with_runtime(rt: AgentRuntime) -> Self {
@@ -62,6 +74,47 @@ impl Backend {
     }
 
     fn spawn_with_state(state: RuntimeBuild) -> Self {
+        let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
+        // Dummy skill-install channel: sender dropped immediately → receiver never fires.
+        let (_dummy_skill_tx, skill_install_rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let permission_enabled = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "weixin")]
+        let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
+
+        let worker = tokio::spawn(worker_loop(
+            state,
+            action_rx,
+            event_tx,
+            perm_tx,
+            cancel_flag.clone(),
+            cancel_notify.clone(),
+            permission_enabled.clone(),
+            #[cfg(feature = "weixin")]
+            weixin_rx,
+        ));
+
+        Self {
+            action_tx,
+            event_rx,
+            perm_rx,
+            cancel_flag,
+            permission_enabled,
+            #[cfg(feature = "weixin")]
+            weixin_tx,
+            skill_install_rx,
+            _worker: worker,
+        }
+    }
+
+    #[cfg(feature = "skill-hub")]
+    fn spawn_with_state_and_skill_rx(
+        state: RuntimeBuild,
+        skill_install_rx: mpsc::UnboundedReceiver<SkillInstallEvent>,
+    ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
@@ -91,6 +144,7 @@ impl Backend {
             permission_enabled,
             #[cfg(feature = "weixin")]
             weixin_tx,
+            skill_install_rx,
             _worker: worker,
         }
     }

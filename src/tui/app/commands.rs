@@ -823,6 +823,13 @@ impl App {
             return self.handle_mcp_servers_key(key);
         }
 
+        // Goal-230: SkillInstall owns ↑/↓/Enter/v/y/Esc.
+        #[cfg(feature = "skill-hub")]
+        if let Some(Modal::SkillInstall(_)) = self.modals.last() {
+            self.handle_skill_install_key(key);
+            return None;
+        }
+
         // Generic modal dispatch (Goal 146).
         self.handle_modal_key(key);
         None
@@ -973,6 +980,166 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Goal-230: dispatch a key against an active `Modal::SkillInstall`.
+    ///
+    /// - `Results` page: `↑/↓` navigate, `Enter` selects (sends slug via phase-1
+    ///   channel), `Esc` cancels.
+    /// - `Files` page: `↑/↓` navigate, `v`/`Enter` opens Preview, `y` confirms
+    ///   installation (sends true via phase-2 channel), `Esc` cancels.
+    /// - `Preview` page: `↑/↓/PgUp/PgDn` scroll, `Esc` returns to Files.
+    #[cfg(feature = "skill-hub")]
+    fn handle_skill_install_key(&mut self, key: KeyEvent) {
+        use crate::tui::app::PendingSkillInstall;
+        use crate::tui::ui::modal::{Modal, SkillInstallPage};
+
+        let page = if let Some(Modal::SkillInstall(s)) = self.modals.last() {
+            s.page.clone()
+        } else {
+            return;
+        };
+
+        match page {
+            SkillInstallPage::Results { selected } => match key.code {
+                KeyCode::Up => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        if selected > 0 {
+                            s.page = SkillInstallPage::Results {
+                                selected: selected - 1,
+                            };
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        let max = s.results.len().saturating_sub(1);
+                        if selected < max {
+                            s.page = SkillInstallPage::Results {
+                                selected: selected + 1,
+                            };
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    // User confirmed a selection — send slug to the tool.
+                    let slug = if let Some(Modal::SkillInstall(s)) = self.modals.last() {
+                        s.results.get(selected).map(|r| r.slug.clone())
+                    } else {
+                        None
+                    };
+                    if let (Some(slug), Some(PendingSkillInstall::Search(tx))) =
+                        (slug, self.pending_skill_install.take())
+                    {
+                        let _ = tx.send(Some(slug));
+                        // Leave the modal open; the tool will send a Files request next.
+                    }
+                }
+                KeyCode::Esc => {
+                    // Cancel — send None to tool.
+                    if let Some(PendingSkillInstall::Search(tx)) = self.pending_skill_install.take()
+                    {
+                        let _ = tx.send(None);
+                    }
+                    self.modals.pop();
+                }
+                _ => {}
+            },
+
+            SkillInstallPage::Files { selected } => match key.code {
+                KeyCode::Up => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        if selected > 0 {
+                            s.page = SkillInstallPage::Files {
+                                selected: selected - 1,
+                            };
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        let max = s.files.len().saturating_sub(1);
+                        if selected < max {
+                            s.page = SkillInstallPage::Files {
+                                selected: selected + 1,
+                            };
+                        }
+                    }
+                }
+                KeyCode::Char('v') | KeyCode::Enter => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        s.page = SkillInstallPage::Preview {
+                            file_idx: selected,
+                            scroll: 0,
+                        };
+                    }
+                }
+                KeyCode::Char('y') => {
+                    // Confirm installation.
+                    if let Some(PendingSkillInstall::Files(tx)) = self.pending_skill_install.take()
+                    {
+                        let _ = tx.send(true);
+                    }
+                    self.modals.pop();
+                }
+                KeyCode::Esc => {
+                    // Cancel.
+                    if let Some(PendingSkillInstall::Files(tx)) = self.pending_skill_install.take()
+                    {
+                        let _ = tx.send(false);
+                    }
+                    self.modals.pop();
+                }
+                _ => {}
+            },
+
+            SkillInstallPage::Preview { file_idx, scroll } => match key.code {
+                KeyCode::Up => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        s.page = SkillInstallPage::Preview {
+                            file_idx,
+                            scroll: scroll.saturating_sub(1),
+                        };
+                    }
+                    self.modal_scroll = self.modal_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        s.page = SkillInstallPage::Preview {
+                            file_idx,
+                            scroll: scroll.saturating_add(1),
+                        };
+                    }
+                    self.modal_scroll = self.modal_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        s.page = SkillInstallPage::Preview {
+                            file_idx,
+                            scroll: scroll.saturating_sub(10),
+                        };
+                    }
+                    self.modal_scroll = self.modal_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        s.page = SkillInstallPage::Preview {
+                            file_idx,
+                            scroll: scroll.saturating_add(10),
+                        };
+                    }
+                    self.modal_scroll = self.modal_scroll.saturating_add(10);
+                }
+                KeyCode::Esc => {
+                    // Return to Files page.
+                    if let Some(Modal::SkillInstall(s)) = self.modals.last_mut() {
+                        s.page = SkillInstallPage::Files { selected: file_idx };
+                    }
+                    self.modal_scroll = 0;
+                }
+                _ => {}
+            },
         }
     }
 
