@@ -146,7 +146,7 @@ apply_provider_profile() {
       ;;
     deepseek-pro)
       export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
-      export RECURSIVE_MODEL="deepseek-v4-pro"
+      export RECURSIVE_MODEL="deepseek-chat"
       export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
       ;;
     glm)
