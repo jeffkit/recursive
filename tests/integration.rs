@@ -189,13 +189,13 @@ async fn hooks_and_compaction() {
         3,
         "expected 3 PostToolCall events"
     );
-    // SessionStart is dispatched by the legacy Agent path only; the runtime
-    // does not currently fire it, so the count is 0.
-    assert_eq!(
+    // SessionStart is dispatched by AgentRuntime::run() at the start of each
+    // turn; this test drives multiple turns so the count should be ≥ 1.
+    assert!(
         hook.session_start_count
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "expected 0 SessionStart events (runtime does not dispatch SessionStart)"
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
+        "expected at least 1 SessionStart event"
     );
 
     // Compaction should have fired (transcript exceeded 100 chars).

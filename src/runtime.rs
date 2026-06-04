@@ -309,9 +309,16 @@ impl AgentRuntime {
             "agent.turn: starting"
         );
 
+        self.kernel
+            .hooks()
+            .dispatch(HookEvent::SessionStart { goal: &user_text });
+
         let started_at = unix_now();
         let pre_id = self.checkpoints.snapshot_pre_turn(&user_text);
         self.reset_touched_files();
+        self.kernel.hooks().dispatch(HookEvent::UserPromptSubmit {
+            content: &user_text,
+        });
         self.append_user_message(&user_text).await;
         self.maybe_compact_cross_turn().await?;
 
@@ -330,6 +337,15 @@ impl AgentRuntime {
             "agent.turn: finished"
         );
         self.checkpoints.turn_index += 1;
+
+        // Do not fire SessionEnd on graceful cancellation — hooks registered
+        // for SessionEnd typically perform post-run cleanup / summarisation
+        // that makes no sense if the turn was cancelled by the user.
+        if !matches!(outcome.finish_reason, FinishReason::Cancelled) {
+            self.kernel
+                .hooks()
+                .dispatch(HookEvent::SessionEnd { outcome: &outcome });
+        }
 
         Ok(outcome)
     }

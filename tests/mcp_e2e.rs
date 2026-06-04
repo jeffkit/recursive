@@ -34,6 +34,7 @@ async fn spawn_mock(mode: &str) -> Result<McpClient> {
         command: env!("CARGO_BIN_EXE_mock_mcp_server").to_string(),
         args: vec![mode.to_string()],
         url: None,
+        env: None,
     };
     McpClient::spawn_with_timeout(&server, TEST_READ_TIMEOUT).await
 }
