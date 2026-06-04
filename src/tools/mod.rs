@@ -171,6 +171,8 @@ pub mod todo;
 pub mod transport;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
+#[cfg(feature = "web_search")]
+pub mod web_search;
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
@@ -207,6 +209,8 @@ pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
+#[cfg(feature = "web_search")]
+pub use web_search::WebSearch;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -1060,6 +1064,11 @@ pub fn build_standard_tools(
     #[cfg(feature = "web_fetch")]
     {
         registry = registry.register(Arc::new(WebFetch::new()));
+    }
+
+    #[cfg(feature = "web_search")]
+    {
+        registry = registry.register(Arc::new(WebSearch::new()));
     }
 
     if !skills.is_empty() {
