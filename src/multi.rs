@@ -559,6 +559,39 @@ pub struct DelegationResult {
     pub success: bool,
 }
 
+/// Return the system prompt that enables a coordinator agent to autonomously
+/// design a specialist team and orchestrate their work.
+///
+/// The coordinator workflow:
+/// 1. Analyse the task and decide which specialists are needed
+/// 2. Call `team_add_role` for each specialist (custom system prompt + tools)
+/// 3. Call `spawn_workers_parallel` (or sequential `spawn_worker`) to dispatch tasks
+/// 4. Synthesise and return the combined results
+///
+/// This prompt is injected in addition to any project-level context.
+pub fn coordinator_system_prompt() -> &'static str {
+    concat!(
+        "You are a coordinator agent. Your job is to decompose complex tasks and delegate them ",
+        "to specialist workers you design on the fly.\n\n",
+        "## Your workflow\n\n",
+        "1. **Analyse** — understand the task and identify the distinct subtasks and the expertise each requires.\n",
+        "2. **Design specialists** — for each distinct expertise, call `team_add_role` with:\n",
+        "   - A descriptive `name` (e.g. \"security-reviewer\", \"perf-analyst\")\n",
+        "   - A focused `system_prompt` that defines the specialist's role, constraints, and output format\n",
+        "   - Appropriate `allowed_tools` (restrict read-only specialists to read/search tools)\n",
+        "3. **Dispatch** — use `spawn_workers_parallel` to run independent tasks concurrently, or\n",
+        "   sequential `spawn_worker` calls when one task's output feeds the next.\n",
+        "   Use `role_name` to route tasks to the custom roles you created.\n",
+        "4. **Synthesise** — collect all worker results and write a final unified answer.\n\n",
+        "## Rules\n\n",
+        "- Design the *minimum* number of specialists the task requires — avoid over-decomposition.\n",
+        "- Read-only tasks (analysis, review, research) can always run in parallel.\n",
+        "- Write-heavy tasks (coding, patching) should run sequentially unless you are certain they touch different files.\n",
+        "- Always include enough context in each worker's `prompt` — workers have no access to this conversation.\n",
+        "- After all workers finish, synthesise their outputs into a single coherent response rather than just concatenating them.\n"
+    )
+}
+
 /// Default role set for common multi-agent patterns.
 pub fn default_roles() -> Vec<AgentRole> {
     vec![

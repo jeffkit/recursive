@@ -22,13 +22,16 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::agent::{FinishReason, PlanningMode};
 use crate::error::{Error, Result};
 use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
+use crate::multi::AgentPool;
 use crate::permissions::PermissionMode;
+use crate::tools::team_manage::{SharedMemoryRead, SharedMemoryWrite};
 use crate::tools::PermissionHook;
 use crate::tools::{Tool, ToolRegistry, ToolSideEffect};
 
@@ -126,6 +129,9 @@ pub struct SpawnWorkerTool {
     /// Optional registry — when set, each spawned worker is registered so
     /// a coordinator can send mid-run messages via `send_message`.
     registry: Option<crate::tools::send_message::WorkerRegistry>,
+    /// Optional agent pool — when set, `role_name` parameter can look up
+    /// custom roles defined via `team_add_role`.
+    pool: Option<Arc<RwLock<AgentPool>>>,
 }
 
 impl SpawnWorkerTool {
@@ -145,12 +151,19 @@ impl SpawnWorkerTool {
             current_depth,
             permission_hook,
             registry: None,
+            pool: None,
         }
     }
 
     /// Attach a `WorkerRegistry` so spawned workers can receive mid-run messages.
     pub fn with_registry(mut self, registry: crate::tools::send_message::WorkerRegistry) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Attach an `AgentPool` so spawned workers can use custom roles via `role_name`.
+    pub fn with_pool(mut self, pool: Arc<RwLock<AgentPool>>) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -177,7 +190,8 @@ impl Tool for SpawnWorkerTool {
             description: concat!(
                 "Spawn a specialist worker agent to handle a focused sub-task. ",
                 "This is the coordinator-pattern delegation tool: use it to assign work to ",
-                "a named specialist (explore, coder, reviewer, researcher, or general). ",
+                "a named specialist (explore, coder, reviewer, researcher, or general), ",
+                "or to a custom role defined via team_add_role (use role_name). ",
                 "The worker runs independently with an empty transcript and returns its result."
             )
             .into(),
@@ -191,16 +205,20 @@ impl Tool for SpawnWorkerTool {
                     "worker_type": {
                         "type": "string",
                         "enum": ["general", "explore", "coder", "reviewer", "researcher"],
-                        "description": "Specialist type: 'explore'/'reviewer'/'researcher' are read-only; 'coder'/'general' have full tool access.",
+                        "description": "Specialist type: 'explore'/'reviewer'/'researcher' are read-only; 'coder'/'general' have full tool access. Ignored if role_name is set.",
                         "default": "general"
+                    },
+                    "role_name": {
+                        "type": "string",
+                        "description": "Optional: name of a custom role defined via team_add_role. When set, the role's system_prompt, max_steps, and allowed_tools override worker_type defaults."
                     },
                     "system_prompt": {
                         "type": "string",
-                        "description": "Optional: override the default system prompt for this worker type."
+                        "description": "Optional: override the system prompt (takes precedence over both worker_type and role_name defaults)."
                     },
                     "max_steps": {
                         "type": "integer",
-                        "description": "Maximum steps for the worker (default 30, max 100).",
+                        "description": "Maximum steps for the worker (default 30, max 100). Role's max_steps used when role_name is set and this is not specified.",
                         "default": 30
                     }
                 },
@@ -233,14 +251,6 @@ impl Tool for SpawnWorkerTool {
                 message: "missing required parameter: prompt".to_string(),
             })?;
 
-        let worker_type = arguments
-            .get("worker_type")
-            .and_then(|v| v.as_str())
-            .and_then(WorkerType::parse)
-            .unwrap_or(WorkerType::General);
-
-        let max_steps = arguments["max_steps"].as_i64().unwrap_or(30).clamp(1, 100) as usize;
-
         // Depth limit check (reuse same env var as sub_agent)
         if self.current_depth >= self.max_depth {
             return Ok(format!(
@@ -249,12 +259,65 @@ impl Tool for SpawnWorkerTool {
             ));
         }
 
-        // System prompt: caller override > worker type default
-        let sys_prompt = arguments
-            .get("system_prompt")
+        // Resolve role config: role_name (custom pool role) > worker_type (preset)
+        let role_name_opt = arguments.get("role_name").and_then(|v| v.as_str());
+
+        // Look up custom role from pool if role_name is provided
+        let pool_role = if let (Some(role_name), Some(pool)) = (role_name_opt, &self.pool) {
+            let pool_guard = pool.read().await;
+            pool_guard.get_role(role_name).map(|r| {
+                (
+                    r.system_prompt.clone(),
+                    r.max_steps,
+                    r.allowed_tools.clone(),
+                )
+            })
+        } else {
+            None
+        };
+
+        let worker_type = arguments
+            .get("worker_type")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| worker_type.system_prompt())
-            .to_string();
+            .and_then(WorkerType::parse)
+            .unwrap_or(WorkerType::General);
+
+        // max_steps priority: explicit arg > pool role default > 30
+        let max_steps = if arguments
+            .get("max_steps")
+            .and_then(|v| v.as_i64())
+            .is_some()
+        {
+            arguments["max_steps"].as_i64().unwrap_or(30).clamp(1, 100) as usize
+        } else if let Some((_, role_max_steps, _)) = &pool_role {
+            (*role_max_steps).min(100)
+        } else {
+            30
+        };
+
+        // System prompt priority: explicit arg > pool role > worker_type default
+        let base_prompt = if let Some(override_prompt) =
+            arguments.get("system_prompt").and_then(|v| v.as_str())
+        {
+            override_prompt.to_string()
+        } else if let Some((role_prompt, _, _)) = &pool_role {
+            role_prompt.clone()
+        } else {
+            worker_type.system_prompt().to_string()
+        };
+
+        // Gap-1: Inject SharedMemory context from the pool so workers can see
+        // state published by other workers or the coordinator.
+        let memory_ctx = if let Some(pool) = &self.pool {
+            pool.read().await.memory().to_context_string().await
+        } else {
+            String::new()
+        };
+        let sys_prompt = if memory_ctx.is_empty() {
+            base_prompt
+        } else {
+            format!("{base_prompt}\n\n{memory_ctx}")
+        };
 
         // Assign a stable worker_id and optionally register in the registry so
         // the coordinator can send mid-run messages via `send_message`.
@@ -269,9 +332,18 @@ impl Tool for SpawnWorkerTool {
             None => None,
         };
 
-        // Build the tool registry for this worker
-        let tool_names = worker_type.allowed_tool_names();
-        let sub_registry = match &tool_names {
+        // Build the tool registry for this worker.
+        // Priority: pool role's allowed_tools > worker_type's allowed_tool_names.
+        let role_tools = pool_role.as_ref().and_then(|(_, _, tools)| {
+            if tools.is_empty() {
+                None
+            } else {
+                Some(tools.clone())
+            }
+        });
+        let tool_names = role_tools.or_else(|| worker_type.allowed_tool_names());
+
+        let mut sub_registry = match &tool_names {
             Some(names) => self.build_sub_registry(names),
             None => {
                 // Full access: give worker all parent tools.
@@ -288,10 +360,25 @@ impl Tool for SpawnWorkerTool {
                 if let Some(r) = &self.registry {
                     child = child.with_registry(r.clone());
                 }
+                if let Some(p) = &self.pool {
+                    child = child.with_pool(p.clone());
+                }
                 reg = reg.register(Arc::new(child));
                 reg
             }
         };
+
+        // Gap-2: Register shared memory tools when pool is available so workers can
+        // publish intermediate results and read state from other workers.
+        if let Some(pool) = &self.pool {
+            let memory = pool.read().await.memory().clone();
+            let author = role_name_opt
+                .map(str::to_string)
+                .unwrap_or_else(|| worker_id.clone());
+            sub_registry = sub_registry
+                .register(Arc::new(SharedMemoryWrite::new(memory.clone(), author)))
+                .register(Arc::new(SharedMemoryRead::new(memory)));
+        }
 
         let kernel = AgentKernel::builder()
             .llm(self.provider.clone())
@@ -347,12 +434,16 @@ impl Tool for SpawnWorkerTool {
             .final_text
             .unwrap_or_else(|| "(no final message)".to_string());
 
-        let type_label = match worker_type {
-            WorkerType::General => "general",
-            WorkerType::Explore => "explore",
-            WorkerType::Coder => "coder",
-            WorkerType::Reviewer => "reviewer",
-            WorkerType::Researcher => "researcher",
+        let type_label = if let Some(role_name) = role_name_opt {
+            role_name.to_string()
+        } else {
+            match worker_type {
+                WorkerType::General => "general".to_string(),
+                WorkerType::Explore => "explore".to_string(),
+                WorkerType::Coder => "coder".to_string(),
+                WorkerType::Reviewer => "reviewer".to_string(),
+                WorkerType::Researcher => "researcher".to_string(),
+            }
         };
 
         Ok(format!(

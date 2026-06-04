@@ -168,6 +168,7 @@ pub mod search;
 pub mod send_message;
 pub mod shell;
 pub mod spawn_worker;
+pub mod spawn_workers_parallel;
 pub mod str_replace;
 pub mod sub_agent;
 pub mod team_manage;
@@ -207,12 +208,15 @@ pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, R
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
-pub use send_message::{SendMessageTool, WorkerMailbox, WorkerRegistry};
+pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
 pub use spawn_worker::{SpawnWorkerTool, WorkerType};
+pub use spawn_workers_parallel::SpawnWorkersParallel;
 pub use str_replace::StrReplaceTool;
 pub use sub_agent::SubAgent;
-pub use team_manage::{TeamAddRole, TeamListRoles, TeamRemoveRole};
+pub use team_manage::{
+    SharedMemoryRead, SharedMemoryWrite, TeamAddRole, TeamListRoles, TeamRemoveRole,
+};
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
