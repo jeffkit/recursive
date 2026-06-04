@@ -102,6 +102,12 @@ provider is unset.
 2. Write a goal file: `.dev/goals/NN-<tag>.md` (next number in sequence).
 3. Commit: `dev: goal files for batch N (gNN tag, gMM tag)`.
 
+> Goal files may declare an optional **`## Complexity: hard`** heading
+> (case-insensitive, anywhere near the top of the file). When present,
+> `self-improve.sh` automatically escalates to the `deepseek-pro` provider
+> and sets `RECURSIVE_MAX_STEPS=400` — unless the caller has already set
+> those env vars, in which case the caller's choice wins.
+
 ### 3.2 Launch
 
 ```bash
