@@ -106,6 +106,37 @@ pub enum Modal {
         entries: Vec<McpEntry>,
         selected: usize,
     },
+    /// Goal-230: skill-hub installation flow. Three-stage interactive modal:
+    /// Results (search results) → Files (zip contents) → Preview (file viewer).
+    #[cfg(feature = "skill-hub")]
+    SkillInstall(crate::tui::ui::modal::SkillInstallState),
+}
+
+// ── Goal-230: SkillInstall modal state ───────────────────────────────────────
+
+/// Which sub-page the SkillInstall modal is on.
+#[cfg(feature = "skill-hub")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SkillInstallPage {
+    /// Showing search results; `selected` is the highlighted row index.
+    Results { selected: usize },
+    /// Showing the file tree for the chosen skill; `selected` is the
+    /// highlighted file index.
+    Files { selected: usize },
+    /// Showing the content of file at index `file_idx`, scrolled to `scroll`.
+    Preview { file_idx: usize, scroll: u16 },
+}
+
+/// Cloneable display state for the `SkillInstall` modal.
+#[cfg(feature = "skill-hub")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillInstallState {
+    pub query: String,
+    pub results: Vec<crate::tui::events::SkillSearchResult>,
+    /// Populated after the user selects a result and the tool downloads the zip.
+    pub slug: Option<String>,
+    pub files: Vec<crate::tui::events::SkillZipFile>,
+    pub page: SkillInstallPage,
 }
 
 impl Modal {
@@ -121,6 +152,8 @@ impl Modal {
             Modal::PlanReview { .. } => " Plan Proposal ",
             Modal::ResumePicker { .. } => " Resume Session ",
             Modal::McpServers { .. } => " MCP Servers ",
+            #[cfg(feature = "skill-hub")]
+            Modal::SkillInstall(_) => " Install Skill ",
         }
     }
 }
@@ -160,6 +193,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             tool_calls,
             ..
         } => render_plan_review(plan_text, tool_calls),
+        #[cfg(feature = "skill-hub")]
+        Modal::SkillInstall(state) => render_skill_install(state),
     };
 
     // Left-accent panel style (Claude Code /mcp inspired):
@@ -795,6 +830,133 @@ pub fn load_recent_sessions(workspace: &std::path::Path, limit: usize) -> Vec<Re
             }
         })
         .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Goal-230: skill-hub install modal renderer
+// (placed before the test module so clippy's items_after_test_module
+// lint is not triggered)
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "skill-hub")]
+fn render_skill_install(state: &SkillInstallState) -> Vec<Line<'static>> {
+    let header = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let selected_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let key = Style::default().fg(Color::Cyan);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    match &state.page {
+        SkillInstallPage::Results { selected: sel } => {
+            out.push(Line::from(Span::styled(
+                format!(" Install Skill — \"{}\" ", state.query),
+                header,
+            )));
+            out.push(Line::raw(""));
+
+            if state.results.is_empty() {
+                out.push(Line::from(Span::styled(
+                    "  No results found. Try a different query.",
+                    dim,
+                )));
+            } else {
+                for (i, r) in state.results.iter().enumerate() {
+                    let stars = format!("⭐ {:>2}", r.stars);
+                    let downloads = if r.downloads >= 1_000 {
+                        format!("↓ {:.1}k", r.downloads as f64 / 1000.0)
+                    } else {
+                        format!("↓ {}", r.downloads)
+                    };
+                    let version = format!("v{}", r.version);
+                    let row_text = format!(
+                        " {:<24} {:>6}  {:>8}  {:>8} ",
+                        r.name, stars, downloads, version
+                    );
+                    if i == *sel {
+                        out.push(Line::from(Span::styled(row_text, selected_style)));
+                        let desc = if r.description.len() > 68 {
+                            format!("  {}", &r.description[..68])
+                        } else {
+                            format!("  {}", r.description)
+                        };
+                        out.push(Line::from(Span::styled(desc, dim)));
+                    } else {
+                        out.push(Line::from(Span::raw(row_text)));
+                    }
+                }
+            }
+            out.push(Line::raw(""));
+            out.push(Line::from(vec![
+                Span::styled(" ↑↓ ", key),
+                Span::raw("navigate  "),
+                Span::styled(" Enter ", key),
+                Span::raw("select & browse files  "),
+                Span::styled(" Esc ", key),
+                Span::raw("cancel"),
+            ]));
+        }
+
+        SkillInstallPage::Files { selected: sel } => {
+            let slug = state.slug.as_deref().unwrap_or("?");
+            out.push(Line::from(Span::styled(
+                format!(" {slug} — Files "),
+                header,
+            )));
+            out.push(Line::raw(""));
+            if state.files.is_empty() {
+                out.push(Line::from(Span::styled("  (no files)", dim)));
+            } else {
+                for (i, f) in state.files.iter().enumerate() {
+                    let size_str = if f.size >= 1024 {
+                        format!("{:.1}kb", f.size as f64 / 1024.0)
+                    } else {
+                        format!("{} b", f.size)
+                    };
+                    let row_text = format!(" {:<45} {:>8} ", f.path, size_str);
+                    if i == *sel {
+                        out.push(Line::from(Span::styled(row_text, selected_style)));
+                    } else {
+                        out.push(Line::from(Span::raw(row_text)));
+                    }
+                }
+            }
+            out.push(Line::raw(""));
+            out.push(Line::from(vec![
+                Span::styled(" ↑↓ ", key),
+                Span::raw("navigate  "),
+                Span::styled(" v ", key),
+                Span::raw("preview file  "),
+                Span::styled(" y ", key),
+                Span::raw("confirm install  "),
+                Span::styled(" Esc ", key),
+                Span::raw("cancel"),
+            ]));
+        }
+
+        SkillInstallPage::Preview { file_idx, .. } => {
+            let file = state.files.get(*file_idx);
+            let fname = file.map(|f| f.path.as_str()).unwrap_or("?");
+            out.push(Line::from(Span::styled(format!(" {fname} "), header)));
+            out.push(Line::raw(""));
+            if let Some(f) = file {
+                for line in f.content.lines() {
+                    out.push(Line::from(Span::raw(line.to_string())));
+                }
+            }
+            out.push(Line::raw(""));
+            out.push(Line::from(vec![
+                Span::styled(" PgUp/PgDn ", key),
+                Span::raw("scroll  "),
+                Span::styled(" Esc ", key),
+                Span::raw("back to files"),
+            ]));
+        }
+    }
+
+    out
 }
 
 // ──────────────────────────────────────────────────────────────────────

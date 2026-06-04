@@ -151,8 +151,12 @@ pub mod e2b_provider;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
+#[cfg(feature = "skill-hub")]
+pub mod find_skills;
 pub mod fs;
 pub mod glob;
+#[cfg(feature = "skill-hub")]
+pub mod install_skill;
 pub mod load_skill;
 pub mod memory;
 pub mod plan_mode;
@@ -182,8 +186,12 @@ pub use facts::{
     facts_path, facts_summary, load_facts, search_facts, Fact, FactStore, ForgetFact, RecallFact,
     RememberFact, ScoredFact, UpdateFact,
 };
+#[cfg(feature = "skill-hub")]
+pub use find_skills::FindSkills;
 pub use fs::{ReadFile, WriteFile};
 pub use glob::GlobTool;
+#[cfg(feature = "skill-hub")]
+pub use install_skill::InstallSkill;
 pub use load_skill::LoadSkill;
 pub use memory::{
     load_scratchpad, scratchpad_path, scratchpad_summary, Scratchpad, ScratchpadDelete,
