@@ -119,17 +119,25 @@ impl CheckpointState {
 
     /// Take a snapshot just before a turn begins. Errors are logged
     /// as warnings and swallowed so a checkpoint failure cannot brick a run.
-    fn snapshot_pre_turn(&self, user_text: &str) -> Option<CheckpointId> {
-        let (repo, sid) = (self.shadow.as_ref()?, self.session_id.as_ref()?);
+    ///
+    /// The underlying git subprocess is blocking; it runs inside
+    /// `tokio::task::spawn_blocking` to avoid starving the async runtime.
+    async fn snapshot_pre_turn(&self, user_text: &str) -> Option<CheckpointId> {
+        let repo = self.shadow.as_ref()?.clone();
+        let sid = self.session_id.as_ref()?.clone();
         let label = format!(
             "turn {} pre: {}",
             self.turn_index,
             truncate_label(user_text)
         );
-        match repo.snapshot_for_session(sid, &label) {
-            Ok(id) => Some(id),
-            Err(e) => {
+        match tokio::task::spawn_blocking(move || repo.snapshot_for_session(&sid, &label)).await {
+            Ok(Ok(id)) => Some(id),
+            Ok(Err(e)) => {
                 tracing::warn!("checkpoint pre-snapshot failed: {e}");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("checkpoint pre-snapshot task panicked: {e}");
                 None
             }
         }
@@ -137,26 +145,23 @@ impl CheckpointState {
 
     /// Take a snapshot at the end of a turn, compute the touched-file set,
     /// and append a [`CheckpointRecord`] to the log.
-    fn snapshot_post_turn(
+    ///
+    /// Blocking git subprocesses run inside `tokio::task::spawn_blocking`.
+    async fn snapshot_post_turn(
         &self,
         user_text: &str,
         pre: Option<&CheckpointId>,
         started_at: i64,
     ) -> Option<CheckpointId> {
-        let (repo, sid) = (self.shadow.as_ref()?, self.session_id.as_ref()?);
+        let repo = self.shadow.as_ref()?.clone();
+        let sid = self.session_id.as_ref()?.clone();
         let label = format!(
             "turn {} post: {}",
             self.turn_index,
             truncate_label(user_text)
         );
-        let post = match repo.snapshot_for_session(sid, &label) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!("checkpoint post-snapshot failed: {e}");
-                return None;
-            }
-        };
 
+        // Collect touched files before moving into spawn_blocking.
         let (mut paths, saw_shell) = match &self.touched_files {
             Some(slot) => match slot.lock() {
                 Ok(t) => (t.paths_sorted(), t.saw_shell),
@@ -165,36 +170,61 @@ impl CheckpointState {
             None => (vec![], true),
         };
 
-        let mut via = TouchedVia::Structured;
-        if saw_shell {
-            via = TouchedVia::ShellDiff;
-            if let Some(pre_id) = pre {
-                if let Ok(diff_paths) = repo.changed_paths(pre_id, &post) {
-                    let mut set: std::collections::HashSet<String> = paths.into_iter().collect();
-                    for p in diff_paths {
-                        set.insert(p);
+        let pre_cloned = pre.cloned();
+        let turn_index = self.turn_index;
+        let writer = self.writer.clone();
+        let repo2 = repo.clone();
+
+        let post = match tokio::task::spawn_blocking(move || {
+            let post = repo2.snapshot_for_session(&sid, &label)?;
+
+            let mut via = TouchedVia::Structured;
+            if saw_shell {
+                via = TouchedVia::ShellDiff;
+                if let Some(ref pre_id) = pre_cloned {
+                    if let Ok(diff_paths) = repo2.changed_paths(pre_id, &post) {
+                        let mut set: std::collections::HashSet<String> = paths.drain(..).collect();
+                        for p in diff_paths {
+                            set.insert(p);
+                        }
+                        paths = {
+                            let mut v: Vec<String> = set.into_iter().collect();
+                            v.sort();
+                            v
+                        };
                     }
-                    let mut v: Vec<String> = set.into_iter().collect();
-                    v.sort();
-                    paths = v;
                 }
             }
-        }
 
-        if let Some(writer) = &self.writer {
-            let rec = CheckpointRecord {
-                turn: self.turn_index,
-                pre: pre.cloned(),
-                post: post.clone(),
-                touched_files: paths,
-                touched_via: via,
-                started_at,
-                finished_at: unix_now(),
-            };
-            if let Err(e) = writer.append(&rec) {
-                tracing::warn!("checkpoint log append failed: {e}");
+            if let Some(w) = writer {
+                let rec = CheckpointRecord {
+                    turn: turn_index,
+                    pre: pre_cloned,
+                    post: post.clone(),
+                    touched_files: paths,
+                    touched_via: via,
+                    started_at,
+                    finished_at: unix_now(),
+                };
+                if let Err(e) = w.append(&rec) {
+                    tracing::warn!("checkpoint log append failed: {e}");
+                }
             }
-        }
+
+            Ok::<CheckpointId, crate::error::Error>(post)
+        })
+        .await
+        {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => {
+                tracing::warn!("checkpoint post-snapshot failed: {e}");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("checkpoint post-snapshot task panicked: {e}");
+                return None;
+            }
+        };
 
         Some(post)
     }
@@ -314,7 +344,7 @@ impl AgentRuntime {
             .dispatch(HookEvent::SessionStart { goal: &user_text });
 
         let started_at = unix_now();
-        let pre_id = self.checkpoints.snapshot_pre_turn(&user_text);
+        let pre_id = self.checkpoints.snapshot_pre_turn(&user_text).await;
         self.reset_touched_files();
         self.kernel.hooks().dispatch(HookEvent::UserPromptSubmit {
             content: &user_text,
@@ -327,9 +357,10 @@ impl AgentRuntime {
         self.emit_turn_messages(&turn_outcome).await;
 
         let mut outcome: RuntimeOutcome = turn_outcome.into();
-        outcome.checkpoint_id =
-            self.checkpoints
-                .snapshot_post_turn(&user_text, pre_id.as_ref(), started_at);
+        outcome.checkpoint_id = self
+            .checkpoints
+            .snapshot_post_turn(&user_text, pre_id.as_ref(), started_at)
+            .await;
 
         tracing::info!(
             steps = outcome.steps,
@@ -390,7 +421,7 @@ impl AgentRuntime {
             transcript_len: chars,
         });
         let Some((removed, summary_chars)) = compactor
-            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript)
+            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript, 0)
             .await?
         else {
             return Ok(());
@@ -682,7 +713,7 @@ impl AgentRuntime {
             return Ok(());
         };
         compactor
-            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript)
+            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript, 0)
             .await?;
         Ok(())
     }

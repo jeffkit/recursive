@@ -58,9 +58,15 @@ impl Compactor {
     const COMPACT_SCHEMA: &'static str = r#"{"type":"object","properties":{"summary":{"type":"string","description":"1-3 paragraph summary of the conversation so far, preserving key decisions, file paths touched, and outcomes."},"kept_facts":{"type":"array","items":{"type":"string"},"description":"Discrete facts worth remembering across compaction (e.g. 'goal=add_X_to_Y', 'compaction happened at step N', 'tool X failed 3 times')."},"next_steps":{"type":"array","items":{"type":"string"},"description":"Outstanding TODOs the agent identified before compaction (each one a single-sentence imperative)."}},"required":["summary","kept_facts"]}"#;
 
     /// Render a structured compaction result into the message format.
-    fn render_structured(summary: &str, kept_facts: &[String], next_steps: &[String]) -> String {
-        let mut rendered =
-            format!("[compacted: structured]\n\nSummary: {summary}\n\nKey facts to remember:\n");
+    fn render_structured(
+        summary: &str,
+        kept_facts: &[String],
+        next_steps: &[String],
+        step: usize,
+    ) -> String {
+        let mut rendered = format!(
+            "[compacted: structured at step {step}]\n\nSummary: {summary}\n\nKey facts to remember:\n"
+        );
         for fact in kept_facts {
             rendered.push_str(&format!("- {fact}\n"));
         }
@@ -79,6 +85,7 @@ impl Compactor {
         &self,
         provider: &dyn LlmProvider,
         older_text: &str,
+        step: usize,
     ) -> Option<String> {
         let structured_prompt = format!(
             "Summarize the following conversation. \
@@ -149,7 +156,12 @@ impl Compactor {
             })
             .unwrap_or_default();
 
-        Some(Self::render_structured(&summary, &kept_facts, &next_steps))
+        Some(Self::render_structured(
+            &summary,
+            &kept_facts,
+            &next_steps,
+            step,
+        ))
     }
 
     /// Apply compaction in-place to `transcript`, returning `(removed, summary_chars)`.
@@ -164,11 +176,12 @@ impl Compactor {
         &self,
         provider: &dyn LlmProvider,
         transcript: &mut Vec<Message>,
+        step: usize,
     ) -> Result<Option<(usize, usize)>> {
         if transcript.len() < self.keep_recent_n + 2 {
             return Ok(None);
         }
-        let summary_msg = self.compact(provider, transcript).await?;
+        let summary_msg = self.compact(provider, transcript, step).await?;
         let summary_chars = summary_msg.content.len();
         let keep = self.keep_recent_n;
         let mut split = transcript.len().saturating_sub(keep);
@@ -184,6 +197,9 @@ impl Compactor {
     /// Compact the transcript: summarize older messages into a single system
     /// message, keeping the last `keep_recent_n` messages verbatim.
     ///
+    /// `step` is the current turn number and is embedded in the compaction
+    /// header for debuggability.
+    ///
     /// Returns the summary `Message` that should replace the older portion.
     /// The caller is responsible for splicing it into the transcript.
     #[tracing::instrument(skip(self, provider, transcript))]
@@ -191,6 +207,7 @@ impl Compactor {
         &self,
         provider: &dyn LlmProvider,
         transcript: &[Message],
+        step: usize,
     ) -> Result<Message> {
         let n = self.keep_recent_n.min(transcript.len().saturating_sub(1));
         let split = transcript.len().saturating_sub(n);
@@ -213,7 +230,10 @@ impl Compactor {
             .join("\n");
 
         // Try structured output first
-        let summary = match self.try_structured_compact(provider, &older_text).await {
+        let summary = match self
+            .try_structured_compact(provider, &older_text, step)
+            .await
+        {
             Some(rendered) => rendered,
             None => {
                 // Fall back to free-text path
@@ -235,7 +255,7 @@ impl Compactor {
         let summary_chars = summary.len();
 
         let header = format!(
-            "[compacted: {} messages → {} chars]\n{}",
+            "[compacted: {} messages → {} chars at step {step}]\n{}",
             older.len(),
             summary_chars,
             summary
@@ -269,7 +289,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(200).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         assert!(summary_msg.content.contains("[compacted:"));
@@ -297,7 +317,7 @@ mod tests {
 
         // keep_recent_n=2 should keep the last 2 messages verbatim
         let compactor = Compactor::new(100).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+        let summary_msg = compactor.compact(&provider, &transcript, 5).await.unwrap();
 
         assert!(summary_msg.content.contains("[compacted: 3 messages →"));
         // The summary should mention the older messages
@@ -318,7 +338,7 @@ mod tests {
 
         // keep_recent_n=5 means all messages are "recent", none to compact
         let compactor = Compactor::new(100).keep_recent_n(5);
-        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         // Should still produce a summary (even if older portion is empty-ish)
         assert_eq!(summary_msg.role, crate::message::Role::System);
@@ -377,11 +397,13 @@ mod tests {
         ];
 
         let compactor = Compactor::new(200).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+        let summary_msg = compactor.compact(&provider, &transcript, 3).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
-        // Should contain the structured rendering format
-        assert!(summary_msg.content.contains("[compacted: structured]"));
+        // Should contain the structured rendering format with the step number
+        assert!(summary_msg
+            .content
+            .contains("[compacted: structured at step 3]"));
         assert!(summary_msg.content.contains("Summary: Added adder tool"));
         assert!(summary_msg.content.contains("Key facts to remember:"));
         assert!(summary_msg.content.contains("- goal=add_adder_tool"));
@@ -411,7 +433,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(100).keep_recent_n(1);
-        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should have fallen back to free-text format
@@ -440,7 +462,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(100).keep_recent_n(1);
-        let summary_msg = compactor.compact(&provider, &transcript).await.unwrap();
+        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should have fallen back to free-text format

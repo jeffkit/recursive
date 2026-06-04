@@ -41,21 +41,10 @@ const STUCK_THRESHOLD: usize = 3;
 
 /// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
 ///
-/// The old `From<StepEvent>` bridge used a hard-coded `"finished"` placeholder
-/// (see `event::From<StepEvent>` prior to Goal 219), which made the reason
-/// unobservable downstream. This helper restores per-variant text so SDK and
-/// TUI consumers can distinguish termination causes.
+/// Delegates to the `Display` implementation on `FinishReason` to ensure
+/// consistency between event payloads and HTTP API responses.
 fn finish_reason_str(reason: &FinishReason) -> String {
-    match reason {
-        FinishReason::NoMoreToolCalls => "no_more_tool_calls".to_string(),
-        FinishReason::BudgetExceeded => "budget_exceeded".to_string(),
-        FinishReason::ProviderStop(s) => format!("provider_stop({s})"),
-        FinishReason::Stuck { .. } => "stuck".to_string(),
-        FinishReason::TranscriptLimit { .. } => "transcript_limit".to_string(),
-        FinishReason::PlanPending => "plan_pending".to_string(),
-        FinishReason::Cancelled => "cancelled".to_string(),
-        FinishReason::PermissionDenialLimit => "permission_denial_limit".to_string(),
-    }
+    reason.to_string()
 }
 
 /// Outcome returned by the stateless [`run_inner`] loop.
@@ -217,7 +206,7 @@ impl<'a> RunCore<'a> {
 
         let kept_before = self.messages.len();
         if let Some((removed, summary_chars)) = compactor
-            .apply_to_transcript(self.llm.as_ref(), &mut self.messages)
+            .apply_to_transcript(self.llm.as_ref(), &mut self.messages, step)
             .await?
         {
             let kept = kept_before - removed;
