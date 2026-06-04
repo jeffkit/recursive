@@ -351,22 +351,27 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
     intersection.len() as f64 / union_size as f64
 }
 
+/// Result of a duplicate-fact check.
+enum DuplicateResult {
+    /// The new text is longer/more specific — supersede the existing fact with this ID.
+    SupersedeExisting(String),
+    /// The existing fact is at least as specific — keep it, discard the new text.
+    KeepExisting(String),
+}
+
 /// Check if a new fact text is a duplicate of an existing active fact.
-/// Returns the ID of the existing fact if similarity >= threshold.
-fn find_duplicate(facts: &[&Fact], text: &str, threshold: f64) -> Option<String> {
+/// Returns `Some(DuplicateResult)` if similarity >= threshold, `None` otherwise.
+fn find_duplicate(facts: &[&Fact], text: &str, threshold: f64) -> Option<DuplicateResult> {
     for fact in facts {
         if !fact.is_active() {
             continue;
         }
         let sim = jaccard_similarity(&fact.text, text);
         if sim >= threshold {
-            // If the new text is longer/more specific, supersede the old one
             if text.len() > fact.text.len() {
-                return Some(fact.id.clone());
+                return Some(DuplicateResult::SupersedeExisting(fact.id.clone()));
             }
-            // Otherwise the existing fact is kept; return its ID to indicate
-            // that the new one should not be added
-            return Some(fact.id.clone());
+            return Some(DuplicateResult::KeepExisting(fact.id.clone()));
         }
     }
     None
@@ -639,16 +644,14 @@ impl Tool for RememberFact {
 
         // Deduplication check
         let active: Vec<&Fact> = store.active_facts();
-        if let Some(dup_id) = find_duplicate(&active, &text, DEDUP_THRESHOLD) {
-            let dup = store.get(&dup_id).unwrap();
-            // If the new text is longer/more specific, supersede the old one
-            if text.len() > dup.text.len() {
+        match find_duplicate(&active, &text, DEDUP_THRESHOLD) {
+            Some(DuplicateResult::SupersedeExisting(dup_id)) => {
                 store.soft_delete(&dup_id, &store.next_id());
                 let id = store.add(text, tags, source);
                 store.save(&path)?;
                 return Ok(format!("saved fact {id} (superseded {dup_id})"));
-            } else {
-                // Existing fact is kept; update its access stats
+            }
+            Some(DuplicateResult::KeepExisting(dup_id)) => {
                 if let Some(existing) = store.get_mut(&dup_id) {
                     existing.last_accessed = chrono_now_rfc3339();
                     existing.access_count += 1;
@@ -656,6 +659,7 @@ impl Tool for RememberFact {
                 store.save(&path)?;
                 return Ok(format!("duplicate of {dup_id}, kept existing"));
             }
+            None => {}
         }
 
         // Eviction check
