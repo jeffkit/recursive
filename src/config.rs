@@ -46,6 +46,9 @@ pub struct Config {
     /// Additional workspace-root directories the agent is allowed to access
     /// (sandbox expansion via `--add-dir`). Empty = only `workspace`.
     pub extra_dirs: Vec<std::path::PathBuf>,
+    /// If non-empty, only tools whose names appear in this list are registered.
+    /// Set via `--allow-tools` CLI flag or `RECURSIVE_ALLOW_TOOLS` env var.
+    pub allow_tools: Vec<String>,
 }
 
 impl Config {
@@ -259,6 +262,7 @@ impl Config {
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            allow_tools: Vec::new(),
         })
     }
 
@@ -491,6 +495,7 @@ mod tests {
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            allow_tools: Vec::new(),
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
