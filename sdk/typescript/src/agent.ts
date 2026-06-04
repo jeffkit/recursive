@@ -116,12 +116,44 @@ export interface AgentOptions {
   apiKey?: string;
   /** HTTP timeout in milliseconds. Default: 120_000. */
   timeout?: number;
-  /** System prompt for the session. */
+  /** Replace the server's default system prompt entirely. */
   systemPrompt?: string;
+  /**
+   * Append additional instructions to the server's default system prompt.
+   * Ignored when `systemPrompt` is also provided.
+   */
+  appendSystemPrompt?: string;
+  /**
+   * Human-readable display name for the session (shown in session list /
+   * resume picker).
+   */
+  sessionName?: string;
+  /** Maximum number of agent steps allowed for this session. */
+  maxSteps?: number;
+  /**
+   * Planning mode. `"immediate"` (default) executes tool calls right away;
+   * `"plan_first"` buffers them and presents a plan for confirmation first.
+   */
+  planningMode?: "immediate" | "plan_first";
+  /**
+   * Extended-thinking token budget for models that support it (e.g. Anthropic
+   * claude-3-7). Pass `0` to disable thinking.
+   */
+  thinkingBudget?: number;
+  /**
+   * Permission mode. Controls tool-call enforcement:
+   * - `"default"` — standard rules (default)
+   * - `"auto"` — LLM-classifier decides each tool call
+   * - `"strict"` — unknown tools are denied
+   * - `"bypass"` — skip all permission rules
+   */
+  permissionMode?: "default" | "auto" | "strict" | "bypass";
+  /** Maximum total API spend in USD for this session / run. */
+  maxBudgetUsd?: number;
 }
 
 export interface PromptOptions extends AgentOptions {
-  maxSteps?: number;
+  // maxSteps is already inherited from AgentOptions
 }
 
 /**
@@ -159,6 +191,16 @@ export class Agent {
     const http = makeClient(options);
     const body: Record<string, unknown> = {};
     if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
+    if (options.appendSystemPrompt)
+      body["append_system_prompt"] = options.appendSystemPrompt;
+    if (options.sessionName) body["session_name"] = options.sessionName;
+    if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
+    if (options.planningMode) body["planning_mode"] = options.planningMode;
+    if (options.thinkingBudget != null)
+      body["thinking_budget"] = options.thinkingBudget;
+    if (options.permissionMode) body["permission_mode"] = options.permissionMode;
+    if (options.maxBudgetUsd != null)
+      body["max_budget_usd"] = options.maxBudgetUsd;
 
     const data = (await http.post("/sessions", body)) as { id: string };
     return new AgentSession(data.id, http, { ownsSession: true });
@@ -190,7 +232,15 @@ export class Agent {
     const http = makeClient(options);
     const body: Record<string, unknown> = { goal: message };
     if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
+    if (options.appendSystemPrompt)
+      body["append_system_prompt"] = options.appendSystemPrompt;
     if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
+    if (options.planningMode) body["planning_mode"] = options.planningMode;
+    if (options.thinkingBudget != null)
+      body["thinking_budget"] = options.thinkingBudget;
+    if (options.permissionMode) body["permission_mode"] = options.permissionMode;
+    if (options.maxBudgetUsd != null)
+      body["max_budget_usd"] = options.maxBudgetUsd;
 
     const data = (await http.post("/run", body)) as Record<string, unknown>;
     const usageRaw = data["usage"] as Record<string, unknown> | undefined;
