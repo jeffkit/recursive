@@ -13,10 +13,11 @@ use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::EpisodicRecall,
     tools::{
-        BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool, LoadSkill,
-        LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell, RunSkillScript,
-        ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles, SpawnWorkerTool, SubAgent,
-        TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
+        ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool,
+        LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
+        RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
+        SpawnWorkerTool, SpawnWorkersParallel, SubAgent, TodoWriteTool, ToolTransport, WebFetch,
+        WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, PlanningMode, RetryPolicy,
@@ -316,6 +317,17 @@ pub(crate) async fn build_runtime(
             None,
         );
         tools = tools.register(Arc::new(worker));
+
+        // spawn_workers_parallel — run multiple workers concurrently.
+        let parallel_worker = SpawnWorkersParallel::new(
+            &config.workspace,
+            provider.clone(),
+            tools.clone(),
+            max_depth,
+            0,
+            None,
+        );
+        tools = tools.register(Arc::new(parallel_worker));
     }
 
     let skills = discover_loaded_skills(config);
