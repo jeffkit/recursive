@@ -7,6 +7,8 @@ use std::time::Duration;
 use recursive::config::{load_project_context, Config};
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
+#[cfg(feature = "web_search")]
+use recursive::tools::WebSearch;
 use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::EpisodicRecall,
@@ -39,6 +41,10 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(WebFetch::new()))
         .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
         .register(Arc::new(CheckBackground::new(bg_manager.clone())));
+    #[cfg(feature = "web_search")]
+    {
+        registry = registry.register(Arc::new(WebSearch::new()));
+    }
     registry = registry.register(Arc::new(EstimateTokens::new(root)));
     registry = registry
         .register(Arc::new(Remember::new(root)))
