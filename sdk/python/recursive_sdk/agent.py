@@ -210,6 +210,13 @@ class Agent:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        append_system_prompt: Optional[str] = None,
+        session_name: Optional[str] = None,
+        max_steps: Optional[int] = None,
+        planning_mode: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
+        permission_mode: Optional[str] = None,
+        max_budget_usd: Optional[float] = None,
         timeout: float = 120.0,
     ) -> _AgentSession:
         """
@@ -223,7 +230,26 @@ class Agent:
         api_key:
             Optional API key (default: ``RECURSIVE_API_KEY`` env var).
         system_prompt:
-            Optional system prompt for the session.
+            Replace the server's default system prompt entirely.
+        append_system_prompt:
+            Append additional instructions to the server's default system prompt.
+            Ignored when *system_prompt* is also provided.
+        session_name:
+            Human-readable display name for the session (shown in session list /
+            resume picker).
+        max_steps:
+            Maximum number of agent steps allowed for this session.
+        planning_mode:
+            ``"immediate"`` (default) or ``"plan_first"`` — controls whether the
+            agent executes tool calls immediately or presents a plan first.
+        thinking_budget:
+            Extended-thinking token budget for models that support it (e.g.
+            Anthropic claude-3-7). Pass ``0`` to disable thinking.
+        permission_mode:
+            ``"default"``, ``"auto"``, ``"strict"``, or ``"bypass"`` — controls
+            tool-call permission enforcement.
+        max_budget_usd:
+            Maximum total API spend in USD for this session.
         timeout:
             HTTP / SSE timeout in seconds.
         """
@@ -231,6 +257,20 @@ class Agent:
         body: dict = {}
         if system_prompt:
             body["system_prompt"] = system_prompt
+        if append_system_prompt:
+            body["append_system_prompt"] = append_system_prompt
+        if session_name:
+            body["session_name"] = session_name
+        if max_steps is not None:
+            body["max_steps"] = max_steps
+        if planning_mode:
+            body["planning_mode"] = planning_mode
+        if thinking_budget is not None:
+            body["thinking_budget"] = thinking_budget
+        if permission_mode:
+            body["permission_mode"] = permission_mode
+        if max_budget_usd is not None:
+            body["max_budget_usd"] = max_budget_usd
         resp = http.post("/sessions", body)
         session_id = resp.json()["id"]
         return _AgentSession(session_id, http, _owns_session=True)
@@ -261,13 +301,38 @@ class Agent:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        append_system_prompt: Optional[str] = None,
         max_steps: Optional[int] = None,
+        planning_mode: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
+        permission_mode: Optional[str] = None,
+        max_budget_usd: Optional[float] = None,
         timeout: float = 120.0,
     ) -> RunResult:
         """
         One-shot convenience: create a session, send *message*, wait, delete.
 
         Returns a :class:`~recursive_sdk.models.RunResult`.
+
+        Parameters
+        ----------
+        message:
+            The goal / task to run.
+        system_prompt:
+            Replace the server's default system prompt entirely.
+        append_system_prompt:
+            Append additional instructions to the server's default system prompt.
+            Ignored when *system_prompt* is also provided.
+        max_steps:
+            Maximum number of agent steps.
+        planning_mode:
+            ``"immediate"`` (default) or ``"plan_first"``.
+        thinking_budget:
+            Extended-thinking token budget. Pass ``0`` to disable.
+        permission_mode:
+            ``"default"``, ``"auto"``, ``"strict"``, or ``"bypass"``.
+        max_budget_usd:
+            Maximum total API spend in USD for this run.
 
         Example::
 
@@ -279,8 +344,18 @@ class Agent:
         body: dict = {"goal": message}
         if system_prompt:
             body["system_prompt"] = system_prompt
+        if append_system_prompt:
+            body["append_system_prompt"] = append_system_prompt
         if max_steps is not None:
             body["max_steps"] = max_steps
+        if planning_mode:
+            body["planning_mode"] = planning_mode
+        if thinking_budget is not None:
+            body["thinking_budget"] = thinking_budget
+        if permission_mode:
+            body["permission_mode"] = permission_mode
+        if max_budget_usd is not None:
+            body["max_budget_usd"] = max_budget_usd
 
         resp = http.post("/run", body)
         data = resp.json()

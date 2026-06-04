@@ -81,6 +81,44 @@ with Agent.create(base_url="http://127.0.0.1:3000") as agent:
     print(f"\nDone in {result.num_turns} turns")
 ```
 
+## Session options
+
+Both `Agent.create()` and `Agent.prompt()` accept these optional keyword arguments in addition to `base_url`, `api_key`, and `timeout`:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `system_prompt` | `str` | Replace the server's default system prompt entirely. |
+| `append_system_prompt` | `str` | Append to the default system prompt (ignored if `system_prompt` is set). |
+| `session_name` | `str` | Human-readable display name for the session (`create` only). |
+| `max_steps` | `int` | Maximum number of agent steps allowed. |
+| `planning_mode` | `"immediate"` \| `"plan_first"` | `"plan_first"` buffers tool calls and shows a plan before executing. |
+| `thinking_budget` | `int` | Extended-thinking token budget (Anthropic models). Pass `0` to disable. |
+| `permission_mode` | `"default"` \| `"auto"` \| `"strict"` \| `"bypass"` | Tool-call permission enforcement level. |
+| `max_budget_usd` | `float` | Maximum API spend in USD for this session / run. |
+
+Example — Plan Mode + named session:
+
+```python
+with Agent.create(
+    base_url="http://localhost:3000",
+    session_name="refactor-auth",
+    planning_mode="plan_first",
+    max_steps=20,
+) as agent:
+    run = agent.send("Refactor the auth module to use JWTs")
+    run.wait()
+```
+
+Example — append extra instructions without losing the default prompt:
+
+```python
+result = Agent.prompt(
+    "Fix all failing tests",
+    base_url="http://localhost:3000",
+    append_system_prompt="\nAlways run `cargo test` to verify before finishing.",
+)
+```
+
 ## API Reference
 
 ### `Agent` (static methods)

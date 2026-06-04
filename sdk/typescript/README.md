@@ -145,13 +145,46 @@ try {
 
 ### `AgentOptions`
 
+Passed to `Agent.create()`, `Agent.resume()`, and `Agent.prompt()`.
+
 ```typescript
 interface AgentOptions {
-  baseUrl?: string;      // default: RECURSIVE_BASE_URL or http://127.0.0.1:3000
-  apiKey?: string;       // default: RECURSIVE_API_KEY env var
-  timeout?: number;      // ms
-  systemPrompt?: string;
+  baseUrl?: string;            // default: RECURSIVE_BASE_URL or http://127.0.0.1:3000
+  apiKey?: string;             // default: RECURSIVE_API_KEY env var
+  timeout?: number;            // ms, default 120_000
+  systemPrompt?: string;       // replace server's default system prompt
+  appendSystemPrompt?: string; // append to default (ignored if systemPrompt is set)
+  sessionName?: string;        // human-readable display name
+  maxSteps?: number;           // max agent steps
+  planningMode?: "immediate" | "plan_first"; // default: "immediate"
+  thinkingBudget?: number;     // extended-thinking token budget; 0 = disabled
+  permissionMode?: "default" | "auto" | "strict" | "bypass";
+  maxBudgetUsd?: number;       // max API spend in USD
 }
+```
+
+`PromptOptions` is an alias for `AgentOptions` — all the same options apply to `Agent.prompt()`.
+
+Example — Plan Mode + named session:
+
+```typescript
+await using agent = await Agent.create({
+  baseUrl: "http://localhost:3000",
+  sessionName: "refactor-auth",
+  planningMode: "plan_first",
+  maxSteps: 20,
+});
+const run = await agent.send("Refactor the auth module to use JWTs");
+await run.wait();
+```
+
+Example — append to the default system prompt:
+
+```typescript
+const result = await Agent.prompt("Fix all failing tests", {
+  baseUrl: "http://localhost:3000",
+  appendSystemPrompt: "\nAlways run `cargo test` to verify before finishing.",
+});
 ```
 
 ### Message types
