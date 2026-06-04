@@ -234,6 +234,7 @@ pub(super) async fn create_session(
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+        non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     state.sessions.write().await.insert(id.clone(), session);
@@ -254,15 +255,12 @@ pub(super) async fn list_sessions(
     let sessions = state.sessions.read().await;
     let mut infos = Vec::with_capacity(sessions.len());
     for s in sessions.values() {
-        // Exclude the system-prompt message from the user-visible count.
+        // Read the pre-computed count without acquiring the runtime lock.
+        // The count is updated atomically whenever a non-system message is
+        // appended, so it remains accurate while a turn is in progress.
         let message_count = s
-            .runtime
-            .lock()
-            .await
-            .transcript()
-            .iter()
-            .filter(|m| m.role != crate::message::Role::System)
-            .count();
+            .non_system_message_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         infos.push(SessionInfo {
             id: s.id.clone(),
             created_at: s.created_at.clone(),
@@ -452,6 +450,10 @@ pub(super) async fn fork_session(
         .build()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let non_system_count = transcript_snapshot
+        .iter()
+        .filter(|m| m.role != crate::message::Role::System)
+        .count();
     runtime.set_transcript(transcript_snapshot);
 
     let plan_approval_gate = runtime.plan_approval_gate();
@@ -462,6 +464,7 @@ pub(super) async fn fork_session(
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+        non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
     };
 
     state.sessions.write().await.insert(new_id.clone(), session);
@@ -693,8 +696,8 @@ pub(super) async fn send_session_message(
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Get the session's runtime and interrupt token (Arc clones are cheap).
-    let (runtime_arc, interrupt_token_arc) = {
+    // Get the session's runtime, interrupt token, and message counter (Arc clones are cheap).
+    let (runtime_arc, interrupt_token_arc, msg_count_arc) = {
         let sessions = state.sessions.read().await;
         let session = sessions.get(&id).ok_or((
             StatusCode::NOT_FOUND,
@@ -703,7 +706,11 @@ pub(super) async fn send_session_message(
                 error: "session not found".into(),
             }),
         ))?;
-        (session.runtime.clone(), session.interrupt_token.clone())
+        (
+            session.runtime.clone(),
+            session.interrupt_token.clone(),
+            session.non_system_message_count.clone(),
+        )
     };
 
     // Ensure broadcast channel exists for this session before we lock the runtime.
@@ -792,6 +799,15 @@ pub(super) async fn send_session_message(
             }),
         )
     })?;
+
+    // Update the lock-free message counter so list_sessions doesn't need to
+    // acquire the runtime mutex.
+    let new_count = runtime
+        .transcript()
+        .iter()
+        .filter(|m| m.role != crate::message::Role::System)
+        .count();
+    msg_count_arc.store(new_count, std::sync::atomic::Ordering::Relaxed);
 
     // Extract the last assistant message from the runtime's transcript.
     let last_assistant = runtime

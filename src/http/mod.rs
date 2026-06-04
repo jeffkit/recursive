@@ -75,6 +75,10 @@ pub struct SessionState {
     /// the kernel to exit with `FinishReason::Cancelled` at the next step
     /// boundary.  Replaced with a fresh token at the start of every turn.
     pub interrupt_token: Arc<tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// Approximate non-system message count, updated atomically as messages
+    /// are appended. Allows `list_sessions` to read the count without taking
+    /// the runtime Mutex (which may be held by a running agent turn).
+    pub non_system_message_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Serialized session info for list/detail endpoints.
