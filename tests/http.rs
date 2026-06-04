@@ -924,6 +924,7 @@ mod http_tests {
             name: "read_file".into(),
             output: "file contents here".into(),
             step: 1,
+            is_error: false,
         };
         let sse = map_agent_event(&event).unwrap();
         assert_eq!(
@@ -944,6 +945,7 @@ mod http_tests {
             name: "write_file".into(),
             output: "ERROR: permission denied".into(),
             step: 3,
+            is_error: true,
         };
         let sse = map_agent_event(&event).unwrap();
         assert_eq!(
