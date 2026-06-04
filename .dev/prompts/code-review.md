@@ -10,6 +10,11 @@ You have been given:
 
 Review the diff against these criteria and output a structured verdict.
 
+You have access to `Read` and `Glob` tools. Use them when you need context not
+visible in the diff — for example, to look up a caller, check an interface
+definition, or verify a constant's value. Limit yourself to 3–4 reads; the goal
+is targeted context, not a full codebase scan.
+
 ### Criteria
 
 **Completeness** (weight: high)

@@ -103,10 +103,10 @@ trap 'rm -f "$REVIEW_PROMPT_FILE"' EXIT
   echo "Please review and output your verdict as JSON."
 } > "$REVIEW_PROMPT_FILE"
 
-# ---- Run the review agent (single-turn, no tools needed) --------------------
-# Use the same binary in the worktree. Run with RECURSIVE_MAX_STEPS=1 so the
-# agent makes exactly one LLM call — just read the diff and output JSON.
-export RECURSIVE_MAX_STEPS=1
+# ---- Run the review agent ---------------------------------------------------
+# Budget: default 5 steps so the reviewer can read files it needs for context.
+# Set RECURSIVE_REVIEW_MAX_STEPS=1 to restore single-turn (no tool) behaviour.
+export RECURSIVE_MAX_STEPS="${RECURSIVE_REVIEW_MAX_STEPS:-5}"
 # Disable features that could interfere with a single-turn review
 export RECURSIVE_COMPACT_THRESHOLD=99999999
 export RECURSIVE_TRACE_SPANS=0
@@ -144,9 +144,9 @@ else
   BIN=./target/debug/recursive
 fi
 
-# Run the review agent. Capture stderr separately so we can extract the JSON
-# verdict from stdout. The agent outputs the review as its final message.
-REVIEW_OUTPUT=$("$BIN" --workspace . --log error run "$(cat "$REVIEW_PROMPT_FILE")" 2>/dev/null || true)
+# Run the review agent. Allow Read and Glob so the reviewer can look up context
+# (callers, definitions) without being able to modify files or run shell commands.
+REVIEW_OUTPUT=$("$BIN" --workspace . --log error --allow-tools Read,Glob run "$(cat "$REVIEW_PROMPT_FILE")" 2>/dev/null || true)
 
 # Extract JSON from the output — the verdict should be the last JSON block
 # or the last line of the assistant's response.
