@@ -40,6 +40,7 @@ mod http_tests {
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            allow_tools: Vec::new(),
         }
     }
 

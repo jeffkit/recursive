@@ -199,6 +199,12 @@ struct Cli {
     /// Run a one-shot prompt (non-interactive). Like `recursive run` but shorter.
     #[arg(short = 'p', long = "print")]
     prompt: Option<String>,
+
+    /// Restrict the agent to a comma-separated list of tools (e.g. "Read,Glob").
+    /// All tools not in the list are removed from the registry before the run.
+    /// Tool names are matched case-insensitively.
+    #[arg(long = "allow-tools", env = "RECURSIVE_ALLOW_TOOLS")]
+    allow_tools: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -506,6 +512,10 @@ async fn main() -> anyhow::Result<()> {
     // --add-dir: extra allowed sandbox roots.
     if !cli.add_dir.is_empty() {
         config.extra_dirs = cli.add_dir.clone();
+    }
+    // --allow-tools: restrict agent to a subset of tools.
+    if let Some(ref allow) = cli.allow_tools {
+        config.allow_tools = allow.split(',').map(|s| s.trim().to_string()).collect();
     }
     // --output-format: supersedes --json and --stream.
     let effective_json = cli.json
@@ -1479,6 +1489,9 @@ async fn run_loop(
     let mut tools = cli::builder::build_tools(&config).await;
     cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
     tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot.clone())));
+    if !config.allow_tools.is_empty() {
+        tools.retain_tools(&config.allow_tools);
+    }
 
     // Build LLM provider
     let api_key = config.require_api_key()?;
@@ -2152,6 +2165,7 @@ mod tests {
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            allow_tools: Vec::new(),
         }
     }
 
