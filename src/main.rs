@@ -1648,6 +1648,7 @@ async fn run_once(
         Some(&goal),
         Some(event_sink),
         Some(shutdown.clone()),
+        true, // interactive CLI — plan mode tools enabled
     )
     .await?;
 
@@ -1798,6 +1799,7 @@ async fn repl(
         None,
         None,
         None,
+        true, // interactive REPL — plan mode tools enabled
     )
     .await?;
 
@@ -2117,6 +2119,7 @@ async fn run_weixin_headless_daemon(
         None,  // goal
         None,  // event_sink (WeChat responses come from enqueue return value)
         None,  // shutdown_token
+        false, // headless daemon — no human to confirm plans
     )
     .await?;
 
@@ -2200,6 +2203,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
         assert!(r1.is_ok(), "openai/stream=false: must not panic or fail");
@@ -2215,6 +2219,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
         assert!(r2.is_ok(), "openai/stream=true: must not panic or fail");
@@ -2234,6 +2239,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
         match original {

@@ -1088,6 +1088,14 @@ pub struct AgentRuntimeBuilder {
     /// Stored here for future multi-agent orchestration; not yet wired to
     /// the actual event emission path.
     pub parent_agent_last_uuid: Option<String>,
+    /// When `true`, register `enter_plan_mode`, `exit_plan_mode`, and
+    /// `request_plan_mode` tools. These tools block waiting for human
+    /// approval via the plan approval gate, so they must only be registered
+    /// when a live interactive channel (TUI or interactive CLI) is present
+    /// to call `confirm_plan()` / `reject_plan()`. Headless and non-interactive
+    /// callers must leave this `false` (the default) — the tools simply do not
+    /// exist in the registry, so the model cannot invoke them.
+    with_plan_mode_tools: bool,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -1129,7 +1137,17 @@ impl AgentRuntimeBuilder {
             saved_event_sink: None,
             compactor: None,
             parent_agent_last_uuid: None,
+            with_plan_mode_tools: false,
         }
+    }
+
+    /// Register `enter_plan_mode`, `exit_plan_mode`, and `request_plan_mode`
+    /// tools. Call this only from channels that have a live human reviewer
+    /// (TUI, interactive CLI). Headless and batch callers must NOT set this —
+    /// the tools block indefinitely waiting for `confirm_plan()`.
+    pub fn with_plan_mode_tools(mut self, enabled: bool) -> Self {
+        self.with_plan_mode_tools = enabled;
+        self
     }
 
     /// Set the UUID of the parent agent's last message.
@@ -1257,35 +1275,37 @@ impl AgentRuntimeBuilder {
             event_sink.clone(),
         )));
 
-        // Goal-165: create the plan approval gate and register the plan mode tools.
+        // Goal-165 / Goal-202: plan mode tools block waiting for human approval
+        // via the gate. They must only be registered when a live interactive
+        // channel (TUI or interactive CLI) is present to call confirm_plan().
+        // Headless / batch callers set with_plan_mode_tools = false (the default)
+        // so the model never sees these tools and cannot trigger a deadlock.
         let plan_approval_gate = Arc::new(PlanApprovalGate::new());
-        // Goal-190: pass permissions config to plan mode tools so they can
-        // report which tools are in Plan mode.
-        let permissions_arc = kernel.tools().permissions_config().map(Arc::new);
-        kernel.tools_mut().register_mut({
-            let mut tool = EnterPlanModeTool::new(plan_approval_gate.clone());
-            if let Some(ref perms) = permissions_arc {
-                tool = tool.with_permissions(perms.clone());
-            }
-            Arc::new(tool)
-        });
-        kernel.tools_mut().register_mut({
-            let mut tool = ExitPlanModeTool::new(plan_approval_gate.clone(), event_sink.clone());
-            if let Some(ref perms) = permissions_arc {
-                tool = tool.with_permissions(perms.clone());
-            }
-            Arc::new(tool)
-        });
-
-        // Goal-202: create the plan-mode pre-confirmation gate and register
-        // the request_plan_mode tool (TUI / HTTP only, same as plan mode tools).
         let plan_mode_request_gate = Arc::new(PlanModeRequestGate::new());
-        kernel
-            .tools_mut()
-            .register_mut(Arc::new(RequestPlanModeTool::new(
-                plan_mode_request_gate.clone(),
-                event_sink.clone(),
-            )));
+        if self.with_plan_mode_tools {
+            let permissions_arc = kernel.tools().permissions_config().map(Arc::new);
+            kernel.tools_mut().register_mut({
+                let mut tool = EnterPlanModeTool::new(plan_approval_gate.clone());
+                if let Some(ref perms) = permissions_arc {
+                    tool = tool.with_permissions(perms.clone());
+                }
+                Arc::new(tool)
+            });
+            kernel.tools_mut().register_mut({
+                let mut tool =
+                    ExitPlanModeTool::new(plan_approval_gate.clone(), event_sink.clone());
+                if let Some(ref perms) = permissions_arc {
+                    tool = tool.with_permissions(perms.clone());
+                }
+                Arc::new(tool)
+            });
+            kernel
+                .tools_mut()
+                .register_mut(Arc::new(RequestPlanModeTool::new(
+                    plan_mode_request_gate.clone(),
+                    event_sink.clone(),
+                )));
+        }
 
         Ok(AgentRuntime {
             kernel,
@@ -2082,10 +2102,14 @@ mod tests {
     #[test]
     fn runtime_builder_has_plan_mode_tools() {
         // AgentRuntimeBuilder::build() must register enter_plan_mode and
-        // exit_plan_mode with the real PlanApprovalGate and EventSink.
+        // exit_plan_mode when with_plan_mode_tools(true) is set.
         // These are channel capabilities used by the TUI and HTTP paths.
         let llm = Arc::new(MockProvider::new(vec![]));
-        let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .with_plan_mode_tools(true)
+            .build()
+            .unwrap();
         let tools = rt.kernel.tools();
         assert!(
             tools.get("enter_plan_mode").is_some(),

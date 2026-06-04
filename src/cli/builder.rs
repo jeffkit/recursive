@@ -253,6 +253,9 @@ pub(crate) async fn build_runtime(
     goal: Option<&str>,
     event_sink: Option<Arc<dyn EventSink>>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    // Pass `true` for interactive channels (TUI, CLI) that have a live human
+    // to call `confirm_plan()`. Headless/batch callers pass `false`.
+    interactive: bool,
 ) -> anyhow::Result<AgentRuntime> {
     let api_key = config.require_api_key()?;
     let provider_type = &config.provider_type;
@@ -464,5 +467,8 @@ pub(crate) async fn build_runtime(
     if let Some(sink) = event_sink {
         builder = builder.event_sink(sink);
     }
-    builder.build().map_err(Into::into)
+    builder
+        .with_plan_mode_tools(interactive)
+        .build()
+        .map_err(Into::into)
 }
