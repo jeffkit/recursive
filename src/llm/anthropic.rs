@@ -902,6 +902,9 @@ enum ContentBlock {
         #[serde(default)]
         input: Value,
     },
+    // Extended thinking blocks (MiniMax-M3, deepseek-v4-flash, etc.) — skip silently.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -955,6 +958,7 @@ fn parse_completion(response: AnthropicResponse) -> Completion {
                     arguments: input,
                 });
             }
+            ContentBlock::Unknown => {}
         }
     }
 
