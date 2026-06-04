@@ -896,8 +896,8 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
             name: name.clone(),
             step: *step,
         }),
-        AgentEvent::ToolResult { name, output, .. } => {
-            let success = !output.starts_with("ERROR: ");
+        AgentEvent::ToolResult { name, is_error, .. } => {
+            let success = !is_error;
             Some(SseEvent::ToolResult {
                 name: name.clone(),
                 success,
@@ -1433,6 +1433,7 @@ mod tests {
             name: "run_shell".to_string(),
             output: "ok".to_string(),
             step: 0,
+            is_error: false,
         };
         if let Some(ev) = map_agent_event(&result_event) {
             emitted.push(ev);
@@ -1480,6 +1481,7 @@ mod tests {
             name: "read_file".to_string(),
             output: "data".to_string(),
             step: 0,
+            is_error: false,
         };
         let elapsed_ms = if let AgentEvent::ToolResult { id, .. } = &result_event {
             tool_start_times

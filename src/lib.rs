@@ -65,7 +65,7 @@ pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
 pub use hooks::ExternalHookRunner;
 pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
-pub use kernel::{AgentKernel, AgentKernelBuilder, SideEffect, TurnContext, TurnOutcome};
+pub use kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 pub use llm::{
     context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, Completion,
     LlmProvider, ModelPricing, RetryPolicy, TokenUsage, ToolCall, ToolSpec,

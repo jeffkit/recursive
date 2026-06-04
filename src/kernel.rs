@@ -22,10 +22,6 @@
 //! As of Goal 219 Commit 1, the kernel passes the caller's
 //! `AgentEvent` channel directly to `RunCore` — no internal bridge.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Duration;
-
 use crate::agent::{FinishReason, PlanningMode};
 use crate::compact::Compactor;
 use crate::event::AgentEvent;
@@ -37,6 +33,8 @@ use crate::storage::{NoopSessionStore, SessionStore, StorageBackend};
 use crate::tool_set_provider::ToolSetProvider;
 use crate::tools::PermissionHook;
 use crate::tools::ToolRegistry;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // TurnContext
@@ -120,9 +118,6 @@ pub struct TurnOutcome {
     /// Number of steps (LLM invocations) executed in this turn.
     pub steps: usize,
 
-    /// Side effects the Wrapper should adopt (background jobs, scheduled tasks).
-    pub side_effects: Vec<SideEffect>,
-
     /// Buffered tool calls from a proposed plan (when plan is pending).
     pub plan_buffer: Option<Vec<crate::llm::ToolCall>>,
 
@@ -136,24 +131,6 @@ pub struct TurnOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// SideEffect
-// ---------------------------------------------------------------------------
-
-/// A side effect produced during a turn that outlives the turn itself.
-/// The Wrapper is responsible for managing these.
-#[derive(Debug, Clone)]
-pub enum SideEffect {
-    /// A background process was spawned (e.g. via run_background tool).
-    BackgroundJob {
-        id: String,
-        pid: u32,
-        command: String,
-    },
-    /// The agent requested a future wakeup (e.g. via schedule_wakeup tool).
-    ScheduleWakeup { delay: Duration, prompt: String },
-}
-
-// ---------------------------------------------------------------------------
 // AgentKernel
 // ---------------------------------------------------------------------------
 
@@ -162,9 +139,6 @@ pub enum SideEffect {
 /// Cheap to create, safe to clone, safe to share across threads.
 /// Does not own transcript, session, or any cross-turn state.
 ///
-/// NOTE: The `run()` method is NOT implemented in this goal.
-/// This goal only defines the struct and its builder. The actual
-/// execution logic will be wired in Goal C (Phase 2).
 #[derive(Clone)]
 pub struct AgentKernel {
     /// The LLM provider to use for completions.
@@ -336,7 +310,6 @@ impl AgentKernel {
             usage: inner.total_usage,
             llm_latency_ms: inner.total_llm_latency_ms,
             steps: inner.steps,
-            side_effects: Vec::new(),
             plan_buffer: inner.plan_buffer,
             plan_confirmed: inner.plan_confirmed,
             tool_audits: inner.tool_audits,
@@ -605,7 +578,6 @@ mod tests {
             usage: TokenUsage::default(),
             llm_latency_ms: 0,
             steps: 0,
-            side_effects: vec![],
             plan_buffer: None,
             plan_confirmed: false,
             tool_audits: std::collections::HashMap::new(),
@@ -616,37 +588,5 @@ mod tests {
         assert_eq!(outcome.usage, TokenUsage::default());
         assert_eq!(outcome.llm_latency_ms, 0);
         assert_eq!(outcome.steps, 0);
-        assert!(outcome.side_effects.is_empty());
-    }
-
-    // -- SideEffect tests ---------------------------------------------------
-
-    #[test]
-    fn side_effect_variants() {
-        let bg = SideEffect::BackgroundJob {
-            id: "job-1".into(),
-            pid: 12345,
-            command: "echo hello".into(),
-        };
-        match &bg {
-            SideEffect::BackgroundJob { id, pid, command } => {
-                assert_eq!(id, "job-1");
-                assert_eq!(*pid, 12345);
-                assert_eq!(command, "echo hello");
-            }
-            _ => panic!("expected BackgroundJob"),
-        }
-
-        let wake = SideEffect::ScheduleWakeup {
-            delay: Duration::from_secs(60),
-            prompt: "check status".into(),
-        };
-        match &wake {
-            SideEffect::ScheduleWakeup { delay, prompt } => {
-                assert_eq!(delay.as_secs(), 60);
-                assert_eq!(prompt, "check status");
-            }
-            _ => panic!("expected ScheduleWakeup"),
-        }
     }
 }
