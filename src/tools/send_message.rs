@@ -134,6 +134,10 @@ impl SendMessageTool {
 
 #[async_trait]
 impl Tool for SendMessageTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "send_message".into(),

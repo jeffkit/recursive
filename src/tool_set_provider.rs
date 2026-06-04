@@ -153,8 +153,8 @@ mod tests {
         let reg = p.build_registry();
         let names = reg.names();
         assert!(
-            names.iter().any(|n| n == "run_shell"),
-            "expected run_shell in registry, got: {names:?}"
+            names.iter().any(|n| n == "Bash"),
+            "expected Bash in registry, got: {names:?}"
         );
     }
 

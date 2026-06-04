@@ -620,7 +620,7 @@ mod tests {
                     "tool_calls":[{
                         "id":"call_1",
                         "type":"function",
-                        "function":{"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                        "function":{"name":"Read","arguments":"{\"path\":\"src/lib.rs\"}"}
                     }]
                 },
                 "finish_reason":"tool_calls"
@@ -629,7 +629,7 @@ mod tests {
         let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
         let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
         assert_eq!(c.tool_calls.len(), 1);
-        assert_eq!(c.tool_calls[0].name, "read_file");
+        assert_eq!(c.tool_calls[0].name, "Read");
         assert_eq!(c.tool_calls[0].arguments["path"], "src/lib.rs");
     }
 
@@ -716,12 +716,12 @@ mod tests {
             "",
             vec![ToolCall {
                 id: "abc".into(),
-                name: "write_file".into(),
+                name: "Write".into(),
                 arguments: serde_json::json!({"path":"a","contents":"b"}),
             }],
         );
         let v = serialize_message(&msg);
-        assert_eq!(v["tool_calls"][0]["function"]["name"], "write_file");
+        assert_eq!(v["tool_calls"][0]["function"]["name"], "Write");
         let args = v["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();

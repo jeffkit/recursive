@@ -407,8 +407,8 @@ preset = "deepseek"
             home.join(".recursive").join("config.toml"),
             r#"
 [permissions]
-allow = ["read_file"]
-deny = ["run_shell"]
+allow = ["Read"]
+deny = ["Bash"]
 "#,
         )
         .unwrap();
@@ -419,7 +419,7 @@ deny = ["run_shell"]
             project.join(".recursive").join("config.toml"),
             r#"
 [permissions]
-allow = ["write_file"]
+allow = ["Write"]
 interactive = ["delete_file"]
 "#,
         )
@@ -445,11 +445,11 @@ interactive = ["delete_file"]
         assert_eq!(config.layers[2].source, RuleSource::Session);
 
         // User layer has allow/deny
-        assert_eq!(config.layers[0].allow, vec!["read_file"]);
-        assert_eq!(config.layers[0].deny, vec!["run_shell"]);
+        assert_eq!(config.layers[0].allow, vec!["Read"]);
+        assert_eq!(config.layers[0].deny, vec!["Bash"]);
 
         // Project layer has allow/interactive
-        assert_eq!(config.layers[1].allow, vec!["write_file"]);
+        assert_eq!(config.layers[1].allow, vec!["Write"]);
         assert_eq!(config.layers[1].interactive, vec!["delete_file"]);
     }
 }

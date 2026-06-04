@@ -584,7 +584,7 @@ pub fn default_roles() -> Vec<AgentRole> {
                             issues, suggest improvements. Do not modify files."
                 .into(),
             max_steps: 20,
-            allowed_tools: vec!["read_file".into(), "search_files".into()],
+            allowed_tools: vec!["Read".into(), "Grep".into()],
         },
     ]
 }
@@ -635,7 +635,7 @@ mod tests {
             name: "tester".into(),
             system_prompt: "You test things.".into(),
             max_steps: 5,
-            allowed_tools: vec!["run_shell".into()],
+            allowed_tools: vec!["Bash".into()],
         };
         pool.add_role(role.clone());
 
@@ -643,7 +643,7 @@ mod tests {
         assert_eq!(retrieved.name, "tester");
         assert_eq!(retrieved.system_prompt, "You test things.");
         assert_eq!(retrieved.max_steps, 5);
-        assert_eq!(retrieved.allowed_tools, vec!["run_shell"]);
+        assert_eq!(retrieved.allowed_tools, vec!["Bash"]);
     }
 
     #[test]

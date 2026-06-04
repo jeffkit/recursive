@@ -11,11 +11,10 @@ use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::EpisodicRecall,
     tools::{
-        ApplyPatch, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, ListDir,
-        LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
-        RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
-        SpawnWorkerTool, SubAgent, TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool,
-        WriteFile,
+        BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool, LoadSkill,
+        LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell, RunSkillScript,
+        ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles, SpawnWorkerTool, SubAgent,
+        TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, PlanningMode, RetryPolicy,
@@ -30,8 +29,7 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
     let mut registry = ToolRegistry::new(transport)
         .register(Arc::new(ReadFile::new(root)))
         .register(Arc::new(WriteFile::new(root)))
-        .register(Arc::new(ApplyPatch::new(root)))
-        .register(Arc::new(ListDir::new(root)))
+        .register(Arc::new(GlobTool::new(root)))
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))

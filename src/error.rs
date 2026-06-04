@@ -126,35 +126,35 @@ mod tests {
     #[test]
     fn test_tool_error_format() {
         let err = Error::Tool {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             message: "command not found".into(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("run_shell"));
+        assert!(msg.contains("Bash"));
         assert!(msg.contains("command not found"));
     }
 
     #[test]
     fn test_bad_tool_args_format() {
         let err = Error::BadToolArgs {
-            name: "read_file".into(),
+            name: "Read".into(),
             message: "missing path".into(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("read_file"));
+        assert!(msg.contains("Read"));
         assert!(msg.contains("missing path"));
     }
 
     #[test]
     fn test_permission_denied_format() {
         let err = Error::PermissionDenied {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             reason: crate::permissions::DecisionReason::Mode(
                 crate::permissions::PermissionMode::DontAsk,
             ),
         };
         let msg = err.to_string();
-        assert!(msg.contains("run_shell"));
+        assert!(msg.contains("Bash"));
         assert!(msg.contains("DontAsk"));
     }
 

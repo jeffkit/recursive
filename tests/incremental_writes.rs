@@ -377,7 +377,7 @@ async fn resume_after_crash_orphan_visible() {
                 content: "I will call the tool".into(),
                 tool_calls: vec![ToolCall {
                     id: "orphan_call_1".into(),
-                    name: "run_shell".into(),
+                    name: "Bash".into(),
                     arguments: json!({"cmd": "dangerous"}),
                 }],
                 tool_call_id: None,

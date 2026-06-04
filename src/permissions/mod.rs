@@ -303,8 +303,8 @@ impl LayeredPermissionsConfig {
     ///    interactive tools in non-headless contexts (Goal-212).
     ///
     /// `content` is the call-time content the tool will operate on. For
-    /// `write_file` / `read_file` it should be the file path; for
-    /// `apply_patch` it should be the full V4A patch body. Other tools
+    /// `Write` / `Read` it should be the file path; for
+    /// `Edit` it should be the file path. Other tools
     /// can pass `None`. See [`extract_file_path_from_content`].
     pub fn check_static(
         &self,
@@ -611,28 +611,16 @@ const PROTECTED_PATHS: &[&str] = &[
 
 /// Extract a file path from `content` for tools that operate on a file.
 ///
-/// - For `write_file` and `read_file`, `content` *is* the file path
+/// - For `Write` and `Read`, `content` *is* the file path
 ///   (the caller is expected to have passed `args["path"]` as `content`).
-/// - For `apply_patch`, `content` is the full V4A patch body; this
-///   helper extracts the **first** file path mentioned in the body
-///   (i.e. the first `*** Update/Add/Delete File:` header). This is
-///   intentionally conservative: if any file in the patch is protected,
-///   we deny.
+/// - For `Edit`, `content` is the file path
+///   (the caller is expected to have passed `args["file_path"]` as `content`).
 /// - All other tools return `None`.
 fn extract_file_path_from_content(tool_name: &str, content: Option<&str>) -> Option<String> {
     let content = content?;
     match tool_name {
-        "write_file" | "read_file" => Some(content.to_string()),
-        "apply_patch" => {
-            for line in content.lines() {
-                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-                    if let Some(rest) = line.strip_prefix(prefix) {
-                        return Some(rest.trim().to_string());
-                    }
-                }
-            }
-            None
-        }
+        "Write" | "Read" => Some(content.to_string()),
+        "Edit" => Some(content.to_string()),
         _ => None,
     }
 }
@@ -652,7 +640,7 @@ fn path_contains_protected(path: &str, protected: &str) -> bool {
 
 /// Match a tool name against a pattern that may end with `*`.
 ///
-/// - `"run_shell"` matches exactly `"run_shell"`
+/// - `"Bash"` matches exactly `"Bash"`
 /// - `"run_*"` matches any name starting with `"run_"`
 /// - `"*"` matches everything
 fn matches_pattern(pattern: &str, name: &str) -> bool {
@@ -827,7 +815,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = config.check_static("write_file", false, None);
+        let result = config.check_static("Write", false, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -870,7 +858,7 @@ mod tests {
         };
         // With bypass_available, write tool is not blocked at plan step;
         // falls through to Passthrough (no rules configured).
-        let result = config.check_static("write_file", false, None);
+        let result = config.check_static("Write", false, None);
         assert!(!result.is_denied());
         assert!(matches!(result, Permission::Unknown));
     }
@@ -882,11 +870,11 @@ mod tests {
             mode: PermissionMode::BypassPermissions,
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                deny: vec!["run_shell".into()],
+                deny: vec!["Bash".into()],
                 ..Default::default()
             }],
         };
-        let result = config.check_static("run_shell", false, None);
+        let result = config.check_static("Bash", false, None);
         assert!(result.is_allowed());
         if let Permission::Allowed(reason) = result {
             assert!(matches!(
@@ -905,11 +893,11 @@ mod tests {
             mode: PermissionMode::DontAsk,
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                interactive: vec!["run_shell".into()],
+                interactive: vec!["Bash".into()],
                 ..Default::default()
             }],
         };
-        let result = config.check_static("run_shell", false, None);
+        let result = config.check_static("Bash", false, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -929,7 +917,7 @@ mod tests {
             mode: PermissionMode::AcceptEdits,
             ..Default::default()
         };
-        let result = config.check_static("write_file", false, None);
+        let result = config.check_static("Write", false, None);
         assert!(result.is_allowed());
         if let Permission::Allowed(reason) = result {
             assert!(matches!(
@@ -948,11 +936,11 @@ mod tests {
             mode: PermissionMode::Default,
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                deny: vec!["run_shell".into()],
+                deny: vec!["Bash".into()],
                 ..Default::default()
             }],
         };
-        let result = config.check_static("run_shell", true, None);
+        let result = config.check_static("Bash", true, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, _msg) = result {
             assert!(matches!(
@@ -974,11 +962,11 @@ mod tests {
             mode: PermissionMode::Default,
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                allow: vec!["read_file".into()],
+                allow: vec!["Read".into()],
                 ..Default::default()
             }],
         };
-        let result = config.check_static("read_file", true, None);
+        let result = config.check_static("Read", true, None);
         assert!(result.is_allowed());
         if let Permission::Allowed(reason) = result {
             assert!(matches!(
@@ -1005,7 +993,7 @@ mod tests {
             ..Default::default()
         };
         // read-only tools are not blocked by plan mode
-        let result = config.check_static("read_file", true, None);
+        let result = config.check_static("Read", true, None);
         assert!(!result.is_denied());
     }
 
@@ -1016,13 +1004,13 @@ mod tests {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                interactive: vec!["run_*".into()],
+                interactive: vec!["Ba*".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert!(config.any_interactive("run_shell"));
-        assert!(!config.any_interactive("read_file"));
+        assert!(config.any_interactive("Bash"));
+        assert!(!config.any_interactive("Read"));
     }
 
     // ── LayeredPermissionsConfig: basic layer tests ──────────────────────
@@ -1040,13 +1028,13 @@ mod tests {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                deny: vec!["run_shell".into()],
+                deny: vec!["Bash".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false, None).is_denied());
-        assert!(!config.check_static("read_file", false, None).is_denied());
+        assert!(config.check_static("Bash", false, None).is_denied());
+        assert!(!config.check_static("Read", false, None).is_denied());
     }
 
     #[test]
@@ -1054,14 +1042,14 @@ mod tests {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                allow: vec!["read_file".into()],
+                allow: vec!["Read".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert!(config.check_static("read_file", false, None).is_allowed());
+        assert!(config.check_static("Read", false, None).is_allowed());
         assert!(matches!(
-            config.check_static("run_shell", false, None),
+            config.check_static("Bash", false, None),
             Permission::Unknown
         ));
     }
@@ -1071,13 +1059,13 @@ mod tests {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                interactive: vec!["run_shell".into()],
+                interactive: vec!["Bash".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert!(config.is_interactive("run_shell"));
-        assert!(!config.is_interactive("read_file"));
+        assert!(config.is_interactive("Bash"));
+        assert!(!config.is_interactive("Read"));
     }
 
     // ── Multi-layer merging ───────────────────────────────────────────────
@@ -1088,18 +1076,18 @@ mod tests {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    deny: vec!["run_shell".into()],
+                    deny: vec!["Bash".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    allow: vec!["run_shell".into()],
+                    allow: vec!["Bash".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false, None).is_denied());
+        assert!(config.check_static("Bash", false, None).is_denied());
     }
 
     #[test]
@@ -1109,19 +1097,19 @@ mod tests {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    allow: vec!["write_file".into()],
+                    allow: vec!["Write".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    allow: vec!["read_file".into()],
+                    allow: vec!["Read".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        assert!(config.check_static("read_file", true, None).is_allowed());
-        assert!(config.check_static("write_file", false, None).is_allowed());
+        assert!(config.check_static("Read", true, None).is_allowed());
+        assert!(config.check_static("Write", false, None).is_allowed());
     }
 
     #[test]
@@ -1130,20 +1118,20 @@ mod tests {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    interactive: vec!["write_file".into()],
+                    interactive: vec!["Write".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    interactive: vec!["run_shell".into()],
+                    interactive: vec!["Bash".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        assert!(config.is_interactive("run_shell"));
-        assert!(config.is_interactive("write_file"));
-        assert!(!config.is_interactive("read_file"));
+        assert!(config.is_interactive("Bash"));
+        assert!(config.is_interactive("Write"));
+        assert!(!config.is_interactive("Read"));
     }
 
     #[test]
@@ -1156,14 +1144,14 @@ mod tests {
                 },
                 PermissionLayer {
                     source: RuleSource::Project,
-                    allow: vec!["read_file".into()],
+                    allow: vec!["Read".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
         // Session layer has empty allow → doesn't restrict
-        assert!(config.check_static("read_file", true, None).is_allowed());
+        assert!(config.check_static("Read", true, None).is_allowed());
     }
 
     #[test]
@@ -1171,13 +1159,13 @@ mod tests {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                allow: vec!["run_shell".into()],
-                deny: vec!["run_shell".into()],
+                allow: vec!["Bash".into()],
+                deny: vec!["Bash".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false, None).is_denied());
+        assert!(config.check_static("Bash", false, None).is_denied());
     }
 
     #[test]
@@ -1190,12 +1178,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("run_shell", false, None).is_allowed());
         assert!(config
             .check_static("run_background", false, None)
             .is_allowed());
         assert!(matches!(
-            config.check_static("read_file", false, None),
+            config.check_static("Read", false, None),
+            Permission::Unknown
+        ));
+        assert!(matches!(
+            config.check_static("Bash", false, None),
             Permission::Unknown
         ));
     }
@@ -1225,21 +1216,26 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(config.check_static("read_file", true, None).is_allowed());
-        assert!(config.check_static("run_shell", false, None).is_denied());
+        assert!(config.check_static("Read", true, None).is_allowed());
+        assert!(config
+            .check_static("run_background", false, None)
+            .is_denied());
+        // Bash doesn't match run_* pattern, so it's allowed by "*"
+        assert!(config.check_static("Bash", false, None).is_allowed());
     }
 
     #[test]
     fn test_matches_pattern_exact() {
-        assert!(matches_pattern("run_shell", "run_shell"));
-        assert!(!matches_pattern("run_shell", "run_background"));
+        assert!(matches_pattern("Bash", "Bash"));
+        assert!(!matches_pattern("Bash", "run_background"));
     }
 
     #[test]
     fn test_matches_pattern_wildcard() {
-        assert!(matches_pattern("run_*", "run_shell"));
         assert!(matches_pattern("run_*", "run_background"));
-        assert!(!matches_pattern("run_*", "read_file"));
+        assert!(!matches_pattern("run_*", "Read"));
+        assert!(!matches_pattern("run_*", "Bash"));
+        assert!(matches_pattern("Ba*", "Bash"));
     }
 
     #[test]
@@ -1271,18 +1267,18 @@ mod tests {
     #[test]
     fn test_old_config_converts_to_layered() {
         let old = OldPermissionsConfig {
-            allow: vec!["read_file".into()],
-            deny: vec!["run_shell".into()],
-            interactive: vec!["write_file".into()],
+            allow: vec!["Read".into()],
+            deny: vec!["Bash".into()],
+            interactive: vec!["Write".into()],
             plan: vec![],
             mode: PermissionMode::Default,
         };
         let layered: LayeredPermissionsConfig = old.into();
         assert_eq!(layered.layers.len(), 1);
         assert_eq!(layered.layers[0].source, RuleSource::User);
-        assert_eq!(layered.layers[0].allow, vec!["read_file"]);
-        assert_eq!(layered.layers[0].deny, vec!["run_shell"]);
-        assert_eq!(layered.layers[0].interactive, vec!["write_file"]);
+        assert_eq!(layered.layers[0].allow, vec!["Read"]);
+        assert_eq!(layered.layers[0].deny, vec!["Bash"]);
+        assert_eq!(layered.layers[0].interactive, vec!["Write"]);
     }
 
     #[test]
@@ -1300,20 +1296,20 @@ mod tests {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    deny: vec!["write_file".into()],
+                    deny: vec!["Write".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    deny: vec!["run_shell".into()],
+                    deny: vec!["Bash".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
         let denies: Vec<&str> = config.all_deny().collect();
-        assert!(denies.contains(&"write_file"));
-        assert!(denies.contains(&"run_shell"));
+        assert!(denies.contains(&"Write"));
+        assert!(denies.contains(&"Bash"));
         assert_eq!(denies.len(), 2);
     }
 
@@ -1323,20 +1319,20 @@ mod tests {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    allow: vec!["read_file".into()],
+                    allow: vec!["Read".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    allow: vec!["write_file".into()],
+                    allow: vec!["Write".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
         let allows: Vec<&str> = config.all_allow().collect();
-        assert!(allows.contains(&"read_file"));
-        assert!(allows.contains(&"write_file"));
+        assert!(allows.contains(&"Read"));
+        assert!(allows.contains(&"Write"));
         assert_eq!(allows.len(), 2);
     }
 
@@ -1346,20 +1342,20 @@ mod tests {
             layers: vec![
                 PermissionLayer {
                     source: RuleSource::Project,
-                    interactive: vec!["run_shell".into()],
+                    interactive: vec!["Bash".into()],
                     ..Default::default()
                 },
                 PermissionLayer {
                     source: RuleSource::User,
-                    interactive: vec!["write_file".into()],
+                    interactive: vec!["Write".into()],
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
         let interactives: Vec<&str> = config.all_interactive().collect();
-        assert!(interactives.contains(&"run_shell"));
-        assert!(interactives.contains(&"write_file"));
+        assert!(interactives.contains(&"Bash"));
+        assert!(interactives.contains(&"Write"));
         assert_eq!(interactives.len(), 2);
     }
 
@@ -1389,12 +1385,12 @@ mod tests {
     fn decision_reason_rule_debug() {
         let reason = DecisionReason::Rule {
             source: RuleSource::User,
-            pattern: "run_shell".into(),
+            pattern: "Bash".into(),
         };
         let debug = format!("{:?}", reason);
         assert!(debug.contains("Rule"));
         assert!(debug.contains("User"));
-        assert!(debug.contains("run_shell"));
+        assert!(debug.contains("Bash"));
     }
 
     #[test]
@@ -1429,12 +1425,12 @@ mod tests {
         let config = LayeredPermissionsConfig {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                deny: vec!["run_shell".into()],
+                deny: vec!["Bash".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        let result = config.check_static("run_shell", false, None);
+        let result = config.check_static("Bash", false, None);
         assert!(result.is_denied());
         if let Permission::Denied(reason, msg) = result {
             assert!(matches!(
@@ -1444,7 +1440,7 @@ mod tests {
                     ..
                 }
             ));
-            assert!(msg.contains("run_shell"));
+            assert!(msg.contains("Bash"));
         } else {
             panic!("expected Denied");
         }
@@ -1455,7 +1451,7 @@ mod tests {
     #[test]
     fn protected_path_denied_in_default_mode() {
         let config = LayeredPermissionsConfig::default();
-        let result = config.check_static("write_file", false, Some(".git/config"));
+        let result = config.check_static("Write", false, Some(".git/config"));
         assert!(result.is_denied());
         if let Permission::Denied(DecisionReason::SafetyCheck { path }, msg) = &result {
             assert_eq!(path, ".git/config");
@@ -1471,7 +1467,7 @@ mod tests {
             mode: PermissionMode::BypassPermissions,
             ..Default::default()
         };
-        let result = config.check_static("write_file", false, Some(".ssh/id_rsa"));
+        let result = config.check_static("Write", false, Some(".ssh/id_rsa"));
         assert!(result.is_denied());
         if let Permission::Denied(DecisionReason::SafetyCheck { path }, msg) = &result {
             assert_eq!(path, ".ssh/id_rsa");
@@ -1485,22 +1481,21 @@ mod tests {
     fn protected_path_readonly_allowed() {
         let config = LayeredPermissionsConfig::default();
         // Read-only tools are exempt from the safety check
-        let result = config.check_static("read_file", true, Some(".git/config"));
+        let result = config.check_static("Read", true, Some(".git/config"));
         assert!(matches!(result, Permission::Unknown));
     }
 
     #[test]
     fn non_protected_path_not_blocked() {
         let config = LayeredPermissionsConfig::default();
-        let result = config.check_static("write_file", false, Some("src/main.rs"));
+        let result = config.check_static("Write", false, Some("src/main.rs"));
         assert!(matches!(result, Permission::Unknown));
     }
 
     #[test]
     fn nested_protected_path_detected() {
         let config = LayeredPermissionsConfig::default();
-        let result =
-            config.check_static("write_file", false, Some("some/dir/.recursive/config.toml"));
+        let result = config.check_static("Write", false, Some("some/dir/.recursive/config.toml"));
         assert!(result.is_denied());
         if let Permission::Denied(DecisionReason::SafetyCheck { path }, _) = &result {
             assert_eq!(path, "some/dir/.recursive/config.toml");
@@ -1535,10 +1530,10 @@ mod tests {
     #[test]
     fn add_session_allow_rule() {
         let mut config = LayeredPermissionsConfig::default();
-        config.add_session_rule(RuleBehavior::Allow, "run_shell".into());
+        config.add_session_rule(RuleBehavior::Allow, "Bash".into());
         let session = config.session_rules();
         assert_eq!(session.source, RuleSource::Session);
-        assert!(session.allow.contains(&"run_shell".to_string()));
+        assert!(session.allow.contains(&"Bash".to_string()));
         assert!(session.deny.is_empty());
         assert!(session.interactive.is_empty());
     }
@@ -1546,32 +1541,29 @@ mod tests {
     #[test]
     fn add_session_deny_rule() {
         let mut config = LayeredPermissionsConfig::default();
-        config.add_session_rule(RuleBehavior::Deny, "run_shell".into());
+        config.add_session_rule(RuleBehavior::Deny, "Bash".into());
         let session = config.session_rules();
-        assert!(session.deny.contains(&"run_shell".to_string()));
+        assert!(session.deny.contains(&"Bash".to_string()));
     }
 
     #[test]
     fn add_session_interactive_rule() {
         let mut config = LayeredPermissionsConfig::default();
-        config.add_session_rule(RuleBehavior::Interactive, "run_shell".into());
+        config.add_session_rule(RuleBehavior::Interactive, "Bash".into());
         let session = config.session_rules();
-        assert!(session.interactive.contains(&"run_shell".to_string()));
+        assert!(session.interactive.contains(&"Bash".to_string()));
     }
 
     #[test]
     fn remove_session_rule() {
         let mut config = LayeredPermissionsConfig::default();
-        config.add_session_rule(RuleBehavior::Allow, "run_shell".into());
-        config.add_session_rule(RuleBehavior::Allow, "write_file".into());
+        config.add_session_rule(RuleBehavior::Allow, "Bash".into());
+        config.add_session_rule(RuleBehavior::Allow, "Write".into());
         assert_eq!(config.session_rules().allow.len(), 2);
 
-        config.remove_session_rule(RuleBehavior::Allow, "run_shell");
+        config.remove_session_rule(RuleBehavior::Allow, "Bash");
         assert_eq!(config.session_rules().allow.len(), 1);
-        assert!(config
-            .session_rules()
-            .allow
-            .contains(&"write_file".to_string()));
+        assert!(config.session_rules().allow.contains(&"Write".to_string()));
     }
 
     #[test]
@@ -1580,7 +1572,7 @@ mod tests {
         // Before any mutation, layers is empty
         assert!(config.layers.is_empty());
         // Adding a rule creates the session layer
-        config.add_session_rule(RuleBehavior::Allow, "read_file".into());
+        config.add_session_rule(RuleBehavior::Allow, "Read".into());
         assert_eq!(config.layers.len(), 1);
         assert_eq!(config.layers[0].source, RuleSource::Session);
     }
@@ -1591,13 +1583,13 @@ mod tests {
             mode: PermissionMode::Default,
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
-                allow: vec!["run_shell".into()],
+                allow: vec!["Bash".into()],
                 ..Default::default()
             }],
         };
         // Session deny should override user allow
-        config.add_session_rule(RuleBehavior::Deny, "run_shell".into());
-        let result = config.check_static("run_shell", false, None);
+        config.add_session_rule(RuleBehavior::Deny, "Bash".into());
+        let result = config.check_static("Bash", false, None);
         assert!(result.is_denied());
     }
 
@@ -1610,14 +1602,11 @@ mod tests {
         // Mutate through the original
         {
             let mut guard = shared.try_write().unwrap();
-            guard.add_session_rule(RuleBehavior::Allow, "run_shell".into());
+            guard.add_session_rule(RuleBehavior::Allow, "Bash".into());
         }
 
         // Clone sees the change
         let guard = clone.try_read().unwrap();
-        assert!(guard
-            .session_rules()
-            .allow
-            .contains(&"run_shell".to_string()));
+        assert!(guard.session_rules().allow.contains(&"Bash".to_string()));
     }
 }

@@ -46,9 +46,9 @@ pub struct HookMatcher {
     /// Optional match pattern. `None` matches all invocations.
     ///
     /// Supported syntax:
-    /// - `"run_shell"` — tool name exact match
-    /// - `"run_shell(git *)"` — tool name + `command` arg prefix
-    /// - `"write_file(src/*)"` — tool name + `path` arg prefix
+    /// - `"Bash"` — tool name exact match
+    /// - `"Bash(git *)"` — tool name + `command` arg prefix
+    /// - `"Write(src/*)"` — tool name + `path` arg prefix
     pub matcher: Option<String>,
     /// Hook commands to execute when the matcher fires (in order).
     pub hooks: Vec<HookCommand>,
@@ -103,8 +103,8 @@ fn default_timeout() -> u64 {
 /// Returns `true` if `input_tool` / `args` satisfy the given matcher pattern.
 ///
 /// - `None` pattern matches everything.
-/// - `"run_shell"` matches only that tool name.
-/// - `"run_shell(git *)"` matches `run_shell` with `command` starting with `"git "`.
+/// - `"Bash"` matches only that tool name.
+/// - `"Bash(git *)"` matches `Bash` with `command` starting with `"git "`.
 pub fn matches_hook(matcher: &Option<String>, tool_name: &str, args: &serde_json::Value) -> bool {
     let Some(pattern) = matcher else {
         return true;
@@ -179,7 +179,7 @@ mod tests {
         {
             "PreToolCall": [
                 {
-                    "matcher": "run_shell",
+                    "matcher": "Bash",
                     "hooks": [
                         { "type": "command", "command": "/usr/local/bin/check.sh", "timeout": 10 }
                     ]
@@ -190,7 +190,7 @@ mod tests {
         assert!(cfg.events.contains_key("PreToolCall"));
         let matchers = &cfg.events["PreToolCall"];
         assert_eq!(matchers.len(), 1);
-        assert_eq!(matchers[0].matcher.as_deref(), Some("run_shell"));
+        assert_eq!(matchers[0].matcher.as_deref(), Some("Bash"));
         assert_eq!(matchers[0].hooks.len(), 1);
         assert_eq!(matchers[0].hooks[0].timeout, 10);
         assert_eq!(matchers[0].hooks[0].r#type, HookCommandType::Command);
@@ -208,51 +208,51 @@ mod tests {
     #[test]
     fn matcher_none_matches_all_tools() {
         let args = serde_json::json!({"command": "ls"});
-        assert!(matches_hook(&None, "run_shell", &args));
-        assert!(matches_hook(&None, "write_file", &args));
+        assert!(matches_hook(&None, "Bash", &args));
+        assert!(matches_hook(&None, "Write", &args));
         assert!(matches_hook(&None, "anything", &serde_json::json!({})));
     }
 
     #[test]
     fn matcher_tool_name_exact() {
         let args = serde_json::json!({});
-        let m = Some("run_shell".to_string());
-        assert!(matches_hook(&m, "run_shell", &args));
-        assert!(!matches_hook(&m, "write_file", &args));
-        assert!(!matches_hook(&m, "read_file", &args));
+        let m = Some("Bash".to_string());
+        assert!(matches_hook(&m, "Bash", &args));
+        assert!(!matches_hook(&m, "Write", &args));
+        assert!(!matches_hook(&m, "Read", &args));
     }
 
     #[test]
     fn matcher_tool_name_with_arg_prefix() {
-        let m = Some("run_shell(git *)".to_string());
+        let m = Some("Bash(git *)".to_string());
         let git_args = serde_json::json!({"command": "git status"});
         let ls_args = serde_json::json!({"command": "ls -la"});
-        assert!(matches_hook(&m, "run_shell", &git_args));
-        assert!(!matches_hook(&m, "run_shell", &ls_args));
+        assert!(matches_hook(&m, "Bash", &git_args));
+        assert!(!matches_hook(&m, "Bash", &ls_args));
     }
 
     #[test]
     fn matcher_tool_name_with_arg_prefix_no_match() {
-        let m = Some("run_shell(git *)".to_string());
+        let m = Some("Bash(git *)".to_string());
         let args = serde_json::json!({"command": "rm -rf /"});
-        assert!(!matches_hook(&m, "run_shell", &args));
+        assert!(!matches_hook(&m, "Bash", &args));
     }
 
     #[test]
     fn matcher_tool_name_mismatch_with_arg_pattern() {
-        let m = Some("run_shell(git *)".to_string());
+        let m = Some("Bash(git *)".to_string());
         let args = serde_json::json!({"command": "git status"});
         // tool name doesn't match even though arg would
-        assert!(!matches_hook(&m, "write_file", &args));
+        assert!(!matches_hook(&m, "Write", &args));
     }
 
     #[test]
     fn matcher_path_arg_used_for_write_file() {
-        let m = Some("write_file(src/*)".to_string());
+        let m = Some("Write(src/*)".to_string());
         let src_args = serde_json::json!({"path": "src/main.rs"});
         let other_args = serde_json::json!({"path": "tests/foo.rs"});
-        assert!(matches_hook(&m, "write_file", &src_args));
-        assert!(!matches_hook(&m, "write_file", &other_args));
+        assert!(matches_hook(&m, "Write", &src_args));
+        assert!(!matches_hook(&m, "Write", &other_args));
     }
 
     #[test]

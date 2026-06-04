@@ -1422,7 +1422,7 @@ mod tests {
 
         // Simulate ToolCall arrival
         let call_event = AgentEvent::ToolCall {
-            name: "run_shell".to_string(),
+            name: "Bash".to_string(),
             id: "tc-1".to_string(),
             arguments: "{}".to_string(),
             step: 0,
@@ -1437,7 +1437,7 @@ mod tests {
         // Simulate ToolResult arrival (no sleep needed — elapsed_ms ≥ 0)
         let result_event = AgentEvent::ToolResult {
             id: "tc-1".to_string(),
-            name: "run_shell".to_string(),
+            name: "Bash".to_string(),
             output: "ok".to_string(),
             step: 0,
             is_error: false,
@@ -1470,7 +1470,7 @@ mod tests {
             panic!("third event should be ToolProgress");
         };
         assert_eq!(tool_use_id, "tc-1");
-        assert_eq!(tool_name, "run_shell");
+        assert_eq!(tool_name, "Bash");
         let _ = elapsed_ms; // ≥ 0 is trivially true for u64
     }
 
@@ -1485,7 +1485,7 @@ mod tests {
 
         let result_event = AgentEvent::ToolResult {
             id: "tc-orphan".to_string(),
-            name: "read_file".to_string(),
+            name: "Read".to_string(),
             output: "data".to_string(),
             step: 0,
             is_error: false,

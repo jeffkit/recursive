@@ -101,7 +101,7 @@ impl DockerShellTool {
             )
             .await
             .map_err(|e| Error::Tool {
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 message: format!("docker exec create: {e}"),
             })?;
 
@@ -111,7 +111,7 @@ impl DockerShellTool {
             .start_exec(&exec.id, None)
             .await
             .map_err(|e| Error::Tool {
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 message: format!("docker exec start: {e}"),
             })? {
             StartExecResults::Attached {
@@ -157,7 +157,7 @@ impl Drop for DockerShellTool {
 impl Tool for DockerShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             description: "Run a shell command inside an isolated Docker container at /workspace."
                 .into(),
             parameters: json!({
@@ -182,7 +182,7 @@ impl Tool for DockerShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::BadToolArgs {
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 message: "missing required argument: command".into(),
             })?;
         self.exec_command(command).await

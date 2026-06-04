@@ -81,12 +81,11 @@ impl AgentType {
     pub fn allowed_tool_names(self) -> Option<Vec<String>> {
         match self {
             Self::Explore => Some(vec![
-                "read_file".to_string(),
-                "list_dir".to_string(),
-                "search_files".to_string(),
+                "Read".to_string(),
+                "Grep".to_string(),
                 "recall".to_string(),
-                "web_fetch".to_string(),
-                "sub_agent".to_string(),
+                "WebFetch".to_string(),
+                "Agent".to_string(),
             ]),
             Self::GeneralPurpose => None,
         }
@@ -144,10 +143,9 @@ impl SubAgent {
     /// Default tool set when no `tools` arg is given: read-only tools.
     fn default_tool_names() -> Vec<String> {
         vec![
-            "read_file".to_string(),
-            "list_dir".to_string(),
-            "search_files".to_string(),
-            "web_fetch".to_string(),
+            "Read".to_string(),
+            "Grep".to_string(),
+            "WebFetch".to_string(),
         ]
     }
 }
@@ -156,7 +154,7 @@ impl SubAgent {
 impl Tool for SubAgent {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "sub_agent".into(),
+            name: "Agent".into(),
             description: "Spawn a fresh agent with its own transcript to complete a focused sub-task. Returns the sub-agent's final response.".into(),
             parameters: json!({
                 "type": "object",
@@ -178,7 +176,7 @@ impl Tool for SubAgent {
                     "tools": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of tool names to make available to the sub-agent. Ignored when subagent_type is 'explore' (which enforces its own read-only tool set). Default: read_file, list_dir, search_files, web_fetch"
+                        "description": "Optional list of tool names to make available to the sub-agent. Ignored when subagent_type is 'explore' (which enforces its own read-only tool set). Default: Read, Grep, WebFetch"
                     }
                 },
                 "required": ["prompt"]
@@ -201,7 +199,7 @@ impl Tool for SubAgent {
         let prompt = arguments["prompt"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
-                name: "sub_agent".into(),
+                name: "Agent".into(),
                 message: "missing required parameter: prompt".to_string(),
             })?;
 
@@ -259,7 +257,7 @@ impl Tool for SubAgent {
             .max_steps(max_steps)
             .build()
             .map_err(|e| Error::Tool {
-                name: "sub_agent".into(),
+                name: "Agent".into(),
                 message: format!("failed to build sub-agent kernel: {e}"),
             })?;
 
@@ -281,7 +279,7 @@ impl Tool for SubAgent {
         };
 
         let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
-            name: "sub_agent".into(),
+            name: "Agent".into(),
             message: format!("sub-agent failed: {e}"),
         })?;
 
@@ -310,9 +308,7 @@ impl Tool for SubAgent {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider, ToolCall};
-    use crate::tools::{
-        ApplyPatch, ListDir, LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile,
-    };
+    use crate::tools::{LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile};
 
     /// Helper: create a MockProvider with the given scripted completions.
     fn mock_provider(script: Vec<Completion>) -> Arc<dyn LlmProvider> {
@@ -324,10 +320,8 @@ mod tests {
         let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
         ToolRegistry::new(transport)
             .register(Arc::new(ReadFile::new(workspace)))
-            .register(Arc::new(ListDir::new(workspace)))
             .register(Arc::new(SearchFiles::new(workspace)))
             .register(Arc::new(WriteFile::new(workspace)))
-            .register(Arc::new(ApplyPatch::new(workspace)))
     }
 
     #[tokio::test]
@@ -376,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn sub_agent_tool_subset_respected() {
-        // Parent passes tools: ["read_file"]; sub-agent must NOT have apply_patch.
+        // Parent passes tools: ["Read"]; sub-agent only has the specified subset.
         let provider = mock_provider(vec![Completion {
             content: "done".to_string(),
             tool_calls: vec![],
@@ -390,19 +384,18 @@ mod tests {
 
         let sub = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
-        // Execute with only read_file allowed
+        // Execute with only Read allowed
         let _ = sub
-            .execute(json!({"prompt": "read something", "tools": ["read_file"]}))
+            .execute(json!({"prompt": "read something", "tools": ["Read"]}))
             .await
             .unwrap();
 
         // We can't easily inspect the sub-agent's registry from here,
-        // but we can verify the sub-agent ran successfully with just read_file.
-        // The real test is that apply_patch is NOT in the default set.
+        // but we can verify the sub-agent ran successfully with just Read.
+        // The real test is that Write is NOT in the default set.
         let defaults = SubAgent::default_tool_names();
-        assert!(!defaults.contains(&"apply_patch".to_string()));
-        assert!(!defaults.contains(&"write_file".to_string()));
-        assert!(defaults.contains(&"read_file".to_string()));
+        assert!(!defaults.contains(&"Write".to_string()));
+        assert!(defaults.contains(&"Read".to_string()));
     }
 
     #[tokio::test]
@@ -419,7 +412,7 @@ mod tests {
                 content: "".to_string(),
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
-                    name: "read_file".into(),
+                    name: "Read".into(),
                     arguments: json!({"path": "test.txt"}),
                 }],
                 finish_reason: Some("tool_calls".into()),
@@ -444,11 +437,10 @@ mod tests {
     #[tokio::test]
     async fn sub_agent_default_tools_are_read_only() {
         let defaults = SubAgent::default_tool_names();
-        assert!(defaults.contains(&"read_file".to_string()));
-        assert!(defaults.contains(&"list_dir".to_string()));
-        assert!(defaults.contains(&"search_files".to_string()));
-        assert!(defaults.contains(&"web_fetch".to_string()));
-        assert_eq!(defaults.len(), 4);
+        assert!(defaults.contains(&"Read".to_string()));
+        assert!(defaults.contains(&"Grep".to_string()));
+        assert!(defaults.contains(&"WebFetch".to_string()));
+        assert_eq!(defaults.len(), 3);
     }
 
     #[tokio::test]
@@ -486,7 +478,7 @@ mod tests {
                 content: "".to_string(),
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
-                    name: "sub_agent".into(),
+                    name: "Agent".into(),
                     arguments: json!({"prompt": "grandchild task"}),
                 }],
                 finish_reason: Some("tool_calls".into()),
@@ -498,7 +490,7 @@ mod tests {
                 content: "".to_string(),
                 tool_calls: vec![ToolCall {
                     id: "c2".into(),
-                    name: "sub_agent".into(),
+                    name: "Agent".into(),
                     arguments: json!({"prompt": "great-grandchild task"}),
                 }],
                 finish_reason: Some("tool_calls".into()),
@@ -529,7 +521,7 @@ mod tests {
         let parent = SubAgent::new(tmp.path(), provider, all_tools, 2, 0, None);
 
         let result = parent
-            .execute(json!({"prompt": "parent task", "tools": ["sub_agent", "read_file"]}))
+            .execute(json!({"prompt": "parent task", "tools": ["Agent", "Read"]}))
             .await
             .unwrap();
 
@@ -565,13 +557,11 @@ mod tests {
     fn explore_agent_has_restricted_tool_list() {
         let names = AgentType::Explore.allowed_tool_names().unwrap();
         // Must contain read tools
-        assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"list_dir".to_string()));
-        assert!(names.contains(&"search_files".to_string()));
+        assert!(names.contains(&"Read".to_string()));
+        assert!(names.contains(&"Grep".to_string()));
         // Must NOT contain write tools
-        assert!(!names.contains(&"write_file".to_string()));
-        assert!(!names.contains(&"apply_patch".to_string()));
-        assert!(!names.contains(&"run_shell".to_string()));
+        assert!(!names.contains(&"Write".to_string()));
+        assert!(!names.contains(&"Bash".to_string()));
     }
 
     #[test]

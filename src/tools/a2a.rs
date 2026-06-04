@@ -164,6 +164,10 @@ impl Default for A2aCallTool {
 
 #[async_trait]
 impl Tool for A2aCallTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "a2a_call".into(),
@@ -704,6 +708,10 @@ impl Default for A2aCardTool {
 
 #[async_trait]
 impl Tool for A2aCardTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "a2a_card".into(),
@@ -806,6 +814,10 @@ impl Default for A2aTaskCheckTool {
 
 #[async_trait]
 impl Tool for A2aTaskCheckTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "a2a_task_check".into(),

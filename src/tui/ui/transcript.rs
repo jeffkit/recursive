@@ -777,7 +777,7 @@ mod tests {
         let lines = render_block(
             &TranscriptBlock::ToolCall {
                 id: "1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 args_preview: "path=\"foo\"".into(),
                 result: None,
             },
@@ -785,7 +785,7 @@ mod tests {
         );
         let header = &lines[0];
         assert!(line_text(header).contains("⏺"));
-        assert!(line_text(header).contains("read_file"));
+        assert!(line_text(header).contains("Read"));
         // Bullet must be yellow.
         let bullet_yellow = header
             .spans
@@ -801,7 +801,7 @@ mod tests {
         let lines = render_block(
             &TranscriptBlock::ToolCall {
                 id: "1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 args_preview: String::new(),
                 result: Some(ToolResultData {
                     success: true,
@@ -849,7 +849,7 @@ mod tests {
         let lines = render_block(
             &TranscriptBlock::ToolCall {
                 id: "1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 args_preview: String::new(),
                 result: Some(ToolResultData {
                     success: true,
@@ -873,7 +873,7 @@ mod tests {
         let lines = render_block(
             &TranscriptBlock::ToolCall {
                 id: "1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 args_preview: String::new(),
                 result: Some(ToolResultData {
                     success: true,

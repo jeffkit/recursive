@@ -37,18 +37,18 @@ pub async fn run_bash_command(
 
     let _ = event_tx.send(UiEvent::ToolCall {
         id: id.clone(),
-        name: "run_shell".into(),
+        name: "Bash".into(),
         arguments: arguments_str,
     });
 
-    let (output, success) = match registry.invoke("run_shell", arguments).await {
+    let (output, success) = match registry.invoke("Bash", arguments).await {
         Ok(out) => (out, true),
         Err(e) => (format!("ERROR: {e}"), false),
     };
 
     let _ = event_tx.send(UiEvent::ToolResult {
         id,
-        name: "run_shell".into(),
+        name: "Bash".into(),
         output,
         success,
     });

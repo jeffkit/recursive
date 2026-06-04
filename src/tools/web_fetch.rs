@@ -36,7 +36,7 @@ impl WebFetch {
     fn validate_url(url: &str) -> Result<String> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(Error::BadToolArgs {
-                name: "web_fetch".into(),
+                name: "WebFetch".into(),
                 message: "URL must start with http:// or https://".into(),
             });
         }
@@ -202,7 +202,7 @@ impl WebFetch {
 impl Tool for WebFetch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "web_fetch".into(),
+            name: "WebFetch".into(),
             description: "Fetch content from a URL via HTTP GET. Returns the body as text, optionally truncated to max_bytes. For HTML pages, attempts basic markdown conversion."
                 .into(),
             parameters: json!({
@@ -216,13 +216,17 @@ impl Tool for WebFetch {
         }
     }
 
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
         let url = args["url"].as_str().ok_or_else(|| Error::BadToolArgs {
-            name: "web_fetch".into(),
+            name: "WebFetch".into(),
             message: "missing `url`".into(),
         })?;
 
@@ -240,7 +244,7 @@ impl Tool for WebFetch {
             .send()
             .await
             .map_err(|e| Error::Tool {
-                name: "web_fetch".into(),
+                name: "WebFetch".into(),
                 message: format!("request failed: {}", e),
             })?;
 
@@ -253,7 +257,7 @@ impl Tool for WebFetch {
                 body
             };
             return Err(Error::Tool {
-                name: "web_fetch".into(),
+                name: "WebFetch".into(),
                 message: format!("HTTP {}: {}", status.as_u16(), excerpt),
             });
         }
@@ -266,7 +270,7 @@ impl Tool for WebFetch {
             .to_string();
 
         let body = response.text().await.map_err(|e| Error::Tool {
-            name: "web_fetch".into(),
+            name: "WebFetch".into(),
             message: format!("failed to read response body: {}", e),
         })?;
 

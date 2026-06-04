@@ -52,7 +52,7 @@ impl LoadSkill {
     ) -> Result<Vec<(String, String)>> {
         if depth > MAX_DEPTH {
             return Err(Error::Tool {
-                name: "load_skill".into(),
+                name: "Skill".into(),
                 message: "dependency tree too deep (max 3 levels)".to_string(),
             });
         }
@@ -79,7 +79,7 @@ impl LoadSkill {
                 .iter()
                 .find(|s| s.name.to_lowercase() == dep_name.to_lowercase())
                 .ok_or_else(|| Error::Tool {
-                    name: "load_skill".into(),
+                    name: "Skill".into(),
                     message: format!(
                         "dependency '{}' not found (required by '{}')",
                         dep_name, skill.name
@@ -92,7 +92,7 @@ impl LoadSkill {
 
             // Read the dependency's body
             let content = fs::read_to_string(&dep_skill.path).map_err(|e| Error::Tool {
-                name: "load_skill".into(),
+                name: "Skill".into(),
                 message: format!("failed to read dependency '{}': {e}", dep_skill.name),
             })?;
 
@@ -116,7 +116,7 @@ impl LoadSkill {
 impl Tool for LoadSkill {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "load_skill".into(),
+            name: "Skill".into(),
             description: "Load a skill's content by name (case-insensitive). Optionally load a reference document from the skill's refs/ directory, or a named section from the skill body. Pass params for template substitution.".into(),
             parameters: json!({
                 "type": "object",
@@ -127,11 +127,11 @@ impl Tool for LoadSkill {
                     },
                     "ref": {
                         "type": "string",
-                        "description": "Optional name of a reference document to load (e.g. 'api-spec'). Use `load_skill` without `ref` first to see available refs."
+                        "description": "Optional name of a reference document to load (e.g. 'api-spec'). Use `Skill` without `ref` first to see available refs."
                     },
                     "section": {
                         "type": "string",
-                        "description": "Optional name of a section to load (e.g. 'Overview'). Sections are delimited by ## headings in the skill body. Use `load_skill` without `section` first to see available sections."
+                        "description": "Optional name of a section to load (e.g. 'Overview'). Sections are delimited by ## headings in the skill body. Use `Skill` without `section` first to see available sections."
                     },
                     "params": {
                         "type": "object",
@@ -154,7 +154,7 @@ impl Tool for LoadSkill {
         let name = arguments["name"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
-                name: "load_skill".into(),
+                name: "Skill".into(),
                 message: "missing required parameter: name".to_string(),
             })?;
 
@@ -164,7 +164,7 @@ impl Tool for LoadSkill {
             .iter()
             .find(|s| s.name.to_lowercase() == name.to_lowercase())
             .ok_or_else(|| Error::Tool {
-                name: "load_skill".into(),
+                name: "Skill".into(),
                 message: format!("skill not found: {name}"),
             })?;
 
@@ -173,7 +173,7 @@ impl Tool for LoadSkill {
             let ref_name = ref_name.trim();
             if ref_name.is_empty() {
                 return Err(Error::BadToolArgs {
-                    name: "load_skill".into(),
+                    name: "Skill".into(),
                     message: "ref parameter must be a non-empty string".to_string(),
                 });
             }
@@ -191,13 +191,13 @@ impl Tool for LoadSkill {
                         format!("available refs: {}", available.join(", "))
                     };
                     Error::Tool {
-                        name: "load_skill".into(),
+                        name: "Skill".into(),
                         message: format!("ref not found: '{ref_name}'. {available_list}"),
                     }
                 })?;
 
             let content = fs::read_to_string(&skill_ref.path).map_err(|e| Error::Tool {
-                name: "load_skill".into(),
+                name: "Skill".into(),
                 message: format!("failed to read ref file: {e}"),
             })?;
 
@@ -209,7 +209,7 @@ impl Tool for LoadSkill {
             let section_name = section_name.trim();
             if section_name.is_empty() {
                 return Err(Error::BadToolArgs {
-                    name: "load_skill".into(),
+                    name: "Skill".into(),
                     message: "section parameter must be a non-empty string".to_string(),
                 });
             }
@@ -228,7 +228,7 @@ impl Tool for LoadSkill {
                         format!("available sections: {}", available.join(", "))
                     };
                     Error::Tool {
-                        name: "load_skill".into(),
+                        name: "Skill".into(),
                         message: format!("section not found: '{section_name}'. {available_list}"),
                     }
                 })?;
@@ -252,7 +252,7 @@ impl Tool for LoadSkill {
 
         // No ref or section specified — return the main SKILL.md body
         let content = fs::read_to_string(&skill.path).map_err(|e| Error::Tool {
-            name: "load_skill".into(),
+            name: "Skill".into(),
             message: format!("failed to read skill file: {e}"),
         })?;
 
@@ -326,7 +326,7 @@ fn resolve_params(
 
     if !missing_required.is_empty() {
         return Err(Error::BadToolArgs {
-            name: "load_skill".into(),
+            name: "Skill".into(),
             message: format!(
                 "missing required params: {}. Declared params: {}",
                 missing_required.join(", "),

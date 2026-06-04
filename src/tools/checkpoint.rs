@@ -38,6 +38,10 @@ impl CheckpointList {
 
 #[async_trait]
 impl Tool for CheckpointList {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "checkpoint_list".into(),
@@ -90,6 +94,10 @@ impl CheckpointDiff {
 
 #[async_trait]
 impl Tool for CheckpointDiff {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "checkpoint_diff".into(),

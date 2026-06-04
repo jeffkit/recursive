@@ -33,6 +33,10 @@ impl EstimateTokens {
 
 #[async_trait]
 impl Tool for EstimateTokens {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "estimate_tokens".into(),

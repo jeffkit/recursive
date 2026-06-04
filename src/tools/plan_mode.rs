@@ -161,11 +161,15 @@ impl EnterPlanModeTool {
 
 #[async_trait]
 impl Tool for EnterPlanModeTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "enter_plan_mode".into(),
-            description: "Enter read-only planning mode. While active, write tools (write_file, \
-                 apply_patch, run_shell, …) are blocked. Use read tools to explore the \
+            description: "Enter read-only planning mode. While active, write tools (Write, \
+                 Edit, Bash, …) are blocked. Use read tools to explore the \
                  codebase freely, then call exit_plan_mode with a markdown plan summary."
                 .into(),
             parameters: json!({
@@ -238,6 +242,10 @@ impl ExitPlanModeTool {
 
 #[async_trait]
 impl Tool for ExitPlanModeTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "exit_plan_mode".into(),
@@ -418,6 +426,10 @@ impl RequestPlanModeTool {
 
 #[async_trait]
 impl Tool for RequestPlanModeTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "request_plan_mode".into(),

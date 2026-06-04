@@ -20,7 +20,7 @@
 //! description: Refactor the selected code for clarity
 //! aliases: [rf]
 //! argument_hint: "<file-or-description>"
-//! allowed_tools: [read_file, apply_patch, run_shell]
+//! allowed_tools: [Read, Edit, Bash]
 //! ---
 //!
 //! Refactor the following with these goals:
@@ -321,7 +321,7 @@ name: refactor
 description: Refactor code for clarity
 aliases: [rf, refac]
 argument_hint: "<file>"
-allowed_tools: [read_file, apply_patch]
+allowed_tools: [Read, Edit]
 ---
 
 Refactor this:
@@ -333,10 +333,7 @@ $ARGUMENTS
         assert_eq!(skill.description, "Refactor code for clarity");
         assert_eq!(skill.aliases, vec!["rf", "refac"]);
         assert_eq!(skill.argument_hint, "<file>");
-        assert_eq!(
-            skill.allowed_tools.as_deref().unwrap(),
-            &["read_file", "apply_patch"]
-        );
+        assert_eq!(skill.allowed_tools.as_deref().unwrap(), &["Read", "Edit"]);
         assert!(skill.prompt_template.contains("$ARGUMENTS"));
     }
 

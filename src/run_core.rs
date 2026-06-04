@@ -124,14 +124,42 @@ impl<'a> RunCore<'a> {
         stream_sender: Option<crate::llm::StreamSender>,
         step: usize,
     ) -> crate::error::Result<Completion> {
+        // Split into eager (full schema) and deferred (name-only) tool lists.
+        let (eager, deferred): (Vec<_>, Vec<_>) = specs
+            .iter()
+            .cloned()
+            .map(|s| {
+                let hint = s
+                    .description
+                    .split('.')
+                    .next()
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty());
+                let is_deferred = self.tools.is_deferred_spec(&s);
+                (s, hint, is_deferred)
+            })
+            .partition(|(_, _, d)| !d);
+        let eager_pairs: Vec<(crate::llm::ToolSpec, Option<String>)> =
+            eager.into_iter().map(|(s, hint, _)| (s, hint)).collect();
+        let deferred_pairs: Vec<(crate::llm::ToolSpec, Option<String>)> =
+            deferred.into_iter().map(|(s, hint, _)| (s, hint)).collect();
+
         let mut attempt = 0u32;
         loop {
             let result = if let Some(ref tx) = stream_sender {
+                // For streaming, pass all tools as eager (no deferred support yet).
+                let all_specs: Vec<crate::llm::ToolSpec> = eager_pairs
+                    .iter()
+                    .chain(deferred_pairs.iter())
+                    .map(|(s, _)| s.clone())
+                    .collect();
                 self.llm
-                    .stream(&self.messages, specs, Some(tx.clone()))
+                    .stream(&self.messages, &all_specs, Some(tx.clone()))
                     .await
             } else {
-                self.llm.complete(&self.messages, specs).await
+                self.llm
+                    .complete_with_search(&self.messages, &eager_pairs, &deferred_pairs)
+                    .await
             };
             match result {
                 Ok(c) => return Ok(c),

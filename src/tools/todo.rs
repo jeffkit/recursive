@@ -77,7 +77,7 @@ impl TodoWriteTool {
 impl Tool for TodoWriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "todo_write".into(),
+            name: "TodoWrite".into(),
             description: "Create and manage a structured task list for the current session. \
                 Use proactively for tasks with 3 or more distinct steps. \
                 Update status in real-time as you work. \
@@ -117,16 +117,20 @@ impl Tool for TodoWriteTool {
         }
     }
 
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, arguments: Value) -> Result<String> {
         // Parse the todos array.
         let raw_todos = arguments.get("todos").ok_or_else(|| Error::BadToolArgs {
-            name: "todo_write".into(),
+            name: "TodoWrite".into(),
             message: "missing required field `todos`".into(),
         })?;
 
         let items: Vec<TodoItem> =
             serde_json::from_value(raw_todos.clone()).map_err(|e| Error::BadToolArgs {
-                name: "todo_write".into(),
+                name: "TodoWrite".into(),
                 message: format!("failed to parse `todos`: {e}"),
             })?;
 
@@ -137,7 +141,7 @@ impl Tool for TodoWriteTool {
             .count();
         if in_progress_count > 1 {
             return Err(Error::BadToolArgs {
-                name: "todo_write".into(),
+                name: "TodoWrite".into(),
                 message: format!(
                     "at most one task may have status `in_progress`; found {in_progress_count}"
                 ),
@@ -158,7 +162,7 @@ impl Tool for TodoWriteTool {
         // Commit to shared state.
         {
             let mut list = self.todo_list.write().map_err(|_| Error::Tool {
-                name: "todo_write".into(),
+                name: "TodoWrite".into(),
                 message: "todo list lock poisoned".into(),
             })?;
             *list = items.clone();

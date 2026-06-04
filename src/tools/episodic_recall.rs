@@ -28,6 +28,10 @@ impl EpisodicRecall {
 
 #[async_trait]
 impl Tool for EpisodicRecall {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "episodic_recall".into(),

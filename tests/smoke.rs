@@ -8,7 +8,7 @@ use std::sync::Arc;
 use recursive::{
     llm::{Completion, MockProvider, ToolCall},
     runtime::AgentRuntime,
-    tools::{ListDir, LocalTransport, ReadFile, ToolTransport, WriteFile},
+    tools::{GlobTool, LocalTransport, ReadFile, ToolTransport, WriteFile},
     ToolRegistry,
 };
 use serde_json::json;
@@ -24,7 +24,7 @@ async fn runtime_writes_reads_and_summarises() {
             content: "I'll create greet.txt then read it back.".into(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
-                name: "write_file".into(),
+                name: "Write".into(),
                 arguments: json!({"path": "greet.txt", "contents": "hello recursive"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -35,7 +35,7 @@ async fn runtime_writes_reads_and_summarises() {
             content: "".into(),
             tool_calls: vec![ToolCall {
                 id: "c2".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "greet.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -46,8 +46,8 @@ async fn runtime_writes_reads_and_summarises() {
             content: "".into(),
             tool_calls: vec![ToolCall {
                 id: "c3".into(),
-                name: "list_dir".into(),
-                arguments: json!({"path": "."}),
+                name: "Glob".into(),
+                arguments: json!({"pattern": "*.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
@@ -67,7 +67,7 @@ async fn runtime_writes_reads_and_summarises() {
     let tools = ToolRegistry::new(transport)
         .register(Arc::new(WriteFile::new(root)))
         .register(Arc::new(ReadFile::new(root)))
-        .register(Arc::new(ListDir::new(root)));
+        .register(Arc::new(GlobTool::new(root)));
 
     let mut runtime = AgentRuntime::builder()
         .llm(llm)

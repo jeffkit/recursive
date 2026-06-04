@@ -23,21 +23,15 @@ pub const MAX_HSEARCH_RESULTS: usize = 12;
 /// `backend::build_default_tools` registers.
 pub fn default_offline_tool_catalog() -> Vec<(String, String)> {
     vec![
-        ("read_file".into(), "Read a file from the workspace".into()),
-        ("write_file".into(), "Write a file to the workspace".into()),
-        ("apply_patch".into(), "Apply a V4A patch to a file".into()),
+        ("Read".into(), "Read a file from the workspace".into()),
+        ("Write".into(), "Write a file to the workspace".into()),
         (
-            "list_dir".into(),
-            "List a directory under the workspace".into(),
+            "Edit".into(),
+            "Edit a file with exact string replacement".into(),
         ),
-        (
-            "run_shell".into(),
-            "Run a shell command in the workspace".into(),
-        ),
-        (
-            "search_files".into(),
-            "Search files for a regex pattern".into(),
-        ),
+        ("Bash".into(), "Run a shell command in the workspace".into()),
+        ("Grep".into(), "Search files for a regex pattern".into()),
+        ("Glob".into(), "Find files matching a glob pattern".into()),
     ]
 }
 

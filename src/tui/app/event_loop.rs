@@ -4,9 +4,7 @@ use crate::tui::events::UiEvent;
 use crate::tui::ui::transcript::render_block;
 
 use super::render::extract_write_file_path_from_result;
-use super::{
-    parse_apply_patch_input, preview_args, verb_for_tool, App, ToolResultData, TranscriptBlock,
-};
+use super::{preview_args, verb_for_tool, App, ToolResultData, TranscriptBlock};
 
 impl App {
     /// Apply an event coming from the backend worker.
@@ -37,21 +35,14 @@ impl App {
                 arguments,
             } => {
                 let preview = preview_args(&arguments);
-                // Try to also synthesise a Diff block when the tool
-                // looks like an edit. For apply_patch we'll create the
-                // Diff alongside the ToolCall; for write_file we wait
-                // for the ToolResult so the byte count is accurate.
+                // Diff blocks for Edit/Write are created on ToolResult
+                // when the byte count is known.
                 self.blocks.push(TranscriptBlock::ToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     args_preview: preview,
                     result: None,
                 });
-                if name == "apply_patch" {
-                    if let Some((path, hunks)) = parse_apply_patch_input(&arguments) {
-                        self.blocks.push(TranscriptBlock::Diff { path, hunks });
-                    }
-                }
                 // Refine spinner verb based on tool category.
                 self.turn.spinner_verb = verb_for_tool(&name);
             }
@@ -67,7 +58,7 @@ impl App {
                 // completed (empty output) so its bullet turns green
                 // instead of staying yellow. The Diff block below
                 // carries the actual file change.
-                if name == "write_file" && success {
+                if name == "Write" && success {
                     if let Some(path) = extract_write_file_path_from_result(&output) {
                         self.blocks.push(TranscriptBlock::Diff {
                             path,
@@ -577,12 +568,12 @@ mod tests {
         app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::ToolCall {
             id: "abc".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             arguments: r#"{"path":"src/agent.rs"}"#.into(),
         });
         app.handle_ui_event(UiEvent::ToolResult {
             id: "abc".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             output: "ok".into(),
             success: true,
         });
@@ -613,42 +604,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_call_emits_diff_block() {
-        let mut app = App::new();
-        app.screen = AppScreen::Chat;
-        let patch = "*** Begin Patch\n*** Update File: src/foo.rs\n@@ pub fn bar()\n pub fn bar() {\n-    let x = 1;\n+    let x = 2;\n }\n*** End Patch";
-        let arguments = serde_json::json!({"input": patch}).to_string();
-        app.handle_ui_event(UiEvent::ToolCall {
-            id: "1".into(),
-            name: "apply_patch".into(),
-            arguments,
-        });
-        let has_diff = app
-            .blocks
-            .iter()
-            .any(|b| matches!(b, TranscriptBlock::Diff { path, .. } if path == "src/foo.rs"));
-        assert!(has_diff, "expected Diff block, got {:?}", app.blocks);
-    }
-
-    #[test]
     fn write_file_result_renders_diff_block() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::ToolCall {
             id: "1".into(),
-            name: "write_file".into(),
+            name: "Write".into(),
             arguments: r#"{"path":"src/new.rs","contents":"x"}"#.into(),
         });
         app.handle_ui_event(UiEvent::ToolResult {
             id: "1".into(),
-            name: "write_file".into(),
+            name: "Write".into(),
             output: "Wrote 42 bytes to src/new.rs".into(),
             success: true,
         });
         let has_diff = app.blocks.iter().any(
             |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),
         );
-        assert!(has_diff, "expected Diff block from write_file");
+        assert!(has_diff, "expected Diff block from Write");
     }
 
     // ── compacted ──────────────────────────────────────────────────
@@ -714,9 +687,9 @@ mod tests {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.handle_ui_event(UiEvent::PlanProposed {
-            plan_text: "1. read_file\n2. apply_patch".into(),
+            plan_text: "1. Read\n2. Edit".into(),
             tool_calls: vec![serde_json::json!({
-                "name": "read_file",
+                "name": "Read",
                 "id": "1",
                 "arguments": { "path": "src/foo.rs" }
             })],
@@ -726,7 +699,7 @@ mod tests {
         // The plan proposal block should be in the transcript.
         assert!(app.blocks.iter().any(|b| matches!(b,
             TranscriptBlock::PlanProposal { plan_text, .. }
-                if plan_text.contains("read_file"))));
+                if plan_text.contains("Read"))));
         assert!(app.plan_awaiting_approval);
     }
 
