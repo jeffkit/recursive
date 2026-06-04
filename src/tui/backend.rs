@@ -66,6 +66,7 @@ impl Backend {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
         let permission_enabled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "weixin")]
         let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
@@ -76,6 +77,7 @@ impl Backend {
             event_tx,
             perm_tx,
             cancel_flag.clone(),
+            cancel_notify.clone(),
             permission_enabled.clone(),
             #[cfg(feature = "weixin")]
             weixin_rx,
@@ -247,12 +249,14 @@ impl PermissionHook for TuiPermissionHook {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     mut state: RuntimeBuild,
     mut action_rx: mpsc::UnboundedReceiver<UserAction>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
     perm_tx: mpsc::UnboundedSender<PermissionRequest>,
     cancel_flag: Arc<AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
     permission_enabled: Arc<AtomicBool>,
     #[cfg(feature = "weixin")] mut weixin_rx: mpsc::UnboundedReceiver<WeixinBackendRequest>,
 ) {
@@ -402,6 +406,7 @@ async fn worker_loop(
                         &event_tx,
                         &cancel_flag,
                         cancel_clone,
+                        cancel_notify.clone(),
                         &gate,
                     )
                     .await;
@@ -446,6 +451,7 @@ async fn worker_loop(
                         &event_tx,
                         &cancel_flag,
                         cancel_clone,
+                        cancel_notify.clone(),
                         &gate,
                     )
                     .await;
@@ -507,6 +513,7 @@ async fn worker_loop(
 
             UserAction::Interrupt => {
                 cancel_flag.store(true, Ordering::SeqCst);
+                cancel_notify.notify_waiters();
             }
 
             // Goal-168: start a condition-based autonomous loop.
@@ -537,6 +544,7 @@ async fn worker_loop(
                         &event_tx,
                         &cancel_flag,
                         cancel_clone,
+                        cancel_notify.clone(),
                         &gate,
                     )
                     .await;
@@ -643,7 +651,7 @@ async fn worker_loop(
                             }
                             false
                         },
-                        _ = wait_for_cancel(cancel_clone) => {
+                        _ = wait_for_cancel(cancel_clone, cancel_notify.clone()) => {
                             handle.abort();
                             let _ = handle.await;
                             let _ = event_tx.send(UiEvent::Interrupted);
@@ -670,12 +678,14 @@ async fn worker_loop(
     }
 }
 
-pub async fn wait_for_cancel(flag: Arc<AtomicBool>) {
+/// Wait until the cancel flag is set. Uses a `Notify` wakeup for near-zero
+/// latency instead of a 100ms busy-poll sleep.
+pub async fn wait_for_cancel(flag: Arc<AtomicBool>, notify: Arc<tokio::sync::Notify>) {
     loop {
         if flag.load(Ordering::SeqCst) {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        notify.notified().await;
     }
 }
 
@@ -697,6 +707,7 @@ async fn run_turn_select_loop(
     event_tx: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
     cancel_flag: &Arc<AtomicBool>,
     cancel_clone: Arc<AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
     gate: &Arc<crate::tools::plan_mode::PlanApprovalGate>,
 ) -> bool {
     loop {
@@ -711,7 +722,7 @@ async fn run_turn_select_loop(
                 }
                 return false;
             }
-            _ = wait_for_cancel(cancel_clone.clone()) => {
+            _ = wait_for_cancel(cancel_clone.clone(), cancel_notify.clone()) => {
                 handle.abort();
                 let _ = handle.await;
                 let _ = event_tx.send(UiEvent::Interrupted);
@@ -723,6 +734,7 @@ async fn run_turn_select_loop(
                     Some(UserAction::RejectPlan(reason)) => gate.reject(&reason),
                     Some(UserAction::Interrupt) => {
                         cancel_flag.store(true, Ordering::SeqCst);
+                        cancel_notify.notify_waiters();
                     }
                     Some(UserAction::Shutdown) => {
                         handle.abort();
@@ -906,10 +918,11 @@ mod tests {
     #[tokio::test]
     async fn run_with_cancel_flag_true_returns_quickly() {
         let flag = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(tokio::sync::Notify::new());
         let started = std::time::Instant::now();
         let timed = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            wait_for_cancel(flag.clone()),
+            wait_for_cancel(flag.clone(), notify.clone()),
         )
         .await;
         let elapsed = started.elapsed();
