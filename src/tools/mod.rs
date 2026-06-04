@@ -615,6 +615,19 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
+    /// Restrict the registry to only the named tools, removing all others.
+    /// Tool names are matched case-insensitively. Aliases for removed tools
+    /// are also dropped. Used by `--allow-tools` to give agents a limited
+    /// tool set (e.g. read-only review agents).
+    pub fn retain_tools(&mut self, allow: &[String]) {
+        let allowed: std::collections::HashSet<String> =
+            allow.iter().map(|n| n.to_lowercase()).collect();
+        self.tools
+            .retain(|name, _| allowed.contains(&name.to_lowercase()));
+        self.aliases
+            .retain(|_, primary| self.tools.contains_key(primary));
+    }
+
     /// Split the registry's tools into eager and deferred partitions.
     ///
     /// Returns `(eager, deferred)` where each element is a
