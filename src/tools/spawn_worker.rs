@@ -14,10 +14,10 @@
 //! | `worker_type` | System prompt focus | Tool access |
 //! |---------------|---------------------|-------------|
 //! | `general`     | General-purpose     | Full (parent registry) |
-//! | `explore`     | Read-only research  | read_file, list_dir, search_files, web_fetch |
+//! | `explore`     | Read-only research  | Read, Grep, WebFetch |
 //! | `coder`       | Code implementation | Full |
-//! | `reviewer`    | Code review         | read_file, list_dir, search_files |
-//! | `researcher`  | External research   | read_file, search_files, web_fetch |
+//! | `reviewer`    | Code review         | Read, Grep |
+//! | `researcher`  | External research   | Read, Grep, WebFetch |
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -97,20 +97,15 @@ impl WorkerType {
         match self {
             Self::General | Self::Coder => None,
             Self::Explore => Some(vec![
-                "read_file".to_string(),
-                "list_dir".to_string(),
-                "search_files".to_string(),
-                "web_fetch".to_string(),
+                "Read".to_string(),
+                "Grep".to_string(),
+                "WebFetch".to_string(),
             ]),
-            Self::Reviewer => Some(vec![
-                "read_file".to_string(),
-                "list_dir".to_string(),
-                "search_files".to_string(),
-            ]),
+            Self::Reviewer => Some(vec!["Read".to_string(), "Grep".to_string()]),
             Self::Researcher => Some(vec![
-                "read_file".to_string(),
-                "search_files".to_string(),
-                "web_fetch".to_string(),
+                "Read".to_string(),
+                "Grep".to_string(),
+                "WebFetch".to_string(),
             ]),
         }
     }
@@ -172,6 +167,10 @@ impl SpawnWorkerTool {
 
 #[async_trait]
 impl Tool for SpawnWorkerTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "spawn_worker".into(),
@@ -370,7 +369,7 @@ impl Tool for SpawnWorkerTool {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider};
-    use crate::tools::{ListDir, LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile};
+    use crate::tools::{LocalTransport, ReadFile, SearchFiles, ToolTransport, WriteFile};
     use tempfile::TempDir;
 
     fn mock_provider(script: Vec<Completion>) -> Arc<dyn LlmProvider> {
@@ -382,7 +381,6 @@ mod tests {
         ToolRegistry::new(transport)
             .register(Arc::new(ReadFile::new(workspace)))
             .register(Arc::new(WriteFile::new(workspace)))
-            .register(Arc::new(ListDir::new(workspace)))
             .register(Arc::new(SearchFiles::new(workspace)))
     }
 

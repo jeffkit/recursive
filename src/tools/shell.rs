@@ -42,7 +42,7 @@ impl RunShell {
 impl Tool for RunShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             description:
                 "Run a shell command (sh -c) from the workspace root, or from an optional subdirectory inside it via `cwd`."
                     .into(),
@@ -72,14 +72,14 @@ impl Tool for RunShell {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let command = args["command"].as_str().ok_or_else(|| Error::BadToolArgs {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             message: "missing `command`".into(),
         })?;
 
         // Determine the working directory: resolve optional cwd or use root.
         let cwd = if let Some(rel) = args.get("cwd").and_then(|v| v.as_str()) {
             resolve_within(&self.root, rel).map_err(|e| Error::BadToolArgs {
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 message: format!("cwd: {e}"),
             })?
         } else {
@@ -96,7 +96,7 @@ impl Tool for RunShell {
         if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
             for (key, val) in env_map {
                 let val_str = val.as_str().ok_or_else(|| Error::BadToolArgs {
-                    name: "run_shell".to_string(),
+                    name: "Bash".to_string(),
                     message: format!("env value for `{key}` must be a string, got {:?}", val),
                 })?;
                 cmd.env(key, val_str);
@@ -104,16 +104,16 @@ impl Tool for RunShell {
         }
 
         let mut child = cmd.spawn().map_err(|e| Error::Tool {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             message: format!("spawn failed: {e}"),
         })?;
 
         let mut stdout = child.stdout.take().ok_or_else(|| Error::Tool {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             message: "stdout was not piped".into(),
         })?;
         let mut stderr = child.stderr.take().ok_or_else(|| Error::Tool {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             message: "stderr was not piped".into(),
         })?;
 
@@ -124,12 +124,12 @@ impl Tool for RunShell {
         let wait = child.wait();
         let status = match tokio::time::timeout(self.timeout, wait).await {
             Ok(s) => s.map_err(|e| Error::Tool {
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 message: format!("wait failed: {e}"),
             })?,
             Err(_) => {
                 return Err(Error::Tool {
-                    name: "run_shell".into(),
+                    name: "Bash".into(),
                     message: format!("command timed out after {:?}", self.timeout),
                 });
             }
@@ -233,7 +233,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::BadToolArgs { ref name, .. } if name == "run_shell"));
+        assert!(matches!(err, Error::BadToolArgs { ref name, .. } if name == "Bash"));
         let err_msg = format!("{err}");
         assert!(err_msg.contains("cwd"));
     }

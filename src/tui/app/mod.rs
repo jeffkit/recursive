@@ -36,7 +36,7 @@ pub use crate::tui::input_state::{
 pub use crate::tui::model::{
     AppScreen, DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock,
 };
-pub use render::{parse_apply_patch_input, parse_v4a_patch, preview_args, verb_for_tool};
+pub use render::{parse_v4a_patch, preview_args, verb_for_tool};
 
 // ──────────────────────────────────────────────────────────────────────
 // Top-level App struct

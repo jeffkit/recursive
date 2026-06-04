@@ -1630,7 +1630,7 @@ mod tests {
                 content: "writing".into(),
                 tool_calls: vec![crate::llm::ToolCall {
                     id: "c1".into(),
-                    name: "write_file".into(),
+                    name: "Write".into(),
                     arguments: json!({"path": "out.txt", "contents": "hello"}),
                 }],
                 finish_reason: Some("tool_calls".into()),
@@ -1682,7 +1682,7 @@ mod tests {
                 content: "shelling".into(),
                 tool_calls: vec![crate::llm::ToolCall {
                     id: "c1".into(),
-                    name: "run_shell".into(),
+                    name: "Bash".into(),
                     arguments: json!({"command": "echo created > made.txt"}),
                 }],
                 finish_reason: Some("tool_calls".into()),

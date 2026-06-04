@@ -1369,6 +1369,10 @@ impl McpTool {
 
 #[async_trait]
 impl Tool for McpTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: format!("mcp__{}__{}", self.server_name, self.spec.name),

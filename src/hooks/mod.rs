@@ -327,7 +327,7 @@ mod tests {
         let mut reg = HookRegistry::new();
         reg.register(Arc::new(SkipHook));
         let action = reg.dispatch(HookEvent::PreToolCall {
-            name: "write_file",
+            name: "Write",
             args: &serde_json::json!({"path": "foo.txt"}),
         });
         assert!(matches!(action, HookAction::Skip));
@@ -338,7 +338,7 @@ mod tests {
         let mut reg = HookRegistry::new();
         reg.register(Arc::new(ErrorHook));
         let action = reg.dispatch(HookEvent::PreToolCall {
-            name: "write_file",
+            name: "Write",
             args: &serde_json::json!({"path": "foo.txt"}),
         });
         assert!(matches!(action, HookAction::Error(ref msg) if msg == "nope"));
@@ -354,7 +354,7 @@ mod tests {
         assert!(matches!(action, HookAction::Continue));
         // PostToolCall — same
         let action = reg.dispatch(HookEvent::PostToolCall {
-            name: "read_file",
+            name: "Read",
             args: &serde_json::json!({"path": "foo.txt"}),
             result: "ok",
             duration_ms: 5,
@@ -414,7 +414,7 @@ mod tests {
         reg.register(Arc::new(FirstSkip(c1)));
         reg.register(Arc::new(SecondCounter(c2.clone())));
         let action = reg.dispatch(HookEvent::PreToolCall {
-            name: "write_file",
+            name: "Write",
             args: &serde_json::json!({"path": "foo.txt"}),
         });
         assert!(matches!(action, HookAction::Skip));
@@ -445,13 +445,13 @@ mod tests {
         let mut reg = HookRegistry::new();
         reg.register(Arc::new(CaptureHook(c)));
         reg.dispatch(HookEvent::PostToolCall {
-            name: "read_file",
+            name: "Read",
             args: &serde_json::json!({"path": "foo.txt"}),
             result: "file contents",
             duration_ms: 42,
         });
         let captured = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(captured.0, "read_file");
+        assert_eq!(captured.0, "Read");
         assert_eq!(captured.1, "file contents");
         assert_eq!(captured.2, 42);
     }
@@ -569,13 +569,13 @@ mod tests {
         });
         assert!(matches!(action, HookAction::Continue));
         let action = reg.dispatch(HookEvent::PostToolCallFailure {
-            name: "run_shell",
+            name: "Bash",
             args: &empty_args,
             error: "err",
         });
         assert!(matches!(action, HookAction::Continue));
         let action = reg.dispatch(HookEvent::PermissionDenied {
-            tool_name: "write_file",
+            tool_name: "Write",
             reason: "not allowed",
         });
         assert!(matches!(action, HookAction::Continue));
@@ -602,12 +602,12 @@ mod tests {
         reg.register(Arc::new(CaptureFailure(c)));
         let args = serde_json::json!({"command": "rm -rf /"});
         reg.dispatch(HookEvent::PostToolCallFailure {
-            name: "run_shell",
+            name: "Bash",
             args: &args,
             error: "permission denied",
         });
         let cap = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(cap.0, "run_shell");
+        assert_eq!(cap.0, "Bash");
         assert_eq!(cap.1, "permission denied");
     }
 
@@ -637,7 +637,7 @@ mod tests {
         // Capture stderr by redirecting
         let hook = ToolTimingHook::new();
         let action = hook.on_event(HookEvent::PostToolCall {
-            name: "read_file",
+            name: "Read",
             args: &serde_json::json!({"path": "foo.txt"}),
             result: "ok",
             duration_ms: 42,
@@ -678,7 +678,7 @@ mod tests {
     fn tool_timing_hook_pre_tool_call_returns_continue() {
         let hook = ToolTimingHook::new();
         let action = hook.on_event(HookEvent::PreToolCall {
-            name: "write_file",
+            name: "Write",
             args: &serde_json::json!({"path": "foo.txt"}),
         });
         assert!(matches!(action, HookAction::Continue));

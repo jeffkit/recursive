@@ -32,7 +32,7 @@ async fn anthropic_full_runtime_loop_with_mock_provider() {
     let root = tmp.path();
 
     // The runtime will make two LLM calls:
-    // 1. First call: model says "I'll write a file" and calls write_file
+    // 1. First call: model says "I'll write a file" and calls Write
     // 2. Second call: model says "Done" and stops
     //
     // We need two mock responses. The runtime loop calls complete() once per
@@ -49,8 +49,8 @@ async fn anthropic_full_runtime_loop_with_mock_provider() {
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let responses: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![
-        // Response 1: tool_use for write_file
-        r#"{"type":"message","content":[{"type":"tool_use","id":"call_abc","name":"write_file","input":{"path":"hello.txt","contents":"Hello from Anthropic"}}],"stop_reason":"tool_use","usage":{"input_tokens":50,"output_tokens":30}}"#.to_string(),
+        // Response 1: tool_use for Write
+        r#"{"type":"message","content":[{"type":"tool_use","id":"call_abc","name":"Write","input":{"path":"hello.txt","contents":"Hello from Anthropic"}}],"stop_reason":"tool_use","usage":{"input_tokens":50,"output_tokens":30}}"#.to_string(),
         // Response 2: text response saying done
         r#"{"type":"message","content":[{"type":"text","text":"Created hello.txt with content."}],"stop_reason":"end_turn","usage":{"input_tokens":60,"output_tokens":10}}"#.to_string(),
     ]));

@@ -578,6 +578,10 @@ impl RememberFact {
 
 #[async_trait]
 impl Tool for RememberFact {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "remember".into(),
@@ -687,6 +691,10 @@ impl RecallFact {
 
 #[async_trait]
 impl Tool for RecallFact {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
     }
@@ -797,6 +805,10 @@ impl ForgetFact {
 
 #[async_trait]
 impl Tool for ForgetFact {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "forget".into(),
@@ -860,6 +872,10 @@ impl UpdateFact {
 
 #[async_trait]
 impl Tool for UpdateFact {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "update_fact".into(),

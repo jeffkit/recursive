@@ -1110,7 +1110,7 @@ mod tests {
         // still drives the toggle path.
         app.handle_ui_event(UiEvent::ToolResult {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             output: "long output".into(),
             success: true,
         });
@@ -1729,7 +1729,7 @@ mod prompt_input_tests {
         let mut app = fresh_app();
         app.handle_ui_event(UiEvent::ToolResult {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             output: "ok".into(),
             success: true,
         });
@@ -2073,16 +2073,16 @@ mod perm_tests {
 
     #[test]
     fn pending_permission_set_and_stored() {
-        let (app, _rx) = make_perm("run_shell", "ls -la");
+        let (app, _rx) = make_perm("Bash", "ls -la");
         assert!(app.pending_permission.is_some());
         let p = app.pending_permission.as_ref().unwrap();
-        assert_eq!(p.tool_name, "run_shell");
+        assert_eq!(p.tool_name, "Bash");
         assert_eq!(p.args_preview, "ls -la");
     }
 
     #[tokio::test]
     async fn y_key_sends_true_and_clears_modal() {
-        let (mut app, rx) = make_perm("run_shell", "ls");
+        let (mut app, rx) = make_perm("Bash", "ls");
         app.handle_permission_key(k(KeyCode::Char('y')));
         assert!(app.pending_permission.is_none());
         assert!(rx.await.unwrap());
@@ -2090,7 +2090,7 @@ mod perm_tests {
 
     #[tokio::test]
     async fn n_key_sends_false_and_clears_modal() {
-        let (mut app, rx) = make_perm("run_shell", "rm -rf /");
+        let (mut app, rx) = make_perm("Bash", "rm -rf /");
         app.handle_permission_key(k(KeyCode::Char('n')));
         assert!(app.pending_permission.is_none());
         assert!(!rx.await.unwrap());
@@ -2098,7 +2098,7 @@ mod perm_tests {
 
     #[tokio::test]
     async fn esc_key_sends_false() {
-        let (mut app, rx) = make_perm("write_file", "path=foo.txt");
+        let (mut app, rx) = make_perm("Write", "path=foo.txt");
         app.handle_permission_key(k(KeyCode::Esc));
         assert!(app.pending_permission.is_none());
         assert!(!rx.await.unwrap());
@@ -2106,7 +2106,7 @@ mod perm_tests {
 
     #[tokio::test]
     async fn enter_key_sends_true() {
-        let (mut app, rx) = make_perm("read_file", "path=foo.txt");
+        let (mut app, rx) = make_perm("Read", "path=foo.txt");
         app.handle_permission_key(k(KeyCode::Enter));
         assert!(app.pending_permission.is_none());
         assert!(rx.await.unwrap());
@@ -2114,20 +2114,20 @@ mod perm_tests {
 
     #[tokio::test]
     async fn a_key_sends_true_and_adds_to_auto_allowed() {
-        let (mut app, rx) = make_perm("run_shell", "cargo test");
+        let (mut app, rx) = make_perm("Bash", "cargo test");
         app.handle_permission_key(k(KeyCode::Char('a')));
         assert!(app.pending_permission.is_none());
         assert!(rx.await.unwrap());
-        assert!(app.auto_allowed_tools.contains("run_shell"));
+        assert!(app.auto_allowed_tools.contains("Bash"));
     }
 
     #[tokio::test]
     async fn auto_allowed_tool_skips_modal() {
         let mut app = App::new();
-        app.auto_allowed_tools.insert("run_shell".to_string());
+        app.auto_allowed_tools.insert("Bash".to_string());
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         let req = crate::tui::events::PermissionRequest {
-            tool_name: "run_shell".to_string(),
+            tool_name: "Bash".to_string(),
             args_preview: "cargo build".to_string(),
             reply: tx,
         };
@@ -2143,7 +2143,7 @@ mod perm_tests {
         let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
         let mut app = App::new();
         let req = crate::tui::events::PermissionRequest {
-            tool_name: "write_file".to_string(),
+            tool_name: "Write".to_string(),
             args_preview: "path=foo.rs".to_string(),
             reply: tx,
         };

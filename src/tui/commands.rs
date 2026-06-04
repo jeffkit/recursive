@@ -744,7 +744,7 @@ mod tests {
         let r = invoke(&mut app, "tools");
         match r {
             InvokeResult::Sync(CommandOutcome::OpenModal(Modal::ToolList { entries })) => {
-                assert!(entries.iter().any(|(n, _)| n == "read_file"));
+                assert!(entries.iter().any(|(n, _)| n == "Read"));
             }
             other => panic!("expected OpenModal(ToolList), got {other:?}"),
         }

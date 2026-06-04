@@ -30,15 +30,15 @@ use tokio::sync::RwLock;
 #[serde(rename_all = "snake_case")]
 pub enum ToolSideEffect {
     /// No mutation of any state outside the agent process. Safe to
-    /// replay at any time. Examples: `read_file`, `search_files`,
+    /// replay at any time. Examples: `Read`, `Grep`,
     /// `recall`, `checkpoint_list`.
     ReadOnly,
     /// Modifies local state (filesystem, scratchpad) in an idempotent-
-    /// friendly way. Examples: `write_file`, `apply_patch`, `remember`.
+    /// friendly way. Examples: `Write`, `Edit`, `remember`.
     Mutating,
     /// Reaches out to the external world or triggers opaque side-effects.
     /// Cannot determine safe re-execution from local state alone.
-    /// Examples: `run_shell`, `sub_agent`, `schedule_wakeup`.
+    /// Examples: `Bash`, `Agent`, `schedule_wakeup`.
     /// **Default** for any tool that does not override `side_effect_class`.
     External,
 }
@@ -141,7 +141,6 @@ fn blake3_canonical_json(v: &Value) -> String {
 }
 
 pub mod a2a;
-pub mod apply_patch;
 pub mod checkpoint;
 #[cfg(feature = "cloud-runtime")]
 pub mod docker_provider;
@@ -153,6 +152,7 @@ pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
 pub mod fs;
+pub mod glob;
 pub mod load_skill;
 pub mod memory;
 pub mod plan_mode;
@@ -173,7 +173,6 @@ pub mod transport;
 pub mod web_fetch;
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
-pub use apply_patch::ApplyPatch;
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
 pub use estimate_tokens::EstimateTokens;
@@ -181,7 +180,8 @@ pub use facts::{
     facts_path, facts_summary, load_facts, search_facts, Fact, FactStore, ForgetFact, RecallFact,
     RememberFact, ScoredFact, UpdateFact,
 };
-pub use fs::{ListDir, ReadFile, WriteFile};
+pub use fs::{ReadFile, WriteFile};
+pub use glob::GlobTool;
 pub use load_skill::LoadSkill;
 pub use memory::{
     load_scratchpad, scratchpad_path, scratchpad_summary, Scratchpad, ScratchpadDelete,
@@ -225,6 +225,13 @@ pub trait Tool: Send + Sync {
     /// built-in tools; MCP tools derive this from their annotations.
     fn side_effect_class(&self) -> ToolSideEffect {
         ToolSideEffect::External
+    }
+
+    /// Return `true` to send this tool as deferred (name-only) in the initial
+    /// prompt; the model must call `ToolSearch` to load its full schema.
+    /// Default is `false` (eager). Override in low-frequency tools.
+    fn is_deferred(&self) -> bool {
+        false
     }
 
     /// Convenience: a tool is read-only iff it classifies as `ReadOnly`.
@@ -302,10 +309,9 @@ pub struct ToolRegistry {
 /// `ToolRegistry` so tool dispatch can record `path` arguments.
 #[derive(Debug, Default, Clone)]
 pub struct TouchedFiles {
-    /// Workspace-relative file paths recorded from `write_file`,
-    /// `apply_patch`, etc.
+    /// Workspace-relative file paths recorded from `Write`, `Edit`, etc.
     pub paths: HashSet<String>,
-    /// True if the agent invoked `run_shell` this turn — runtime will
+    /// True if the agent invoked `Bash` this turn — runtime will
     /// use a pre/post snapshot diff to attribute file changes.
     pub saw_shell: bool,
 }
@@ -331,33 +337,27 @@ fn record_touched(name: &str, args: &Value, slot: &Mutex<TouchedFiles>) {
         return;
     };
     match name {
-        "write_file" => {
+        "Write" => {
             if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                 t.paths.insert(p.to_string());
             }
         }
-        "apply_patch" => {
-            // V4A patch headers carry the file paths. The agent passes
-            // the patch as a single string under "patch" or "input".
-            let body = args
-                .get("patch")
-                .or_else(|| args.get("input"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            for line in body.lines() {
-                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-                    if let Some(rest) = line.strip_prefix(prefix) {
-                        t.paths.insert(rest.trim().to_string());
-                    }
-                }
+        "Edit" => {
+            // Edit (str_replace) stores the path in file_path.
+            if let Some(p) = args.get("file_path").and_then(|v| v.as_str()) {
+                t.paths.insert(p.to_string());
             }
         }
-        "run_shell" => {
+        "Bash" => {
             t.saw_shell = true;
         }
         _ => {}
     }
 }
+
+/// A `(ToolSpec, optional_search_hint)` pair returned by
+/// [`ToolRegistry::split_eager_deferred`].
+pub type SpecWithHint = (ToolSpec, Option<String>);
 
 impl ToolRegistry {
     pub fn new(transport: Arc<dyn ToolTransport>) -> Self {
@@ -597,6 +597,43 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
+    }
+
+    /// Split the registry's tools into eager and deferred partitions.
+    ///
+    /// Returns `(eager, deferred)` where each element is a
+    /// `(ToolSpec, Option<search_hint>)` pair. Eager tools carry their
+    /// full schema; deferred tools carry only the name (the full schema is
+    /// returned on demand when the model calls `ToolSearch`). The
+    /// search hint is the first sentence of the tool's description,
+    /// suitable for injection into the deferred tool list so the model
+    /// knows what is available without the full schema.
+    pub fn split_eager_deferred(&self) -> (Vec<SpecWithHint>, Vec<SpecWithHint>) {
+        let mut eager = Vec::new();
+        let mut deferred = Vec::new();
+        for tool in self.tools.values() {
+            let spec = tool.spec();
+            let hint = spec
+                .description
+                .split('.')
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if tool.is_deferred() {
+                deferred.push((spec, hint));
+            } else {
+                eager.push((spec, hint));
+            }
+        }
+        (eager, deferred)
+    }
+
+    /// Check whether a spec is deferred by looking up the tool in the registry.
+    pub fn is_deferred_spec(&self, spec: &ToolSpec) -> bool {
+        self.tools
+            .get(&spec.name)
+            .map(|t| t.is_deferred())
+            .unwrap_or(false)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -983,14 +1020,13 @@ pub fn build_standard_tools(
     let mut registry = ToolRegistry::local()
         .register(Arc::new(ReadFile::new(workspace)))
         .register(Arc::new(WriteFile::new(workspace)))
-        .register(Arc::new(ApplyPatch::new(workspace)))
         .register(Arc::new(StrReplaceTool::new(workspace)))
-        .register(Arc::new(ListDir::new(workspace)))
         .register(Arc::new(
             RunShell::new(workspace)
                 .with_timeout(std::time::Duration::from_secs(shell_timeout_secs)),
         ))
         .register(Arc::new(SearchFiles::new(workspace)))
+        .register(Arc::new(GlobTool::new(workspace)))
         .register(Arc::new(RunBackground::new(workspace, bg_manager.clone())))
         .register(Arc::new(CheckBackground::new(bg_manager)))
         .register(Arc::new(EstimateTokens::new(workspace)))
@@ -1045,13 +1081,13 @@ pub fn build_standard_tools(
 /// check in `check_static`. Returns `None` for tools that don't operate
 /// on a file path.
 ///
-/// - `write_file` / `read_file`: extract `args["path"]`
-/// - `apply_patch`: extract `args["patch"]` (the full V4A patch body)
+/// - `Write` / `Read`: extract `args["path"]`
+/// - `Edit`: extract `args["file_path"]`
 /// - All other tools: `None`
 fn safety_content_for_tool(name: &str, args: &serde_json::Value) -> Option<String> {
     match name {
-        "write_file" | "read_file" => args["path"].as_str().map(String::from),
-        "apply_patch" => args["patch"].as_str().map(String::from),
+        "Write" | "Read" => args["path"].as_str().map(String::from),
+        "Edit" => args["file_path"].as_str().map(String::from),
         _ => None,
     }
 }

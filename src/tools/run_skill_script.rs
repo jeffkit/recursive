@@ -61,6 +61,10 @@ impl Tool for RunSkillScript {
         }
     }
 
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, arguments: Value) -> Result<String> {
         let skill_name = arguments["skill"]
             .as_str()

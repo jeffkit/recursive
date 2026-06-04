@@ -197,6 +197,10 @@ impl Tool for RunBackground {
         }
     }
 
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let command = args["command"].as_str().ok_or_else(|| Error::BadToolArgs {
             name: "run_background".into(),
@@ -309,6 +313,10 @@ impl Tool for CheckBackground {
                 "required": ["job_id"]
             }),
         }
+    }
+
+    fn is_deferred(&self) -> bool {
+        true
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

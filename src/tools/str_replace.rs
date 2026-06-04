@@ -235,10 +235,10 @@ fn try_match(haystack: &str, needle: &str) -> Option<String> {
 impl Tool for StrReplaceTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "str_replace".into(),
+            name: "Edit".into(),
             description: "Performs exact string replacements in files.\n\
 Usage:\n\
-- You must use your `read_file` tool at least once in the conversation before editing. \
+- You must use your `Read` tool at least once in the conversation before editing. \
 This tool will error if you attempt an edit without reading the file.\n\
 - When editing text from Read tool output, ensure you preserve the exact indentation \
 (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: \
@@ -287,19 +287,19 @@ useful if you want to rename a variable for instance."
         let file_path = args["file_path"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: "missing `file_path`".into(),
             })?;
         let old_string = args["old_string"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: "missing `old_string`".into(),
             })?;
         let new_string = args["new_string"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: "missing `new_string`".into(),
             })?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
@@ -312,14 +312,14 @@ useful if you want to rename a variable for instance."
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| Error::Tool {
-                        name: "str_replace".into(),
+                        name: "Edit".into(),
                         message: format!("mkdir {}: {e}", parent.display()),
                     })?;
             }
             tokio::fs::write(&abs_path, new_string)
                 .await
                 .map_err(|e| Error::Tool {
-                    name: "str_replace".into(),
+                    name: "Edit".into(),
                     message: format!("{}: {e}", abs_path.display()),
                 })?;
             return Ok(format!(
@@ -333,14 +333,14 @@ useful if you want to rename a variable for instance."
         let content = tokio::fs::read_to_string(&abs_path)
             .await
             .map_err(|e| Error::Tool {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: format!("{}: {e}", abs_path.display()),
             })?;
 
         // ── Guard: identical strings do nothing ─────────────────────────
         if old_string == new_string {
             return Err(Error::Tool {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: "No changes to make: old_string and new_string are exactly the same."
                     .into(),
             });
@@ -348,7 +348,7 @@ useful if you want to rename a variable for instance."
 
         // ── Find old_string via fuzzy-match chain ───────────────────────
         let actual_old = try_match(&content, old_string).ok_or_else(|| Error::Tool {
-            name: "str_replace".into(),
+            name: "Edit".into(),
             message: format!("String to replace not found in `{file_path}`.\nString: {old_string}"),
         })?;
 
@@ -356,7 +356,7 @@ useful if you want to rename a variable for instance."
         let occurrence_count = content.matches(actual_old.as_str()).count();
         if !replace_all && occurrence_count > 1 {
             return Err(Error::Tool {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: format!(
                     "Found {occurrence_count} matches of the string to replace, but \
 replace_all is false. To replace all occurrences, set replace_all to true. \
@@ -376,7 +376,7 @@ the instance.\nString: {old_string}"
         tokio::fs::write(&abs_path, &updated)
             .await
             .map_err(|e| Error::Tool {
-                name: "str_replace".into(),
+                name: "Edit".into(),
                 message: format!("{}: {e}", abs_path.display()),
             })?;
 

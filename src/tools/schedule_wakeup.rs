@@ -37,6 +37,10 @@ impl ScheduleWakeup {
 
 #[async_trait]
 impl Tool for ScheduleWakeup {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "schedule_wakeup".into(),

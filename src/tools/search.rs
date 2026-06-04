@@ -32,7 +32,7 @@ impl SearchFiles {
 impl Tool for SearchFiles {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "search_files".into(),
+            name: "Grep".into(),
             description:
                 "Find lines containing a pattern (literal substring or regex) across files in the workspace. Returns up to N matches as 'path:line: text'."
                     .into(),
@@ -56,12 +56,12 @@ impl Tool for SearchFiles {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let pattern = args["pattern"].as_str().ok_or_else(|| Error::BadToolArgs {
-            name: "search_files".into(),
+            name: "Grep".into(),
             message: "missing `pattern`".into(),
         })?;
         if pattern.is_empty() {
             return Err(Error::BadToolArgs {
-                name: "search_files".into(),
+                name: "Grep".into(),
                 message: "`pattern` must not be empty".into(),
             });
         }
@@ -80,7 +80,7 @@ impl Tool for SearchFiles {
                 Regex::new(pattern)
             };
             Some(regex.map_err(|e| Error::BadToolArgs {
-                name: "search_files".into(),
+                name: "Grep".into(),
                 message: format!("invalid regex: {e}"),
             })?)
         } else {
@@ -89,7 +89,7 @@ impl Tool for SearchFiles {
 
         let scope = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => resolve_within(&self.root, p).map_err(|e| Error::BadToolArgs {
-                name: "search_files".into(),
+                name: "Grep".into(),
                 message: format!("path: {e}"),
             })?,
             None => self.root.clone(),

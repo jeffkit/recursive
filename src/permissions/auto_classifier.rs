@@ -218,7 +218,7 @@ mod tests {
     async fn classifier_parse_block_true() {
         let provider = Arc::new(mock_classifier(r#"{"block":true,"reason":"unsafe"}"#));
         let mut classifier = AutoClassifier::new(provider);
-        let (block, reason) = classifier.classify("run_shell", "{}", "").await.unwrap();
+        let (block, reason) = classifier.classify("Bash", "{}", "").await.unwrap();
         assert!(block);
         assert_eq!(reason, "unsafe");
         assert_eq!(classifier.tracker.consecutive, 1);
@@ -228,7 +228,7 @@ mod tests {
     async fn classifier_parse_allow() {
         let provider = Arc::new(mock_classifier(r#"{"block":false,"reason":"ok"}"#));
         let mut classifier = AutoClassifier::new(provider);
-        let (block, reason) = classifier.classify("read_file", "{}", "").await.unwrap();
+        let (block, reason) = classifier.classify("Read", "{}", "").await.unwrap();
         assert!(!block);
         assert_eq!(reason, "ok");
         assert_eq!(classifier.tracker.consecutive, 0);
@@ -238,7 +238,7 @@ mod tests {
     async fn classifier_parse_error_defaults_allow() {
         let provider = Arc::new(mock_classifier("not valid json"));
         let mut classifier = AutoClassifier::new(provider);
-        let (block, _reason) = classifier.classify("read_file", "{}", "").await.unwrap();
+        let (block, _reason) = classifier.classify("Read", "{}", "").await.unwrap();
         assert!(!block, "parse error should default to allow");
         // Consecutive should still be 0 (parse error is not a denial).
         assert_eq!(classifier.tracker.consecutive, 0);
@@ -275,13 +275,13 @@ mod tests {
 
         // Trigger 3 consecutive denials.
         for _ in 0..3 {
-            let (block, _) = classifier.classify("run_shell", "{}", "").await.unwrap();
+            let (block, _) = classifier.classify("Bash", "{}", "").await.unwrap();
             assert!(block);
         }
         assert!(classifier.tracker.is_over_limit());
 
         // Next call should skip LLM entirely (no mock completions needed).
-        let (block, reason) = classifier.classify("run_shell", "{}", "").await.unwrap();
+        let (block, reason) = classifier.classify("Bash", "{}", "").await.unwrap();
         assert!(block);
         assert!(reason.contains("limit reached"));
     }

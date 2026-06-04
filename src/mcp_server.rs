@@ -388,9 +388,9 @@ mod tests {
     #[test]
     fn tool_name_format() {
         let server = "my-server";
-        let tool = "read_file";
+        let tool = "Read";
         let namespaced = format!("mcp__{}__{}", server, tool);
-        assert_eq!(namespaced, "mcp__my-server__read_file");
+        assert_eq!(namespaced, "mcp__my-server__Read");
     }
 
     /// Test that a server config with a URL creates an SSE-based client

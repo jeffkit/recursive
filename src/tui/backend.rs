@@ -787,7 +787,7 @@ mod tests {
     fn map_tool_result_error_prefix_marks_failure() {
         let ev = AgentEvent::ToolResult {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             output: "ERROR: missing".into(),
             step: 0,
             is_error: true,
@@ -869,7 +869,7 @@ mod tests {
                 ref id,
                 ref arguments,
             } => {
-                assert_eq!(name, "run_shell");
+                assert_eq!(name, "Bash");
                 assert!(id.starts_with("ui-bash-"));
                 assert!(
                     arguments.contains("echo bash-mode-works"),
@@ -887,7 +887,7 @@ mod tests {
                 success,
                 ..
             } => {
-                assert_eq!(name, "run_shell");
+                assert_eq!(name, "Bash");
                 assert!(success, "shell command should succeed");
                 assert!(
                     output.contains("bash-mode-works"),

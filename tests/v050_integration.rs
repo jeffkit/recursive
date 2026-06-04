@@ -53,7 +53,7 @@ mod v050_integration {
     fn test_app_state() -> AppState {
         AppState {
             tools: vec![ToolInfo {
-                name: "read_file".into(),
+                name: "Read".into(),
                 description: "Read a file".into(),
                 parameters: serde_json::json!({}),
             }],

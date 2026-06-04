@@ -45,25 +45,14 @@ fn clamp(s: &str, max: usize) -> String {
 /// Pick a spinner verb based on the tool name.
 pub fn verb_for_tool(name: &str) -> &'static str {
     match name {
-        "read_file" | "list_dir" | "search_files" => "Reading",
-        "apply_patch" | "write_file" => "Editing",
-        "run_shell" => "Running",
+        "Read" | "Grep" | "Glob" => "Reading",
+        "Edit" | "Write" => "Editing",
+        "Bash" => "Running",
         _ => "Calling tool",
     }
 }
 
 // ── V4A patch parser ─────────────────────────────────────────────────
-
-/// Parse a V4A patch envelope from an `apply_patch` arguments JSON.
-///
-/// Returns `(path, hunks)` for the first `*** Update File:` /
-/// `*** Add File:` block found, or `None` if the input is not parseable
-/// as a V4A patch.
-pub fn parse_apply_patch_input(arguments: &str) -> Option<(String, Vec<DiffHunk>)> {
-    let v: Value = serde_json::from_str(arguments).ok()?;
-    let input = v.get("input")?.as_str()?;
-    parse_v4a_patch(input)
-}
 
 /// Pure parser for a V4A patch string.
 pub fn parse_v4a_patch(input: &str) -> Option<(String, Vec<DiffHunk>)> {
@@ -173,9 +162,9 @@ mod tests {
 
     #[test]
     fn verb_for_tool_categorises_tools() {
-        assert_eq!(verb_for_tool("read_file"), "Reading");
-        assert_eq!(verb_for_tool("apply_patch"), "Editing");
-        assert_eq!(verb_for_tool("run_shell"), "Running");
+        assert_eq!(verb_for_tool("Read"), "Reading");
+        assert_eq!(verb_for_tool("Edit"), "Editing");
+        assert_eq!(verb_for_tool("Bash"), "Running");
         assert_eq!(verb_for_tool("custom_xyz"), "Calling tool");
     }
 

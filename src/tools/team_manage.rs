@@ -34,6 +34,10 @@ impl TeamAddRole {
 
 #[async_trait]
 impl Tool for TeamAddRole {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "team_add_role".into(),
@@ -131,6 +135,10 @@ impl TeamRemoveRole {
 
 #[async_trait]
 impl Tool for TeamRemoveRole {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "team_remove_role".into(),
@@ -190,6 +198,10 @@ impl TeamListRoles {
 
 #[async_trait]
 impl Tool for TeamListRoles {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "team_list_roles".into(),

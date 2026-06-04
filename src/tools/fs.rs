@@ -1,4 +1,4 @@
-//! Filesystem tools: `read_file`, `write_file`, `list_dir`.
+//! Filesystem tools: `Read`, `Write`.
 //!
 //! All paths are sandboxed to a workspace root. Reads/writes outside the
 //! root are rejected at the tool layer, so the model can't (accidentally
@@ -31,7 +31,7 @@ impl ReadFile {
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "read_file".into(),
+            name: "Read".into(),
             description:
                 "Read a UTF-8 text file under the workspace. Optionally return a line range."
                     .to_string(),
@@ -53,17 +53,17 @@ impl Tool for ReadFile {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let path = args["path"].as_str().ok_or_else(|| Error::BadToolArgs {
-            name: "read_file".into(),
+            name: "Read".into(),
             message: "missing `path`".into(),
         })?;
         let abs = resolve_within(&self.root, path)?;
         let bytes = tokio::fs::read(&abs).await.map_err(|e| Error::Tool {
-            name: "read_file".into(),
+            name: "Read".into(),
             message: format!("{}: {e}", abs.display()),
         })?;
         if bytes.len() > self.max_bytes {
             return Err(Error::Tool {
-                name: "read_file".into(),
+                name: "Read".into(),
                 message: format!(
                     "file too large: {} bytes (max {})",
                     bytes.len(),
@@ -72,7 +72,7 @@ impl Tool for ReadFile {
             });
         }
         let content = String::from_utf8(bytes).map_err(|e| Error::Tool {
-            name: "read_file".into(),
+            name: "Read".into(),
             message: format!("not utf-8: {e}"),
         })?;
 
@@ -95,7 +95,7 @@ impl Tool for ReadFile {
         let start = match start_line {
             Some(0) => {
                 return Err(Error::BadToolArgs {
-                    name: "read_file".to_string(),
+                    name: "Read".to_string(),
                     message: "start_line must be >= 1 (1-indexed)".to_string(),
                 });
             }
@@ -106,7 +106,7 @@ impl Tool for ReadFile {
         let end = match end_line {
             Some(0) => {
                 return Err(Error::BadToolArgs {
-                    name: "read_file".to_string(),
+                    name: "Read".to_string(),
                     message: "end_line must be >= 1 (1-indexed)".to_string(),
                 });
             }
@@ -117,7 +117,7 @@ impl Tool for ReadFile {
         // Validate start <= end
         if start > end {
             return Err(Error::BadToolArgs {
-                name: "read_file".to_string(),
+                name: "Read".to_string(),
                 message: format!("start_line ({}) must be <= end_line ({})", start, end),
             });
         }
@@ -129,7 +129,7 @@ impl Tool for ReadFile {
         // Check if start exceeds total lines
         if start_line.is_some() && start > total_lines {
             return Err(Error::BadToolArgs {
-                name: "read_file".to_string(),
+                name: "Read".to_string(),
                 message: format!("start_line {} exceeds total lines {}", start, total_lines),
             });
         }
@@ -164,7 +164,7 @@ impl WriteFile {
 impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "write_file".into(),
+            name: "Write".into(),
             description: "Write/overwrite a UTF-8 text file under the workspace. Parent directories are created.".into(),
             parameters: json!({
                 "type": "object",
@@ -183,13 +183,13 @@ impl Tool for WriteFile {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let path = args["path"].as_str().ok_or_else(|| Error::BadToolArgs {
-            name: "write_file".into(),
+            name: "Write".into(),
             message: "missing `path`".into(),
         })?;
         let contents = args["contents"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
-                name: "write_file".into(),
+                name: "Write".into(),
                 message: "missing `contents`".into(),
             })?;
         let abs = resolve_within(&self.root, path)?;
@@ -197,72 +197,17 @@ impl Tool for WriteFile {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| Error::Tool {
-                    name: "write_file".into(),
+                    name: "Write".into(),
                     message: format!("mkdir {}: {e}", parent.display()),
                 })?;
         }
         tokio::fs::write(&abs, contents)
             .await
             .map_err(|e| Error::Tool {
-                name: "write_file".into(),
+                name: "Write".into(),
                 message: format!("{}: {e}", abs.display()),
             })?;
         Ok(format!("wrote {} bytes to {}", contents.len(), path))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ListDir {
-    pub root: PathBuf,
-}
-
-impl ListDir {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-}
-
-#[async_trait]
-impl Tool for ListDir {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "list_dir".into(),
-            description: "List entries of a directory under the workspace. Returns one path per line, `/` suffix for dirs.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory relative to the workspace root", "default": "."}
-                }
-            }),
-        }
-    }
-
-    fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
-        crate::tools::ToolSideEffect::ReadOnly
-    }
-    async fn execute(&self, args: Value) -> Result<String> {
-        let path = args["path"].as_str().unwrap_or(".");
-        let abs = resolve_within(&self.root, path)?;
-        let mut entries = tokio::fs::read_dir(&abs).await.map_err(|e| Error::Tool {
-            name: "list_dir".into(),
-            message: format!("{}: {e}", abs.display()),
-        })?;
-        let mut lines = Vec::new();
-        while let Some(entry) = entries.next_entry().await.map_err(|e| Error::Tool {
-            name: "list_dir".into(),
-            message: e.to_string(),
-        })? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let kind = entry.file_type().await.ok();
-            let suffix = if kind.is_some_and(|k| k.is_dir()) {
-                "/"
-            } else {
-                ""
-            };
-            lines.push(format!("{name}{suffix}"));
-        }
-        lines.sort();
-        Ok(lines.join("\n"))
     }
 }
 
@@ -291,18 +236,6 @@ mod tests {
             .await
             .unwrap();
         assert!(tmp.path().join("a/b/c.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn list_dir_sorts_and_marks_dirs() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir(tmp.path().join("sub")).unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
-        let out = ListDir::new(tmp.path())
-            .execute(json!({"path":"."}))
-            .await
-            .unwrap();
-        assert_eq!(out, "a.txt\nsub/");
     }
 
     #[tokio::test]

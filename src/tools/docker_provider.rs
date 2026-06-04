@@ -73,14 +73,14 @@ impl ToolSetProvider for DockerToolSetProvider {
 
         match docker_shell {
             Ok(tool) => {
-                // register_mut replaces the existing "run_shell" entry.
+                // register_mut replaces the existing "Bash" entry.
                 registry.register_mut(Arc::new(tool));
             }
             Err(e) => {
                 tracing::warn!(
                     "DockerToolSetProvider: failed to start container, falling back to local shell: {e}"
                 );
-                // Fallback: keep the existing local run_shell
+                // Fallback: keep the existing local Bash
             }
         }
         registry

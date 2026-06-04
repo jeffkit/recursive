@@ -87,7 +87,7 @@ async fn hooks_and_compaction() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
-    // Write a file so read_file succeeds.
+    // Write a file so Read succeeds.
     std::fs::write(root.join("data.txt"), b"hello world").unwrap();
 
     // Script: 3 tool calls (to build up transcript) then a final stop.
@@ -96,7 +96,7 @@ async fn hooks_and_compaction() {
             content: "reading file".into(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "data.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -104,11 +104,11 @@ async fn hooks_and_compaction() {
             reasoning_content: None,
         },
         Completion {
-            content: "listing dir".into(),
+            content: "globbing files".into(),
             tool_calls: vec![ToolCall {
                 id: "c2".into(),
-                name: "list_dir".into(),
-                arguments: json!({"path": "."}),
+                name: "Glob".into(),
+                arguments: json!({"pattern": "*.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
@@ -118,7 +118,7 @@ async fn hooks_and_compaction() {
             content: "reading again".into(),
             tool_calls: vec![ToolCall {
                 id: "c3".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "data.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -127,7 +127,7 @@ async fn hooks_and_compaction() {
         },
         // This completion is consumed by the compactor
         Completion {
-            content: "Summary: read file, listed dir, tests pass.".into(),
+            content: "Summary: read file, glob files, tests pass.".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
@@ -147,7 +147,7 @@ async fn hooks_and_compaction() {
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let tools = ToolRegistry::new(transport)
         .register(Arc::new(recursive::tools::ReadFile::new(root)))
-        .register(Arc::new(recursive::tools::ListDir::new(root)));
+        .register(Arc::new(recursive::tools::GlobTool::new(root)));
 
     let hook = Arc::new(CountingHook::new());
     let mut hooks = recursive::hooks::HookRegistry::new();
@@ -247,43 +247,43 @@ async fn permission_hook_and_sub_agent() {
     // Scripted completions for the parent agent:
     //   1. Parent calls sub_agent with a prompt that asks to run_shell and read_file.
     //   2. Sub-agent's first call: tries run_shell (denied by inherited hook).
-    //   3. Sub-agent's second call: tries read_file (allowed).
+    //   3. Sub-agent's second call: tries Read (allowed).
     //   4. Sub-agent's third call: finishes.
     //   5. Parent's second call: finishes.
     let script = vec![
-        // 1. Parent calls sub_agent
+        // 1. Parent calls Agent
         Completion {
             content: "spawning sub-agent".into(),
             tool_calls: vec![ToolCall {
                 id: "p1".into(),
-                name: "sub_agent".into(),
+                name: "Agent".into(),
                 arguments: json!({
                     "prompt": "run 'echo hi' and read notes.txt",
-                    "tools": ["run_shell", "read_file"]
+                    "tools": ["Bash", "Read"]
                 }),
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
             reasoning_content: None,
         },
-        // 2. Sub-agent tries run_shell (denied by permission hook)
+        // 2. Sub-agent tries Bash (denied by permission hook)
         Completion {
             content: "running shell".into(),
             tool_calls: vec![ToolCall {
                 id: "s1".into(),
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 arguments: json!({"command": "echo hi"}),
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
             reasoning_content: None,
         },
-        // 3. Sub-agent tries read_file (allowed)
+        // 3. Sub-agent tries Read (allowed)
         Completion {
             content: "reading file".into(),
             tool_calls: vec![ToolCall {
                 id: "s2".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "notes.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -329,13 +329,13 @@ async fn permission_hook_and_sub_agent() {
             None,
         )));
 
-    // Permission hook: deny run_shell, allow everything else.
+    // Permission hook: deny Bash, allow everything else.
     struct DenyShellHook;
     #[async_trait::async_trait]
     impl PermissionHook for DenyShellHook {
         async fn check(&self, tool_name: &str, _args: &serde_json::Value) -> PermissionDecision {
-            if tool_name == "run_shell" {
-                PermissionDecision::Deny("run_shell is not allowed".into())
+            if tool_name == "Bash" {
+                PermissionDecision::Deny("Bash is not allowed".into())
             } else {
                 PermissionDecision::Allow
             }
@@ -423,7 +423,7 @@ async fn skill_index_injection() {
             content: "loading skill".into(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
-                name: "load_skill".into(),
+                name: "Skill".into(),
                 arguments: json!({"name": "test-skill"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -500,7 +500,7 @@ async fn session_pause_and_resume() {
             content: "reading config".into(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "config.json"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -569,7 +569,7 @@ async fn session_pause_and_resume() {
             content: "continuing from where I left off".into(),
             tool_calls: vec![ToolCall {
                 id: "c2".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "config.json"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -645,7 +645,7 @@ async fn tool_transport_explicit() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
-    // Write a file so read_file succeeds.
+    // Write a file so Read succeeds.
     std::fs::write(root.join("greeting.txt"), b"hello from transport test").unwrap();
 
     // Script: one tool call then stop.
@@ -654,7 +654,7 @@ async fn tool_transport_explicit() {
             content: "reading file via explicit transport".into(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "Read".into(),
                 arguments: json!({"path": "greeting.txt"}),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -977,16 +977,16 @@ mod permissions {
             mode: PermissionMode::Default,
             layers: vec![recursive::permissions::PermissionLayer {
                 source: recursive::permissions::RuleSource::User,
-                deny: vec!["run_shell".into()],
+                deny: vec!["Bash".into()],
                 ..Default::default()
             }],
         };
         let (registry, _tmp) = registry_with(perms);
         let result = registry
-            .invoke("run_shell", json!({ "command": "echo hi" }))
+            .invoke("Bash", json!({ "command": "echo hi" }))
             .await;
         match result {
-            Err(Error::PermissionDenied { name, .. }) => assert_eq!(name, "run_shell"),
+            Err(Error::PermissionDenied { name, .. }) => assert_eq!(name, "Bash"),
             other => panic!("expected PermissionDenied, got {other:?}"),
         }
     }
@@ -999,28 +999,28 @@ mod permissions {
             mode: PermissionMode::Default,
             layers: vec![recursive::permissions::PermissionLayer {
                 source: recursive::permissions::RuleSource::User,
-                allow: vec!["read_file".into()],
+                allow: vec!["Read".into()],
                 ..Default::default()
             }],
         };
         let (registry, _tmp) = registry_with(perms);
         // Listed tool is allowed.
         let ok = registry
-            .invoke("read_file", json!({ "path": "nonexistent.txt" }))
+            .invoke("Read", json!({ "path": "nonexistent.txt" }))
             .await;
         // Should succeed (or fail on file not found — but not PermissionDenied)
         assert!(
             !matches!(ok, Err(Error::PermissionDenied { .. })),
-            "read_file should be allowed when in allow list"
+            "Read should be allowed when in allow list"
         );
 
         // Unlisted tool is NOT denied — falls through to Passthrough.
         let ok2 = registry
-            .invoke("write_file", json!({ "path": "x.txt", "content": "y" }))
+            .invoke("Write", json!({ "path": "x.txt", "content": "y" }))
             .await;
         assert!(
             !matches!(ok2, Err(Error::PermissionDenied { .. })),
-            "write_file should be allowed (Passthrough) when not in deny list"
+            "Write should be allowed (Passthrough) when not in deny list"
         );
     }
 
@@ -1037,7 +1037,7 @@ mod permissions {
         };
         let (registry, _tmp) = registry_with(perms);
 
-        for tool in ["run_shell", "run_background"] {
+        for tool in ["run_background"] {
             let result = registry.invoke(tool, json!({})).await;
             assert!(
                 matches!(result, Err(Error::PermissionDenied { .. })),
@@ -1045,16 +1045,16 @@ mod permissions {
             );
         }
 
-        // read_file is unrelated — it should not be rejected by the
+        // Read is unrelated — it should not be rejected by the
         // permission layer (it may still fail for other reasons, e.g.
         // a missing path argument; we only assert it's not
         // PermissionDenied).
         let result = registry
-            .invoke("read_file", json!({ "path": "doesnotexist.txt" }))
+            .invoke("Read", json!({ "path": "doesnotexist.txt" }))
             .await;
         assert!(
             !matches!(result, Err(Error::PermissionDenied { .. })),
-            "read_file must not be denied by run_* pattern"
+            "Read must not be denied by run_* pattern"
         );
     }
 
@@ -1068,7 +1068,7 @@ mod permissions {
         let registry =
             ToolRegistry::new(Arc::new(LocalTransport)).register(Arc::new(WriteFile::new(&root)));
         let result = registry
-            .invoke("write_file", json!({ "path": "ok.txt", "content": "ok" }))
+            .invoke("Write", json!({ "path": "ok.txt", "content": "ok" }))
             .await;
         assert!(
             !matches!(result, Err(Error::PermissionDenied { .. })),
@@ -1082,15 +1082,15 @@ mod permissions {
     fn permissions_section_parses_from_toml() {
         let toml_text = r#"
 [permissions]
-allow = ["read_file", "list_dir"]
+allow = ["Read", "Glob"]
 deny = ["run_*"]
-interactive = ["write_file"]
+interactive = ["Write"]
 "#;
         let cfg: recursive::config_file::FileConfig =
             toml::from_str(toml_text).expect("parse config.toml");
         let section = cfg.permissions.expect("permissions section present");
-        assert_eq!(section.allow, vec!["read_file", "list_dir"]);
+        assert_eq!(section.allow, vec!["Read", "Glob"]);
         assert_eq!(section.deny, vec!["run_*"]);
-        assert_eq!(section.interactive, vec!["write_file"]);
+        assert_eq!(section.interactive, vec!["Write"]);
     }
 }

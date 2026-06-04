@@ -56,7 +56,7 @@ fn resume_by_full_id_round_trips_seed() {
     let _h = HomeOverride::new();
     let ws = workspace();
 
-    let specs = make_specs("read_file");
+    let specs = make_specs("Read");
     let mut w =
         SessionWriter::create_with_tools(&ws, "round trip", "model", "openai", &specs, None)
             .unwrap();
@@ -202,7 +202,7 @@ fn lock_path_inside_session_dir() {
 fn tool_registry_hash_round_trip_via_create_with_tools() {
     let _h = HomeOverride::new();
     let ws = workspace();
-    let specs = make_specs("write_file");
+    let specs = make_specs("Write");
     let w = SessionWriter::create_with_tools(&ws, "hashed", "m", "p", &specs, None).unwrap();
     let dir = w.session_dir().to_path_buf();
     drop(w);
@@ -237,7 +237,7 @@ fn load_messages_round_trips_tool_calls_and_reasoning() {
 
     let tool_calls = vec![ToolCall {
         id: "call_001".into(),
-        name: "read_file".into(),
+        name: "Read".into(),
         arguments: serde_json::json!({"path":"/tmp/foo"}),
     }];
     let assistant = Message {

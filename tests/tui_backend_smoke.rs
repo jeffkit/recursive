@@ -164,7 +164,7 @@ async fn bash_mode_dispatches_run_shell_without_calling_llm() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
-            Ok(Some(UiEvent::ToolCall { name, .. })) if name == "run_shell" => {
+            Ok(Some(UiEvent::ToolCall { name, .. })) if name == "Bash" => {
                 saw_call = true;
             }
             Ok(Some(UiEvent::ToolResult {
@@ -172,8 +172,8 @@ async fn bash_mode_dispatches_run_shell_without_calling_llm() {
                 output,
                 success,
                 ..
-            })) if name == "run_shell" => {
-                assert!(success, "run_shell should succeed");
+            })) if name == "Bash" => {
+                assert!(success, "Bash should succeed");
                 assert!(
                     output.contains("hi"),
                     "expected output to contain 'hi': {output}"
@@ -189,8 +189,8 @@ async fn bash_mode_dispatches_run_shell_without_calling_llm() {
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
 
-    assert!(saw_call, "expected a ToolCall event for run_shell");
-    assert!(saw_result, "expected a ToolResult event for run_shell");
+    assert!(saw_call, "expected a ToolCall event for Bash");
+    assert!(saw_result, "expected a ToolResult event for Bash");
     assert!(
         llm_observer.calls().is_empty(),
         "bash mode must not invoke the LLM provider: got {} calls",

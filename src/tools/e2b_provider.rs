@@ -269,7 +269,7 @@ impl E2bShellTool {
 impl Tool for E2bShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "run_shell".into(),
+            name: "Bash".into(),
             description: "Run a shell command inside an isolated E2B microVM (Firecracker).".into(),
             parameters: json!({
                 "type": "object",
@@ -293,7 +293,7 @@ impl Tool for E2bShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::BadToolArgs {
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 message: "missing required argument: command".into(),
             })?;
 
@@ -303,7 +303,7 @@ impl Tool for E2bShellTool {
                 E2bSandbox::create(self.config.clone())
                     .await
                     .map_err(|e| Error::Tool {
-                        name: "run_shell".into(),
+                        name: "Bash".into(),
                         message: format!("e2b sandbox init failed: {e}"),
                     })?;
             *guard = Some(sandbox);

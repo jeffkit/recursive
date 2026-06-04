@@ -11,7 +11,7 @@
 //! ```json
 //! {
 //!   "event": "preToolCall",
-//!   "toolName": "run_shell",
+//!   "toolName": "Bash",
 //!   "args": {"command": "rm -rf /"},
 //!   "mode": "ask"
 //! }
@@ -1041,7 +1041,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         assert_eq!(runner.len(), 1);
         let input = make_tool_input(
             HookEvent::PreToolCall,
-            "run_shell",
+            "Bash",
             serde_json::json!({"command": "ls"}),
         );
         let result = runner.dispatch(&input).await;
@@ -1053,7 +1053,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         let runner = ExternalHookRunner::discover(&[]);
         let input = make_tool_input(
             HookEvent::PreToolCall,
-            "read_file",
+            "Read",
             serde_json::json!({"path": "foo.txt"}),
         );
         let result = runner.dispatch(&input).await;
@@ -1078,7 +1078,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         assert_eq!(runner.len(), 1);
         let input = make_tool_input(
             HookEvent::PreToolCall,
-            "run_shell",
+            "Bash",
             serde_json::json!({"command": "ls"}),
         );
         let result = runner.dispatch(&input).await;
@@ -1104,7 +1104,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         assert_eq!(runner.len(), 1);
         let input = make_tool_input(
             HookEvent::PreToolCall,
-            "run_shell",
+            "Bash",
             serde_json::json!({"command": "ls"}),
         );
         let result = runner.dispatch(&input).await;
@@ -1138,7 +1138,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         assert_eq!(runner.len(), 2);
         let input = make_tool_input(
             HookEvent::PreToolCall,
-            "write_file",
+            "Write",
             serde_json::json!({"path": "test.txt"}),
         );
         let result = runner.dispatch(&input).await;
@@ -1198,11 +1198,11 @@ echo '{"action":"skip","message":"blocked by test hook"}'
     fn hook_input_tool_name_present_for_tool_events() {
         let input = make_tool_input(
             HookEvent::PreToolCall,
-            "run_shell",
+            "Bash",
             serde_json::json!({"command": "ls"}),
         );
         let json = serde_json::to_string(&input).unwrap();
-        assert!(json.contains("run_shell"));
+        assert!(json.contains("Bash"));
         assert!(json.contains("command"));
     }
 
@@ -1476,7 +1476,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         let runner = ExternalHookRunner::from_config_with_llm(cfg, None);
         assert_eq!(runner.len(), 1); // hook is registered
 
-        let input = make_tool_input(HookEvent::PreToolCall, "run_shell", serde_json::json!({}));
+        let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         let result = runner.dispatch(&input).await;
         // Should fail-open because no LLM is configured.
         assert!(matches!(result.action, HookAction::Continue));
@@ -1487,7 +1487,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
     #[test]
     fn from_config_creates_hooks_from_json() {
         use crate::hooks::config::HooksConfig;
-        let json = r#"{"PreToolCall":[{"matcher":"run_shell","hooks":[{"type":"command","command":"/usr/bin/true"}]}]}"#;
+        let json = r#"{"PreToolCall":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/bin/true"}]}]}"#;
         let cfg: HooksConfig = serde_json::from_str(json).unwrap();
         let runner = ExternalHookRunner::from_config(cfg);
         assert_eq!(runner.len(), 1);
@@ -1549,14 +1549,14 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         }
         // Register hook only for "PostToolCall" event
         let json = format!(
-            r#"{{"PostToolCall":[{{"matcher":"run_shell","hooks":[{{"type":"command","command":"{}"}}]}}]}}"#,
+            r#"{{"PostToolCall":[{{"matcher":"Bash","hooks":[{{"type":"command","command":"{}"}}]}}]}}"#,
             hook_path.display()
         );
         let cfg: HooksConfig = serde_json::from_str(&json).unwrap();
         let runner = ExternalHookRunner::from_config(cfg);
 
         // Dispatch PreToolCall — should NOT trigger the hook
-        let pre_input = make_tool_input(HookEvent::PreToolCall, "run_shell", serde_json::json!({}));
+        let pre_input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         let result = runner.dispatch(&pre_input).await;
         assert!(
             matches!(result.action, HookAction::Continue),
@@ -1564,8 +1564,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         );
 
         // Dispatch PostToolCall — SHOULD trigger the hook
-        let post_input =
-            make_tool_input(HookEvent::PostToolCall, "run_shell", serde_json::json!({}));
+        let post_input = make_tool_input(HookEvent::PostToolCall, "Bash", serde_json::json!({}));
         let result = runner.dispatch(&post_input).await;
         assert!(
             matches!(result.action, HookAction::Skip),
@@ -1610,7 +1609,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             )]),
         };
         let runner = ExternalHookRunner::from_config(cfg);
-        let input = make_tool_input(HookEvent::PreToolCall, "run_shell", serde_json::json!({}));
+        let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         runner.dispatch(&input).await;
         runner.dispatch(&input).await;
         // Counter should be 1, not 2.
@@ -1655,7 +1654,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             )]),
         };
         let runner = ExternalHookRunner::from_config(cfg);
-        let input = make_tool_input(HookEvent::PreToolCall, "run_shell", serde_json::json!({}));
+        let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         let start = std::time::Instant::now();
         let result = runner.dispatch(&input).await;
         let elapsed = start.elapsed();
@@ -1700,7 +1699,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             )]),
         };
         let runner = ExternalHookRunner::from_config(cfg).with_cancel_token(child_token);
-        let input = make_tool_input(HookEvent::PreToolCall, "run_shell", serde_json::json!({}));
+        let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         runner.dispatch(&input).await;
         // Wait for the background task to complete and cancel the token.
         // Use a longer timeout to avoid flakiness under parallel test load.
@@ -1749,7 +1748,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             )]),
         };
         let runner = ExternalHookRunner::from_config(cfg).with_cancel_token(child_token);
-        let input = make_tool_input(HookEvent::PreToolCall, "run_shell", serde_json::json!({}));
+        let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         runner.dispatch(&input).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(

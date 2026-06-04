@@ -1438,12 +1438,12 @@ mod tests {
         let provider = "openai".to_string();
         let tool_specs = vec![
             ToolSpec {
-                name: "read_file".into(),
+                name: "Read".into(),
                 description: "Read a file".into(),
                 parameters: serde_json::json!({"type":"object"}),
             },
             ToolSpec {
-                name: "write_file".into(),
+                name: "Write".into(),
                 description: "Write a file".into(),
                 parameters: serde_json::json!({"type":"object"}),
             },
@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn resume_validates_tool_registry_hash() {
         let tool_specs = vec![ToolSpec {
-            name: "read_file".into(),
+            name: "Read".into(),
             description: "Read a file".into(),
             parameters: serde_json::json!({"type":"object"}),
         }];
@@ -1502,7 +1502,7 @@ mod tests {
 
         // Different specs should fail
         let different_specs = vec![ToolSpec {
-            name: "write_file".into(),
+            name: "Write".into(),
             description: "Write a file".into(),
             parameters: serde_json::json!({"type":"object"}),
         }];
@@ -1573,12 +1573,12 @@ mod tests {
         let tool_calls = vec![
             ToolCall {
                 id: "call_001".to_string(),
-                name: "read_file".to_string(),
+                name: "Read".to_string(),
                 arguments: serde_json::json!({"path": "/tmp/foo.rs"}),
             },
             ToolCall {
                 id: "call_002".to_string(),
-                name: "write_file".to_string(),
+                name: "Write".to_string(),
                 arguments: serde_json::json!({"path": "/tmp/bar.rs", "content": "fn main() {}"}),
             },
         ];
@@ -1614,13 +1614,13 @@ mod tests {
         assert_eq!(assistant_msg.content, "I'll read the file first.");
         assert_eq!(assistant_msg.tool_calls.len(), 2);
         assert_eq!(assistant_msg.tool_calls[0].id, "call_001");
-        assert_eq!(assistant_msg.tool_calls[0].name, "read_file");
+        assert_eq!(assistant_msg.tool_calls[0].name, "Read");
         assert_eq!(
             assistant_msg.tool_calls[0].arguments,
             serde_json::json!({"path": "/tmp/foo.rs"})
         );
         assert_eq!(assistant_msg.tool_calls[1].id, "call_002");
-        assert_eq!(assistant_msg.tool_calls[1].name, "write_file");
+        assert_eq!(assistant_msg.tool_calls[1].name, "Write");
         assert_eq!(
             assistant_msg.tool_calls[1].arguments,
             serde_json::json!({"path": "/tmp/bar.rs", "content": "fn main() {}"})
@@ -1659,12 +1659,12 @@ mod tests {
     fn validate_tool_registry_mismatch() {
         let original_specs = vec![
             ToolSpec {
-                name: "read_file".into(),
+                name: "Read".into(),
                 description: "Read a file".into(),
                 parameters: serde_json::json!({"type":"object"}),
             },
             ToolSpec {
-                name: "write_file".into(),
+                name: "Write".into(),
                 description: "Write a file".into(),
                 parameters: serde_json::json!({"type":"object"}),
             },
@@ -2167,7 +2167,7 @@ mod tests {
         let ws = tmp.path();
 
         let specs = vec![ToolSpec {
-            name: "read_file".into(),
+            name: "Read".into(),
             description: "Read".into(),
             parameters: serde_json::json!({"type":"object"}),
         }];

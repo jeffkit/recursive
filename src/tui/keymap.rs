@@ -57,7 +57,7 @@ mod tests {
         app.screen = AppScreen::Chat;
         app.blocks.push(TranscriptBlock::ToolCall {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             args_preview: String::new(),
             result: Some(ToolResultData {
                 success: true,

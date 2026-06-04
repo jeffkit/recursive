@@ -467,7 +467,7 @@ mod tests {
 
         let tc = LlmToolCall {
             id: "call_1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             arguments: serde_json::json!({"path": "/tmp/foo"}),
         };
         let msg = Message {
@@ -489,7 +489,7 @@ mod tests {
             assert_eq!(m.content, "some text");
             assert_eq!(m.reasoning_content.as_deref(), Some("my reasoning"));
             assert_eq!(m.tool_calls.len(), 1);
-            assert_eq!(m.tool_calls[0].name, "read_file");
+            assert_eq!(m.tool_calls[0].name, "Read");
         } else {
             panic!("deserialized to wrong variant");
         }

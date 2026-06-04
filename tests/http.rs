@@ -54,7 +54,7 @@ mod http_tests {
         AppState {
             tools: vec![
                 ToolInfo {
-                    name: "read_file".into(),
+                    name: "Read".into(),
                     description: "Read a file from the workspace".into(),
                     parameters: serde_json::json!({
                         "type": "object",
@@ -65,7 +65,7 @@ mod http_tests {
                     }),
                 },
                 ToolInfo {
-                    name: "write_file".into(),
+                    name: "Write".into(),
                     description: "Write content to a file".into(),
                     parameters: serde_json::json!({
                         "type": "object",
@@ -158,8 +158,8 @@ mod http_tests {
         let tools: Vec<ToolInfo> = serde_json::from_slice(&body).unwrap();
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Write"));
     }
 
     #[tokio::test]
@@ -861,21 +861,21 @@ mod http_tests {
     async fn sse_event_serialization() {
         // Verify SseEvent serializes to expected JSON structure
         let tool_call = SseEvent::ToolCall {
-            name: "read_file".into(),
+            name: "Read".into(),
             step: 1,
         };
         let json = serde_json::to_value(&tool_call).unwrap();
         assert_eq!(json["type"], "tool_call");
-        assert_eq!(json["name"], "read_file");
+        assert_eq!(json["name"], "Read");
         assert_eq!(json["step"], 1);
 
         let tool_result = SseEvent::ToolResult {
-            name: "read_file".into(),
+            name: "Read".into(),
             success: true,
         };
         let json = serde_json::to_value(&tool_result).unwrap();
         assert_eq!(json["type"], "tool_result");
-        assert_eq!(json["name"], "read_file");
+        assert_eq!(json["name"], "Read");
         assert_eq!(json["success"], true);
 
         let done = SseEvent::Done {
@@ -900,7 +900,7 @@ mod http_tests {
         use recursive::AgentEvent;
 
         let event = AgentEvent::ToolCall {
-            name: "write_file".into(),
+            name: "Write".into(),
             id: "call_1".into(),
             arguments: r#"{"path": "/tmp/test"}"#.into(),
             step: 2,
@@ -909,7 +909,7 @@ mod http_tests {
         assert_eq!(
             sse,
             SseEvent::ToolCall {
-                name: "write_file".into(),
+                name: "Write".into(),
                 step: 2,
             }
         );
@@ -921,7 +921,7 @@ mod http_tests {
 
         let event = AgentEvent::ToolResult {
             id: "call_1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             output: "file contents here".into(),
             step: 1,
             is_error: false,
@@ -930,7 +930,7 @@ mod http_tests {
         assert_eq!(
             sse,
             SseEvent::ToolResult {
-                name: "read_file".into(),
+                name: "Read".into(),
                 success: true,
             }
         );
@@ -942,7 +942,7 @@ mod http_tests {
 
         let event = AgentEvent::ToolResult {
             id: "call_2".into(),
-            name: "write_file".into(),
+            name: "Write".into(),
             output: "ERROR: permission denied".into(),
             step: 3,
             is_error: true,
@@ -951,7 +951,7 @@ mod http_tests {
         assert_eq!(
             sse,
             SseEvent::ToolResult {
-                name: "write_file".into(),
+                name: "Write".into(),
                 success: false,
             }
         );
@@ -1036,7 +1036,7 @@ mod http_tests {
                 content: "calling".into(),
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
-                    name: "read_file".into(),
+                    name: "Read".into(),
                     arguments: serde_json::json!({"path": "x"}),
                 }],
                 tool_call_id: None,
@@ -1054,7 +1054,7 @@ mod http_tests {
         assert!(matches!(&content[0], SseContentBlock::Text { text } if text == "calling"));
         assert!(matches!(
             &content[1],
-            SseContentBlock::ToolUse { id, name, .. } if id == "tc1" && name == "read_file"
+            SseContentBlock::ToolUse { id, name, .. } if id == "tc1" && name == "Read"
         ));
     }
 

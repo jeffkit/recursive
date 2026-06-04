@@ -128,12 +128,12 @@ fn skip_policy_sees_every_unanswered_call() {
     let dir = write_orphan_session(
         &ws,
         &[
-            ("tc_a", "run_shell", json!({"cmd": "ls"})),
-            ("tc_b", "run_shell", json!({"cmd": "pwd"})),
+            ("tc_a", "Bash", json!({"cmd": "ls"})),
+            ("tc_b", "Bash", json!({"cmd": "pwd"})),
         ],
     );
 
-    let registry = registry_with(&[("run_shell", ToolSideEffect::External)]);
+    let registry = registry_with(&[("Bash", ToolSideEffect::External)]);
     let orphans: Vec<OrphanToolCall> =
         SessionReader::scan_orphan_tool_calls(&dir, &registry).expect("scan");
 
@@ -154,13 +154,13 @@ fn redo_policy_gets_side_effect_for_warning() {
         &ws,
         &[
             ("tc_safe", "estimate_tokens", json!({"text": "hi"})),
-            ("tc_risky", "run_shell", json!({"cmd": "curl bad.example"})),
+            ("tc_risky", "Bash", json!({"cmd": "curl bad.example"})),
         ],
     );
 
     let registry = registry_with(&[
         ("estimate_tokens", ToolSideEffect::ReadOnly),
-        ("run_shell", ToolSideEffect::External),
+        ("Bash", ToolSideEffect::External),
     ]);
     let orphans = SessionReader::scan_orphan_tool_calls(&dir, &registry).expect("scan");
 
@@ -187,14 +187,14 @@ fn ask_policy_gets_tool_name_and_args_hash() {
     let _home = HomePin::new();
     let ws = std::path::PathBuf::from("/tmp/g153-ask-test-ws");
     let args = json!({"cmd": "echo hello"});
-    let dir = write_orphan_session(&ws, &[("tc_only", "run_shell", args.clone())]);
+    let dir = write_orphan_session(&ws, &[("tc_only", "Bash", args.clone())]);
 
-    let registry = registry_with(&[("run_shell", ToolSideEffect::External)]);
+    let registry = registry_with(&[("Bash", ToolSideEffect::External)]);
     let orphans = SessionReader::scan_orphan_tool_calls(&dir, &registry).expect("scan");
 
     assert_eq!(orphans.len(), 1);
     let o = &orphans[0];
-    assert_eq!(o.tool_name, "run_shell");
+    assert_eq!(o.tool_name, "Bash");
     assert_eq!(o.tool_call_id, "tc_only");
 
     // args_hash must match the BLAKE3 of `arguments.to_string()` so the
@@ -243,7 +243,7 @@ fn answered_calls_are_not_orphans() {
             content: "ok".into(),
             tool_calls: vec![recursive::llm::ToolCall {
                 id: "tc_done".into(),
-                name: "run_shell".into(),
+                name: "Bash".into(),
                 arguments: json!({"cmd": "ls"}),
             }],
             tool_call_id: None,
@@ -268,7 +268,7 @@ fn answered_calls_are_not_orphans() {
     let dir = w.session_dir().to_path_buf();
     drop(w);
 
-    let registry = registry_with(&[("run_shell", ToolSideEffect::External)]);
+    let registry = registry_with(&[("Bash", ToolSideEffect::External)]);
     let orphans = SessionReader::scan_orphan_tool_calls(&dir, &registry).expect("scan");
     assert!(
         orphans.is_empty(),

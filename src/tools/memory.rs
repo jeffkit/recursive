@@ -300,6 +300,10 @@ impl Tool for Remember {
         }
     }
 
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::Mutating
     }
@@ -380,6 +384,10 @@ impl Recall {
 
 #[async_trait]
 impl Tool for Recall {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
     }
@@ -493,6 +501,10 @@ impl Forget {
 
 #[async_trait]
 impl Tool for Forget {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "forget".into(),
@@ -680,6 +692,10 @@ impl WorkingMemoryTool {
 
 #[async_trait]
 impl Tool for WorkingMemoryTool {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "scratchpad_set".into(),
@@ -743,6 +759,10 @@ impl ScratchpadGet {
 
 #[async_trait]
 impl Tool for ScratchpadGet {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "scratchpad_get".into(),
@@ -794,6 +814,10 @@ impl ScratchpadDelete {
 
 #[async_trait]
 impl Tool for ScratchpadDelete {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "scratchpad_delete".into(),
@@ -846,6 +870,10 @@ impl ScratchpadList {
 
 #[async_trait]
 impl Tool for ScratchpadList {
+    fn is_deferred(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "scratchpad_list".into(),

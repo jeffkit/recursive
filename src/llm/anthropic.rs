@@ -1048,7 +1048,7 @@ mod tests {
         let raw = r#"{
             "type": "message",
             "content": [
-                {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "src/lib.rs"}}
+                {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "src/lib.rs"}}
             ],
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 100, "output_tokens": 50}
@@ -1058,7 +1058,7 @@ mod tests {
         assert!(c.content.is_empty());
         assert_eq!(c.tool_calls.len(), 1);
         assert_eq!(c.tool_calls[0].id, "call_1");
-        assert_eq!(c.tool_calls[0].name, "read_file");
+        assert_eq!(c.tool_calls[0].name, "Read");
         assert_eq!(c.tool_calls[0].arguments["path"], "src/lib.rs");
     }
 
@@ -1068,7 +1068,7 @@ mod tests {
             "type": "message",
             "content": [
                 {"type": "text", "text": "I'll read that file. "},
-                {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "src/lib.rs"}}
+                {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "src/lib.rs"}}
             ],
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 50, "output_tokens": 25}
@@ -1118,7 +1118,7 @@ mod tests {
             "I'll use a tool".to_string(),
             vec![ToolCall {
                 id: "abc".to_string(),
-                name: "write_file".to_string(),
+                name: "Write".to_string(),
                 arguments: serde_json::json!({"path": "a", "contents": "b"}),
             }],
         );
@@ -1126,7 +1126,7 @@ mod tests {
         assert_eq!(v["role"], "assistant");
         let content = &v["content"][0];
         assert_eq!(content["type"], "tool_use");
-        assert_eq!(content["name"], "write_file");
+        assert_eq!(content["name"], "Write");
     }
 
     #[test]
@@ -1271,7 +1271,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
 
-            let body = r#"{"type":"message","content":[{"type":"tool_use","id":"call_abc123","name":"read_file","input":{"path":"src/lib.rs"}}],"stop_reason":"tool_use","usage":{"input_tokens":50,"output_tokens":30}}"#;
+            let body = r#"{"type":"message","content":[{"type":"tool_use","id":"call_abc123","name":"Read","input":{"path":"src/lib.rs"}}],"stop_reason":"tool_use","usage":{"input_tokens":50,"output_tokens":30}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -1295,7 +1295,7 @@ mod tests {
         assert_eq!(completion.tool_calls.len(), 1);
         let tc = &completion.tool_calls[0];
         assert_eq!(tc.id, "call_abc123");
-        assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.name, "Read");
         assert_eq!(tc.arguments["path"], "src/lib.rs");
     }
 
@@ -1416,7 +1416,7 @@ event: message_start
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}
 
 event: content_block_start
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_abc123\",\"name\":\"read_file\",\"input\":{}}}
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_abc123\",\"name\":\"Read\",\"input\":{}}}
 
 event: content_block_delta
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"src/\"}}
@@ -1451,7 +1451,7 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(completion.tool_calls.len(), 1);
         let tc = &completion.tool_calls[0];
         assert_eq!(tc.id, "call_abc123");
-        assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.name, "Read");
         assert_eq!(tc.arguments["path"], "src/lib.rs");
         assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
     }
@@ -1602,7 +1602,7 @@ data: {\"type\":\"message_stop\"}
     fn build_request_with_partition_marks_deferred_tools() {
         let eager = vec![(
             ToolSpec {
-                name: "read_file".to_string(),
+                name: "Read".to_string(),
                 description: "Read a file".to_string(),
                 parameters: json!({"type": "object"}),
             },
@@ -1631,7 +1631,7 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(tools.len(), 2);
         // Eager has no `defer_loading` key.
         assert!(tools[0].get("defer_loading").is_none());
-        assert_eq!(tools[0]["name"], "read_file");
+        assert_eq!(tools[0]["name"], "Read");
         // Deferred has `defer_loading: true`.
         assert_eq!(tools[1]["defer_loading"], true);
         assert_eq!(tools[1]["name"], "notebook_edit");
@@ -1696,9 +1696,9 @@ data: {\"type\":\"message_stop\"}
     async fn complete_with_search_round_trips_tool_reference() {
         // Mock server that:
         //   - On request 1, returns a `ToolSearchTool` tool_use.
-        //   - On request 2, returns a real `read_file` tool_use.
+        //   - On request 2, returns a real `notebook_edit` tool_use.
         // The test asserts:
-        //   - The final Completion is the `read_file` call.
+        //   - The final Completion is the `notebook_edit` call.
         //   - The first request's body has ToolSearchTool + a
         //     deferred tool marked `defer_loading: true`.
         //   - The second request's body has the `tool_result`
@@ -1761,11 +1761,11 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
 
-        // Pretend "read_file" is eager (always available) and
+        // Pretend "Read" is eager (always available) and
         // "notebook_edit" is deferred (needs ToolSearchTool).
         let eager = vec![(
             ToolSpec {
-                name: "read_file".to_string(),
+                name: "Read".to_string(),
                 description: "Read a UTF-8 text file under the workspace.".to_string(),
                 parameters: json!({"type": "object"}),
             },
@@ -1792,7 +1792,7 @@ data: {\"type\":\"message_stop\"}
             captured_bodies.len()
         );
 
-        // First request: ToolSearchTool + read_file (eager),
+        // First request: ToolSearchTool + Read (eager),
         // notebook_edit (deferred).
         let body1: serde_json::Value = serde_json::from_str(&captured_bodies[0]).unwrap();
         let tools1 = body1["tools"].as_array().expect("tools should be array");
@@ -1806,8 +1806,8 @@ data: {\"type\":\"message_stop\"}
             tool_names
         );
         assert!(
-            tool_names.contains(&"read_file"),
-            "missing read_file in {:?}",
+            tool_names.contains(&"Read"),
+            "missing Read in {:?}",
             tool_names
         );
         assert!(

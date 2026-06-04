@@ -52,7 +52,7 @@ fn write_file_call(id: &str, path: &str, contents: &str) -> Completion {
         content: format!("writing {path}"),
         tool_calls: vec![ToolCall {
             id: id.into(),
-            name: "write_file".into(),
+            name: "Write".into(),
             arguments: json!({"path": path, "contents": contents}),
         }],
         finish_reason: Some("tool_calls".into()),
