@@ -172,7 +172,7 @@ impl Tool for SubAgent {
                     },
                     "max_steps": {
                         "type": "integer",
-                        "description": "Maximum steps for the sub-agent (default 30, capped at parent's remaining budget)",
+                        "description": "Maximum steps for the sub-agent (default 30, clamped to 1–100)",
                         "default": 30
                     },
                     "tools": {
