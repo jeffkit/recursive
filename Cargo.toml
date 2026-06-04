@@ -23,11 +23,12 @@ exclude = [".dev/", "journal/", "goals/"]
 default-run = "recursive"
 
 [features]
-default = ["cli", "mcp", "web_fetch", "anthropic", "http", "tui"]
+default = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "tui"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:anyhow"]
 test-utils = ["dep:tempfile"]
 mcp = ["dep:futures-util"]
 web_fetch = []
+web_search = []
 anthropic = []
 http = ["dep:axum", "dep:tower-http", "dep:tokio-stream", "dep:futures-util", "dep:jsonwebtoken", "dep:agui-protocol"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:syntect", "dep:pulldown-cmark"]
