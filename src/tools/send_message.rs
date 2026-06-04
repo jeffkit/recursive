@@ -210,6 +210,60 @@ impl Tool for SendMessageTool {
 }
 
 // ---------------------------------------------------------------------------
+// ListWorkers
+// ---------------------------------------------------------------------------
+
+/// List all currently active workers registered in the `WorkerRegistry`.
+///
+/// Workers spawned via `spawn_workers_parallel` can use this to discover
+/// peer worker IDs and then call `send_message` to communicate with them.
+pub struct ListWorkersTool {
+    registry: WorkerRegistry,
+}
+
+impl ListWorkersTool {
+    pub fn new(registry: WorkerRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for ListWorkersTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_workers".into(),
+            description: concat!(
+                "List all currently active worker IDs in this parallel batch. ",
+                "Use this to discover peer workers you can communicate with via send_message."
+            )
+            .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        }
+    }
+
+    fn side_effect_class(&self) -> ToolSideEffect {
+        ToolSideEffect::ReadOnly
+    }
+
+    async fn execute(&self, _arguments: Value) -> Result<String> {
+        let mut workers = self.registry.active_workers().await;
+        if workers.is_empty() {
+            Ok("No active workers currently registered.".to_string())
+        } else {
+            workers.sort_unstable();
+            Ok(format!(
+                "Active workers ({}):\n{}",
+                workers.len(),
+                workers.join("\n")
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
