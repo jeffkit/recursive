@@ -91,6 +91,48 @@ const result = await run.wait();
 console.log(`\n完成，共 ${result.numTurns} 轮`);
 ```
 
+## 会话选项（`AgentOptions`）
+
+传递给 `Agent.create()`、`Agent.resume()` 和 `Agent.prompt()` 的选项对象：
+
+```typescript
+interface AgentOptions {
+  baseUrl?: string;            // 默认: RECURSIVE_BASE_URL 或 http://127.0.0.1:3000
+  apiKey?: string;             // 默认: RECURSIVE_API_KEY 环境变量
+  timeout?: number;            // 毫秒，默认 120_000
+  systemPrompt?: string;       // 完全替换服务器的默认系统提示词
+  appendSystemPrompt?: string; // 在默认提示词后追加（设置了 systemPrompt 时忽略）
+  sessionName?: string;        // 会话可读显示名
+  maxSteps?: number;           // 最大步数
+  planningMode?: "immediate" | "plan_first"; // 默认: "immediate"
+  thinkingBudget?: number;     // 扩展思考 token 预算；0 = 禁用
+  permissionMode?: "default" | "auto" | "strict" | "bypass";
+  maxBudgetUsd?: number;       // 最大 API 花费（美元）
+}
+```
+
+示例 — Plan Mode + 命名会话：
+
+```typescript
+await using agent = await Agent.create({
+  baseUrl: "http://localhost:3000",
+  sessionName: "refactor-auth",
+  planningMode: "plan_first",
+  maxSteps: 20,
+});
+const run = await agent.send("重构认证模块，改用 JWT");
+await run.wait();
+```
+
+示例 — 在默认提示词后追加额外指令：
+
+```typescript
+const result = await Agent.prompt("修复所有失败的测试", {
+  baseUrl: "http://localhost:3000",
+  appendSystemPrompt: "\n完成前务必运行 cargo test 验证。",
+});
+```
+
 ## API 参考
 
 ### `Agent`（静态方法）

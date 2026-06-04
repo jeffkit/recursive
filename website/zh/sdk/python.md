@@ -81,6 +81,44 @@ with Agent.create(base_url="http://127.0.0.1:3000") as agent:
     print(f"\n完成，共 {result.num_turns} 轮")
 ```
 
+## 会话选项
+
+`Agent.create()` 和 `Agent.prompt()` 都接受以下可选关键字参数（除 `base_url`、`api_key`、`timeout` 外）：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `system_prompt` | `str` | 完全替换服务器的默认系统提示词。 |
+| `append_system_prompt` | `str` | 在默认系统提示词后追加内容（设置了 `system_prompt` 时忽略）。 |
+| `session_name` | `str` | 会话的可读显示名（仅 `create`）。 |
+| `max_steps` | `int` | 最大步数限制。 |
+| `planning_mode` | `"immediate"` \| `"plan_first"` | `"plan_first"` 模式会先缓冲工具调用并展示计划，确认后再执行。 |
+| `thinking_budget` | `int` | 扩展思考 token 预算（Anthropic 模型）。填 `0` 禁用。 |
+| `permission_mode` | `"default"` \| `"auto"` \| `"strict"` \| `"bypass"` | 工具调用权限控制级别。 |
+| `max_budget_usd` | `float` | 本次会话/运行的最大 API 花费（美元）。 |
+
+示例 — 使用 Plan Mode 并命名会话：
+
+```python
+with Agent.create(
+    base_url="http://localhost:3000",
+    session_name="refactor-auth",
+    planning_mode="plan_first",
+    max_steps=20,
+) as agent:
+    run = agent.send("重构认证模块，改用 JWT")
+    run.wait()
+```
+
+示例 — 在默认提示词后追加额外指令：
+
+```python
+result = Agent.prompt(
+    "修复所有失败的测试",
+    base_url="http://localhost:3000",
+    append_system_prompt="\n完成前务必运行 cargo test 验证。",
+)
+```
+
 ## API 参考
 
 ### `Agent`（静态方法）
