@@ -67,7 +67,8 @@ impl RetryPolicy {
         if attempt >= self.max_retries {
             return None;
         }
-        let is_transient = is_network_error || status.is_some_and(|s| (500..600).contains(&s));
+        let is_transient =
+            is_network_error || status.is_some_and(|s| s == 429 || (500..600).contains(&s));
         if !is_transient {
             return None;
         }

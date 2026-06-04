@@ -16,9 +16,13 @@ use tracing::{debug, warn};
 const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay for exponential back-off on LLM retries (milliseconds).
 const LLM_RETRY_BASE_MS: u64 = 1_000;
+/// Sentinel returned in the tool-result string when the permission denial
+/// limit is exceeded.  Matches the check in `run_inner` that breaks the
+/// ReAct loop.  Defined as a constant to avoid scattered string literals.
+pub(crate) const DENIAL_LIMIT_SENTINEL: &str = "ERROR_DENIAL_LIMIT:";
 
 use crate::compact::Compactor;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
 use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
@@ -392,7 +396,7 @@ impl<'a> RunCore<'a> {
                         let result = match dispatch.result {
                             Ok(output) => output,
                             Err(crate::error::Error::PermissionDeniedLimit { .. }) => {
-                                "ERROR_DENIAL_LIMIT:".to_string()
+                                DENIAL_LIMIT_SENTINEL.to_string()
                             }
                             Err(err) => format!("ERROR: {err}"),
                         };
@@ -424,6 +428,18 @@ impl<'a> RunCore<'a> {
                         .iter()
                         .find(|(id, _, _, _, _, _)| id == &pc.id)
                     else {
+                        // Task panicked — push a placeholder error result so
+                        // the tool-call ↔ tool-result pairing invariant (#8)
+                        // is preserved. Without this, the next LLM request
+                        // would include an orphaned tool_call with no matching
+                        // tool result and be rejected with HTTP 400.
+                        results.push((
+                            pc.id.clone(),
+                            pc.name.clone(),
+                            "ERROR: tool task panicked during parallel execution".to_string(),
+                            pc.args.clone(),
+                            None,
+                        ));
                         continue;
                     };
                     results.push((
@@ -450,7 +466,7 @@ impl<'a> RunCore<'a> {
                 let result = match dispatch.result {
                     Ok(output) => output,
                     Err(crate::error::Error::PermissionDeniedLimit { .. }) => {
-                        "ERROR_DENIAL_LIMIT:".to_string()
+                        DENIAL_LIMIT_SENTINEL.to_string()
                     }
                     Err(err) => format!("ERROR: {err}"),
                 };
@@ -593,7 +609,7 @@ impl<'a> RunCore<'a> {
                 if let Some(calls) = self.plan_buffer.take() {
                     let results = self.execute_tool_calls(&calls).await;
                     for (id, name, output, _args, _audit) in results {
-                        if output == "ERROR_DENIAL_LIMIT:" {
+                        if output == DENIAL_LIMIT_SENTINEL {
                             let finish = FinishReason::PermissionDenialLimit;
                             self.emit(AgentEvent::TurnFinished {
                                 reason: finish_reason_str(&finish),
@@ -611,11 +627,14 @@ impl<'a> RunCore<'a> {
                                 tool_audits,
                             });
                         }
+                        let is_error =
+                            output.starts_with("ERROR: ") || output == DENIAL_LIMIT_SENTINEL;
                         self.emit(AgentEvent::ToolResult {
                             id: id.clone(),
                             name: name.clone(),
                             output: output.clone(),
                             step,
+                            is_error,
                         });
                         self.push_message(Message::tool_result(id, output));
                     }
@@ -684,15 +703,6 @@ impl<'a> RunCore<'a> {
 
             // ---- no tool calls → finish -------------------------------------------
             if completion.tool_calls.is_empty() {
-                if matches!(completion.finish_reason.as_deref(), Some("length")) {
-                    let finish = FinishReason::ProviderStop("length".into());
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: step,
-                    });
-                    return Err(Error::ProviderTruncated("length".into()));
-                }
-
                 self.push_message(Message::assistant(completion.content.clone()));
                 if completion.reasoning_content.is_some() {
                     if let Some(msg) = self.messages.last_mut() {
@@ -800,7 +810,7 @@ impl<'a> RunCore<'a> {
 
             for (id, name, result, args, audit) in &results {
                 // B1 fix: auto-classifier denial limit — stop the agent immediately.
-                if result == "ERROR_DENIAL_LIMIT:" {
+                if result == DENIAL_LIMIT_SENTINEL {
                     let finish = FinishReason::PermissionDenialLimit;
                     self.emit(AgentEvent::TurnFinished {
                         reason: finish_reason_str(&finish),
@@ -819,11 +829,13 @@ impl<'a> RunCore<'a> {
                     });
                 }
 
+                let is_error = result.starts_with("ERROR: ") || result == DENIAL_LIMIT_SENTINEL;
                 self.emit(AgentEvent::ToolResult {
                     id: id.clone(),
                     name: name.clone(),
                     output: result.clone(),
                     step,
+                    is_error,
                 });
                 // Goal-153: accumulate audit keyed by tool_call_id.
                 if let Some(a) = audit {

@@ -134,7 +134,14 @@ pub fn hash_tool_specs(specs: &[ToolSpec]) -> String {
         });
         map.insert(spec.name.clone(), value);
     }
-    let canonical = serde_json::to_string(&map).unwrap_or_default();
+    // BTreeMap<String, serde_json::Value> is always serializable; the error
+    // branch is unreachable in practice. If it is somehow reached, log it and
+    // return a sentinel that callers can detect and handle explicitly rather
+    // than silently comparing equal to every other hash.
+    let canonical = serde_json::to_string(&map).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "hash_tool_specs: unreachable serialization failure — drift detection may be compromised");
+        String::new()
+    });
     let hash = blake3::hash(canonical.as_bytes());
     hash.to_hex().to_string()
 }

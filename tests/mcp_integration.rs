@@ -47,6 +47,7 @@ fn server() -> &'static McpServer {
                 dir.to_string_lossy().into(),
             ],
             url: None,
+            env: None,
         }
     })
 }
