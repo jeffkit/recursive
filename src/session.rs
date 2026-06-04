@@ -716,6 +716,14 @@ impl SessionWriter {
             let prompt: String = msg.content.chars().take(200).collect();
             if self.first_prompt.is_none() {
                 self.first_prompt = Some(prompt.clone());
+                // Auto-populate `name` from the first user message when no
+                // explicit --name was set.  Truncate to 60 visible chars so
+                // the session list stays readable.  `name` can be overridden
+                // later with `SessionWriter::set_name`.
+                if self.name.is_none() {
+                    let title: String = prompt.chars().take(60).collect();
+                    self.name = Some(title);
+                }
             }
             self.last_prompt = Some(prompt);
         }
@@ -809,6 +817,11 @@ impl SessionWriter {
         }
         if self.last_prompt.is_some() {
             meta.last_prompt = self.last_prompt.clone();
+        }
+        // Persist auto-generated or explicitly set display name on every bump
+        // so the session list shows the title as soon as the first message lands.
+        if self.name.is_some() && meta.name.is_none() {
+            meta.name = self.name.clone();
         }
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1890,6 +1903,75 @@ mod tests {
         assert!(
             !raw.contains("\"preset\""),
             "preset key should be absent when None, got: {raw}"
+        );
+    }
+
+    /// `name` is auto-filled from the first user prompt when no explicit
+    /// `--name` was supplied.
+    #[test]
+    fn session_name_autofills_from_first_prompt() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+
+        // No --name set; name should be None before any message.
+        assert!(writer.name.is_none());
+
+        // After the first user message the writer should have auto-populated name.
+        writer
+            .append(&Message::user("hello world".to_string()), None, None)
+            .unwrap();
+        assert_eq!(writer.name.as_deref(), Some("hello world"));
+
+        writer.finish("completed").unwrap();
+
+        // name should be persisted in meta.json.
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.name.as_deref(), Some("hello world"));
+    }
+
+    /// When --name is set explicitly, auto-fill must NOT overwrite it.
+    #[test]
+    fn explicit_name_not_overwritten_by_autofill() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
+        writer.set_name("my custom name".to_string());
+        let session_dir = writer.session_dir().to_path_buf();
+
+        writer
+            .append(&Message::user("hello world".to_string()), None, None)
+            .unwrap();
+        // Auto-fill should not replace the explicitly set name.
+        assert_eq!(writer.name.as_deref(), Some("my custom name"));
+
+        writer.finish("completed").unwrap();
+
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.name.as_deref(), Some("my custom name"));
+    }
+
+    /// Long prompts are truncated to 60 visible chars in the auto-filled name.
+    #[test]
+    fn autofill_name_truncates_long_prompt() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let long_prompt = "a".repeat(100);
+        let mut writer = SessionWriter::create(ws, "test goal", "gpt-4o", "openai").unwrap();
+        writer
+            .append(&Message::user(long_prompt.clone()), None, None)
+            .unwrap();
+        writer.finish("completed").unwrap();
+
+        let session_dir = writer.session_dir().to_path_buf();
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(
+            meta.name.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") // 60 'a's
         );
     }
 
