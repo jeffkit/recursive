@@ -139,16 +139,21 @@ fn print_startup_banner(workspace: &std::path::Path) {
     if let Ok(sorted) = crate::session::SessionReader::list_sessions_sorted_by_updated_at(workspace)
     {
         // list_sessions_sorted_by_updated_at returns newest first.
+        // Show all sessions (TUI, CLI, self-improve) with display priority:
+        // name > last_prompt > goal.
         for (_, meta) in sorted.iter().take(5) {
-            if let Some(ref prompt) = meta.last_prompt {
-                let short: String = prompt.chars().take(max_prompt_chars).collect();
-                let ellipsis = if prompt.chars().count() > max_prompt_chars {
-                    "…"
-                } else {
-                    ""
-                };
-                session_lines.push(format!("{DARK_GRAY}  › {short}{ellipsis}{RESET}"));
-            }
+            let label = meta
+                .name
+                .as_deref()
+                .or(meta.last_prompt.as_deref())
+                .unwrap_or(meta.goal.as_str());
+            let short: String = label.chars().take(max_prompt_chars).collect();
+            let ellipsis = if label.chars().count() > max_prompt_chars {
+                "…"
+            } else {
+                ""
+            };
+            session_lines.push(format!("{DARK_GRAY}  › {short}{ellipsis}{RESET}"));
         }
     }
 
