@@ -248,7 +248,7 @@ mod http_tests {
         assert!(resp["finish_reason"]
             .as_str()
             .unwrap()
-            .contains("NoMoreToolCalls"));
+            .contains("no_more_tool_calls"));
         assert!(resp["messages"].is_array());
         assert!(!resp["messages"].as_array().unwrap().is_empty());
         assert_eq!(resp["usage"]["total_steps"], 1);
@@ -491,7 +491,7 @@ mod http_tests {
         assert!(resp["finish_reason"]
             .as_str()
             .unwrap()
-            .contains("BudgetExceeded"));
+            .contains("budget_exceeded"));
         assert_eq!(resp["usage"]["total_steps"], 2);
     }
 
