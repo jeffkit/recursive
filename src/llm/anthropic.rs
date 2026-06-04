@@ -715,7 +715,7 @@ fn build_request(
         req["system"] = Value::String(sys.to_string());
     }
 
-    let msgs: Vec<Value> = messages.iter().map(serialize_message).collect();
+    let msgs: Vec<Value> = serialize_messages_anthropic(messages);
     req["messages"] = Value::Array(msgs);
 
     if !tools.is_empty() {
@@ -768,7 +768,7 @@ fn build_request_with_partition(
         req["system"] = Value::String(sys.to_string());
     }
 
-    let mut msgs: Vec<Value> = messages.iter().map(serialize_message).collect();
+    let mut msgs: Vec<Value> = serialize_messages_anthropic(messages);
     if let Some((id, names)) = pending_tool_result {
         if let Some(last) = msgs.last_mut() {
             // Replace the last (marker) message with a proper
@@ -875,6 +875,51 @@ fn serialize_message(m: &Message) -> Value {
             "content": m.content,
         })
     }
+}
+
+/// Serialize a slice of messages for the Anthropic API, merging consecutive
+/// tool-result messages into a single user message with multiple `tool_result`
+/// content blocks.
+///
+/// Anthropic requires that when an assistant message contains multiple `tool_use`
+/// blocks, the immediately following user message must contain ALL corresponding
+/// `tool_result` blocks in a single message. Sending them as separate messages
+/// causes HTTP 400 "tool_use ids were found without tool_result blocks".
+fn serialize_messages_anthropic(messages: &[Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        // Check if this is a tool result message (Role::Tool or has tool_call_id)
+        if m.tool_call_id.is_some() || m.role == Role::Tool {
+            // Collect all consecutive tool result messages into one user message
+            let mut blocks: Vec<Value> = Vec::new();
+            while i < messages.len() {
+                let tm = &messages[i];
+                if tm.tool_call_id.is_none() && tm.role != Role::Tool {
+                    break;
+                }
+                if let Some(id) = &tm.tool_call_id {
+                    blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "content": tm.content,
+                    }));
+                }
+                i += 1;
+            }
+            if !blocks.is_empty() {
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": blocks,
+                }));
+            }
+        } else {
+            out.push(serialize_message(m));
+            i += 1;
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
