@@ -208,7 +208,7 @@ pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, R
 pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
-pub use send_message::{SendMessageTool, WorkerMailbox, WorkerRegistry};
+pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
 pub use spawn_worker::{SpawnWorkerTool, WorkerType};
 pub use spawn_workers_parallel::SpawnWorkersParallel;
