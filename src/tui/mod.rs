@@ -20,7 +20,7 @@ pub use model::{AppScreen, DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
 use std::io::{self, Write as _};
 use std::time::Duration;
 
-use unicode_width::UnicodeWidthStr as _;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -44,57 +44,139 @@ const INLINE_HEIGHT_NORMAL: u16 = 10;
 /// When the modal closes the viewport shrinks back to `INLINE_HEIGHT_NORMAL`.
 const INLINE_HEIGHT_EXPANDED: u16 = 40;
 
-/// Print the compact logo, version, model, and recent sessions to
-/// stdout before the inline TUI viewport starts. Styled after the
-/// fake-cc welcome screen: a small 3-line logo, a dot-separator, and
-/// a brief session list — all flowing into the terminal's scrollback
-/// so they remain readable above the interactive area.
+/// Strip ANSI escape sequences from a string and return the visible character count.
+fn visible_len(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_escape = false;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_escape {
+            if ch == 'm'
+                || ch == 'K'
+                || ch == 'H'
+                || ch == 'J'
+                || ch == 'A'
+                || ch == 'B'
+                || ch == 'C'
+                || ch == 'D'
+                || ch == 'G'
+            {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            in_escape = true;
+        } else {
+            count += ch.width().unwrap_or(1);
+        }
+    }
+    count
+}
+
+/// Pad a styled string (which may contain ANSI codes) to `width` visible columns.
+fn pad_to(s: &str, width: usize, reset: &str) -> String {
+    let vlen = visible_len(s);
+    if vlen >= width {
+        s.to_string()
+    } else {
+        format!("{s}{reset}{}", " ".repeat(width - vlen))
+    }
+}
+
+/// Print the startup banner in Claude Code style: two-column layout.
+///
+/// Left column  — logo (3 lines), version · model, workspace path.
+/// Right column — "Recent sessions" header + newest-first session list.
+///
+/// Both columns flow into the terminal's native scrollback so they
+/// remain readable above the interactive inline viewport.
 fn print_startup_banner(workspace: &std::path::Path) {
     const CYAN: &str = "\x1b[36m";
     const BOLD: &str = "\x1b[1m";
     const DARK_GRAY: &str = "\x1b[90m";
     const DIM: &str = "\x1b[2m";
+    const WHITE: &str = "\x1b[97m";
     const RESET: &str = "\x1b[0m";
 
-    // 3-line compact logo (fits in ~48 cols)
-    println!("{CYAN}{BOLD}╦═╗╔═╗╔═╗╦ ╦╦═╗╔═╗╦╦  ╦╔═╗{RESET}");
-    println!("{CYAN}{BOLD}╠╦╝║╣ ║  ║ ║╠╦╝╚═╗║╚╗╔╝║╣ {RESET}");
-    println!("{CYAN}{BOLD}╩╚═╚═╝╚═╝╚═╝╩╚═╚═╝╩ ╚╝ ╚═╝{RESET}");
+    let term_width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(100)
+        .max(60);
 
-    // Version + model on one line (fake-cc style).
-    // Use the same detection logic as the status bar so the value is always real.
+    // Left column gets ~46% of the terminal width (logo is 28 chars wide + indent)
+    let left_col = (term_width * 46 / 100).clamp(36, 52);
+    // Separator is 1 char, right column takes the rest.
+    let right_col = term_width.saturating_sub(left_col + 1);
+
+    // ── Left column lines ─────────────────────────────────────────────
     let model = crate::tui::cost::detect_model_name();
-    println!("{DIM}  v{}  ·  {model}{RESET}", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION");
 
-    // Dot separator (fake-cc style)
-    println!("{DARK_GRAY}  ……………………………………………………………………………………………………{RESET}");
+    let ws_str = workspace.display().to_string();
+    let home_str = dirs::home_dir()
+        .map(|h| h.display().to_string())
+        .unwrap_or_default();
+    let ws_display = if !home_str.is_empty() && ws_str.starts_with(&home_str) {
+        format!("~{}", &ws_str[home_str.len()..])
+    } else {
+        ws_str
+    };
 
-    // Recent user-initiated sessions — show newest first, skip self-improve runs
-    // (those have a `goal` but no `last_prompt`; TUI sessions set `last_prompt`).
-    let mut shown = 0;
-    if let Ok(mut sessions) = crate::session::SessionReader::list_sessions(workspace) {
-        // list_sessions returns alphabetical (oldest first); reverse for newest first.
-        sessions.reverse();
-        for dir in &sessions {
-            if shown >= 3 {
-                break;
-            }
-            if let Ok(meta) = crate::session::SessionReader::load_meta(dir) {
-                // Only show sessions that have a human prompt (not internal goal runs)
-                if let Some(ref prompt) = meta.last_prompt {
-                    let short: String = prompt.chars().take(60).collect();
-                    let ellipsis = if prompt.chars().count() > 60 {
-                        "…"
-                    } else {
-                        ""
-                    };
-                    println!("{DARK_GRAY}  › {short}{ellipsis}{RESET}");
-                    shown += 1;
-                }
+    let left_lines: Vec<String> = vec![
+        format!("{CYAN}{BOLD}╦═╗╔═╗╔═╗╦ ╦╦═╗╔═╗╦╦  ╦╔═╗{RESET}"),
+        format!("{CYAN}{BOLD}╠╦╝║╣ ║  ║ ║╠╦╝╚═╗║╚╗╔╝║╣ {RESET}"),
+        format!("{CYAN}{BOLD}╩╚═╚═╝╚═╝╚═╝╩╚═╚═╝╩ ╚╝ ╚═╝{RESET}"),
+        String::new(),
+        format!("{DIM}  v{version}  ·  {model}{RESET}"),
+        format!("{DARK_GRAY}  {ws_display}{RESET}"),
+    ];
+
+    // ── Right column lines ────────────────────────────────────────────
+    let max_prompt_chars = right_col.saturating_sub(4); // "  › " = 4 chars
+
+    let mut session_lines: Vec<String> = Vec::new();
+    // Use sorted-by-updated_at so we get real recency ordering.
+    if let Ok(sorted) = crate::session::SessionReader::list_sessions_sorted_by_updated_at(workspace)
+    {
+        // list_sessions_sorted_by_updated_at returns newest first.
+        for (_, meta) in sorted.iter().take(5) {
+            if let Some(ref prompt) = meta.last_prompt {
+                let short: String = prompt.chars().take(max_prompt_chars).collect();
+                let ellipsis = if prompt.chars().count() > max_prompt_chars {
+                    "…"
+                } else {
+                    ""
+                };
+                session_lines.push(format!("{DARK_GRAY}  › {short}{ellipsis}{RESET}"));
             }
         }
     }
 
+    let mut right_lines: Vec<String> = vec![format!("{WHITE}{BOLD}Recent sessions{RESET}")];
+    if session_lines.is_empty() {
+        right_lines.push(format!("{DARK_GRAY}  No recent sessions{RESET}"));
+    } else {
+        right_lines.extend(session_lines);
+    }
+
+    // ── Render side-by-side ───────────────────────────────────────────
+    let num_rows = left_lines.len().max(right_lines.len());
+    let sep = format!("{DARK_GRAY}│{RESET}");
+
+    for i in 0..num_rows {
+        let left = left_lines.get(i).map(String::as_str).unwrap_or("");
+        let right = right_lines.get(i).map(String::as_str).unwrap_or("");
+
+        // Pad left to `left_col` visible columns then append separator and right.
+        let padded = pad_to(left, left_col, RESET);
+        if right.is_empty() {
+            println!("{padded}");
+        } else {
+            println!("{padded}{sep} {right}");
+        }
+    }
+
+    // Add a blank line before the TUI viewport starts.
     println!();
     let _ = io::stdout().flush();
 }
