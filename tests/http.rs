@@ -2055,6 +2055,7 @@ mod http_tests {
             runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
             plan_approval_gate: gate,
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         state
             .sessions
