@@ -325,6 +325,15 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
             INLINE_HEIGHT_NORMAL
         };
         if desired_height != current_inline_height {
+            if desired_height < current_inline_height {
+                // When shrinking the viewport (e.g. after a modal is dismissed),
+                // render a blank frame with the expanded terminal first.  This
+                // overwrites the stale modal content so it does not remain
+                // visible above the new smaller inline viewport.
+                terminal.draw(|frame| {
+                    frame.render_widget(ratatui::widgets::Clear, frame.area());
+                })?;
+            }
             terminal = make_inline_terminal(desired_height)?;
             current_inline_height = desired_height;
         }
