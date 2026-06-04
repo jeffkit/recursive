@@ -123,9 +123,13 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
             arguments,
         }),
         AgentEvent::ToolResult {
-            id, name, output, ..
+            id,
+            name,
+            output,
+            is_error,
+            ..
         } => {
-            let success = !output.starts_with("ERROR: ");
+            let success = !is_error;
             Some(UiEvent::ToolResult {
                 id,
                 name,
@@ -774,6 +778,7 @@ mod tests {
             name: "read_file".into(),
             output: "ERROR: missing".into(),
             step: 0,
+            is_error: true,
         };
         let mapped = map_agent_event(ev).unwrap();
         match mapped {

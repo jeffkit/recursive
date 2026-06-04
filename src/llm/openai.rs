@@ -898,11 +898,12 @@ data: [DONE]\n\n";
     #[test]
     fn policy_does_not_retry_4xx() {
         let policy = RetryPolicy::default();
-        // 4xx errors should not be retried
+        // Non-rate-limit 4xx errors should not be retried
         assert_eq!(policy.backoff_for(0, Some(400), false), None);
         assert_eq!(policy.backoff_for(0, Some(401), false), None);
         assert_eq!(policy.backoff_for(0, Some(404), false), None);
-        assert_eq!(policy.backoff_for(0, Some(429), false), None);
+        // 429 (rate limit) IS retried with backoff
+        assert!(policy.backoff_for(0, Some(429), false).is_some());
     }
 
     #[test]

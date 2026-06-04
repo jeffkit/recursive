@@ -108,8 +108,14 @@ impl Tool for RunShell {
             message: format!("spawn failed: {e}"),
         })?;
 
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout = child.stdout.take().ok_or_else(|| Error::Tool {
+            name: "run_shell".into(),
+            message: "stdout was not piped".into(),
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| Error::Tool {
+            name: "run_shell".into(),
+            message: "stderr was not piped".into(),
+        })?;
 
         let max = self.max_output_bytes;
         let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });

@@ -402,6 +402,7 @@ mod tests {
             command: String::new(),
             args: vec![],
             url: Some("http://localhost:8080/sse".into()),
+            env: None,
         };
         // The McpClient::spawn method checks server.url.is_some()
         // to decide transport. We verify the config is wired correctly.
@@ -417,6 +418,7 @@ mod tests {
             command: "echo".into(),
             args: vec!["hello".into()],
             url: None,
+            env: None,
         };
         assert!(!server.command.is_empty());
         assert!(server.url.is_none());

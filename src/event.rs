@@ -43,6 +43,11 @@ pub enum AgentEvent {
         name: String,
         output: String,
         step: usize,
+        /// `true` if the tool execution produced an error (output begins with
+        /// `"ERROR: "` or was a permission denial). UI consumers should use
+        /// this field instead of inspecting the `output` string prefix.
+        #[serde(default)]
+        is_error: bool,
     },
     /// Token usage statistics from the LLM provider.
     Usage {
@@ -413,6 +418,7 @@ mod tests {
                 name: "foo".into(),
                 output: "ok".into(),
                 step: 3,
+                is_error: false,
             },
             AgentEvent::Usage {
                 input_tokens: 10,
