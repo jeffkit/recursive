@@ -107,11 +107,30 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+        // provider_type must be resolved before api_base so we can pick the
+        // correct endpoint for dual-protocol presets (e.g. DeepSeek supports
+        // both OpenAI-compatible /v1 and Anthropic Messages API endpoints).
+        let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
+            .ok()
+            .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
+            .or_else(|| preset.map(|p| p.provider_type.clone()))
+            .unwrap_or_else(|| "anthropic".into());
+
+        // When the user requests the Anthropic protocol and the preset has a
+        // dedicated Anthropic endpoint, prefer that over the default api_base.
+        let preset_api_base = preset.map(|p| {
+            if provider_type == "anthropic" {
+                p.anthropic_api_base.as_deref().unwrap_or(&p.api_base).to_string()
+            } else {
+                p.api_base.clone()
+            }
+        });
+
         let api_base = std::env::var("RECURSIVE_API_BASE")
             .or_else(|_| std::env::var("OPENAI_API_BASE"))
             .ok()
             .or_else(|| file_provider.and_then(|p| p.api_base.clone()))
-            .or_else(|| preset.map(|p| p.api_base.clone()))
+            .or(preset_api_base)
             .unwrap_or_else(|| "https://api.anthropic.com".into());
 
         // api_key chain: generic env (above file) → file explicit → preset's
@@ -174,12 +193,6 @@ impl Config {
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-
-        let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
-            .ok()
-            .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
-            .or_else(|| preset.map(|p| p.provider_type.clone()))
-            .unwrap_or_else(|| "anthropic".into());
 
         let memory_summary_limit = std::env::var("RECURSIVE_MEMORY_SUMMARY_LIMIT")
             .ok()

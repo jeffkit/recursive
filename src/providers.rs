@@ -27,6 +27,11 @@ pub struct ProviderPreset {
     pub name: String,
     pub provider_type: String,
     pub api_base: String,
+    /// Optional Anthropic-protocol base URL for providers that support both
+    /// OpenAI-compatible and Anthropic Messages API formats (e.g. DeepSeek,
+    /// MiniMax). When set and the user selects `provider_type = "anthropic"`,
+    /// `Config::from_env` uses this URL instead of `api_base`.
+    pub anthropic_api_base: Option<String>,
     pub default_model: String,
     pub models: Vec<ModelSpec>,
     pub mainland_accessible: bool,
