@@ -63,6 +63,18 @@ pub struct McpServer {
     pub env: Option<HashMap<String, String>>,
 }
 
+impl From<(String, McpServerConfig)> for McpServer {
+    fn from((name, config): (String, McpServerConfig)) -> Self {
+        Self {
+            name,
+            command: config.command,
+            args: config.args,
+            url: config.url,
+            env: config.env,
+        }
+    }
+}
+
 /// Optional 2025-03-26 MCP tool annotations that carry hints about
 /// the tool's side-effects. All fields default to `false` / `None`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1515,13 +1527,7 @@ async fn load_mcp_discovery_config(path: &Path) -> Result<Vec<McpServer>> {
     let servers: Vec<McpServer> = parsed
         .mcp_servers
         .into_iter()
-        .map(|(name, config)| McpServer {
-            name,
-            command: config.command,
-            args: config.args,
-            url: config.url,
-            env: config.env,
-        })
+        .map(McpServer::from)
         .collect();
 
     Ok(servers)

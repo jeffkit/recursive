@@ -49,9 +49,23 @@ pub struct Config {
     /// If non-empty, only tools whose names appear in this list are registered.
     /// Set via `--allow-tools` CLI flag or `RECURSIVE_ALLOW_TOOLS` env var.
     pub allow_tools: Vec<String>,
+    /// Override the detected context window size for the configured model.
+    /// When set, `context_window_tokens()` returns this value instead of the
+    /// value from providers.toml. Useful for custom deployments where the
+    /// actual context window differs from the preset default.
+    pub context_window_override: Option<usize>,
 }
 
 impl Config {
+    /// Return the effective context window size for the configured model.
+    ///
+    /// Prefers `context_window_override` when set; otherwise falls back to the
+    /// value from the bundled `providers.toml` via `context_window_tokens_for_model`.
+    pub fn context_window_tokens(&self) -> usize {
+        self.context_window_override
+            .unwrap_or_else(|| crate::llm::context_window_tokens_for_model(&self.model))
+    }
+
     /// Load from environment, with config file (~/.recursive/config.toml) as fallback.
     ///
     /// Precedence (highest first), applied to `api_base` / `api_key` / `model` /
@@ -279,6 +293,7 @@ impl Config {
             max_budget_usd: None,
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
+            context_window_override: None,
         })
     }
 
@@ -512,6 +527,7 @@ mod tests {
             max_budget_usd: None,
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
+            context_window_override: None,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
