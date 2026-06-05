@@ -47,20 +47,23 @@ impl AnthropicProvider {
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         model: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .map_err(|e| Error::Config {
+                message: format!("failed to build HTTP client: {e}"),
+            })?;
+        Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(180))
-                .build()
-                .expect("reqwest client build"),
+            client,
             temperature: 0.2,
             max_tokens: 4096,
             retry: RetryPolicy::default(),
             search_engine: Arc::new(KeywordSearchEngine::new()),
-        }
+        })
     }
 
     /// Build an `Error::Llm` with the model name prefixed.
@@ -1430,7 +1433,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let result = provider
             .complete(&[Message::user("hi".to_string())], &[])
             .await;
@@ -1470,7 +1473,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-invalid", "claude-3-opus");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-invalid", "claude-3-opus")
+                .unwrap();
         let err = provider
             .complete(&[Message::user("hi".to_string())], &[])
             .await
@@ -1514,7 +1518,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let result = provider
             .complete(&[Message::user("read the file".to_string())], &[])
             .await;
@@ -1562,7 +1566,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let _ = provider
             .stream(&[Message::user("hi".to_string())], &[], None)
             .await;
@@ -1616,7 +1620,7 @@ data: {\"type\":\"message_stop\"}
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
             .stream(&[Message::user("hi".to_string())], &[], None)
             .await
@@ -1673,7 +1677,7 @@ data: {\"type\":\"message_stop\"}
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
             .stream(&[Message::user("read the file".to_string())], &[], None)
             .await
@@ -1730,7 +1734,7 @@ data: {\"type\":\"message_stop\"}
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
             .stream(&[Message::user("hi".to_string())], &[], Some(tx))
@@ -1787,7 +1791,7 @@ data: {\"type\":\"message_stop\"}
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
             .stream(&[Message::user("hi".to_string())], &[], None)
             .await
@@ -1989,7 +1993,7 @@ data: {\"type\":\"message_stop\"}
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let provider =
-            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet");
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
 
         // Pretend "Read" is eager (always available) and
         // "notebook_edit" is deferred (needs ToolSearchTool).

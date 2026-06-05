@@ -21,7 +21,8 @@ async fn anthropic_smoke_constructs_with_minimum_config() {
         "https://api.example.com",
         "sk-test-key",
         "claude-3-sonnet-20240229",
-    );
+    )
+    .unwrap();
     // Provider should be usable (no panic on construction)
     let _ = provider;
 }
@@ -84,11 +85,14 @@ async fn anthropic_full_runtime_loop_with_mock_provider() {
     // Give the server a moment to start
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let provider = Arc::new(AnthropicProvider::new(
-        format!("http://{addr}"),
-        "sk-noop",
-        "claude-3-sonnet-20240229",
-    ));
+    let provider = Arc::new(
+        AnthropicProvider::new(
+            format!("http://{addr}"),
+            "sk-noop",
+            "claude-3-sonnet-20240229",
+        )
+        .unwrap(),
+    );
 
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let tools = ToolRegistry::new(transport)
