@@ -473,7 +473,13 @@ impl AgentRuntime {
         let turn_outcome = self.kernel.run(ctx).await?;
         drop(event_tx);
         // Wait for forwarder; stash the deferred TurnFinished for emit_turn_messages.
-        self.deferred_turn_finished = forwarder.await.ok().flatten();
+        self.deferred_turn_finished = match forwarder.await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("forwarder task panicked, TurnFinished will be synthesized: {e}");
+                None
+            }
+        };
         Ok(turn_outcome)
     }
 

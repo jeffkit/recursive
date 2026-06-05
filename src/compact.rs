@@ -50,8 +50,20 @@ impl Compactor {
     ///
     /// This is a rough proxy for token count. The agent uses this to decide
     /// whether compaction is needed before the next LLM call.
+    /// Includes tool_calls arguments and reasoning_content which were previously
+    /// omitted, causing the threshold to be systematically underestimated.
     pub fn estimate_chars(transcript: &[Message]) -> usize {
-        transcript.iter().map(|m| m.content.len()).sum()
+        transcript
+            .iter()
+            .map(|m| {
+                m.content.len()
+                    + m.tool_calls
+                        .iter()
+                        .map(|tc| tc.name.len() + tc.arguments.to_string().len() + 32)
+                        .sum::<usize>()
+                    + m.reasoning_content.as_deref().map_or(0, |r| r.len())
+            })
+            .sum()
     }
 
     /// JSON schema for structured compaction output.
@@ -164,6 +176,20 @@ impl Compactor {
         ))
     }
 
+    /// Compute the safe split point for compaction: the index at which to
+    /// divide "older messages to summarize" from "recent messages to keep".
+    ///
+    /// Never splits in the middle of a Tool role message — if the natural
+    /// split point lands on a Tool message, it backs up until it finds a
+    /// non-Tool boundary, preserving tool-call / tool-result pairs.
+    fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
+        let mut split = transcript.len().saturating_sub(keep_n);
+        while split > 0 && matches!(transcript[split].role, crate::message::Role::Tool) {
+            split -= 1;
+        }
+        split
+    }
+
     /// Apply compaction in-place to `transcript`, returning `(removed, summary_chars)`.
     ///
     /// Finds the correct split point (never splits inside a tool-call pair),
@@ -183,11 +209,7 @@ impl Compactor {
         }
         let summary_msg = self.compact(provider, transcript, step).await?;
         let summary_chars = summary_msg.content.len();
-        let keep = self.keep_recent_n;
-        let mut split = transcript.len().saturating_sub(keep);
-        while split > 0 && matches!(transcript[split].role, crate::message::Role::Tool) {
-            split -= 1;
-        }
+        let split = Self::safe_split_point(transcript, self.keep_recent_n);
         let removed = split;
         transcript.drain(..split);
         transcript.insert(0, summary_msg);
@@ -209,8 +231,7 @@ impl Compactor {
         transcript: &[Message],
         step: usize,
     ) -> Result<Message> {
-        let n = self.keep_recent_n.min(transcript.len().saturating_sub(1));
-        let split = transcript.len().saturating_sub(n);
+        let split = Self::safe_split_point(transcript, self.keep_recent_n);
         let older = &transcript[..split];
         let _recent = &transcript[split..];
 

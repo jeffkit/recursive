@@ -10,24 +10,25 @@ pub enum RuntimeBuild {
     Offline { reason: String },
 }
 
-fn build_provider(config: &Config, api_key: String) -> Arc<dyn LlmProvider> {
+fn build_provider(config: &Config, api_key: String) -> crate::error::Result<Arc<dyn LlmProvider>> {
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    match config.provider_type.as_str() {
+    let provider: Arc<dyn LlmProvider> = match config.provider_type.as_str() {
         "anthropic" => Arc::new(
-            crate::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)
+            crate::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
                 .with_retry_policy(retry),
         ),
         _ => Arc::new(
-            crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)
+            crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
                 .with_retry_policy(retry),
         ),
-    }
+    };
+    Ok(provider)
 }
 
 pub fn build_runtime() -> RuntimeBuild {
@@ -53,7 +54,14 @@ pub fn build_runtime() -> RuntimeBuild {
         }
     };
 
-    let provider = build_provider(&config, api_key);
+    let provider = match build_provider(&config, api_key) {
+        Ok(p) => p,
+        Err(e) => {
+            return RuntimeBuild::Offline {
+                reason: format!("failed to build HTTP client: {e}"),
+            }
+        }
+    };
 
     let tools =
         crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
@@ -121,7 +129,14 @@ fn build_runtime_with_skill_tx(
         }
     };
 
-    let provider = build_provider(&config, api_key);
+    let provider = match build_provider(&config, api_key) {
+        Ok(p) => p,
+        Err(e) => {
+            return RuntimeBuild::Offline {
+                reason: format!("failed to build HTTP client: {e}"),
+            }
+        }
+    };
 
     let mut tools =
         crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
