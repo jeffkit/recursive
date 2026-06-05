@@ -17,7 +17,6 @@ pub(crate) struct ToolCallOutcome {
     pub id: String,
     pub name: String,
     pub result: String,
-    pub args: serde_json::Value,
     pub audit: Option<crate::tools::AuditMeta>,
 }
 
@@ -296,7 +295,6 @@ impl<'a> RunCore<'a> {
                          exit_plan_mode with your plan.",
                         call.name
                     ),
-                    args: call.arguments.clone(),
                     audit: None,
                 });
                 continue;
@@ -318,7 +316,6 @@ impl<'a> RunCore<'a> {
                          then call exit_plan_mode with your plan before using this tool.",
                         call.name
                     ),
-                    args: call.arguments.clone(),
                     audit: None,
                 });
                 continue;
@@ -333,7 +330,6 @@ impl<'a> RunCore<'a> {
                             id: call.id.clone(),
                             name: call.name.clone(),
                             result,
-                            args: call.arguments.clone(),
                             audit: None,
                         });
                         continue;
@@ -355,7 +351,6 @@ impl<'a> RunCore<'a> {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         result,
-                        args: call.arguments.clone(),
                         audit: None,
                     });
                     continue;
@@ -366,7 +361,6 @@ impl<'a> RunCore<'a> {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         result,
-                        args: call.arguments.clone(),
                         audit: None,
                     });
                     continue;
@@ -415,18 +409,11 @@ impl<'a> RunCore<'a> {
                             Err(err) => format!("ERROR: {err}"),
                         };
                         let duration_ms = tool_start.elapsed().as_millis() as u64;
-                        (id, name, result, args, dispatch.audit, duration_ms)
+                        (id, name, result, dispatch.audit, duration_ms)
                     });
                 }
 
-                type BatchRow = (
-                    String,
-                    String,
-                    String,
-                    serde_json::Value,
-                    crate::tools::AuditMeta,
-                    u64,
-                );
+                type BatchRow = (String, String, String, crate::tools::AuditMeta, u64);
                 let mut batch_results: Vec<BatchRow> = Vec::new();
                 while let Some(res) = join_set.join_next().await {
                     match res {
@@ -438,9 +425,8 @@ impl<'a> RunCore<'a> {
                 }
 
                 for pc in &batch {
-                    let Some((_, _, result, _, audit, duration_ms)) = batch_results
-                        .iter()
-                        .find(|(id, _, _, _, _, _)| id == &pc.id)
+                    let Some((_, _, result, audit, duration_ms)) =
+                        batch_results.iter().find(|(id, _, _, _, _)| id == &pc.id)
                     else {
                         // Task panicked — push a placeholder error result so
                         // the tool-call ↔ tool-result pairing invariant (#8)
@@ -452,7 +438,6 @@ impl<'a> RunCore<'a> {
                             name: pc.name.clone(),
                             result: "ERROR: tool task panicked during parallel execution"
                                 .to_string(),
-                            args: pc.args.clone(),
                             audit: None,
                         });
                         continue;
@@ -461,7 +446,6 @@ impl<'a> RunCore<'a> {
                         id: pc.id.clone(),
                         name: pc.name.clone(),
                         result: result.clone(),
-                        args: pc.args.clone(),
                         audit: Some(audit.clone()),
                     });
                     self.hooks.dispatch(HookEvent::PostToolCall {
@@ -490,7 +474,6 @@ impl<'a> RunCore<'a> {
                     id: pc.id.clone(),
                     name: pc.name.clone(),
                     result: result.clone(),
-                    args: pc.args.clone(),
                     audit: Some(dispatch.audit),
                 });
                 self.hooks.dispatch(HookEvent::PostToolCall {
@@ -724,7 +707,6 @@ impl<'a> RunCore<'a> {
                 id,
                 name,
                 result,
-                args,
                 audit,
             } in &results
             {
