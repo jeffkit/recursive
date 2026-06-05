@@ -177,45 +177,12 @@ fn format_timestamp(t: SystemTime) -> String {
     let minutes = (remaining % 3600) / 60;
     let seconds = remaining % 60;
 
-    // Days since 1970-01-01
-    let (year, month, day) = days_to_ymd(days);
+    // Days since 1970-01-01 — delegate to the O(1) civil-calendar impl in session.rs
+    let (year, month, day) = crate::session::epoch_day_to_ymd(days as i64);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
     )
-}
-
-/// Convert days since epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Simplified civil calendar calculation
-    let mut y = 1970;
-    let mut remaining = days;
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let months_days: [u64; 12] = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 1;
-    for &md in &months_days {
-        if remaining < md {
-            break;
-        }
-        remaining -= md;
-        m += 1;
-    }
-    (y, m, remaining + 1)
-}
-
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 /// POST /sessions — create a new session.
