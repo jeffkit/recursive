@@ -28,6 +28,13 @@ impl App {
             return self.handle_permission_key(key);
         }
 
+        // ── Interactive command panel ────────────────────────────────
+        // When a command panel is open, route all keys to it so it can
+        // handle navigation / confirmation / cancellation.
+        if self.prompt.mode == InputMode::CommandInteract {
+            return self.handle_command_panel_key(key);
+        }
+
         // ── Goal-202: plan-mode pre-confirmation ──────────────────────
         // When the agent has called `request_plan_mode`, y/Enter approve
         // and n/Esc reject — just like the plan approval banner.
@@ -442,9 +449,25 @@ impl App {
                 self.start_turn();
                 Some(UserAction::SendMessage(body))
             }
+            // CommandInteract intercepts Enter in handle_command_panel_key.
+            // If submit_prompt is somehow called, close the panel gracefully.
+            InputMode::CommandInteract => {
+                self.close_command_panel();
+                None
+            }
         };
 
-        self.prompt.record_submission(prefixed);
+        // Only call record_submission when we're staying in a normal mode.
+        // If a command opened an interactive panel, record_submission would
+        // reset the mode back to Prompt and close the panel's mode.
+        if self.prompt.mode != InputMode::CommandInteract {
+            self.prompt.record_submission(prefixed);
+        } else {
+            // Still clear the buffer / history state so the input is clean.
+            self.prompt.buffer.clear();
+            self.prompt.cursor = 0;
+            self.prompt.history_idx = None;
+        }
         self.command_menu_selected = None;
         action
     }
@@ -471,6 +494,7 @@ impl App {
                         CommandOutcome::Done => {}
                         CommandOutcome::Error(msg) => self.push_error(msg),
                         CommandOutcome::OpenModal(modal) => self.push_modal(modal),
+                        CommandOutcome::OpenPanel(panel) => self.open_command_panel(panel),
                     }
                     None
                 }
@@ -771,6 +795,145 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    // ── Interactive command panel ─────────────────────────────────────
+
+    /// Handle a key while an interactive command panel is open.
+    ///
+    /// - `Esc` → close the panel.
+    /// - `Up` / `Down` / `PgUp` / `PgDn` → navigate list or scroll content.
+    /// - `Enter` → command-specific confirm action, then close.
+    pub fn handle_command_panel_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_command_panel();
+                None
+            }
+            KeyCode::Up => {
+                if let Some(panel) = &self.active_command_panel {
+                    if let Some(sel) = panel.selected {
+                        let new_sel = sel.saturating_sub(1);
+                        let name = panel.command_name.clone();
+                        let ctx = panel.context.clone();
+                        if let Some(p) = &mut self.active_command_panel {
+                            p.selected = Some(new_sel);
+                        }
+                        self.rebuild_panel_lines_for_selection(&name, new_sel, ctx.as_deref());
+                    } else if let Some(p) = &mut self.active_command_panel {
+                        p.scroll = p.scroll.saturating_sub(1);
+                    }
+                }
+                None
+            }
+            KeyCode::Down => {
+                if let Some(panel) = &self.active_command_panel {
+                    if let Some(sel) = panel.selected {
+                        let max = panel.item_count.saturating_sub(1);
+                        let new_sel = (sel + 1).min(max);
+                        let name = panel.command_name.clone();
+                        let ctx = panel.context.clone();
+                        if let Some(p) = &mut self.active_command_panel {
+                            p.selected = Some(new_sel);
+                        }
+                        self.rebuild_panel_lines_for_selection(&name, new_sel, ctx.as_deref());
+                    } else if let Some(p) = &mut self.active_command_panel {
+                        p.scroll = p.scroll.saturating_add(1);
+                    }
+                }
+                None
+            }
+            KeyCode::PageUp => {
+                if let Some(p) = &mut self.active_command_panel {
+                    p.scroll = p.scroll.saturating_sub(10);
+                }
+                None
+            }
+            KeyCode::PageDown => {
+                if let Some(p) = &mut self.active_command_panel {
+                    p.scroll = p.scroll.saturating_add(10);
+                }
+                None
+            }
+            KeyCode::Enter => self.confirm_command_panel(),
+            _ => None,
+        }
+    }
+
+    /// Re-render a list panel's lines after the selection changes so the
+    /// highlight tracks the cursor without reopening the panel.
+    fn rebuild_panel_lines_for_selection(
+        &mut self,
+        command_name: &str,
+        new_sel: usize,
+        _ctx: Option<&str>,
+    ) {
+        use crate::tui::commands::{
+            build_journal_lines, build_resume_lines, build_theme_picker_lines,
+        };
+        match command_name {
+            "journal" => {
+                let entries = crate::tui::ui::modal::load_recent_journal_entries(5);
+                if let Some(p) = &mut self.active_command_panel {
+                    p.lines = build_journal_lines(&entries, new_sel);
+                }
+            }
+            "resume" => {
+                let workspace = self.workspace_path.clone();
+                let entries = crate::tui::ui::modal::load_recent_sessions(&workspace, 20);
+                if let Some(p) = &mut self.active_command_panel {
+                    p.lines = build_resume_lines(&entries, new_sel);
+                }
+            }
+            "theme" => {
+                let current = self.theme.name;
+                if let Some(p) = &mut self.active_command_panel {
+                    p.lines = build_theme_picker_lines(current, new_sel);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Execute the command-specific confirm action and close the panel.
+    fn confirm_command_panel(&mut self) -> Option<UserAction> {
+        let (name, sel, ctx) = match &self.active_command_panel {
+            Some(p) => (p.command_name.clone(), p.selected, p.context.clone()),
+            None => {
+                self.close_command_panel();
+                return None;
+            }
+        };
+
+        match name.as_str() {
+            "resume" => {
+                if let (Some(idx), Some(raw)) = (sel, ctx.as_deref()) {
+                    let paths: Vec<&str> = raw.lines().collect();
+                    if let Some(path_str) = paths.get(idx) {
+                        let session_dir = std::path::PathBuf::from(path_str);
+                        self.close_command_panel();
+                        return Some(UserAction::ResumeSession { session_dir });
+                    }
+                }
+                self.close_command_panel();
+                None
+            }
+            "theme" => {
+                use crate::tui::ui::theme::ALL_THEMES;
+                if let Some(idx) = sel {
+                    if let Some(theme) = ALL_THEMES.get(idx) {
+                        self.theme = theme;
+                        self.push_system(format!("Theme switched to '{}'.", theme.name));
+                    }
+                }
+                self.close_command_panel();
+                None
+            }
+            _ => {
+                self.close_command_panel();
+                None
+            }
         }
     }
 
@@ -1842,8 +2005,7 @@ mod prompt_input_tests {
 
     #[test]
     fn submit_in_command_mode_dispatches_to_registry() {
-        // Goal-146 replaces the old placeholder System block with the
-        // actual command dispatcher. /help opens the Help modal.
+        // /help now opens the interactive command panel (not a modal).
         let mut app = fresh_app();
         let _ = app.handle_key(k(KeyCode::Char('/')));
         for c in "help".chars() {
@@ -1851,11 +2013,13 @@ mod prompt_input_tests {
         }
         let action = app.handle_key(k(KeyCode::Enter));
         assert!(action.is_none());
-        // /help pushed a Help modal onto the stack.
-        assert_eq!(app.modals.last(), Some(&crate::tui::ui::modal::Modal::Help));
-        // Buffer was reset.
-        assert!(app.prompt.buffer.is_empty());
-        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        // Panel is open and mode switched to CommandInteract.
+        assert!(app.active_command_panel.is_some());
+        assert_eq!(
+            app.active_command_panel.as_ref().unwrap().command_name,
+            "help"
+        );
+        assert_eq!(app.prompt.mode, InputMode::CommandInteract);
     }
 
     // ── prompt_input::submit_clears_buffer_and_resets_mode ──────────

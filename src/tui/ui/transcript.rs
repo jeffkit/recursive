@@ -119,10 +119,11 @@ fn render_weixin_message(user_id: &str, text: &str) -> Vec<Line<'static>> {
 /// messages stay stacked, one `>` per line, so the visual shape
 /// mirrors the indentation of a quoted block reply.
 fn render_user(text: &str, _th: &Theme) -> Vec<Line<'static>> {
+    let body_bg = Color::Rgb(50, 50, 55);
     let prefix_style = Style::default()
         .fg(Color::DarkGray)
+        .bg(body_bg)
         .add_modifier(Modifier::BOLD);
-    let body_bg = Color::Rgb(50, 50, 55);
     let body_style = Style::default().bg(body_bg).fg(Color::White);
 
     let prefix = Span::styled("> ", prefix_style);
