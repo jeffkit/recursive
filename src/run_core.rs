@@ -36,8 +36,10 @@ use crate::tools::PermissionHook;
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
 pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
-/// Threshold for consecutive identical failing tool calls before declaring stuck.
-const STUCK_THRESHOLD: usize = 3;
+/// Sliding window size for stuck detection.
+const STUCK_WINDOW: usize = 10;
+/// Error rate threshold (fraction) within the window that triggers stuck detection.
+const STUCK_ERROR_RATE: f64 = 0.8;
 
 /// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
 ///
@@ -515,8 +517,8 @@ impl<'a> RunCore<'a> {
         let specs = self.tools.specs();
 
         let mut final_message: Option<String> = None;
-        let mut last_call_key: Option<(String, String)> = None;
-        let mut consecutive_errors: usize = 0;
+        let mut recent_errors: std::collections::VecDeque<bool> =
+            std::collections::VecDeque::with_capacity(STUCK_WINDOW);
         let mut total_usage = TokenUsage::default();
         // Goal-153: audit metadata for tool calls, keyed by tool_call_id.
         let mut tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta> =
@@ -724,9 +726,20 @@ impl<'a> RunCore<'a> {
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
-            for (id, name, result, args, audit) in &results {
+            for (id, name, result, _args, audit) in &results {
                 // Auto-classifier denial limit — stop the agent immediately.
+                // Push all pending tool results first (including the sentinel) to
+                // preserve Invariant #8 (every tool-call must have a matching tool-result).
                 if result == DENIAL_LIMIT_SENTINEL {
+                    for (pending_id, _, pending_result, _, pending_audit) in &results {
+                        if let Some(a) = pending_audit {
+                            tool_audits.insert(pending_id.clone(), a.clone());
+                        }
+                        self.push_message(Message::tool_result(
+                            pending_id.clone(),
+                            pending_result.clone(),
+                        ));
+                    }
                     let finish = FinishReason::PermissionDenialLimit;
                     self.emit(AgentEvent::TurnFinished {
                         reason: finish_reason_str(&finish),
@@ -756,44 +769,38 @@ impl<'a> RunCore<'a> {
                     tool_audits.insert(id.clone(), a.clone());
                 }
 
-                let call_key = (
-                    name.clone(),
-                    serde_json::to_string(args).unwrap_or_default(),
-                );
-                // Use the same is_error definition as above (includes DENIAL_LIMIT_SENTINEL).
-                if is_error {
-                    if last_call_key == Some(call_key.clone()) {
-                        consecutive_errors += 1;
-                    } else {
-                        consecutive_errors = 1;
-                    }
-                } else {
-                    consecutive_errors = 0;
+                // Sliding-window stuck detection: track whether each tool call
+                // was an error. Triggers when the error rate in the last
+                // STUCK_WINDOW steps exceeds STUCK_ERROR_RATE, catching loops
+                // that cycle across different tools (e.g. A→B→A→B).
+                if recent_errors.len() == STUCK_WINDOW {
+                    recent_errors.pop_front();
                 }
+                recent_errors.push_back(is_error);
 
-                last_call_key = Some(call_key);
-
-                if consecutive_errors >= STUCK_THRESHOLD {
-                    let repeated_call = name.clone();
-                    let repeats = consecutive_errors;
-                    let finish = FinishReason::Stuck {
-                        repeated_call,
-                        repeats,
-                    };
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: step,
-                    });
-                    let outcome = RunInnerOutcome {
-                        messages: self.messages,
-                        final_message,
-                        finish_reason: finish,
-                        total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                        steps: step,
-                        tool_audits,
-                    };
-                    return Ok(outcome);
+                if recent_errors.len() == STUCK_WINDOW {
+                    let error_count = recent_errors.iter().filter(|&&e| e).count();
+                    let rate = error_count as f64 / STUCK_WINDOW as f64;
+                    if rate >= STUCK_ERROR_RATE {
+                        let finish = FinishReason::Stuck {
+                            repeated_call: name.clone(),
+                            repeats: error_count,
+                        };
+                        self.emit(AgentEvent::TurnFinished {
+                            reason: finish_reason_str(&finish),
+                            steps: step,
+                        });
+                        let outcome = RunInnerOutcome {
+                            messages: self.messages,
+                            final_message,
+                            finish_reason: finish,
+                            total_usage,
+                            total_llm_latency_ms: self.total_llm_latency_ms,
+                            steps: step,
+                            tool_audits,
+                        };
+                        return Ok(outcome);
+                    }
                 }
 
                 self.push_message(Message::tool_result(id.clone(), result.clone()));

@@ -355,7 +355,11 @@ impl ShadowRepo {
         let mut stats = RestoreStats::default();
 
         for path in paths {
-            let abs = self.workspace.join(path);
+            let abs =
+                crate::tools::resolve_within(&self.workspace, path).map_err(|_| Error::Tool {
+                    name: "checkpoint".into(),
+                    message: format!("path '{path}' escapes workspace root"),
+                })?;
             let cp_bytes = self.read_file_at(checkpoint, path)?;
             let current_bytes = std::fs::read(&abs).ok();
 
