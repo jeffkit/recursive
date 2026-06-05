@@ -253,7 +253,7 @@ pub enum RuleSource {
 pub struct PermissionLayer {
     /// Which source this layer comes from.
     pub source: RuleSource,
-    /// Tools that are explicitly allowed. Empty = allow all.
+    /// Tools that are explicitly allowed. Empty = no explicit allow rules (falls through to mode default).
     pub allow: Vec<String>,
     /// Tools that are explicitly denied. Takes priority over `allow`.
     pub deny: Vec<String>,
@@ -382,7 +382,15 @@ impl LayeredPermissionsConfig {
             }
         }
 
-        // 6. Default: defer to upper layer
+        // 6. Strict mode: no explicit allow rule → deny
+        if matches!(self.mode, PermissionMode::Strict) {
+            return Permission::Denied(
+                DecisionReason::Mode(PermissionMode::Strict),
+                format!("tool `{tool_name}` has no explicit allow rule and mode is strict"),
+            );
+        }
+
+        // 7. Default: defer to upper layer
         Permission::Unknown
     }
 
@@ -516,7 +524,7 @@ impl LayeredPermissionsConfig {
 #[serde(default)]
 #[derive(Default)]
 pub struct OldPermissionsConfig {
-    /// Tools that are explicitly allowed. Empty = allow all.
+    /// Tools that are explicitly allowed. Empty = no explicit allow rules (falls through to mode default).
     #[serde(default)]
     pub allow: Vec<String>,
     /// Tools that are explicitly denied. Takes priority over `allow`.
