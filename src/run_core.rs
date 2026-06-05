@@ -757,13 +757,14 @@ impl<'a> RunCore<'a> {
                     tool_audits.insert(id.clone(), a.clone());
                 }
 
-                let call_key = (
-                    name.clone(),
-                    serde_json::to_string(args).unwrap_or_default(),
-                );
+                // Use None for args when serialization fails so that a
+                // stringify error never accidentally matches a prior call key.
+                let call_key = serde_json::to_string(args)
+                    .ok()
+                    .map(|args_str| (name.clone(), args_str));
                 // Use the same is_error definition as above (includes DENIAL_LIMIT_SENTINEL).
                 if is_error {
-                    if last_call_key == Some(call_key.clone()) {
+                    if call_key.is_some() && last_call_key == call_key {
                         consecutive_errors += 1;
                     } else {
                         consecutive_errors = 1;
@@ -772,7 +773,7 @@ impl<'a> RunCore<'a> {
                     consecutive_errors = 0;
                 }
 
-                last_call_key = Some(call_key);
+                last_call_key = call_key;
 
                 if consecutive_errors >= STUCK_THRESHOLD {
                     let repeated_call = name.clone();

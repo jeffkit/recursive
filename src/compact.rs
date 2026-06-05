@@ -236,6 +236,8 @@ impl Compactor {
         let _recent = &transcript[split..];
 
         // Build a meta-prompt asking the model to summarize the older portion.
+        // Include tool_calls on assistant messages so the compactor sees what
+        // tools were invoked, not just the text content.
         let older_text: String = older
             .iter()
             .map(|m| {
@@ -245,7 +247,16 @@ impl Compactor {
                     crate::message::Role::Assistant => "assistant",
                     crate::message::Role::Tool => "tool",
                 };
-                format!("<{role_tag}>{}</{role_tag}>", m.content)
+                let mut body = m.content.replace('<', "&lt;").replace('>', "&gt;");
+                if !m.tool_calls.is_empty() {
+                    let calls_summary: Vec<String> = m
+                        .tool_calls
+                        .iter()
+                        .map(|tc| format!("{}({})", tc.name, tc.arguments))
+                        .collect();
+                    body.push_str(&format!("\n[tool_calls: {}]", calls_summary.join(", ")));
+                }
+                format!("<{role_tag}>{body}</{role_tag}>")
             })
             .collect::<Vec<_>>()
             .join("\n");
