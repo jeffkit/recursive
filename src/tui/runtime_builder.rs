@@ -1,11 +1,33 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::Config;
+use crate::llm::RetryPolicy;
 use crate::{AgentRuntime, AgentRuntimeBuilder, LlmProvider};
 
 pub enum RuntimeBuild {
     Ready(Option<Box<AgentRuntime>>),
     Offline { reason: String },
+}
+
+fn build_provider(config: &Config, api_key: String) -> Arc<dyn LlmProvider> {
+    let retry = RetryPolicy {
+        max_retries: config.retry_max,
+        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+    };
+    match config.provider_type.as_str() {
+        "anthropic" => Arc::new(
+            crate::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)
+                .with_temperature(config.temperature)
+                .with_retry_policy(retry),
+        ),
+        _ => Arc::new(
+            crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)
+                .with_temperature(config.temperature)
+                .with_retry_policy(retry),
+        ),
+    }
 }
 
 pub fn build_runtime() -> RuntimeBuild {
@@ -31,10 +53,7 @@ pub fn build_runtime() -> RuntimeBuild {
         }
     };
 
-    let provider: Arc<dyn LlmProvider> = Arc::new(
-        crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)
-            .with_temperature(config.temperature),
-    );
+    let provider = build_provider(&config, api_key);
 
     let tools =
         crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
@@ -102,10 +121,7 @@ fn build_runtime_with_skill_tx(
         }
     };
 
-    let provider: Arc<dyn LlmProvider> = Arc::new(
-        crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)
-            .with_temperature(config.temperature),
-    );
+    let provider = build_provider(&config, api_key);
 
     let mut tools =
         crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
