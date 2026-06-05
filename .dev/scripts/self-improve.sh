@@ -144,21 +144,25 @@ trap 'rm -f "$SYSPROMPT_FILE"' EXIT
 apply_provider_profile() {
   case "$1" in
     minimax)
+      export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://api.minimaxi.com/v1"
       export RECURSIVE_MODEL="MiniMax-M3"
       export RECURSIVE_API_KEY="${MINIMAX_API_KEY:-}"
       ;;
     deepseek)
+      export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
       export RECURSIVE_MODEL="deepseek-chat"
       export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
       ;;
     deepseek-pro)
+      export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
       export RECURSIVE_MODEL="deepseek-chat"
       export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
       ;;
     glm)
+      export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://open.bigmodel.cn/api/paas/v4"
       export RECURSIVE_MODEL="glm-5.1"
       export RECURSIVE_API_KEY="${GLM_API_KEY:-}"
