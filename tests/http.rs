@@ -41,6 +41,7 @@ mod http_tests {
             max_budget_usd: None,
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
+            context_window_override: None,
         }
     }
 
