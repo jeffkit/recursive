@@ -355,9 +355,190 @@ impl LlmProvider for AnthropicProvider {
         self.run_search_aware_loop(messages, eager_tools, deferred_tools, None, 0)
             .await
     }
+
+    /// Search-aware streaming: injects `ToolSearchTool` into the eager list
+    /// and handles multi-round search across streaming calls.
+    ///
+    /// When the model calls `ToolSearchTool`, the resolved tool schemas are
+    /// injected as `tool_reference` blocks and a new streaming round begins —
+    /// identical to the non-streaming `complete_with_search` loop, but each
+    /// round uses SSE streaming so the user sees tokens as they arrive.
+    async fn stream_with_search(
+        &self,
+        messages: &[Message],
+        eager_tools: &[(ToolSpec, Option<String>)],
+        deferred_tools: &[(ToolSpec, Option<String>)],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        self.run_stream_search_loop(messages, eager_tools, deferred_tools, None, 0, stream_tx)
+            .await
+    }
 }
 
 impl AnthropicProvider {
+    /// Streaming version of the search-aware loop.
+    ///
+    /// Each round streams eagerly (with `ToolSearchTool` in the eager list).
+    /// If the model calls `ToolSearchTool`, we resolve the query, inject
+    /// `tool_reference` blocks (same as the non-streaming loop), and start
+    /// a new streaming round. The stream_tx is passed through every round so
+    /// the user sees tokens as they arrive across all rounds.
+    async fn run_stream_search_loop(
+        &self,
+        messages: &[Message],
+        eager_tools: &[SpecWithHint],
+        deferred_tools: &[SpecWithHint],
+        pending_tool_result: Option<(&str, &[String])>,
+        round: usize,
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        // Build the full eager list: caller's eager + ToolSearchTool.
+        let mut all_eager: Vec<SpecWithHint> = Vec::with_capacity(eager_tools.len() + 1);
+        all_eager.push(Self::tool_search_spec());
+        all_eager.extend_from_slice(eager_tools);
+
+        let (system, msgs) = extract_system_message(messages);
+        let msgs = filter_leading_assistant(&msgs);
+
+        let mut body = build_request_with_partition(
+            &self.model,
+            self.temperature,
+            self.max_tokens,
+            system.as_deref(),
+            &msgs,
+            &all_eager,
+            deferred_tools,
+            pending_tool_result,
+        );
+        body["stream"] = Value::Bool(true);
+
+        let completion = self.stream_with_body(body, stream_tx.clone()).await?;
+
+        // If the model called ToolSearchTool, resolve and recurse.
+        if let Some(search_call) = completion
+            .tool_calls
+            .iter()
+            .find(|c| c.name == TOOL_SEARCH_TOOL_NAME)
+        {
+            if round >= MAX_SEARCH_ROUNDS {
+                tracing::warn!(
+                    target: "recursive::llm",
+                    round,
+                    max = MAX_SEARCH_ROUNDS,
+                    "ToolSearchTool (stream): hit MAX_SEARCH_ROUNDS, returning current completion"
+                );
+                return Ok(completion);
+            }
+            let query = search_call
+                .arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let max_results = search_call
+                .arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let names = self.search_engine.resolve(query, deferred_tools);
+            let names: Vec<String> = match max_results {
+                Some(n) => names.into_iter().take(n).collect(),
+                None => names,
+            };
+
+            let mut next_messages: Vec<Message> = msgs.clone();
+            let assistant_with_call = Message {
+                role: Role::Assistant,
+                content: completion.content.clone(),
+                tool_calls: completion.tool_calls.clone(),
+                tool_call_id: None,
+                reasoning_content: completion.reasoning_content.clone(),
+            };
+            next_messages.push(assistant_with_call);
+            next_messages.push(Message {
+                role: Role::User,
+                content: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(search_call.id.clone()),
+                reasoning_content: None,
+            });
+
+            return Box::pin(self.run_stream_search_loop(
+                &next_messages,
+                eager_tools,
+                deferred_tools,
+                Some((&search_call.id, &names)),
+                round + 1,
+                stream_tx,
+            ))
+            .await;
+        }
+
+        Ok(completion)
+    }
+
+    /// Send a pre-built request body as a streaming call and return the
+    /// accumulated `Completion`. Handles HTTP retry internally.
+    async fn stream_with_body(
+        &self,
+        body: Value,
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        let url = format!("{}/v1/messages", self.base_url);
+        let mut attempt = 0;
+        loop {
+            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (stream/search)", url);
+            let result = self
+                .client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return self.parse_sse_stream(resp, stream_tx).await;
+                    }
+                    let text = resp.text().await?;
+                    if let Some(backoff) =
+                        self.retry
+                            .backoff_for(attempt, Some(status.as_u16()), false)
+                    {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            status = status.as_u16(),
+                            "transient HTTP error, retrying (stream/search)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
+                }
+                Err(e) => {
+                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            error = %e,
+                            "network error, retrying (stream/search)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(self.make_err(format!("request failed: {e}")));
+                }
+            }
+        }
+    }
+
     /// Internal streaming implementation.
     async fn stream_inner(
         &self,

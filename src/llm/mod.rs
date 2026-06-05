@@ -282,6 +282,29 @@ pub trait LlmProvider: Send + Sync {
         Ok(completion)
     }
 
+    /// Search-aware streaming: model sees eager tools + `ToolSearchTool`;
+    /// deferred tools become available only after the model requests them.
+    ///
+    /// The default implementation merges both lists and delegates to
+    /// [`LlmProvider::stream`] — i.e., behaves like the legacy eager-only path.
+    /// Providers that support deferred tool loading (e.g. Anthropic) override
+    /// this to inject `ToolSearchTool` into the eager set and handle the
+    /// search loop across multiple streaming rounds.
+    async fn stream_with_search(
+        &self,
+        messages: &[Message],
+        eager_tools: &[(ToolSpec, Option<String>)],
+        deferred_tools: &[(ToolSpec, Option<String>)],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        let all: Vec<ToolSpec> = eager_tools
+            .iter()
+            .chain(deferred_tools.iter())
+            .map(|(spec, _)| spec.clone())
+            .collect();
+        self.stream(messages, &all, stream_tx).await
+    }
+
     /// Simple completion with a single user prompt.
     ///
     /// Wraps the prompt in a user [`Message`] and calls [`complete`](LlmProvider::complete)
