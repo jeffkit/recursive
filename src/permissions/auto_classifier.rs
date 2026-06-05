@@ -37,9 +37,9 @@ Respond ONLY with JSON (no markdown): { \"block\": true|false, \"reason\": \"...
 #[derive(Debug, Default)]
 pub struct DenialTracker {
     /// Number of consecutive denials without an intervening allow.
-    pub consecutive: u32,
+    consecutive: u32,
     /// Total number of denials ever recorded.
-    pub total: u32,
+    total: u32,
 }
 
 /// Maximum number of consecutive denials before limit is hit.
@@ -107,8 +107,8 @@ impl AutoClassifier {
     /// # Behaviour
     /// * If the denial tracker is over limit, returns `(true, "...")` without
     ///   calling the LLM.
-    /// * On JSON parse error, defaults to `(false, "classifier parse error...")`
-    ///   (conservative: err on the side of allowing).
+    /// * On JSON parse error, defaults to `(true, "classifier parse error...")`
+    ///   (fail-closed: err on the side of blocking).
     pub async fn classify(
         &mut self,
         tool_name: &str,
@@ -144,9 +144,10 @@ impl AutoClassifier {
                 }
                 Ok((r.block, r.reason))
             }
-            Err(_) => {
-                // Parse failure — conservative: allow the tool
-                Ok((false, "classifier parse error, defaulting to allow".into()))
+            Err(e) => {
+                // Parse failure — fail closed: deny rather than accidentally allow.
+                tracing::warn!(target: "recursive::permissions", "classifier JSON parse error: {e}; defaulting to block");
+                Ok((true, "classifier parse error, defaulting to block".into()))
             }
         }
     }
@@ -235,12 +236,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classifier_parse_error_defaults_allow() {
+    async fn classifier_parse_error_defaults_block() {
         let provider = Arc::new(mock_classifier("not valid json"));
         let mut classifier = AutoClassifier::new(provider);
-        let (block, _reason) = classifier.classify("Read", "{}", "").await.unwrap();
-        assert!(!block, "parse error should default to allow");
-        // Consecutive should still be 0 (parse error is not a denial).
+        let (block, reason) = classifier.classify("Read", "{}", "").await.unwrap();
+        assert!(block, "parse error should default to block (fail-closed)");
+        assert!(reason.contains("defaulting to block"));
+        // Parse error does not increment the denial tracker (it's not an LLM-decided denial).
         assert_eq!(classifier.tracker.consecutive, 0);
     }
 

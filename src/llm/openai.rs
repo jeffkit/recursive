@@ -581,7 +581,10 @@ impl OpenAiProvider {
     ) -> Result<Completion> {
         let mut content = String::new();
         let mut reasoning_content = String::new();
-        let tool_calls: Vec<ToolCall> = Vec::new();
+        // Accumulate tool_call deltas keyed by index.
+        // Each entry: (id, name, partial_arguments).
+        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<TokenUsage> = None;
 
@@ -598,11 +601,11 @@ impl OpenAiProvider {
                 let chunk: Value = serde_json::from_str(data)
                     .map_err(|e| self.make_err(format!("SSE parse error: {e}; data: {data}")))?;
 
-                // Extract delta content
+                // Extract delta content and tool_calls
                 if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
                     if let Some(choice) = choices.first() {
-                        // Delta content
                         if let Some(delta) = choice.get("delta") {
+                            // Text content delta
                             if let Some(delta_content) =
                                 delta.get("content").and_then(|c| c.as_str())
                             {
@@ -613,12 +616,39 @@ impl OpenAiProvider {
                                     }
                                 }
                             }
-                            // Accumulate reasoning_content deltas (DeepSeek thinking mode)
+                            // reasoning_content delta (DeepSeek thinking mode)
                             if let Some(delta_reasoning) =
                                 delta.get("reasoning_content").and_then(|c| c.as_str())
                             {
                                 if !delta_reasoning.is_empty() {
                                     reasoning_content.push_str(delta_reasoning);
+                                }
+                            }
+                            // Tool-call deltas: accumulate id/name/arguments by index
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                for tc_delta in tcs {
+                                    let index =
+                                        tc_delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            as usize;
+                                    let entry =
+                                        tool_call_builders.entry(index).or_insert_with(|| {
+                                            (String::new(), String::new(), String::new())
+                                        });
+                                    if let Some(id) = tc_delta.get("id").and_then(|v| v.as_str()) {
+                                        entry.0.push_str(id);
+                                    }
+                                    if let Some(func) = tc_delta.get("function") {
+                                        if let Some(name) =
+                                            func.get("name").and_then(|v| v.as_str())
+                                        {
+                                            entry.1.push_str(name);
+                                        }
+                                        if let Some(args) =
+                                            func.get("arguments").and_then(|v| v.as_str())
+                                        {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -659,6 +689,29 @@ impl OpenAiProvider {
                 }
             }
         }
+
+        // Convert accumulated builders into ToolCall objects, sorted by index.
+        let mut sorted_indices: Vec<usize> = tool_call_builders.keys().copied().collect();
+        sorted_indices.sort_unstable();
+        let tool_calls: Vec<ToolCall> = sorted_indices
+            .into_iter()
+            .filter_map(|i| {
+                let (id, name, partial_json) = tool_call_builders.remove(&i)?;
+                if id.is_empty() && name.is_empty() {
+                    return None;
+                }
+                let arguments = if partial_json.trim().is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&partial_json).unwrap_or(Value::String(partial_json))
+                };
+                Some(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect();
 
         Ok(Completion {
             content,
