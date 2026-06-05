@@ -72,7 +72,7 @@ impl RetryPolicy {
         if !is_transient {
             return None;
         }
-        let backoff = self.initial_backoff * 2u32.pow(attempt as u32);
+        let backoff = self.initial_backoff * 2u32.saturating_pow(attempt as u32);
         Some(backoff.min(self.max_backoff))
     }
 }

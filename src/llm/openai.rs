@@ -18,10 +18,12 @@
 //!    appended to the eager list.
 //! 3. Capped at `MAX_SEARCH_ROUNDS` to prevent infinite loops.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -584,113 +586,47 @@ impl OpenAiProvider {
     ) -> Result<Completion> {
         let mut content = String::new();
         let mut reasoning_content = String::new();
-        // Accumulate tool_call deltas keyed by index.
-        // Each entry: (id, name, partial_arguments).
-        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new();
+        // key: index → (id, name, accumulated_arguments)
+        let mut tool_call_builders: HashMap<usize, (String, String, String)> = HashMap::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<TokenUsage> = None;
 
-        // Read the byte stream line by line
-        let reader = resp.text().await?;
-        for line in reader.lines() {
-            if let Some(data) = line.strip_prefix("data: ") {
-                // Skip the final "[DONE]" marker
-                if data.trim() == "[DONE]" {
-                    break;
-                }
+        // Process the byte stream incrementally line by line instead of
+        // buffering the entire response body first.
+        let mut byte_stream = resp.bytes_stream();
+        let mut line_buf = String::new();
 
-                // Parse the JSON chunk
-                let chunk: Value = serde_json::from_str(data)
-                    .map_err(|e| self.make_err(format!("SSE parse error: {e}; data: {data}")))?;
-
-                // Extract delta content and tool_calls
-                if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
-                    if let Some(choice) = choices.first() {
-                        if let Some(delta) = choice.get("delta") {
-                            // Text content delta
-                            if let Some(delta_content) =
-                                delta.get("content").and_then(|c| c.as_str())
-                            {
-                                if !delta_content.is_empty() {
-                                    content.push_str(delta_content);
-                                    if let Some(ref tx) = stream_tx {
-                                        let _ = tx.send(delta_content.to_string());
-                                    }
-                                }
-                            }
-                            // reasoning_content delta (DeepSeek thinking mode)
-                            if let Some(delta_reasoning) =
-                                delta.get("reasoning_content").and_then(|c| c.as_str())
-                            {
-                                if !delta_reasoning.is_empty() {
-                                    reasoning_content.push_str(delta_reasoning);
-                                }
-                            }
-                            // Tool-call deltas: accumulate id/name/arguments by index
-                            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                                for tc_delta in tcs {
-                                    let index =
-                                        tc_delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
-                                            as usize;
-                                    let entry =
-                                        tool_call_builders.entry(index).or_insert_with(|| {
-                                            (String::new(), String::new(), String::new())
-                                        });
-                                    if let Some(id) = tc_delta.get("id").and_then(|v| v.as_str()) {
-                                        entry.0.push_str(id);
-                                    }
-                                    if let Some(func) = tc_delta.get("function") {
-                                        if let Some(name) =
-                                            func.get("name").and_then(|v| v.as_str())
-                                        {
-                                            entry.1.push_str(name);
-                                        }
-                                        if let Some(args) =
-                                            func.get("arguments").and_then(|v| v.as_str())
-                                        {
-                                            entry.2.push_str(args);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Finish reason (only on the last chunk)
-                        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                            if !fr.is_empty() {
-                                finish_reason = Some(fr.to_string());
-                            }
-                        }
-                    }
-                }
-
-                // Usage (only on the last chunk for some providers)
-                if let Some(u) = chunk.get("usage") {
-                    let prompt =
-                        u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let completion = u
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let cache_hit = u
-                        .get("prompt_cache_hit_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let cache_miss = u
-                        .get("prompt_cache_miss_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    usage = Some(TokenUsage {
-                        prompt_tokens: prompt,
-                        completion_tokens: completion,
-                        total_tokens: total,
-                        cache_hit_tokens: cache_hit,
-                        cache_miss_tokens: cache_miss,
-                    });
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk.map_err(|e| self.make_err(format!("SSE stream read error: {e}")))?;
+            let text = String::from_utf8_lossy(&bytes);
+            for ch in text.chars() {
+                if ch == '\n' {
+                    let line = std::mem::take(&mut line_buf);
+                    Self::process_sse_line(
+                        &line,
+                        &mut content,
+                        &mut reasoning_content,
+                        &mut tool_call_builders,
+                        &mut finish_reason,
+                        &mut usage,
+                        &stream_tx,
+                    )?;
+                } else if ch != '\r' {
+                    line_buf.push(ch);
                 }
             }
+        }
+        // Flush any trailing line
+        if !line_buf.is_empty() {
+            Self::process_sse_line(
+                &line_buf,
+                &mut content,
+                &mut reasoning_content,
+                &mut tool_call_builders,
+                &mut finish_reason,
+                &mut usage,
+                &stream_tx,
+            )?;
         }
 
         // Convert accumulated builders into ToolCall objects, sorted by index.
@@ -727,6 +663,106 @@ impl OpenAiProvider {
                 Some(reasoning_content)
             },
         })
+    }
+
+    fn process_sse_line(
+        line: &str,
+        content: &mut String,
+        reasoning_content: &mut String,
+        tool_call_builders: &mut HashMap<usize, (String, String, String)>,
+        finish_reason: &mut Option<String>,
+        usage: &mut Option<TokenUsage>,
+        stream_tx: &Option<StreamSender>,
+    ) -> Result<()> {
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        if data.trim() == "[DONE]" {
+            return Ok(());
+        }
+
+        let chunk: Value = serde_json::from_str(data).map_err(|e| Error::Llm {
+            provider: "openai".into(),
+            message: format!("SSE parse error: {e}; data: {data}"),
+        })?;
+
+        if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+            if let Some(choice) = choices.first() {
+                if let Some(delta) = choice.get("delta") {
+                    if let Some(delta_content) = delta.get("content").and_then(|c| c.as_str()) {
+                        if !delta_content.is_empty() {
+                            content.push_str(delta_content);
+                            if let Some(tx) = stream_tx {
+                                let _ = tx.send(delta_content.to_string());
+                            }
+                        }
+                    }
+                    if let Some(delta_reasoning) =
+                        delta.get("reasoning_content").and_then(|c| c.as_str())
+                    {
+                        if !delta_reasoning.is_empty() {
+                            reasoning_content.push_str(delta_reasoning);
+                        }
+                    }
+                    // Accumulate tool_calls deltas
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tcs {
+                            let idx =
+                                tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let entry = tool_call_builders
+                                .entry(idx)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                if !id.is_empty() {
+                                    entry.0 = id.to_string();
+                                }
+                            }
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                    if !name.is_empty() {
+                                        entry.1 = name.to_string();
+                                    }
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                    entry.2.push_str(args);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                    if !fr.is_empty() {
+                        *finish_reason = Some(fr.to_string());
+                    }
+                }
+            }
+        }
+
+        if let Some(u) = chunk.get("usage") {
+            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let completion = u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let cache_hit = u
+                .get("prompt_cache_hit_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let cache_miss = u
+                .get("prompt_cache_miss_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            *usage = Some(TokenUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total,
+                cache_hit_tokens: cache_hit,
+                cache_miss_tokens: cache_miss,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -776,9 +812,12 @@ fn serialize_message(m: &Message) -> Value {
     if let Some(id) = &m.tool_call_id {
         obj.insert("tool_call_id".into(), Value::String(id.clone()));
     }
-    // Echo reasoning_content back to the API (required by DeepSeek thinking mode)
-    if let Some(ref reasoning) = m.reasoning_content {
-        obj.insert("reasoning_content".into(), Value::String(reasoning.clone()));
+    // Echo reasoning_content back to the API (required by DeepSeek thinking mode).
+    // Only valid on Assistant messages — other roles have no reasoning field.
+    if matches!(m.role, Role::Assistant) {
+        if let Some(ref reasoning) = m.reasoning_content {
+            obj.insert("reasoning_content".into(), Value::String(reasoning.clone()));
+        }
     }
     if !m.tool_calls.is_empty() {
         let calls: Vec<Value> = m
