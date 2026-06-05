@@ -362,21 +362,21 @@ impl LayeredPermissionsConfig {
         }
 
         // 5. Static deny/allow rules (union semantics)
-        for pattern in self.all_deny() {
+        for (pattern, source) in self.all_deny() {
             if matches_pattern(pattern, tool_name) {
                 return Permission::Denied(
                     DecisionReason::Rule {
-                        source: RuleSource::User,
+                        source: *source,
                         pattern: pattern.to_string(),
                     },
                     format!("tool `{tool_name}` matches deny pattern `{pattern}`"),
                 );
             }
         }
-        for pattern in self.all_allow() {
+        for (pattern, source) in self.all_allow() {
             if matches_pattern(pattern, tool_name) {
                 return Permission::Allowed(DecisionReason::Rule {
-                    source: RuleSource::User,
+                    source: *source,
                     pattern: pattern.to_string(),
                 });
             }
@@ -418,20 +418,18 @@ impl LayeredPermissionsConfig {
             .any(|p| matches_pattern(p, tool_name))
     }
 
-    /// Iterate over all deny patterns across all layers.
-    pub fn all_deny(&self) -> impl Iterator<Item = &str> {
+    /// Iterate over all deny patterns across all layers, paired with their source.
+    pub fn all_deny(&self) -> impl Iterator<Item = (&str, &RuleSource)> {
         self.layers
             .iter()
-            .flat_map(|l| l.deny.iter())
-            .map(|s| s.as_str())
+            .flat_map(|l| l.deny.iter().map(move |s| (s.as_str(), &l.source)))
     }
 
-    /// Iterate over all allow patterns across all layers.
-    pub fn all_allow(&self) -> impl Iterator<Item = &str> {
+    /// Iterate over all allow patterns across all layers, paired with their source.
+    pub fn all_allow(&self) -> impl Iterator<Item = (&str, &RuleSource)> {
         self.layers
             .iter()
-            .flat_map(|l| l.allow.iter())
-            .map(|s| s.as_str())
+            .flat_map(|l| l.allow.iter().map(move |s| (s.as_str(), &l.source)))
     }
 
     /// Iterate over all interactive patterns across all layers.
@@ -1307,9 +1305,16 @@ mod tests {
             ],
             ..Default::default()
         };
-        let denies: Vec<&str> = config.all_deny().collect();
-        assert!(denies.contains(&"Write"));
-        assert!(denies.contains(&"Bash"));
+        let denies: Vec<(&str, &RuleSource)> = config.all_deny().collect();
+        assert!(denies.iter().any(|(p, _)| *p == "Write"));
+        assert!(denies.iter().any(|(p, _)| *p == "Bash"));
+        // Also verify the sources are correctly paired
+        assert!(denies
+            .iter()
+            .any(|(p, s)| *p == "Write" && matches!(s, RuleSource::Project)));
+        assert!(denies
+            .iter()
+            .any(|(p, s)| *p == "Bash" && matches!(s, RuleSource::User)));
         assert_eq!(denies.len(), 2);
     }
 
@@ -1330,9 +1335,16 @@ mod tests {
             ],
             ..Default::default()
         };
-        let allows: Vec<&str> = config.all_allow().collect();
-        assert!(allows.contains(&"Read"));
-        assert!(allows.contains(&"Write"));
+        let allows: Vec<(&str, &RuleSource)> = config.all_allow().collect();
+        assert!(allows.iter().any(|(p, _)| *p == "Read"));
+        assert!(allows.iter().any(|(p, _)| *p == "Write"));
+        // Verify sources are correctly paired
+        assert!(allows
+            .iter()
+            .any(|(p, s)| *p == "Read" && matches!(s, RuleSource::Project)));
+        assert!(allows
+            .iter()
+            .any(|(p, s)| *p == "Write" && matches!(s, RuleSource::User)));
         assert_eq!(allows.len(), 2);
     }
 

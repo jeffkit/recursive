@@ -274,6 +274,9 @@ pub struct AgentRuntime {
     /// Deferred `TurnFinished` event held by `execute_kernel_turn` until
     /// `emit_turn_messages` can flush it after all assistant messages.
     deferred_turn_finished: Option<AgentEvent>,
+    /// Set by `close()` after `SessionEnd` has been fired; prevents duplicate
+    /// `SessionEnd` events when `close()` is called more than once.
+    session_closed: bool,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -358,16 +361,26 @@ impl AgentRuntime {
         );
         self.checkpoints.turn_index += 1;
 
-        // Do not fire SessionEnd on graceful cancellation — hooks registered
-        // for SessionEnd typically perform post-run cleanup / summarisation
-        // that makes no sense if the turn was cancelled by the user.
-        if !matches!(outcome.finish_reason, FinishReason::Cancelled) {
-            self.kernel
-                .hooks()
-                .dispatch(HookEvent::SessionEnd { outcome: &outcome });
-        }
-
         Ok(outcome)
+    }
+
+    /// Signal that the session is permanently over and fire `SessionEnd`.
+    ///
+    /// Call this exactly once, after the last `run()` or `enqueue()` call, to
+    /// give hooks a chance to do post-session cleanup. Calling `run()` after
+    /// `close()` is safe but `SessionEnd` will not fire again.
+    pub async fn close(&mut self, last_outcome: Option<&RuntimeOutcome>) {
+        if self.session_closed {
+            return;
+        }
+        self.session_closed = true;
+        if let Some(outcome) = last_outcome {
+            if !matches!(outcome.finish_reason, FinishReason::Cancelled) {
+                self.kernel
+                    .hooks()
+                    .dispatch(HookEvent::SessionEnd { outcome });
+            }
+        }
     }
 
     /// Reset the touched-files collector at the start of a turn.
@@ -490,8 +503,14 @@ impl AgentRuntime {
         let new_messages = outcome.new_messages.clone();
         let turn_usage = crate::session::UsageMeta::from_token_usage(&outcome.usage);
         let mut tool_audits = outcome.tool_audits.clone();
+        // Token usage belongs only on the last assistant message of the turn —
+        // attaching it to every assistant message would cause consumers to
+        // multiply-count tokens.
+        let last_assistant_idx = new_messages
+            .iter()
+            .rposition(|m| matches!(m.role, crate::message::Role::Assistant));
         self.transcript.extend(new_messages.iter().cloned());
-        for msg in &new_messages {
+        for (idx, msg) in new_messages.iter().enumerate() {
             let event = if msg.role == crate::message::Role::Tool {
                 if let Some(tcid) = &msg.tool_call_id {
                     if let Some(audit) = tool_audits.remove(tcid) {
@@ -514,7 +533,9 @@ impl AgentRuntime {
                     }
                 }
             } else {
-                let usage = if matches!(msg.role, crate::message::Role::Assistant) {
+                let usage = if matches!(msg.role, crate::message::Role::Assistant)
+                    && Some(idx) == last_assistant_idx
+                {
                     Some(turn_usage.clone())
                 } else {
                     None
@@ -566,7 +587,13 @@ impl AgentRuntime {
     async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
         let mut last: Option<RuntimeOutcome> = None;
         while let Some(msg) = self.message_queue.pop_front() {
-            last = Some(self.run(msg).await?);
+            match self.run(msg).await {
+                Ok(outcome) => last = Some(outcome),
+                Err(e) => {
+                    tracing::warn!(error = %e, "drain_queue: turn failed, continuing with next queued message");
+                    continue;
+                }
+            }
         }
         Ok(last)
     }
@@ -1262,6 +1289,7 @@ impl AgentRuntimeBuilder {
             goal_state: Arc::new(RwLock::new(None)),
             message_queue: std::collections::VecDeque::new(),
             deferred_turn_finished: None,
+            session_closed: false,
         })
     }
 }
