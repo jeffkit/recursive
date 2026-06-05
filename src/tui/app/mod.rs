@@ -159,6 +159,99 @@ pub struct App {
     /// (ResumePicker, McpServers, Journal) the key handler auto-updates
     /// this to keep the selection visible.
     pub modal_scroll: u16,
+
+    // ── Interactive command panel ─────────────────────────────────────────
+    /// State for the bottom panel opened when a slash-command needs
+    /// interactive input. `None` when closed. When `Some`,
+    /// `prompt.mode` is `InputMode::CommandInteract` and the panel owns
+    /// key events.
+    pub active_command_panel: Option<CommandPanelState>,
+}
+
+// ── CommandPanelState ────────────────────────────────────────────────────────
+
+/// State for the interactive panel that expands below the input box when a
+/// slash-command requires user interaction (a form, picker, confirmation, …).
+///
+/// Commands open a panel by returning [`crate::tui::commands::CommandOutcome::OpenPanel`]
+/// from their handler. The panel closes when the user presses Esc or the
+/// command resolves (confirmed / cancelled).
+#[derive(Debug, Clone)]
+pub struct CommandPanelState {
+    /// The name of the command that opened this panel (for the border title).
+    pub command_name: String,
+    /// Lines of content to display inside the panel.
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    /// Optional footer hint shown at the bottom of the panel (e.g. key bindings).
+    pub hint: Option<String>,
+    /// Desired panel height in rows (including the 2 border rows).
+    /// The renderer caps this to a terminal-relative maximum.
+    pub height: u16,
+    /// Currently selected item index (for list-style panels). `None` if the
+    /// panel has no selectable items.
+    pub selected: Option<usize>,
+    /// Total number of selectable items (for bounds checking on ↑/↓).
+    pub item_count: usize,
+    /// Vertical scroll offset into `lines` (for long read-only content).
+    pub scroll: u16,
+    /// Arbitrary string the command handler can use to carry its own payload
+    /// (e.g. a pending argument name, a serialised form state).
+    pub context: Option<String>,
+}
+
+impl CommandPanelState {
+    /// Convenience constructor.
+    pub fn new(command_name: impl Into<String>, lines: Vec<ratatui::text::Line<'static>>) -> Self {
+        let height = (lines.len() as u16 + 2).max(3);
+        let item_count = lines.len();
+        Self {
+            command_name: command_name.into(),
+            lines,
+            hint: None,
+            height,
+            selected: None,
+            item_count,
+            scroll: 0,
+            context: None,
+        }
+    }
+
+    /// Builder — set the footer hint line (adds 1 to height).
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self.height = self.height.max(self.lines.len() as u16 + 3);
+        self
+    }
+
+    /// Builder — mark the panel as having a selectable list.
+    pub fn with_selection(mut self, selected: usize) -> Self {
+        self.selected = Some(selected);
+        self
+    }
+
+    /// Builder — set the total number of selectable items explicitly
+    /// (use when `lines` mixes selectable and non-selectable rows).
+    pub fn with_item_count(mut self, count: usize) -> Self {
+        self.item_count = count;
+        self
+    }
+
+    /// Builder — attach opaque context data for the owning command handler.
+    pub fn with_context(mut self, ctx: impl Into<String>) -> Self {
+        self.context = Some(ctx.into());
+        self
+    }
+
+    /// Scroll down by `n` lines (clamped to content length).
+    pub fn scroll_down(&mut self, n: u16) {
+        let max = self.lines.len().saturating_sub(1) as u16;
+        self.scroll = (self.scroll + n).min(max);
+    }
+
+    /// Scroll up by `n` lines (clamped to 0).
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_sub(n);
+    }
 }
 
 // ── Goal-230: PendingSkillInstall ────────────────────────────────────────────

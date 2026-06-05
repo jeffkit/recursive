@@ -311,6 +311,13 @@ pub fn panel_height(app: &App) -> u16 {
             // Always show at least one row (the "no matches" placeholder).
             app.hsearch_matches.len().clamp(1, MAX_VISIBLE) as u16 + 2
         }
+        InputMode::CommandInteract => {
+            // Height is driven by the panel state; cap at MAX_VISIBLE + 2 borders.
+            app.active_command_panel
+                .as_ref()
+                .map(|p| p.height.min(MAX_VISIBLE as u16 + 2))
+                .unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -328,6 +335,7 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
         InputMode::Command => render_command_panel(frame, area, app),
         InputMode::AtFile => render_atfile_panel(frame, area, app),
         InputMode::HistorySearch => render_history_panel(frame, area, app),
+        InputMode::CommandInteract => render_command_interact_panel(frame, area, app),
         _ => {}
     }
 }
@@ -459,6 +467,61 @@ fn render_history_panel(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(Color::LightGreen))
         .title(title)
         .style(Style::default().bg(Color::Black));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_command_interact_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(panel) = &app.active_command_panel else {
+        return;
+    };
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(205, 100, 50))
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+    let hint_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+
+    // Reserve the last row for the hint when present.
+    let content_rows = if panel.hint.is_some() {
+        area.height.saturating_sub(3) as usize // 2 borders + 1 hint
+    } else {
+        area.height.saturating_sub(2) as usize // 2 borders
+    };
+
+    let mut lines: Vec<Line<'static>> = panel
+        .lines
+        .iter()
+        .take(content_rows)
+        .enumerate()
+        .map(|(i, text)| {
+            let style = if panel.selected == Some(i) {
+                selected_style
+            } else {
+                normal_style
+            };
+            Line::from(Span::styled(format!(" {text} "), style))
+        })
+        .collect();
+
+    if let Some(hint) = &panel.hint {
+        lines.push(Line::from(Span::styled(format!(" {hint} "), hint_style)));
+    }
+
+    let title = format!(" /{} ", panel.command_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(205, 100, 50)))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Rgb(205, 100, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Black));
+
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 

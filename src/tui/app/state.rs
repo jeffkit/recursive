@@ -63,6 +63,7 @@ impl App {
             print_queue: Vec::new(),
             recent_display: Vec::new(),
             modal_scroll: 0,
+            active_command_panel: None,
         }
     }
 
@@ -105,6 +106,22 @@ impl App {
         self.blocks
             .push(TranscriptBlock::Error { text: text.into() });
         self.scroll_to_bottom();
+    }
+
+    /// Open an interactive command panel below the input box and switch
+    /// the input mode to [`InputMode::CommandInteract`].
+    pub fn open_command_panel(&mut self, panel: crate::tui::app::CommandPanelState) {
+        self.active_command_panel = Some(panel);
+        self.prompt.mode = InputMode::CommandInteract;
+        self.prompt.buffer.clear();
+        self.prompt.cursor = 0;
+    }
+
+    /// Close the active command panel (if any) and return the input
+    /// mode to [`InputMode::Prompt`].
+    pub fn close_command_panel(&mut self) {
+        self.active_command_panel = None;
+        self.prompt.mode = InputMode::Prompt;
     }
 
     /// Reset the transcript to a single fresh welcome block and zero

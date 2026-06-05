@@ -74,13 +74,21 @@ pub enum InputMode {
     /// `Ctrl+R`-triggered (Goal 160): shows a fuzzy history-search
     /// popup. Search state lives in the parent [`App`].
     HistorySearch,
+    /// A slash-command has been selected and opened an interactive
+    /// panel below the input box. The panel owns key input until the
+    /// user confirms or cancels (Esc / Enter). State lives in
+    /// `App::active_command_panel`.
+    CommandInteract,
 }
 
 impl InputMode {
     /// Indicator character for the left of the input box.
     pub fn indicator(self) -> char {
         match self {
-            InputMode::Prompt | InputMode::AtFile | InputMode::HistorySearch => '❯',
+            InputMode::Prompt
+            | InputMode::AtFile
+            | InputMode::HistorySearch
+            | InputMode::CommandInteract => '❯',
             InputMode::Bash => '!',
             InputMode::Note => '#',
             InputMode::Command => '/',
@@ -91,7 +99,10 @@ impl InputMode {
     /// that recalling them later restores the originating mode.
     pub fn history_prefix(self) -> &'static str {
         match self {
-            InputMode::Prompt | InputMode::AtFile | InputMode::HistorySearch => "",
+            InputMode::Prompt
+            | InputMode::AtFile
+            | InputMode::HistorySearch
+            | InputMode::CommandInteract => "",
             InputMode::Bash => "!",
             InputMode::Note => "#",
             InputMode::Command => "/",
@@ -106,7 +117,10 @@ impl InputMode {
             InputMode::Prompt => InputMode::Bash,
             InputMode::Bash => InputMode::Note,
             InputMode::Note => InputMode::Prompt,
-            InputMode::Command | InputMode::AtFile | InputMode::HistorySearch => InputMode::Prompt,
+            InputMode::Command
+            | InputMode::AtFile
+            | InputMode::HistorySearch
+            | InputMode::CommandInteract => InputMode::Prompt,
         }
     }
 }

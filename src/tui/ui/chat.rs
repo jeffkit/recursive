@@ -95,6 +95,9 @@ pub fn render(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::Yellow),
         )]));
     }
+    // Always keep one blank row between the last content line and the status bar
+    // so the output doesn't visually collide with it.
+    lines.push(Line::raw(""));
 
     let todo_area = chunks[1];
     // The messages panel no longer wraps in a bordered `Block`, so the

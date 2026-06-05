@@ -124,6 +124,7 @@ fn indicator_style(mode: InputMode) -> Style {
         InputMode::Command => Color::Magenta,
         InputMode::AtFile => Color::Cyan,
         InputMode::HistorySearch => Color::LightGreen,
+        InputMode::CommandInteract => Color::Rgb(205, 100, 50),
     };
     Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
@@ -137,6 +138,7 @@ fn input_box_title(mode: InputMode) -> &'static str {
         InputMode::Command => " Command ",
         InputMode::AtFile => " @File ",
         InputMode::HistorySearch => " 🔍 History Search ",
+        InputMode::CommandInteract => " Input ",
     }
 }
 
@@ -180,6 +182,7 @@ pub fn footer_hint(mode: InputMode) -> String {
         InputMode::HistorySearch => {
             "⏎ confirm  ↑↓ select  ctrl+r next  backspace edit  esc cancel".into()
         }
+        InputMode::CommandInteract => "⏎ confirm  ↑↓ select  esc cancel".into(),
     }
 }
 
