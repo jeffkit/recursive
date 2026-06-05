@@ -55,15 +55,18 @@ impl OpenAiProvider {
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         model: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> crate::error::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .map_err(|e| crate::error::Error::Config {
+                message: format!("failed to build HTTP client: {e}"),
+            })?;
+        Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(180))
-                .build()
-                .expect("reqwest client build"),
+            client,
             temperature: 0.2,
             // DeepSeek defaults to a per-response cap of 4096 tokens; any
             // tool call whose `arguments` string holds more than that — e.g.
@@ -77,7 +80,7 @@ impl OpenAiProvider {
             retry: RetryPolicy::default(),
             stream_tx: None,
             search_engine: Arc::new(KeywordSearchEngine::new()),
-        }
+        })
     }
 
     /// Replace the search engine used to resolve `ToolSearchTool` queries.
@@ -1022,7 +1025,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m");
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
         let eager = vec![(make_tool_spec("Read"), None)];
         let result = provider
             .complete_with_search(&[Message::user("hi")], &eager, &[])
@@ -1094,6 +1097,7 @@ mod tests {
         let deferred = vec![(my_tool.clone(), None)];
         let engine = Arc::new(AlwaysReturnsEngine(vec!["MyTool".to_string()]));
         let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
             .with_search_engine(engine);
 
         let result = provider
@@ -1144,6 +1148,7 @@ mod tests {
         let deferred = vec![(make_tool_spec("SomeTool"), None)];
         let engine = Arc::new(AlwaysReturnsEngine(vec![])); // returns nothing
         let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
             .with_search_engine(engine);
 
         let result = provider
@@ -1187,7 +1192,8 @@ mod tests {
         // Small sleep so the OS releases the port.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model");
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model").unwrap();
         let err = provider
             .complete(&[Message::user("hi")], &[])
             .await
@@ -1222,7 +1228,8 @@ mod tests {
         // Give the server a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model-http");
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model-http").unwrap();
         let err = provider
             .complete(&[Message::user("hi")], &[])
             .await
@@ -1269,7 +1276,7 @@ data: [DONE]\n\n";
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-stream-model");
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-stream-model").unwrap();
         let completion = provider
             .stream(&[Message::user("hi")], &[], None)
             .await
@@ -1388,7 +1395,8 @@ data: [DONE]\n\n";
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-structured-model");
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-structured-model")
+                .unwrap();
 
         let schema = serde_json::json!({
             "type": "object",
@@ -1445,7 +1453,8 @@ data: [DONE]\n\n";
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let provider =
-            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-structured-model");
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-structured-model")
+                .unwrap();
 
         let schema = serde_json::json!({
             "type": "object",

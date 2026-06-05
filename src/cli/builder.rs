@@ -269,13 +269,13 @@ pub(crate) async fn build_runtime(
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
-            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)
+            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
                 .with_retry_policy(anthropic_retry);
             Arc::new(anthropic)
         }
         _ => {
-            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)
+            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
                 .with_retry_policy(retry);
             Arc::new(openai)

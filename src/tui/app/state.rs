@@ -14,7 +14,10 @@ impl App {
         // Goal-169: load workspace skill commands at startup.
         let workspace = crate::config::Config::from_env()
             .map(|c| c.workspace)
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            .unwrap_or_else(|e| {
+                tracing::warn!("config error at TUI startup, using '.': {e}");
+                std::path::PathBuf::from(".")
+            });
         let skills = crate::tui::skill_commands::SkillCommandLoader::load(&workspace);
         let commands =
             crate::tui::commands::CommandRegistry::default_set().with_skill_commands(skills);
