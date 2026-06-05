@@ -14,10 +14,15 @@ use crate::tui::ui::{diff, markdown};
 /// Convert the entire transcript into a flat `Vec<Line>` with one
 /// blank line between adjacent blocks. Folded ToolResult blocks
 /// honour the `expanded` flag.
+///
+/// `width` is the available render width in columns (0 = no limit / 80-char
+/// fallback). Passed down to the markdown renderer so tables and code blocks
+/// can adapt to the actual terminal width.
 pub fn render_blocks(
     blocks: &[TranscriptBlock],
     _usage: &UsageStats,
     th: &Theme,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
@@ -30,7 +35,7 @@ pub fn render_blocks(
                 lines.push(Line::raw(""));
             }
         }
-        lines.extend(render_block(b, th));
+        lines.extend(render_block(b, th, width));
         // Add a trailing blank line after each User block so the AI response
         // that follows feels spacious (same two-line gap on both sides).
         if matches!(b, TranscriptBlock::User { .. }) {
@@ -41,14 +46,16 @@ pub fn render_blocks(
 }
 
 /// Render a single block. Exposed for unit tests.
-pub fn render_block(block: &TranscriptBlock, th: &Theme) -> Vec<Line<'static>> {
+///
+/// `width` is the available render width in columns (0 = no limit).
+pub fn render_block(block: &TranscriptBlock, th: &Theme, width: u16) -> Vec<Line<'static>> {
     match block {
         TranscriptBlock::User { text } => render_user(text, th),
         TranscriptBlock::Assistant {
             text,
             streaming,
             latency_ms,
-        } => render_assistant(text, *streaming, *latency_ms, th),
+        } => render_assistant(text, *streaming, *latency_ms, th, width),
         TranscriptBlock::Reasoning { text } => render_reasoning(text),
         TranscriptBlock::ToolCall {
             name,
@@ -154,6 +161,7 @@ fn render_assistant(
     _streaming: bool,
     _latency_ms: Option<u64>,
     _th: &Theme,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let bullet_style = Style::default()
         .fg(Color::Cyan)
@@ -171,7 +179,7 @@ fn render_assistant(
     // code with syntax highlighting, etc.). The first line picks up
     // the bullet prefix; subsequent lines share the 2-space indent
     // so wrapping reads naturally.
-    let md_lines = markdown::render_markdown(text, 0);
+    let md_lines = markdown::render_markdown(text, width);
     let mut iter = md_lines.into_iter();
     if let Some(first) = iter.next() {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(first.spans.len() + 2);
@@ -689,6 +697,7 @@ mod tests {
                 text: "hello world".into(),
             },
             &theme::DARK,
+            0,
         );
         let txt = line_text(&lines[0]);
         assert!(txt.starts_with("> "), "first line should start with `> `");
@@ -702,6 +711,7 @@ mod tests {
                 text: "line1\nline2".into(),
             },
             &theme::DARK,
+            0,
         );
         assert_eq!(lines.len(), 2);
         assert!(line_text(&lines[0]).starts_with("> "));
@@ -711,7 +721,11 @@ mod tests {
 
     #[test]
     fn user_block_carries_background_highlight() {
-        let lines = render_block(&TranscriptBlock::User { text: "hi".into() }, &theme::DARK);
+        let lines = render_block(
+            &TranscriptBlock::User { text: "hi".into() },
+            &theme::DARK,
+            0,
+        );
         let has_bg = lines[0]
             .spans
             .iter()
@@ -726,6 +740,7 @@ mod tests {
                 text: "let me think about this\nmaybe this way".into(),
             },
             &theme::DARK,
+            0,
         );
         let header = line_text(&lines[0]);
         assert!(
@@ -750,6 +765,7 @@ mod tests {
                 text: String::new(),
             },
             &theme::DARK,
+            0,
         );
         let h = line_text(&lines[0]);
         assert!(h.contains("Thinking") || h.contains("∴"));
@@ -764,6 +780,7 @@ mod tests {
                 latency_ms: None,
             },
             &theme::DARK,
+            0,
         );
         let txt = line_text(&lines[0]);
         assert!(txt.contains("•"), "assistant must lead with a bullet");
@@ -782,6 +799,7 @@ mod tests {
                 result: None,
             },
             &theme::DARK,
+            0,
         );
         let header = &lines[0];
         assert!(line_text(header).contains("⏺"));
@@ -810,6 +828,7 @@ mod tests {
                 }),
             },
             &theme::DARK,
+            0,
         );
         let header = &lines[0];
         let bullet_green = header
@@ -834,6 +853,7 @@ mod tests {
                 }),
             },
             &theme::DARK,
+            0,
         );
         let header = &lines[0];
         let has_red = header.spans.iter().any(|s| s.style.fg == Some(Color::Red));
@@ -858,6 +878,7 @@ mod tests {
                 }),
             },
             &theme::DARK,
+            0,
         );
         let txt = full_text(&lines);
         assert!(txt.contains("Ctrl+E"));
@@ -882,6 +903,7 @@ mod tests {
                 }),
             },
             &theme::DARK,
+            0,
         );
         for i in 0..10 {
             assert!(full_text(&lines).contains(&format!("line {i}")));
@@ -899,7 +921,7 @@ mod tests {
                 }],
             }],
         };
-        let lines = render_block(&block, &theme::DARK);
+        let lines = render_block(&block, &theme::DARK, 0);
         assert!(line_text(&lines[0]).contains("src/x.rs"));
         // body should have at least one Green span (diff adds are always green)
         let has_green = lines
@@ -915,7 +937,7 @@ mod tests {
             path: "src/x.rs".into(),
             hunks: vec![],
         };
-        let lines = render_block(&block, &theme::DARK);
+        let lines = render_block(&block, &theme::DARK, 0);
         assert!(lines.iter().any(|l| line_text(l).contains("Updated")));
     }
 
@@ -927,6 +949,7 @@ mod tests {
                 kept: 1,
             },
             &theme::DARK,
+            0,
         );
         let s = line_text(&lines[0]);
         assert!(s.contains("12"));

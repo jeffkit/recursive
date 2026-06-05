@@ -41,7 +41,6 @@ impl App {
             commands,
             tool_catalog: default_offline_tool_catalog(),
             command_menu_selected: None,
-            planning_mode_on: false,
             plan_awaiting_approval: false,
             plan_mode_request_pending: false,
             double_press: DoublePressTracker::default(),
@@ -62,6 +61,7 @@ impl App {
             theme: &crate::tui::ui::theme::DARK,
             last_printed_idx: 0,
             print_queue: Vec::new(),
+            recent_display: Vec::new(),
             modal_scroll: 0,
         }
     }
@@ -114,6 +114,13 @@ impl App {
         self.blocks.push(TranscriptBlock::System {
             text: "Conversation cleared.".into(),
         });
+        // Reset the scrollback-pointer so the new System block gets
+        // flushed on the next iteration (without this, last_printed_idx
+        // would remain past blocks.len(), leaving the block invisible).
+        self.last_printed_idx = 0;
+        // Clear any stale in-viewport content from the previous conversation.
+        self.recent_display.clear();
+        self.print_queue.clear();
         self.usage = UsageStats::default();
         self.turn_count = 0;
         self.pending_latency_ms = None;

@@ -87,12 +87,6 @@ pub fn build_line(app: &App) -> Line<'static> {
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
-    } else if app.planning_mode_on {
-        spans.push(separator());
-        spans.push(Span::styled(
-            "plan-first".to_string(),
-            Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-        ));
     }
 
     // [elapsed] — only while turn is running
@@ -195,15 +189,5 @@ mod tests {
         app.plan_awaiting_approval = true;
         let with_plan = line_text(&build_line(&app));
         assert!(with_plan.contains("plan: y/n"));
-    }
-
-    #[test]
-    fn status_bar_shows_plan_first_mode() {
-        let mut app = App::new();
-        let no_mode = line_text(&build_line(&app));
-        assert!(!no_mode.contains("plan-first"));
-        app.planning_mode_on = true;
-        let with_mode = line_text(&build_line(&app));
-        assert!(with_mode.contains("plan-first"));
     }
 }

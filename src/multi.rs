@@ -1,6 +1,5 @@
 //! Multi-agent orchestration: agent pool, role definitions, and message bus.
 
-use crate::agent::PlanningMode;
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
@@ -303,12 +302,9 @@ impl AgentPool {
                 Message::user(goal.to_string()),
             ],
             step_events_tx: None,
-            plan_confirmed: false,
-            plan_buffer: None,
             tool_specs: kernel.tools().specs(),
             streaming: false,
             permission_hook: None,
-            planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             permission_mode: PermissionMode::Default,
             mailbox: None,

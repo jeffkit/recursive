@@ -189,13 +189,12 @@ async fn hooks_and_compaction() {
         3,
         "expected 3 PostToolCall events"
     );
-    // SessionStart is dispatched by AgentRuntime::run() at the start of each
-    // turn; this test drives multiple turns so the count should be ≥ 1.
-    assert!(
+    // SessionStart is dispatched exactly once per session (on turn_index == 0).
+    assert_eq!(
         hook.session_start_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 1,
-        "expected at least 1 SessionStart event"
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "expected exactly 1 SessionStart event per session"
     );
 
     // Compaction should have fired (transcript exceeded 100 chars).
@@ -346,9 +345,11 @@ async fn permission_hook_and_sub_agent() {
         .tools(all_tools)
         .system_prompt("you are a test agent with permission hook")
         .max_steps(10)
-        .permission_hook(Arc::new(DenyShellHook))
         .build()
         .unwrap();
+    // Wire the permission hook via set_permission_hook so it lives in the
+    // ToolRegistry — the canonical location for permission interception.
+    runtime.set_permission_hook(Arc::new(DenyShellHook));
 
     let outcome = runtime.run("spawn a sub-agent to explore").await.unwrap();
 

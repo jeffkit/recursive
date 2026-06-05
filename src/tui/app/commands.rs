@@ -148,13 +148,16 @@ impl App {
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     || key.modifiers.contains(KeyModifiers::ALT)
-                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    || key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER)
+                    || key.modifiers.contains(KeyModifiers::META) =>
             {
-                // Shift+Enter / Alt+Enter / Ctrl+Enter all insert a
-                // literal newline instead of submitting. macOS
-                // Terminal.app often intercepts Option+Enter before
-                // the app sees it, so we offer Ctrl+Enter as a
-                // terminal-independent alternative.
+                // Shift+Enter / Alt+Enter / Ctrl+Enter / Cmd+Enter (⌘) all insert
+                // a literal newline instead of submitting. macOS Terminal.app
+                // often intercepts Option+Enter before the app sees it, so we
+                // offer Ctrl+Enter and Cmd+Enter as terminal-independent
+                // alternatives. SUPER covers macOS Command key reported by
+                // Kitty / Alacritty / Warp via the kitty keyboard protocol.
                 self.prompt.insert_char('\n');
                 None
             }
@@ -196,10 +199,6 @@ impl App {
             }
             KeyCode::Down if self.should_walk_history_down() => {
                 self.prompt.history_next();
-                None
-            }
-            KeyCode::Char('q') if self.prompt.buffer.is_empty() => {
-                self.should_quit = true;
                 None
             }
             KeyCode::Char(c) => {

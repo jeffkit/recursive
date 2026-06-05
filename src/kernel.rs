@@ -22,7 +22,7 @@
 //! As of Goal 219 Commit 1, the kernel passes the caller's
 //! `AgentEvent` channel directly to `RunCore` — no internal bridge.
 
-use crate::agent::{FinishReason, PlanningMode};
+use crate::agent::FinishReason;
 use crate::compact::Compactor;
 use crate::event::AgentEvent;
 use crate::hooks::HookRegistry;
@@ -55,12 +55,6 @@ pub struct TurnContext {
     /// no internal conversion.
     pub step_events_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 
-    /// Whether the user confirmed a pending plan.
-    pub plan_confirmed: bool,
-
-    /// Buffered tool calls from a proposed plan (when user confirms).
-    pub plan_buffer: Option<Vec<crate::llm::ToolCall>>,
-
     /// Tool specifications to advertise to the LLM.
     pub tool_specs: Vec<ToolSpec>,
 
@@ -69,9 +63,6 @@ pub struct TurnContext {
 
     /// Optional permission hook for gating tool calls.
     pub permission_hook: Option<Arc<dyn PermissionHook>>,
-
-    /// Planning mode (execute immediately vs buffer for confirmation).
-    pub planning_mode: PlanningMode,
 
     /// Goal-165: shared flag that enables agent-driven read-only plan mode.
     /// When `true`, write tools are blocked until `exit_plan_mode` is called.
@@ -118,16 +109,10 @@ pub struct TurnOutcome {
     /// Number of steps (LLM invocations) executed in this turn.
     pub steps: usize,
 
-    /// Buffered tool calls from a proposed plan (when plan is pending).
-    pub plan_buffer: Option<Vec<crate::llm::ToolCall>>,
-
     /// Goal-153: audit records for tool results, keyed by `tool_call_id`.
     /// Passed through from `RunInnerOutcome` so the persistence layer
     /// can emit `MessageAppendedWithAudit` for tool messages.
     pub tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta>,
-
-    /// Whether the plan was confirmed by the user.
-    pub plan_confirmed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -274,10 +259,7 @@ impl AgentKernel {
             compactor: self.compactor.clone(),
             permission_hook: ctx.permission_hook,
             hooks: &self.hooks,
-            planning_mode: ctx.planning_mode,
             total_llm_latency_ms: 0,
-            plan_buffer: ctx.plan_buffer,
-            plan_confirmed: ctx.plan_confirmed,
             exploring_plan_mode: ctx.exploring_plan_mode,
             permission_mode: ctx.permission_mode,
             shutdown_token: self.shutdown_token.clone(),
@@ -310,8 +292,6 @@ impl AgentKernel {
             usage: inner.total_usage,
             llm_latency_ms: inner.total_llm_latency_ms,
             steps: inner.steps,
-            plan_buffer: inner.plan_buffer,
-            plan_confirmed: inner.plan_confirmed,
             tool_audits: inner.tool_audits,
         })
     }
@@ -578,8 +558,6 @@ mod tests {
             usage: TokenUsage::default(),
             llm_latency_ms: 0,
             steps: 0,
-            plan_buffer: None,
-            plan_confirmed: false,
             tool_audits: std::collections::HashMap::new(),
         };
         assert!(outcome.new_messages.is_empty());

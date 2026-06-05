@@ -16,13 +16,14 @@
 
 use std::sync::OnceLock;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SyntectStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthStr as _;
 
 // ── Lazy-loaded syntect state ──────────────────────────────────────────
 // Use OnceLock (stable since 1.70) instead of LazyLock (stable 1.80)
@@ -136,7 +137,14 @@ pub fn render_inline(line: &str, default_fg: Color, state: MdState) -> RenderedL
 /// optional `|---|---|` separator row) into a set of styled `Line`s.
 ///
 /// `gutter_style` is applied to the leading gutter prefix (e.g. `"│  "`).
-pub fn render_table(rows: &[&str], gutter_prefix: &str, gutter_style: Style) -> Vec<Line<'static>> {
+/// `max_table_width` is the maximum total character width of the rendered
+/// table (including gutter). Pass `0` to disable capping.
+pub fn render_table(
+    rows: &[&str],
+    gutter_prefix: &str,
+    gutter_style: Style,
+    max_table_width: usize,
+) -> Vec<Line<'static>> {
     let parsed = parse_table_rows(rows);
     if parsed.is_empty() {
         return Vec::new();
@@ -155,20 +163,42 @@ pub fn render_table(rows: &[&str], gutter_prefix: &str, gutter_style: Style) -> 
     // Find which row is the separator row (contains only dashes/colons).
     let separator_idx = parsed.iter().position(|(is_sep, _)| *is_sep);
 
-    // Compute maximum content width per column.
+    // Compute maximum content width per column using Unicode visual width
+    // (CJK characters are 2 columns wide; ASCII is 1).
     let mut col_widths: Vec<usize> = vec![0; ncols];
     for (is_sep, cells) in &parsed {
         if *is_sep {
             continue;
         }
         for (ci, cell) in cells.iter().enumerate().take(ncols) {
-            col_widths[ci] = col_widths[ci].max(cell.len());
+            col_widths[ci] = col_widths[ci].max(cell.width());
         }
     }
     // Minimum width of 1.
     for w in &mut col_widths {
         if *w == 0 {
             *w = 1;
+        }
+    }
+
+    // Cap column widths so the table fits within max_table_width.
+    // Total visual width = gutter.width() + 1 (left │) + sum(col_width + 3) for each col
+    //                    = gutter.width() + 1 + sum(col_widths) + 3*ncols
+    if max_table_width > 0 && ncols > 0 {
+        let gutter_len = gutter_prefix.width();
+        let overhead = gutter_len + 1 + 3 * ncols;
+        if overhead < max_table_width {
+            let available = max_table_width - overhead;
+            let total_content: usize = col_widths.iter().sum();
+            if total_content > available {
+                // Distribute proportionally; each column keeps at least 1 char.
+                for w in &mut col_widths {
+                    *w = ((*w * available) / total_content).max(1);
+                }
+            }
+        } else {
+            // Extreme case: not enough room even for borders — give each col 1.
+            col_widths.fill(1);
         }
     }
 
@@ -206,7 +236,11 @@ pub fn render_table(rows: &[&str], gutter_prefix: &str, gutter_style: Style) -> 
         spans.push(Span::raw("│"));
         for (ci, w) in col_widths.iter().enumerate() {
             let cell_text = cells.get(ci).map(String::as_str).unwrap_or("");
-            let padded = format!(" {:<width$} ", cell_text, width = w);
+            // Truncate cell content that exceeds column visual width.
+            let (display, vis_w) = truncate_to_visual_width(cell_text, *w);
+            // Manual right-padding so CJK chars (width 2) align properly.
+            let pad = w.saturating_sub(vis_w);
+            let padded = format!(" {}{} ", display, " ".repeat(pad));
             let style = if *is_header {
                 Style::default()
                     .fg(Color::LightCyan)
@@ -373,7 +407,21 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 }
                 Tag::Heading { level, .. } => {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
-                    let _ = level; // currently we render heading body as bold+cyan.
+                    let heading_style = match level {
+                        HeadingLevel::H1 => Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                        HeadingLevel::H2 => Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        HeadingLevel::H3 => Style::default()
+                            .fg(Color::LightBlue)
+                            .add_modifier(Modifier::BOLD),
+                        _ => Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    };
+                    style_stack.push(heading_style);
                 }
                 Tag::Table(_) => {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
@@ -411,12 +459,17 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                     }
                 }
                 TagEnd::CodeBlock => {
-                    // Emit each code block line as a separate `Line` with a `│ ` prefix.
+                    // Emit each code block line with a `│ ` gutter prefix and
+                    // per-token syntax highlighting via syntect.
+                    let lang = code_block_lang.clone();
                     for line in code_block_buffer.drain(..) {
-                        out.push(Line::from(vec![
-                            Span::styled("\u{2502} ".to_string(), Style::default().fg(Color::Cyan)),
-                            Span::styled(line, Style::default().fg(Color::Cyan)),
-                        ]));
+                        let mut spans: Vec<Span<'static>> = Vec::new();
+                        spans.push(Span::styled(
+                            "\u{2502} ".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        spans.extend(highlight_code_line(&line, &lang));
+                        out.push(Line::from(spans));
                     }
                     in_code_block = false;
                     code_block_lang.clear();
@@ -429,6 +482,10 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 }
                 TagEnd::Heading(_) => {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
+                    // Pop the level-specific heading style pushed by Tag::Heading.
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
                 }
                 TagEnd::TableCell => {
                     current_table_row.push(std::mem::take(&mut current_table_cell));
@@ -461,10 +518,14 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                         })
                         .collect();
                     let row_refs: Vec<&str> = raw_rows.iter().map(String::as_str).collect();
+                    // Subtract gutter width (2) so the table fits within the
+                    // available render width. Width==0 means no limit.
+                    let table_max = width.saturating_sub(2);
                     out.extend(render_table(
                         &row_refs,
                         "  ",
                         Style::default().fg(Color::DarkGray),
+                        table_max,
                     ));
                     in_table = false;
                     table_rows.clear();
@@ -675,6 +736,35 @@ fn make_border_line(
     s.push(right);
     spans.push(Span::styled(s, Style::default().fg(Color::Gray)));
     Line::from(spans)
+}
+
+// ── Unicode visual-width helpers ──────────────────────────────────────
+
+/// Truncate `s` so its Unicode visual width is ≤ `max_width`.
+/// Returns `(truncated_string, actual_visual_width)`.
+/// If truncation was needed, the last char is replaced with `…`.
+fn truncate_to_visual_width(s: &str, max_width: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar as _;
+    let mut result = String::new();
+    let mut vis_w = 0usize;
+    let chars: Vec<char> = s.chars().collect();
+    let full_vis = s.width();
+    if full_vis <= max_width {
+        return (s.to_string(), full_vis);
+    }
+    // Need to truncate — leave room for the `…` (1 column).
+    let budget = max_width.saturating_sub(1);
+    for &ch in &chars {
+        let cw = ch.width().unwrap_or(0);
+        if vis_w + cw > budget {
+            break;
+        }
+        result.push(ch);
+        vis_w += cw;
+    }
+    result.push('…');
+    vis_w += 1;
+    (result, vis_w)
 }
 
 // ── Shared inline-parse helpers ────────────────────────────────────────
@@ -908,7 +998,7 @@ mod tests {
     fn table_three_columns_renders_cells() {
         let rows = ["| A | B | C |", "|---|---|---|", "| 1 | 2 | 3 |"];
         let rows_ref: Vec<&str> = rows.iter().map(|s| s.as_ref()).collect();
-        let lines = render_table(&rows_ref, "│  ", Style::default().fg(Color::Gray));
+        let lines = render_table(&rows_ref, "│  ", Style::default().fg(Color::Gray), 0);
         // Should have: top border, header, divider, data row, bottom border = 5 lines
         assert_eq!(lines.len(), 5);
         // Header line should contain A, B, C
@@ -931,7 +1021,7 @@ mod tests {
             "| foo      | 42    |",
         ];
         let rows_ref: Vec<&str> = rows.iter().map(|s| s.as_ref()).collect();
-        let lines = render_table(&rows_ref, "", Style::default());
+        let lines = render_table(&rows_ref, "", Style::default(), 0);
         // top + header + divider + data + bottom = 5
         assert_eq!(lines.len(), 5);
         let hdr: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -943,7 +1033,7 @@ mod tests {
     fn table_without_separator_falls_back_to_plain() {
         let rows = ["| A | B |", "| 1 | 2 |"];
         let rows_ref: Vec<&str> = rows.iter().map(|s| s.as_ref()).collect();
-        let lines = render_table(&rows_ref, "", Style::default());
+        let lines = render_table(&rows_ref, "", Style::default(), 0);
         // No header detection means both treated as data rows.
         // top + 2 data + bottom = 4
         assert_eq!(lines.len(), 4);

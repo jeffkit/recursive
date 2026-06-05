@@ -978,9 +978,14 @@ pub fn args_preview_for_permission(arguments: &Value) -> String {
 
 /// Resolve a possibly-relative path against the workspace root.
 ///
-/// Both the root and the candidate are normalised to an absolute, dot-free
-/// form before comparison so that `--workspace .` works exactly the same as
-/// `--workspace /abs/path`.
+/// Normalises both the root and candidate to absolute, dot-free form first,
+/// then performs a second check via `canonicalize()` (which follows symlinks)
+/// when the path already exists on disk.  This prevents symlink-based escapes
+/// where a link inside the workspace points to a location outside it.
+///
+/// For paths that do not yet exist (e.g. a new file being written), only the
+/// lexical normalisation check is performed — the caller is responsible for
+/// ensuring no symlink is created that would bridge outside the root.
 pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf> {
     let candidate = std::path::Path::new(path);
     let joined = if candidate.is_absolute() {
@@ -990,6 +995,7 @@ pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::
     };
     let abs_root = absolutise(root);
     let abs_joined = absolutise(&joined);
+    // Lexical check (works for paths that don't exist yet).
     if !abs_joined.starts_with(&abs_root) {
         return Err(Error::BadToolArgs {
             name: "<fs>".into(),
@@ -999,6 +1005,31 @@ pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::
                 abs_root.display()
             ),
         });
+    }
+    // Symlink-aware check: if the path exists, canonicalize both sides and
+    // re-check so that symlinks pointing outside the workspace are rejected.
+    if abs_joined.exists() {
+        let canonical_root = abs_root.canonicalize().unwrap_or(abs_root.clone());
+        match abs_joined.canonicalize() {
+            Ok(canonical_joined) => {
+                if !canonical_joined.starts_with(&canonical_root) {
+                    return Err(Error::BadToolArgs {
+                        name: "<fs>".into(),
+                        message: format!(
+                            "path `{}` resolves via symlink to a location outside the workspace root `{}`",
+                            path,
+                            canonical_root.display()
+                        ),
+                    });
+                }
+            }
+            Err(e) => {
+                return Err(Error::BadToolArgs {
+                    name: "<fs>".into(),
+                    message: format!("cannot resolve path `{}`: {e}", path),
+                });
+            }
+        }
     }
     Ok(abs_joined)
 }

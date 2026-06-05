@@ -21,14 +21,16 @@ pub enum PermissionDecision {
     Transform(serde_json::Value),
 }
 
-/// Controls whether the agent executes tools immediately or presents a plan first.
+/// Controls how the agent executes tool calls.
+///
+/// Currently only `Immediate` is supported. Agent-driven planning is handled by
+/// the `enter_plan_mode` / `exit_plan_mode` tool pair (Plan Mode 2.0), which does
+/// not require a separate runtime mode flag.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum PlanningMode {
-    /// Execute tool calls immediately (current behavior).
+    /// Execute tool calls immediately.
     #[default]
     Immediate,
-    /// Buffer tool calls and emit a plan for confirmation before executing.
-    PlanFirst,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,8 +63,6 @@ pub enum FinishReason {
     },
     /// Transcript size exceeded hard limit and cannot be reduced further.
     TranscriptLimit { chars: usize, limit: usize },
-    /// Agent proposed a plan (PlanFirst mode) and is waiting for confirmation.
-    PlanPending,
     /// Agent was cancelled by a shutdown signal (SIGINT/SIGTERM).
     Cancelled,
 
@@ -85,7 +85,6 @@ impl std::fmt::Display for FinishReason {
             FinishReason::TranscriptLimit { chars, limit } => {
                 write!(f, "transcript_limit:{chars}/{limit}")
             }
-            FinishReason::PlanPending => write!(f, "plan_pending"),
             FinishReason::Cancelled => write!(f, "cancelled"),
             FinishReason::PermissionDenialLimit => write!(f, "permission_denial_limit"),
         }

@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::agent::{FinishReason, PlanningMode};
+use crate::agent::FinishReason;
 use crate::checkpoint::{CheckpointId, ShadowRepo};
 use crate::checkpoint_log::{CheckpointLogWriter, CheckpointRecord, TouchedVia};
 use crate::error::Result;
@@ -34,7 +34,6 @@ use crate::message::Message;
 use crate::tools::plan_mode::{
     EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanModeRequestGate, RequestPlanModeTool,
 };
-use crate::tools::PermissionHook;
 use crate::tools::{TodoItem, TodoWriteTool, ToolRegistry, TouchedFiles};
 use crate::Compactor;
 
@@ -247,16 +246,8 @@ pub struct AgentRuntime {
     transcript: Vec<Message>,
     /// Event sink for streaming events (Arc for sharing with forwarder task).
     event_sink: Arc<dyn EventSink>,
-    /// Pending plan tool calls buffered by the kernel (plan-first mode).
-    pending_plan_calls: Option<Vec<crate::llm::ToolCall>>,
-    /// Whether the user confirmed the pending plan.
-    plan_confirmed: bool,
     /// Whether to request streaming responses from the LLM.
     streaming: bool,
-    /// Optional permission hook for tool-call interception.
-    permission_hook: Option<Arc<dyn PermissionHook>>,
-    /// Planning mode (immediate vs plan-first).
-    planning_mode: PlanningMode,
     /// Optional compactor for cross-turn transcript summarization.
     compactor: Option<Compactor>,
     /// Checkpoint subsystem (snapshot, session-id, writer, touched-files).
@@ -272,7 +263,8 @@ pub struct AgentRuntime {
     /// `approve_plan_mode_request` / `reject_plan_mode_request` forward here.
     plan_mode_request_gate: Arc<PlanModeRequestGate>,
     /// Goal-168: active goal state (set by `/goal`). `None` when no goal is active.
-    pub goal_state: Arc<RwLock<Option<GoalState>>>,
+    /// Use [`current_goal`], [`set_goal`], and [`clear_goal`] for all access.
+    goal_state: Arc<RwLock<Option<GoalState>>>,
     /// Goal-181: FIFO queue of user messages waiting to be processed.
     /// Callers use [`enqueue`](AgentRuntime::enqueue) instead of
     /// [`run`](AgentRuntime::run) directly; the queue is drained in FIFO
@@ -291,11 +283,6 @@ impl std::fmt::Debug for AgentRuntime {
             .field("transcript", &self.transcript)
             .field("event_sink", &"<EventSink>")
             .field("streaming", &self.streaming)
-            .field(
-                "permission_hook",
-                &self.permission_hook.as_ref().map(|_| "<hook>"),
-            )
-            .field("planning_mode", &self.planning_mode)
             .field(
                 "todo_list",
                 &self.todo_list.read().map(|l| l.len()).unwrap_or(0),
@@ -339,9 +326,12 @@ impl AgentRuntime {
             "agent.turn: starting"
         );
 
-        self.kernel
-            .hooks()
-            .dispatch(HookEvent::SessionStart { goal: &user_text });
+        // SessionStart fires exactly once — at the beginning of the first turn.
+        if self.checkpoints.turn_index == 0 {
+            self.kernel
+                .hooks()
+                .dispatch(HookEvent::SessionStart { goal: &user_text });
+        }
 
         let started_at = unix_now();
         let pre_id = self.checkpoints.snapshot_pre_turn(&user_text).await;
@@ -353,7 +343,6 @@ impl AgentRuntime {
         self.maybe_compact_cross_turn().await?;
 
         let turn_outcome = self.execute_kernel_turn().await?;
-        self.update_plan_state(&turn_outcome);
         self.emit_turn_messages(&turn_outcome).await;
 
         let mut outcome: RuntimeOutcome = turn_outcome.into();
@@ -474,11 +463,8 @@ impl AgentRuntime {
             messages: self.transcript.clone(),
             tool_specs: self.kernel.tools().specs(),
             step_events_tx: Some(event_tx.clone()),
-            plan_confirmed: self.plan_confirmed,
-            plan_buffer: self.pending_plan_calls.clone(),
             streaming: self.streaming,
-            permission_hook: self.permission_hook.clone(),
-            planning_mode: self.planning_mode.clone(),
+            permission_hook: None,
             exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
             permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
@@ -489,18 +475,6 @@ impl AgentRuntime {
         // Wait for forwarder; stash the deferred TurnFinished for emit_turn_messages.
         self.deferred_turn_finished = forwarder.await.ok().flatten();
         Ok(turn_outcome)
-    }
-
-    /// Update plan-confirmation state from a completed turn outcome.
-    fn update_plan_state(&mut self, outcome: &crate::kernel::TurnOutcome) {
-        if outcome.finish_reason == crate::agent::FinishReason::PlanPending {
-            self.pending_plan_calls = outcome.plan_buffer.clone();
-        }
-        let was_confirmed = self.plan_confirmed;
-        self.plan_confirmed = false;
-        if was_confirmed {
-            self.pending_plan_calls = None;
-        }
     }
 
     /// Append new kernel messages to the transcript and emit `MessageAppended`
@@ -692,12 +666,10 @@ impl AgentRuntime {
         self.plan_approval_gate.clone()
     }
 
-    /// Confirm the pending plan, allowing execution to proceed on the next run.
+    /// Confirm the pending plan, allowing execution to proceed.
     ///
-    /// Covers both PlanFirst mode (sets `plan_confirmed` flag for kernel) and
-    /// Plan Mode 2.0 (wakes `exit_plan_mode`'s blocking wait via the gate).
+    /// Wakes `exit_plan_mode`'s blocking wait via the Plan Mode 2.0 gate.
     pub fn confirm_plan(&mut self) {
-        self.plan_confirmed = true;
         self.plan_approval_gate.approve();
     }
 
@@ -718,13 +690,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// Update the planning mode in place. Allows the TUI's
-    /// `/plan on|off` command to flip plan-first vs immediate
-    /// without rebuilding the runtime.
-    pub fn set_planning_mode(&mut self, mode: PlanningMode) {
-        self.planning_mode = mode;
-    }
-
     /// Goal-202: approve the plan-mode entry request.
     ///
     /// Wakes `RequestPlanModeTool`'s blocking wait, returning `{"approved": true}`
@@ -743,16 +708,11 @@ impl AgentRuntime {
 
     /// Reject the pending plan with a reason.
     ///
-    /// Covers both PlanFirst mode (injects a user message) and Plan Mode 2.0
-    /// (wakes `exit_plan_mode`'s blocking wait with the rejection reason).
+    /// Injects a user message into the transcript and wakes `exit_plan_mode`'s
+    /// blocking wait (Plan Mode 2.0 gate) with the rejection reason.
     pub fn reject_plan(&mut self, reason: &str) {
-        // PlanFirst mode: clear pending plan calls and inject rejection message.
-        self.pending_plan_calls = None;
-        self.plan_confirmed = false;
         let rejection_msg = Message::user(format!("Plan rejected: {}", reason));
         self.transcript.push(rejection_msg);
-
-        // Plan Mode 2.0: wake the blocking ExitPlanModeTool with the reason.
         self.plan_approval_gate.reject(reason);
     }
 
@@ -1078,16 +1038,11 @@ pub struct AgentRuntimeBuilder {
     system_prompt: Option<String>,
     seed: Vec<Message>,
     streaming: bool,
-    permission_hook: Option<Arc<dyn PermissionHook>>,
-    planning_mode: PlanningMode,
     saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
-    /// UUID of the parent agent's last message. When set, the first
-    /// `MessageAppended` event will carry this as `parent_uuid`, branching
-    /// the subagent's messages off that point in the conversation tree (g155).
-    /// Stored here for future multi-agent orchestration; not yet wired to
-    /// the actual event emission path.
-    pub parent_agent_last_uuid: Option<String>,
+    /// UUID of the parent agent's last message. Reserved for future
+    /// multi-agent orchestration (g155). Not yet wired to event emission.
+    parent_agent_last_uuid: Option<String>,
     /// When `true`, register `enter_plan_mode`, `exit_plan_mode`, and
     /// `request_plan_mode` tools. These tools block waiting for human
     /// approval via the plan approval gate, so they must only be registered
@@ -1105,11 +1060,6 @@ impl std::fmt::Debug for AgentRuntimeBuilder {
             .field("system_prompt", &self.system_prompt)
             .field("seed", &self.seed)
             .field("streaming", &self.streaming)
-            .field(
-                "permission_hook",
-                &self.permission_hook.as_ref().map(|_| "<hook>"),
-            )
-            .field("planning_mode", &self.planning_mode)
             .field(
                 "event_sink",
                 &self.saved_event_sink.as_ref().map(|_| "<EventSink>"),
@@ -1132,8 +1082,6 @@ impl AgentRuntimeBuilder {
             system_prompt: None,
             seed: Vec::new(),
             streaming: false,
-            permission_hook: None,
-            planning_mode: PlanningMode::Immediate,
             saved_event_sink: None,
             compactor: None,
             parent_agent_last_uuid: None,
@@ -1209,12 +1157,6 @@ impl AgentRuntimeBuilder {
         self
     }
 
-    /// Set the planning mode (optional, defaults to [`PlanningMode::Immediate`]).
-    pub fn planning_mode(mut self, mode: PlanningMode) -> Self {
-        self.planning_mode = mode;
-        self
-    }
-
     /// Set the hook registry (optional).
     pub fn hooks(mut self, hooks: HookRegistry) -> Self {
         self.kernel_builder = self.kernel_builder.hooks(hooks);
@@ -1227,12 +1169,6 @@ impl AgentRuntimeBuilder {
     /// first user turn. Use this to resume an existing conversation.
     pub fn seed_transcript(mut self, messages: Vec<Message>) -> Self {
         self.seed = messages;
-        self
-    }
-
-    /// Set an optional permission hook for tool-call interception.
-    pub fn permission_hook(mut self, hook: Arc<dyn PermissionHook>) -> Self {
-        self.permission_hook = Some(hook);
         self
     }
 
@@ -1311,11 +1247,7 @@ impl AgentRuntimeBuilder {
             kernel,
             transcript,
             event_sink,
-            pending_plan_calls: None,
-            plan_confirmed: false,
             streaming: self.streaming,
-            permission_hook: self.permission_hook,
-            planning_mode: self.planning_mode,
             compactor: self.compactor,
             checkpoints: CheckpointState::disabled(),
             todo_list,
@@ -1763,7 +1695,7 @@ mod tests {
         assert!(!rt.checkpoints_enabled());
     }
 
-    // ── compact_now / set_planning_mode (Goal 146) ────────────────────
+    // ── compact_now (Goal 146) ────────────────────────────────────────────
 
     #[tokio::test]
     async fn compact_now_invokes_compactor() {
@@ -1828,24 +1760,6 @@ mod tests {
         let before = rt.transcript().len();
         rt.compact_now().await.unwrap();
         assert_eq!(rt.transcript().len(), before);
-    }
-
-    #[tokio::test]
-    async fn set_planning_mode_updates_field() {
-        let llm = Arc::new(MockProvider::new(vec![Completion {
-            content: "ok".into(),
-            tool_calls: vec![],
-            finish_reason: Some("stop".into()),
-            usage: None,
-            reasoning_content: None,
-        }]));
-        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
-        // Default is Immediate.
-        assert_eq!(rt.planning_mode, PlanningMode::Immediate);
-        rt.set_planning_mode(PlanningMode::PlanFirst);
-        assert_eq!(rt.planning_mode, PlanningMode::PlanFirst);
-        rt.set_planning_mode(PlanningMode::Immediate);
-        assert_eq!(rt.planning_mode, PlanningMode::Immediate);
     }
 
     // ── Goal-168: GoalState / GoalEvaluator / run_goal_loop tests ──────────
