@@ -29,6 +29,27 @@ pub(super) async fn health() -> &'static str {
     "ok"
 }
 
+/// Update metrics after a successful agent run.
+fn record_run_success(metrics: &super::Metrics, steps: usize, usage: &crate::llm::TokenUsage) {
+    metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
+    metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .agent_steps_total
+        .fetch_add(steps as u64, Ordering::Relaxed);
+    metrics
+        .tokens_prompt_total
+        .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+    metrics
+        .tokens_completion_total
+        .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+}
+
+/// Update metrics after a failed agent run.
+fn record_run_failed(metrics: &super::Metrics) {
+    metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
+    metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(super) async fn openapi_spec() -> Json<serde_json::Value> {
     Json(build_openapi_spec())
 }
@@ -90,14 +111,7 @@ pub(super) async fn run_agent(
         })?;
 
     let outcome = runtime.run(&body.goal).await.map_err(|e| {
-        state
-            .metrics
-            .agent_runs_total
-            .fetch_add(1, Ordering::Relaxed);
-        state
-            .metrics
-            .agent_runs_failed
-            .fetch_add(1, Ordering::Relaxed);
+        record_run_failed(&state.metrics);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -107,27 +121,7 @@ pub(super) async fn run_agent(
         )
     })?;
 
-    // Increment metrics
-    state
-        .metrics
-        .agent_runs_total
-        .fetch_add(1, Ordering::Relaxed);
-    state
-        .metrics
-        .agent_runs_success
-        .fetch_add(1, Ordering::Relaxed);
-    state
-        .metrics
-        .agent_steps_total
-        .fetch_add(outcome.steps as u64, Ordering::Relaxed);
-    state
-        .metrics
-        .tokens_prompt_total
-        .fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
-    state.metrics.tokens_completion_total.fetch_add(
-        outcome.total_usage.completion_tokens as u64,
-        Ordering::Relaxed,
-    );
+    record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
 
     // Serialize transcript messages to JSON values
     let messages: Vec<serde_json::Value> = runtime
@@ -1319,23 +1313,8 @@ pub(super) async fn agui_run(
         };
 
         match outcome {
-            Ok(o) => {
-                metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
-                metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .agent_steps_total
-                    .fetch_add(o.steps as u64, Ordering::Relaxed);
-                metrics
-                    .tokens_prompt_total
-                    .fetch_add(o.total_usage.prompt_tokens as u64, Ordering::Relaxed);
-                metrics
-                    .tokens_completion_total
-                    .fetch_add(o.total_usage.completion_tokens as u64, Ordering::Relaxed);
-            }
-            Err(_) => {
-                metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
-                metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
-            }
+            Ok(o) => record_run_success(&metrics, o.steps, &o.total_usage),
+            Err(_) => record_run_failed(&metrics),
         }
 
         // Wait for the converter task to translate the last AgentEvent

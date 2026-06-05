@@ -153,7 +153,11 @@ async fn hooks_and_compaction() {
     let mut hooks = recursive::hooks::HookRegistry::new();
     hooks.register(hook.clone() as Arc<dyn Hook>);
 
-    let compactor = Compactor::new(100).keep_recent_n(2);
+    // Threshold calibrated to trigger after all 3 tool calls have completed.
+    // estimate_chars now includes tool_call arguments (~54 chars each), so the
+    // old threshold of 100 would fire too early (after step 2). After all 3
+    // steps the transcript is ~264 chars, so 250 fires at the right moment.
+    let compactor = Compactor::new(250).keep_recent_n(2);
 
     let mut runtime = AgentRuntime::builder()
         .llm(llm)
