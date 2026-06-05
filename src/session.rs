@@ -208,7 +208,7 @@ fn chrono_lite_now() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {
+pub(crate) fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;

@@ -12,6 +12,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+/// Output of a single tool call execution, replacing the anonymous 5-tuple.
+pub(crate) struct ToolCallOutcome {
+    pub id: String,
+    pub name: String,
+    pub result: String,
+    pub args: serde_json::Value,
+    pub audit: Option<crate::tools::AuditMeta>,
+}
+
 /// Maximum number of automatic retries for retryable LLM errors (rate limits, timeouts).
 const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay for exponential back-off on LLM retries (milliseconds).
@@ -258,24 +267,8 @@ impl<'a> RunCore<'a> {
     /// Execute a set of tool calls, returning `(id, name, output, args)` for each.
     /// Read-only calls are batched and executed in parallel; write calls run
     /// sequentially to preserve ordering guarantees.
-    async fn execute_tool_calls(
-        &self,
-        calls: &[ToolCall],
-    ) -> Vec<(
-        String,
-        String,
-        String,
-        serde_json::Value,
-        Option<crate::tools::AuditMeta>,
-    )> {
-        type ResultRow = (
-            String,
-            String,
-            String,
-            serde_json::Value,
-            Option<crate::tools::AuditMeta>,
-        );
-        let mut results: Vec<ResultRow> = Vec::new();
+    async fn execute_tool_calls(&self, calls: &[ToolCall]) -> Vec<ToolCallOutcome> {
+        let mut results: Vec<ToolCallOutcome> = Vec::new();
 
         struct PendingCall {
             id: String,
@@ -291,19 +284,19 @@ impl<'a> RunCore<'a> {
                 && !self.tools.is_readonly(&call.name)
                 && call.name != "exit_plan_mode"
             {
-                results.push((
-                    call.id.clone(),
-                    call.name.clone(),
-                    format!(
+                results.push(ToolCallOutcome {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: format!(
                         "ERROR: Cannot execute '{}' in plan mode. \
                          You are in read-only planning mode. \
                          Explore freely with read tools, then call \
                          exit_plan_mode with your plan.",
                         call.name
                     ),
-                    call.arguments.clone(),
-                    None,
-                ));
+                    args: call.arguments.clone(),
+                    audit: None,
+                });
                 continue;
             }
 
@@ -314,18 +307,18 @@ impl<'a> RunCore<'a> {
                 && call.name != "enter_plan_mode"
                 && call.name != "exit_plan_mode"
             {
-                results.push((
-                    call.id.clone(),
-                    call.name.clone(),
-                    format!(
+                results.push(ToolCallOutcome {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: format!(
                         "ERROR: Tool '{}' requires plan mode. \
                          Call enter_plan_mode first to explore and plan, \
                          then call exit_plan_mode with your plan before using this tool.",
                         call.name
                     ),
-                    call.arguments.clone(),
-                    None,
-                ));
+                    args: call.arguments.clone(),
+                    audit: None,
+                });
                 continue;
             }
 
@@ -334,13 +327,13 @@ impl<'a> RunCore<'a> {
                     PermissionDecision::Allow => call.arguments.clone(),
                     PermissionDecision::Deny(reason) => {
                         let result = format!("ERROR: {reason}");
-                        results.push((
-                            call.id.clone(),
-                            call.name.clone(),
+                        results.push(ToolCallOutcome {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
                             result,
-                            call.arguments.clone(),
-                            None,
-                        ));
+                            args: call.arguments.clone(),
+                            audit: None,
+                        });
                         continue;
                     }
                     PermissionDecision::Transform(new_args) => new_args,
@@ -356,24 +349,24 @@ impl<'a> RunCore<'a> {
             match hook_action {
                 HookAction::Skip => {
                     let result = "ERROR: tool call skipped by hook".to_string();
-                    results.push((
-                        call.id.clone(),
-                        call.name.clone(),
+                    results.push(ToolCallOutcome {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
                         result,
-                        call.arguments.clone(),
-                        None,
-                    ));
+                        args: call.arguments.clone(),
+                        audit: None,
+                    });
                     continue;
                 }
                 HookAction::Error(msg) => {
                     let result = format!("ERROR: {msg}");
-                    results.push((
-                        call.id.clone(),
-                        call.name.clone(),
+                    results.push(ToolCallOutcome {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
                         result,
-                        call.arguments.clone(),
-                        None,
-                    ));
+                        args: call.arguments.clone(),
+                        audit: None,
+                    });
                     continue;
                 }
                 HookAction::Continue => {}
@@ -452,22 +445,23 @@ impl<'a> RunCore<'a> {
                         // is preserved. Without this, the next LLM request
                         // would include an orphaned tool_call with no matching
                         // tool result and be rejected with HTTP 400.
-                        results.push((
-                            pc.id.clone(),
-                            pc.name.clone(),
-                            "ERROR: tool task panicked during parallel execution".to_string(),
-                            pc.args.clone(),
-                            None,
-                        ));
+                        results.push(ToolCallOutcome {
+                            id: pc.id.clone(),
+                            name: pc.name.clone(),
+                            result: "ERROR: tool task panicked during parallel execution"
+                                .to_string(),
+                            args: pc.args.clone(),
+                            audit: None,
+                        });
                         continue;
                     };
-                    results.push((
-                        pc.id.clone(),
-                        pc.name.clone(),
-                        result.clone(),
-                        pc.args.clone(),
-                        Some(audit.clone()),
-                    ));
+                    results.push(ToolCallOutcome {
+                        id: pc.id.clone(),
+                        name: pc.name.clone(),
+                        result: result.clone(),
+                        args: pc.args.clone(),
+                        audit: Some(audit.clone()),
+                    });
                     self.hooks.dispatch(HookEvent::PostToolCall {
                         name: &pc.name,
                         args: &pc.args,
@@ -490,13 +484,13 @@ impl<'a> RunCore<'a> {
                     Err(err) => format!("ERROR: {err}"),
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
-                results.push((
-                    pc.id.clone(),
-                    pc.name.clone(),
-                    result.clone(),
-                    pc.args.clone(),
-                    Some(dispatch.audit),
-                ));
+                results.push(ToolCallOutcome {
+                    id: pc.id.clone(),
+                    name: pc.name.clone(),
+                    result: result.clone(),
+                    args: pc.args.clone(),
+                    audit: Some(dispatch.audit),
+                });
                 self.hooks.dispatch(HookEvent::PostToolCall {
                     name: &pc.name,
                     args: &pc.args,
@@ -724,7 +718,14 @@ impl<'a> RunCore<'a> {
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
-            for (id, name, result, args, audit) in &results {
+            for ToolCallOutcome {
+                id,
+                name,
+                result,
+                args,
+                audit,
+            } in &results
+            {
                 // Auto-classifier denial limit — stop the agent immediately.
                 if result == DENIAL_LIMIT_SENTINEL {
                     let finish = FinishReason::PermissionDenialLimit;

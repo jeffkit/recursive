@@ -933,6 +933,8 @@ mod shutdown {
 
         let outcome = runtime.run("ignored").await.expect("run");
         assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
+        // Explicitly close the session — even with close(), Cancelled skips SessionEnd.
+        runtime.close(Some(&outcome)).await;
         assert_eq!(
             counter.session_end_count.load(Ordering::Relaxed),
             0,
