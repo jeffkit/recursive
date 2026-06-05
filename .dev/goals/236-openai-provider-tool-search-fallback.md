@@ -113,6 +113,20 @@ Add unit tests in `#[cfg(test)] mod tests` in `src/llm/openai.rs`:
 - The `ToolSearchTool` result content format for OpenAI is plain JSON text
   (not `tool_reference` blocks) — keep it simple, the model understands JSON.
 
+## CRITICAL: How to edit files
+
+`src/llm/openai.rs` is a large file (~400 lines). **DO NOT use `Write` to
+replace the entire file** — the output will be truncated and the tool call
+will fail with "missing path".
+
+**Use `apply_patch` (str_replace) for all edits:**
+1. Read the current file with `Read`.
+2. Use `apply_patch` to insert/replace specific sections (the `search_engine`
+   field addition, the new `run_search_loop` method, the builder, the trait
+   overrides, and the test module). Each `apply_patch` call should be a
+   surgical diff of the specific section being added.
+3. Never attempt to write the full file content in one `Write` call.
+
 ## Definition of done
 
 - `cargo build` and `cargo test --lib` green.
