@@ -21,6 +21,7 @@
 10. [自我迭代 Dashboard 可观测性分析](#十自我迭代-dashboard-可观测性分析)
 11. [深入分析：Compaction / Checkpoint / Shell 工具 / main.rs](#十一深入分析compaction--checkpoint--shell-工具--mainrs)
 12. [整体评分与修复优先级](#十二整体评分与修复优先级)
+13. [深入分析：LLM Provider / Runtime / Permissions / Config / TUI（+21 问题）](#十三深入分析llm-provider--runtime--permissions--config--tui)
 
 ---
 
@@ -673,6 +674,322 @@ format!("<{role_tag}>{}</{role_tag}>", m.content)
 
 ---
 
+## 十三、深入分析：LLM Provider / Runtime / Permissions / Config / TUI
+
+本节涵盖对 `src/llm/openai.rs`、`src/llm/anthropic.rs`、`src/runtime.rs`、`src/permissions/mod.rs`、`src/config.rs`、`src/run_core.rs`、`src/tui/` 的二次深挖，新增 21 个问题。
+
+---
+
+### 13.1 OpenAI `parse_sse_stream` 把整个流加载到内存再解析（伪流式）
+
+**位置**：`src/llm/openai.rs:344-346`
+
+```rust
+let reader = resp.text().await?;   // 一次性把整个 SSE stream 拉进内存
+for line in reader.lines() { ... }
+```
+
+`reqwest::Response::text()` 会等待整个 HTTP 体传输完毕才返回字符串。这意味着 OpenAI provider 的 `stream()` 实现虽然设置了 `"stream": true`，但实际上完全失去了流式效果：用户要等到最后一个 token 下载完毕才能看到任何输出。
+
+Anthropic provider 的流式实现使用 `bytes_stream()` + 逐行增量解析，这才是正确做法。OpenAI 的实现需要同样改造。
+
+---
+
+### 13.2 OpenAI `parse_sse_stream` 完全丢弃 tool_calls
+
+**位置**：`src/llm/openai.rs:340`
+
+```rust
+let tool_calls: Vec<ToolCall> = Vec::new();  // 声明后从未填充
+```
+
+SSE 流式解析函数只积累 `content` 和 `reasoning_content`，tool call 的 delta 块（`delta.tool_calls[*].function.arguments`）从未被解析。若模型在流式响应中返回 tool call，返回的 `Completion` 的 `tool_calls` 永远为空，导致 agent 认为这是一个纯文本回应而跳过工具执行。
+
+这是一个功能性 bug，在启用了流式模式（`--stream`）且使用 OpenAI-compatible provider 时，所有 tool call 会被静默丢弃。
+
+---
+
+### 13.3 `AnthropicProvider::new` 和 `OpenAiProvider::new` 均包含 `expect()`
+
+**位置**：`src/llm/anthropic.rs:55-58` / `src/llm/openai.rs:49-52`
+
+```rust
+client: Client::builder()
+    .timeout(Duration::from_secs(180))
+    .build()
+    .expect("reqwest client build"),  // 违反 Invariant #5
+```
+
+违反项目 Invariant #5（非测试代码不得使用 `unwrap()`/`expect()`）。尽管 `reqwest::Client::build()` 在 TLS 初始化失败时才报错（极少见），但在生产环境中（如操作系统缺少 root CA 证书）仍可触发，导致进程直接 panic 而非返回有意义的错误信息。
+
+---
+
+### 13.4 `check_static` 的 `DecisionReason::Rule` 总是报告 `RuleSource::User`
+
+**位置**：`src/permissions/mod.rs:367-382`
+
+```rust
+return Permission::Denied(
+    DecisionReason::Rule {
+        source: RuleSource::User,  // 硬编码，无论实际来自哪层
+        pattern: pattern.to_string(),
+    }, ...
+);
+```
+
+`LayeredPermissionsConfig` 有 Session / Project / User 三层。但在 `all_deny()` / `all_allow()` 的迭代过程中，没有跟踪"当前匹配的模式来自哪一层"。无论是 Session 层的临时规则还是 User 层的全局规则，audit log 里 `source` 都显示 `User`，使审计日志失去准确溯源能力。
+
+---
+
+### 13.5 `PermissionMode::Strict` 在 `check_static` 中没有显式处理
+
+**位置**：`src/permissions/mod.rs:309-387`
+
+`Strict` 模式在文档中描述为"把 `Unknown` 视为 `Denied`"，但 `check_static` 本身对 `Strict` 没有分支。如果没有任何 deny/allow 规则匹配，`Strict` 模式同样返回 `Permission::Unknown`。是否将 `Unknown` 升级为 `Denied` 完全依赖调用方（`invoke_with_audit`）的隐性约定，而非编码在 `check_static` 的返回值中。这是一种脆弱的设计——未来新增调用方很容易绕过 Strict 语义。
+
+---
+
+### 13.6 `DENIAL_LIMIT_SENTINEL` 早退路径违反工具调用配对不变量
+
+**位置**：`src/run_core.rs:729-744`
+
+```rust
+if result == DENIAL_LIMIT_SENTINEL {
+    // ...
+    return Ok(RunInnerOutcome { messages: self.messages, ... });
+    // push_message 在第 799 行，此处未到达
+}
+// ...（第 799 行）
+self.push_message(Message::tool_result(id.clone(), result.clone()));
+```
+
+当批量 tool call 中，第 N 个返回 DENIAL_LIMIT_SENTINEL 时，前 N-1 个 tool result 已经由前几轮迭代 push 进 `messages`，但第 N 个及之后的 tool result 从未被 push。这在 `self.messages` 中留下一条 assistant 消息（包含多个 tool_calls），但只有前 N-1 条匹配的 tool_result，违反 Invariant #8（tool-call ↔ tool-result 配对）。
+
+---
+
+### 13.7 `emit_turn_messages` 将相同 `UsageMeta` 分配给一轮中所有 assistant 消息
+
+**位置**：`src/runtime.rs:511-520`
+
+```rust
+let usage = if matches!(msg.role, Role::Assistant) {
+    Some(turn_usage.clone())   // turn_usage 是整轮的累计，每条 assistant msg 都获得相同值
+} else {
+    None
+};
+```
+
+若一轮内发生多次 LLM 调用（工具 → 模型 → 工具 → 模型），所有 assistant 消息均被标注为"完整的累计 token 数"。在 session JSONL 中统计成本时，token 数被重复累加，实际成本被高估数倍。
+
+---
+
+### 13.8 `execute_kernel_turn` 的 forwarder 任务 panic 会永久丢失 `TurnFinished` 事件
+
+**位置**：`src/runtime.rs:476`
+
+```rust
+self.deferred_turn_finished = forwarder.await.ok().flatten();
+```
+
+`forwarder.await` 若返回 `Err(JoinError)`（task panic），`.ok()` 将其转为 `None`，`TurnFinished` 事件永久丢失。使用 HTTP SSE 的 SDK 消费者永远收不到 turn 完成通知，其流式接收循环会无限等待。
+
+---
+
+### 13.9 `RetryPolicy::backoff_for` 指数退避计算可能整数溢出
+
+**位置**：`src/llm/mod.rs:75`
+
+```rust
+let backoff = self.initial_backoff * 2u32.pow(attempt as u32);
+```
+
+当用户通过 `RECURSIVE_RETRY_MAX` 设置较大重试次数时（例如 32），`2u32.pow(32)` 在 debug 模式下直接 panic，在 release 模式下产生 0（归零）并跳过退避。应使用 `saturating_pow` 或在乘法前先检查上界。
+
+---
+
+### 13.10 并行工具批次结果匹配使用 O(n²) 线性扫描
+
+**位置**：`src/run_core.rs:446-449`
+
+```rust
+batch_results.iter().find(|(id, _, _, _, _, _)| id == &pc.id)
+```
+
+每个 `batch` 中的工具调用都要对 `batch_results` 做线性扫描以找到对应结果。如果批次大小为 N，总复杂度为 O(N²)。应在批次完成后构建一个 `HashMap<String, BatchRow>`，将匹配降至 O(1)。
+
+---
+
+### 13.11 `Config::from_env()` 在 App::new() 中同步读取多个磁盘文件
+
+**位置**：`src/config.rs:218-237` / `src/tui/app/state.rs:15-17`
+
+```rust
+// Config::from_env() 内部：
+let memory_block = memory_summary(&workspace, memory_summary_limit);  // 磁盘 I/O
+let scratchpad_block = scratchpad_summary(&workspace);                  // 磁盘 I/O
+let facts_block = facts_summary(&workspace, ...);                      // 磁盘 I/O
+let episodic_block = episodic_recall_summary(&workspace, ...);         // 磁盘 I/O
+
+// App::new() 调用：
+let workspace = crate::config::Config::from_env().map(|c| c.workspace)...;
+```
+
+TUI 启动时 `App::new()` 在主线程同步调用 `from_env()`，4 次磁盘读取完成前无法渲染第一帧。对于大型 memory 文件（记忆条目多时），这会导致 TUI 启动卡顿。
+
+---
+
+### 13.12 `App::new()` 静默丢弃 `Config::from_env()` 错误
+
+**位置**：`src/tui/app/state.rs:15-17`
+
+```rust
+let workspace = crate::config::Config::from_env()
+    .map(|c| c.workspace)
+    .unwrap_or_else(|_| std::path::PathBuf::from("."));  // 错误被吞掉
+```
+
+如果配置文件损坏（例如 `~/.recursive/config.toml` 语法错误）或 preset id 无效，`from_env()` 返回 `Err`，但 TUI 会静默 fallback 到当前目录继续运行，用户不会看到任何报错。实际上 session 会用错误的 workspace 路径进行工具沙箱验证，可能放行或拒绝原本不该放行/拒绝的操作。
+
+---
+
+### 13.13 `HookEvent::SessionEnd` 在每轮 `run()` 结束时都触发，而非会话真正结束时
+
+**位置**：`src/runtime.rs:364-368`
+
+```rust
+// 每次 run() 结束时：
+if !matches!(outcome.finish_reason, FinishReason::Cancelled) {
+    self.kernel.hooks().dispatch(HookEvent::SessionEnd { outcome: &outcome });
+}
+```
+
+`SessionStart` 只在 `turn_index == 0` 触发一次，但 `SessionEnd` 在每次 `run()` 调用后（每轮对话）都触发。对于 HTTP 多轮会话（同一 session 发多条消息），`SessionEnd` hook 会在每条消息处理完后触发一次，而非真正关闭会话时触发一次。做清理/归档的 hooks 会被多次重复执行。
+
+---
+
+### 13.14 `OpenAiProvider::serialize_message` 将 `reasoning_content` 发送给所有角色消息
+
+**位置**：`src/llm/openai.rs:480-482`
+
+```rust
+// 对所有 Message 角色（包括 User、Tool）
+if let Some(ref reasoning) = m.reasoning_content {
+    obj.insert("reasoning_content".into(), Value::String(reasoning.clone()));
+}
+```
+
+DeepSeek 的 `reasoning_content` 字段仅在 assistant 消息中有效；在 user 或 tool 消息中发送此字段是非法的，会被 API 以 400 错误拒绝或静默忽略（取决于版本）。当 `Message` 对象被错误地携带了 `reasoning_content`（例如在 replay 或 compaction 路径中），会导致 API 请求失败。
+
+---
+
+### 13.15 `ModelPricing::cost_usd` 的缓存命中计费逻辑存在双重问题
+
+**位置**：`src/llm/mod.rs:120-133`
+
+```rust
+let in_cost = if usage.cache_hit_tokens > 0 {
+    let cache_hit = usage.cache_hit_tokens as f64 * self.cache_hit_input_per_million / ...;
+    let cache_miss = usage.cache_miss_tokens as f64 * self.input_per_million / ...;
+    cache_hit + cache_miss  // 问题：prompt_tokens 包括两者，但这里用 cache_miss_tokens 替代
+} else {
+    (usage.prompt_tokens as f64) * self.input_per_million / ...  // 走另一分支
+};
+```
+
+当 `cache_hit_tokens > 0` 时，代码用 `cache_hit_tokens + cache_miss_tokens` 替代 `prompt_tokens` 做计费。代码注释自承"cache_miss_tokens may not equal prompt - cache_hit due to rounding"，这意味着在有缓存命中时，总计费可能不等于无缓存时的 `prompt_tokens * rate`，造成静默计费误差。
+
+---
+
+### 13.16 `context_window_tokens_for_model` 对未知模型 fallback 到 128K，双向失准
+
+**位置**：`src/llm/mod.rs:143-153`
+
+```rust
+// Unknown models get a conservative 128K token default
+128_000
+```
+
+若实际模型窗口 < 128K（如某些 8K 上下文的本地模型），compaction 阈值被设得过高，agent 会在超出上下文后得到 API 错误而非优雅地触发 compaction；若实际窗口 > 128K（如 1M 上下文模型），compaction 阈值被设得过低，导致频繁压缩降低性能。对于自定义 endpoint 的用户，这是常见配置错误场景。
+
+---
+
+### 13.17 `ToolSearchTool` 的 `MAX_SEARCH_ROUNDS = 3` 硬编码且不可配置
+
+**位置**：`src/llm/anthropic.rs:26`
+
+```rust
+const MAX_SEARCH_ROUNDS: usize = 3;
+```
+
+搜索轮次上限硬编码为 3，且在达到上限时采用的策略是"返回当前 completion 让 kernel 决定"（line 193-195），但 kernel 不知道这是因为搜索轮次耗尽，可能将不完整的 tool 发现结果当作正常响应处理。
+
+不同场景（工具数多/少、复杂查询）所需轮次差异很大，应提供 `AnthropicProvider::with_max_search_rounds()` 方法或通过 config 文件配置。
+
+---
+
+### 13.18 `run_inner` 的 `last_call_key` 序列化失败时使用空字符串误触发 Stuck
+
+**位置**：`src/run_core.rs:761`
+
+```rust
+let call_key = (
+    name.clone(),
+    serde_json::to_string(args).unwrap_or_default(),  // 失败时用空字符串 ""
+);
+```
+
+若 `serde_json::to_string` 失败（罕见，但在参数含有特殊 Value 类型时可能发生），`call_key` 的参数部分为空字符串 `""`。下一个同名工具（即使参数完全不同）的失败调用也会误匹配为"完全相同的调用"，导致 Stuck 被错误触发，提前终止 agent。
+
+---
+
+### 13.19 `PermissionLayer::allow` 字段注释"Empty = allow all"语义有误
+
+**位置**：`src/permissions/mod.rs:256-258`
+
+```rust
+/// Tools that are explicitly allowed. Empty = allow all.
+pub allow: Vec<String>,
+```
+
+注释"Empty = allow all"与实际行为相反：allow 列表为空时，在 `check_static` 中 `all_allow()` 迭代零次，无任何 allow 规则匹配，最终返回 `Permission::Unknown`（对非交互工具相当于允许，但并非"无条件 allow all"）。实际语义是"no explicit allow rules"。这个误导性注释可能导致新开发者错误地认为空列表会放行所有工具，实际上行为依赖于 mode 和其他层的 deny 规则。
+
+---
+
+### 13.20 `drain_queue` 错误传播会静默放弃后续队列中的消息
+
+**位置**：`src/runtime.rs:560-566`
+
+```rust
+async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
+    let mut last: Option<RuntimeOutcome> = None;
+    while let Some(msg) = self.message_queue.pop_front() {
+        last = Some(self.run(msg).await?);  // ? 立即传播，剩余消息丢失
+    }
+    Ok(last)
+}
+```
+
+若队列中第 1 条消息处理时发生错误（LLM 错误、工具错误等），`?` 立即传播 `Err`，队列中其余消息（pop 出的 `msg` 和未 pop 的后续消息）均被永久丢弃，且调用方无法感知有多少消息被跳过。
+
+---
+
+### 13.21 `OpenAiProvider` 与 `AnthropicProvider` 流式实现不对称：工具调用处理缺失
+
+**总结性问题**
+
+上述 13.2 问题（OpenAI 流式丢弃 tool_calls）与 Anthropic 的实现存在系统性不对称：
+
+| 能力 | Anthropic stream | OpenAI stream |
+|------|-----------------|---------------|
+| 内容 delta 积累 | ✅ | ✅ |
+| reasoning_content delta | ✅ | ✅ |
+| tool_calls delta 解析 | ✅ | ❌ 静默丢弃 |
+| 真正的增量流（逐块解析）| ✅ | ❌ 全量缓冲后解析 |
+
+由于 OpenAI 是项目的"通用 adapter"（兼容 DeepSeek、GLM、Moonshot 等大量 provider），这个缺陷影响范围远超 OpenAI 本身。
+
+---
+
 ## 十二、整体评分与修复优先级
 
 ### 评分
@@ -686,23 +1003,38 @@ format!("<{role_tag}>{}</{role_tag}>", m.content)
 | 测试覆盖 | 5/10 | 核心类型有测试，集成路径覆盖不足 |
 | 可观测性 | 4/10 | 日志有 tracing，但缺结构化 metrics |
 
-### 修复优先级
+### 修复优先级（含第十三章新增 21 个问题）
 
 | 优先级 | 问题 | 影响 | 成本 |
 |--------|------|------|------|
-| **P0** | 合并双重重试逻辑 | 高（实际重试次数翻倍，成本加倍） | 低 |
-| **P0** | 修复 Stuck 检测 | 高（agent 循环卡死消耗全部预算） | 低 |
-| **P0** | 修复 `blake3_canonical_json` | 高（args_hash 不稳定，resume 漏检） | 低 |
-| **P0** | AutoClassifier 失败改为默认 block | 高（安全假设方向错误） | 低 |
-| **P1** | `restore_paths` 加 `resolve_within` 验证 | 高（path traversal 风险） | 低 |
-| **P1** | 统一 permission hook 路径 | 中（`RunCore` hook 路径是死代码） | 中 |
-| **P1** | `backend.rs` unwrap 替换为 pattern match | 中（生产 panic 风险） | 低 |
-| **P1** | Checkpoint `snapshot_for_session` 改 `spawn_blocking` | 中（阻塞 tokio 线程） | 中 |
-| **P1** | `estimate_chars` 补充 tool_calls 体积 | 中（compaction 阈值偏低） | 低 |
-| **P1** | Session metrics 更新不一致（POST /messages 不更新） | 中（监控数据失真） | 低 |
-| **P2** | `compact()` / `apply_to_transcript()` 分割点统一 | 中（摘要与 drain 不一致） | 低 |
-| **P2** | `App` 拆分 + `commands.rs` 重构 | 低（可维护性） | 高 |
-| **P2** | Sessions 内存上限 | 低（长期服务器 OOM 风险） | 中 |
-| **P2** | `main()` 拆分为子函数 | 低（可维护性） | 中 |
-| **P3** | MCP SSE 重连机制 | 低（稳定性） | 中 |
-| **P3** | compact 的 tool_calls 加入 older_text | 低（摘要质量） | 低 |
+| **P0** | 合并双重重试逻辑（§1.1） | 高（实际重试次数翻倍） | 低 |
+| **P0** | 修复 Stuck 检测（§1.2） | 高（agent 循环卡死消耗全部预算） | 低 |
+| **P0** | 修复 blake3_canonical_json（§3.4） | 高（args_hash 不稳定，resume 漏检） | 低 |
+| **P0** | AutoClassifier 失败改为默认 block（§8.1） | 高（安全假设方向错误） | 低 |
+| **P0** | OpenAI 流式丢弃 tool_calls（§13.2） | 高（所有 tool call 被静默丢弃） | 中 |
+| **P0** | DENIAL_LIMIT 早退违反配对不变量（§13.6） | 高（Invariant #8 违反，API 400） | 低 |
+| **P1** | restore_paths 加 resolve_within 验证（§11.4） | 高（path traversal 风险） | 低 |
+| **P1** | 统一 permission hook 路径（§2.4） | 中（RunCore hook 路径是死代码） | 中 |
+| **P1** | Provider::new 中的 .expect() unwrap（§13.3） | 中（生产 panic 风险） | 低 |
+| **P1** | Checkpoint snapshot_for_session 改 spawn_blocking（§11.3） | 中（阻塞 tokio 线程） | 中 |
+| **P1** | estimate_chars 补充 tool_calls 体积（§11.2） | 中（compaction 阈值偏低） | 低 |
+| **P1** | Session metrics 更新不一致（§6.2） | 中（监控数据失真） | 低 |
+| **P1** | forwarder panic 丢失 TurnFinished（§13.8） | 中（SDK 消费者无限等待） | 低 |
+| **P1** | App::new() 静默丢弃配置错误（§13.12） | 中（错误 workspace 路径无提示） | 低 |
+| **P2** | OpenAI 伪流式全量缓冲（§13.1） | 中（流式用户体验失效） | 中 |
+| **P2** | check_static DecisionReason 来源层信息丢失（§13.4） | 中（审计日志失准） | 低 |
+| **P2** | HookEvent::SessionEnd 多轮重复触发（§13.13） | 中（cleanup hook 重复执行） | 低 |
+| **P2** | emit_turn_messages token 双重计费（§13.7） | 中（成本统计虚高） | 低 |
+| **P2** | compact/apply_to_transcript 分割点统一（§11.1） | 中（摘要与 drain 不一致） | 低 |
+| **P2** | RetryPolicy 指数溢出（§13.9） | 低（高重试次数时 panic） | 低 |
+| **P2** | drain_queue 静默丢失后续消息（§13.20） | 低（队列消息丢失无提示） | 低 |
+| **P2** | App 拆分 + commands.rs 重构（§2.1） | 低（可维护性） | 高 |
+| **P2** | Sessions 内存上限（§6.4） | 低（长期服务器 OOM 风险） | 中 |
+| **P2** | main() 拆分为子函数（§11.6） | 低（可维护性） | 中 |
+| **P3** | Strict 模式在 check_static 无显式分支（§13.5） | 低（依赖调用方隐性约定） | 低 |
+| **P3** | last_call_key 序列化失败误触发 Stuck（§13.18） | 低（罕见，误判 Stuck） | 低 |
+| **P3** | context_window_tokens_for_model 双向失准（§13.16） | 低（compaction 时机不准确） | 低 |
+| **P3** | PermissionLayer::allow 注释语义有误（§13.19） | 低（文档误导） | 低 |
+| **P3** | MCP SSE 重连机制（§7.2） | 低（稳定性） | 中 |
+| **P3** | compact 的 tool_calls 加入 older_text（§11.7） | 低（摘要质量） | 低 |
+| **P3** | MAX_SEARCH_ROUNDS 硬编码（§13.17） | 低（灵活性缺失） | 低 |

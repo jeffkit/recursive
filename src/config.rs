@@ -120,7 +120,10 @@ impl Config {
         // dedicated Anthropic endpoint, prefer that over the default api_base.
         let preset_api_base = preset.map(|p| {
             if provider_type == "anthropic" {
-                p.anthropic_api_base.as_deref().unwrap_or(&p.api_base).to_string()
+                p.anthropic_api_base
+                    .as_deref()
+                    .unwrap_or(&p.api_base)
+                    .to_string()
             } else {
                 p.api_base.clone()
             }
