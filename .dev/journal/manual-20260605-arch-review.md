@@ -19,7 +19,8 @@
 8. [深入分析：Permissions 自动分类器](#八深入分析permissions-自动分类器)
 9. [深入分析：Hooks 系统](#九深入分析hooks-系统)
 10. [自我迭代 Dashboard 可观测性分析](#十自我迭代-dashboard-可观测性分析)
-11. [整体评分与修复优先级](#十一整体评分与修复优先级)
+11. [深入分析：Compaction / Checkpoint / Shell 工具 / main.rs](#十一深入分析compaction--checkpoint--shell-工具--mainrs)
+12. [整体评分与修复优先级](#十二整体评分与修复优先级)
 
 ---
 
@@ -549,7 +550,130 @@ JSONL sessions       →  session analyzer    →  JSON API
 
 ---
 
-## 十一、整体评分与修复优先级
+## 十一、深入分析：Compaction / Checkpoint / Shell 工具 / main.rs
+
+### 11.1 `compact()` 和 `apply_to_transcript()` 的分割点计算不一致
+
+**位置**：`src/compact.rs:206-265`（`compact`）vs `src/compact.rs:175-195`（`apply_to_transcript`）
+
+`compact()` 用 `n = self.keep_recent_n.min(transcript.len() - 1)`、`split = len - n` 计算旧消息范围（用于摘要），但 `apply_to_transcript()` 用同样的 `keep`/`split` 逻辑计算 drain 范围（用于实际删除）。**两者的 split 点相互独立**：
+
+```rust
+// compact() 内部
+let n = self.keep_recent_n.min(transcript.len().saturating_sub(1));
+let split = transcript.len().saturating_sub(n);  // "older" 范围
+
+// apply_to_transcript() 独立计算
+let keep = self.keep_recent_n;
+let mut split = transcript.len().saturating_sub(keep);  // "drain" 范围
+```
+
+如果 `apply_to_transcript()` 后退了 split（因为命中 `Role::Tool`），而 `compact()` 使用未后退的 split 来决定摘要哪些消息，**summary 摘要的消息集合和实际 drain 的消息集合不完全一致**。极端情况：工具结果被 drain 掉，但其对应的 assistant tool_call 消息被摘要（因为 compact 时未后退，而 apply_to_transcript 后退了）。
+
+**建议**：将分割点计算提取为单一 `fn safe_split_point(transcript, keep_n) -> usize`，`compact()` 和 `apply_to_transcript()` 共用同一结果。
+
+---
+
+### 11.2 `estimate_chars` 遗漏了 tool_calls 的序列化体积
+
+**位置**：`src/compact.rs:53-55`
+
+```rust
+pub fn estimate_chars(transcript: &[Message]) -> usize {
+    transcript.iter().map(|m| m.content.len()).sum()
+}
+```
+
+`m.content` 只计算了文字内容。`m.tool_calls`（每个含 `name`、`id`、`arguments` JSON 串）和 `m.reasoning_content`（DeepSeek 思维链）完全不在估算里。一个 step 调用了 5 个工具，每个 `arguments` 是 500 字符的 JSON，估算就少了 2500 字符。对 compaction 阈值的判断会系统性偏低，导致压缩触发比预期晚。
+
+---
+
+### 11.3 Checkpoint 系统每次操作都 fork 新 git 进程
+
+**位置**：`src/checkpoint.rs:143-265`（`snapshot_for_session`）
+
+`snapshot_for_session` 一次快照需要顺序执行 4 个同步 `git` 子进程：`git add`、`git write-tree`、`git commit-tree`、`git update-ref`。在 agent 每次 turn 开始和结束时都要调用两次快照，每次 4 个进程，一个 50 步的 run 会产生 400 次 `git` fork。
+
+- `std::process::Command::output()` 是同步阻塞的，在 tokio async 上下文中会阻塞工作线程
+- 如果 git 因为 gitconfig 读取慢（NFS/远程文件系统）每次多花 50ms，整个 run 会多花 20 秒
+
+**建议**：将 `ShadowRepo` 方法包装在 `tokio::task::spawn_blocking` 中，使其异步化；或使用 `git2` crate（libgit2 bindings）避免 fork。
+
+---
+
+### 11.4 `restore_paths` 没有路径规范化，存在 path traversal 风险
+
+**位置**：`src/checkpoint.rs:345-398`
+
+```rust
+pub fn restore_paths(&self, checkpoint: &CheckpointId, paths: &[String]) -> Result<RestoreStats> {
+    for path in paths {
+        let abs = self.workspace.join(path);  // 直接 join，没有 resolve_within 检查
+```
+
+`paths` 来自 `CheckpointRecord::touched_files`，是 `run_shell` 的 shell-diff 归因结果。如果 shell 命令（通过 symlink 或 `../` 写入）产生了包含 `..` 的路径，`restore_paths` 会盲目地在 workspace 外写入/删除文件。`validate_session_id` 对 session_id 做了路径检查，但 `restore_paths` 对文件路径没有同等保护。
+
+**建议**：在 `restore_paths` 的循环里用 `resolve_within(&self.workspace, path)` 验证 `abs` 确实在 workspace 内。
+
+---
+
+### 11.5 Shell 工具的沙箱仅保护 `cwd`，不限制命令本身
+
+**位置**：`src/tools/shell.rs:79-91`
+
+```rust
+let cwd = if let Some(rel) = args.get("cwd").and_then(|v| v.as_str()) {
+    resolve_within(&self.root, rel).map_err(...)?
+} else {
+    self.root.clone()
+};
+let mut cmd = Command::new("/bin/sh");
+cmd.arg("-c").arg(command);   // command 本身没有任何限制
+cmd.current_dir(&cwd);
+```
+
+`cwd` 的路径通过 `resolve_within` 做了沙箱验证，但 `command` 字符串本身（`/bin/sh -c "$command"`）完全未受约束。agent 可以执行：
+- `cat /etc/passwd`（读 workspace 外的文件）
+- `curl http://...`（外部网络请求）  
+- `rm -rf /`（如果有权限）
+
+**这是设计决策**（`ToolSideEffect::External` 的语义），不是 bug。但它意味着：在 `PermissionMode::Auto` 或 `BypassPermissions` 下，RunShell 的安全性完全依赖 AutoClassifier 和权限层，而不是内核层面的强制隔离。README/文档中应明确说明这一点，并建议生产环境使用容器化（`docker_sandbox` feature）。
+
+---
+
+### 11.6 `main.rs` 2222 行，`main()` 函数 500+ 行，参数冲突检测缺失
+
+**位置**：`src/main.rs`
+
+`main()` 函数处理所有参数的合并、provider 选择、工具注册、subcommand 分发，超过 500 行。问题：
+
+1. **互斥参数未显式声明冲突**：`--json` 和 `--output-format=json` 语义重叠，`--system-prompt` 和 `--system-prompt-file` 互斥，但 Clap 的 `conflicts_with` 特性未被使用，靠代码中的 `if let Some`/`else` 约定处理，容易漏掉组合。
+
+2. **`effective_json` 等局部变量跨越 500+ 行**：在 `main()` 顶部定义的变量一直到底部才被消费，阅读时难以追踪状态。
+
+3. **subcommand 处理全部在同一个 `main()` 中**：应提取为 `run_cmd_run()`、`run_cmd_resume()`、`run_cmd_sessions()` 等独立函数。
+
+**建议**：
+- 将 `main()` 重构为：参数解析 → `AppConfig::from_cli(cli)` → `dispatch_cmd(app_config, cmd)` 三层
+- 对互斥参数使用 `#[clap(conflicts_with = "...")]` 声明
+
+---
+
+### 11.7 `compact()` 的 tool_calls 内容被 XML 转义包裹，但 `m.content` 可能包含 `<`
+
+**位置**：`src/compact.rs:218-230`
+
+```rust
+format!("<{role_tag}>{}</{role_tag}>", m.content)
+```
+
+`m.content` 是原始字符串，可能包含 `<`、`>`、`&` 等字符（如文件内容、代码片段）。将其直接嵌入 XML 风格标签中，会在摘要 prompt 里产生格式混乱，误导 LLM 解析结构。
+
+另外，`tool_calls` 字段完全没有被序列化进 `older_text`，即历史工具调用的名称和参数在摘要 prompt 里不可见，LLM 摘要时会遗漏哪些工具被调用过。
+
+---
+
+## 十二、整体评分与修复优先级
 
 ### 评分
 
@@ -564,10 +688,21 @@ JSONL sessions       →  session analyzer    →  JSON API
 
 ### 修复优先级
 
-1. **P0 - 合并双重重试**（高影响，低成本）
-2. **P0 - 修复 Stuck 检测**（高影响，低成本）
-3. **P0 - 修复 `blake3_canonical_json`**（高影响，低成本）
-4. **P1 - 统一 permission hook 路径**（中影响，中成本）
-5. **P1 - `backend.rs` unwrap 替换为 pattern match**（中影响，低成本）
-6. **P2 - `App` 拆分 + `commands.rs` 重构**（低影响，高成本）
-7. **P2 - 两套 Compaction 合并**（低影响，中成本）
+| 优先级 | 问题 | 影响 | 成本 |
+|--------|------|------|------|
+| **P0** | 合并双重重试逻辑 | 高（实际重试次数翻倍，成本加倍） | 低 |
+| **P0** | 修复 Stuck 检测 | 高（agent 循环卡死消耗全部预算） | 低 |
+| **P0** | 修复 `blake3_canonical_json` | 高（args_hash 不稳定，resume 漏检） | 低 |
+| **P0** | AutoClassifier 失败改为默认 block | 高（安全假设方向错误） | 低 |
+| **P1** | `restore_paths` 加 `resolve_within` 验证 | 高（path traversal 风险） | 低 |
+| **P1** | 统一 permission hook 路径 | 中（`RunCore` hook 路径是死代码） | 中 |
+| **P1** | `backend.rs` unwrap 替换为 pattern match | 中（生产 panic 风险） | 低 |
+| **P1** | Checkpoint `snapshot_for_session` 改 `spawn_blocking` | 中（阻塞 tokio 线程） | 中 |
+| **P1** | `estimate_chars` 补充 tool_calls 体积 | 中（compaction 阈值偏低） | 低 |
+| **P1** | Session metrics 更新不一致（POST /messages 不更新） | 中（监控数据失真） | 低 |
+| **P2** | `compact()` / `apply_to_transcript()` 分割点统一 | 中（摘要与 drain 不一致） | 低 |
+| **P2** | `App` 拆分 + `commands.rs` 重构 | 低（可维护性） | 高 |
+| **P2** | Sessions 内存上限 | 低（长期服务器 OOM 风险） | 中 |
+| **P2** | `main()` 拆分为子函数 | 低（可维护性） | 中 |
+| **P3** | MCP SSE 重连机制 | 低（稳定性） | 中 |
+| **P3** | compact 的 tool_calls 加入 older_text | 低（摘要质量） | 低 |
