@@ -322,7 +322,7 @@ mod tests {
             "[provider]\npreset = \"deepseek\"\n",
         )
         .expect("rewrite");
-        assert_eq!(detect_model_name(), "deepseek-chat");
+        assert_eq!(detect_model_name(), "deepseek-v4-flash");
 
         // Restore env.
         std::env::remove_var("RECURSIVE_MODEL");

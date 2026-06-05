@@ -292,10 +292,10 @@ mod tests {
         tracker.record_usage(usage, 0);
 
         let cost = tracker.cost_usd().unwrap();
-        // input: 1M * 0.27/1M = $0.27
-        // output: 500k * 1.10/1M = $0.55
-        // total: $0.82
-        assert!((cost - 0.82).abs() < 0.001);
+        // input: 1M * 0.14/1M = $0.14
+        // output: 500k * 0.28/1M = $0.14
+        // total: $0.28
+        assert!((cost - 0.28).abs() < 0.001);
     }
 
     #[test]
@@ -380,12 +380,12 @@ mod tests {
         // Verify .meta.json was updated with cost fields
         let updated_meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
-        // deepseek-chat: input $0.27/M, output $1.10/M, cache hit $0.027/M
-        // cache hit: 100 * 0.027/1M = 0.0000027
-        // cache miss: 400 * 0.27/1M = 0.000108
-        // output: 300 * 1.10/1M = 0.00033
-        // total: 0.0004407
-        assert!((updated_meta["cost_usd"].as_f64().unwrap() - 0.000_440_7).abs() < 0.000_001);
+        // deepseek-chat: input $0.14/M, output $0.28/M, cache hit $0.0028/M
+        // cache hit: 100 * 0.0028/1M = 0.00000028
+        // cache miss: 400 * 0.14/1M = 0.000056
+        // output: 300 * 0.28/1M = 0.000084
+        // total: 0.000140308
+        assert!((updated_meta["cost_usd"].as_f64().unwrap() - 0.000_140_308).abs() < 0.000_001);
         assert_eq!(updated_meta["total_tokens"], 800);
         assert_eq!(updated_meta["prompt_tokens"], 500);
         assert_eq!(updated_meta["completion_tokens"], 300);
@@ -484,7 +484,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
-        // deepseek-chat: $0.27/M input, $1.10/M output, $0.027/M cache hit
+        // deepseek-chat: $0.14/M input, $0.28/M output, $0.0028/M cache hit
         let usage = TokenUsage {
             prompt_tokens: 1_000_000,
             completion_tokens: 500_000,
@@ -495,10 +495,10 @@ mod tests {
         tracker.record_usage(usage, 0);
 
         let cost = tracker.cost_usd().unwrap();
-        // cache hit: 600k * 0.027/1M = $0.0162
-        // cache miss: 400k * 0.27/1M = $0.108
-        // output: 500k * 1.10/1M = $0.55
-        // total: $0.6742
-        assert!((cost - 0.6742).abs() < 0.001);
+        // cache hit: 600k * 0.0028/1M = $0.00168
+        // cache miss: 400k * 0.14/1M = $0.056
+        // output: 500k * 0.28/1M = $0.14
+        // total: $0.19768
+        assert!((cost - 0.19768).abs() < 0.001);
     }
 }
