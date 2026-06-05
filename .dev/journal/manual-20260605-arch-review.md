@@ -5,6 +5,8 @@
 **审查范围**：`src/` 全部约 68,000 行 Rust 代码  
 **说明**：不依赖文档，直接以代码事实为依据
 
+**核实更新（2026-06-05）**：对照源码复核后，§1.1、§1.3 判定为**不属实**（见各节标注）。其余条目未经逐条复核的，仍保持原审查结论。
+
 ---
 
 ## 目录
@@ -27,13 +29,15 @@
 
 ## 一、严重问题
 
-### 1.1 双重重试逻辑，实际重试次数翻倍
+### ~~1.1 双重重试逻辑，实际重试次数翻倍~~ ❌ 核实后不属实
+
+> **核实结论（2026-06-05）**：不属实。Provider 内重试耗尽后返回的是 `Error::Llm`，而 `RunCore::call_llm_with_retry` 仅对 `Error::RateLimited` / `Error::Timeout` 重试（`error.rs::is_retryable`）。当前 OpenAI/Anthropic provider 从不产生 `RateLimited`，RunCore 层重试实为死代码，不存在「最多 6 次 HTTP 请求」的叠加。
 
 **位置**：`src/run_core.rs:116-180` 和 `src/llm/mod.rs:42-78`
 
-`RunCore::call_llm_with_retry` 在 agent 循环层做了最多 3 次重试（`LLM_MAX_RETRIES = 3`）；而每个 LLM provider（`AnthropicProvider`、`OpenAiProvider`）内部还有独立的 `RetryPolicy`（默认 `max_retries = 2`）。两套重试完全独立：一次限速错误会先在 provider 内重试 2 次，失败后再被 `RunCore` 重试 3 次，实际最多触发 **6 次 HTTP 请求**，退避时间也不一致。
+~~`RunCore::call_llm_with_retry` 在 agent 循环层做了最多 3 次重试（`LLM_MAX_RETRIES = 3`）；而每个 LLM provider（`AnthropicProvider`、`OpenAiProvider`）内部还有独立的 `RetryPolicy`（默认 `max_retries = 2`）。两套重试完全独立：一次限速错误会先在 provider 内重试 2 次，失败后再被 `RunCore` 重试 3 次，实际最多触发 **6 次 HTTP 请求**，退避时间也不一致。~~
 
-**建议**：删掉 `RunCore` 层的重试逻辑，统一交给 provider 的 `RetryPolicy`，只在一处控制重试语义。
+~~**建议**：删掉 `RunCore` 层的重试逻辑，统一交给 provider 的 `RetryPolicy`，只在一处控制重试语义。~~
 
 ---
 
@@ -59,7 +63,9 @@ if is_error {
 
 ---
 
-### 1.3 `blake3_canonical_json` 命名与实现不符
+### ~~1.3 `blake3_canonical_json` 命名与实现不符~~ ❌ 核实后不属实
+
+> **核实结论（2026-06-05）**：不属实。项目 `Cargo.toml` 使用 `serde_json = "1"` 且未启用 `preserve_order`，默认 `Map` 为 `BTreeMap`（键有序），`Value::to_string()` 输出对等价对象是确定的。函数名虽易误导，但 `args_hash` 不会因键插入顺序不同而产生不同哈希。
 
 **位置**：`src/tools/mod.rs:137-141`
 
@@ -71,9 +77,9 @@ fn blake3_canonical_json(v: &Value) -> String {
 }
 ```
 
-`serde_json::Value::to_string()` 的 Object key 顺序依赖于 `Value` 的内部构造方式（`serde_json::Map` 默认是随机哈希顺序）。两个逻辑等价的 JSON 对象因字段插入顺序不同，会产生**不同的哈希值**，导致 `args_hash` 用于"检测参数漂移"的功能不可靠。
+~~`serde_json::Value::to_string()` 的 Object key 顺序依赖于 `Value` 的内部构造方式（`serde_json::Map` 默认是随机哈希顺序）。两个逻辑等价的 JSON 对象因字段插入顺序不同，会产生**不同的哈希值**，导致 `args_hash` 用于"检测参数漂移"的功能不可靠。~~
 
-**建议**：使用 BTreeMap 强制键排序后再序列化，或引入 `json-canon` crate。
+~~**建议**：使用 BTreeMap 强制键排序后再序列化，或引入 `json-canon` crate。~~
 
 ---
 
@@ -1007,9 +1013,9 @@ async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
 
 | 优先级 | 问题 | 影响 | 成本 |
 |--------|------|------|------|
-| **P0** | 合并双重重试逻辑（§1.1） | 高（实际重试次数翻倍） | 低 |
+| ~~**P0**~~ | ~~合并双重重试逻辑（§1.1）~~ | ~~高（实际重试次数翻倍）~~ | — **核实后不属实，已移除** |
 | **P0** | 修复 Stuck 检测（§1.2） | 高（agent 循环卡死消耗全部预算） | 低 |
-| **P0** | 修复 blake3_canonical_json（§3.4） | 高（args_hash 不稳定，resume 漏检） | 低 |
+| ~~**P0**~~ | ~~修复 blake3_canonical_json（§1.3）~~ | ~~高（args_hash 不稳定，resume 漏检）~~ | — **核实后不属实，已移除** |
 | **P0** | AutoClassifier 失败改为默认 block（§8.1） | 高（安全假设方向错误） | 低 |
 | **P0** | OpenAI 流式丢弃 tool_calls（§13.2） | 高（所有 tool call 被静默丢弃） | 中 |
 | **P0** | DENIAL_LIMIT 早退违反配对不变量（§13.6） | 高（Invariant #8 违反，API 400） | 低 |

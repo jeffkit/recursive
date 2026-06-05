@@ -472,7 +472,7 @@ mod tests {
 
         let p2 = pricing_for("deepseek-chat");
         assert!(p2.is_some());
-        assert!((p2.unwrap().input_per_million - 0.27).abs() < 1e-9);
+        assert!((p2.unwrap().input_per_million - 0.14).abs() < 1e-9);
     }
 
     #[test]
@@ -557,9 +557,9 @@ mod tests {
     #[test]
     fn pricing_for_deepseek_has_cache_discount() {
         let pricing = pricing_for("deepseek-chat").expect("deepseek-chat should be known");
-        // Input: $0.27/M, cache hit should be 10% = $0.027/M
-        assert!((pricing.input_per_million - 0.27).abs() < 1e-9);
-        assert!((pricing.cache_hit_input_per_million - 0.027).abs() < 1e-9);
+        // deepseek-chat now routes to deepseek-v4-flash: $0.14/M input, $0.0028/M cache hit
+        assert!((pricing.input_per_million - 0.14).abs() < 1e-9);
+        assert!((pricing.cache_hit_input_per_million - 0.0028).abs() < 1e-9);
     }
 
     /// Unknown model returns None (cost won't be printed - conservative).
@@ -599,15 +599,14 @@ mod tests {
         // Names must exactly match providers.toml entries.
         assert_eq!(
             context_window_tokens_for_model("claude-sonnet-4-6"),
-            200_000
+            1_000_000
         );
-        assert_eq!(context_window_tokens_for_model("claude-opus-4-7"), 200_000);
-        assert_eq!(context_window_tokens_for_model("MiniMax-M3"), 1_000_000);
-        assert_eq!(context_window_tokens_for_model("deepseek-chat"), 64_000);
-        assert_eq!(context_window_tokens_for_model("deepseek-reasoner"), 64_000);
+        assert_eq!(context_window_tokens_for_model("claude-opus-4-7"), 1_000_000);
+        assert_eq!(context_window_tokens_for_model("MiniMax-M3"), 1_048_576);
+        assert_eq!(context_window_tokens_for_model("deepseek-chat"), 1_000_000);
+        assert_eq!(context_window_tokens_for_model("deepseek-reasoner"), 1_000_000);
         assert_eq!(context_window_tokens_for_model("gpt-4o"), 128_000);
         assert_eq!(context_window_tokens_for_model("gpt-4o-mini"), 128_000);
-        assert_eq!(context_window_tokens_for_model("glm-4-plus"), 128_000);
         assert_eq!(context_window_tokens_for_model("moonshot-v1-8k"), 8_000);
         assert_eq!(
             context_window_tokens_for_model("doubao-1-5-pro-256k"),
@@ -627,15 +626,15 @@ mod tests {
 
     #[test]
     fn default_compact_threshold_is_reasonable() {
-        // deepseek-chat: 64 K tokens → threshold should be in the 50K–300K char range
+        // deepseek-chat: 1M tokens → threshold should be large
         let ds = default_compact_threshold_chars("deepseek-chat");
-        assert!(ds > 50_000, "deepseek threshold too small: {ds}");
-        assert!(ds < 300_000, "deepseek threshold suspiciously large: {ds}");
+        assert!(ds > 500_000, "deepseek threshold too small: {ds}");
+        assert!(ds < 4_000_000, "deepseek threshold suspiciously large: {ds}");
 
-        // claude-sonnet-4-6: 200 K tokens → threshold should be much larger
+        // claude-sonnet-4-6: 1M tokens → threshold should be large
         let cl = default_compact_threshold_chars("claude-sonnet-4-6");
-        assert!(cl > 400_000, "claude threshold too small: {cl}");
-        assert!(cl < 1_000_000, "claude threshold suspiciously large: {cl}");
+        assert!(cl > 500_000, "claude threshold too small: {cl}");
+        assert!(cl < 4_000_000, "claude threshold suspiciously large: {cl}");
 
         // unknown model: threshold must be positive (falls back to 128K window)
         let unk = default_compact_threshold_chars("unknown-model");

@@ -860,7 +860,7 @@ preset = "deepseek"
             assert_eq!(c.preset.as_deref(), Some("deepseek"));
             assert_eq!(c.provider_type, "openai");
             assert_eq!(c.api_base, "https://api.deepseek.com/v1");
-            assert_eq!(c.model, "deepseek-chat");
+            assert_eq!(c.model, "deepseek-v4-flash");
             assert!(
                 c.api_key.is_none(),
                 "no key_env set, no env, no file → None"
