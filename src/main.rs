@@ -24,7 +24,7 @@ use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::{ScheduleWakeup, WakeupSlot},
     AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink, FinishReason, NullSink,
-    PlanningMode, RetryPolicy, SessionPersistenceSink, ToolRegistry,
+    RetryPolicy, SessionPersistenceSink, ToolRegistry,
 };
 
 #[derive(Parser, Debug)]
@@ -130,11 +130,6 @@ struct Cli {
     /// - auto: approve all tool calls without prompting (headless, use in trusted envs)
     #[arg(long = "permission-mode", value_parser = ["default", "plan", "auto"])]
     permission_mode: Option<String>,
-
-    /// Enable plan-first mode: agent proposes a plan, user confirms before execution.
-    /// Equivalent to --permission-mode=plan. Kept for backward compatibility.
-    #[arg(long = "plan-first")]
-    plan_first: bool,
 
     /// System prompt string to use for this session. Overrides the default system prompt.
     /// Mutually exclusive with --system-prompt-file; if both are given, --system-prompt wins.
@@ -487,9 +482,6 @@ async fn main() -> anyhow::Result<()> {
         config.system_prompt.push('\n');
         config.system_prompt.push_str(extra);
     }
-    // --permission-mode / --plan-first: resolve to the canonical plan_first bool.
-    let effective_plan_first =
-        cli.plan_first || matches!(cli.permission_mode.as_deref(), Some("plan"));
     if matches!(cli.permission_mode.as_deref(), Some("auto")) {
         config.headless = true;
     }
@@ -724,7 +716,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.session_out,
                 effective_json,
                 effective_stream,
-                effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
                 !cli.no_session,
@@ -737,7 +728,6 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 cli.max_transcript_chars,
                 effective_json,
-                effective_plan_first,
                 cli.mcp_config,
                 effective_stream,
                 cli.hook_timing,
@@ -752,7 +742,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 effective_json,
                 effective_stream,
-                effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
                 shutdown,
@@ -804,7 +793,6 @@ async fn main() -> anyhow::Result<()> {
                         cli.transcript_out,
                         cli.session_out,
                         effective_json,
-                        effective_plan_first,
                         cli.mcp_config,
                         cli.hook_timing,
                         !cli.no_session,
@@ -829,7 +817,6 @@ async fn main() -> anyhow::Result<()> {
                 cli.transcript_out,
                 cli.session_out,
                 effective_json,
-                effective_plan_first,
                 cli.mcp_config,
                 cli.hook_timing,
                 !cli.no_session,
@@ -1470,7 +1457,6 @@ async fn run_loop(
     max_transcript_chars: Option<usize>,
     json_mode: bool,
     stream: bool,
-    plan_first: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1536,9 +1522,6 @@ async fn run_loop(
         hooks.register(Arc::new(recursive::hooks::ToolTimingHook::new()));
         builder = builder.hooks(hooks);
     }
-    if plan_first {
-        builder = builder.planning_mode(PlanningMode::PlanFirst);
-    }
     let mut runtime = builder.build().map_err(Into::<anyhow::Error>::into)?;
 
     let outcomes = runtime.run_loop(&goal, &wakeup_slot).await?;
@@ -1579,7 +1562,6 @@ async fn run_once(
     session_out: Option<PathBuf>,
     json_mode: bool,
     stream: bool,
-    plan_first: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     session: bool,
@@ -1642,7 +1624,6 @@ async fn run_once(
         max_transcript_chars,
         Vec::new(),
         stream,
-        plan_first,
         mcp_config,
         hook_timing,
         Some(&goal),
@@ -1684,26 +1665,7 @@ async fn run_once(
         tokio::spawn(cli::output::stream_events(event_rx))
     };
 
-    let outcome = loop {
-        let o = runtime.run(goal.clone()).await?;
-        if !matches!(o.finish_reason, FinishReason::PlanPending) {
-            break o;
-        }
-        let plan_text = o.final_text.as_deref().unwrap_or("(no plan)");
-        eprintln!("\n=== Proposed Plan ===\n{plan_text}");
-        eprint!("Confirm plan? [Y/n] ");
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
-            runtime.confirm_plan();
-        } else {
-            runtime.reject_plan("User rejected the plan");
-            break o;
-        }
-    };
+    let outcome = runtime.run(goal.clone()).await?;
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
@@ -1766,7 +1728,6 @@ async fn repl(
     config: Config,
     max_transcript_chars: Option<usize>,
     json_mode: bool,
-    plan_first: bool,
     mcp_config: Option<PathBuf>,
     stream: bool,
     hook_timing: bool,
@@ -1793,7 +1754,6 @@ async fn repl(
         max_transcript_chars,
         Vec::new(),
         stream,
-        plan_first,
         mcp_config,
         hook_timing,
         None,
@@ -2113,7 +2073,6 @@ async fn run_weixin_headless_daemon(
         None,       // max_transcript_chars
         Vec::new(), // seed messages
         false,      // stream
-        false,      // plan_first
         mcp_config,
         false, // hook_timing
         None,  // goal
@@ -2197,7 +2156,6 @@ mod tests {
             None,
             Vec::new(),
             /* stream */ false,
-            false,
             None,
             false,
             None,
@@ -2213,7 +2171,6 @@ mod tests {
             None,
             Vec::new(),
             /* stream */ true,
-            false,
             None,
             false,
             None,
@@ -2232,7 +2189,6 @@ mod tests {
             &cfg_anthropic,
             None,
             Vec::new(),
-            false,
             false,
             None,
             false,

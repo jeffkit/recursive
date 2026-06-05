@@ -554,15 +554,10 @@ async fn worker_loop(
                 }
             },
 
-            UserAction::SetPlanningMode(on) => {
-                if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let mode = if on {
-                        crate::PlanningMode::PlanFirst
-                    } else {
-                        crate::PlanningMode::Immediate
-                    };
-                    rt_opt.as_mut().unwrap().set_planning_mode(mode);
-                }
+            UserAction::SetPlanningMode(_on) => {
+                // PlanFirst mode removed; this action is now a no-op.
+                // Plan Mode 2.0 (enter_plan_mode / exit_plan_mode tools) handles
+                // human-in-the-loop planning without a runtime-level mode flag.
             }
 
             UserAction::Interrupt => {

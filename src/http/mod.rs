@@ -104,8 +104,6 @@ pub struct CreateSessionRequest {
     pub session_name: Option<String>,
     /// Maximum number of steps (tool calls) allowed in this session.
     pub max_steps: Option<u32>,
-    /// Planning mode: `"immediate"` (default) or `"plan_first"`.
-    pub planning_mode: Option<String>,
     /// Extended-thinking token budget for models that support it (e.g.
     /// Anthropic claude-3-7). `0` disables thinking.
     pub thinking_budget: Option<u32>,
@@ -295,8 +293,6 @@ pub struct RunRequest {
     /// Extended-thinking token budget for models that support it (e.g.
     /// Anthropic claude-3-7). `0` disables thinking.
     pub thinking_budget: Option<u32>,
-    /// Planning mode: `"immediate"` (default) or `"plan_first"`.
-    pub planning_mode: Option<String>,
     /// Permission mode: `"default"`, `"auto"`, `"strict"`, or `"bypass"`.
     pub permission_mode: Option<String>,
     /// Maximum total API spend in USD for this run.
@@ -720,7 +716,6 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "system_prompt": { "type": "string", "nullable": true },
                         "append_system_prompt": { "type": "string", "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
-                        "planning_mode": { "type": "string", "enum": ["immediate", "plan_first"], "nullable": true },
                         "permission_mode": { "type": "string", "enum": ["default", "auto", "strict", "bypass"], "nullable": true },
                         "max_budget_usd": { "type": "number", "nullable": true }
                     },
@@ -759,7 +754,6 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "append_system_prompt": { "type": "string", "nullable": true },
                         "session_name": { "type": "string", "nullable": true },
                         "max_steps": { "type": "integer", "nullable": true },
-                        "planning_mode": { "type": "string", "enum": ["immediate", "plan_first"], "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
                         "permission_mode": { "type": "string", "enum": ["default", "auto", "strict", "bypass"], "nullable": true },
                         "max_budget_usd": { "type": "number", "nullable": true }

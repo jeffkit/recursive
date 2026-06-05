@@ -1,17 +1,29 @@
 # Manual edit: fix-modal-clear
 
 **Date**: 2026-06-04
-**Goal**: Fix visual bug where dismissed modals leave stale content on screen after ESC key press
+**Goal**: Fix visual bug where dismissed modals leave stale content in scrollback
 **Files touched**: `src/tui/mod.rs`
 **Tests added**: none (existing test `esc_first_press_closes_modal_not_quits` already covered state correctness; this fix is purely visual)
 
 **Notes**:
-The modal state was correctly managed (ESC correctly pops the modal from `app.modals`),
-but a visual artifact remained on screen. When the modal was closed, the viewport shrank
-from INLINE_HEIGHT_EXPANDED (40) back to INLINE_HEIGHT_NORMAL (10). The new 10-line
-terminal rendered at the bottom, but the upper 30 lines (where the modal had been displayed)
-were not cleared — leaving stale modal content visible.
+Root cause: the expand/shrink approach for modals (10→40 lines on open, 40→10 on close)
+is fundamentally broken. When the viewport shrinks, ratatui creates a new smaller terminal
+at the current cursor position, and the previously expanded rows (with modal content) are
+pushed into the terminal's native scrollback buffer. They then appear as residue above the
+TUI and scroll up with subsequent chat messages.
 
-Fix: before creating the smaller terminal instance, draw a blank frame (`ratatui::widgets::Clear`)
-using the still-expanded terminal. This overwrites the old modal content with spaces, so when
-the viewport shrinks, there is no stale content visible above it.
+Multiple attempts to fix the shrink transition (ratatui Clear widget, crossterm cursor
+manipulation, buffer area.y) all failed because:
+1. Any content cleared before shrinking still ends up in scrollback as blank lines
+2. Cursor position assumptions were incorrect due to insert_before() shifting the viewport
+
+**Final fix**: Removed the expand/shrink logic entirely.
+- Set `INLINE_HEIGHT_NORMAL = 40` (same value for all states)
+- Removed `INLINE_HEIGHT_EXPANDED` constant (no longer needed)
+- Removed `current_inline_height` variable (no longer needed)
+- Removed the conditional viewport resize block in the main loop
+- The terminal resize (on window resize events) still works correctly
+
+The viewport is now always 40 lines: modals render in the upper portion, input/status sit
+at the bottom. Completed messages still go to native scrollback via insert_before().
+This matches the user's suggestion to avoid the resize-based approach entirely.

@@ -21,8 +21,7 @@ use recursive::{
         WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
-    AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, PlanningMode, RetryPolicy,
-    ToolRegistry,
+    AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, RetryPolicy, ToolRegistry,
 };
 
 /// Build the tool registry, optionally registering MCP tools from a config file.
@@ -247,7 +246,6 @@ pub(crate) async fn build_runtime(
     max_transcript_chars: Option<usize>,
     seed: Vec<recursive::message::Message>,
     stream: bool,
-    plan_first: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     goal: Option<&str>,
@@ -460,9 +458,6 @@ pub(crate) async fn build_runtime(
         let mut hooks = HookRegistry::new();
         hooks.register(Arc::new(recursive::hooks::ToolTimingHook::new()));
         builder = builder.hooks(hooks);
-    }
-    if plan_first {
-        builder = builder.planning_mode(PlanningMode::PlanFirst);
     }
     if let Some(sink) = event_sink {
         builder = builder.event_sink(sink);

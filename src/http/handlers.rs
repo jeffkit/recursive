@@ -14,7 +14,6 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::agent::PlanningMode;
 use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
@@ -65,7 +64,6 @@ pub(super) async fn run_agent(
             p
         }
     };
-    let planning_mode = parse_planning_mode(body.planning_mode.as_deref());
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str);
@@ -80,7 +78,6 @@ pub(super) async fn run_agent(
         .tools(tool_registry)
         .system_prompt(system_prompt)
         .max_steps(max_steps)
-        .planning_mode(planning_mode)
         .build()
         .map_err(|e| {
             (
@@ -153,19 +150,6 @@ pub(super) async fn run_agent(
 }
 
 // ── Request parsing helpers ────────────────────────────────────────────────
-
-/// Parse `planning_mode` string from an API request body.
-///
-/// Accepted values (case-insensitive): `"immediate"` (default), `"plan_first"`.
-/// Unknown values fall back to `Immediate`.
-fn parse_planning_mode(s: Option<&str>) -> PlanningMode {
-    match s {
-        Some(v) if v.eq_ignore_ascii_case("plan_first") || v.eq_ignore_ascii_case("planfirst") => {
-            PlanningMode::PlanFirst
-        }
-        _ => PlanningMode::Immediate,
-    }
-}
 
 /// Parse `permission_mode` string from an API request body.
 ///
@@ -262,7 +246,6 @@ pub(super) async fn create_session(
         .max_steps
         .map(|n| n as usize)
         .unwrap_or(state.config.max_steps);
-    let planning_mode = parse_planning_mode(body.planning_mode.as_deref());
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str);
@@ -277,7 +260,6 @@ pub(super) async fn create_session(
         .tools(tool_registry)
         .system_prompt(system_prompt)
         .max_steps(max_steps)
-        .planning_mode(planning_mode)
         .build()
         .map_err(|e| {
             (

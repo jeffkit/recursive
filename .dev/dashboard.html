@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recursive Self-Improve Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface2: #21262d;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --green: #3fb950;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --orange: #d29922;
+  --purple: #bc8cff;
+  --yellow: #e3b341;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace; background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 12px; }
+.header-left { display: flex; align-items: center; gap: 12px; }
+.header-title { font-size: 20px; font-weight: 700; }
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+.header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ts { font-size: 12px; color: var(--muted); }
+.btn { font-size: 12px; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; transition: all 0.15s; }
+.btn:hover { background: var(--border); }
+.btn-primary { background: rgba(63,185,80,0.15); border-color: rgba(63,185,80,0.4); color: var(--green); }
+.btn-primary:hover { background: rgba(63,185,80,0.25); }
+.tabs { display: flex; gap: 2px; margin-bottom: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 3px; width: fit-content; }
+.tab { font-size: 13px; padding: 6px 16px; border-radius: 6px; cursor: pointer; color: var(--muted); transition: all 0.15s; border: none; background: transparent; }
+.tab.active { background: var(--surface2); color: var(--text); }
+.tab:hover:not(.active) { color: var(--text); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.g4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin-bottom: 20px; }
+.g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 20px; }
+.g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 20px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.card-sm { padding: 14px 16px; }
+.card-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin-bottom: 6px; }
+.card-value { font-size: 28px; font-weight: 700; line-height: 1; margin-bottom: 3px; }
+.card-sub { font-size: 12px; color: var(--muted); }
+.chart-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 20px; }
+.chart-title { font-size: 13px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 7px; }
+canvas { max-height: 240px; }
+/* Pill */
+.pill { display: inline-block; padding: 1px 7px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+.p-green { background: rgba(63,185,80,0.12); color: var(--green); }
+.p-red { background: rgba(248,81,73,0.12); color: var(--red); }
+.p-blue { background: rgba(88,166,255,0.12); color: var(--blue); }
+.p-orange { background: rgba(210,153,34,0.12); color: var(--orange); }
+.p-purple { background: rgba(188,140,255,0.12); color: var(--purple); }
+/* Table */
+.tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
+.tbl th { text-align: left; padding: 7px 10px; color: var(--muted); border-bottom: 1px solid var(--border); font-weight: 500; white-space: nowrap; }
+.tbl td { padding: 5px 10px; border-bottom: 1px solid rgba(48,54,61,0.4); }
+.tbl tr:hover td { background: var(--surface2); }
+/* Phase */
+.phase-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.phase-name { font-size: 12px; width: 200px; flex-shrink: 0; }
+.phase-bar-bg { flex: 1; height: 7px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
+.phase-bar { height: 100%; border-radius: 4px; }
+.phase-pct { font-size: 11px; color: var(--muted); width: 36px; text-align: right; flex-shrink: 0; }
+.phase-tag { font-size: 10px; padding: 1px 6px; border-radius: 10px; flex-shrink: 0; }
+/* Live metrics */
+.metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+.metric-item { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.metric-name { font-size: 10px; color: var(--muted); margin-bottom: 4px; font-family: monospace; }
+.metric-val { font-size: 20px; font-weight: 700; color: var(--blue); }
+.live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 5px; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.server-url { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+.server-url input { flex: 1; background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 6px; font-size: 13px; font-family: monospace; }
+.server-url input:focus { outline: none; border-color: var(--blue); }
+.status-bar { font-size: 11px; color: var(--muted); margin-bottom: 12px; }
+/* Failure analysis */
+.fail-card { background: rgba(248,81,73,0.06); border: 1px solid rgba(248,81,73,0.2); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+.fail-title { font-size: 13px; font-weight: 600; color: var(--red); margin-bottom: 8px; }
+.fail-detail { font-size: 12px; color: var(--muted); line-height: 1.7; }
+.fail-detail span { color: var(--text); }
+.warn-card { background: rgba(210,153,34,0.06); border: 1px solid rgba(210,153,34,0.2); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+.warn-title { font-size: 13px; font-weight: 600; color: var(--orange); margin-bottom: 8px; }
+.insight-box { background: rgba(88,166,255,0.06); border: 1px solid rgba(88,166,255,0.18); border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+.insight-title { font-size: 13px; font-weight: 600; color: var(--blue); margin-bottom: 8px; }
+.insight-list { font-size: 12px; color: var(--muted); line-height: 2; }
+.insight-list li { margin-left: 14px; }
+.insight-list span { color: var(--text); }
+@media(max-width:900px){ .g4,.g3{grid-template-columns:1fr 1fr} .g2{grid-template-columns:1fr} .metrics-grid{grid-template-columns:1fr 1fr} }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="header-title">🔁 Recursive Self-Improve Dashboard</span>
+    <span class="badge">v0.6</span>
+  </div>
+  <div class="header-right">
+    <span class="ts" id="lastRefresh">数据截止: 2026-06-05</span>
+    <button class="btn btn-primary" onclick="refreshAll()">🔄 刷新</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('overview')">📊 总览</button>
+  <button class="tab" onclick="switchTab('contribution')">🤝 贡献来源</button>
+  <button class="tab" onclick="switchTab('runs')">📋 运行记录</button>
+  <button class="tab" onclick="switchTab('failure')">🔴 失败分析</button>
+  <button class="tab" onclick="switchTab('live')">⚡ 实时监控</button>
+  <button class="tab" onclick="switchTab('roadmap')">🗺 Roadmap</button>
+</div>
+
+<!-- TAB: OVERVIEW -->
+<div id="tab-overview" class="tab-content active">
+  <div class="g4" id="kpiCards"></div>
+  <div class="g2">
+    <div class="chart-wrap"><div class="chart-title">📈 运行结果时间线 (绿=提交 红=回滚)</div><canvas id="timelineChart"></canvas></div>
+    <div class="chart-wrap"><div class="chart-title">🤖 各 Provider 成功率 vs 平均步数</div><canvas id="providerChart"></canvas></div>
+  </div>
+  <div class="g2">
+    <div class="chart-wrap"><div class="chart-title">⚡ 步数使用分布</div><canvas id="stepsChart"></canvas></div>
+    <div class="chart-wrap"><div class="chart-title">📝 代码改动量 (行数)</div><canvas id="linesChart"></canvas></div>
+  </div>
+  <div class="g3">
+    <div class="chart-wrap" style="margin-bottom:0"><div class="chart-title">✅ 结果分布</div><canvas id="outcomeChart"></canvas></div>
+    <div class="chart-wrap" style="margin-bottom:0"><div class="chart-title">🚪 退出原因</div><canvas id="exitChart"></canvas></div>
+    <div class="chart-wrap" style="margin-bottom:0"><div class="chart-title">⏱ 平均耗时 by Provider</div><canvas id="timeByProviderChart"></canvas></div>
+  </div>
+</div>
+
+<!-- TAB: CONTRIBUTION -->
+<div id="tab-contribution" class="tab-content">
+  <div class="g4" id="contribKPIs"></div>
+  <div class="g2">
+    <div class="chart-wrap"><div class="chart-title">🥧 人工 vs 自我迭代 提交占比</div><canvas id="contribPieChart"></canvas></div>
+    <div class="chart-wrap"><div class="chart-title">📅 每月贡献来源分布</div><canvas id="contribMonthChart"></canvas></div>
+  </div>
+  <div class="insight-box">
+    <div class="insight-title">💡 数据说明</div>
+    <div class="insight-list">
+      <li>共 <span>841 次 git 提交</span>（包含所有分支合并后的历史）</li>
+      <li><span>自我迭代</span>：以 <code>self-improve()</code>、<code>merge: goal-</code>、<code>feat(goal-)</code>、<code>dev: observation</code> 开头的提交</li>
+      <li><span>人工</span>：其余所有提交（fix、feat、docs、chore、merge worktree 等）</li>
+      <li>38 次 metrics 记录 = 从 Batch 36 起开始结构化追踪的自我迭代运行，早期批次没有 YAML 记录</li>
+      <li>注：每次 self-improve 运行通常产生 2-3 个 git 提交（feat + merge + observation），所以提交数 / 3 ≈ 实际运行次数</li>
+    </div>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart-title">📋 最近 15 次自我迭代提交</div>
+    <div style="overflow-x:auto"><table class="tbl" id="siTable"></table></div>
+  </div>
+</div>
+
+<!-- TAB: RUNS -->
+<div id="tab-runs" class="tab-content">
+  <div class="chart-wrap">
+    <div class="chart-title">📋 所有运行记录
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button class="btn" onclick="filterRuns('all')">全部</button>
+        <button class="btn" onclick="filterRuns('committed')">已提交</button>
+        <button class="btn btn-primary" onclick="filterRuns('rolled-back')" style="color:var(--red);border-color:rgba(248,81,73,0.4);background:rgba(248,81,73,0.08)">已回滚</button>
+      </span>
+    </div>
+    <div style="overflow-x:auto"><table class="tbl" id="runTable"></table></div>
+  </div>
+</div>
+
+<!-- TAB: FAILURE ANALYSIS -->
+<div id="tab-failure" class="tab-content">
+  <div id="failureContent"></div>
+</div>
+
+<!-- TAB: LIVE METRICS -->
+<div id="tab-live" class="tab-content">
+  <div class="chart-wrap">
+    <div class="chart-title">⚡ 实时 HTTP /metrics 接口
+      <span style="margin-left:auto;font-size:11px;color:var(--muted)">基于 Phase 15.2 Prometheus 端点</span>
+    </div>
+    <div class="server-url">
+      <input type="text" id="serverUrl" value="http://localhost:3000" placeholder="http://localhost:3000">
+      <button class="btn btn-primary" onclick="fetchLiveMetrics()">连接</button>
+      <button class="btn" onclick="startAutoRefresh()" id="autoBtn">每 5s 刷新</button>
+    </div>
+    <div class="status-bar" id="liveStatus">⚪ 未连接 — 输入 Recursive HTTP server 地址后点击「连接」</div>
+    <div class="metrics-grid" id="liveMetrics">
+      <div class="metric-item"><div class="metric-name">recursive_agent_runs_total</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_agent_runs_success</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_agent_runs_failed</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_tokens_prompt_total</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_tokens_completion_total</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_agent_steps_total</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_requests_total</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+      <div class="metric-item"><div class="metric-name">recursive_requests_active</div><div class="metric-val" style="color:var(--muted)">--</div></div>
+    </div>
+    <div class="chart-wrap" style="margin-bottom:0;padding:0;border:none;background:none">
+      <div class="chart-title" style="margin-bottom:12px">📈 实时运行趋势 (最近 60 个数据点)</div>
+      <canvas id="liveChart" style="max-height:200px"></canvas>
+    </div>
+  </div>
+  <div class="insight-box">
+    <div class="insight-title">💡 接入说明</div>
+    <div class="insight-list">
+      Phase 15.2 已实现 GET /metrics Prometheus 兼容端点，包含：<br>
+      • <span>recursive_agent_runs_total/success/failed</span> — 运行次数统计<br>
+      • <span>recursive_tokens_prompt_total/completion_total</span> — Token 消耗<br>
+      • <span>recursive_agent_steps_total</span> — 累计步骤数<br>
+      • <span>recursive_requests_total/active</span> — HTTP 请求统计<br><br>
+      启动方式：<code style="background:var(--surface2);padding:1px 5px;border-radius:3px">recursive serve --port 3000</code>，然后点击「连接」。
+    </div>
+  </div>
+</div>
+
+<!-- TAB: ROADMAP -->
+<div id="tab-roadmap" class="tab-content">
+  <div class="chart-wrap">
+    <div class="chart-title">🗺 Roadmap 阶段完成进度 (v0.6 → v0.7)</div>
+    <div id="phaseGrid"></div>
+  </div>
+  <div class="g2">
+    <div class="chart-wrap" style="margin-bottom:0">
+      <div class="chart-title">📊 各阶段完成率</div>
+      <canvas id="phaseChart"></canvas>
+    </div>
+    <div class="chart-wrap" style="margin-bottom:0">
+      <div class="chart-title">🏃 批次进度 (Batch 35-46)</div>
+      <canvas id="batchChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+const RUNS = [{"run_id": "20260527T042443Z-50399", "goal_tag": "110b-memory-layer0-complete", "goal_source": ".dev/goals/110b-memory-layer0-complete.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "641390f", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "8 files changed, cargo test green", "steps_used": 29, "steps_budget": 200, "total_tool_calls": 30, "error_count": 6, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 201, "files_changed": 11, "lines_added": 861, "lines_removed": 128, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T042444Z-50417", "goal_tag": "110b-memory-layer0-complete", "goal_source": ".dev/goals/110b-memory-layer0-complete.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "641390f", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "8 files changed, cargo test green", "steps_used": 42, "steps_budget": 200, "total_tool_calls": 43, "error_count": 9, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 174, "files_changed": 11, "lines_added": 826, "lines_removed": 130, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T045035Z-52622", "goal_tag": "structured-tracing", "goal_source": ".dev/goals/115-structured-tracing.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "f7fccb9", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "2 files changed, cargo test green", "steps_used": 106, "steps_budget": 200, "total_tool_calls": 105, "error_count": 6, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 218, "files_changed": 2, "lines_added": 85, "lines_removed": 65, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T045036Z-52670", "goal_tag": "cost-tracker-persist", "goal_source": ".dev/goals/116-cost-tracker-persist.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "f7fccb9", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "3 files changed, cargo test green", "steps_used": 73, "steps_budget": 200, "total_tool_calls": 92, "error_count": 10, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 248, "files_changed": 2, "lines_added": 34, "lines_removed": 62, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T045658Z-91233", "goal_tag": "transcript-export", "goal_source": ".dev/goals/117-transcript-export.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "3c56deb", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "2 files changed, cargo test green", "steps_used": 45, "steps_budget": 200, "total_tool_calls": 48, "error_count": 5, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 142, "files_changed": 7, "lines_added": 2656, "lines_removed": 32, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T051105Z-69478", "goal_tag": "wire-cost-tracker", "goal_source": ".dev/goals/118-wire-cost-tracker.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "b0efef1", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "2 files changed, cargo test green", "steps_used": 31, "steps_budget": 200, "total_tool_calls": 33, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 111, "files_changed": 6, "lines_added": 520, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T051107Z-69644", "goal_tag": "wire-cost-tracker", "goal_source": ".dev/goals/118-wire-cost-tracker.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "b0efef1", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "5 files changed, cargo test green", "steps_used": 65, "steps_budget": 200, "total_tool_calls": 69, "error_count": 7, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 201, "files_changed": 9, "lines_added": 530, "lines_removed": 81, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T051727Z-32676", "goal_tag": "rate-limiting", "goal_source": ".dev/goals/121-rate-limiting.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "d22110f", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "6 files changed, cargo test green", "steps_used": 21, "steps_budget": 200, "total_tool_calls": 21, "error_count": 2, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 183, "files_changed": 6, "lines_added": 320, "lines_removed": 84, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T051729Z-34984", "goal_tag": "rate-limiting", "goal_source": ".dev/goals/121-rate-limiting.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "d22110f", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "6 files changed, cargo test green", "steps_used": 38, "steps_budget": 200, "total_tool_calls": 40, "error_count": 1, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 215, "files_changed": 6, "lines_added": 313, "lines_removed": 83, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T051733Z-36252", "goal_tag": "sessions-export", "goal_source": ".dev/goals/119-sessions-export.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "d22110f", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "6 files changed, cargo test green", "steps_used": 46, "steps_budget": 200, "total_tool_calls": 54, "error_count": 9, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 178, "files_changed": 6, "lines_added": 141, "lines_removed": 82, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T052218Z-43972", "goal_tag": "graceful-shutdown", "goal_source": ".dev/goals/120-graceful-shutdown.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "e2da6c1", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "5 files changed, cargo test green", "steps_used": 95, "steps_budget": 200, "total_tool_calls": 100, "error_count": 16, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 254, "files_changed": 9, "lines_added": 1445, "lines_removed": 1, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T052220Z-44173", "goal_tag": "graceful-shutdown", "goal_source": ".dev/goals/120-graceful-shutdown.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "e2da6c1", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "9 files changed, cargo test green", "steps_used": 184, "steps_budget": 200, "total_tool_calls": 194, "error_count": 13, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 376, "files_changed": 13, "lines_added": 1488, "lines_removed": 1, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T052221Z-44375", "goal_tag": "prometheus-metrics", "goal_source": ".dev/goals/122-prometheus-metrics.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "e2da6c1", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "5 files changed, cargo test green", "steps_used": 86, "steps_budget": 200, "total_tool_calls": 85, "error_count": 22, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 236, "files_changed": 9, "lines_added": 1490, "lines_removed": 2, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T131848Z-44063", "goal_tag": "event-sink-trait", "goal_source": ".dev/goals/123-event-sink-trait.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "e369471", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "3 files changed, cargo test green", "steps_used": 25, "steps_budget": 200, "total_tool_calls": 27, "error_count": 2, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 139, "files_changed": 9, "lines_added": 1950, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260527T132743Z-67651", "goal_tag": "kernel-types", "goal_source": ".dev/goals/124-kernel-types.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "10278ba", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "7 files changed, cargo test green", "steps_used": 31, "steps_budget": 200, "total_tool_calls": 41, "error_count": 1, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 130, "files_changed": 5, "lines_added": 54, "lines_removed": 56, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260528T001009Z-75918", "goal_tag": "extract-run-inner", "goal_source": ".dev/goals/125-extract-run-inner.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "2c4d99b", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "2 files changed, cargo test green", "steps_used": 97, "steps_budget": 200, "total_tool_calls": 102, "error_count": 2, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 912, "files_changed": 2, "lines_added": 628, "lines_removed": 134, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260528T005510Z-49896", "goal_tag": "agent-runtime", "goal_source": ".dev/goals/127-agent-runtime.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "5374d85", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "4 files changed, cargo test green", "steps_used": 76, "steps_budget": 200, "total_tool_calls": 99, "error_count": 4, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 736, "files_changed": 3, "lines_added": 33, "lines_removed": 1, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260528T065104Z-52320", "goal_tag": "permissions-config", "goal_source": ".dev/goals/133-permissions-config.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "5fd5f82", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "4 files changed, cargo test green", "steps_used": 31, "steps_budget": 200, "total_tool_calls": 32, "error_count": 4, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 152, "files_changed": 9, "lines_added": 400, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260528T065439Z-64287", "goal_tag": "permissions-config", "goal_source": ".dev/goals/133-permissions-config.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "ca8f26a", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "1 files changed, cargo test green", "steps_used": 10, "steps_budget": 200, "total_tool_calls": 13, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 34, "files_changed": 1, "lines_added": 36, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T065552Z-58199", "goal_tag": "provider-presets", "goal_source": ".dev/goals/175-provider-presets.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "3e1c04e", "outcome": "rolled-back", "exit_reason": "NoMoreToolCalls", "detail": "E2E smoke test failed (new binary broken)", "steps_used": 13, "steps_budget": 200, "total_tool_calls": 24, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 116, "files_changed": 0, "lines_added": 0, "lines_removed": 0, "test_pass": false, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T073648Z-5141", "goal_tag": "provider-presets", "goal_source": ".dev/goals/175-provider-presets.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "a17d830", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "6 files changed, cargo test green", "steps_used": 119, "steps_budget": 200, "total_tool_calls": 121, "error_count": 38, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 489, "files_changed": 5, "lines_added": 187, "lines_removed": 59, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T085253Z-67180", "goal_tag": "permission-mode-enum", "goal_source": ".dev/goals/190-permission-mode-enum.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "a63fea6", "outcome": "committed", "exit_reason": "NoMoreToolCalls", "detail": "15 files changed, cargo test green", "steps_used": 148, "steps_budget": 200, "total_tool_calls": 153, "error_count": 11, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 828, "files_changed": 39, "lines_added": 4452, "lines_removed": 34, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T090748Z-34743", "goal_tag": "layered-permissions-config", "goal_source": ".dev/goals/191-layered-permissions-config.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "83205a5", "outcome": "committed", "exit_reason": "finished", "detail": "9 files changed, cargo test green", "steps_used": 100, "steps_budget": 200, "total_tool_calls": 103, "error_count": 14, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 672, "files_changed": 9, "lines_added": 671, "lines_removed": 303, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T091917Z-82232", "goal_tag": "decision-reason-tracking", "goal_source": ".dev/goals/192-decision-reason-tracking.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "82b47fe", "outcome": "committed", "exit_reason": "finished", "detail": "5 files changed, cargo test green", "steps_used": 55, "steps_budget": 200, "total_tool_calls": 57, "error_count": 2, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 376, "files_changed": 5, "lines_added": 262, "lines_removed": 81, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T103448Z-78811", "goal_tag": "permission-mode-check-static", "goal_source": ".dev/goals/193-permission-mode-check-static.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "bcaf490", "outcome": "committed", "exit_reason": "finished", "detail": "13 files changed, cargo test green", "steps_used": 97, "steps_budget": 200, "total_tool_calls": 110, "error_count": 3, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 1109, "files_changed": 26, "lines_added": 4728, "lines_removed": 316, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T105336Z-96259", "goal_tag": "content-aware-rules", "goal_source": ".dev/goals/194-content-aware-rules.md", "provider": "minimax", "model": "MiniMax-M3", "batch": 36, "baseline": "7ad0814", "outcome": "committed", "exit_reason": "finished", "detail": "1 files changed, cargo test green", "steps_used": 16, "steps_budget": 200, "total_tool_calls": 15, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 560, "files_changed": 1, "lines_added": 40, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T110309Z-68017", "goal_tag": "tool-check-permissions", "goal_source": ".dev/goals/195-tool-check-permissions.md", "provider": "minimax", "model": "MiniMax-M3", "batch": 36, "baseline": "7b86c41", "outcome": "committed", "exit_reason": "finished", "detail": "1 files changed, cargo test green", "steps_used": 20, "steps_budget": 200, "total_tool_calls": 19, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 361, "files_changed": 1, "lines_added": 34, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T112115Z-59958", "goal_tag": "safe-path-protection", "goal_source": ".dev/goals/196-safe-path-protection.md", "provider": "deepseek", "model": "deepseek-chat", "batch": 36, "baseline": "b915f44", "outcome": "committed", "exit_reason": "finished", "detail": "5 files changed, cargo test green", "steps_used": 42, "steps_budget": 200, "total_tool_calls": 46, "error_count": 1, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 349, "files_changed": 5, "lines_added": 2306, "lines_removed": 64, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T114302Z-43322", "goal_tag": "external-hook-process", "goal_source": ".dev/goals/198-external-hook-process.md", "provider": "minimax", "model": "MiniMax-M3", "batch": 36, "baseline": "26ce753", "outcome": "rolled-back", "exit_reason": "finished", "detail": "post-agent cargo test failed (resume-fix also failed)", "steps_used": 34, "steps_budget": 200, "total_tool_calls": 39, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 1254, "files_changed": 0, "lines_added": 0, "lines_removed": 0, "test_pass": false, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T120920Z-66424", "goal_tag": "external-hook-process", "goal_source": ".dev/goals/198-external-hook-process.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "f2b2f76", "outcome": "committed", "exit_reason": "finished", "detail": "5 files changed, cargo test green", "steps_used": 27, "steps_budget": 200, "total_tool_calls": 34, "error_count": 1, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 609, "files_changed": 3, "lines_added": 237, "lines_removed": 533, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T121945Z-4258", "goal_tag": "headless-agent-permissions", "goal_source": ".dev/goals/199-headless-agent-permissions.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "4758442", "outcome": "committed", "exit_reason": "finished", "detail": "11 files changed, cargo test green", "steps_used": 135, "steps_budget": 200, "total_tool_calls": 158, "error_count": 4, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 903, "files_changed": 11, "lines_added": 2867, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T123453Z-77949", "goal_tag": "runtime-rule-updates", "goal_source": ".dev/goals/197-runtime-rule-updates.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "06183a8", "outcome": "committed", "exit_reason": "finished", "detail": "11 files changed, cargo test green", "steps_used": 55, "steps_budget": 200, "total_tool_calls": 64, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 638, "files_changed": 12, "lines_added": 1008, "lines_removed": 60, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T124535Z-27084", "goal_tag": "auto-mode-llm-classifier", "goal_source": ".dev/goals/200-auto-mode-llm-classifier.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "30475d0", "outcome": "committed", "exit_reason": "finished", "detail": "12 files changed, cargo test green", "steps_used": 78, "steps_budget": 200, "total_tool_calls": 96, "error_count": 11, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 765, "files_changed": 8, "lines_added": 121, "lines_removed": 1596, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T125825Z-94443", "goal_tag": "plan-mode-tools-opt-in", "goal_source": ".dev/goals/201-plan-mode-tools-opt-in.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "abf0004", "outcome": "committed", "exit_reason": "finished", "detail": "4 files changed, cargo test green", "steps_used": 68, "steps_budget": 200, "total_tool_calls": 77, "error_count": 1, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 523, "files_changed": 3, "lines_added": 58, "lines_removed": 1, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260602T130739Z-32480", "goal_tag": "str-replace-edit-tool", "goal_source": ".dev/goals/203-str-replace-edit-tool.md", "provider": "deepseek-pro", "model": "deepseek-v4-pro", "batch": 36, "baseline": "e96672d", "outcome": "committed", "exit_reason": "finished", "detail": "6 files changed, cargo test green", "steps_used": 39, "steps_budget": 200, "total_tool_calls": 43, "error_count": 3, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 427, "files_changed": 2, "lines_added": 42, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260604T055146Z-2875", "goal_tag": "goal-complexity-hint", "goal_source": ".dev/goals/232-goal-complexity-hint.md", "provider": "anthropic-minimax", "model": "MiniMax-M3", "batch": 36, "baseline": "1c3e305", "outcome": "committed", "exit_reason": "no_more_tool_calls", "detail": "3 files changed, cargo test green", "steps_used": 71, "steps_budget": 200, "total_tool_calls": 183, "error_count": 5, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 2190, "files_changed": 4, "lines_added": 3841, "lines_removed": 4, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260604T062956Z-7245", "goal_tag": "review-static-invariant-checks", "goal_source": ".dev/goals/231-review-static-invariant-checks.md", "provider": "anthropic-minimax", "model": "MiniMax-M3", "batch": 36, "baseline": "08b2751", "outcome": "committed", "exit_reason": "no_more_tool_calls", "detail": "1 files changed, cargo test green", "steps_used": 2, "steps_budget": 300, "total_tool_calls": 0, "error_count": 0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 159, "files_changed": 7, "lines_added": 3968, "lines_removed": 4, "test_pass": true, "self_review_enabled": 1, "review_verdict": null, "review_rounds": 0}, {"run_id": "20260604T073128Z-3398", "goal_tag": "review-multi-round-revision", "goal_source": ".dev/goals/234-review-multi-round-revision.md", "provider": "anthropic-minimax", "model": "MiniMax-M3", "batch": 36, "baseline": "829e87a", "outcome": "committed", "exit_reason": "provider_stop:length", "detail": "1 files changed, cargo test green", "steps_used": 13, "steps_budget": 400, "total_tool_calls": 17, "error_count": 1, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0, "wall_time_seconds": 253, "files_changed": 2, "lines_added": 26, "lines_removed": 0, "test_pass": true, "self_review_enabled": 1, "review_verdict": "request_changes", "review_rounds": 1}];
+const COMMIT_DATA = {"total": 841, "si_count": 319, "manual_count": 522, "by_month": {"2026-05": {"si": 276, "manual": 267}, "2026-06": {"si": 43, "manual": 255}}, "recent_si": [{"date": "2026-06-04", "msg": "merge: goal-234 multi-round revision loop in self-improve.sh (anthropic-minimax)"}, {"date": "2026-06-04", "msg": "feat(goal-234): multi-round revision loop in self-improve.sh"}, {"date": "2026-06-04", "msg": "merge: goal-235 reviewer with Read/Glob access + --allow-tools flag (anthropic-minimax)"}, {"date": "2026-06-04", "msg": "feat(goal-235): --allow-tools flag + multi-step reviewer with Read/Glob access"}, {"date": "2026-06-04", "msg": "dev: observation — review-multi-round-revision (anthropic-minimax)"}, {"date": "2026-06-04", "msg": "self-improve(review-multi-round-revision): 1 files changed, cargo test green"}, {"date": "2026-06-04", "msg": "merge: goal-231 static invariant checks in review-changes.sh"}, {"date": "2026-06-04", "msg": "self-improve(review-static-invariant-checks): 1 files changed, cargo test green"}, {"date": "2026-06-04", "msg": "merge: goal-232 complexity hint (anthropic-minimax)"}, {"date": "2026-06-04", "msg": "dev: observation — goal-complexity-hint (anthropic-minimax)"}, {"date": "2026-06-04", "msg": "self-improve(goal-complexity-hint): 3 files changed, cargo test green"}, {"date": "2026-06-02", "msg": "dev: observation — str-replace-edit-tool (deepseek-pro)"}, {"date": "2026-06-02", "msg": "self-improve(str-replace-edit-tool): 6 files changed, cargo test green"}, {"date": "2026-06-02", "msg": "dev: observation — plan-mode-tools-opt-in (deepseek-pro)"}, {"date": "2026-06-02", "msg": "self-improve(plan-mode-tools-opt-in): 4 files changed, cargo test green"}]};
+const PHASES = {"Phase 14 Persistence": {"total": 4, "done": 4}, "Phase 15 Observability": {"total": 3, "done": 3}, "Phase 16 Plugin System": {"total": 4, "done": 0, "deferred": 4}, "Phase 17 Hardening": {"total": 5, "done": 5}, "Phase 18 Agent Patterns": {"total": 5, "done": 2}, "Phase 19 Ecosystem": {"total": 4, "done": 0}, "Phase 20 v0.7 Refactor": {"total": 11, "done": 0}};
+const PHASE_DETAILS = {
+  "Phase 14 Persistence": { batch: "35-36", items: ["Session JSONL", "Memory 4层", "Transcript export", "Checkpoint/Rewind"] },
+  "Phase 15 Observability": { batch: "36-38", items: ["Tracing spans", "Prometheus /metrics", "Cost tracking"] },
+  "Phase 16 Plugin System": { batch: "deferred", items: ["Plugin trait+dylib", "Plugin manifest", "Plugin registry", "WASM sandbox"] },
+  "Phase 17 Hardening": { batch: "38-39", items: ["Rate limiting", "API Key+JWT auth", "Tool permissions", "Graceful shutdown", "Docker packaging"] },
+  "Phase 18 Agent Patterns": { batch: "40+", items: ["Self-reflection", "Tool learning", "Hierarchical planning ✅", "Consensus", "Long-running goals"] },
+  "Phase 19 Ecosystem": { batch: "41+", items: ["SDKs", "Installers", "Docs site", "Plugin registry"] },
+  "Phase 20 v0.7 Refactor": { batch: "42-46", items: ["删除废弃 Agent/StepEvent", "Split tui/app.rs", "Split session.rs", "Split LlmProvider", "Narrow Error", "#![deny(unwrap)]", "Split tools/mod.rs", "Extract recursive-tui crate", "E2E invariant tests", "Goal dep graph", "unwrap batch cleanup"] },
+};
+const pColor = { 'deepseek':'#58a6ff', 'deepseek-pro':'#bc8cff', 'minimax':'#3fb950', 'anthropic-minimax':'#d29922' };
+
+let liveInterval = null;
+let liveChart = null;
+let liveHistory = [];
+
+// ---- TAB ----
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  const tabs = ['overview','contribution','runs','failure','live','roadmap'];
+  const idx = tabs.indexOf(name);
+  document.querySelectorAll('.tab')[idx].classList.add('active');
+  if (name === 'failure') buildFailureAnalysis();
+  if (name === 'roadmap') { buildPhaseGrid(); buildPhaseChart(); buildBatchChart(); }
+  if (name === 'contribution') buildContribution();
+}
+
+// ---- KPIs ----
+function buildKPIs() {
+  const total = RUNS.length;
+  const committed = RUNS.filter(r => r.outcome === 'committed').length;
+  const totalLines = RUNS.reduce((s,r) => s+(r.lines_added||0), 0);
+  const avgTime = (RUNS.reduce((s,r) => s+(r.wall_time_seconds||0), 0)/total/60).toFixed(1);
+  const totalCalls = RUNS.reduce((s,r) => s+(r.total_tool_calls||0), 0);
+  const kpis = [
+    { l:'成功率', v:(committed/total*100).toFixed(1)+'%', s:committed+'/'+total+' 次', c:'color:var(--green)' },
+    { l:'代码产出', v:totalLines.toLocaleString(), s:'行代码净新增', c:'color:var(--blue)' },
+    { l:'总工具调用', v:totalCalls.toLocaleString(), s:'累计 tool calls', c:'color:var(--purple)' },
+    { l:'平均耗时', v:avgTime+' min', s:'每次运行', c:'color:var(--orange)' },
+  ];
+  document.getElementById('kpiCards').innerHTML = kpis.map(k=>`
+    <div class="card card-sm">
+      <div class="card-label">${k.l}</div>
+      <div class="card-value" style="${k.c}">${k.v}</div>
+      <div class="card-sub">${k.s}</div>
+    </div>`).join('');
+}
+
+// ---- TIMELINE ----
+function buildTimeline() {
+  const s = [...RUNS].sort((a,b) => a.run_id.localeCompare(b.run_id));
+  new Chart(document.getElementById('timelineChart'), {
+    type: 'bar',
+    data: {
+      labels: s.map((_,i) => '#'+(i+1)),
+      datasets: [{
+        data: s.map(r => r.steps_used||0),
+        backgroundColor: s.map(r => r.outcome==='committed'?'rgba(63,185,80,0.7)':'rgba(248,81,73,0.8)'),
+        borderRadius: 2,
+      }]
+    },
+    options: { responsive:true, plugins:{legend:{display:false}}, scales:{x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}}} }
+  });
+}
+
+// ---- PROVIDER CHART ----
+function buildProviderChart() {
+  const ps = {};
+  for(const r of RUNS){ const p=r.provider||'unknown'; if(!ps[p]) ps[p]={t:0,c:0,s:0}; ps[p].t++; if(r.outcome==='committed') ps[p].c++; ps[p].s+=r.steps_used||0; }
+  const providers = Object.keys(ps);
+  new Chart(document.getElementById('providerChart'), {
+    type: 'bar',
+    data: {
+      labels: providers,
+      datasets: [
+        { label:'成功率%', data: providers.map(p=>(ps[p].c/ps[p].t*100).toFixed(1)), backgroundColor: providers.map(p=>pColor[p]||'#8b949e'), borderRadius:4, yAxisID:'y' },
+        { label:'平均步数', data: providers.map(p=>(ps[p].s/ps[p].t).toFixed(1)), type:'line', borderColor:'#d29922', pointBackgroundColor:'#d29922', yAxisID:'y2', tension:0.3 }
+      ]
+    },
+    options: { responsive:true, plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}, scales:{x:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'},title:{display:true,text:'成功率%',color:'#8b949e'}},y2:{position:'right',ticks:{color:'#d29922'},grid:{display:false},title:{display:true,text:'平均步数',color:'#d29922'}}} }
+  });
+}
+
+// ---- STEPS CHART ----
+function buildStepsChart() {
+  const s = [...RUNS].sort((a,b) => a.run_id.localeCompare(b.run_id));
+  new Chart(document.getElementById('stepsChart'), {
+    type: 'bar',
+    data: {
+      labels: s.map((_,i)=>'#'+(i+1)),
+      datasets: [
+        { label:'步数', data: s.map(r=>r.steps_used||0), backgroundColor:'rgba(88,166,255,0.6)', borderRadius:2, yAxisID:'y' },
+        { label:'预算', data: s.map(r=>r.steps_budget||200), type:'line', borderColor:'rgba(248,81,73,0.4)', borderDash:[4,4], pointRadius:0, yAxisID:'y', fill:false },
+      ]
+    },
+    options: { responsive:true, plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}, scales:{x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}}} }
+  });
+}
+
+// ---- LINES CHART ----
+function buildLinesChart() {
+  const s = [...RUNS].sort((a,b) => a.run_id.localeCompare(b.run_id));
+  let cum = 0;
+  new Chart(document.getElementById('linesChart'), {
+    type: 'bar',
+    data: {
+      labels: s.map((_,i)=>'#'+(i+1)),
+      datasets: [
+        { label:'新增行', data: s.map(r=>r.lines_added||0), backgroundColor:'rgba(63,185,80,0.6)', borderRadius:2, yAxisID:'y' },
+        { label:'删除行', data: s.map(r=>-(r.lines_removed||0)), backgroundColor:'rgba(248,81,73,0.4)', borderRadius:2, yAxisID:'y' },
+        { label:'累计净增', data: s.map(r=>{ cum+=(r.lines_added||0)-(r.lines_removed||0); return cum; }), type:'line', borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.05)', pointRadius:2, yAxisID:'y2', tension:0.3, fill:true },
+      ]
+    },
+    options: { responsive:true, plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}, scales:{x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'},title:{display:true,text:'行数',color:'#8b949e'}},y2:{position:'right',ticks:{color:'#58a6ff'},grid:{display:false},title:{display:true,text:'累计',color:'#58a6ff'}}} }
+  });
+}
+
+// ---- PIE CHARTS ----
+function buildOutcomeChart() {
+  const c={};for(const r of RUNS){c[r.outcome||'?']=(c[r.outcome||'?']||0)+1;}
+  new Chart(document.getElementById('outcomeChart'),{type:'doughnut',data:{labels:Object.keys(c),datasets:[{data:Object.values(c),backgroundColor:['#3fb950','#f85149','#58a6ff'],borderWidth:0}]},options:{responsive:true,plugins:{legend:{position:'bottom',labels:{color:'#8b949e',font:{size:11},padding:10}}}}});
+}
+function buildExitChart() {
+  const c={};for(const r of RUNS){const e=r.exit_reason||'?';c[e]=(c[e]||0)+1;}
+  new Chart(document.getElementById('exitChart'),{type:'doughnut',data:{labels:Object.keys(c),datasets:[{data:Object.values(c),backgroundColor:['#58a6ff','#bc8cff','#3fb950','#d29922','#f85149'],borderWidth:0}]},options:{responsive:true,plugins:{legend:{position:'bottom',labels:{color:'#8b949e',font:{size:10},padding:8}}}}});
+}
+function buildTimeByProviderChart() {
+  const pt={};const pc={};
+  for(const r of RUNS){const p=r.provider||'?';pt[p]=(pt[p]||0)+(r.wall_time_seconds||0);pc[p]=(pc[p]||0)+1;}
+  const ps=Object.keys(pt);
+  new Chart(document.getElementById('timeByProviderChart'),{type:'bar',data:{labels:ps,datasets:[{label:'平均耗时(分)',data:ps.map(p=>(pt[p]/pc[p]/60).toFixed(1)),backgroundColor:ps.map(p=>pColor[p]||'#8b949e'),borderRadius:4}]},options:{responsive:true,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e'},grid:{color:'#21262d'},title:{display:true,text:'分钟',color:'#8b949e'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}}}}});
+}
+
+// ---- RUN TABLE ----
+let filteredRuns = RUNS;
+function buildRunTable(runs) {
+  runs = runs || filteredRuns;
+  const sorted = [...runs].sort((a,b)=>b.run_id.localeCompare(a.run_id));
+  document.getElementById('runTable').innerHTML =
+    `<thead><tr><th>Run ID</th><th>Goal</th><th>Provider</th><th>结果</th><th>步数</th><th>工具调用</th><th>错误</th><th>新增行</th><th>耗时</th><th>测试</th><th>Review</th></tr></thead>` +
+    `<tbody>` + sorted.map(r => {
+      const oc = r.outcome==='committed'?'p-green':'p-red';
+      const pc = r.provider==='deepseek'?'p-blue':r.provider==='deepseek-pro'?'p-purple':r.provider==='minimax'?'p-green':'p-orange';
+      const time = r.wall_time_seconds ? Math.round(r.wall_time_seconds/60)+'m' : '-';
+      const rv = r.review_verdict ? `<span class="pill ${r.review_verdict==='approved'?'p-green':r.review_verdict==='request_changes'?'p-orange':'p-blue'}">${r.review_verdict}</span>` : '-';
+      return `<tr>
+        <td style="font-family:monospace;font-size:10px;color:var(--muted)">${r.run_id.slice(0,15)}</td>
+        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;color:var(--blue);font-size:12px">${r.goal_tag||'-'}</td>
+        <td><span class="pill ${pc}">${r.provider||'-'}</span></td>
+        <td><span class="pill ${oc}">${r.outcome||'-'}</span></td>
+        <td>${r.steps_used||0}</td>
+        <td>${r.total_tool_calls||0}</td>
+        <td style="color:${(r.error_count||0)>10?'var(--red)':(r.error_count||0)>5?'var(--orange)':'var(--muted)'}">${r.error_count||0}</td>
+        <td style="color:var(--green)">+${r.lines_added||0}</td>
+        <td>${time}</td>
+        <td><span class="pill ${r.test_pass?'p-green':'p-red'}">${r.test_pass?'✓':'✗'}</span></td>
+        <td>${rv}</td>
+      </tr>`;
+    }).join('') + `</tbody>`;
+}
+function filterRuns(type) {
+  filteredRuns = type==='all' ? RUNS : RUNS.filter(r=>r.outcome===type);
+  buildRunTable(filteredRuns);
+}
+
+// ---- FAILURE ANALYSIS ----
+function buildFailureAnalysis() {
+  const rolled = RUNS.filter(r=>r.outcome==='rolled-back');
+  const highErr = RUNS.filter(r=>(r.error_count||0)>10);
+  const stuckRuns = RUNS.filter(r=>(r.exit_reason||'').includes('Stuck'));
+  const slowRuns = RUNS.filter(r=>(r.wall_time_seconds||0)>1200);
+  
+  // Provider failure rate
+  const pf={};for(const r of RUNS){const p=r.provider||'?';if(!pf[p]) pf[p]={t:0,f:0};pf[p].t++;if(r.outcome==='rolled-back') pf[p].f++;}
+  const provFailLines = Object.entries(pf).map(([p,v])=>`<li><span>${p}</span>: 回滚 ${v.f}/${v.t} 次 (${(v.f/v.t*100).toFixed(0)}%)</li>`).join('');
+
+  // Average error by provider
+  const pe={};const pc2={};
+  for(const r of RUNS){const p=r.provider||'?';pe[p]=(pe[p]||0)+(r.error_count||0);pc2[p]=(pc2[p]||0)+1;}
+  const provErrLines = Object.entries(pe).map(([p,v])=>`<li><span>${p}</span>: 平均 ${(v/pc2[p]).toFixed(1)} 错误/次</li>`).join('');
+
+  document.getElementById('failureContent').innerHTML = `
+    <div class="insight-box" style="margin-bottom:16px">
+      <div class="insight-title">📊 整体健康状况 (38 次运行)</div>
+      <ul class="insight-list">
+        <li>回滚次数: <span>${rolled.length} 次 (${(rolled.length/RUNS.length*100).toFixed(1)}%)</span></li>
+        <li>高错误率运行 (>10次工具错误): <span>${highErr.length} 次</span></li>
+        <li>Stuck 触发: <span>${stuckRuns.length} 次</span></li>
+        <li>超时运行 (>20min): <span>${slowRuns.length} 次</span></li>
+        <li>测试通过率: <span>${RUNS.filter(r=>r.test_pass).length}/${RUNS.length}</span></li>
+      </ul>
+    </div>
+
+    ${rolled.map(r=>`
+    <div class="fail-card">
+      <div class="fail-title">❌ 回滚: ${r.goal_tag} (${r.run_id.slice(0,15)})</div>
+      <div class="fail-detail">
+        Provider: <span>${r.provider}</span> &nbsp;|&nbsp;
+        退出原因: <span>${r.exit_reason}</span> &nbsp;|&nbsp;
+        步数: <span>${r.steps_used}</span> &nbsp;|&nbsp;
+        耗时: <span>${Math.round((r.wall_time_seconds||0)/60)}m</span><br>
+        错误详情: <span>${r.detail||'无'}</span><br>
+        ${r.test_pass===false?'<span style="color:var(--red)">⚠ cargo test 失败</span>':''}
+      </div>
+    </div>`).join('')}
+
+    ${highErr.map(r=>`
+    <div class="warn-card">
+      <div class="warn-title">⚠️ 高错误率: ${r.goal_tag} — ${r.error_count} 次工具错误</div>
+      <div class="fail-detail">
+        Provider: <span>${r.provider}</span> &nbsp;|&nbsp;
+        结果: <span class="pill ${r.outcome==='committed'?'p-green':'p-red'}">${r.outcome}</span> &nbsp;|&nbsp;
+        步数: <span>${r.steps_used}</span><br>
+        ${r.exit_reason ? '退出原因: <span>'+r.exit_reason+'</span>' : ''}
+      </div>
+    </div>`).join('')}
+
+    <div class="insight-box" style="margin-top:16px">
+      <div class="insight-title">🔍 各 Provider 风险分析</div>
+      <div class="g2" style="margin:0">
+        <ul class="insight-list">${provFailLines}</ul>
+        <ul class="insight-list">${provErrLines}</ul>
+      </div>
+    </div>
+
+    <div class="insight-box">
+      <div class="insight-title">💡 改进建议</div>
+      <ul class="insight-list">
+        <li><span>token/cost 数据全为 0</span>：self-improve.sh 尚未接入真实 token 计数，建议在 agent 结束时从 session 读取并回填 YAML</li>
+        <li><span>batch 字段固定为 36</span>：batch 字段看起来不是自动递增的，需确认 self-improve.sh 的 batch 维护逻辑</li>
+        <li><span>cargo test 失败的回滚</span>：2 次回滚均为 cargo test 失败（provider-presets / external-hook-process），可以在 Dashboard 上单独标记「编译失败 vs 功能回滚」</li>
+        <li><span>minimax 耗时异常</span>：external-hook-process 耗时达 1254s (21min)，远超其他运行，建议增加超时上限告警</li>
+      </ul>
+    </div>
+  `;
+}
+
+// ---- PHASE GRID ----
+function buildPhaseGrid() {
+  const phaseStatusStyle = {
+    done: { cls:'p-green', label:'✅ 完成', color:'#3fb950' },
+    progress: { cls:'p-blue', label:'🔄 进行中', color:'#58a6ff' },
+    deferred: { cls:'p-orange', label:'⏸ 推迟', color:'#d29922' },
+    pending: { cls:'', label:'⏳ 待开始', color:'#8b949e' },
+  };
+
+  document.getElementById('phaseGrid').innerHTML = Object.entries(PHASES).map(([name, p]) => {
+    const done = p.done||0, total = p.total||1, deferred = p.deferred||0;
+    const pct = Math.round(done/total*100);
+    const statusKey = deferred===total ? 'deferred' : done===total ? 'done' : done>0 ? 'progress' : 'pending';
+    const s = phaseStatusStyle[statusKey];
+    const det = PHASE_DETAILS[name];
+    return `<div class="phase-row">
+      <span class="phase-name">${name}</span>
+      <div class="phase-bar-bg"><div class="phase-bar" style="width:${pct}%;background:${s.color}"></div></div>
+      <span class="phase-pct">${done}/${total}</span>
+      <span class="pill phase-tag ${s.cls}">${s.label}</span>
+      ${det ? `<span style="font-size:10px;color:var(--muted);margin-left:6px">Batch ${det.batch}</span>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function buildPhaseChart() {
+  const entries = Object.entries(PHASES);
+  new Chart(document.getElementById('phaseChart'), {
+    type: 'bar',
+    data: {
+      labels: entries.map(([n]) => n.replace('Phase ','Ph.')),
+      datasets: [
+        { label:'已完成', data: entries.map(([,p])=>p.done||0), backgroundColor:'#3fb950', borderRadius:3, stack:'s' },
+        { label:'推迟', data: entries.map(([,p])=>p.deferred||0), backgroundColor:'#d29922', borderRadius:3, stack:'s' },
+        { label:'未开始', data: entries.map(([,p])=>Math.max(0,(p.total||0)-(p.done||0)-(p.deferred||0))), backgroundColor:'#30363d', borderRadius:3, stack:'s' },
+      ]
+    },
+    options: { responsive:true, plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}, scales:{x:{ticks:{color:'#8b949e',font:{size:10}},grid:{color:'#21262d'},stacked:true},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'},stacked:true}} }
+  });
+}
+
+function buildBatchChart() {
+  const batches = [
+    { b:35, done:4, plan:4 }, { b:36, done:5, plan:5 },
+    { b:37, done:5, plan:5 }, { b:38, done:5, plan:5 },
+    { b:39, done:2, plan:2 }, { b:40, done:1, plan:5 },
+    { b:41, done:0, plan:4 }, { b:42, done:0, plan:5 },
+    { b:43, done:0, plan:6 }, { b:44, done:0, plan:6 }, { b:45, done:0, plan:2 },
+  ];
+  new Chart(document.getElementById('batchChart'), {
+    type: 'bar',
+    data: {
+      labels: batches.map(b => 'Batch '+b.b),
+      datasets: [
+        { label:'已完成', data: batches.map(b=>b.done), backgroundColor:'#3fb950', borderRadius:3, stack:'s' },
+        { label:'计划中', data: batches.map(b=>b.plan-b.done), backgroundColor:'#21262d', borderRadius:3, stack:'s' },
+      ]
+    },
+    options: { responsive:true, plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}, scales:{x:{ticks:{color:'#8b949e',font:{size:10}},grid:{color:'#21262d'},stacked:true},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'},stacked:true}} }
+  });
+}
+
+// ---- LIVE METRICS ----
+function parsePrometheus(text) {
+  const result = {};
+  for(const line of text.split("\n")) {
+    if(line.startsWith('#') || !line.trim()) continue;
+    const [name, val] = line.split(' ');
+    if(name && val) result[name] = parseFloat(val);
+  }
+  return result;
+}
+
+async function fetchLiveMetrics() {
+  const url = document.getElementById('serverUrl').value.trim();
+  const statusEl = document.getElementById('liveStatus');
+  statusEl.innerHTML = '🔄 连接中...';
+  try {
+    const resp = await fetch(url + '/metrics', { signal: AbortSignal.timeout(5000) });
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    const text = await resp.text();
+    const m = parsePrometheus(text);
+    updateLiveDisplay(m);
+    statusEl.innerHTML = '<span class="live-dot"></span> 已连接 · 最后更新: ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    statusEl.innerHTML = '🔴 连接失败: ' + e.message + ' — 请确认 Recursive server 正在运行';
+  }
+}
+
+function updateLiveDisplay(m) {
+  const metricNames = [
+    'recursive_agent_runs_total','recursive_agent_runs_success','recursive_agent_runs_failed',
+    'recursive_tokens_prompt_total','recursive_tokens_completion_total','recursive_agent_steps_total',
+    'recursive_requests_total','recursive_requests_active'
+  ];
+  document.getElementById('liveMetrics').innerHTML = metricNames.map(n => {
+    const v = m[n];
+    const color = n.includes('failed') ? 'var(--red)' : n.includes('active') ? 'var(--green)' : 'var(--blue)';
+    return `<div class="metric-item"><div class="metric-name">${n.replace('recursive_','')}</div><div class="metric-val" style="color:${color}">${v!=null?v.toLocaleString():'N/A'}</div></div>`;
+  }).join('');
+
+  // Update live chart
+  const now = new Date().toLocaleTimeString();
+  liveHistory.push({ t: now, runs: m['recursive_agent_runs_total']||0, success: m['recursive_agent_runs_success']||0 });
+  if(liveHistory.length > 60) liveHistory.shift();
+
+  if(!liveChart) {
+    liveChart = new Chart(document.getElementById('liveChart'), {
+      type: 'line',
+      data: { labels: liveHistory.map(h=>h.t), datasets: [
+        { label:'总运行', data: liveHistory.map(h=>h.runs), borderColor:'#58a6ff', tension:0.3, pointRadius:2 },
+        { label:'成功', data: liveHistory.map(h=>h.success), borderColor:'#3fb950', tension:0.3, pointRadius:2 },
+      ]},
+      options: { responsive:true, plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}, scales:{x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}}} }
+    });
+  } else {
+    liveChart.data.labels = liveHistory.map(h=>h.t);
+    liveChart.data.datasets[0].data = liveHistory.map(h=>h.runs);
+    liveChart.data.datasets[1].data = liveHistory.map(h=>h.success);
+    liveChart.update();
+  }
+}
+
+let autoRefreshing = false;
+function startAutoRefresh() {
+  const btn = document.getElementById('autoBtn');
+  if(autoRefreshing) {
+    clearInterval(liveInterval);
+    autoRefreshing = false;
+    btn.textContent = '每 5s 刷新';
+    btn.className = 'btn';
+  } else {
+    fetchLiveMetrics();
+    liveInterval = setInterval(fetchLiveMetrics, 5000);
+    autoRefreshing = true;
+    btn.textContent = '⏹ 停止刷新';
+    btn.className = 'btn btn-primary';
+  }
+}
+
+function refreshAll() {
+  document.getElementById('lastRefresh').textContent = '刷新于: ' + new Date().toLocaleString();
+}
+
+// ---- CONTRIBUTION ----
+let contribBuilt = false;
+function buildContribution() {
+  if (contribBuilt) return;
+  contribBuilt = true;
+  const cd = COMMIT_DATA;
+  const siPct = (cd.si_count / cd.total * 100).toFixed(1);
+  const manPct = (cd.manual_count / cd.total * 100).toFixed(1);
+  const estimatedRuns = Math.round(cd.si_count / 3);
+
+  // KPI Cards
+  document.getElementById('contribKPIs').innerHTML = [
+    { l:'总提交数', v: cd.total.toLocaleString(), s:'全部 git 历史', c:'color:var(--text)' },
+    { l:'自我迭代提交', v: cd.si_count, s: siPct + '% 占比', c:'color:var(--blue)' },
+    { l:'人工提交', v: cd.manual_count, s: manPct + '% 占比', c:'color:var(--purple)' },
+    { l:'估算自动运行', v: '~' + estimatedRuns, s: '= SI提交 ÷ 3 (feat+merge+obs)', c:'color:var(--green)' },
+  ].map(k=>`<div class="card card-sm"><div class="card-label">${k.l}</div><div class="card-value" style="${k.c}">${k.v}</div><div class="card-sub">${k.s}</div></div>`).join('');
+
+  // Pie chart
+  new Chart(document.getElementById('contribPieChart'), {
+    type: 'doughnut',
+    data: {
+      labels: ['自我迭代 (' + siPct + '%)', '人工 (' + manPct + '%)'],
+      datasets: [{
+        data: [cd.si_count, cd.manual_count],
+        backgroundColor: ['#58a6ff', '#bc8cff'],
+        borderWidth: 0,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { position: 'bottom', labels: { color: '#8b949e', font: { size: 12 }, padding: 14 } } }
+    }
+  });
+
+  // Month chart
+  const months = Object.keys(cd.by_month);
+  const siData = months.map(m => cd.by_month[m].si);
+  const manData = months.map(m => cd.by_month[m].manual);
+  new Chart(document.getElementById('contribMonthChart'), {
+    type: 'bar',
+    data: {
+      labels: months,
+      datasets: [
+        { label: '自我迭代', data: siData, backgroundColor: '#58a6ff', borderRadius: 4, stack: 's' },
+        { label: '人工', data: manData, backgroundColor: '#bc8cff', borderRadius: 4, stack: 's' },
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: '#8b949e', font: { size: 11 } } } },
+      scales: {
+        x: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' }, stacked: true },
+        y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' }, stacked: true }
+      }
+    }
+  });
+
+  // Recent SI commits table
+  document.getElementById('siTable').innerHTML =
+    `<thead><tr><th>日期</th><th>提交信息</th><th>类型</th></tr></thead>` +
+    `<tbody>` + cd.recent_si.map(c => {
+      const t = c.msg.startsWith('self-improve') ? 'p-green' :
+                c.msg.startsWith('merge:') ? 'p-blue' :
+                c.msg.startsWith('feat(goal') ? 'p-purple' : 'p-orange';
+      const label = c.msg.startsWith('self-improve') ? '代码提交' :
+                    c.msg.startsWith('merge:') ? 'Merge' :
+                    c.msg.startsWith('feat(goal') ? 'Goal实现' : 'Observation';
+      return `<tr><td style="font-size:11px;color:var(--muted)">${c.date}</td><td style="font-size:12px;color:var(--text)">${c.msg}</td><td><span class="pill ${t}">${label}</span></td></tr>`;
+    }).join('') + `</tbody>`;
+}
+
+// ---- INIT ----
+buildKPIs();
+buildTimeline();
+buildProviderChart();
+buildStepsChart();
+buildLinesChart();
+buildOutcomeChart();
+buildExitChart();
+buildTimeByProviderChart();
+buildRunTable();
+</script>
+</body>
+</html>

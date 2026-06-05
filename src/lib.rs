@@ -51,7 +51,6 @@ pub mod tui;
 #[cfg(feature = "weixin")]
 pub mod weixin;
 
-pub use agent::PlanningMode;
 pub use agent::{FinishReason, PermissionDecision};
 pub use checkpoint::{CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};
 pub use checkpoint_log::{

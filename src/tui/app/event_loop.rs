@@ -422,7 +422,7 @@ impl App {
     /// - All other variants — always
     ///
     /// This is idempotent and safe to call after every event.
-    pub fn flush_ready_blocks(&mut self) {
+    pub fn flush_ready_blocks(&mut self, width: u16) {
         loop {
             let i = self.last_printed_idx;
             if i >= self.blocks.len() {
@@ -463,7 +463,7 @@ impl App {
                 self.print_queue.push(pre);
             }
 
-            let lines = render_block(&self.blocks[i], self.theme);
+            let lines = render_block(&self.blocks[i], self.theme, width);
             self.print_queue.push(lines);
 
             // Extra blank after User turns (same as render_blocks).

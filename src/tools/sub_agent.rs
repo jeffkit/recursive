@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::agent::{FinishReason, PlanningMode};
+use crate::agent::FinishReason;
 use crate::error::{Error, Result};
 use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{LlmProvider, ToolSpec};
@@ -267,12 +267,9 @@ impl Tool for SubAgent {
                 Message::user(prompt.to_string()),
             ],
             step_events_tx: None,
-            plan_confirmed: false,
-            plan_buffer: None,
             tool_specs: kernel.tools().specs(),
             streaming: false,
             permission_hook: self.permission_hook.clone(),
-            planning_mode: PlanningMode::default(),
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             permission_mode: PermissionMode::Default,
             mailbox: None,
@@ -289,7 +286,6 @@ impl Tool for SubAgent {
             FinishReason::ProviderStop(r) => r,
             FinishReason::Stuck { .. } => "Stuck",
             FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
-            FinishReason::PlanPending => "PlanPending",
             FinishReason::Cancelled => "Cancelled",
             FinishReason::PermissionDenialLimit => "PermissionDenialLimit",
         };

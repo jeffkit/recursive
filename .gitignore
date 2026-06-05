@@ -39,3 +39,6 @@ e2e/.argusai/
 
 # macOS Finder metadata (per-directory, never project state)
 .DS_Store
+
+# Local docs and assets (not committed to git)
+local_docs/

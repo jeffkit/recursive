@@ -306,14 +306,12 @@ fn cmd_model(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
 fn cmd_status(app: &mut AppState, _args: &[String]) -> CommandOutcome {
     let uptime_secs = app.start_time.elapsed().as_secs();
     let total_tokens = app.usage.total_input.saturating_add(app.usage.total_output);
-    let plan = if app.planning_mode_on { "on" } else { "off" };
     let text = format!(
-        "Status — turn {}, blocks {}, tokens {}, uptime {}s, planning {}",
+        "Status — turn {}, blocks {}, tokens {}, uptime {}s",
         app.turn_count,
         app.blocks.len(),
         total_tokens,
         uptime_secs,
-        plan
     );
     app.push_system(text);
     CommandOutcome::Done
@@ -325,19 +323,13 @@ fn cmd_tools(app: &mut AppState, _args: &[String]) -> CommandOutcome {
     })
 }
 
-fn cmd_plan(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
-    let arg = args.first().map(|s| s.to_lowercase());
-    let on = match arg.as_deref() {
-        Some("on") | Some("true") | Some("1") => true,
-        Some("off") | Some("false") | Some("0") => false,
-        _ => {
-            app.push_error("Usage: /plan on|off");
-            return Vec::new();
-        }
-    };
-    app.planning_mode_on = on;
-    app.push_system(format!("Planning mode: {}", if on { "on" } else { "off" }));
-    vec![UserAction::SetPlanningMode(on)]
+fn cmd_plan(app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
+    app.push_system(
+        "PlanFirst mode has been removed. Use the agent's plan-mode tools \
+         (enter_plan_mode / exit_plan_mode) for human-in-the-loop planning."
+            .to_string(),
+    );
+    Vec::new()
 }
 
 fn cmd_journal(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
@@ -661,7 +653,6 @@ mod tests {
         match last {
             TranscriptBlock::System { text } => {
                 assert!(text.contains("turn 7"), "got {text:?}");
-                assert!(text.contains("planning off"));
             }
             other => panic!("expected System, got {other:?}"),
         }
@@ -681,40 +672,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_on_off_toggles_state_and_pushes_system_block() {
+    fn plan_command_shows_deprecation_notice() {
         let mut app = App::new();
         let r = invoke(&mut app, "plan on");
         match r {
             InvokeResult::Async(actions) => {
-                assert_eq!(actions, vec![UserAction::SetPlanningMode(true)]);
-            }
-            other => panic!("expected async actions, got {other:?}"),
-        }
-        assert!(app.planning_mode_on);
-
-        let r = invoke(&mut app, "plan off");
-        match r {
-            InvokeResult::Async(actions) => {
-                assert_eq!(actions, vec![UserAction::SetPlanningMode(false)]);
-            }
-            other => panic!("expected async actions, got {other:?}"),
-        }
-        assert!(!app.planning_mode_on);
-    }
-
-    #[test]
-    fn plan_without_arg_pushes_error_and_no_action() {
-        let mut app = App::new();
-        let r = invoke(&mut app, "plan");
-        match r {
-            InvokeResult::Async(actions) => {
-                assert!(actions.is_empty(), "expected no actions, got {actions:?}");
+                assert!(actions.is_empty(), "expected no actions after plan removal");
             }
             other => panic!("expected async result, got {other:?}"),
         }
         match app.blocks.last() {
-            Some(TranscriptBlock::Error { text }) => assert!(text.contains("Usage")),
-            other => panic!("expected Error, got {other:?}"),
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("PlanFirst mode has been removed"))
+            }
+            other => panic!("expected System block with deprecation notice, got {other:?}"),
         }
     }
 

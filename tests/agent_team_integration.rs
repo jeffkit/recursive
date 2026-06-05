@@ -193,7 +193,6 @@ async fn send_message_tool_spec_has_required_fields() {
 
 #[tokio::test]
 async fn worker_receives_coordinator_message_via_mailbox() {
-    use recursive::agent::PlanningMode;
     use recursive::kernel::{AgentKernel, TurnContext};
     use recursive::message::Message;
     use recursive::permissions::PermissionMode;
@@ -221,12 +220,9 @@ async fn worker_receives_coordinator_message_via_mailbox() {
             Message::user("Do the task."),
         ],
         step_events_tx: None,
-        plan_confirmed: false,
-        plan_buffer: None,
         tool_specs: kernel.tools().specs(),
         streaming: false,
         permission_hook: None,
-        planning_mode: PlanningMode::default(),
         exploring_plan_mode: Arc::new(AtomicBool::new(false)),
         permission_mode: PermissionMode::Default,
         mailbox: Some(mailbox.clone()),

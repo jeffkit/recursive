@@ -58,11 +58,26 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel: only render in-flight blocks (index >= last_printed_idx).
-    // Completed blocks have already been pushed to the terminal's native
-    // scrollback buffer via `terminal.insert_before()` in the main loop.
+    // Messages panel: combines recent completed messages (`recent_display`)
+    // with in-flight blocks (index >= last_printed_idx).  Completed blocks
+    // are also pushed to the terminal's native scrollback buffer via
+    // `terminal.insert_before()`, so users can scroll up to see older
+    // history.  The in-viewport `recent_display` ensures the top rows of
+    // the fixed-height viewport always show context instead of blank space.
+    let messages_area = chunks[0];
     let inflight = &app.blocks[app.last_printed_idx..];
-    let mut lines = transcript::render_blocks(inflight, &app.usage, app.theme);
+    let inflight_lines =
+        transcript::render_blocks(inflight, &app.usage, app.theme, messages_area.width);
+
+    // Build the combined line list: recent display + separator (if needed)
+    // + in-flight content + optional spinner.
+    let mut lines: Vec<Line<'static>> = app.recent_display.clone();
+    if !inflight_lines.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.extend(inflight_lines);
+    }
     if app.turn.running {
         let elapsed = app
             .turn
@@ -76,7 +91,6 @@ pub fn render(frame: &mut Frame, app: &App) {
         )]));
     }
 
-    let messages_area = chunks[0];
     let todo_area = chunks[1];
     // The messages panel no longer wraps in a bordered `Block`, so the
     // area is the chunk itself — no border rows / columns to subtract.
@@ -110,6 +124,19 @@ pub fn render(frame: &mut Frame, app: &App) {
     };
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+
+    // Bottom-align: when content is fewer rows than the visible area, prepend
+    // blank lines so content sits flush against the status bar rather than
+    // floating at the top. This eliminates the startup blank space and makes
+    // the banner (seeded into recent_display) appear directly above the input.
+    // When content exceeds visible_rows, normal scroll behaviour applies.
+    if total_rows < visible_rows {
+        let pad = (visible_rows - total_rows) as usize;
+        let mut padded: Vec<Line<'static>> = (0..pad).map(|_| Line::raw("")).collect();
+        padded.extend(lines);
+        lines = padded;
+        // effective_scroll is already 0 in this branch (max_scroll was 0).
+    }
 
     let messages_widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })

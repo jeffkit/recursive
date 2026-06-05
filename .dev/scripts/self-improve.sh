@@ -380,6 +380,14 @@ METRICS_DIR="$DEV_DIR/metrics"
 mkdir -p "$METRICS_DIR"
 METRICS_FILE="$METRICS_DIR/run-${TS}.yaml"
 
+# Batch counter: read from .dev/current-batch (auto-created at 36 if missing).
+# To advance: echo N > .dev/current-batch  (orchestrator / human sets this).
+BATCH_FILE="$DEV_DIR/current-batch"
+if [[ ! -f "$BATCH_FILE" ]]; then
+  echo "36" > "$BATCH_FILE"
+fi
+CURRENT_BATCH="$(cat "$BATCH_FILE" 2>/dev/null || echo 36)"
+
 emit_metrics() {
   local verdict="$1"
   local detail="$2"
@@ -397,12 +405,24 @@ emit_metrics() {
   term_reason="$(rg '^\[done after \d+ steps\] reason: (.+)$' -r '$1' "$LOG" 2>/dev/null | tail -n1)"
   [[ -z "$term_reason" ]] && term_reason="unknown"
 
-  # Token/cost from transcript (if jq available and transcript exists)
+  # Token/cost from cost.json written by CostTracker in the session dir.
+  # The agent prints "session: recording to PATH" to stderr (captured in $LOG).
+  # Fall back to parsing "cost: $X.XXXX" from the log if cost.json is missing.
   local tokens_prompt=0 tokens_completion=0 cost_usd="0.0"
-  if command -v jq >/dev/null 2>&1 && [[ -f "$TRANSCRIPT_OUT" ]]; then
-    tokens_prompt="$(jq '[.messages[]?.usage?.prompt_tokens // 0] | add // 0' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
-    tokens_completion="$(jq '[.messages[]?.usage?.completion_tokens // 0] | add // 0' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
-    cost_usd="$(jq '.cost_usd // 0' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
+  if command -v jq >/dev/null 2>&1; then
+    local session_dir
+    session_dir="$(rg -oP 'session: recording to \K\S+' "$LOG" 2>/dev/null | tail -n1)"
+    if [[ -n "$session_dir" && -f "${session_dir}/cost.json" ]]; then
+      tokens_prompt="$(jq '.total_usage.prompt_tokens // 0' "${session_dir}/cost.json" 2>/dev/null || echo 0)"
+      tokens_completion="$(jq '.total_usage.completion_tokens // 0' "${session_dir}/cost.json" 2>/dev/null || echo 0)"
+      cost_usd="$(jq '.cost_usd // 0' "${session_dir}/cost.json" 2>/dev/null || echo '0.0')"
+    fi
+  fi
+  # Last-resort: parse "cost: $X.XXXX" printed by the agent to stderr (rg, not grep -P)
+  if [[ "$cost_usd" == "0.0" || "$cost_usd" == "0" ]]; then
+    local log_cost
+    log_cost="$(rg -oP 'cost: \$\K[0-9.]+' "$LOG" 2>/dev/null | tail -n1)"
+    [[ -n "$log_cost" ]] && cost_usd="$log_cost"
   fi
 
   # Code changes stats
@@ -450,7 +470,7 @@ goal_tag: "${GOAL_TAG}"
 goal_source: "${GOAL_SOURCE}"
 provider: "${SELECTED_PROVIDER}"
 model: "${RECURSIVE_MODEL}"
-batch: 36
+batch: ${CURRENT_BATCH}
 baseline: "${BASELINE_SHORT}"
 
 # Outcome

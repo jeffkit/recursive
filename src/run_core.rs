@@ -29,7 +29,7 @@ use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::tools::ToolRegistry;
 
-use crate::agent::{FinishReason, PermissionDecision, PlanningMode};
+use crate::agent::{FinishReason, PermissionDecision};
 use crate::event::AgentEvent;
 use crate::tools::PermissionHook;
 
@@ -55,8 +55,6 @@ pub(crate) struct RunInnerOutcome {
     pub(crate) total_usage: TokenUsage,
     pub(crate) total_llm_latency_ms: u64,
     pub(crate) steps: usize,
-    pub(crate) plan_buffer: Option<Vec<ToolCall>>,
-    pub(crate) plan_confirmed: bool,
     /// Goal-153: audit metadata for tool results, keyed by `tool_call_id`.
     /// Only entries for successfully-dispatched tool calls are present;
     /// the key matches `Message.tool_call_id` on `Role::Tool` messages.
@@ -79,10 +77,7 @@ pub(crate) struct RunCore<'a> {
     pub(crate) compactor: Option<Compactor>,
     pub(crate) permission_hook: Option<Arc<dyn PermissionHook>>,
     pub(crate) hooks: &'a HookRegistry,
-    pub(crate) planning_mode: PlanningMode,
     pub(crate) total_llm_latency_ms: u64,
-    pub(crate) plan_buffer: Option<Vec<ToolCall>>,
-    pub(crate) plan_confirmed: bool,
     /// Goal-165: shared flag set by `EnterPlanModeTool`; blocks write tools
     /// while the agent is in read-only exploring / planning mode.
     pub(crate) exploring_plan_mode: Arc<AtomicBool>,
@@ -221,6 +216,9 @@ impl<'a> RunCore<'a> {
 
     /// Compact the transcript if a [`Compactor`] is configured and the
     /// character budget is exceeded.
+    ///
+    /// `PreCompact` and `PostCompact` hooks are dispatched only when
+    /// compaction actually runs (threshold is exceeded), not on every step.
     async fn maybe_compact(&mut self, step: usize) -> Result<()> {
         let compactor = match &self.compactor {
             Some(c) => c,
@@ -231,6 +229,11 @@ impl<'a> RunCore<'a> {
         if chars < compactor.threshold_chars {
             return Ok(());
         }
+
+        // Only dispatch PreCompact when we're actually about to compact.
+        self.hooks.dispatch(HookEvent::PreCompact {
+            transcript_len: chars,
+        });
 
         let kept_before = self.messages.len();
         if let Some((removed, summary_chars)) = compactor
@@ -557,8 +560,6 @@ impl<'a> RunCore<'a> {
                         total_usage,
                         total_llm_latency_ms: self.total_llm_latency_ms,
                         steps: finished_steps,
-                        plan_buffer: self.plan_buffer,
-                        plan_confirmed: self.plan_confirmed,
                         tool_audits,
                     });
                 }
@@ -607,57 +608,13 @@ impl<'a> RunCore<'a> {
                         total_usage,
                         total_llm_latency_ms: self.total_llm_latency_ms,
                         steps: step,
-                        plan_buffer: self.plan_buffer,
-                        plan_confirmed: self.plan_confirmed,
                         tool_audits,
                     });
                 }
             }
 
             // ---- compaction -------------------------------------------------------
-            self.hooks.dispatch(HookEvent::PreCompact {
-                transcript_len: self.messages.iter().map(|m| m.content.len()).sum(),
-            });
             self.maybe_compact(step).await?;
-
-            // ---- plan-confirmed execution -----------------------------------------
-            if self.plan_confirmed {
-                self.plan_confirmed = false;
-                if let Some(calls) = self.plan_buffer.take() {
-                    let results = self.execute_tool_calls(&calls).await;
-                    for (id, name, output, _args, _audit) in results {
-                        if output == DENIAL_LIMIT_SENTINEL {
-                            let finish = FinishReason::PermissionDenialLimit;
-                            self.emit(AgentEvent::TurnFinished {
-                                reason: finish_reason_str(&finish),
-                                steps: step,
-                            });
-                            return Ok(RunInnerOutcome {
-                                messages: self.messages,
-                                final_message,
-                                finish_reason: finish,
-                                total_usage,
-                                total_llm_latency_ms: self.total_llm_latency_ms,
-                                steps: step,
-                                plan_buffer: self.plan_buffer,
-                                plan_confirmed: self.plan_confirmed,
-                                tool_audits,
-                            });
-                        }
-                        let is_error =
-                            output.starts_with("ERROR: ") || output == DENIAL_LIMIT_SENTINEL;
-                        self.emit(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            output: output.clone(),
-                            step,
-                            is_error,
-                        });
-                        self.push_message(Message::tool_result(id, output));
-                    }
-                    continue;
-                }
-            }
 
             // ---- LLM call (with retry) --------------------------------------------
             debug!(target: "recursive::agent", step, "calling llm");
@@ -741,8 +698,6 @@ impl<'a> RunCore<'a> {
                     total_usage,
                     total_llm_latency_ms: self.total_llm_latency_ms,
                     steps: step,
-                    plan_buffer: self.plan_buffer,
-                    plan_confirmed: self.plan_confirmed,
                     tool_audits,
                 };
                 return Ok(outcome);
@@ -767,66 +722,11 @@ impl<'a> RunCore<'a> {
                 });
             }
 
-            // ---- planning mode ----------------------------------------------------
-            if self.planning_mode == PlanningMode::PlanFirst && self.plan_buffer.is_none() {
-                self.plan_buffer = Some(completion.tool_calls.clone());
-
-                let plan_text = completion
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        let args_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                        format!("  - {}({})", tc.name, args_str)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let plan_text = format!(
-                    "The agent proposes the following steps:\n{}\n\nConfirm or reject this plan.",
-                    plan_text
-                );
-
-                self.emit(AgentEvent::PlanProposed {
-                    plan_text: plan_text.clone(),
-                    tool_calls: completion
-                        .tool_calls
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "name": tc.name,
-                                "id": tc.id,
-                                "arguments": tc.arguments,
-                            })
-                        })
-                        .collect(),
-                });
-
-                tracing::info!(
-                    target: "recursive::agent",
-                    steps = step,
-                    tokens_in = 0usize,
-                    tokens_out = 0usize,
-                    finish = ?FinishReason::PlanPending,
-                    llm_latency_ms = self.total_llm_latency_ms,
-                    "agent.run.complete"
-                );
-                return Ok(RunInnerOutcome {
-                    messages: self.messages,
-                    final_message: Some(plan_text),
-                    finish_reason: FinishReason::PlanPending,
-                    total_usage: TokenUsage::default(),
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
-                    plan_buffer: self.plan_buffer,
-                    plan_confirmed: self.plan_confirmed,
-                    tool_audits,
-                });
-            }
-
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
             for (id, name, result, args, audit) in &results {
-                // B1 fix: auto-classifier denial limit — stop the agent immediately.
+                // Auto-classifier denial limit — stop the agent immediately.
                 if result == DENIAL_LIMIT_SENTINEL {
                     let finish = FinishReason::PermissionDenialLimit;
                     self.emit(AgentEvent::TurnFinished {
@@ -840,8 +740,6 @@ impl<'a> RunCore<'a> {
                         total_usage,
                         total_llm_latency_ms: self.total_llm_latency_ms,
                         steps: step,
-                        plan_buffer: self.plan_buffer,
-                        plan_confirmed: self.plan_confirmed,
                         tool_audits,
                     });
                 }
@@ -863,8 +761,7 @@ impl<'a> RunCore<'a> {
                     name.clone(),
                     serde_json::to_string(args).unwrap_or_default(),
                 );
-                let is_error = result.starts_with("ERROR:");
-
+                // Use the same is_error definition as above (includes DENIAL_LIMIT_SENTINEL).
                 if is_error {
                     if last_call_key == Some(call_key.clone()) {
                         consecutive_errors += 1;
@@ -895,8 +792,6 @@ impl<'a> RunCore<'a> {
                         total_usage,
                         total_llm_latency_ms: self.total_llm_latency_ms,
                         steps: step,
-                        plan_buffer: self.plan_buffer,
-                        plan_confirmed: self.plan_confirmed,
                         tool_audits,
                     };
                     return Ok(outcome);
@@ -919,8 +814,6 @@ impl<'a> RunCore<'a> {
             total_usage,
             total_llm_latency_ms: self.total_llm_latency_ms,
             steps: self.max_steps,
-            plan_buffer: self.plan_buffer,
-            plan_confirmed: self.plan_confirmed,
             tool_audits,
         };
         Ok(outcome)

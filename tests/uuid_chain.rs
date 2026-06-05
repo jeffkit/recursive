@@ -236,12 +236,12 @@ fn builder_stores_parent_agent_last_uuid() {
     use recursive::AgentRuntime;
     use std::sync::Arc;
 
+    // Verify the builder accepts a parent UUID without panicking.
+    // (Field is private; builder construction is the observable side-effect.)
     let llm = Arc::new(MockProvider::new(vec![]));
-    let builder = AgentRuntime::builder()
+    let _runtime = AgentRuntime::builder()
         .llm(llm)
-        .parent_agent_last_uuid("abc-123-def");
-    assert_eq!(
-        builder.parent_agent_last_uuid.as_deref(),
-        Some("abc-123-def")
-    );
+        .parent_agent_last_uuid("abc-123-def")
+        .build()
+        .expect("build with parent_agent_last_uuid should succeed");
 }

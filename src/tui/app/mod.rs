@@ -74,10 +74,6 @@ pub struct App {
     /// completion popup. `None` means the user hasn't navigated
     /// (Enter executes the literal buffer).
     pub command_menu_selected: Option<usize>,
-    /// Goal-146: planning-mode flag mirrored on the UI side. Reflects
-    /// the latest `/plan on|off` invocation. Used to render an
-    /// indicator and to seed `/status`.
-    pub planning_mode_on: bool,
     /// Set when the agent has proposed a plan via `exit_plan_mode` and we are
     /// waiting for the user to approve or reject it. Cleared by
     /// `PlanConfirmed` / `PlanRejected` events. Used to show a status-bar
@@ -149,6 +145,13 @@ pub struct App {
     /// buffer in the next event-loop iteration. Drained by the main
     /// loop using `terminal.insert_before()`.
     pub print_queue: Vec<Vec<ratatui::text::Line<'static>>>,
+    /// Rolling buffer of rendered lines from recently-finalised blocks.
+    /// Populated by the main loop whenever blocks are flushed to
+    /// `terminal.insert_before()`.  The messages panel renders these
+    /// above any in-flight content so the viewport always shows context
+    /// instead of blank space, even when no turn is running.
+    /// Capped at 300 lines to bound memory.
+    pub recent_display: Vec<ratatui::text::Line<'static>>,
 
     // ── Modal scroll ─────────────────────────────────────────────────────
     /// Vertical scroll offset (in lines) for the currently-active modal.
