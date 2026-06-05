@@ -62,22 +62,25 @@ const RECENT_DISPLAY_MAX: usize = 300;
 fn make_viewport_banner(workspace: &std::path::Path) -> Vec<Line<'static>> {
     use ratatui::style::Modifier;
 
-    let cyan_bold = Style::default()
-        .fg(Color::Cyan)
+    // Claude Code-inspired palette: orange accent, muted grays, white text
+    let orange_bold = Style::default()
+        .fg(Color::Rgb(205, 100, 50))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let dark_gray = Style::default().fg(Color::DarkGray);
-    let white_bold = Style::default()
-        .fg(Color::White)
+    let orange = Style::default().fg(Color::Rgb(205, 100, 50));
+    let gray = Style::default().fg(Color::Rgb(140, 140, 140));
+    let dim_gray = Style::default().fg(Color::Rgb(90, 90, 90));
+    let sep_style = Style::default().fg(Color::Rgb(70, 70, 70));
+    let session_label_style = Style::default()
+        .fg(Color::Rgb(180, 180, 180))
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(Color::DarkGray);
+    let session_item_style = Style::default().fg(Color::Rgb(120, 120, 120));
+    let session_arrow_style = Style::default().fg(Color::Rgb(205, 100, 50));
 
     let term_width = crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(80)
         .max(60);
     // 40/60 split: left holds logo + meta, right holds session list.
-    // Mirrors the layout from the old stdout two-column banner.
     let left_col = (term_width * 40 / 100).max(30);
     // " │ " separator = 3 chars, "  › " prefix = 4 chars.
     let max_session_chars = term_width.saturating_sub(left_col + 7);
@@ -96,22 +99,33 @@ fn make_viewport_banner(workspace: &std::path::Path) -> Vec<Line<'static>> {
     };
 
     // ── Left column: logo rows + version / workspace ──────────────────────
+    // Logo uses a slimmer single-stroke box style for a cleaner look.
     // Each entry is (padded_text, style). Text is padded to `left_col`
     // visible columns so the separator always aligns on every row.
-    // Box-drawing characters and ASCII are all single-width, so Rust's
-    // char-count padding `{:<N$}` equals visual-column padding here.
     let left_lines: Vec<(String, Style)> = vec![
         (
-            format!("{:<width$}", "╦═╗╔═╗╔═╗╦ ╦╦═╗╔═╗╦╦  ╦╔═╗", width = left_col),
-            cyan_bold,
+            format!(
+                "{:<width$}",
+                " ┬─┐┌─┐┌─┐┬ ┬┬─┐┌─┐┬┬  ┬┌─┐",
+                width = left_col
+            ),
+            orange_bold,
         ),
         (
-            format!("{:<width$}", "╠╦╝║╣ ║  ║ ║╠╦╝╚═╗║╚╗╔╝║╣ ", width = left_col),
-            cyan_bold,
+            format!(
+                "{:<width$}",
+                " ├┬┘├┤ │  │ │├┬┘└─┐│└┐┌┘├┤ ",
+                width = left_col
+            ),
+            orange_bold,
         ),
         (
-            format!("{:<width$}", "╩╚═╚═╝╚═╝╚═╝╩╚═╚═╝╩ ╚╝ ╚═╝", width = left_col),
-            cyan_bold,
+            format!(
+                "{:<width$}",
+                " ┴└─└─┘└─┘└─┘┴└─└─┘┴ └┘ └─┘",
+                width = left_col
+            ),
+            orange,
         ),
         (format!("{:<left_col$}", ""), Style::default()),
         (
@@ -120,58 +134,78 @@ fn make_viewport_banner(workspace: &std::path::Path) -> Vec<Line<'static>> {
                 format!("  v{version}  ·  {model}"),
                 width = left_col
             ),
-            dim,
+            gray,
         ),
         (
             format!("{:<width$}", format!("  {ws_display}"), width = left_col),
-            dark_gray,
+            dim_gray,
         ),
     ];
 
     // ── Right column: session list ────────────────────────────────────────
-    let mut right_lines: Vec<(String, Style)> =
-        vec![("Recent sessions".to_string(), white_bold)];
+    // Build session entries as structured span-groups for per-span styling.
+    let sessions_data: Vec<String> = {
+        match crate::session::SessionReader::list_sessions_sorted_by_updated_at(workspace) {
+            Ok(sorted) if !sorted.is_empty() => sorted
+                .iter()
+                .take(5)
+                .map(|(_, meta)| {
+                    let label = meta
+                        .name
+                        .as_deref()
+                        .or(meta.last_prompt.as_deref())
+                        .unwrap_or(meta.goal.as_str());
+                    let short: String = label.chars().take(max_session_chars).collect();
+                    let ellipsis = if label.chars().count() > max_session_chars {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    format!("{short}{ellipsis}")
+                })
+                .collect(),
+            _ => vec![],
+        }
+    };
 
-    match crate::session::SessionReader::list_sessions_sorted_by_updated_at(workspace) {
-        Ok(sorted) if !sorted.is_empty() => {
-            for (_, meta) in sorted.iter().take(5) {
-                let label = meta
-                    .name
-                    .as_deref()
-                    .or(meta.last_prompt.as_deref())
-                    .unwrap_or(meta.goal.as_str());
-                let short: String = label.chars().take(max_session_chars).collect();
-                let ellipsis = if label.chars().count() > max_session_chars {
-                    "…"
-                } else {
-                    ""
-                };
-                right_lines.push((format!("  › {short}{ellipsis}"), dark_gray));
-            }
-        }
-        _ => {
-            right_lines.push(("  No recent sessions".to_string(), dark_gray));
-        }
-    }
+    // ── Right column rows: header then session items ──────────────────────
+    // Row 0 = "Recent sessions" header, rows 1..N = session entries.
+    let right_rows = 1 + sessions_data.len().max(1); // header + items (min 1 placeholder)
 
     // ── Merge into two-column ratatui Lines ───────────────────────────────
-    let num_rows = left_lines.len().max(right_lines.len());
+    let num_rows = left_lines.len().max(right_rows);
     let empty_left = format!("{:<left_col$}", "");
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(num_rows + 1);
 
     for i in 0..num_rows {
         let mut spans: Vec<Span<'static>> = Vec::new();
 
+        // Left column
         if let Some((text, style)) = left_lines.get(i) {
             spans.push(Span::styled(text.clone(), *style));
         } else {
             spans.push(Span::raw(empty_left.clone()));
         }
 
-        // Separator + right content only when the right column has a row.
-        if let Some((text, style)) = right_lines.get(i) {
+        // Right column: row 0 = label, rows 1..N = session entries
+        if i == 0 {
             spans.push(Span::styled(" │ ", sep_style));
-            spans.push(Span::styled(text.clone(), *style));
+            spans.push(Span::styled("Recent sessions", session_label_style));
+        } else {
+            let session_idx = i - 1;
+            if session_idx < sessions_data.len() {
+                spans.push(Span::styled(" │ ", sep_style));
+                spans.push(Span::styled("  ", sep_style));
+                spans.push(Span::styled("›", session_arrow_style));
+                spans.push(Span::styled(" ", sep_style));
+                spans.push(Span::styled(
+                    sessions_data[session_idx].clone(),
+                    session_item_style,
+                ));
+            } else if sessions_data.is_empty() && session_idx == 0 {
+                spans.push(Span::styled(" │ ", sep_style));
+                spans.push(Span::styled("  No recent sessions", dim_gray));
+            }
         }
 
         lines.push(Line::from(spans));

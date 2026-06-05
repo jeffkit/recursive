@@ -47,14 +47,19 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         0
     };
+    // The bottom panel slot (below the input box) expands when a slash-command,
+    // @file, or history-search panel is active, pushing the input upward.
+    // When no interactive panel is open, the height is 0 and the slot is invisible.
+    let panel_h = command_menu::panel_height(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),                     // messages
-            Constraint::Length(todo_height),        // Goal-167: task list (0 when empty)
-            Constraint::Length(1),                  // status bar
-            Constraint::Length(plan_banner_height), // Fix-E: plan approval banner
-            Constraint::Length(input_total),        // input + footer hint
+            Constraint::Min(3),                     // 0: messages
+            Constraint::Length(todo_height),        // 1: Goal-167 task list (0 when empty)
+            Constraint::Length(1),                  // 2: status bar
+            Constraint::Length(plan_banner_height), // 3: Fix-E plan approval banner
+            Constraint::Length(input_total),        // 4: input + footer hint
+            Constraint::Length(panel_h),            // 5: interactive panel below input
         ])
         .split(frame.area());
 
@@ -159,22 +164,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_plan_mode_request_banner(frame, chunks[3]);
     }
 
-    // Input panel + footer hint (chunks[4] when banner present, [3] otherwise).
-    // The layout always reserves the slot; when plan_banner_height=0 the
-    // area has zero height and input renders normally at [4].
+    // Input panel + footer hint.
     input::render(frame, chunks[4], app);
 
-    // Goal-146: floating slash-command popup, drawn after the input
-    // box so it overlays the messages panel.
-    command_menu::render(frame, chunks[4], app);
+    // Goal-146/158/160: interactive panel below the input box (chunks[5]).
+    // When no panel is active, panel_h == 0 and the slot has zero height.
+    // Active panels push the input box upward via Layout shrinking messages.
+    command_menu::render_panel(frame, chunks[5], app);
 
-    // Goal-158: @file completion popup.
-    command_menu::render_atfile(frame, chunks[4], app);
-
-    // Goal-160: Ctrl+R history-search popup.
-    command_menu::render_history_search(frame, chunks[4], app);
-
-    // Goal-161: permission-request modal (top layer — covers everything).
+    // Goal-161: permission-request modal (centred overlay — covers everything).
     command_menu::render_permission_modal(frame, app);
 
     // Goal-146: modals are last so they cover everything else.

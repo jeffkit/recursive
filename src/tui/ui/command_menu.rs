@@ -279,6 +279,189 @@ pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
     frame.render_widget(para, area);
 }
 
+// ── Bottom-panel API (replaces the overlay popups) ───────────────────────────
+
+/// Compute the height that the bottom panel slot needs in the Layout.
+///
+/// The panel slot lives **below** the input box.  When a slash-command,
+/// @file-completion, or history-search mode is active, this returns the
+/// number of rows required; otherwise returns 0 so the slot collapses.
+pub fn panel_height(app: &App) -> u16 {
+    use crate::tui::app::InputMode;
+    match app.prompt.mode {
+        InputMode::Command => {
+            let n = app.commands.search(&app.prompt.buffer).len()
+                + app.commands.search_skills(&app.prompt.buffer).len();
+            let visible = n.min(MAX_VISIBLE);
+            if visible == 0 {
+                0
+            } else {
+                visible as u16 + 2
+            } // 2 = borders
+        }
+        InputMode::AtFile => {
+            let n = app.atfile_suggestions.len().min(MAX_VISIBLE);
+            if n == 0 {
+                0
+            } else {
+                n as u16 + 2
+            }
+        }
+        InputMode::HistorySearch => {
+            // Always show at least one row (the "no matches" placeholder).
+            app.hsearch_matches.len().clamp(1, MAX_VISIBLE) as u16 + 2
+        }
+        _ => 0,
+    }
+}
+
+/// Render the active interactive panel into the slot below the input box.
+///
+/// `area` is provided by the Layout (`Constraint::Length(panel_height(app))`).
+/// When no panel is active the constraint collapses to 0 and this is a no-op.
+pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    use crate::tui::app::InputMode;
+    match app.prompt.mode {
+        InputMode::Command => render_command_panel(frame, area, app),
+        InputMode::AtFile => render_atfile_panel(frame, area, app),
+        InputMode::HistorySearch => render_history_panel(frame, area, app),
+        _ => {}
+    }
+}
+
+fn render_command_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let builtin_matches = app.commands.search(&app.prompt.buffer);
+    let skill_matches = app.commands.search_skills(&app.prompt.buffer);
+
+    let mut combined: Vec<MenuEntry<'_>> = builtin_matches
+        .iter()
+        .map(|s| MenuEntry::Builtin(s))
+        .chain(skill_matches.iter().map(|s| MenuEntry::Skill(s)))
+        .collect();
+    combined.truncate(MAX_VISIBLE);
+
+    if combined.is_empty() {
+        return;
+    }
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+    let summary_style = Style::default().fg(Color::DarkGray);
+    let skill_badge_style = Style::default().fg(Color::Green);
+
+    let lines: Vec<Line<'static>> = combined
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let style = if app.command_menu_selected == Some(i) {
+                selected_style
+            } else {
+                normal_style
+            };
+            let mut spans = vec![
+                Span::styled(format!(" /{:<10} ", entry.name().to_string()), style),
+                Span::styled(entry.summary().to_string(), summary_style),
+            ];
+            if entry.is_skill() {
+                spans.push(Span::styled(" [skill]".to_string(), skill_badge_style));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Commands ")
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_atfile_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let suggestions = &app.atfile_suggestions;
+    if suggestions.is_empty() {
+        return;
+    }
+    let visible = &suggestions[..suggestions.len().min(MAX_VISIBLE)];
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+
+    let lines: Vec<Line<'static>> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let style = if app.atfile_selected == Some(i) {
+                selected_style
+            } else {
+                normal_style
+            };
+            Line::from(Span::styled(format!(" {} ", path), style))
+        })
+        .collect();
+
+    let title = format!(" @files  query: {:?} ", app.atfile_query);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_history_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+    let empty_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+
+    let lines: Vec<Line<'static>> = if app.hsearch_matches.is_empty() {
+        vec![Line::from(Span::styled(" (no matches) ", empty_style))]
+    } else {
+        let history = &app.prompt.history;
+        app.hsearch_matches
+            .iter()
+            .take(MAX_VISIBLE)
+            .enumerate()
+            .map(|(i, &hist_idx)| {
+                let entry = history.get(hist_idx).map(String::as_str).unwrap_or("");
+                let display = if entry.len() > 60 {
+                    format!(" {}… ", &entry[..57])
+                } else {
+                    format!(" {} ", entry)
+                };
+                let style = if i == app.hsearch_selected {
+                    selected_style
+                } else {
+                    normal_style
+                };
+                Line::from(Span::styled(display, style))
+            })
+            .collect()
+    };
+
+    let title = format!(" 🔍 {} ", app.hsearch_query);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightGreen))
+        .title(title)
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 // ── Goal-161: Permission Request Modal ───────────────────────────────────────
 
 /// Render the permission-request modal when a tool is waiting for user
