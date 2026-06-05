@@ -5,24 +5,35 @@
 //! The only thing that varies is the base URL + model name + API key, which
 //! is all driven by config.
 //!
-//! ## Deferred tool loading
+//! ## Deferred tool loading (software-layer ToolSearch)
 //!
-//! This provider does **not** support `Tool::should_defer()` or
-//! `complete_with_search`. The default `complete_with_search` impl
-//! in `LlmProvider` concatenates the eager and deferred lists and
-//! calls `complete()` — so the model sees every tool on every turn.
-//! To enable deferred loading, use the Anthropic provider.
+//! This provider implements the same deferred-tool pattern as `AnthropicProvider`
+//! but in pure software — no API-level `defer_loading` or `tool_reference` needed.
+//! On each `complete_with_search` / `stream_with_search` call:
+//!
+//! 1. Only eager tools + `ToolSearchTool` are sent in the initial request.
+//! 2. If the model calls `ToolSearchTool`, the query is resolved against the
+//!    deferred list, the matched schemas are returned as plain JSON in a
+//!    `tool_result` message, and a new request is sent with the matched tools
+//!    appended to the eager list.
+//! 3. Capped at `MAX_SEARCH_ROUNDS` to prevent infinite loops.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
 
+use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
 use super::StructuredRequest;
 use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
+
+const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
+const MAX_SEARCH_ROUNDS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -34,6 +45,9 @@ pub struct OpenAiProvider {
     max_tokens: u32,
     retry: RetryPolicy,
     stream_tx: Option<StreamSender>,
+    /// Algorithm used to resolve a `ToolSearchTool` query into a list of
+    /// deferred tool names. Defaults to `KeywordSearchEngine`.
+    search_engine: Arc<dyn ToolSearchEngine>,
 }
 
 impl OpenAiProvider {
@@ -62,7 +76,14 @@ impl OpenAiProvider {
             max_tokens: 16384,
             retry: RetryPolicy::default(),
             stream_tx: None,
+            search_engine: Arc::new(KeywordSearchEngine::new()),
         }
+    }
+
+    /// Replace the search engine used to resolve `ToolSearchTool` queries.
+    pub fn with_search_engine(mut self, engine: Arc<dyn ToolSearchEngine>) -> Self {
+        self.search_engine = engine;
+        self
     }
 
     /// Enable streaming by providing a channel sender for partial tokens.
@@ -237,6 +258,36 @@ impl LlmProvider for OpenAiProvider {
         })
     }
 
+    async fn complete_with_search(
+        &self,
+        messages: &[Message],
+        eager_tools: &[SpecWithHint],
+        deferred_tools: &[SpecWithHint],
+    ) -> Result<Completion> {
+        if deferred_tools.is_empty() {
+            let specs: Vec<ToolSpec> = eager_tools.iter().map(|(s, _)| s.clone()).collect();
+            return self.complete(messages, &specs).await;
+        }
+        self.run_search_loop(messages, eager_tools, deferred_tools, &[], 0)
+            .await
+    }
+
+    async fn stream_with_search(
+        &self,
+        messages: &[Message],
+        eager_tools: &[SpecWithHint],
+        deferred_tools: &[SpecWithHint],
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        if deferred_tools.is_empty() {
+            let specs: Vec<ToolSpec> = eager_tools.iter().map(|(s, _)| s.clone()).collect();
+            let tx = stream_tx.or_else(|| self.stream_tx.clone());
+            return self.stream_inner(messages, &specs, tx).await;
+        }
+        self.run_stream_search_loop(messages, eager_tools, deferred_tools, &[], 0, stream_tx)
+            .await
+    }
+
     async fn stream(
         &self,
         messages: &[Message],
@@ -250,6 +301,199 @@ impl LlmProvider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    fn tool_search_spec() -> SpecWithHint {
+        let spec = ToolSpec {
+            name: TOOL_SEARCH_TOOL_NAME.to_string(),
+            description: "Fetches full schema definitions for deferred tools so they can be \
+                called. Until fetched, only the name is known — there is no parameter schema, so \
+                the tool cannot be invoked. Use `select:<tool_name>` for direct selection, or \
+                keywords to search."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Query to find deferred tools."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }),
+        };
+        (spec, Some("find search discover tools lookup".to_string()))
+    }
+
+    /// Software-layer ToolSearch loop for `complete_with_search`.
+    ///
+    /// Sends only `eager_tools` + `ToolSearchTool` in round 0. If the model
+    /// calls `ToolSearchTool`, resolves the query, appends the matched schemas
+    /// as a plain JSON `tool_result`, and recurses with the matched tools
+    /// added to `loaded_tools` (which are appended to eager for the next call).
+    async fn run_search_loop(
+        &self,
+        messages: &[Message],
+        eager_tools: &[SpecWithHint],
+        deferred_tools: &[SpecWithHint],
+        loaded_tools: &[ToolSpec],
+        round: usize,
+    ) -> Result<Completion> {
+        // Build tool list: ToolSearchTool + caller eager + already-loaded deferred
+        let mut call_tools: Vec<ToolSpec> = Vec::new();
+        call_tools.push(Self::tool_search_spec().0);
+        call_tools.extend(eager_tools.iter().map(|(s, _)| s.clone()));
+        call_tools.extend_from_slice(loaded_tools);
+
+        let completion = self.complete(messages, &call_tools).await?;
+
+        let search_call = completion
+            .tool_calls
+            .iter()
+            .find(|c| c.name == TOOL_SEARCH_TOOL_NAME);
+
+        let search_call = match search_call {
+            None => return Ok(completion),
+            Some(c) => c.clone(),
+        };
+
+        if round >= MAX_SEARCH_ROUNDS {
+            tracing::warn!(
+                target: "recursive::llm",
+                round,
+                max = MAX_SEARCH_ROUNDS,
+                "ToolSearchTool (openai): hit MAX_SEARCH_ROUNDS, returning current completion"
+            );
+            return Ok(completion);
+        }
+
+        let query = search_call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let names = self.search_engine.resolve(query, deferred_tools);
+        let matched: Vec<ToolSpec> = deferred_tools
+            .iter()
+            .filter(|(s, _)| names.contains(&s.name))
+            .map(|(s, _)| s.clone())
+            .collect();
+        let result_json = serde_json::to_string(&matched).unwrap_or_else(|_| "[]".into());
+
+        // Append the ToolSearch exchange to the transcript
+        let mut next_messages: Vec<Message> = messages.to_vec();
+        next_messages.push(Message {
+            role: Role::Assistant,
+            content: completion.content.clone(),
+            tool_calls: completion.tool_calls.clone(),
+            tool_call_id: None,
+            reasoning_content: completion.reasoning_content.clone(),
+        });
+        next_messages.push(Message {
+            role: Role::Tool,
+            content: result_json,
+            tool_calls: vec![],
+            tool_call_id: Some(search_call.id.clone()),
+            reasoning_content: None,
+        });
+
+        let mut next_loaded = loaded_tools.to_vec();
+        next_loaded.extend_from_slice(&matched);
+
+        Box::pin(self.run_search_loop(
+            &next_messages,
+            eager_tools,
+            deferred_tools,
+            &next_loaded,
+            round + 1,
+        ))
+        .await
+    }
+
+    /// Software-layer ToolSearch loop for `stream_with_search`.
+    async fn run_stream_search_loop(
+        &self,
+        messages: &[Message],
+        eager_tools: &[SpecWithHint],
+        deferred_tools: &[SpecWithHint],
+        loaded_tools: &[ToolSpec],
+        round: usize,
+        stream_tx: Option<StreamSender>,
+    ) -> Result<Completion> {
+        let mut call_tools: Vec<ToolSpec> = Vec::new();
+        call_tools.push(Self::tool_search_spec().0);
+        call_tools.extend(eager_tools.iter().map(|(s, _)| s.clone()));
+        call_tools.extend_from_slice(loaded_tools);
+
+        let tx = stream_tx.clone().or_else(|| self.stream_tx.clone());
+        let completion = self.stream_inner(messages, &call_tools, tx).await?;
+
+        let search_call = completion
+            .tool_calls
+            .iter()
+            .find(|c| c.name == TOOL_SEARCH_TOOL_NAME);
+
+        let search_call = match search_call {
+            None => return Ok(completion),
+            Some(c) => c.clone(),
+        };
+
+        if round >= MAX_SEARCH_ROUNDS {
+            tracing::warn!(
+                target: "recursive::llm",
+                round,
+                max = MAX_SEARCH_ROUNDS,
+                "ToolSearchTool (openai/stream): hit MAX_SEARCH_ROUNDS"
+            );
+            return Ok(completion);
+        }
+
+        let query = search_call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let names = self.search_engine.resolve(query, deferred_tools);
+        let matched: Vec<ToolSpec> = deferred_tools
+            .iter()
+            .filter(|(s, _)| names.contains(&s.name))
+            .map(|(s, _)| s.clone())
+            .collect();
+        let result_json = serde_json::to_string(&matched).unwrap_or_else(|_| "[]".into());
+
+        let mut next_messages: Vec<Message> = messages.to_vec();
+        next_messages.push(Message {
+            role: Role::Assistant,
+            content: completion.content.clone(),
+            tool_calls: completion.tool_calls.clone(),
+            tool_call_id: None,
+            reasoning_content: completion.reasoning_content.clone(),
+        });
+        next_messages.push(Message {
+            role: Role::Tool,
+            content: result_json,
+            tool_calls: vec![],
+            tool_call_id: Some(search_call.id.clone()),
+            reasoning_content: None,
+        });
+
+        let mut next_loaded = loaded_tools.to_vec();
+        next_loaded.extend_from_slice(&matched);
+
+        Box::pin(self.run_stream_search_loop(
+            &next_messages,
+            eager_tools,
+            deferred_tools,
+            &next_loaded,
+            round + 1,
+            stream_tx,
+        ))
+        .await
+    }
+
     async fn stream_inner(
         &self,
         messages: &[Message],
@@ -727,6 +971,195 @@ mod tests {
             .unwrap();
         let decoded: Value = serde_json::from_str(args).unwrap();
         assert_eq!(decoded["contents"], "b");
+    }
+
+    // ---- ToolSearch loop tests ----
+
+    #[derive(Debug)]
+    struct AlwaysReturnsEngine(Vec<String>);
+    impl ToolSearchEngine for AlwaysReturnsEngine {
+        fn resolve(&self, _query: &str, _candidates: &[SpecWithHint]) -> Vec<String> {
+            self.0.clone()
+        }
+    }
+
+    fn make_tool_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({"type":"object","properties":{},"required":[]}),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_search_loop_skips_when_no_deferred() {
+        // With no deferred tools, run_search_loop should make exactly one
+        // request (no ToolSearch round-trip). We use a mock server that
+        // returns a plain text response and assert it's called exactly once.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m");
+        let eager = vec![(make_tool_spec("Read"), None)];
+        let result = provider
+            .complete_with_search(&[Message::user("hi")], &eager, &[])
+            .await
+            .unwrap();
+        assert_eq!(result.content, "done");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn openai_search_loop_resolves_deferred_tool() {
+        // Two mock responses:
+        // Round 0: model calls ToolSearchTool with query "MyTool"
+        // Round 1: model returns normal content
+        // After round 1 the tool list should include MyTool's schema.
+        use std::sync::Mutex;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_tools: std::sync::Arc<Mutex<Vec<String>>> =
+            std::sync::Arc::new(Mutex::new(vec![]));
+        let captured_clone = captured_tools.clone();
+        let call_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_idx_clone = call_idx.clone();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let idx = call_idx_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 65536];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    // Extract JSON body and record tool names
+                    if let Some(start) = req.find("\r\n\r\n") {
+                        let body_str = req[start + 4..].trim();
+                        if let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) {
+                            if let Some(tools) = body["tools"].as_array() {
+                                let names: Vec<String> = tools
+                                    .iter()
+                                    .filter_map(|t| {
+                                        t["function"]["name"].as_str().map(String::from)
+                                    })
+                                    .collect();
+                                *captured_clone.lock().unwrap() = names;
+                            }
+                        }
+                    }
+                    let resp = if idx == 0 {
+                        // First call: return a ToolSearchTool call
+                        r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"ts1","type":"function","function":{"name":"ToolSearchTool","arguments":"{\"query\":\"MyTool\"}"}}]},"finish_reason":"tool_calls"}]}"#
+                    } else {
+                        // Second call: return normal content
+                        r#"{"choices":[{"message":{"role":"assistant","content":"found it"},"finish_reason":"stop"}]}"#
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp.len(),
+                        resp
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let my_tool = make_tool_spec("MyTool");
+        let deferred = vec![(my_tool.clone(), None)];
+        let engine = Arc::new(AlwaysReturnsEngine(vec!["MyTool".to_string()]));
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .with_search_engine(engine);
+
+        let result = provider
+            .complete_with_search(&[Message::user("hi")], &[], &deferred)
+            .await
+            .unwrap();
+        assert_eq!(result.content, "found it");
+        // The second request should include MyTool's schema
+        let tools = captured_tools.lock().unwrap().clone();
+        assert!(
+            tools.contains(&"MyTool".to_string()),
+            "second request should include MyTool, got: {tools:?}"
+        );
+        assert_eq!(call_idx.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn openai_search_loop_caps_at_max_rounds() {
+        // Mock server always returns a ToolSearchTool call.
+        // Assert we stop after MAX_SEARCH_ROUNDS and return.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    // Always respond with a ToolSearchTool call
+                    let resp = r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"ts1","type":"function","function":{"name":"ToolSearchTool","arguments":"{\"query\":\"anything\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp.len(),
+                        resp
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let deferred = vec![(make_tool_spec("SomeTool"), None)];
+        let engine = Arc::new(AlwaysReturnsEngine(vec![])); // returns nothing
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .with_search_engine(engine);
+
+        let result = provider
+            .complete_with_search(&[Message::user("hi")], &[], &deferred)
+            .await
+            .unwrap();
+        // Should have made MAX_SEARCH_ROUNDS + 1 calls and stopped
+        let calls = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            calls,
+            MAX_SEARCH_ROUNDS + 1,
+            "expected {} calls, got {calls}",
+            MAX_SEARCH_ROUNDS + 1
+        );
+        // The returned completion should be the last ToolSearchTool response
+        assert!(!result.tool_calls.is_empty());
     }
 
     #[test]
