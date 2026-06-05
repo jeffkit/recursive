@@ -142,14 +142,13 @@ impl<'a> RunCore<'a> {
         let mut attempt = 0u32;
         loop {
             let result = if let Some(ref tx) = stream_sender {
-                // For streaming, pass all tools as eager (no deferred support yet).
-                let all_specs: Vec<crate::llm::ToolSpec> = eager_pairs
-                    .iter()
-                    .chain(deferred_pairs.iter())
-                    .map(|(s, _)| s.clone())
-                    .collect();
                 self.llm
-                    .stream(&self.messages, &all_specs, Some(tx.clone()))
+                    .stream_with_search(
+                        &self.messages,
+                        &eager_pairs,
+                        &deferred_pairs,
+                        Some(tx.clone()),
+                    )
                     .await
             } else {
                 self.llm
