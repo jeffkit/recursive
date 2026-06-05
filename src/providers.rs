@@ -1,9 +1,9 @@
 //! Static vendor preset catalog, embedded at compile time.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-million-token pricing embedded in a provider preset model entry. USD.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct ModelPricingSpec {
     pub input_per_million: f64,
     pub output_per_million: f64,
@@ -12,7 +12,7 @@ pub struct ModelPricingSpec {
 }
 
 /// A single model entry within a provider preset.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelSpec {
     pub name: String,
     /// Maximum input context window in tokens for this model.
@@ -21,7 +21,7 @@ pub struct ModelSpec {
     pub pricing: Option<ModelPricingSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderPreset {
     pub id: String,
     pub name: String,
@@ -56,8 +56,23 @@ pub fn all_presets() -> &'static [ProviderPreset] {
     })
 }
 
+/// Return the effective preset list: cache merged over bundled, or just bundled
+/// if no cache is available. The result is computed once and stored in a
+/// process-local `OnceLock`.
+pub fn all_presets_effective() -> &'static [ProviderPreset] {
+    use std::sync::OnceLock;
+    static EFFECTIVE: OnceLock<Vec<ProviderPreset>> = OnceLock::new();
+    EFFECTIVE.get_or_init(|| {
+        let bundled = all_presets();
+        match crate::providers_cache::load_cache() {
+            Some(cache) => crate::providers_cache::merge(bundled, &cache.providers),
+            None => bundled.to_vec(),
+        }
+    })
+}
+
 pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
-    all_presets().iter().find(|p| p.id == id)
+    all_presets_effective().iter().find(|p| p.id == id)
 }
 
 /// Look up a preset by its API base URL. Used to recover the preset id
@@ -65,13 +80,13 @@ pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
 /// and to pick sensible defaults in the manual branch of `recursive init` instead
 /// of guessing the model from URL substrings.
 pub fn find_preset_by_api_base(url: &str) -> Option<&'static ProviderPreset> {
-    all_presets().iter().find(|p| p.api_base == url)
+    all_presets_effective().iter().find(|p| p.api_base == url)
 }
 
 /// Look up pricing for a model name across all presets.
 /// Returns `None` if the model is not listed or has no pricing field.
 pub fn find_model_pricing(model: &str) -> Option<&'static ModelPricingSpec> {
-    for preset in all_presets() {
+    for preset in all_presets_effective() {
         for spec in &preset.models {
             if spec.name == model {
                 return spec.pricing.as_ref();

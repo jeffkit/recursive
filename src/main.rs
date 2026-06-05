@@ -331,6 +331,25 @@ enum Cmd {
     /// List active agent sessions (sessions in the current workspace
     /// whose status is "active" or whose lock file is live).
     Agents,
+    /// Manage the remote provider preset catalog.
+    #[command(subcommand)]
+    Providers(ProvidersCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvidersCmd {
+    /// Download the latest provider presets from the remote URL and save to
+    /// ~/.recursive/providers_cache.json. Subsequent runs will use the cache
+    /// in preference to the bundled providers.toml.
+    Update {
+        /// Override the default source URL.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Show the currently effective provider list (cache merged over bundled).
+    List,
+    /// Show the path and age of the local cache file.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -561,6 +580,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+
+    // Kick off a background providers cache refresh if the cache is stale.
+    // Runs concurrently; errors are silently logged at debug level.
+    // Skip for `providers update` (it runs its own explicit fetch).
+    if !matches!(effective_cmd, Cmd::Providers(ProvidersCmd::Update { .. })) {
+        recursive::providers_cache::spawn_background_refresh();
+    }
 
     // Warn about legacy in-tree state for commands that interact with
     // the workspace. The Migrate command itself shouldn't double-warn.
@@ -1074,6 +1100,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Mcp { cmd } => cmd_mcp(cmd, &config.workspace).await,
         Cmd::Update | Cmd::Upgrade => cmd_update().await,
         Cmd::Agents => cmd_agents(&config.workspace),
+        Cmd::Providers(sub) => cmd_providers(sub).await,
     }
 }
 
@@ -1388,6 +1415,72 @@ fn cmd_agents(workspace: &std::path::Path) -> anyhow::Result<()> {
                 meta.session_id, label, meta.updated_at, prompt
             );
             println!("    dir: {}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+// ─── providers ───────────────────────────────────────────────────────────────
+
+async fn cmd_providers(sub: ProvidersCmd) -> anyhow::Result<()> {
+    use recursive::providers::all_presets_effective;
+    use recursive::providers_cache::{
+        cache_path, fetch_and_save, load_cache, needs_update, DEFAULT_PROVIDERS_URL,
+    };
+
+    match sub {
+        ProvidersCmd::Update { url } => {
+            let url = url
+                .or_else(|| std::env::var("RECURSIVE_PROVIDERS_URL").ok())
+                .unwrap_or_else(|| DEFAULT_PROVIDERS_URL.to_string());
+            println!("Fetching providers from {url} …");
+            let cache = fetch_and_save(&url).await?;
+            println!(
+                "✓ Saved {} presets to {}",
+                cache.providers.len(),
+                cache_path().display()
+            );
+            println!("  updated_at: {}", cache.updated_at);
+        }
+        ProvidersCmd::List => {
+            let presets = all_presets_effective();
+            println!("{} providers (cache merged over bundled):", presets.len());
+            for p in presets {
+                let model_count = p.models.len();
+                println!(
+                    "  {:12}  {:40}  {} model(s)  [{}]",
+                    p.id,
+                    p.api_base,
+                    model_count,
+                    if p.mainland_accessible {
+                        "mainland ✓"
+                    } else {
+                        "mainland ✗"
+                    }
+                );
+            }
+        }
+        ProvidersCmd::Status => {
+            let path = cache_path();
+            if !path.exists() {
+                println!("No cache file found at {}", path.display());
+                println!("Run `recursive providers update` to download the latest presets.");
+                return Ok(());
+            }
+            let meta = std::fs::metadata(&path)?;
+            let modified = meta.modified()?;
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            let age_days = age.as_secs() / 86400;
+            let stale = if needs_update() { " (stale)" } else { "" };
+            println!("Cache: {}", path.display());
+            println!("Age:   {} day(s){}", age_days, stale);
+            if let Some(cache) = load_cache() {
+                println!("Presets: {}", cache.providers.len());
+                println!("Source:  {}", cache.source_url);
+                println!("Updated: {}", cache.updated_at);
+            }
         }
     }
     Ok(())
