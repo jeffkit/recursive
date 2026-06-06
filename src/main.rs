@@ -698,6 +698,11 @@ async fn main() -> anyhow::Result<()> {
                 slash_commands: std::sync::Arc::new(slash_commands),
                 session_ttl_secs,
             };
+            // M3: spawn the session reaper so idle sessions are evicted.
+            // Clone the state before consuming it for the router (both share the
+            // same Arc-wrapped inner fields, so no actual data is duplicated).
+            let reaper_state = std::sync::Arc::new(state.clone());
+            recursive::http::spawn_session_reaper(reaper_state, Duration::from_secs(60));
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");

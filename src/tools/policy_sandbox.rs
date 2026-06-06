@@ -61,15 +61,34 @@ impl PolicyConfig {
     /// A baseline restrictive policy that blocks the most dangerous shell
     /// patterns. Filesystem access is unrestricted (the workspace path check
     /// in `tools::resolve_within` already handles escapes at a lower level).
+    ///
+    /// **Security note**: substring matching is a best-effort heuristic and
+    /// cannot prevent all destructive commands. A determined adversary can
+    /// bypass these patterns with whitespace variations, Unicode, or indirect
+    /// execution (e.g. `bash -c "$(curl ...)"``). The primary security
+    /// boundary is OS-level sandboxing (Docker / E2B). These patterns exist
+    /// as a secondary defence-in-depth layer only.
     pub fn default_restrictive() -> Self {
         Self {
             fs: FsPolicy::default(),
             shell: ShellPolicy {
                 deny_patterns: vec![
+                    // Recursive deletion of root or home
                     "rm -rf /".into(),
-                    "rm -rf ~".into(),
+                    "rm -rf ~/".into(),
+                    "rm -fr /".into(),
+                    "rm -fr ~/".into(),
+                    // Filesystem creation / disk wiping
                     "mkfs".into(),
+                    "dd if=".into(),
+                    // Writing to raw device files
                     "> /dev/".into(),
+                    ">/dev/".into(),
+                    // Fork bomb
+                    ":(){ :|:& };:".into(),
+                    // Privilege escalation helpers
+                    "chmod 777 /".into(),
+                    "chmod -R 777 /".into(),
                 ],
             },
         }

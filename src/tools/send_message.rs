@@ -166,7 +166,9 @@ impl Tool for SendMessageTool {
     }
 
     fn side_effect_class(&self) -> ToolSideEffect {
-        ToolSideEffect::ReadOnly
+        // Pushing a message into a worker mailbox mutates shared external state
+        // (the coordinator ↔ worker channel). This is not read-only.
+        ToolSideEffect::External
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {
@@ -270,6 +272,24 @@ impl Tool for ListWorkersTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_message_tool_is_not_readonly() {
+        use crate::tools::Tool;
+        let reg = WorkerRegistry::new();
+        let tool = SendMessageTool::new(reg);
+        // SendMessageTool mutates external state (worker mailboxes) — must NOT
+        // be classified as ReadOnly, otherwise plan_mode would incorrectly allow it.
+        assert!(
+            !tool.is_readonly(),
+            "SendMessageTool must not be ReadOnly: it pushes messages to worker mailboxes"
+        );
+        assert_eq!(
+            tool.side_effect_class(),
+            super::ToolSideEffect::External,
+            "SendMessageTool side_effect_class must be External"
+        );
+    }
 
     #[tokio::test]
     async fn mailbox_push_pop() {

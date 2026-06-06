@@ -825,35 +825,48 @@ impl AgentRuntime {
             let outcome = self.run(&next_prompt).await?;
             outcomes.push(outcome);
 
-            // Increment turn counter.
-            let turns = {
-                let mut guard = self.goal_state.write().ok();
-                if let Some(ref mut guard) = guard {
-                    if let Some(ref mut gs) = **guard {
+            // Increment turn counter and check budget in a single write lock
+            // (C-2: TOCTOU fix — previously two separate locks created a window
+            // where an external clear_goal() call could set goal=None between the
+            // increment and the budget check, causing a duplicate GoalCleared emit).
+            enum TurnOutcomeKind {
+                Continue(u32),
+                BudgetExceeded(u32),
+                ExternallyCleared,
+            }
+            let turn_outcome = {
+                let mut guard = match self.goal_state.write().ok() {
+                    Some(g) => g,
+                    None => break,
+                };
+                match *guard {
+                    None => TurnOutcomeKind::ExternallyCleared,
+                    Some(ref mut gs) => {
                         gs.turns += 1;
-                        gs.turns
-                    } else {
-                        break; // goal was cleared externally
+                        let turns = gs.turns;
+                        if turns >= max_turns {
+                            gs.status = GoalStatus::Cleared;
+                            *guard = None;
+                            TurnOutcomeKind::BudgetExceeded(turns)
+                        } else {
+                            TurnOutcomeKind::Continue(turns)
+                        }
                     }
-                } else {
-                    break;
                 }
             };
 
-            // Budget exceeded?
-            if turns >= max_turns {
-                if let Ok(mut g) = self.goal_state.write() {
-                    if let Some(ref mut gs) = *g {
-                        gs.status = GoalStatus::Cleared;
-                    }
-                    *g = None;
+            let turns = match turn_outcome {
+                TurnOutcomeKind::ExternallyCleared => break,
+                TurnOutcomeKind::BudgetExceeded(t) => {
+                    self.event_sink.emit(AgentEvent::GoalCleared).await;
+                    tracing::warn!(
+                        "goal loop: turn budget of {max_turns} exceeded without achieving condition"
+                    );
+                    let _ = t;
+                    break;
                 }
-                self.event_sink.emit(AgentEvent::GoalCleared).await;
-                tracing::warn!(
-                    "goal loop: turn budget of {max_turns} exceeded without achieving condition"
-                );
-                break;
-            }
+                TurnOutcomeKind::Continue(t) => t,
+            };
 
             // Ask the judge.
             let verdict = evaluator.evaluate(&condition, self.transcript()).await?;
@@ -1317,6 +1330,7 @@ impl AgentRuntimeBuilder {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider};
+    use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -2128,11 +2142,11 @@ mod tests {
             .unwrap();
         let tools = rt.kernel.tools();
         assert!(
-            tools.get("enter_plan_mode").is_some(),
+            tools.get(ENTER_PLAN_MODE_TOOL_NAME).is_some(),
             "enter_plan_mode must be registered by AgentRuntimeBuilder"
         );
         assert!(
-            tools.get("exit_plan_mode").is_some(),
+            tools.get(EXIT_PLAN_MODE_TOOL_NAME).is_some(),
             "exit_plan_mode must be registered by AgentRuntimeBuilder"
         );
     }

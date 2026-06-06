@@ -4,12 +4,26 @@
 //! both under `<workspace>/.recursive/` — identical layout to what Recursive
 //! used before the trait abstraction existed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::storage::StorageBackend;
 use async_trait::async_trait;
+
+/// Write `data` to `path` atomically using a sibling temp file + rename.
+///
+/// On most Unix filesystems `rename(2)` is atomic with respect to crashes,
+/// so a reader will see either the old file or the complete new file — never
+/// a partially-written one.
+async fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    let tmp_path = dir.join(format!(".tmp-{}-{}", filename, std::process::id()));
+    tokio::fs::write(&tmp_path, data).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
 
 /// [`StorageBackend`] backed by the local filesystem.
 ///
@@ -77,7 +91,7 @@ impl StorageBackend for LocalStorageBackend {
             })?;
             lines.push(line);
         }
-        tokio::fs::write(&path, lines.join("\n"))
+        atomic_write(&path, lines.join("\n").as_bytes())
             .await
             .map_err(|e| Error::Storage {
                 message: format!("write transcript {path:?}: {e}"),
