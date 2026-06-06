@@ -1,7 +1,9 @@
 //! Token-bucket rate limiting and metrics middleware.
 
 use axum::http::StatusCode;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -94,14 +96,27 @@ pub(super) fn rate_limiter_from_env() -> RateLimiter {
     RateLimiter::new(burst, refill_rate)
 }
 
+/// Hash a string value using `DefaultHasher` to avoid storing raw secrets.
+///
+/// Returns a stable hex string for the given input. Not cryptographically
+/// strong, but sufficient to prevent raw API key values from appearing in
+/// memory dumps or logs.
+fn hash_key(value: &str) -> String {
+    let mut h = DefaultHasher::new();
+    value.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Extract a client key from the request for rate limiting.
 ///
-/// Uses the `X-API-Key` header if present, otherwise falls back to the
-/// remote IP address.
+/// Uses the `X-API-Key` header if present, hashing the value so the raw
+/// credential is never stored in the rate-limit bucket map (prevents leaking
+/// keys via memory dumps). Falls back to the remote IP address when no
+/// `X-API-Key` header is present.
 pub(super) fn extract_client_key(req: &axum::extract::Request) -> String {
     if let Some(api_key) = req.headers().get("x-api-key") {
         if let Ok(key) = api_key.to_str() {
-            return format!("apikey:{}", key);
+            return format!("apikey:{}", hash_key(key));
         }
     }
     // Fall back to remote IP
@@ -218,7 +233,35 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let key = extract_client_key(&req);
-        assert_eq!(key, "apikey:test-key-123");
+        // Key is prefixed with "apikey:" and the raw credential is not stored.
+        assert!(
+            key.starts_with("apikey:"),
+            "expected apikey: prefix, got: {key}"
+        );
+        assert!(
+            !key.contains("test-key-123"),
+            "raw API key must not appear in bucket key"
+        );
+        // Stable: same input produces the same bucket key.
+        let req2 = axum::http::Request::builder()
+            .header("x-api-key", "test-key-123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            key,
+            extract_client_key(&req2),
+            "bucket key must be deterministic"
+        );
+        // Different keys produce different bucket keys.
+        let req3 = axum::http::Request::builder()
+            .header("x-api-key", "other-key-456")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_ne!(
+            key,
+            extract_client_key(&req3),
+            "different keys must have different buckets"
+        );
     }
 
     #[tokio::test]

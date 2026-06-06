@@ -419,11 +419,15 @@ pub fn build_router_with_auth_and_rate_limit(
             state.metrics.clone(),
             metrics_middleware,
         ))
+        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
+        // rate_limit is added last so it is the outermost layer and runs
+        // before auth — this ensures unauthenticated (brute-force) requests
+        // are counted against the IP-based bucket and cannot bypass limits by
+        // rotating API keys (SEC-006).
         .layer(axum::middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
         ))
-        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(state))
 }

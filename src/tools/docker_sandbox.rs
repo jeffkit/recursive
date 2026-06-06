@@ -55,7 +55,7 @@ impl DockerShellTool {
                     open_stdin: Some(true),
                     tty: Some(true),
                     host_config: Some(HostConfig {
-                        binds: Some(vec![format!("{workspace_str}:/workspace")]),
+                        binds: Some(vec![format!("{workspace_str}:/workspace:ro")]),
                         memory: Some(512 * 1024 * 1024),
                         nano_cpus: Some(1_000_000_000),
                         ..Default::default()
