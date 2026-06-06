@@ -168,7 +168,7 @@ impl SpawnWorkerTool {
     }
 
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
-        let mut reg = self.all_tools.with_same_transport();
+        let mut reg = self.all_tools.fork();
         for name in tool_names {
             if let Some(tool) = self.all_tools.get(name) {
                 reg = reg.register(tool);
