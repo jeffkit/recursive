@@ -23,9 +23,16 @@ use handlers::{
 use rate_limit::{metrics_middleware, rate_limit_middleware, rate_limiter_from_env};
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
+
+/// Maximum accepted request body size (1 MiB).
+///
+/// Prevents OOM via maliciously large JSON payloads on POST /run and
+/// POST /sessions/:id/messages, both of which accept unbounded user strings.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -417,6 +424,7 @@ pub fn build_router_with_auth_and_rate_limit(
             rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(state))
 }
 
