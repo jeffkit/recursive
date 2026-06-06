@@ -2869,4 +2869,62 @@ mod http_tests {
             .unwrap();
         assert_eq!(resp.status(), 404);
     }
+
+    /// list_sessions must return sessions sorted by id so that paginated
+    /// requests are stable across calls (HashMap iteration order is random).
+    #[tokio::test]
+    async fn list_sessions_stable_sort_by_id() {
+        let state = sample_state();
+        let app = build_router(state.clone());
+
+        // Create several sessions so the HashMap has multiple entries.
+        for _ in 0..5 {
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/sessions")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Fetch the full list twice and assert both pages are identical and sorted.
+        let fetch = || {
+            let app = build_router(state.clone());
+            async move {
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("GET")
+                            .uri("/sessions")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let sessions: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+                sessions
+                    .iter()
+                    .map(|s| s["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let ids_a = fetch().await;
+        let ids_b = fetch().await;
+
+        assert!(!ids_a.is_empty(), "should have sessions");
+        assert_eq!(ids_a, ids_b, "list_sessions must return a stable order");
+
+        // Verify the returned ids are sorted lexicographically.
+        let mut sorted = ids_a.clone();
+        sorted.sort();
+        assert_eq!(ids_a, sorted, "list_sessions ids must be sorted by id");
+    }
 }

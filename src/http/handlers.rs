@@ -282,6 +282,10 @@ pub(super) async fn list_sessions(
             title: s.title.clone(),
         });
     }
+    // Sort by session_id for stable, deterministic pagination across requests.
+    // Without this, HashMap iteration order is non-deterministic and pages
+    // would shift between calls.
+    infos.sort_by(|a, b| a.id.cmp(&b.id));
     // Apply offset + limit pagination.
     let offset = params.offset.unwrap_or(0);
     let page: Vec<SessionInfo> = infos
