@@ -42,6 +42,7 @@ mod http_tests {
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
+            subagent_max_depth: 2,
         }
     }
 
@@ -86,6 +87,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         }
     }
 
@@ -99,6 +101,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         }
     }
 
@@ -176,6 +179,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         });
 
         let response = app
@@ -221,6 +225,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         };
         let app = build_router(state);
 
@@ -269,6 +274,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         };
         let app = build_router(state);
 
@@ -323,6 +329,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         };
         let app = build_router(state);
 
@@ -389,6 +396,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         };
         let app = build_router(state);
 
@@ -462,6 +470,7 @@ mod http_tests {
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
         };
         let app = build_router(state);
 
@@ -2058,6 +2067,7 @@ mod http_tests {
             plan_approval_gate: gate,
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         };
         state
             .sessions
@@ -2766,6 +2776,7 @@ mod http_tests {
                     argument_hint: String::new(),
                 },
             ]),
+            session_ttl_secs: 0,
         };
         let app = build_router(state);
         let resp = app

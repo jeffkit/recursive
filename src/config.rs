@@ -54,6 +54,9 @@ pub struct Config {
     /// value from providers.toml. Useful for custom deployments where the
     /// actual context window differs from the preset default.
     pub context_window_override: Option<usize>,
+    /// Maximum nesting depth for sub-agents and parallel workers.
+    /// Read from `RECURSIVE_SUBAGENT_MAX_DEPTH` env var, defaults to 2.
+    pub subagent_max_depth: usize,
 }
 
 impl Config {
@@ -216,6 +219,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
 
+        let subagent_max_depth = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
         // This helps LLM prefix caching.
@@ -294,6 +302,7 @@ impl Config {
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
+            subagent_max_depth,
         })
     }
 
@@ -528,6 +537,7 @@ mod tests {
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
+            subagent_max_depth: 2,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
