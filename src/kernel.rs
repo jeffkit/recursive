@@ -164,6 +164,10 @@ pub struct AgentKernel {
     /// Pluggable session hot-state store (checkpoint step/transcript_len).
     /// Defaults to `NoopSessionStore`; cloud deployments inject Redis.
     pub(crate) session_store: Arc<dyn SessionStore>,
+    /// Sliding window size for stuck detection (from Config). Default 10.
+    pub(crate) stuck_window: usize,
+    /// Error rate threshold within the window to declare stuck. Default 0.8.
+    pub(crate) stuck_error_rate: f64,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -246,6 +250,8 @@ impl AgentKernel {
             shutdown_token: self.shutdown_token.clone(),
             storage: self.storage.clone(),
             session_store: self.session_store.clone(),
+            stuck_window: self.stuck_window,
+            stuck_error_rate: self.stuck_error_rate,
         }
     }
 
@@ -279,6 +285,8 @@ impl AgentKernel {
             permission_mode: ctx.permission_mode,
             shutdown_token: self.shutdown_token.clone(),
             mailbox: ctx.mailbox,
+            stuck_window: self.stuck_window,
+            stuck_error_rate: self.stuck_error_rate,
         };
 
         let inner = core.run_inner().await?;
@@ -335,6 +343,10 @@ pub struct AgentKernelBuilder {
     /// Pluggable tool set provider. When `Some`, `build()` calls
     /// `provider.build_registry()` unless `tools` was set explicitly.
     tool_set_provider: Option<Arc<dyn ToolSetProvider>>,
+    /// Stuck detection window (default 10).
+    stuck_window: Option<usize>,
+    /// Stuck detection error rate threshold (default 0.8).
+    stuck_error_rate: Option<f64>,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -432,6 +444,18 @@ impl AgentKernelBuilder {
         self
     }
 
+    /// Set the stuck-detection sliding window size.
+    pub fn stuck_window(mut self, n: usize) -> Self {
+        self.stuck_window = Some(n);
+        self
+    }
+
+    /// Set the stuck-detection error rate threshold.
+    pub fn stuck_error_rate(mut self, rate: f64) -> Self {
+        self.stuck_error_rate = Some(rate);
+        self
+    }
+
     /// Build the `AgentKernel`, or return an error if required fields are missing.
     pub fn build(self) -> crate::error::Result<AgentKernel> {
         let llm = self.llm.ok_or_else(|| crate::error::Error::Config {
@@ -466,6 +490,8 @@ impl AgentKernelBuilder {
             shutdown_token: self.shutdown_token,
             storage,
             session_store,
+            stuck_window: self.stuck_window.unwrap_or(10),
+            stuck_error_rate: self.stuck_error_rate.unwrap_or(0.8),
         })
     }
 }

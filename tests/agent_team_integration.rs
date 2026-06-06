@@ -270,6 +270,8 @@ fn test_config() -> recursive::Config {
         subagent_max_depth: 2,
         allow_bypass_permissions: false,
         max_search_rounds: 3,
+        stuck_window: 10,
+        stuck_error_rate: 0.8,
     }
 }
 

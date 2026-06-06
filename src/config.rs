@@ -65,6 +65,12 @@ pub struct Config {
     /// `complete_with_search` / `stream_with_search` call.
     /// Defaults to 3. Set via `RECURSIVE_MAX_SEARCH_ROUNDS`.
     pub max_search_rounds: usize,
+    /// Number of recent steps to check for stuck detection. Default 10.
+    /// Set via `RECURSIVE_STUCK_WINDOW`.
+    pub stuck_window: usize,
+    /// Fraction of steps in the window that must be errors to declare "stuck".
+    /// Default 0.8. Set via `RECURSIVE_STUCK_ERROR_RATE`.
+    pub stuck_error_rate: f64,
 }
 
 impl std::fmt::Debug for Config {
@@ -97,6 +103,8 @@ impl std::fmt::Debug for Config {
             .field("subagent_max_depth", &self.subagent_max_depth)
             .field("allow_bypass_permissions", &self.allow_bypass_permissions)
             .field("max_search_rounds", &self.max_search_rounds)
+            .field("stuck_window", &self.stuck_window)
+            .field("stuck_error_rate", &self.stuck_error_rate)
             .finish()
     }
 }
@@ -276,6 +284,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
 
+        let stuck_window = std::env::var("RECURSIVE_STUCK_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10usize);
+
+        let stuck_error_rate = std::env::var("RECURSIVE_STUCK_ERROR_RATE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.8f64);
+
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
         // This helps LLM prefix caching.
@@ -357,6 +375,8 @@ impl Config {
             subagent_max_depth,
             allow_bypass_permissions,
             max_search_rounds,
+            stuck_window,
+            stuck_error_rate,
         })
     }
 
@@ -594,6 +614,8 @@ mod tests {
             subagent_max_depth: 2,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
@@ -1082,9 +1104,33 @@ preset = "ollama"
             subagent_max_depth: 2,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret"));
         assert!(dbg.contains("REDACTED"));
+    }
+
+    #[test]
+    fn stuck_window_env_override() {
+        std::env::set_var("RECURSIVE_STUCK_WINDOW", "5");
+        let window = std::env::var("RECURSIVE_STUCK_WINDOW")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10);
+        assert_eq!(window, 5);
+        std::env::remove_var("RECURSIVE_STUCK_WINDOW");
+    }
+
+    #[test]
+    fn stuck_error_rate_env_override() {
+        std::env::set_var("RECURSIVE_STUCK_ERROR_RATE", "0.5");
+        let rate = std::env::var("RECURSIVE_STUCK_ERROR_RATE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.8);
+        assert!((rate - 0.5).abs() < 1e-9);
+        std::env::remove_var("RECURSIVE_STUCK_ERROR_RATE");
     }
 }

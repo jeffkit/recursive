@@ -44,11 +44,6 @@ use crate::tools::PermissionHook;
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
 pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
-/// Sliding window size for stuck detection.
-const STUCK_WINDOW: usize = 10;
-/// Error rate threshold (fraction) within the window that triggers stuck detection.
-const STUCK_ERROR_RATE: f64 = 0.8;
-
 /// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
 ///
 /// Delegates to the `Display` implementation on `FinishReason` to ensure
@@ -105,6 +100,10 @@ pub(crate) struct RunCore<'a> {
     /// Drained at the start of every step so the agent sees coordinator
     /// instructions as user-role messages injected into the conversation.
     pub(crate) mailbox: Option<crate::tools::send_message::WorkerMailbox>,
+    /// Sliding window size for stuck detection (from Config).
+    pub(crate) stuck_window: usize,
+    /// Error rate threshold to declare stuck (from Config).
+    pub(crate) stuck_error_rate: f64,
 }
 
 impl<'a> RunCore<'a> {
@@ -495,7 +494,7 @@ impl<'a> RunCore<'a> {
 
         let mut final_message: Option<String> = None;
         let mut recent_errors: std::collections::VecDeque<bool> =
-            std::collections::VecDeque::with_capacity(STUCK_WINDOW);
+            std::collections::VecDeque::with_capacity(self.stuck_window);
         let mut total_usage = TokenUsage::default();
         // Goal-153: audit metadata for tool calls, keyed by tool_call_id.
         let mut tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta> =
@@ -760,17 +759,17 @@ impl<'a> RunCore<'a> {
 
                 // Sliding-window stuck detection: track whether each tool call
                 // was an error. Triggers when the error rate in the last
-                // STUCK_WINDOW steps exceeds STUCK_ERROR_RATE, catching loops
+                // stuck_window steps exceeds stuck_error_rate, catching loops
                 // that cycle across different tools (e.g. A→B→A→B).
-                if recent_errors.len() == STUCK_WINDOW {
+                if recent_errors.len() == self.stuck_window {
                     recent_errors.pop_front();
                 }
                 recent_errors.push_back(is_error);
 
-                if recent_errors.len() == STUCK_WINDOW {
+                if recent_errors.len() == self.stuck_window {
                     let error_count = recent_errors.iter().filter(|&&e| e).count();
-                    let rate = error_count as f64 / STUCK_WINDOW as f64;
-                    if rate >= STUCK_ERROR_RATE {
+                    let rate = error_count as f64 / self.stuck_window as f64;
+                    if rate >= self.stuck_error_rate {
                         let finish = FinishReason::Stuck {
                             repeated_call: name.clone(),
                             repeats: error_count,
@@ -812,5 +811,73 @@ impl<'a> RunCore<'a> {
             tool_audits,
         };
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verify the stuck-detection window/rate math that RunCore uses.
+    /// This tests the same logic as the sliding-window check in run_inner().
+    #[test]
+    fn stuck_detection_window_and_rate() {
+        // Simulate: stuck_window=3, stuck_error_rate=1.0 → 3 consecutive errors triggers stuck
+        let stuck_window = 3usize;
+        let stuck_error_rate = 1.0f64;
+
+        let mut recent_errors: std::collections::VecDeque<bool> =
+            std::collections::VecDeque::with_capacity(stuck_window);
+
+        // Push 2 errors — should not trigger yet
+        for _ in 0..2 {
+            if recent_errors.len() == stuck_window {
+                recent_errors.pop_front();
+            }
+            recent_errors.push_back(true);
+            let rate =
+                recent_errors.iter().filter(|&&e| e).count() as f64 / recent_errors.len() as f64;
+            assert!(
+                recent_errors.len() < stuck_window || rate < stuck_error_rate,
+                "should not trigger before window is full"
+            );
+        }
+
+        // Push 3rd error — window is now full and rate = 1.0 ≥ threshold
+        if recent_errors.len() == stuck_window {
+            recent_errors.pop_front();
+        }
+        recent_errors.push_back(true);
+        assert_eq!(recent_errors.len(), stuck_window);
+        let error_count = recent_errors.iter().filter(|&&e| e).count();
+        let rate = error_count as f64 / stuck_window as f64;
+        assert!(
+            rate >= stuck_error_rate,
+            "rate {rate} should trigger stuck at threshold {stuck_error_rate}"
+        );
+    }
+
+    #[test]
+    fn stuck_detection_partial_errors_below_threshold() {
+        // window=4, rate=0.8 → need 4 errors out of 4 (or round up).
+        // With 3 errors + 1 success the rate is 0.75 < 0.8, so no trigger.
+        let stuck_window = 4usize;
+        let stuck_error_rate = 0.8f64;
+
+        let mut recent_errors: std::collections::VecDeque<bool> =
+            std::collections::VecDeque::with_capacity(stuck_window);
+
+        let pattern = [true, true, true, false]; // 3/4 errors = 0.75
+        for &is_error in &pattern {
+            if recent_errors.len() == stuck_window {
+                recent_errors.pop_front();
+            }
+            recent_errors.push_back(is_error);
+        }
+
+        assert_eq!(recent_errors.len(), stuck_window);
+        let rate = recent_errors.iter().filter(|&&e| e).count() as f64 / stuck_window as f64;
+        assert!(
+            rate < stuck_error_rate,
+            "rate {rate} should be below threshold {stuck_error_rate}"
+        );
     }
 }

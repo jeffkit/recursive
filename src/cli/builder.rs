@@ -424,7 +424,9 @@ pub(crate) async fn build_runtime(
         .tools(tools)
         .system_prompt(&system_prompt)
         .max_steps(config.max_steps)
-        .streaming(stream);
+        .streaming(stream)
+        .stuck_window(config.stuck_window)
+        .stuck_error_rate(config.stuck_error_rate);
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
     }

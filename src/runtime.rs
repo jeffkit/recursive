@@ -1223,6 +1223,18 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set the stuck-detection sliding window size.
+    pub fn stuck_window(mut self, n: usize) -> Self {
+        self.kernel_builder = self.kernel_builder.stuck_window(n);
+        self
+    }
+
+    /// Set the stuck-detection error rate threshold.
+    pub fn stuck_error_rate(mut self, rate: f64) -> Self {
+        self.kernel_builder = self.kernel_builder.stuck_error_rate(rate);
+        self
+    }
+
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.
