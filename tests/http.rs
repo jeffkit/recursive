@@ -1426,10 +1426,12 @@ mod http_tests {
 
     #[tokio::test]
     async fn auth_config_is_valid_unit() {
-        // Empty config: any input (including empty string) returns true.
+        // Empty config: is_valid always returns false (no keys to match).
+        // Auth bypass for the "disabled" case is handled by is_enabled() +
+        // auth_middleware, not by is_valid() returning true.
         let empty = AuthConfig::default();
-        assert!(empty.is_valid(""));
-        assert!(empty.is_valid("anything"));
+        assert!(!empty.is_valid(""));
+        assert!(!empty.is_valid("anything"));
         assert!(!empty.is_enabled());
 
         // Populated config:
