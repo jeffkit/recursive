@@ -16,7 +16,7 @@
 //!    deferred list, the matched schemas are returned as plain JSON in a
 //!    `tool_result` message, and a new request is sent with the matched tools
 //!    appended to the eager list.
-//! 3. Capped at `MAX_SEARCH_ROUNDS` to prevent infinite loops.
+//! 3. Capped at `max_search_rounds` to prevent infinite loops.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,7 +35,6 @@ use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
 const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
-const MAX_SEARCH_ROUNDS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -50,6 +49,9 @@ pub struct OpenAiProvider {
     /// Algorithm used to resolve a `ToolSearchTool` query into a list of
     /// deferred tool names. Defaults to `KeywordSearchEngine`.
     search_engine: Arc<dyn ToolSearchEngine>,
+    /// Maximum number of ToolSearchTool round-trips per
+    /// `complete_with_search` / `stream_with_search` call.
+    max_search_rounds: usize,
 }
 
 impl OpenAiProvider {
@@ -82,12 +84,20 @@ impl OpenAiProvider {
             retry: RetryPolicy::default(),
             stream_tx: None,
             search_engine: Arc::new(KeywordSearchEngine::new()),
+            max_search_rounds: 3,
         })
     }
 
     /// Replace the search engine used to resolve `ToolSearchTool` queries.
     pub fn with_search_engine(mut self, engine: Arc<dyn ToolSearchEngine>) -> Self {
         self.search_engine = engine;
+        self
+    }
+
+    /// Set the maximum number of ToolSearchTool round-trips per
+    /// `complete_with_search` / `stream_with_search` call.
+    pub fn with_max_search_rounds(mut self, n: usize) -> Self {
+        self.max_search_rounds = n;
         self
     }
 
@@ -365,12 +375,12 @@ impl OpenAiProvider {
             Some(c) => c.clone(),
         };
 
-        if round >= MAX_SEARCH_ROUNDS {
+        if round >= self.max_search_rounds {
             tracing::warn!(
                 target: "recursive::llm",
                 round,
-                max = MAX_SEARCH_ROUNDS,
-                "ToolSearchTool (openai): hit MAX_SEARCH_ROUNDS, returning current completion"
+                max = self.max_search_rounds,
+                "ToolSearchTool (openai): hit max_search_rounds, returning current completion"
             );
             return Ok(completion);
         }
@@ -446,12 +456,12 @@ impl OpenAiProvider {
             Some(c) => c.clone(),
         };
 
-        if round >= MAX_SEARCH_ROUNDS {
+        if round >= self.max_search_rounds {
             tracing::warn!(
                 target: "recursive::llm",
                 round,
-                max = MAX_SEARCH_ROUNDS,
-                "ToolSearchTool (openai/stream): hit MAX_SEARCH_ROUNDS"
+                max = self.max_search_rounds,
+                "ToolSearchTool (openai/stream): hit max_search_rounds"
             );
             return Ok(completion);
         }
@@ -1209,7 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn openai_search_loop_caps_at_max_rounds() {
         // Mock server always returns a ToolSearchTool call.
-        // Assert we stop after MAX_SEARCH_ROUNDS and return.
+        // Assert we stop after max_search_rounds and return.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1247,14 +1257,9 @@ mod tests {
             .complete_with_search(&[Message::user("hi")], &[], &deferred)
             .await
             .unwrap();
-        // Should have made MAX_SEARCH_ROUNDS + 1 calls and stopped
+        // Should have made max_search_rounds + 1 calls and stopped
         let calls = call_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(
-            calls,
-            MAX_SEARCH_ROUNDS + 1,
-            "expected {} calls, got {calls}",
-            MAX_SEARCH_ROUNDS + 1
-        );
+        assert_eq!(calls, 3 + 1, "expected {} calls, got {calls}", 3 + 1);
         // The returned completion should be the last ToolSearchTool response
         assert!(!result.tool_calls.is_empty());
     }

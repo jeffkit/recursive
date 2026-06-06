@@ -20,10 +20,6 @@ use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, Tool
 /// with `tool_reference` content blocks.
 pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
 
-/// Hard cap on the number of search round-trips per
-/// `complete_with_search` call. Bounds the worst case where the
-/// model keeps calling `ToolSearchTool` with different queries.
-const MAX_SEARCH_ROUNDS: usize = 3;
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
@@ -40,6 +36,9 @@ pub struct AnthropicProvider {
     /// list of deferred tool names. Always non-null (defaults to
     /// `KeywordSearchEngine`).
     search_engine: Arc<dyn ToolSearchEngine>,
+    /// Maximum number of ToolSearchTool round-trips per
+    /// `complete_with_search` / `stream_with_search` call.
+    max_search_rounds: usize,
 }
 
 impl AnthropicProvider {
@@ -63,6 +62,7 @@ impl AnthropicProvider {
             max_tokens: 4096,
             retry: RetryPolicy::default(),
             search_engine: Arc::new(KeywordSearchEngine::new()),
+            max_search_rounds: 3,
         })
     }
 
@@ -94,6 +94,13 @@ impl AnthropicProvider {
     /// which tools the search returns.
     pub fn with_search_engine(mut self, engine: Arc<dyn ToolSearchEngine>) -> Self {
         self.search_engine = engine;
+        self
+    }
+
+    /// Set the maximum number of ToolSearchTool round-trips per
+    /// `complete_with_search` / `stream_with_search` call.
+    pub fn with_max_search_rounds(mut self, n: usize) -> Self {
+        self.max_search_rounds = n;
         self
     }
 
@@ -185,14 +192,14 @@ impl AnthropicProvider {
             .iter()
             .find(|c| c.name == TOOL_SEARCH_TOOL_NAME)
         {
-            if round >= MAX_SEARCH_ROUNDS {
+            if round >= self.max_search_rounds {
                 // Bail out: too many search rounds. Return what
                 // we have so the kernel can decide.
                 tracing::warn!(
                     target: "recursive::llm",
                     round,
-                    max = MAX_SEARCH_ROUNDS,
-                    "ToolSearchTool: hit MAX_SEARCH_ROUNDS, returning current completion"
+                    max = self.max_search_rounds,
+                    "ToolSearchTool: hit max_search_rounds, returning current completion"
                 );
                 return Ok(completion);
             }
@@ -423,12 +430,12 @@ impl AnthropicProvider {
             .iter()
             .find(|c| c.name == TOOL_SEARCH_TOOL_NAME)
         {
-            if round >= MAX_SEARCH_ROUNDS {
+            if round >= self.max_search_rounds {
                 tracing::warn!(
                     target: "recursive::llm",
                     round,
-                    max = MAX_SEARCH_ROUNDS,
-                    "ToolSearchTool (stream): hit MAX_SEARCH_ROUNDS, returning current completion"
+                    max = self.max_search_rounds,
+                    "ToolSearchTool (stream): hit max_search_rounds, returning current completion"
                 );
                 return Ok(completion);
             }

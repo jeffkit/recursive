@@ -635,13 +635,15 @@ async fn main() -> anyhow::Result<()> {
                     let anthropic =
                         AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                             .with_temperature(config.temperature)
-                            .with_retry_policy(anthropic_retry);
+                            .with_retry_policy(anthropic_retry)
+                            .with_max_search_rounds(config.max_search_rounds);
                     Arc::new(anthropic)
                 }
                 _ => {
                     let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                         .with_temperature(config.temperature)
-                        .with_retry_policy(retry);
+                        .with_retry_policy(retry)
+                        .with_max_search_rounds(config.max_search_rounds);
                     Arc::new(openai)
                 }
             };
@@ -1510,13 +1512,15 @@ async fn run_loop(
             };
             let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(anthropic_retry);
+                .with_retry_policy(anthropic_retry)
+                .with_max_search_rounds(config.max_search_rounds);
             Arc::new(anthropic)
         }
         _ => {
             let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(retry);
+                .with_retry_policy(retry)
+                .with_max_search_rounds(config.max_search_rounds);
             Arc::new(openai)
         }
     };
@@ -2146,6 +2150,7 @@ mod tests {
             context_window_override: None,
             subagent_max_depth: 2,
             allow_bypass_permissions: false,
+            max_search_rounds: 3,
         }
     }
 
