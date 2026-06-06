@@ -102,3 +102,5 @@ Minimal implementation notes:
   `tokio::time::sleep(Duration::from_secs(60))` is fine.
 - **DO NOT modify** `src/llm/`, `src/run_core.rs`, `src/compact.rs`,
   `src/session.rs`, `src/runtime.rs`.
+- **DO NOT call `exit_plan_mode` or `request_plan_mode`.** You are running
+  headless; the plan gate has no reviewer. Just read and edit directly.
