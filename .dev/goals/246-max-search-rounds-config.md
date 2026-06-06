@@ -60,6 +60,13 @@ existing env-var parse tests in that file).
 - Read `src/llm/anthropic.rs` and `src/llm/openai.rs` to find where
   `MAX_SEARCH_ROUNDS` is used.
 - Read `src/config.rs` to see how other env-var fields are parsed.
+- CRITICAL: After adding `max_search_rounds` to Config, search for ALL
+  `Config {` struct literals in the entire repo and add `max_search_rounds: 3`
+  to each one. Run `grep -rn "Config {" src/ tests/` to find them all.
+  Missing fields will cause compile errors in test files.
+- CRITICAL: Use surgical edits (Edit tool) on `anthropic.rs` and `openai.rs`,
+  NOT full-file rewrites. The files are large and rewriting them causes syntax
+  errors. Only change the lines that reference `MAX_SEARCH_ROUNDS`.
 - **DO NOT modify** `src/agent.rs`, `src/run_core.rs`, `src/runtime.rs`.
 - **DO NOT call `exit_plan_mode` or `request_plan_mode`.** You are running
   headless; the plan gate has no reviewer. Just read and edit directly.

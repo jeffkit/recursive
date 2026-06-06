@@ -66,6 +66,11 @@ Existing tests should continue to pass. No new tests needed beyond confirming
 - Read `src/kernel/` to understand `TurnContext` usage.
 - Prefer the `Arc<Vec<Message>>` approach if `TurnContext` has many
   construction sites — it minimises the blast radius.
+- CRITICAL: Run `cargo test --workspace` (not just `cargo check` or
+  `cargo test --lib`) to verify the full test suite passes before declaring
+  done. Integration tests in `tests/` must also compile and pass.
+- CRITICAL: After any struct change, search `grep -rn "TurnContext {" src/ tests/`
+  to find ALL construction sites and update them.
 - **DO NOT modify** `src/agent.rs`, `src/run_core.rs`, `src/llm/`, `src/config.rs`.
 - **DO NOT call `exit_plan_mode` or `request_plan_mode`.** You are running
   headless; the plan gate has no reviewer. Just read and edit directly.
