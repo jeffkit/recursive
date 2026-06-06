@@ -2086,7 +2086,7 @@ mod tests {
     fn truncate_label_ascii_over_120() {
         let s = "a".repeat(200);
         let result = truncate_label(&s);
-        assert_eq!(result.len(), 121); // 120 chars + ellipsis (1 byte in UTF-8)
+        assert_eq!(result.len(), 123); // 120 chars + ellipsis (3 bytes in UTF-8)
         assert!(result.ends_with('…'));
     }
 
