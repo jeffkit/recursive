@@ -914,6 +914,35 @@ impl ToolRegistry {
             };
         };
 
+        // L1 policy check: enforce shell/fs policies from the registry-level
+        // PolicyConfig before executing any tool. This runs in the framework
+        // layer so individual tool implementations don't need to opt in.
+        if let Some(ref policy) = self.policy {
+            // Shell tools: check the "command" argument.
+            if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
+                if let Err(e) = policy.check_shell(cmd) {
+                    return ToolDispatch {
+                        result: Err(e),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
+                    };
+                }
+            }
+            // Filesystem tools: check "path" / "file_path" arguments.
+            let is_write = matches!(name, "Write" | "Edit" | "StrReplace");
+            let path_arg = arguments
+                .get("path")
+                .or_else(|| arguments.get("file_path"))
+                .and_then(|v| v.as_str());
+            if let Some(path) = path_arg {
+                if let Err(e) = policy.check_fs_path(path, is_write) {
+                    return ToolDispatch {
+                        result: Err(e),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
+                    };
+                }
+            }
+        }
+
         let side_effect = tool.side_effect_class();
         let step_id = uuid::Uuid::now_v7().hyphenated().to_string();
         let args_hash = blake3_canonical_json(&arguments);
