@@ -57,6 +57,10 @@ pub struct Config {
     /// Maximum nesting depth for sub-agents and parallel workers.
     /// Read from `RECURSIVE_SUBAGENT_MAX_DEPTH` env var, defaults to 2.
     pub subagent_max_depth: usize,
+    /// When `false` (default), API callers who request `"bypass"` permission
+    /// mode are silently downgraded to `Default`. Set to `true` via
+    /// `RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1` to honour bypass requests.
+    pub allow_bypass_permissions: bool,
 }
 
 impl Config {
@@ -224,6 +228,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2);
 
+        let allow_bypass_permissions = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS")
+            .ok()
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
         // This helps LLM prefix caching.
@@ -303,6 +312,7 @@ impl Config {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth,
+            allow_bypass_permissions,
         })
     }
 
@@ -538,6 +548,7 @@ mod tests {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
+            allow_bypass_permissions: false,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
