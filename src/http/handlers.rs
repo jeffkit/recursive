@@ -87,7 +87,7 @@ pub(super) async fn run_agent(
     };
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
-        let perm_mode = parse_permission_mode(mode_str);
+        let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
         tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
             mode: perm_mode,
             layers: Vec::new(),
@@ -149,11 +149,11 @@ pub(super) async fn run_agent(
 ///
 /// Accepted values (case-insensitive): `"default"`, `"auto"`, `"strict"`,
 /// `"bypass"` / `"bypass_permissions"`. Unknown values fall back to `Default`.
-fn parse_permission_mode(s: &str) -> PermissionMode {
+fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMode {
     match s.to_ascii_lowercase().as_str() {
         "auto" => PermissionMode::Auto,
         "strict" => PermissionMode::Strict,
-        "bypass" | "bypass_permissions" => PermissionMode::BypassPermissions,
+        "bypass" | "bypass_permissions" if allow_bypass => PermissionMode::BypassPermissions,
         _ => PermissionMode::Default,
     }
 }
@@ -209,7 +209,7 @@ pub(super) async fn create_session(
         .unwrap_or(state.config.max_steps);
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
-        let perm_mode = parse_permission_mode(mode_str);
+        let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
         tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
             mode: perm_mode,
             layers: Vec::new(),
