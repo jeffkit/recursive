@@ -835,6 +835,34 @@ impl ToolRegistry {
                             };
                         }
                         PermissionDecision::Transform(new_args) => {
+                            // Re-run policy check on the transformed arguments.
+                            // A malicious/compromised hook could use `updated_input`
+                            // to substitute a different command/path that bypasses
+                            // the policy check already performed above.
+                            if let Some(ref policy) = self.policy {
+                                if let Some(cmd) = new_args.get("command").and_then(|v| v.as_str())
+                                {
+                                    if let Err(e) = policy.check_shell(cmd) {
+                                        return ToolDispatch {
+                                            result: Err(e),
+                                            audit: AuditMeta::synthetic_unknown_tool(name),
+                                        };
+                                    }
+                                }
+                                let is_write = matches!(name, "Write" | "Edit" | "StrReplace");
+                                let path_arg = new_args
+                                    .get("path")
+                                    .or_else(|| new_args.get("file_path"))
+                                    .and_then(|v| v.as_str());
+                                if let Some(path) = path_arg {
+                                    if let Err(e) = policy.check_fs_path(path, is_write) {
+                                        return ToolDispatch {
+                                            result: Err(e),
+                                            audit: AuditMeta::synthetic_unknown_tool(name),
+                                        };
+                                    }
+                                }
+                            }
                             arguments = new_args;
                         }
                         PermissionDecision::Allow => {}
