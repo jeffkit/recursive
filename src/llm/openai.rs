@@ -601,14 +601,36 @@ impl OpenAiProvider {
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<TokenUsage> = None;
 
-        // Process the byte stream incrementally line by line instead of
-        // buffering the entire response body first.
+        // Process the byte stream incrementally line by line.
+        //
+        // We maintain a raw byte buffer (`incomplete`) to handle multi-byte
+        // UTF-8 sequences that may be split across HTTP chunk boundaries.
+        // String::from_utf8_lossy() would silently replace the incomplete
+        // tail bytes with U+FFFD, permanently corrupting non-ASCII content
+        // (e.g. Chinese/Japanese text in tool arguments or assistant output).
         let mut byte_stream = resp.bytes_stream();
+        let mut incomplete: Vec<u8> = Vec::new();
         let mut line_buf = String::new();
 
         while let Some(chunk) = byte_stream.next().await {
             let bytes = chunk.map_err(|e| self.make_err(format!("SSE stream read error: {e}")))?;
-            let text = String::from_utf8_lossy(&bytes);
+            // Prepend any leftover bytes from the previous chunk.
+            let combined: Vec<u8> = if incomplete.is_empty() {
+                bytes.to_vec()
+            } else {
+                let mut v = std::mem::take(&mut incomplete);
+                v.extend_from_slice(&bytes);
+                v
+            };
+            // Decode as much valid UTF-8 as possible; keep the remainder.
+            let valid_up_to = match std::str::from_utf8(&combined) {
+                Ok(_) => combined.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            incomplete = combined[valid_up_to..].to_vec();
+            // SAFETY: valid_up_to is guaranteed by from_utf8 to be a valid
+            // UTF-8 boundary within `combined`.
+            let text = unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) };
             for ch in text.chars() {
                 if ch == '\n' {
                     let line = std::mem::take(&mut line_buf);
@@ -626,7 +648,15 @@ impl OpenAiProvider {
                 }
             }
         }
-        // Flush any trailing line
+        // Flush any remaining bytes (shouldn't happen with a well-formed stream,
+        // but handle gracefully to avoid silent truncation).
+        if !incomplete.is_empty() {
+            tracing::warn!(
+                bytes = incomplete.len(),
+                "SSE stream ended with incomplete UTF-8 sequence; discarding tail bytes"
+            );
+        }
+        // Flush any trailing line without a terminating newline.
         if !line_buf.is_empty() {
             Self::process_sse_line(
                 &line_buf,

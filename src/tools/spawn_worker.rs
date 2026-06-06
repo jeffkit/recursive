@@ -167,8 +167,13 @@ impl SpawnWorkerTool {
         self
     }
 
+    /// Build a restricted tool registry containing only the named tools.
+    ///
+    /// Uses `with_same_transport()` (empty tool set, shared transport/policy)
+    /// rather than `fork()` (which cloned all tools), so the worker actually
+    /// runs with only the declared tool subset.
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
-        let mut reg = self.all_tools.fork();
+        let mut reg = self.all_tools.with_same_transport();
         for name in tool_names {
             if let Some(tool) = self.all_tools.get(name) {
                 reg = reg.register(tool);

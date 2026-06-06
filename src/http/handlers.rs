@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{wrappers::BroadcastStream, wrappers::IntervalStream, StreamExt};
 
 use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
@@ -282,6 +282,10 @@ pub(super) async fn list_sessions(
             title: s.title.clone(),
         });
     }
+    // Sort by session_id for stable, deterministic pagination across requests.
+    // Without this, HashMap iteration order is non-deterministic and pages
+    // would shift between calls.
+    infos.sort_by(|a, b| a.id.cmp(&b.id));
     // Apply offset + limit pagination.
     let offset = params.offset.unwrap_or(0);
     let page: Vec<SessionInfo> = infos
@@ -879,7 +883,8 @@ pub(super) async fn session_events(
         tx.subscribe()
     };
 
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+    // Map real agent events to SSE data events, dropping lagged-receiver errors.
+    let agent_stream = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(sse_event) => {
             let event_type = match &sse_event {
                 SseEvent::Message { .. } => "message",
@@ -894,12 +899,25 @@ pub(super) async fn session_events(
                 SseEvent::ToolProgress { .. } => "tool_progress",
             };
             let data = serde_json::to_string(&sse_event).unwrap_or_default();
-            Some(Ok(Event::default().event(event_type).data(data)))
+            Some(Ok::<Event, Infallible>(
+                Event::default().event(event_type).data(data),
+            ))
         }
         Err(_) => None,
     });
 
-    Ok(Sse::new(stream))
+    // Heartbeat: emit an SSE comment every 30 seconds so proxy/load-balancer
+    // layers can detect the connection is still alive.
+    let heartbeat_stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(30)))
+        .map(|_| Ok::<Event, Infallible>(Event::default().comment("heartbeat")));
+
+    // Merge agent events and heartbeats into a single stream, capped at 1 hour.
+    let combined = agent_stream
+        .merge(heartbeat_stream)
+        .timeout(Duration::from_secs(3600))
+        .filter_map(|r| r.ok());
+
+    Ok(Sse::new(combined))
 }
 
 // ── Event mapping ────────────────────────────────────────────────────────
