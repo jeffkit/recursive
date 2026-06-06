@@ -193,19 +193,10 @@ fn filesystem_safe_timestamp() -> String {
     chrono_lite_now().replace(':', "-")
 }
 
-// Tiny RFC3339-ish timestamp without pulling in `chrono`. Format:
-// "YYYY-MM-DDTHH:MM:SSZ" using UTC.
+/// RFC3339 UTC timestamp using `chrono`. Format:
+/// "YYYY-MM-DDTHH:MM:SSZ".
 fn chrono_lite_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let day = secs / 86_400;
-    let sec_of_day = secs % 86_400;
-    let (h, m, s) = (sec_of_day / 3600, (sec_of_day / 60) % 60, sec_of_day % 60);
-    let (y, mo, d) = epoch_day_to_ymd(day as i64);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 pub(crate) fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {

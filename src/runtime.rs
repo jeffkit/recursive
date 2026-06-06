@@ -1048,11 +1048,14 @@ fn unix_now() -> i64 {
 /// Truncate a turn label to keep checkpoint commit messages readable.
 fn truncate_label(s: &str) -> String {
     const MAX: usize = 120;
-    let trimmed: String = s.lines().next().unwrap_or("").chars().take(MAX).collect();
-    if trimmed.len() < s.len() {
-        format!("{trimmed}…")
+    let first_line = s.lines().next().unwrap_or("");
+    let truncated: String = first_line.chars().take(MAX).collect();
+    // was truncated if original had multiple lines OR first line was longer than MAX
+    let was_cut = s.lines().count() > 1 || first_line.chars().count() > MAX;
+    if was_cut {
+        format!("{truncated}…")
     } else {
-        trimmed
+        truncated
     }
 }
 
@@ -2067,5 +2070,48 @@ mod tests {
             tools.get("exit_plan_mode").is_some(),
             "exit_plan_mode must be registered by AgentRuntimeBuilder"
         );
+    }
+
+    // ── truncate_label ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_label_ascii_under_120() {
+        let s = "a".repeat(100);
+        let result = truncate_label(&s);
+        assert_eq!(result.len(), 100);
+        assert!(!result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_label_ascii_over_120() {
+        let s = "a".repeat(200);
+        let result = truncate_label(&s);
+        assert_eq!(result.len(), 121); // 120 chars + ellipsis (1 byte in UTF-8)
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_label_multiline() {
+        let s = "first line
+second line";
+        let result = truncate_label(s);
+        assert_eq!(result, "first line…");
+    }
+
+    #[test]
+    fn truncate_label_cjk_exactly_120() {
+        // Each CJK character is 3 bytes in UTF-8
+        let s = "中".repeat(120);
+        let result = truncate_label(&s);
+        assert_eq!(result.chars().count(), 120);
+        assert!(!result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_label_cjk_over_120() {
+        let s = "中".repeat(121);
+        let result = truncate_label(&s);
+        assert_eq!(result.chars().count(), 121); // 120 chars + ellipsis
+        assert!(result.ends_with('…'));
     }
 }
