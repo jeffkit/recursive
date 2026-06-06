@@ -13,7 +13,7 @@ use crate::tools::facts::facts_summary;
 use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub workspace: PathBuf,
     pub api_base: String,
@@ -61,6 +61,39 @@ pub struct Config {
     /// mode are silently downgraded to `Default`. Set to `true` via
     /// `RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1` to honour bypass requests.
     pub allow_bypass_permissions: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("workspace", &self.workspace)
+            .field("api_base", &self.api_base)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("model", &self.model)
+            .field("provider_type", &self.provider_type)
+            .field("preset", &self.preset)
+            .field("max_steps", &self.max_steps)
+            .field("temperature", &self.temperature)
+            .field("system_prompt", &self.system_prompt)
+            .field("retry_max", &self.retry_max)
+            .field(
+                "retry_initial_backoff_secs",
+                &self.retry_initial_backoff_secs,
+            )
+            .field("retry_max_backoff_secs", &self.retry_max_backoff_secs)
+            .field("shell_timeout_secs", &self.shell_timeout_secs)
+            .field("headless", &self.headless)
+            .field("memory_summary_limit", &self.memory_summary_limit)
+            .field("thinking_budget", &self.thinking_budget)
+            .field("session_name", &self.session_name)
+            .field("max_budget_usd", &self.max_budget_usd)
+            .field("extra_dirs", &self.extra_dirs)
+            .field("allow_tools", &self.allow_tools)
+            .field("context_window_override", &self.context_window_override)
+            .field("subagent_max_depth", &self.subagent_max_depth)
+            .field("allow_bypass_permissions", &self.allow_bypass_permissions)
+            .finish()
+    }
 }
 
 impl Config {
@@ -406,7 +439,7 @@ pub fn default_system_prompt() -> String {
         "",
         "Use enter_plan_mode when:",
         "- The task requires exploring 3+ files before deciding what to change",
-        "- The task touches architectural boundaries (new module, new trait, API change)",
+        "- The task touches architectural boundaries (new module, new tool, API change)",
         "- You are unsure of the correct approach and want to discuss options first",
         "",
         "While in plan mode:",
@@ -1008,5 +1041,37 @@ preset = "ollama"
                 std::env::remove_var(name);
             }
         }
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let c = Config {
+            workspace: PathBuf::from("."),
+            api_base: String::new(),
+            api_key: Some("sk-secret".into()),
+            model: String::new(),
+            provider_type: "openai".into(),
+            preset: None,
+            max_steps: 32,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
+            headless: false,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            allow_bypass_permissions: false,
+        };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("sk-secret"));
+        assert!(dbg.contains("REDACTED"));
     }
 }
