@@ -369,8 +369,21 @@ pub(super) async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    let mut sessions = state.sessions.write().await;
-    if sessions.remove(&id).is_some() {
+    // Look up the runtime under a read lock so we can take the per-session
+    // runtime Mutex and call `close()` without holding the global write
+    // lock across an await point.
+    let session_runtime = {
+        let sessions = state.sessions.read().await;
+        sessions.get(&id).map(|s| s.runtime.clone())
+    };
+    if let Some(runtime) = session_runtime {
+        // Fire SessionEnd (no outcome — the client is deleting the session
+        // without a terminating turn) and flip `session_closed` before the
+        // runtime is dropped. Idempotent on repeated calls.
+        let mut rt = runtime.lock().await;
+        rt.close(None).await;
+        drop(rt);
+        state.sessions.write().await.remove(&id);
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
