@@ -87,6 +87,7 @@ fn mock_config(workspace: PathBuf) -> Config {
         extra_dirs: Vec::new(),
         allow_tools: Vec::new(),
         context_window_override: None,
+        subagent_max_depth: 2,
     }
 }
 
@@ -100,6 +101,7 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
         event_channels: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(Metrics::default()),
         slash_commands: Arc::new(Vec::new()),
+        session_ttl_secs: 0,
     }
 }
 

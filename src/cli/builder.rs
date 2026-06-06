@@ -296,10 +296,7 @@ pub(crate) async fn build_runtime(
     let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1")
         || std::env::var("RECURSIVE_TEAM_ENABLED").as_deref() == Ok("1");
     if sub_agent_enabled {
-        let max_depth: usize = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+        let max_depth = config.subagent_max_depth;
         let sub = SubAgent::new(
             &config.workspace,
             provider.clone(),

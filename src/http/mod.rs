@@ -79,6 +79,7 @@ pub struct SessionState {
     /// are appended. Allows `list_sessions` to read the count without taking
     /// the runtime Mutex (which may be held by a running agent turn).
     pub non_system_message_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub last_active: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 /// Serialized session info for list/detail endpoints.
@@ -271,6 +272,7 @@ pub struct AppState {
     /// Goal-169: registered slash commands (built-in + skill-backed).
     /// Pre-built at startup for cheap `GET /slash-commands` responses.
     pub slash_commands: Arc<Vec<SlashCommandInfo>>,
+    pub session_ttl_secs: u64,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -799,6 +801,52 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "content": { "type": "string" }
                     },
                     "required": ["role", "content"]
+                }
+            }
+        }
+    })
+}
+
+/// Spawn a background task that periodically evicts idle sessions.
+///
+/// Every `check_interval` seconds, the reaper scans all sessions and removes
+/// those whose `last_active` is older than `session_ttl_secs`. The reaper
+/// calls `runtime.close()` on each evicted session so the transcript is
+/// saved to the storage backend before the session is dropped.
+pub fn spawn_session_reaper(
+    state: Arc<AppState>,
+    check_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(check_interval).await;
+            let ttl = std::time::Duration::from_secs(state.session_ttl_secs);
+            let now = std::time::Instant::now();
+            let mut to_evict: Vec<String> = Vec::new();
+            // Phase 1: collect eviction candidates under a read lock.
+            {
+                let sessions = state.sessions.read().await;
+                for (id, session) in sessions.iter() {
+                    if now.saturating_duration_since(*session.last_active.lock().unwrap()) >= ttl {
+                        to_evict.push(id.clone());
+                    }
+                }
+            }
+            if to_evict.is_empty() {
+                continue;
+            }
+            // Phase 2: evict under a write lock, calling close() on each.
+            {
+                let mut sessions = state.sessions.write().await;
+                for id in &to_evict {
+                    if let Some(session) = sessions.remove(id) {
+                        // Try to close the runtime (best-effort — the lock
+                        // may be held by an in-flight turn).
+                        if let Ok(mut rt) = session.runtime.try_lock() {
+                            rt.close(None).await;
+                        }
+                        tracing::info!("reaper: evicted idle session {id}");
+                    }
                 }
             }
         }

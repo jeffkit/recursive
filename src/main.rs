@@ -677,6 +677,10 @@ async fn main() -> anyhow::Result<()> {
             };
             #[cfg(not(feature = "tui"))]
             let slash_commands: Vec<recursive::http::SlashCommandInfo> = Vec::new();
+            let session_ttl_secs: u64 = std::env::var("RECURSIVE_SESSION_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3600);
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -690,6 +694,7 @@ async fn main() -> anyhow::Result<()> {
                 )),
                 metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
                 slash_commands: std::sync::Arc::new(slash_commands),
+                session_ttl_secs,
             };
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -2129,6 +2134,7 @@ mod tests {
             extra_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
+            subagent_max_depth: 2,
         }
     }
 

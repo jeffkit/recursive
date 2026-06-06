@@ -248,6 +248,7 @@ pub(super) async fn create_session(
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
     };
 
     state.sessions.write().await.insert(id.clone(), session);
@@ -491,6 +492,7 @@ pub(super) async fn fork_session(
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
+        last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
     };
 
     state.sessions.write().await.insert(new_id.clone(), session);
@@ -722,7 +724,7 @@ pub(super) async fn send_session_message(
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Get the session's runtime, interrupt token, and message counter (Arc clones are cheap).
+    // Get the session's runtime, interrupt token, message counter, and last_active.
     let (runtime_arc, interrupt_token_arc, msg_count_arc) = {
         let sessions = state.sessions.read().await;
         let session = sessions.get(&id).ok_or((
@@ -732,6 +734,8 @@ pub(super) async fn send_session_message(
                 error: "session not found".into(),
             }),
         ))?;
+        // Update last_active timestamp for this session.
+        *session.last_active.lock().unwrap() = std::time::Instant::now();
         (
             session.runtime.clone(),
             session.interrupt_token.clone(),
