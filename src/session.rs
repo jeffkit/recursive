@@ -468,6 +468,30 @@ pub fn entry_to_message(entry: TranscriptEntry) -> Message {
     }
 }
 
+/// Write `contents` to `path` atomically via a sibling temp file + rename.
+///
+/// Prevents corrupt reads when a crash occurs mid-write. The temp file is
+/// placed in the same directory as `path` so the rename stays on the same
+/// filesystem (required for atomicity on most OSes).
+fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("meta"),
+        std::process::id(),
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Writer for appending messages to a JSONL session file.
 ///
 /// Opens (or creates) a `.jsonl` file in append mode and writes one
@@ -580,11 +604,11 @@ impl SessionWriter {
             name: None,
         };
 
-        // Write initial meta file
+        // Write initial meta file (atomic: temp + rename to prevent corruption).
         let meta_path = session_dir.join(".meta.json");
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&meta_path, meta_json)?;
+        atomic_write(&meta_path, &meta_json)?;
 
         Ok(Self {
             session_id,
@@ -823,7 +847,7 @@ impl SessionWriter {
         }
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&meta_path, json)
+        atomic_write(&meta_path, &json)
     }
 
     /// Finalise the session: flush the writer and update the meta file
@@ -860,7 +884,7 @@ impl SessionWriter {
 
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&meta_path, meta_json)
+        atomic_write(&meta_path, &meta_json)
     }
 
     /// Set an optional human-readable display name for this session.
