@@ -20,12 +20,14 @@ fn build_provider(config: &Config, api_key: String) -> crate::error::Result<Arc<
         "anthropic" => Arc::new(
             crate::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(retry),
+                .with_retry_policy(retry)
+                .with_max_search_rounds(config.max_search_rounds),
         ),
         _ => Arc::new(
             crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(retry),
+                .with_retry_policy(retry)
+                .with_max_search_rounds(config.max_search_rounds),
         ),
     };
     Ok(provider)

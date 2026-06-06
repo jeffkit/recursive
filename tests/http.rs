@@ -44,6 +44,7 @@ mod http_tests {
             context_window_override: None,
             subagent_max_depth: 2,
             allow_bypass_permissions: false,
+            max_search_rounds: 3,
         }
     }
 
