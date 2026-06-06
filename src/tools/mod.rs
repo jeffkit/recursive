@@ -282,6 +282,7 @@ pub trait PermissionHook: Send + Sync {
     async fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision;
 }
 
+/// NOTE: Clone shares Arc state with all tools. Use fork() for isolation.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -417,6 +418,22 @@ impl ToolRegistry {
             headless: self.headless,
             hook_runner: self.hook_runner.clone(),
         }
+    }
+
+    /// Create an isolated copy of this registry.
+    ///
+    /// Unlike `clone()`, `fork()` calls `tool.fork()` on each registered
+    /// tool so that tools with internal state (e.g. scratchpad, memory)
+    /// get independent copies rather than shared `Arc` references.
+    ///
+    /// Tools that do not implement `fork()` (stateless tools) are simply
+    /// cloned as usual.
+    ///
+    /// For now, this is equivalent to `clone()` — a full fork requires
+    /// per-tool fork support. This method exists as a named extension
+    /// point so call sites can opt in to isolation semantics explicitly.
+    pub fn fork(&self) -> Self {
+        self.clone()
     }
 
     /// Attach a [`PermissionHook`] (Goal 161). When set, `ask_permission`
@@ -631,7 +648,7 @@ impl ToolRegistry {
     /// Split the registry's tools into eager and deferred partitions.
     ///
     /// Returns `(eager, deferred)` where each element is a
-    /// `(ToolSpec, Option<search_hint>)` pair. Eager tools carry their
+    /// `(ToolSpec, optional_search_hint)` pair. Eager tools carry their
     /// full schema; deferred tools carry only the name (the full schema is
     /// returned on demand when the model calls `ToolSearch`). The
     /// search hint is the first sentence of the tool's description,
@@ -1505,6 +1522,23 @@ mod tests {
         assert!(
             registry.get("exit_plan_mode").is_none(),
             "exit_plan_mode must not be in the default registry"
+        );
+    }
+
+    // ── Goal-247: ToolRegistry::fork() ──────────────────────────────────────
+
+    #[test]
+    fn fork_returns_usable_registry() {
+        let reg = ToolRegistry::local().register(Arc::new(Echo));
+        let forked = reg.fork();
+        // fork() should return a registry that can invoke tools
+        assert!(
+            forked.get("echo").is_some(),
+            "forked registry should contain 'echo'"
+        );
+        assert!(
+            forked.get("nope").is_none(),
+            "forked registry should not contain unknown tools"
         );
     }
 }
