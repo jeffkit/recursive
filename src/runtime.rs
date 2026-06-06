@@ -960,12 +960,13 @@ impl AgentRuntime {
             }
 
             // Priority 2: background job completed
+            // Use .lock().await instead of try_lock() so a completed job is
+            // never silently skipped when the lock is momentarily contended.
             if let Some(mgr) = bg_manager {
-                if let Ok(mut mgr) = mgr.try_lock() {
-                    if let Some((id, output)) = mgr.take_completed() {
-                        next_goal = format!("Background job '{}' completed:\n{}", id, output);
-                        continue;
-                    }
+                let mut mgr = mgr.lock().await;
+                if let Some((id, output)) = mgr.take_completed() {
+                    next_goal = format!("Background job '{}' completed:\n{}", id, output);
+                    continue;
                 }
             }
 
