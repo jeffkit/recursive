@@ -584,16 +584,15 @@ impl AgentRuntime {
     ///
     /// Returns `Ok(Some(outcome))` for the last turn processed, or
     /// `Ok(None)` if the queue is empty when called.
+    ///
+    /// Stops on the first error and returns it to the caller. Messages
+    /// that were not yet popped from the queue remain in the queue for
+    /// later processing.
     async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
         let mut last: Option<RuntimeOutcome> = None;
         while let Some(msg) = self.message_queue.pop_front() {
-            match self.run(msg).await {
-                Ok(outcome) => last = Some(outcome),
-                Err(e) => {
-                    tracing::warn!(error = %e, "drain_queue: turn failed, continuing with next queued message");
-                    continue;
-                }
-            }
+            let outcome = self.run(msg).await?;
+            last = Some(outcome);
         }
         Ok(last)
     }
@@ -2046,6 +2045,59 @@ mod tests {
         assert_eq!(rt.queue_len(), 1);
         rt.message_queue.push_back("also pending".into());
         assert_eq!(rt.queue_len(), 2);
+    }
+
+    // ── Goal-244: drain_queue error propagation ──
+
+    #[tokio::test]
+    async fn drain_queue_returns_ok_for_all_messages() {
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "reply A".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "reply B".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.message_queue.push_back("msg A".into());
+        rt.message_queue.push_back("msg B".into());
+        let result = rt.drain_queue().await;
+        assert!(result.is_ok());
+        let last = result.unwrap();
+        assert!(last.is_some());
+        assert_eq!(last.unwrap().final_text.as_deref(), Some("reply B"));
+        // Both user messages + both assistant replies are in transcript.
+        assert_eq!(rt.transcript().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn drain_queue_stops_on_first_error() {
+        // Only one completion available — second message will fail.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "reply A".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.message_queue.push_back("msg A".into());
+        rt.message_queue.push_back("msg B".into());
+        let result = rt.drain_queue().await;
+        assert!(result.is_err(), "expected error, got {:?}", result);
+        // First message was processed (popped from queue).
+        // Second message was popped from queue before the error (pop_front happens before run).
+        // Second message was popped from queue before the error.
+        assert_eq!(rt.queue_len(), 0, "second message was already popped");
     }
 
     // ── Goal-201: plan mode tools are registered by the runtime builder ──
