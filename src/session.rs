@@ -1393,7 +1393,7 @@ impl EventSink for SessionPersistenceSink {
                         Ok(mut w) => w.append_with_audit(&message, Some(audit), None, None),
                         Err(poisoned) => {
                             let mut w = poisoned.into_inner();
-                            w.append_with_audit(&message, None, None, None)
+                            w.append_with_audit(&message, Some(audit), None, None)
                         }
                     }
                 };
