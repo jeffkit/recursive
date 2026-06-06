@@ -61,6 +61,10 @@ pub struct Config {
     /// mode are silently downgraded to `Default`. Set to `true` via
     /// `RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1` to honour bypass requests.
     pub allow_bypass_permissions: bool,
+    /// Maximum number of ToolSearchTool round-trips per
+    /// `complete_with_search` / `stream_with_search` call.
+    /// Defaults to 3. Set via `RECURSIVE_MAX_SEARCH_ROUNDS`.
+    pub max_search_rounds: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -92,6 +96,7 @@ impl std::fmt::Debug for Config {
             .field("context_window_override", &self.context_window_override)
             .field("subagent_max_depth", &self.subagent_max_depth)
             .field("allow_bypass_permissions", &self.allow_bypass_permissions)
+            .field("max_search_rounds", &self.max_search_rounds)
             .finish()
     }
 }
@@ -266,6 +271,11 @@ impl Config {
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let max_search_rounds = std::env::var("RECURSIVE_MAX_SEARCH_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
         // This helps LLM prefix caching.
@@ -346,6 +356,7 @@ impl Config {
             context_window_override: None,
             subagent_max_depth,
             allow_bypass_permissions,
+            max_search_rounds,
         })
     }
 
@@ -582,6 +593,7 @@ mod tests {
             context_window_override: None,
             subagent_max_depth: 2,
             allow_bypass_permissions: false,
+            max_search_rounds: 3,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
@@ -1069,6 +1081,7 @@ preset = "ollama"
             context_window_override: None,
             subagent_max_depth: 2,
             allow_bypass_permissions: false,
+            max_search_rounds: 3,
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret"));
