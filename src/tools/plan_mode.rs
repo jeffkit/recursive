@@ -25,6 +25,22 @@ use crate::permissions::{PermissionMode, PermissionsConfig};
 use crate::tools::{Tool, ToolSideEffect};
 
 // ---------------------------------------------------------------------------
+// Tool name constants (M-5)
+// ---------------------------------------------------------------------------
+
+/// Canonical name for the `enter_plan_mode` tool.
+///
+/// Use this constant instead of the bare string literal so that any rename
+/// of the tool produces a compile-time error rather than a silent runtime mismatch.
+pub const ENTER_PLAN_MODE_TOOL_NAME: &str = "enter_plan_mode";
+
+/// Canonical name for the `exit_plan_mode` tool.
+///
+/// Use this constant instead of the bare string literal so that any rename
+/// of the tool produces a compile-time error rather than a silent runtime mismatch.
+pub const EXIT_PLAN_MODE_TOOL_NAME: &str = "exit_plan_mode";
+
+// ---------------------------------------------------------------------------
 // PlanApprovalResult
 // ---------------------------------------------------------------------------
 
@@ -167,7 +183,7 @@ impl Tool for EnterPlanModeTool {
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "enter_plan_mode".into(),
+            name: ENTER_PLAN_MODE_TOOL_NAME.into(),
             description: "Enter read-only planning mode. While active, write tools (Write, \
                  Edit, Bash, …) are blocked. Use read tools to explore the \
                  codebase freely, then call exit_plan_mode with a markdown plan summary."
@@ -248,7 +264,7 @@ impl Tool for ExitPlanModeTool {
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "exit_plan_mode".into(),
+            name: EXIT_PLAN_MODE_TOOL_NAME.into(),
             description:
                 "Exit plan mode and present your plan for human review. Include a markdown \
                  summary with: (1) your understanding of the current code, (2) the approach \

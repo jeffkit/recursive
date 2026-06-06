@@ -35,6 +35,7 @@ use crate::hooks::{HookAction, HookEvent, HookRegistry};
 use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
+use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use crate::tools::ToolRegistry;
 
 use crate::agent::{FinishReason, PermissionDecision};
@@ -282,7 +283,7 @@ impl<'a> RunCore<'a> {
             // that is not `exit_plan_mode` itself.
             if self.exploring_plan_mode.load(Ordering::Relaxed)
                 && !self.tools.is_readonly(&call.name)
-                && call.name != "exit_plan_mode"
+                && call.name != EXIT_PLAN_MODE_TOOL_NAME
             {
                 results.push(ToolCallOutcome {
                     id: call.id.clone(),
@@ -303,8 +304,8 @@ impl<'a> RunCore<'a> {
             // tell the agent to enter plan mode first.
             if !self.exploring_plan_mode.load(Ordering::Relaxed)
                 && self.tools.is_plan_mode(&call.name)
-                && call.name != "enter_plan_mode"
-                && call.name != "exit_plan_mode"
+                && call.name != ENTER_PLAN_MODE_TOOL_NAME
+                && call.name != EXIT_PLAN_MODE_TOOL_NAME
             {
                 results.push(ToolCallOutcome {
                     id: call.id.clone(),
