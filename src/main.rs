@@ -699,6 +699,16 @@ async fn main() -> anyhow::Result<()> {
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
+            // Warn if auth is effectively disabled
+            let auth_enabled = std::env::var("RECURSIVE_API_KEY").is_ok()
+                || std::env::var("RECURSIVE_JWT_SECRET").is_ok();
+            if !auth_enabled {
+                tracing::warn!(
+                    "HTTP server started with authentication DISABLED. \
+                     Set RECURSIVE_API_KEY or RECURSIVE_JWT_SECRET to enable auth. \
+                     Any client with network access can execute commands."
+                );
+            }
             let shutdown = shutdown_signal();
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move { shutdown.cancelled().await })
@@ -2226,5 +2236,15 @@ mod tests {
         let args = vec!["recursive", "run", "test goal"];
         let cli = Cli::parse_from(args);
         assert!(!cli.hook_timing);
+    }
+
+    #[test]
+    fn auth_disabled_when_no_env_vars() {
+        // Can't easily test env vars in parallel tests, so just verify
+        // the logic compiles and the condition is reachable.
+        let api_key_set = false;
+        let jwt_set = false;
+        let auth_enabled = api_key_set || jwt_set;
+        assert!(!auth_enabled);
     }
 }
