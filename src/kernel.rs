@@ -44,8 +44,23 @@ use std::sync::Arc;
 ///
 /// Prepared by the Wrapper (AgentRuntime). The Kernel does not know
 /// where these messages came from — could be fresh, compacted, or resumed.
+///
+/// # Ownership
+///
+/// `messages` is an **owned copy** of the wrapper's transcript. The kernel
+/// takes ownership and may mutate it freely during the ReAct loop (trimming
+/// old tool results, intra-turn compaction). The wrapper retains the canonical
+/// transcript and incorporates only the new messages from
+/// [`TurnOutcome::new_messages`] after the turn completes.
+///
+/// A full clone per turn is intentional: `RunCore` mutates the list in-place,
+/// so sharing via `Arc` would not eliminate the allocation. The clone is
+/// bounded by the `max_transcript_chars` trim that runs before each turn.
 pub struct TurnContext {
-    /// The full message list to send to the LLM (system + history + new user msg).
+    /// Owned copy of the wrapper's transcript for this turn.
+    ///
+    /// The kernel may mutate this list in-place; the wrapper's canonical
+    /// transcript is unaffected.
     pub messages: Vec<Message>,
 
     /// Channel to send agent events to the caller (runtime or test harness).
