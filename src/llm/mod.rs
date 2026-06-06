@@ -601,10 +601,16 @@ mod tests {
             context_window_tokens_for_model("claude-sonnet-4-6"),
             1_000_000
         );
-        assert_eq!(context_window_tokens_for_model("claude-opus-4-7"), 1_000_000);
+        assert_eq!(
+            context_window_tokens_for_model("claude-opus-4-7"),
+            1_000_000
+        );
         assert_eq!(context_window_tokens_for_model("MiniMax-M3"), 1_048_576);
         assert_eq!(context_window_tokens_for_model("deepseek-chat"), 1_000_000);
-        assert_eq!(context_window_tokens_for_model("deepseek-reasoner"), 1_000_000);
+        assert_eq!(
+            context_window_tokens_for_model("deepseek-reasoner"),
+            1_000_000
+        );
         assert_eq!(context_window_tokens_for_model("gpt-4o"), 128_000);
         assert_eq!(context_window_tokens_for_model("gpt-4o-mini"), 128_000);
         assert_eq!(context_window_tokens_for_model("moonshot-v1-8k"), 8_000);
@@ -629,7 +635,10 @@ mod tests {
         // deepseek-chat: 1M tokens → threshold should be large
         let ds = default_compact_threshold_chars("deepseek-chat");
         assert!(ds > 500_000, "deepseek threshold too small: {ds}");
-        assert!(ds < 4_000_000, "deepseek threshold suspiciously large: {ds}");
+        assert!(
+            ds < 4_000_000,
+            "deepseek threshold suspiciously large: {ds}"
+        );
 
         // claude-sonnet-4-6: 1M tokens → threshold should be large
         let cl = default_compact_threshold_chars("claude-sonnet-4-6");
