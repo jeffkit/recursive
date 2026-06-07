@@ -924,11 +924,27 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # differs across branches) and e2e/plugins/src/ is only modified
   # by goals that explicitly touch the E2E suite.
   if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
-    MAIN_DIST="$(cd "$REPO_ROOT" 2>/dev/null && pwd)/e2e/plugins/dist/index.js"
-    if [[ -f "$MAIN_DIST" ]]; then
-      echo "[self-improve] E2E: copying prebuilt dist/ from main repo ($MAIN_DIST)" >&2
-      mkdir -p e2e/plugins/dist
-      cp -R "$REPO_ROOT/e2e/plugins/dist/." e2e/plugins/dist/ 2>&1 | tail -3
+    # REPO_ROOT in a worktree points to the worktree itself (BASH_SOURCE
+    # resolves relative to where the script lives). The MAIN repo's
+    # root is the parent of the shared .git dir — git rev-parse's
+    # --git-common-dir gives that path. Use it to find the main
+    # repo's prebuilt dist.
+    MAIN_REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null \
+      && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+        | xargs -I{} dirname {} 2>/dev/null)"
+    if [[ -n "$MAIN_REPO_ROOT" && -d "$MAIN_REPO_ROOT" ]]; then
+      MAIN_DIST="$MAIN_REPO_ROOT/e2e/plugins/dist/index.js"
+      if [[ -f "$MAIN_DIST" ]]; then
+        echo "[self-improve] E2E: copying prebuilt dist/ from main repo ($MAIN_REPO_ROOT)" >&2
+        mkdir -p e2e/plugins/dist
+        cp -R "$MAIN_REPO_ROOT/e2e/plugins/dist/." e2e/plugins/dist/ 2>&1 | tail -3
+      elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
+        echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
+        if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
+              && pnpm build 2>&1 | tail -5); then
+          echo "[self-improve] E2E: pnpm build FAILED — plugins still missing" >&2
+        fi
+      fi
     elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
       echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
       if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
