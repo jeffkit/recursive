@@ -1,6 +1,6 @@
 //! Integration tests for v0.5.0 cross-module features.
 //!
-//! Tests that HTTP API, Multi-Agent, and Pipeline work together correctly.
+//! Tests that HTTP API and Multi-Agent features work together correctly.
 
 #[cfg(feature = "http")]
 mod v050_integration {
@@ -8,7 +8,7 @@ mod v050_integration {
     use http_body_util::BodyExt;
     use recursive::http::{build_router, AppState, Metrics, ToolInfo};
     use recursive::llm::{mock::MockProvider, Completion};
-    use recursive::multi::{default_roles, AgentPool, AgentRole, Pipeline};
+    use recursive::multi::{default_roles, AgentPool};
     use recursive::tools::ToolRegistry;
     use recursive::{Config, LlmProvider};
     use std::collections::HashMap;
@@ -207,53 +207,6 @@ mod v050_integration {
         let ctx = pool.memory().to_context_string().await;
         assert!(ctx.contains("architecture"));
         assert!(ctx.contains("modular with clear boundaries"));
-    }
-
-    #[tokio::test]
-    async fn multi_agent_pipeline_execution() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![
-            Completion {
-                content: "Step 1: Create the file. Step 2: Write hello world.".to_string(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".to_string()),
-                usage: None,
-                reasoning_content: None,
-            },
-            Completion {
-                content: "Done! Created hello.rs with fn main() { println!(\"Hello!\"); }"
-                    .to_string(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".to_string()),
-                usage: None,
-                reasoning_content: None,
-            },
-        ]));
-        let config = test_config();
-        let mut pool = AgentPool::new(provider, config);
-
-        pool.add_role(AgentRole {
-            name: "planner".into(),
-            system_prompt: "Plan the task".into(),
-            max_steps: 5,
-            allowed_tools: vec![],
-        });
-        pool.add_role(AgentRole {
-            name: "coder".into(),
-            system_prompt: "Implement the plan".into(),
-            max_steps: 10,
-            allowed_tools: vec![],
-        });
-
-        let pipeline = Pipeline::new(vec!["planner".into(), "coder".into()]);
-        let result = pipeline
-            .execute(&pool, "build a hello world")
-            .await
-            .unwrap();
-
-        assert_eq!(result.stage_count(), 2);
-        assert_eq!(result.stages[0].role, "planner");
-        assert_eq!(result.stages[1].role, "coder");
-        assert!(!result.final_output().is_empty());
     }
 
     #[tokio::test]
