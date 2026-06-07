@@ -306,6 +306,18 @@ impl std::fmt::Debug for AgentRuntime {
     }
 }
 
+/// How many of the most-recent transcript messages to send to the
+/// goal-evaluator judge on each turn. The judge is supposed to evaluate
+/// *recent progress* — "did the last few turns move toward the
+/// condition?" — not the full session history. The full transcript
+/// keeps growing turn after turn (user prompt + assistant reply +
+/// optional tool result), so passing the whole thing to the judge
+/// after several turns gets expensive. A 12-message tail covers
+/// roughly 3-4 turns of context. The judge still does its own
+/// internal TAIL slicing inside `GoalEvaluator::evaluate`; this
+/// constant bounds the *caller-side* payload as well.
+const GOAL_EVAL_TRANSCRIPT_TAIL: usize = 12;
+
 impl AgentRuntime {
     /// Create a new [`AgentRuntimeBuilder`].
     pub fn builder() -> AgentRuntimeBuilder {
@@ -623,6 +635,22 @@ impl AgentRuntime {
         &self.transcript
     }
 
+    /// Return the most-recent `n` transcript messages, or the full
+    /// transcript if `n >= transcript.len()`. Returns an empty slice
+    /// when `n == 0`.
+    ///
+    /// Used by the goal-loop judge (`run_goal_loop`) to keep the
+    /// per-turn evaluator payload bounded as the transcript grows.
+    /// Goal-260.
+    pub fn transcript_tail(&self, n: usize) -> &[Message] {
+        let len = self.transcript.len();
+        if n >= len {
+            &self.transcript
+        } else {
+            &self.transcript[len - n..]
+        }
+    }
+
     /// Replace the current transcript (useful for restoring from a saved session).
     pub fn set_transcript(&mut self, transcript: Vec<Message>) {
         self.transcript = transcript;
@@ -877,7 +905,11 @@ impl AgentRuntime {
             };
 
             // Ask the judge.
-            let verdict = evaluator.evaluate(&condition, self.transcript()).await?;
+            // Goal-260: pass a tail slice, not the full transcript. The judge
+            // only needs recent progress; the full transcript grows every turn
+            // and would balloon the judge call's payload.
+            let tail = self.transcript_tail(GOAL_EVAL_TRANSCRIPT_TAIL);
+            let verdict = evaluator.evaluate(&condition, tail).await?;
             if verdict.achieved {
                 if let Ok(mut g) = self.goal_state.write() {
                     if let Some(ref mut gs) = *g {
@@ -2008,6 +2040,57 @@ mod tests {
         let g = rt.current_goal().unwrap();
         assert_eq!(g.condition, "second goal");
         assert_eq!(g.max_turns, 15);
+    }
+
+    // ── Goal-260: transcript_tail accessor ───────────────────────────────
+
+    #[test]
+    fn transcript_tail_returns_full_when_n_exceeds_len() -> Result<(), Box<dyn std::error::Error>> {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build()?;
+        // Build a 3-message transcript directly (no LLM calls).
+        rt.set_transcript(vec![
+            crate::message::Message::user("one"),
+            crate::message::Message::assistant("two"),
+            crate::message::Message::user("three"),
+        ]);
+        let tail = rt.transcript_tail(10);
+        assert_eq!(tail.len(), 3, "n > len should return the full transcript");
+        assert_eq!(tail[0].content, "one");
+        assert_eq!(tail[2].content, "three");
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_tail_returns_last_n() -> Result<(), Box<dyn std::error::Error>> {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build()?;
+        rt.set_transcript(vec![
+            crate::message::Message::user("m0"),
+            crate::message::Message::assistant("m1"),
+            crate::message::Message::user("m2"),
+            crate::message::Message::assistant("m3"),
+            crate::message::Message::user("m4"),
+        ]);
+        let tail = rt.transcript_tail(2);
+        assert_eq!(tail.len(), 2, "should return exactly the last 2 messages");
+        assert_eq!(tail[0].content, "m3");
+        assert_eq!(tail[1].content, "m4");
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_tail_handles_zero() -> Result<(), Box<dyn std::error::Error>> {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build()?;
+        rt.set_transcript(vec![
+            crate::message::Message::user("only"),
+            crate::message::Message::assistant("reply"),
+        ]);
+        let tail = rt.transcript_tail(0);
+        assert_eq!(tail.len(), 0, "n == 0 should return an empty slice");
+        assert!(tail.is_empty());
+        Ok(())
     }
 
     // ── Goal-181: message queue ───────────────────────────────────────────
