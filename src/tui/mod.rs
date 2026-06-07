@@ -22,8 +22,11 @@ use std::time::Duration;
 
 use unicode_width::UnicodeWidthStr as _;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::ExecutableCommand as _;
 use ratatui::prelude::*;
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -39,17 +42,6 @@ use crate::tui::events::UserAction;
 /// old shell history is pushed into native scrollback and the TUI fills the
 /// entire visible area.
 const MIN_INLINE_HEIGHT: u16 = 20;
-
-/// How many rendered lines to keep in the in-viewport rolling buffer
-/// (`app.recent_display`).  Lines beyond this cap are pushed to native
-/// scrollback via `insert_before()` and removed from `recent_display`,
-/// so every line lives in exactly one place (no duplicates).
-///
-/// Set large (300) so the startup banner and most recent conversation
-/// history stay accessible via in-app scroll (Shift+↑) for the entire
-/// session. Native scrollback (`terminal.insert_before`) is still used
-/// for truly long transcripts.
-const RECENT_DISPLAY_MAX: usize = 300;
 
 /// Build the startup banner as ratatui `Line`s for display inside the
 /// viewport's messages panel.
@@ -226,6 +218,7 @@ struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = io::stdout().execute(DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = writeln!(io::stdout());
     }
@@ -277,6 +270,7 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     enable_raw_mode()?;
+    io::stdout().execute(EnableMouseCapture)?;
     let _guard = RawModeGuard;
 
     // Size the viewport to the full terminal height so old shell history is
@@ -321,25 +315,15 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         // push their rendered lines into `print_queue`.
         app.flush_ready_blocks(last_size.0);
 
-        // Drain the queue: sliding-window approach — each line lives in
-        // exactly ONE place, so there is never duplicate content.
+        // Drain the print_queue: push completed blocks into the terminal's
+        // native scrollback via insert_before().  This keeps the inline
+        // viewport height stable (no content accumulates inside it) and
+        // gives the user a continuous scrollback that merges seamlessly
+        // with prior shell history above the TUI.
         //
-        // Strategy:
-        //   1. Append the new lines to `recent_display` (the viewport's
-        //      messages panel).
-        //   2. If `recent_display` now exceeds RECENT_DISPLAY_MAX, drain the
-        //      OLDEST lines and push them to native scrollback via
-        //      `insert_before()`.  Those drained lines are removed from
-        //      `recent_display`, so they exist only in the scrollback.
-        //
-        // Result:
-        //   • Viewport always shows the last RECENT_DISPLAY_MAX rendered lines
-        //     → the messages panel is never blank between turns.
-        //   • As the conversation grows past RECENT_DISPLAY_MAX lines, older
-        //     content flows to native scrollback (pushing the startup banner
-        //     upward) and is accessible via terminal scroll (Shift+PgUp).
-        //   • No line is ever simultaneously in the viewport and in native
-        //     scrollback, so duplicate display is structurally impossible.
+        // The messages widget in chat.rs now renders from app.blocks
+        // (full history), so recent_display is only used for the startup
+        // banner — it is never appended to here.
         let queued: Vec<Vec<Line<'static>>> = app.print_queue.drain(..).collect();
 
         // Pre-draw: if a modal was dismissed in the previous event cycle AND
@@ -350,37 +334,29 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         }
 
         for lines in queued {
-            // 1. Append to the viewport rolling buffer.
-            app.recent_display.extend(lines);
-
-            // 2. Overflow → push excess to native scrollback.
-            if app.recent_display.len() > RECENT_DISPLAY_MAX {
-                let drain = app.recent_display.len() - RECENT_DISPLAY_MAX;
-                let overflow: Vec<Line<'static>> = app.recent_display.drain(..drain).collect();
-                let h = (overflow.len() as u16).max(1);
-                terminal.insert_before(h, |buf| {
-                    let area = buf.area;
-                    Paragraph::new(overflow)
-                        .wrap(Wrap { trim: false })
-                        .render(area, buf);
-                    // Fix wide-char continuation cells: ratatui's draw_lines
-                    // initialises them to Cell::EMPTY (symbol=" "), causing a
-                    // visible space after each wide (CJK/emoji) character.
-                    // Setting them to "" makes Print("") a no-op.
-                    let mut i = 0;
-                    while i < buf.content.len() {
-                        let w = buf.content[i].symbol().width();
-                        if w >= 2 {
-                            for j in 1..w {
-                                if i + j < buf.content.len() {
-                                    buf.content[i + j].set_symbol("");
-                                }
+            let h = (lines.len() as u16).max(1);
+            terminal.insert_before(h, |buf| {
+                let area = buf.area;
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .render(area, buf);
+                // Fix wide-char continuation cells: ratatui's draw_lines
+                // initialises them to Cell::EMPTY (symbol=" "), causing a
+                // visible space after each wide (CJK/emoji) character.
+                // Setting them to "" makes Print("") a no-op.
+                let mut i = 0;
+                while i < buf.content.len() {
+                    let w = buf.content[i].symbol().width();
+                    if w >= 2 {
+                        for j in 1..w {
+                            if i + j < buf.content.len() {
+                                buf.content[i + j].set_symbol("");
                             }
                         }
-                        i += 1;
                     }
-                })?;
-            }
+                    i += 1;
+                }
+            })?;
         }
 
         terminal.draw(|frame| ui::chat::render(frame, &app))?;
@@ -389,12 +365,14 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 while event::poll(Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Press {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
                             if let Some(action) = keymap::dispatch(&mut app, key) {
                                 let _ = backend.action_tx.send(action);
                             }
                         }
+                        Event::Mouse(mev) => handle_mouse(&mut app, mev),
+                        _ => {}
                     }
                 }
                 // Detect terminal resize: rebuild the inline viewport so
@@ -437,4 +415,18 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
     Ok(())
+}
+
+/// Map trackpad / mouse wheel events onto the transcript scroll offset.
+/// 3 lines per tick matches macOS trackpad feel and real-wheel notch speed.
+fn handle_mouse(app: &mut App, ev: MouseEvent) {
+    match ev.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        _ => {}
+    }
 }
