@@ -46,6 +46,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEV_DIR="$REPO_ROOT/.dev"
 cd "$REPO_ROOT"
 
+# Create runtime directories the script writes to. Several of these
+# are .gitignore'd (so a fresh worktree does NOT have them); the
+# script must mkdir -p before any write. Observed on g263 (first
+# run after the E2E hard-gate fix): verdict_and_exit's
+# failure-context write crashed with "No such file or directory"
+# because the rolled-back path did not mkdir .dev/runs/ first.
+mkdir -p "$DEV_DIR/runs" "$DEV_DIR/journal" "$DEV_DIR/metrics" "$DEV_DIR/observations"
+
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <goal-file-or-text>" >&2
   exit 2
@@ -893,6 +901,24 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && ! command -v argusai >/dev/null 
       break
     fi
   done
+fi
+
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
+   && command -v argusai >/dev/null 2>&1 \
+   && [[ -f "e2e/e2e.yaml" ]]; then
+  # Auto-build e2e/plugins/dist/ if missing. The plugins are
+  # gitignored build artifacts (see .gitignore `e2e/plugins/dist/`)
+  # so a fresh worktree does NOT have them. Without this, the
+  # gate would always fail in worktrees.
+  if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
+    if [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
+      echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
+      if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
+            && pnpm build 2>&1 | tail -5); then
+        echo "[self-improve] E2E: pnpm build FAILED — plugins still missing" >&2
+      fi
+    fi
+  fi
 fi
 
 if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
