@@ -1,0 +1,38 @@
+{
+  "verdict": "request_changes",
+  "confidence": 0.5,
+  "summary": "Review agent output could not be parsed as JSON; defaulting to approve [static invariant check: critical issue found]",
+  "issues": [
+    {
+      "severity": "critical",
+      "file": "src/ (static check)",
+      "description": "Found 3 new unwrap()/expect() call(s) in non-test product code",
+      "suggestion": "Replace with proper error propagation using ?-operator or map_err. Invariant #5.",
+      "check": "static_unwrap"
+    }
+  ],
+  "missing_scope": [],
+  "score": {
+    "completeness": 5,
+    "correctness": 5,
+    "architecture": 5,
+    "tests": 5,
+    "style": 5
+  },
+  "run_id": "20260607T052403Z-13996",
+  "goal_tag": "transcript-tail-to-goal-evaluator",
+  "provider": "minimax",
+  "review_provider": "deepseek",
+  "scores": {
+    "completeness": 5,
+    "correctness": 5,
+    "architecture": 5,
+    "tests": 5,
+    "style": 5
+  },
+  "issues_found": 1,
+  "issues_fixed": 0,
+  "rounds": 1,
+  "review_cost_tokens": 0,
+  "review_caught_real_bug": false
+}
