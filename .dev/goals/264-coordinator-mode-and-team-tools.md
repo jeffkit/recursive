@@ -3,6 +3,8 @@
 **Roadmap**: Code quality — architecture review follow-up (P2 backlog,
 Phase D of multi-agent unification)
 
+## Complexity: hard
+
 **Design principle check**:
 - Implemented as: a new `team` module (file-backed team registry),
   a new `tasks` module (task lifecycle tracking), and a
