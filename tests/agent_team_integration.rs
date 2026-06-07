@@ -10,12 +10,10 @@
 //! - Coordinator → worker mid-run message injection via a mock round-trip
 
 use recursive::llm::{mock::MockProvider, Completion};
-use recursive::multi::AgentPool;
 use recursive::tools::send_message::{SendMessageTool, WorkerMailbox, WorkerRegistry};
 use recursive::tools::Tool;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
 // Helpers
