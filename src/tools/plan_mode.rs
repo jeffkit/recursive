@@ -99,7 +99,7 @@ impl PlanApprovalGate {
                 let guard = self
                     .response
                     .read()
-                    .expect("PlanApprovalGate response lock poisoned");
+                    .unwrap_or_else(|e| e.into_inner());
                 guard.clone()
             };
             if let Some(result) = result_opt {
@@ -377,7 +377,7 @@ impl PlanModeRequestGate {
                 let guard = self
                     .response
                     .read()
-                    .expect("PlanModeRequestGate response lock poisoned");
+                    .unwrap_or_else(|e| e.into_inner());
                 guard.clone()
             };
             if let Some(result) = result_opt {
