@@ -36,6 +36,7 @@ use crate::message::Message;
 use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::permissions::PermissionMode;
 use crate::tools::agent_defs::AgentDefinitions;
+use crate::tasks::TaskRegistry;
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
@@ -179,6 +180,7 @@ pub struct AgentTool {
     permission_hook: Option<Arc<dyn PermissionHook>>,
     registry: Option<WorkerRegistry>,
     pool: Option<Arc<RwLock<AgentPool>>>,
+    task_registry: Arc<TaskRegistry>,
     definitions: Option<AgentDefinitions>,
 }
 
@@ -200,6 +202,7 @@ impl AgentTool {
             permission_hook,
             registry: None,
             pool: None,
+            task_registry: Arc::new(TaskRegistry::new()),
             definitions: None,
         }
     }
@@ -213,6 +216,14 @@ impl AgentTool {
     /// Attach an `AgentPool` for shared-memory coordination between workers.
     pub fn with_pool(mut self, pool: Arc<RwLock<AgentPool>>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Attach a `TaskRegistry` so this agent and its descendants can
+    /// share background tasks (Phase D). If never called, a private
+    /// in-memory registry is used.
+    pub fn with_task_registry(mut self, reg: Arc<TaskRegistry>) -> Self {
+        self.task_registry = reg;
         self
     }
 
@@ -291,6 +302,8 @@ impl AgentTool {
         if let Some(pool) = &self.pool {
             child_agent = child_agent.with_pool(pool.clone());
         }
+        // Always propagate the task registry so all descendants share it.
+        child_agent = child_agent.with_task_registry(self.task_registry.clone());
         sub_registry = sub_registry.register(Arc::new(child_agent));
 
         // Inject shared-memory tools if pool is available
@@ -304,8 +317,8 @@ impl AgentTool {
 
         // Inject inter-worker messaging tools if registry is available
         if let Some(reg) = &self.registry {
-            sub_registry = sub_registry.register(Arc::new(SendMessageTool::new(reg.clone())));
-            sub_registry = sub_registry.register(Arc::new(ListWorkersTool::new(reg.clone())));
+            sub_registry = sub_registry.register(Arc::new(SendMessageTool::new(reg.clone(), self.task_registry.clone())));
+            sub_registry = sub_registry.register(Arc::new(ListWorkersTool::new(reg.clone(), self.task_registry.clone())));
         }
 
         // Build the system prompt with shared-memory context
@@ -387,7 +400,18 @@ impl AgentTool {
                 ),
             });
         }
-        let (worker_id, entry) = manifest.iter().next().unwrap();
+        // Safe: the `manifest.len() != 1` check above guarantees exactly one
+        // entry, so the iterator yields exactly one element.  Use
+        // `ok_or_else` (not `unwrap()`) to satisfy AGENTS.md invariant #5
+        // (no `unwrap()` in non-test code) while preserving the same error
+        // type.
+        let (worker_id, entry) = manifest
+            .iter()
+            .next()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "agent".into(),
+                message: "mode 'single' requires exactly one manifest entry".to_string(),
+            })?;
         self.run_worker(worker_id, entry, prompt, max_steps, child_depth)
             .await
     }
@@ -450,6 +474,7 @@ impl AgentTool {
                     permission_hook,
                     registry: registry.clone(),
                     pool: pool.clone(),
+                    task_registry: Arc::new(crate::tasks::TaskRegistry::new()),
                     definitions,
                 };
                 let result = agent
