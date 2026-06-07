@@ -371,7 +371,11 @@ mod tests {
 
         // Query with a 2-d vector — E1 (3-d) must be skipped, only E2 returned.
         let results = store.search(vec![1.0, 0.0], "", 10).await.unwrap();
-        assert_eq!(results.len(), 1, "mismatched-dimension entry must be excluded");
+        assert_eq!(
+            results.len(),
+            1,
+            "mismatched-dimension entry must be excluded"
+        );
         assert_eq!(results[0].id, "E2");
     }
 }
