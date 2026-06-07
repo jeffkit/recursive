@@ -142,6 +142,7 @@ fn blake3_canonical_json(v: &Value) -> String {
 }
 
 pub mod a2a;
+pub mod agent;
 pub mod checkpoint;
 #[cfg(feature = "cloud-runtime")]
 pub mod docker_provider;
@@ -170,10 +171,6 @@ pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
 pub mod shell;
-pub mod spawn_worker;
-pub mod spawn_workers_parallel;
-pub mod sub_agent;
-pub mod team_manage;
 pub mod todo;
 pub mod transport;
 #[cfg(feature = "web_fetch")]
@@ -182,6 +179,7 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
+pub use agent::{AgentTool, SharedMemoryRead, SharedMemoryWrite};
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use edit::EditTool;
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
@@ -214,12 +212,6 @@ pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
-pub use spawn_worker::{SpawnWorkerTool, WorkerType};
-pub use spawn_workers_parallel::SpawnWorkersParallel;
-pub use sub_agent::SubAgent;
-pub use team_manage::{
-    SharedMemoryRead, SharedMemoryWrite, TeamAddRole, TeamListRoles, TeamRemoveRole,
-};
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
