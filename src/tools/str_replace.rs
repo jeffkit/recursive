@@ -7,30 +7,50 @@
 //!
 //! Fuzzy-match chain (first success wins):
 //!   1. Exact match
-//!   2. Quote normalization (curly to straight quotes)
+//!   2. Quote normalization (curly to straight quotes) — both needle and
+//!      haystack are normalised; the match position is used to extract the
+//!      *original* bytes from the haystack so the replacement is exact.
 //!   3. Trailing whitespace strip (rstrip each line of old_string)
 //!   4. Quote normalization + trailing whitespace strip combined
 //!   5. XML-tag desanitization (model-escaped tags to real tags)
 //!
 //! When the match succeeds via quote normalization, curly-quote style is
 //! preserved in `new_string` so the edit does not silently change typography.
+//!
+//! `new_string` has trailing whitespace stripped from each line before being
+//! written (matching the normalisation applied to `old_string` in step 3/4),
+//! unless the file is a Markdown file where trailing spaces are significant.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::{resolve_within, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::fs::ReadFileState;
 
 #[derive(Debug, Clone)]
 pub struct StrReplaceTool {
     pub root: PathBuf,
+    /// When `Some`, enforces the partial-read guard: edits on files that were
+    /// never read, or only partially read, are rejected with a clear error.
+    /// `None` (default) disables the guard for backward compatibility.
+    pub read_state: Option<Arc<Mutex<ReadFileState>>>,
 }
 
 impl StrReplaceTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            read_state: None,
+        }
+    }
+
+    pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
+        self.read_state = Some(slot);
+        self
     }
 }
 
@@ -193,17 +213,41 @@ Assistant:",
 // ---------------------------------------------------------------------------
 
 /// Try to find `needle` in `haystack` using the fuzzy-match chain.
-/// Returns the effective needle (possibly normalised) on success.
+///
+/// Returns the *actual* substring from `haystack` that matched (not the
+/// normalised needle), so callers can do a byte-exact replacement.
+///
+/// For quote-normalisation steps the match is found by normalising *both*
+/// sides, locating the byte index in the normalised haystack, then slicing
+/// the *original* haystack at that position.  This mirrors the approach used
+/// by Claude Code's FileEditTool and avoids silent replace failures when the
+/// normalised needle doesn't exist verbatim in the original file.
 fn try_match(haystack: &str, needle: &str) -> Option<String> {
     // 1. Exact
     if haystack.contains(needle) {
         return Some(needle.to_string());
     }
 
-    // 2. Quote normalization
-    let qn = normalize_quotes(needle);
-    if qn != needle && haystack.contains(qn.as_str()) {
-        return Some(qn);
+    // 2. Quote normalization — normalise both sides, find index in normalised
+    //    haystack, then extract the original bytes from haystack.
+    //
+    //    We normalise both needle and haystack to straight quotes, search in
+    //    that normalised space, then map the byte index back to the *original*
+    //    haystack to return the verbatim slice.  This handles both directions:
+    //      • needle has curly quotes, file has straight quotes
+    //      • needle has straight quotes, file has curly quotes
+    let qn_needle = normalize_quotes(needle);
+    let qn_haystack = normalize_quotes(haystack);
+    // Only enter this branch if normalisation actually changed something.
+    if qn_needle != needle || qn_haystack != haystack {
+        if let Some(idx) = qn_haystack.find(qn_needle.as_str()) {
+            // `idx` is a byte index into `qn_haystack`. Because normalize_quotes
+            // only does character-level replacements that preserve char boundaries
+            // (curly quotes are multi-byte; straight quotes are single-byte), we
+            // cannot use idx directly into `haystack`. Instead, map via char counts.
+            let actual = extract_by_char_count(haystack, &qn_haystack, idx, needle.chars().count());
+            return Some(actual);
+        }
     }
 
     // 3. Trailing whitespace strip
@@ -213,9 +257,14 @@ fn try_match(haystack: &str, needle: &str) -> Option<String> {
     }
 
     // 4. Quote normalization + trailing whitespace strip combined
-    let qn_tws = strip_trailing_whitespace(&qn);
-    if qn_tws != needle && qn_tws != qn && qn_tws != tws && haystack.contains(qn_tws.as_str()) {
-        return Some(qn_tws);
+    let qn_tws = strip_trailing_whitespace(&qn_needle);
+    if qn_tws != needle && qn_tws != qn_needle && qn_tws != tws {
+        let qn_tws_haystack = strip_trailing_whitespace(&qn_haystack);
+        if let Some(idx) = qn_tws_haystack.find(qn_tws.as_str()) {
+            let actual =
+                extract_by_char_count(haystack, &qn_tws_haystack, idx, needle.chars().count());
+            return Some(actual);
+        }
     }
 
     // 5. Desanitization
@@ -225,6 +274,24 @@ fn try_match(haystack: &str, needle: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Given a `normalised` string (derived from `original` by character-level
+/// substitutions) and a byte `idx` into `normalised`, return the substring of
+/// `original` that has the same *char count* as `char_len`.
+///
+/// This works because normalize_quotes replaces each character 1-for-1 (a
+/// curly quote is still one Unicode scalar; a straight quote is also one), so
+/// char counts are preserved even though byte counts differ.
+fn extract_by_char_count(
+    original: &str,
+    normalised: &str,
+    byte_idx: usize,
+    char_len: usize,
+) -> String {
+    // Find the char offset that byte_idx corresponds to in normalised.
+    let char_start = normalised[..byte_idx].chars().count();
+    original.chars().skip(char_start).take(char_len).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +373,35 @@ useful if you want to rename a variable for instance."
 
         let abs_path = resolve_within(&self.root, file_path)?;
 
+        // ── Partial-read guard ──────────────────────────────────────────
+        // Reject edits on files that have never been read, or were only read
+        // partially (via start_line/end_line), in this session.
+        if let Some(slot) = &self.read_state {
+            if let Ok(state) = slot.lock() {
+                match state.get(&abs_path) {
+                    None => {
+                        return Err(Error::Tool {
+                            name: "Edit".into(),
+                            message: format!(
+                                "File `{file_path}` has not been read yet. \
+                                 Read it first before editing."
+                            ),
+                        });
+                    }
+                    Some(record) if record.is_partial => {
+                        return Err(Error::Tool {
+                            name: "Edit".into(),
+                            message: format!(
+                                "File `{file_path}` was only partially read \
+                                 (line range). Read the complete file before editing."
+                            ),
+                        });
+                    }
+                    Some(_) => {} // full read — proceed
+                }
+            }
+        }
+
         // ── Empty old_string: create new file or overwrite empty file ───
         if old_string.is_empty() {
             if let Some(parent) = abs_path.parent() {
@@ -345,6 +441,20 @@ useful if you want to rename a variable for instance."
                     .into(),
             });
         }
+
+        // ── Normalise new_string trailing whitespace (pre-pass) ─────────
+        // Strip trailing spaces/tabs from each line of new_string before any
+        // matching, mirroring the normalisation applied to old_string in the
+        // fuzzy-match chain.  This prevents the model from accidentally writing
+        // invisible trailing whitespace into files.  Markdown files are exempt
+        // because two trailing spaces are a hard line-break in CommonMark.
+        let new_string_normalised;
+        let new_string = if file_path.ends_with(".md") || file_path.ends_with(".mdx") {
+            new_string
+        } else {
+            new_string_normalised = strip_trailing_whitespace(new_string);
+            &new_string_normalised
+        };
 
         // ── Find old_string via fuzzy-match chain ───────────────────────
         let actual_old = try_match(&content, old_string).ok_or_else(|| Error::Tool {
@@ -475,11 +585,51 @@ mod tests {
 
     #[test]
     fn try_match_quote_normalization() {
+        // File uses straight quote; needle has curly quote — should match and
+        // return the *original* substring from the haystack (straight quote).
         let haystack = "Here's a string";
         let needle = "Here\u{2019}s a string";
         assert_eq!(
             try_match(haystack, needle),
             Some("Here's a string".to_string())
+        );
+    }
+
+    #[test]
+    fn try_match_quote_normalization_file_has_curly_returns_original() {
+        // File uses curly quotes; needle has straight quotes — the returned
+        // value must be the original curly-quote slice, not the normalised needle.
+        let haystack = "say \u{201c}hello\u{201d} world";
+        let needle = "say \"hello\" world";
+        let result = try_match(haystack, needle);
+        assert!(result.is_some(), "should match via quote normalisation");
+        let matched = result.unwrap();
+        // The returned string must be the original file slice (curly quotes).
+        assert!(
+            matched.contains('\u{201c}'),
+            "returned slice should preserve original curly quote, got: {matched:?}"
+        );
+        // And it must actually exist in the haystack (so replace will work).
+        assert!(
+            haystack.contains(&matched),
+            "returned slice must be present verbatim in haystack, got: {matched:?}"
+        );
+    }
+
+    #[test]
+    fn try_match_quote_norm_combined_with_tws() {
+        // Quote normalization + trailing whitespace strip combined (step 4).
+        let haystack = "fn foo() {\n    bar\n}\n";
+        // Needle has curly brace lookalike AND trailing whitespace — exercise
+        // the combined path.  (Using a trailing space here rather than curly
+        // quotes so the test stays simple and deterministic.)
+        let needle = "fn foo() {\n    bar   \n}\n";
+        let result = try_match(haystack, needle);
+        assert!(result.is_some(), "should match via tws strip");
+        let matched = result.unwrap();
+        assert!(
+            haystack.contains(&matched),
+            "returned slice must be verbatim in haystack"
         );
     }
 
@@ -695,6 +845,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_string_trailing_whitespace_stripped() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "fn foo() {\n    bar\n}\n").unwrap();
+
+        StrReplaceTool::new(tmp.path())
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "fn foo() {\n    bar\n}\n",
+                "new_string": "fn foo() {\n    baz   \n}\n"  // trailing spaces on middle line
+            }))
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join("src.txt")).unwrap();
+        // Trailing spaces on the middle line must be stripped.
+        assert_eq!(content, "fn foo() {\n    baz\n}\n");
+    }
+
+    #[tokio::test]
+    async fn new_string_trailing_whitespace_preserved_in_markdown() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("doc.md"), "# Hello\nold line  \n").unwrap();
+
+        StrReplaceTool::new(tmp.path())
+            .execute(serde_json::json!({
+                "file_path": "doc.md",
+                "old_string": "old line  \n",
+                "new_string": "new line  \n"  // trailing spaces are hard line-break in Markdown
+            }))
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join("doc.md")).unwrap();
+        // Trailing spaces must be preserved for Markdown files.
+        assert_eq!(content, "# Hello\nnew line  \n");
+    }
+
+    #[tokio::test]
     async fn replace_all_with_multiple_occurrences() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "aaa bbb aaa\n").unwrap();
@@ -712,5 +900,95 @@ mod tests {
         assert!(result.contains("All occurrences"));
         let content = std::fs::read_to_string(tmp.path().join("src.txt")).unwrap();
         assert_eq!(content, "ccc bbb ccc\n");
+    }
+
+    // ── Partial-read guard tests ──────────────────────────────────────────────
+
+    fn make_slot() -> std::sync::Arc<std::sync::Mutex<crate::tools::fs::ReadFileState>> {
+        std::sync::Arc::new(std::sync::Mutex::new(crate::tools::fs::ReadFileState::new()))
+    }
+
+    #[tokio::test]
+    async fn edit_rejected_when_file_never_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let slot = make_slot();
+        let err = StrReplaceTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not been read"),
+            "expected 'not been read', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejected_when_partial_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let slot = make_slot();
+        // Simulate a partial read record.
+        slot.lock()
+            .unwrap()
+            .record(tmp.path().join("src.txt"), true);
+        let err = StrReplaceTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("partially read"),
+            "expected 'partially read', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_allowed_after_full_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let slot = make_slot();
+        // Simulate a full read record.
+        slot.lock()
+            .unwrap()
+            .record(tmp.path().join("src.txt"), false);
+        let result = StrReplaceTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("updated successfully"));
+    }
+
+    #[tokio::test]
+    async fn edit_allowed_when_no_read_state() {
+        // StrReplaceTool::new() without with_read_state — guard disabled,
+        // backward-compatible behavior.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let result = StrReplaceTool::new(tmp.path())
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("updated successfully"));
     }
 }

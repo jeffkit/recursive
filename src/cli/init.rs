@@ -26,8 +26,8 @@ pub(crate) enum PresetChoice<'a> {
 /// - "2", "3", ... → the corresponding entry in `presets`
 pub(crate) fn resolve_preset_choice<'a>(
     input: &str,
-    presets: &[&'static ProviderPreset],
-    default_preset: &'static ProviderPreset,
+    presets: &[&'a ProviderPreset],
+    default_preset: &'a ProviderPreset,
 ) -> PresetChoice<'a> {
     if input == "0" {
         return PresetChoice::Manual;
@@ -58,7 +58,7 @@ fn detect_current_preset(config_path: &Path) -> Option<String> {
         .flatten()?;
     let provider = cfg.provider?;
     if let Some(preset_id) = provider.preset.as_deref() {
-        if let Some(preset) = recursive::find_preset(preset_id) {
+        if let Some(preset) = recursive::find_preset_extended(preset_id) {
             return Some(format!(
                 "preset={} (model={}, api_base={})",
                 preset.id, preset.default_model, preset.api_base
@@ -80,6 +80,39 @@ fn detect_current_preset(config_path: &Path) -> Option<String> {
         provider.model.as_deref().unwrap_or("(none)"),
         provider.api_base.as_deref().unwrap_or("(none)")
     ))
+}
+
+/// Look up the default model for a preset id from the bundled catalog.
+/// Returns an empty string if the preset is not in the catalog.
+///
+/// Centralizing this lookup makes the "wizard defaults follow the catalog"
+/// invariant testable, and stops any future code from re-introducing
+/// hardcoded `match preset.id.as_str() { "anthropic" => "…", … }` style
+/// fallbacks that drift from `providers.toml`.
+// Allow dead_code: this helper exists as a defensive catalog lookup
+// for the auto-detect / prefill path and is exercised by tests in this
+// file. If a hardcoded preset-id -> model match ever re-appears in
+// run_init, route it through this helper instead of re-introducing the
+// catalog-vs-init drift.
+#[allow(dead_code)]
+fn default_model_for_preset(preset_id: &str) -> String {
+    recursive::find_preset(preset_id)
+        .map(|p| p.default_model.clone())
+        .unwrap_or_default()
+}
+
+/// Look up the default model for a manually-typed API base URL by matching
+/// it against the bundled catalog. Replaces a previous string-contains
+/// heuristic that guessed at models from URL substrings (deepseek,
+/// bigmodel, anthropic, localhost/11434) — fragile and drift-prone.
+///
+/// Returns an empty string when no bundled preset matches the URL; the
+/// wizard's existing model prompt will then ask the user instead of
+/// silently writing a guessed name.
+pub(crate) fn detect_model_from_api_base(api_base: &str) -> String {
+    recursive::providers::find_preset_by_api_base(api_base)
+        .map(|p| p.default_model.clone())
+        .unwrap_or_default()
 }
 
 /// Interactive setup wizard: walk the user through provider/model/key config.
@@ -110,11 +143,11 @@ pub(crate) async fn run_init(
     let (provider_type, api_base, default_model, key_env, key_url, resolved_preset_id) =
         match provider_prefill.as_deref() {
             Some(id) => {
-                let preset = recursive::find_preset(id).ok_or_else(|| {
+                let preset = recursive::find_preset_extended(id).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "--provider {:?} not found in providers.toml. Valid ids: {}",
+                        "--provider {:?} not found in providers catalog. Valid ids: {}",
                         id,
-                        recursive::all_presets()
+                        recursive::all_presets_dynamic()
                             .iter()
                             .map(|p| p.id.as_str())
                             .collect::<Vec<_>>()
@@ -134,7 +167,17 @@ pub(crate) async fn run_init(
             None => {
                 // Interactive selection from the preset catalog.
                 let presets = recursive::all_presets();
-                let anthropic_preset = recursive::find_preset("anthropic").unwrap();
+                // Default to the user override of "anthropic" if one
+                // exists in providers.d/; otherwise fall back to the
+                // bundled anthropic preset. resolve_preset_choice only
+                // uses this for the empty-input / unknown-input case,
+                // so a runtime-owned `ProviderPreset` is fine — we borrow
+                // it when passing into the helper.
+                let anthropic_preset = recursive::find_preset_extended("anthropic")
+                    .or_else(|| recursive::find_preset("anthropic").cloned())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("anthropic preset must be present in bundled catalog")
+                    })?;
 
                 println!("Select a provider (or press Enter for Anthropic):\n");
 
@@ -203,7 +246,7 @@ pub(crate) async fn run_init(
                 // the preset by URL so the catalog drives type/default_model
                 // instead of brittle substring matching. The hardcoded
                 // substring heuristic is kept only as a last-resort fallback.
-                let choice = resolve_preset_choice(trimmed, &all_entries, anthropic_preset);
+                let choice = resolve_preset_choice(trimmed, &all_entries, &anthropic_preset);
                 match choice {
                     PresetChoice::Preset(p) => (
                         p.provider_type.clone(),
@@ -242,23 +285,14 @@ pub(crate) async fn run_init(
                             } else {
                                 "openai"
                             };
-                            let manual_default_model = if manual_base.contains("deepseek") {
-                                "deepseek-chat"
-                            } else if manual_base.contains("bigmodel") {
-                                "glm-4-flash"
-                            } else if manual_base.contains("anthropic") {
-                                "claude-sonnet-4-6"
-                            } else if manual_base.contains("localhost")
-                                || manual_base.contains("11434")
-                            {
-                                "qwen2.5-coder"
-                            } else {
-                                "gpt-4o-mini"
-                            };
+                            // Pull the default model from the bundled catalog
+                            // via api_base match; an empty string here just
+                            // makes the wizard prompt for the model below.
+                            let manual_default_model = detect_model_from_api_base(&manual_base);
                             (
                                 manual_provider_type.to_string(),
                                 manual_base,
-                                manual_default_model.to_string(),
+                                manual_default_model,
                                 String::new(),
                                 String::new(),
                                 None,
@@ -351,6 +385,9 @@ mod tests {
     use super::*;
 
     fn all_presets() -> Vec<&'static ProviderPreset> {
+        // Caller (resolve_preset_choice) accepts `&ProviderPreset`;
+        // the `&'static` here is just a stricter bound that still
+        // satisfies it.
         recursive::all_presets().iter().collect()
     }
     fn default_preset() -> &'static ProviderPreset {
@@ -410,5 +447,62 @@ mod tests {
             PresetChoice::Manual => {}
             other => panic!("expected Manual, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn init_default_model_uses_catalog_for_anthropic() {
+        // The helper must return the catalog's default_model, not a
+        // hardcoded fallback. Asserts both equality and non-emptiness so
+        // a future drift to empty string would also be caught.
+        let from_helper = default_model_for_preset("anthropic");
+        let from_catalog = recursive::find_preset("anthropic")
+            .unwrap()
+            .default_model
+            .clone();
+        assert_eq!(from_helper, from_catalog);
+        assert!(
+            !from_helper.is_empty(),
+            "anthropic catalog default_model is empty"
+        );
+    }
+
+    #[test]
+    fn init_default_model_detect_from_api_base_deepseek() {
+        // Previously the heuristic returned the hardcoded "deepseek-chat";
+        // the catalog now lists "deepseek-v4-flash". The helper must
+        // follow the catalog.
+        let from_helper = detect_model_from_api_base("https://api.deepseek.com/v1");
+        let from_catalog = recursive::find_preset("deepseek")
+            .unwrap()
+            .default_model
+            .clone();
+        assert_eq!(from_helper, from_catalog);
+        assert!(!from_helper.is_empty());
+    }
+
+    #[test]
+    fn init_default_model_detect_from_api_base_openai() {
+        // Previously the heuristic fell through to "gpt-4o-mini" for
+        // OpenAI; the catalog now lists "gpt-5.4". The helper must
+        // follow the catalog.
+        let from_helper = detect_model_from_api_base("https://api.openai.com/v1");
+        let from_catalog = recursive::find_preset("openai")
+            .unwrap()
+            .default_model
+            .clone();
+        assert_eq!(from_helper, from_catalog);
+        assert!(!from_helper.is_empty());
+    }
+
+    #[test]
+    fn init_default_model_detect_from_api_base_unknown_is_empty() {
+        // No catalog match → empty string. The wizard's prompt handles
+        // empty defaults by asking the user.
+        assert_eq!(detect_model_from_api_base("https://example.com/v1"), "");
+    }
+
+    #[test]
+    fn init_default_model_uses_catalog_for_unknown_preset_is_empty() {
+        assert_eq!(default_model_for_preset("not-a-real-preset"), "");
     }
 }

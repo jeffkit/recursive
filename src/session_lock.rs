@@ -187,53 +187,70 @@ impl SessionLock {
     /// another live process holds it (or when an unrecoverable
     /// cross-host lock is detected).
     pub fn acquire(session_dir: &Path) -> std::io::Result<Self> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
         let lock_path = session_dir.join(SESSION_LOCK_FILE);
 
-        if lock_path.is_file() {
-            match std::fs::read_to_string(&lock_path) {
-                Ok(text) => {
-                    if let Some(info) = SentinelInfo::parse(&text) {
-                        let our_host = current_hostname();
-                        if info.hostname != our_host {
-                            return Err(std::io::Error::other(SessionLockBusy {
-                                pid: info.pid,
-                                hostname: info.hostname,
-                                started_at_unix: info.started_at_unix,
-                                session_dir: session_dir.to_path_buf(),
-                            }));
-                        }
-                        if is_pid_alive(info.pid) {
-                            return Err(std::io::Error::other(SessionLockBusy {
-                                pid: info.pid,
-                                hostname: info.hostname,
-                                started_at_unix: info.started_at_unix,
-                                session_dir: session_dir.to_path_buf(),
-                            }));
-                        }
-                        // Stale: pid dead on our host. Recover.
-                        eprintln!(
-                            "warning: recovered stale session lock at {} \
-                             (pid {} not running)",
-                            lock_path.display(),
-                            info.pid,
-                        );
-                    }
-                    // Parse failed — corrupt sentinel. Treat as
-                    // recoverable (overwrite) rather than abort.
-                }
-                Err(_) => {
-                    // Read failed — treat as recoverable.
-                }
-            }
-        }
-
-        // (Re)write sentinel with our info.
-        let info = SentinelInfo::for_self();
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&lock_path, info.serialise())?;
 
+        let info = SentinelInfo::for_self();
+        let sentinel = info.serialise();
+
+        // Attempt an atomic exclusive create: succeeds only if the file does
+        // not exist, eliminating the TOCTOU window between `is_file()` and
+        // `write()` that allowed two concurrent processes to both believe they
+        // held the lock.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                f.write_all(sentinel.as_bytes())?;
+                return Ok(Self { lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Fall through: inspect the existing sentinel.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // The file exists. Read it and decide whether to steal (stale) or
+        // refuse (live owner on same or different host).
+        match std::fs::read_to_string(&lock_path) {
+            Ok(text) => {
+                if let Some(existing) = SentinelInfo::parse(&text) {
+                    let our_host = current_hostname();
+                    if existing.hostname != our_host || is_pid_alive(existing.pid) {
+                        return Err(std::io::Error::other(SessionLockBusy {
+                            pid: existing.pid,
+                            hostname: existing.hostname,
+                            started_at_unix: existing.started_at_unix,
+                            session_dir: session_dir.to_path_buf(),
+                        }));
+                    }
+                    // Stale: pid is dead on our host. Recover by overwriting.
+                    eprintln!(
+                        "warning: recovered stale session lock at {} \
+                         (pid {} not running)",
+                        lock_path.display(),
+                        existing.pid,
+                    );
+                }
+                // Parse failed — corrupt sentinel. Treat as recoverable.
+            }
+            Err(_) => {
+                // Read failed — treat as recoverable (e.g. race-removed).
+            }
+        }
+
+        // Overwrite the stale/corrupt sentinel.  Another concurrent process
+        // may have beaten us to the steal; that is an accepted edge case for
+        // the stale-recovery path (both processes were racing on a dead pid).
+        std::fs::write(&lock_path, &sentinel)?;
         Ok(Self { lock_path })
     }
 

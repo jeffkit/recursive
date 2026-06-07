@@ -149,16 +149,10 @@ apply_provider_profile() {
       export RECURSIVE_MODEL="MiniMax-M3"
       export RECURSIVE_API_KEY="${MINIMAX_API_KEY:-}"
       ;;
-    deepseek)
+    deepseek|deepseek-pro)
       export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
-      export RECURSIVE_MODEL="deepseek-chat"
-      export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
-      ;;
-    deepseek-pro)
-      export RECURSIVE_PROVIDER_TYPE="openai"
-      export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
-      export RECURSIVE_MODEL="deepseek-chat"
+      export RECURSIVE_MODEL="deepseek-v4-pro"
       export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
       ;;
     glm)
@@ -589,22 +583,6 @@ EOF
       echo ""
       echo "=== ✗ rolled back to ${BASELINE_SHORT} (${detail}); journal committed ==="
       echo "=== journaled to ${LOG} ==="
-
-      # ---- DeepSeek flash → pro auto-fallback --------------------------------
-      # If the provider was 'deepseek' (flash) and RECURSIVE_DEEPSEEK_PRO_FALLBACK
-      # is enabled (default: 1), automatically retry with deepseek-pro.
-      DEEPSEEK_PRO_FALLBACK="${RECURSIVE_DEEPSEEK_PRO_FALLBACK:-1}"
-      if [[ "$DEEPSEEK_PRO_FALLBACK" == "1" ]] \
-         && [[ "${SELECTED_PROVIDER:-}" == "deepseek" ]] \
-         && [[ -z "${_RECURSIVE_IS_PRO_RETRY:-}" ]]; then
-        echo ""
-        echo "--- AUTO-FALLBACK: deepseek flash failed, retrying with deepseek-pro ---"
-        echo ""
-        export RECURSIVE_PROVIDER="deepseek-pro"
-        export _RECURSIVE_IS_PRO_RETRY=1
-        exec "$0" "$GOAL_SOURCE"
-        # exec replaces this process — below is unreachable
-      fi
 
       exit 1
       ;;

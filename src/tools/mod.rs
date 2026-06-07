@@ -16,6 +16,7 @@ use crate::llm::ToolSpec;
 use crate::permissions::auto_classifier::AutoClassifier;
 use crate::permissions::SharedPermissions;
 use crate::permissions::{DecisionReason, Permission, PermissionMode, PermissionsConfig};
+use crate::tools::fs::ReadFileState;
 use tokio::sync::RwLock;
 
 // ── Goal-153: Tool side-effect classification + audit types ─────────────────
@@ -299,6 +300,9 @@ pub struct ToolRegistry {
     /// Mirrors `PermissionsConfig.mode` for quick access without config lookup.
     permission_mode: PermissionMode,
     touched: Option<Arc<Mutex<TouchedFiles>>>,
+    /// Partial-read guard: shared state written by `ReadFile` and checked by
+    /// `StrReplaceTool`. `None` disables the guard (backward-compatible).
+    read_file_state: Option<Arc<Mutex<ReadFileState>>>,
     /// Goal-161: optional runtime permission hook. When `Some`, called
     /// before every tool invocation. `None` means allow all (backward-
     /// compatible default).
@@ -386,6 +390,7 @@ impl ToolRegistry {
             auto_classifier: None,
             permission_mode: PermissionMode::Default,
             touched: None,
+            read_file_state: None,
             permission_hook: None,
             policy: None,
             headless: false,
@@ -413,6 +418,7 @@ impl ToolRegistry {
             auto_classifier: self.auto_classifier.clone(),
             permission_mode: self.permission_mode.clone(),
             touched: self.touched.clone(),
+            read_file_state: self.read_file_state.clone(),
             permission_hook: self.permission_hook.clone(),
             policy: self.policy.clone(),
             headless: self.headless,
@@ -575,6 +581,18 @@ impl ToolRegistry {
     /// Return the currently attached touched-files collector, if any.
     pub fn touched_files(&self) -> Option<Arc<Mutex<TouchedFiles>>> {
         self.touched.clone()
+    }
+
+    /// Attach shared `ReadFileState` so `ReadFile` records reads and
+    /// `StrReplaceTool` can enforce the partial-read guard.
+    pub fn with_read_file_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
+        self.read_file_state = Some(slot);
+        self
+    }
+
+    /// Return the currently attached read-file state, if any.
+    pub fn read_file_state(&self) -> Option<Arc<Mutex<ReadFileState>>> {
+        self.read_file_state.clone()
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
@@ -835,6 +853,34 @@ impl ToolRegistry {
                             };
                         }
                         PermissionDecision::Transform(new_args) => {
+                            // Re-run policy check on the transformed arguments.
+                            // A malicious/compromised hook could use `updated_input`
+                            // to substitute a different command/path that bypasses
+                            // the policy check already performed above.
+                            if let Some(ref policy) = self.policy {
+                                if let Some(cmd) = new_args.get("command").and_then(|v| v.as_str())
+                                {
+                                    if let Err(e) = policy.check_shell(cmd) {
+                                        return ToolDispatch {
+                                            result: Err(e),
+                                            audit: AuditMeta::synthetic_unknown_tool(name),
+                                        };
+                                    }
+                                }
+                                let is_write = matches!(name, "Write" | "Edit" | "StrReplace");
+                                let path_arg = new_args
+                                    .get("path")
+                                    .or_else(|| new_args.get("file_path"))
+                                    .and_then(|v| v.as_str());
+                                if let Some(path) = path_arg {
+                                    if let Err(e) = policy.check_fs_path(path, is_write) {
+                                        return ToolDispatch {
+                                            result: Err(e),
+                                            audit: AuditMeta::synthetic_unknown_tool(name),
+                                        };
+                                    }
+                                }
+                            }
                             arguments = new_args;
                         }
                         PermissionDecision::Allow => {}
@@ -913,6 +959,35 @@ impl ToolRegistry {
                 audit: AuditMeta::synthetic_unknown_tool(name),
             };
         };
+
+        // L1 policy check: enforce shell/fs policies from the registry-level
+        // PolicyConfig before executing any tool. This runs in the framework
+        // layer so individual tool implementations don't need to opt in.
+        if let Some(ref policy) = self.policy {
+            // Shell tools: check the "command" argument.
+            if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
+                if let Err(e) = policy.check_shell(cmd) {
+                    return ToolDispatch {
+                        result: Err(e),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
+                    };
+                }
+            }
+            // Filesystem tools: check "path" / "file_path" arguments.
+            let is_write = matches!(name, "Write" | "Edit" | "StrReplace");
+            let path_arg = arguments
+                .get("path")
+                .or_else(|| arguments.get("file_path"))
+                .and_then(|v| v.as_str());
+            if let Some(path) = path_arg {
+                if let Err(e) = policy.check_fs_path(path, is_write) {
+                    return ToolDispatch {
+                        result: Err(e),
+                        audit: AuditMeta::synthetic_unknown_tool(name),
+                    };
+                }
+            }
+        }
 
         let side_effect = tool.side_effect_class();
         let step_id = uuid::Uuid::now_v7().hyphenated().to_string();
@@ -1026,7 +1101,14 @@ pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::
     // Symlink-aware check: if the path exists, canonicalize both sides and
     // re-check so that symlinks pointing outside the workspace are rejected.
     if abs_joined.exists() {
-        let canonical_root = abs_root.canonicalize().unwrap_or(abs_root.clone());
+        let canonical_root = abs_root.canonicalize().map_err(|e| Error::BadToolArgs {
+            name: "<fs>".into(),
+            message: format!(
+                "cannot canonicalize workspace root `{}`: {}",
+                abs_root.display(),
+                e
+            ),
+        })?;
         match abs_joined.canonicalize() {
             Ok(canonical_joined) => {
                 if !canonical_joined.starts_with(&canonical_root) {
@@ -1094,10 +1176,16 @@ pub fn build_standard_tools(
 ) -> ToolRegistry {
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let todo_list = Arc::new(std::sync::RwLock::new(Vec::<TodoItem>::new()));
+    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
     let mut registry = ToolRegistry::local()
-        .register(Arc::new(ReadFile::new(workspace)))
+        .with_read_file_state(read_state.clone())
+        .register(Arc::new(
+            ReadFile::new(workspace).with_read_state(read_state.clone()),
+        ))
         .register(Arc::new(WriteFile::new(workspace)))
-        .register(Arc::new(StrReplaceTool::new(workspace)))
+        .register(Arc::new(
+            StrReplaceTool::new(workspace).with_read_state(read_state.clone()),
+        ))
         .register(Arc::new(
             RunShell::new(workspace)
                 .with_timeout(std::time::Duration::from_secs(shell_timeout_secs)),
