@@ -149,6 +149,7 @@ pub mod docker_provider;
 pub mod docker_sandbox;
 #[cfg(feature = "e2b-sandbox")]
 pub mod e2b_provider;
+pub mod edit;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
@@ -170,7 +171,6 @@ pub mod send_message;
 pub mod shell;
 pub mod spawn_worker;
 pub mod spawn_workers_parallel;
-pub mod str_replace;
 pub mod sub_agent;
 pub mod team_manage;
 pub mod todo;
@@ -182,6 +182,7 @@ pub mod web_search;
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
+pub use edit::EditTool;
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
 pub use estimate_tokens::EstimateTokens;
 pub use facts::{
@@ -213,7 +214,6 @@ pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRe
 pub use shell::RunShell;
 pub use spawn_worker::{SpawnWorkerTool, WorkerType};
 pub use spawn_workers_parallel::SpawnWorkersParallel;
-pub use str_replace::StrReplaceTool;
 pub use sub_agent::SubAgent;
 pub use team_manage::{
     SharedMemoryRead, SharedMemoryWrite, TeamAddRole, TeamListRoles, TeamRemoveRole,
@@ -301,7 +301,7 @@ pub struct ToolRegistry {
     permission_mode: PermissionMode,
     touched: Option<Arc<Mutex<TouchedFiles>>>,
     /// Partial-read guard: shared state written by `ReadFile` and checked by
-    /// `StrReplaceTool`. `None` disables the guard (backward-compatible).
+    /// `EditTool`. `None` disables the guard (backward-compatible).
     read_file_state: Option<Arc<Mutex<ReadFileState>>>,
     /// Goal-161: optional runtime permission hook. When `Some`, called
     /// before every tool invocation. `None` means allow all (backward-
@@ -584,7 +584,7 @@ impl ToolRegistry {
     }
 
     /// Attach shared `ReadFileState` so `ReadFile` records reads and
-    /// `StrReplaceTool` can enforce the partial-read guard.
+    /// `EditTool` can enforce the partial-read guard.
     pub fn with_read_file_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
         self.read_file_state = Some(slot);
         self
@@ -1184,7 +1184,7 @@ pub fn build_standard_tools(
         ))
         .register(Arc::new(WriteFile::new(workspace)))
         .register(Arc::new(
-            StrReplaceTool::new(workspace).with_read_state(read_state.clone()),
+            EditTool::new(workspace).with_read_state(read_state.clone()),
         ))
         .register(Arc::new(
             RunShell::new(workspace)
