@@ -164,6 +164,18 @@ tests/
    set `RECURSIVE_FMT_CHECK=0` if you have a documented reason in the
    journal entry.
 
+   **`cargo clippy --all-targets --all-features -- -D warnings` is also
+   a hard gate by `self-improve.sh`** (since g262 — added after a
+   deepseek-pro run landed 2 unused imports that `cargo test` accepted
+   but `cargo clippy` rejected): if the clippy run is non-zero after
+   your edits, the wrapper invokes a one-shot resume-fix replay
+   asking you to clean up the lints, then re-runs the gate. A
+   mechanical lint (needless_borrow, redundant_clone, unused_imports)
+   is almost always a one-line change — do not push back. Only set
+   `RECURSIVE_CLIPPY_CHECK=0` if a goal genuinely needs to land
+   clippy-dirty code (very rare; document the reason in the journal
+   entry).
+
    **Verify behavior through `cargo test`, never through `cargo run | jq`.**
    On a fresh worktree, `cargo run` first does a full `cargo build`, whose
    "Compiling …" / "Finished …" lines spill onto stderr *and sometimes
