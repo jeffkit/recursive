@@ -64,6 +64,32 @@ pub fn team_file_path(team_name: &str) -> PathBuf {
     teams_dir().join(format!("{team_name}.json"))
 }
 
+/// Validate a team name to ensure it can't be used for path traversal.
+///
+/// Team names are used as filename stems under `teams_dir()`. Without
+/// validation, a name like `"../etc"` would resolve to a file outside
+/// the teams directory. This is the team-registry equivalent of the
+/// workspace sandbox enforced by `tools::resolve_within` for
+/// workspace-bounded file operations: it rejects any name that could
+/// escape `teams_dir()` when joined with it.
+///
+/// Returns `Err(Error::BadToolArgs)` with a descriptive message if the
+/// name is invalid.
+pub fn validate_team_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.starts_with('.')
+    {
+        return Err(Error::BadToolArgs {
+            name: "<team>".into(),
+            message: format!("invalid team name: '{name}'"),
+        });
+    }
+    Ok(())
+}
+
 /// Make sure the teams directory exists.  Returns the path.
 pub fn ensure_teams_dir() -> std::io::Result<PathBuf> {
     let dir = teams_dir();
@@ -268,6 +294,7 @@ impl TeamRegistry {
     /// Load a team from disk.  Errors if the team file does not exist
     /// or is malformed.
     pub async fn load(team_name: &str) -> Result<Self> {
+        validate_team_name(team_name)?;
         let path = team_file_path(team_name);
         let bytes = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -286,6 +313,7 @@ impl TeamRegistry {
 
     /// Create a new empty team in memory and persist it.
     pub async fn create(team_name: &str) -> Result<Self> {
+        validate_team_name(team_name)?;
         let team = TeamFile::new(team_name);
         Self::save_team(&team)?;
         let mut inner = TeamRegistryInner::default();
@@ -355,6 +383,7 @@ impl TeamRegistry {
 
     /// Delete a team from memory and disk.
     pub async fn delete(team_name: &str) -> Result<bool> {
+        validate_team_name(team_name)?;
         let path = team_file_path(team_name);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -365,6 +394,7 @@ impl TeamRegistry {
 
     /// Add a member to a team (in-memory + persisted).
     pub async fn add_member(&self, team_name: &str, member: TeamMember) -> Result<()> {
+        validate_team_name(team_name)?;
         let mut inner = self.inner.write().await;
         let team = inner
             .teams
@@ -378,6 +408,7 @@ impl TeamRegistry {
     /// Remove a member from a team (in-memory + persisted).
     /// Returns `true` if the member existed.
     pub async fn remove_member(&self, team_name: &str, member_name: &str) -> Result<bool> {
+        validate_team_name(team_name)?;
         let mut inner = self.inner.write().await;
         let team = inner
             .teams

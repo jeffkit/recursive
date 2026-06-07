@@ -77,7 +77,7 @@ impl Tool for TaskUpdateTool {
                 message: "missing required parameter: status".to_string(),
             })?;
 
-        let task = self.registry.get(&id).await.unwrap();
+        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         let current = task.status().await;
         // Allow transition from any non-terminal state.
         if current.is_terminal() {

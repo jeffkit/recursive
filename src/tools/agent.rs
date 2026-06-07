@@ -400,7 +400,18 @@ impl AgentTool {
                 ),
             });
         }
-        let (worker_id, entry) = manifest.iter().next().unwrap();
+        // Safe: the `manifest.len() != 1` check above guarantees exactly one
+        // entry, so the iterator yields exactly one element.  Use
+        // `ok_or_else` (not `unwrap()`) to satisfy AGENTS.md invariant #5
+        // (no `unwrap()` in non-test code) while preserving the same error
+        // type.
+        let (worker_id, entry) = manifest
+            .iter()
+            .next()
+            .ok_or_else(|| Error::BadToolArgs {
+                name: "agent".into(),
+                message: "mode 'single' requires exactly one manifest entry".to_string(),
+            })?;
         self.run_worker(worker_id, entry, prompt, max_steps, child_depth)
             .await
     }
