@@ -225,7 +225,12 @@ impl Config {
             .ok()
             .or_else(|| file_provider.and_then(|p| p.model.clone()))
             .or_else(|| preset.map(|p| p.default_model.clone()))
-            .unwrap_or_else(|| "claude-sonnet-4-6".into());
+            .unwrap_or_else(|| {
+                // Fall back to the default preset's model from the catalog.
+                crate::providers::find_preset("deepseek")
+                    .map(|p| p.default_model.clone())
+                    .unwrap_or_else(|| "claude-sonnet-4-6".into())
+            });
 
         let max_steps = std::env::var("RECURSIVE_MAX_STEPS")
             .ok()
