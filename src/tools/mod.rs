@@ -172,6 +172,23 @@ pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
 pub mod shell;
+
+#[cfg(feature = "coordinator-mode")]
+pub mod task_create;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_get;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_list;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_output;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_stop;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_update;
+#[cfg(feature = "coordinator-mode")]
+pub mod team_create;
+#[cfg(feature = "coordinator-mode")]
+pub mod team_delete;
 pub mod todo;
 pub mod transport;
 #[cfg(feature = "web_fetch")]
@@ -214,6 +231,23 @@ pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
+
+#[cfg(feature = "coordinator-mode")]
+pub use task_create::TaskCreateTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_get::TaskGetTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_list::TaskListTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_output::TaskOutputTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_stop::TaskStopTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_update::TaskUpdateTool;
+#[cfg(feature = "coordinator-mode")]
+pub use team_create::TeamCreateTool;
+#[cfg(feature = "coordinator-mode")]
+pub use team_delete::TeamDeleteTool;
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]

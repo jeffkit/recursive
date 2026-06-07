@@ -80,6 +80,10 @@ pub enum Error {
     #[error("storage error: {message}")]
     Storage { message: String },
 
+    /// A named resource (team, task, etc.) was requested but does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
+
     /// Catch-all for errors that don't fit elsewhere
     #[error("{0}")]
     Other(String),

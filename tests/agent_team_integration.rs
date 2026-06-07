@@ -10,6 +10,7 @@
 //! - Coordinator → worker mid-run message injection via a mock round-trip
 
 use recursive::llm::{mock::MockProvider, Completion};
+use recursive::tasks::TaskRegistry;
 use recursive::tools::send_message::{SendMessageTool, WorkerMailbox, WorkerRegistry};
 use recursive::tools::Tool;
 use serde_json::json;
@@ -135,7 +136,7 @@ async fn send_message_tool_delivers_to_registered_worker() {
     let reg = WorkerRegistry::new();
     let mailbox = reg.register("target-worker").await;
 
-    let tool = SendMessageTool::new(reg);
+    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
     let result = tool
         .execute(json!({
             "worker_id": "target-worker",
@@ -153,7 +154,7 @@ async fn send_message_tool_unknown_worker_returns_helpful_error() {
     let reg = WorkerRegistry::new();
     reg.register("active-worker").await;
 
-    let tool = SendMessageTool::new(reg);
+    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
     let result = tool
         .execute(json!({
             "worker_id": "nonexistent",
@@ -171,8 +172,10 @@ async fn send_message_tool_unknown_worker_returns_helpful_error() {
 
 #[tokio::test]
 async fn send_message_tool_spec_has_required_fields() {
+    // Phase D: only `message` is strictly required; `task_id` (preferred) and
+    // `worker_id` (legacy fallback) are alternative routing parameters.
     let reg = WorkerRegistry::new();
-    let tool = SendMessageTool::new(reg);
+    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
     let spec = tool.spec();
 
     assert_eq!(spec.name, "send_message");
@@ -180,8 +183,19 @@ async fn send_message_tool_spec_has_required_fields() {
         .as_array()
         .expect("required array");
     let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-    assert!(required_strs.contains(&"worker_id"));
-    assert!(required_strs.contains(&"message"));
+    assert!(
+        required_strs.contains(&"message"),
+        "expected `message` in required: {required_strs:?}"
+    );
+
+    let props = spec.parameters["properties"]
+        .as_object()
+        .expect("properties object");
+    assert!(props.contains_key("task_id"), "spec should mention task_id");
+    assert!(
+        props.contains_key("worker_id"),
+        "spec should still mention worker_id (legacy)"
+    );
 }
 
 // ---------------------------------------------------------------------------
