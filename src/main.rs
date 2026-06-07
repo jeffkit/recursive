@@ -1043,12 +1043,31 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .unwrap_or_else(|| "(none)".to_string());
                 println!("preset:        {preset_label}");
-                if let Some(preset) = config
+                // Resolve preset chain: explicit `provider.preset` from
+                // the file wins; if absent, fall back to a catalog match
+                // against the resolved `api_base`. Surfaces the preset
+                // chain added by the preset-config goal — without it, a
+                // user with `preset = "deepseek"` would only see the raw
+                // fields and have to manually re-derive that they're on
+                // DeepSeek.
+                //
+                // We use `find_preset_extended` (bundled + providers.d/),
+                // so a user override also surfaces here. Since the
+                // surrounding code only reads three `String` fields, we
+                // skip the bundling step and read them directly from the
+                // owned preset.
+                let resolved_preset: Option<recursive::providers::ProviderPreset> = config
                     .preset
                     .as_deref()
-                    .and_then(recursive::providers::find_preset)
-                    .or_else(|| recursive::providers::find_preset_by_api_base(&config.api_base))
-                {
+                    .and_then(recursive::providers::find_preset_extended)
+                    .or_else(|| {
+                        // Bundled fallback by api_base — only the
+                        // bundled catalog is searchable by URL.
+                        let bundled: Option<&'static recursive::providers::ProviderPreset> =
+                            recursive::providers::find_preset_by_api_base(&config.api_base);
+                        bundled.cloned()
+                    });
+                if let Some(preset) = &resolved_preset {
                     let key_env = if preset.key_env.is_empty() {
                         "(none)".to_string()
                     } else {

@@ -26,8 +26,8 @@ pub(crate) enum PresetChoice<'a> {
 /// - "2", "3", ... → the corresponding entry in `presets`
 pub(crate) fn resolve_preset_choice<'a>(
     input: &str,
-    presets: &[&'static ProviderPreset],
-    default_preset: &'static ProviderPreset,
+    presets: &[&'a ProviderPreset],
+    default_preset: &'a ProviderPreset,
 ) -> PresetChoice<'a> {
     if input == "0" {
         return PresetChoice::Manual;
@@ -58,7 +58,7 @@ fn detect_current_preset(config_path: &Path) -> Option<String> {
         .flatten()?;
     let provider = cfg.provider?;
     if let Some(preset_id) = provider.preset.as_deref() {
-        if let Some(preset) = recursive::find_preset(preset_id) {
+        if let Some(preset) = recursive::find_preset_extended(preset_id) {
             return Some(format!(
                 "preset={} (model={}, api_base={})",
                 preset.id, preset.default_model, preset.api_base
@@ -110,11 +110,11 @@ pub(crate) async fn run_init(
     let (provider_type, api_base, default_model, key_env, key_url, resolved_preset_id) =
         match provider_prefill.as_deref() {
             Some(id) => {
-                let preset = recursive::find_preset(id).ok_or_else(|| {
+                let preset = recursive::find_preset_extended(id).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "--provider {:?} not found in providers.toml. Valid ids: {}",
+                        "--provider {:?} not found in providers catalog. Valid ids: {}",
                         id,
-                        recursive::all_presets()
+                        recursive::all_presets_dynamic()
                             .iter()
                             .map(|p| p.id.as_str())
                             .collect::<Vec<_>>()
@@ -134,7 +134,17 @@ pub(crate) async fn run_init(
             None => {
                 // Interactive selection from the preset catalog.
                 let presets = recursive::all_presets();
-                let anthropic_preset = recursive::find_preset("anthropic").unwrap();
+                // Default to the user override of "anthropic" if one
+                // exists in providers.d/; otherwise fall back to the
+                // bundled anthropic preset. resolve_preset_choice only
+                // uses this for the empty-input / unknown-input case,
+                // so a runtime-owned `ProviderPreset` is fine — we borrow
+                // it when passing into the helper.
+                let anthropic_preset = recursive::find_preset_extended("anthropic")
+                    .or_else(|| recursive::find_preset("anthropic").cloned())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("anthropic preset must be present in bundled catalog")
+                    })?;
 
                 println!("Select a provider (or press Enter for Anthropic):\n");
 
@@ -203,7 +213,7 @@ pub(crate) async fn run_init(
                 // the preset by URL so the catalog drives type/default_model
                 // instead of brittle substring matching. The hardcoded
                 // substring heuristic is kept only as a last-resort fallback.
-                let choice = resolve_preset_choice(trimmed, &all_entries, anthropic_preset);
+                let choice = resolve_preset_choice(trimmed, &all_entries, &anthropic_preset);
                 match choice {
                     PresetChoice::Preset(p) => (
                         p.provider_type.clone(),
@@ -351,6 +361,9 @@ mod tests {
     use super::*;
 
     fn all_presets() -> Vec<&'static ProviderPreset> {
+        // Caller (resolve_preset_choice) accepts `&ProviderPreset`;
+        // the `&'static` here is just a stricter bound that still
+        // satisfies it.
         recursive::all_presets().iter().collect()
     }
     fn default_preset() -> &'static ProviderPreset {
