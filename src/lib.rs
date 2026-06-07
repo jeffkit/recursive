@@ -80,9 +80,8 @@ pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
 pub use migrate::{migrate_workspace, MigrateReport};
 pub use multi::{
-    coordinator_system_prompt, parse_delegations, AgentMessage, AgentPool, AgentRole,
-    DelegationResult, MemoryEntry, MessageBus, MessageType, Pipeline, PipelineResult, SharedMemory,
-    StageOutcome, TeamOrchestrator, TeamResult,
+    coordinator_system_prompt, AgentMessage, AgentPool, AgentRole, MemoryEntry, MessageBus,
+    MessageType, SharedMemory,
 };
 pub use paths::{
     legacy_paths_in_workspace, user_data_dir, user_scratchpad_path, user_sessions_dir,
