@@ -16,6 +16,7 @@ use crate::llm::ToolSpec;
 use crate::permissions::auto_classifier::AutoClassifier;
 use crate::permissions::SharedPermissions;
 use crate::permissions::{DecisionReason, Permission, PermissionMode, PermissionsConfig};
+use crate::tools::fs::ReadFileState;
 use tokio::sync::RwLock;
 
 // ── Goal-153: Tool side-effect classification + audit types ─────────────────
@@ -299,6 +300,9 @@ pub struct ToolRegistry {
     /// Mirrors `PermissionsConfig.mode` for quick access without config lookup.
     permission_mode: PermissionMode,
     touched: Option<Arc<Mutex<TouchedFiles>>>,
+    /// Partial-read guard: shared state written by `ReadFile` and checked by
+    /// `StrReplaceTool`. `None` disables the guard (backward-compatible).
+    read_file_state: Option<Arc<Mutex<ReadFileState>>>,
     /// Goal-161: optional runtime permission hook. When `Some`, called
     /// before every tool invocation. `None` means allow all (backward-
     /// compatible default).
@@ -386,6 +390,7 @@ impl ToolRegistry {
             auto_classifier: None,
             permission_mode: PermissionMode::Default,
             touched: None,
+            read_file_state: None,
             permission_hook: None,
             policy: None,
             headless: false,
@@ -413,6 +418,7 @@ impl ToolRegistry {
             auto_classifier: self.auto_classifier.clone(),
             permission_mode: self.permission_mode.clone(),
             touched: self.touched.clone(),
+            read_file_state: self.read_file_state.clone(),
             permission_hook: self.permission_hook.clone(),
             policy: self.policy.clone(),
             headless: self.headless,
@@ -575,6 +581,18 @@ impl ToolRegistry {
     /// Return the currently attached touched-files collector, if any.
     pub fn touched_files(&self) -> Option<Arc<Mutex<TouchedFiles>>> {
         self.touched.clone()
+    }
+
+    /// Attach shared `ReadFileState` so `ReadFile` records reads and
+    /// `StrReplaceTool` can enforce the partial-read guard.
+    pub fn with_read_file_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
+        self.read_file_state = Some(slot);
+        self
+    }
+
+    /// Return the currently attached read-file state, if any.
+    pub fn read_file_state(&self) -> Option<Arc<Mutex<ReadFileState>>> {
+        self.read_file_state.clone()
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
@@ -1158,10 +1176,16 @@ pub fn build_standard_tools(
 ) -> ToolRegistry {
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let todo_list = Arc::new(std::sync::RwLock::new(Vec::<TodoItem>::new()));
+    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
     let mut registry = ToolRegistry::local()
-        .register(Arc::new(ReadFile::new(workspace)))
+        .with_read_file_state(read_state.clone())
+        .register(Arc::new(
+            ReadFile::new(workspace).with_read_state(read_state.clone()),
+        ))
         .register(Arc::new(WriteFile::new(workspace)))
-        .register(Arc::new(StrReplaceTool::new(workspace)))
+        .register(Arc::new(
+            StrReplaceTool::new(workspace).with_read_state(read_state.clone()),
+        ))
         .register(Arc::new(
             RunShell::new(workspace)
                 .with_timeout(std::time::Duration::from_secs(shell_timeout_secs)),

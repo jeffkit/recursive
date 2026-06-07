@@ -24,19 +24,33 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::{resolve_within, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::fs::ReadFileState;
 
 #[derive(Debug, Clone)]
 pub struct StrReplaceTool {
     pub root: PathBuf,
+    /// When `Some`, enforces the partial-read guard: edits on files that were
+    /// never read, or only partially read, are rejected with a clear error.
+    /// `None` (default) disables the guard for backward compatibility.
+    pub read_state: Option<Arc<Mutex<ReadFileState>>>,
 }
 
 impl StrReplaceTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            read_state: None,
+        }
+    }
+
+    pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
+        self.read_state = Some(slot);
+        self
     }
 }
 
@@ -358,6 +372,35 @@ useful if you want to rename a variable for instance."
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
         let abs_path = resolve_within(&self.root, file_path)?;
+
+        // ── Partial-read guard ──────────────────────────────────────────
+        // Reject edits on files that have never been read, or were only read
+        // partially (via start_line/end_line), in this session.
+        if let Some(slot) = &self.read_state {
+            if let Ok(state) = slot.lock() {
+                match state.get(&abs_path) {
+                    None => {
+                        return Err(Error::Tool {
+                            name: "Edit".into(),
+                            message: format!(
+                                "File `{file_path}` has not been read yet. \
+                                 Read it first before editing."
+                            ),
+                        });
+                    }
+                    Some(record) if record.is_partial => {
+                        return Err(Error::Tool {
+                            name: "Edit".into(),
+                            message: format!(
+                                "File `{file_path}` was only partially read \
+                                 (line range). Read the complete file before editing."
+                            ),
+                        });
+                    }
+                    Some(_) => {} // full read — proceed
+                }
+            }
+        }
 
         // ── Empty old_string: create new file or overwrite empty file ───
         if old_string.is_empty() {
@@ -857,5 +900,95 @@ mod tests {
         assert!(result.contains("All occurrences"));
         let content = std::fs::read_to_string(tmp.path().join("src.txt")).unwrap();
         assert_eq!(content, "ccc bbb ccc\n");
+    }
+
+    // ── Partial-read guard tests ──────────────────────────────────────────────
+
+    fn make_slot() -> std::sync::Arc<std::sync::Mutex<crate::tools::fs::ReadFileState>> {
+        std::sync::Arc::new(std::sync::Mutex::new(crate::tools::fs::ReadFileState::new()))
+    }
+
+    #[tokio::test]
+    async fn edit_rejected_when_file_never_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let slot = make_slot();
+        let err = StrReplaceTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not been read"),
+            "expected 'not been read', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejected_when_partial_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let slot = make_slot();
+        // Simulate a partial read record.
+        slot.lock()
+            .unwrap()
+            .record(tmp.path().join("src.txt"), true);
+        let err = StrReplaceTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("partially read"),
+            "expected 'partially read', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_allowed_after_full_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let slot = make_slot();
+        // Simulate a full read record.
+        slot.lock()
+            .unwrap()
+            .record(tmp.path().join("src.txt"), false);
+        let result = StrReplaceTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("updated successfully"));
+    }
+
+    #[tokio::test]
+    async fn edit_allowed_when_no_read_state() {
+        // StrReplaceTool::new() without with_read_state — guard disabled,
+        // backward-compatible behavior.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let result = StrReplaceTool::new(tmp.path())
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("updated successfully"));
     }
 }
