@@ -1,4 +1,4 @@
-//! `str_replace`: edit a file by replacing an exact string.
+//! `Edit`: edit a file by replacing an exact string.
 //!
 //! This is the recommended editing tool for single-file changes. The LLM
 //! provides an `old_string` (text to find) and `new_string` (replacement),
@@ -32,7 +32,7 @@ use crate::llm::ToolSpec;
 use crate::tools::fs::ReadFileState;
 
 #[derive(Debug, Clone)]
-pub struct StrReplaceTool {
+pub struct EditTool {
     pub root: PathBuf,
     /// When `Some`, enforces the partial-read guard: edits on files that were
     /// never read, or only partially read, are rejected with a clear error.
@@ -40,7 +40,7 @@ pub struct StrReplaceTool {
     pub read_state: Option<Arc<Mutex<ReadFileState>>>,
 }
 
-impl StrReplaceTool {
+impl EditTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -299,7 +299,7 @@ fn extract_by_char_count(
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl Tool for StrReplaceTool {
+impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Edit".into(),
@@ -666,7 +666,7 @@ mod tests {
         )
         .unwrap();
 
-        let tool = StrReplaceTool::new(tmp.path());
+        let tool = EditTool::new(tmp.path());
         let result = tool
             .execute(serde_json::json!({
                 "file_path": "src.txt",
@@ -686,7 +686,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
 
-        let err = StrReplaceTool::new(tmp.path())
+        let err = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "goodbye",
@@ -704,7 +704,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "foo\nfoo\nfoo\n").unwrap();
 
-        let err = StrReplaceTool::new(tmp.path())
+        let err = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "foo",
@@ -722,7 +722,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "foo\nfoo\nfoo\n").unwrap();
 
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "foo",
@@ -741,7 +741,7 @@ mod tests {
     async fn empty_old_string_creates_file() {
         let tmp = TempDir::new().unwrap();
 
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "new_file.txt",
                 "old_string": "",
@@ -759,7 +759,7 @@ mod tests {
     async fn empty_old_creates_nested_file() {
         let tmp = TempDir::new().unwrap();
 
-        StrReplaceTool::new(tmp.path())
+        EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "a/b/c/new_file.txt",
                 "old_string": "",
@@ -777,7 +777,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "hello\n").unwrap();
 
-        let err = StrReplaceTool::new(tmp.path())
+        let err = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "hello",
@@ -793,7 +793,7 @@ mod tests {
     #[tokio::test]
     async fn sandboxed_path_rejected() {
         let tmp = TempDir::new().unwrap();
-        let err = StrReplaceTool::new(tmp.path())
+        let err = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "../outside.txt",
                 "old_string": "x",
@@ -813,7 +813,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "let msg = \"it's done\";\n").unwrap();
 
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "let msg = \"it\u{2019}s done\";",
@@ -830,7 +830,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "fn foo() {\n    bar\n}\n").unwrap();
 
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "fn foo() {   \n    bar   \n}\n",
@@ -849,7 +849,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "fn foo() {\n    bar\n}\n").unwrap();
 
-        StrReplaceTool::new(tmp.path())
+        EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "fn foo() {\n    bar\n}\n",
@@ -868,7 +868,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("doc.md"), "# Hello\nold line  \n").unwrap();
 
-        StrReplaceTool::new(tmp.path())
+        EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "doc.md",
                 "old_string": "old line  \n",
@@ -887,7 +887,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "aaa bbb aaa\n").unwrap();
 
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "aaa",
@@ -913,7 +913,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
         let slot = make_slot();
-        let err = StrReplaceTool::new(tmp.path())
+        let err = EditTool::new(tmp.path())
             .with_read_state(slot)
             .execute(serde_json::json!({
                 "file_path": "src.txt",
@@ -938,7 +938,7 @@ mod tests {
         slot.lock()
             .unwrap()
             .record(tmp.path().join("src.txt"), true);
-        let err = StrReplaceTool::new(tmp.path())
+        let err = EditTool::new(tmp.path())
             .with_read_state(slot)
             .execute(serde_json::json!({
                 "file_path": "src.txt",
@@ -963,7 +963,7 @@ mod tests {
         slot.lock()
             .unwrap()
             .record(tmp.path().join("src.txt"), false);
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .with_read_state(slot)
             .execute(serde_json::json!({
                 "file_path": "src.txt",
@@ -977,11 +977,11 @@ mod tests {
 
     #[tokio::test]
     async fn edit_allowed_when_no_read_state() {
-        // StrReplaceTool::new() without with_read_state — guard disabled,
+        // EditTool::new() without with_read_state — guard disabled,
         // backward-compatible behavior.
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
-        let result = StrReplaceTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .execute(serde_json::json!({
                 "file_path": "src.txt",
                 "old_string": "hello",

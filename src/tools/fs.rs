@@ -15,10 +15,10 @@ use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
 // ---------------------------------------------------------------------------
-// ReadFileState — shared between ReadFile and StrReplaceTool
+// ReadFileState — shared between ReadFile and EditTool
 // ---------------------------------------------------------------------------
 
-/// Per-file read record written by `ReadFile` and consumed by `StrReplaceTool`.
+/// Per-file read record written by `ReadFile` and consumed by `EditTool`.
 #[derive(Debug, Clone)]
 pub struct ReadRecord {
     /// True when the read used start_line/end_line and did NOT cover the whole
@@ -28,7 +28,7 @@ pub struct ReadRecord {
 
 /// Session-scoped state tracking which files have been read (and whether
 /// those reads were partial). Injected via `Arc<Mutex<ReadFileState>>` into
-/// both `ReadFile` and `StrReplaceTool`.
+/// both `ReadFile` and `EditTool`.
 #[derive(Debug, Default, Clone)]
 pub struct ReadFileState {
     records: HashMap<PathBuf, ReadRecord>,
@@ -57,7 +57,7 @@ pub struct ReadFile {
     pub root: PathBuf,
     pub max_bytes: usize,
     /// Optional shared state slot. When `Some`, every successful read is
-    /// recorded so `StrReplaceTool` can enforce the partial-read guard.
+    /// recorded so `EditTool` can enforce the partial-read guard.
     pub read_state: Option<Arc<Mutex<ReadFileState>>>,
 }
 
