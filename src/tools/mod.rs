@@ -1083,7 +1083,14 @@ pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::
     // Symlink-aware check: if the path exists, canonicalize both sides and
     // re-check so that symlinks pointing outside the workspace are rejected.
     if abs_joined.exists() {
-        let canonical_root = abs_root.canonicalize().unwrap_or(abs_root.clone());
+        let canonical_root = abs_root.canonicalize().map_err(|e| Error::BadToolArgs {
+            name: "<fs>".into(),
+            message: format!(
+                "cannot canonicalize workspace root `{}`: {}",
+                abs_root.display(),
+                e
+            ),
+        })?;
         match abs_joined.canonicalize() {
             Ok(canonical_joined) => {
                 if !canonical_joined.starts_with(&canonical_root) {
