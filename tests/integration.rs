@@ -259,10 +259,16 @@ async fn permission_hook_and_sub_agent() {
             content: "spawning sub-agent".into(),
             tool_calls: vec![ToolCall {
                 id: "p1".into(),
-                name: "Agent".into(),
+                name: "agent".into(),
                 arguments: json!({
-                    "prompt": "run 'echo hi' and read notes.txt",
-                    "tools": ["Bash", "Read"]
+                    "mode": "single",
+                    "manifest": {
+                        "helper": {
+                            "system_prompt": "You are a helper. Run commands and read files as directed.",
+                            "allowed_tools": ["Bash", "Read"]
+                        }
+                    },
+                    "prompt": "run 'echo hi' and read notes.txt"
                 }),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -314,16 +320,13 @@ async fn permission_hook_and_sub_agent() {
     let llm = Arc::new(MockProvider::new(script));
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
 
-    // Build the full tool registry including sub_agent.
+    // Build the full tool registry including agent delegation.
     let all_tools = ToolRegistry::new(transport)
         .register(Arc::new(recursive::tools::ReadFile::new(root)))
         .register(Arc::new(recursive::tools::RunShell::new(root)))
-        .register(Arc::new(recursive::tools::SubAgent::new(
+        .register(Arc::new(recursive::tools::AgentTool::new(
             root,
             llm.clone(),
-            // We need a placeholder; the sub_agent tool will use this
-            // to build its own sub-registry. Since we pass the same
-            // all_tools, it will have access to everything.
             ToolRegistry::new(Arc::new(LocalTransport))
                 .register(Arc::new(recursive::tools::ReadFile::new(root)))
                 .register(Arc::new(recursive::tools::RunShell::new(root))),
