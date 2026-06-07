@@ -280,6 +280,11 @@ pub struct AppState {
     /// Pre-built at startup for cheap `GET /slash-commands` responses.
     pub slash_commands: Arc<Vec<SlashCommandInfo>>,
     pub session_ttl_secs: u64,
+    /// Semaphore limiting concurrent agent runs. Acquired in `run_agent` and
+    /// `send_session_message` before creating an `AgentRuntime`. When the
+    /// configured `max_concurrent_runs` is 0 (unlimited), this is initialised
+    /// with `Semaphore::MAX_PERMITS`.
+    pub run_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.

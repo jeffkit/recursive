@@ -683,6 +683,13 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3600);
+            let max_concurrent = config.max_concurrent_runs;
+            let run_semaphore =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(if max_concurrent == 0 {
+                    tokio::sync::Semaphore::MAX_PERMITS
+                } else {
+                    max_concurrent.max(1)
+                }));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -697,6 +704,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
                 slash_commands: std::sync::Arc::new(slash_commands),
                 session_ttl_secs,
+                run_semaphore,
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the
@@ -2158,6 +2166,7 @@ mod tests {
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         }
     }
 

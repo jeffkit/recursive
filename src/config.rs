@@ -71,6 +71,10 @@ pub struct Config {
     /// Fraction of steps in the window that must be errors to declare "stuck".
     /// Default 0.8. Set via `RECURSIVE_STUCK_ERROR_RATE`.
     pub stuck_error_rate: f64,
+    /// Maximum number of concurrent agent runs across all HTTP endpoints.
+    /// `0` means unlimited. Defaults to 8.
+    /// Set via `RECURSIVE_MAX_CONCURRENT_RUNS` env var.
+    pub max_concurrent_runs: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -105,6 +109,7 @@ impl std::fmt::Debug for Config {
             .field("max_search_rounds", &self.max_search_rounds)
             .field("stuck_window", &self.stuck_window)
             .field("stuck_error_rate", &self.stuck_error_rate)
+            .field("max_concurrent_runs", &self.max_concurrent_runs)
             .finish()
     }
 }
@@ -294,6 +299,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.8f64);
 
+        let max_concurrent_runs = std::env::var("RECURSIVE_MAX_CONCURRENT_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8usize);
+
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
         // This helps LLM prefix caching.
@@ -377,6 +387,7 @@ impl Config {
             max_search_rounds,
             stuck_window,
             stuck_error_rate,
+            max_concurrent_runs,
         })
     }
 
@@ -616,6 +627,7 @@ mod tests {
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
@@ -1106,6 +1118,7 @@ preset = "ollama"
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret"));

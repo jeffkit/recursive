@@ -73,6 +73,21 @@ pub(super) async fn run_agent(
         ));
     }
 
+    // Acquire a semaphore permit to limit concurrent runs.
+    let _permit = state
+        .run_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: "too many concurrent runs, try again later".into(),
+                }),
+            )
+        })?;
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
     let system_prompt = match body.system_prompt {
         Some(s) => s,
@@ -758,6 +773,22 @@ pub(super) async fn send_session_message(
     };
 
     // Lock the runtime for this turn (serializes concurrent requests per session).
+
+    // Acquire a semaphore permit to limit concurrent runs.
+    let _permit = state
+        .run_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: "too many concurrent runs, try again later".into(),
+                }),
+            )
+        })?;
     let mut runtime = runtime_arc.lock().await;
 
     // Goal-170: install a fresh cancellation token so `POST .../interrupt`
