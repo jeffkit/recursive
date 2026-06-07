@@ -92,7 +92,9 @@ pub use permissions::auto_classifier::{AutoClassifier, DenialTracker};
 pub use permissions::PermissionMode;
 pub use permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
 pub use permissions::{RuleBehavior, SharedPermissions};
-pub use providers::{all_presets, find_preset, ModelSpec, ProviderPreset};
+pub use providers::{
+    all_presets, all_presets_dynamic, find_preset, find_preset_extended, ModelSpec, ProviderPreset,
+};
 pub use rewind::{
     apply_rewind, checkpoint_log_path, detect_conflicts, plan_rewind, ConflictReport, RewindPlan,
     RewindResult,
