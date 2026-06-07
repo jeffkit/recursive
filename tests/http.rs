@@ -47,6 +47,7 @@ mod http_tests {
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         }
     }
 
@@ -92,6 +93,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 
@@ -106,6 +108,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 
@@ -184,6 +187,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         });
 
         let response = app
@@ -230,6 +234,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let app = build_router(state);
 
@@ -279,6 +284,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let app = build_router(state);
 
@@ -334,6 +340,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let app = build_router(state);
 
@@ -401,6 +408,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let app = build_router(state);
 
@@ -475,6 +483,7 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let app = build_router(state);
 
@@ -2783,6 +2792,7 @@ mod http_tests {
                 },
             ]),
             session_ttl_secs: 0,
+            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let app = build_router(state);
         let resp = app
