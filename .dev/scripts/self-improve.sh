@@ -101,6 +101,62 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 2
 fi
 
+# ---- EXIT trap: force-reset the worktree on abnormal exit ------------------
+# Background: g262 minimax run died with a network error at step 141.
+# The script's verdict_and_exit "rolled-back" path was reached and
+# the journal claim "rolled back" was written, but the actual
+# `git reset --hard $BASELINE_HEAD` did NOT run — the script
+# exited before reaching it, leaving the worktree dirty (modified
+# src/multi.rs + untracked journal). The next run of self-improve.sh
+# refused to launch because the tree was dirty, and the operator
+# had to manually `cd .worktrees/... && git checkout . && git clean -fd`.
+#
+# The fix: a single EXIT trap that runs on ANY exit (normal,
+# `set -e` failure, signal). Three flag-based exceptions:
+#   - _CLEANUP_DONE: set by verdict_and_exit() once it has fully
+#     handled the cleanup (committed, rolled-back) — back off.
+#   - _INTENTIONAL_DIRTY: set by skip-commit / panic-preserved
+#     before exit — the worktree is meant to stay dirty for
+#     diagnosis, do not touch it.
+#   - _WORKTREE_BASELINE empty: pre-flight failure (e.g. no
+#     baseline commit, dirty working tree) — there is nothing
+#     to reset to. Back off.
+# Anything else is an abnormal exit: force-reset to baseline and
+# commit the journal (if any) so the worktree is clean for the
+# next launch.
+_INTENTIONAL_DIRTY=0
+_CLEANUP_DONE=0
+_WORKTREE_BASELINE=""
+
+cleanup_on_exit() {
+  local exit_code=$?
+  [[ "$_CLEANUP_DONE"     -eq 1 ]] && return 0
+  [[ "$_INTENTIONAL_DIRTY" -eq 1 ]] && return 0
+  [[ -z "$_WORKTREE_BASELINE"   ]] && return 0
+
+  echo "!! self-improve.sh: abnormal exit (code $exit_code); force-resetting to $_WORKTREE_BASELINE" >&2
+  cd "$REPO_ROOT" 2>/dev/null || cd /
+  if ! git reset --hard "$_WORKTREE_BASELINE" --quiet 2>/dev/null; then
+    echo "!! self-improve.sh: git reset --hard FAILED; worktree may still be dirty" >&2
+    return 1
+  fi
+  # Best-effort: also clean untracked files (target/, .dev/journal/, etc.)
+  # that the agent may have created. The worktree is meant to be
+  # reusable for the next run, so leaving artifacts is unhelpful.
+  git clean -fd --quiet 2>/dev/null || true
+  if [[ -f "$LOG" ]]; then
+    git add "$LOG" 2>/dev/null || true
+    git commit --quiet -m "dev: journal — abnormal-exit cleanup (code $exit_code) on $(basename "$LOG")" 2>/dev/null || true
+  fi
+}
+
+trap 'cleanup_on_exit' EXIT
+# Note: _WORKTREE_BASELINE is set later, right before the agent is
+# launched. This ensures that pre-flight failures (provider selection,
+# tool checks, sysprompt build) leave _WORKTREE_BASELINE empty and
+# the trap backs off — no spurious `git reset`/`git clean` of the
+# user's main checkout or freshly-created worktree.
+
 # ---- Build system prompt ----------------------------------------------------
 
 SYSPROMPT_FILE="$(mktemp -t recursive-sysprompt.XXXXXX)"
@@ -291,6 +347,12 @@ mkdir -p "$TRANSCRIPT_DIR"
 PRICING_FILE="$DEV_DIR/pricing.yaml"
 PRICING_FLAG=""
 [[ -f "$PRICING_FILE" ]] && PRICING_FLAG="--pricing-file $PRICING_FILE"
+
+# From this point on, an abnormal exit (set -e failure, signal,
+# process crash) should reset the worktree to the baseline and
+# commit the journal. Set the baseline flag so the EXIT trap
+# knows to act.
+_WORKTREE_BASELINE="$BASELINE_HEAD"
 
 set +e
 "$BIN" --workspace . \
@@ -510,6 +572,16 @@ verdict_and_exit() {
   append_result_footer "$verdict" "$detail"
   emit_metrics "$verdict" "$detail"
 
+  # The exit-trap sees _CLEANUP_DONE=1 and backs off — this function
+  # is the authoritative cleanup path. For the skip-commit verdict
+  # the worktree is *intentionally* left dirty, so we set
+  # _INTENTIONAL_DIRTY=1 instead and re-mark _CLEANUP_DONE=0 below.
+  if [[ "$verdict" == "skip-commit" ]]; then
+    _INTENTIONAL_DIRTY=1
+  else
+    _CLEANUP_DONE=1
+  fi
+
   case "$verdict" in
     committed)
       # Commit log + agent output together.
@@ -622,6 +694,9 @@ if [[ "$AGENT_STATUS" -ne 0 ]]; then
     # Commit journal + metrics without resetting — preserve the code state
     git add "$LOG" "$METRICS_FILE" 2>/dev/null || true
     git commit --quiet -m "dev: journal — PANIC run ${TS} (${GOAL_TAG}: exit ${AGENT_STATUS})" 2>/dev/null || true
+    # Tell the EXIT trap to back off: this path is *intentionally*
+    # leaving the worktree dirty (src/ + journal) for diagnosis.
+    _INTENTIONAL_DIRTY=1
     echo ""
     echo "=== ⚠ PANIC preserved (exit ${AGENT_STATUS}); worktree left dirty for diagnosis ==="
     echo "=== journaled to ${LOG} ==="
