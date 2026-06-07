@@ -92,6 +92,8 @@ fn mock_config(workspace: PathBuf) -> Config {
         max_search_rounds: 3,
         stuck_window: 10,
         stuck_error_rate: 0.8,
+
+        max_concurrent_runs: 8,
     }
 }
 
@@ -106,6 +108,7 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
         metrics: Arc::new(Metrics::default()),
         slash_commands: Arc::new(Vec::new()),
         session_ttl_secs: 0,
+        run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
     }
 }
 
