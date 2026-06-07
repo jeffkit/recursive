@@ -797,6 +797,29 @@ fi
 # Verify the newly-built binary actually works as an agent (not just compiles).
 # Uses ArgusAI replay mode with fixtures — deterministic, no API key needed.
 # Disable with RECURSIVE_SMOKE_TEST=0 for debugging or when Docker is unavailable.
+#
+# argusai is normally on PATH via fnm, but fnm's multishell bin path
+# (e.g. /Users/<user>/.local/state/fnm_multishells/<session-id>/bin)
+# is per-shell. When self-improve.sh runs in a non-interactive subprocess
+# the multishell path may not be inherited, so `command -v argusai`
+# fails even though argusai is correctly installed. Fall back to the
+# stable fnm install path (and a few common system-wide locations) so
+# the gate actually runs.
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && ! command -v argusai >/dev/null 2>&1; then
+  for argusai_candidate in \
+      "${FNM_DIR:-}/node-versions"/*/installation/bin/argusai \
+      "${XDG_DATA_HOME:-$HOME/.local/share}/fnm/node-versions"/*/installation/bin/argusai \
+      /opt/homebrew/bin/argusai \
+      /usr/local/bin/argusai \
+      "$HOME/.local/bin/argusai"; do
+    if [[ -x "$argusai_candidate" ]]; then
+      export PATH="$(dirname "$argusai_candidate"):$PATH"
+      echo "[self-improve] E2E: found argusai at $argusai_candidate (added to PATH)" >&2
+      break
+    fi
+  done
+fi
+
 if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
    && command -v argusai >/dev/null 2>&1 \
    && [[ -f "e2e/e2e.yaml" ]] \
@@ -857,7 +880,25 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
     fi
   fi
 elif [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]; then
-  echo "[self-improve] WARN: E2E smoke skipped (argusai not found, e2e/e2e.yaml missing, or plugins not built)"
+  # ---- Hard gate: missing E2E prerequisites must fail the run ---------------
+  # E2E has been quietly skipped in many recent runs because argusai's
+  # fnm-multishell PATH was not inherited. That hid regressions (e.g. a
+  # goal that broke write_file) and meant self-improve runs were never
+  # actually exercising the binary end-to-end. Treat any missing
+  # prerequisite as a hard error so the operator sees the problem
+  # and fixes the environment, rather than letting the run commit
+  # unverified code.
+  _missing=()
+  command -v argusai >/dev/null 2>&1 || _missing+=("argusai-on-PATH")
+  [[ -f "e2e/e2e.yaml" ]]               || _missing+=("e2e/e2e.yaml")
+  [[ -f "e2e/plugins/dist/index.js" ]]  || _missing+=("e2e/plugins/dist/index.js")
+  echo "[self-improve] E2E: HARD GATE FAILED — missing prerequisites:" >&2
+  printf '  - %s\n' "${_missing[@]}" >&2
+  echo "[self-improve] E2E: fix the environment (e.g. add argusai to a stable PATH location," >&2
+  echo "[self-improve]      run \`pnpm install -g argusai-cli\`, or build the plugins)" >&2
+  echo "[self-improve]      then re-run self-improve.sh." >&2
+  echo "[self-improve]      To skip intentionally: RECURSIVE_SMOKE_TEST=0 .dev/scripts/self-improve.sh ..." >&2
+  verdict_and_exit "rolled-back" "E2E prerequisites missing: ${_missing[*]}"
 fi
 
 # ---- Self-review pipeline (default ON since batch 36) ----------------------
