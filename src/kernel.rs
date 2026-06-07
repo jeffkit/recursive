@@ -7,8 +7,6 @@
 //!   (messages, tools, config, event sink).
 //! * [`TurnOutcome`] — the result of executing one turn (new messages,
 //!   usage, finish reason, side effects).
-//! * [`SideEffect`] — side effects that outlive the turn (background jobs,
-//!   scheduled wakeups).
 //! * [`AgentKernel`] — the stateless single-turn executor (struct + builder
 //!   only; `run()` is not yet implemented).
 //!
