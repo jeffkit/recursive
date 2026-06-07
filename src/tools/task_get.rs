@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tasks::TaskRegistry;
 use crate::tools::{Tool, ToolSideEffect};
@@ -46,7 +46,7 @@ impl Tool for TaskGetTool {
 
     async fn execute(&self, arguments: Value) -> Result<String> {
         let id = lookup_task_id(&self.registry, &arguments, "task_get").await?;
-        let task = self.registry.get(&id).await.unwrap();
+        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         // Drain any pending output so the snapshot is current.
         let _ = self.registry.drain_output(&id).await;
         let status = task.status().await;

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tasks::TaskRegistry;
 use crate::tools::{Tool, ToolSideEffect};
@@ -78,7 +78,7 @@ impl Tool for TaskOutputTool {
         if block {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {
-                let s = self.registry.get(&id).await.unwrap().status().await;
+                let s = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?.status().await;
                 if s.is_terminal() {
                     break;
                 }
@@ -91,7 +91,7 @@ impl Tool for TaskOutputTool {
 
         // Drain output buffer.
         let _ = self.registry.drain_output(&id).await;
-        let task = self.registry.get(&id).await.unwrap();
+        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         let lines = task.output_snapshot().await;
         // Clear it (drain consumed the channel, but the snapshot buffer is separate).
         {

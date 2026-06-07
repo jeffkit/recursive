@@ -149,7 +149,7 @@ impl Tool for TeamCreateTool {
         TeamRegistry::save_team(&team)?;
         self.registry.register_team(team.clone()).await;
 
-        let team = self.registry.get(&name).await.unwrap();
+        let team = self.registry.get(&name).await.ok_or_else(|| Error::NotFound(format!("team '{name}'")))?;
         Ok(format!(
             "Created team '{name}' ({} members).",
             team.member_count()
