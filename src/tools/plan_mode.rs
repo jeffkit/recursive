@@ -96,10 +96,7 @@ impl PlanApprovalGate {
         loop {
             // Read without holding the lock across the await point.
             let result_opt = {
-                let guard = self
-                    .response
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
+                let guard = self.response.read().unwrap_or_else(|e| e.into_inner());
                 guard.clone()
             };
             if let Some(result) = result_opt {
@@ -374,10 +371,7 @@ impl PlanModeRequestGate {
     pub async fn wait_for_decision(&self) -> PlanModeRequestResult {
         loop {
             let result_opt = {
-                let guard = self
-                    .response
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
+                let guard = self.response.read().unwrap_or_else(|e| e.into_inner());
                 guard.clone()
             };
             if let Some(result) = result_opt {
