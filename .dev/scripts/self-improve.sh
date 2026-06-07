@@ -152,13 +152,13 @@ apply_provider_profile() {
     deepseek)
       export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
-      export RECURSIVE_MODEL="deepseek-chat"
+      export RECURSIVE_MODEL="deepseek-v4-flash"
       export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
       ;;
     deepseek-pro)
       export RECURSIVE_PROVIDER_TYPE="openai"
       export RECURSIVE_API_BASE="https://api.deepseek.com/v1"
-      export RECURSIVE_MODEL="deepseek-chat"
+      export RECURSIVE_MODEL="deepseek-v4-pro"
       export RECURSIVE_API_KEY="${DEEPSEEK_API_KEY:-}"
       ;;
     glm)
