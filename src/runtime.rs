@@ -590,9 +590,21 @@ impl AgentRuntime {
     /// later processing.
     async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
         let mut last: Option<RuntimeOutcome> = None;
-        while let Some(msg) = self.message_queue.pop_front() {
-            let outcome = self.run(msg).await?;
-            last = Some(outcome);
+        // Peek then run: only pop the message from the queue after `run`
+        // returns Ok. Goal-259 — a transient error during `run` would
+        // otherwise permanently lose the in-flight message. The message
+        // stays at the front of the queue and can be retried by calling
+        // `drain_queue` again once the error is handled.
+        while let Some(msg) = self.message_queue.front().cloned() {
+            match self.run(msg).await {
+                Ok(outcome) => {
+                    self.message_queue.pop_front();
+                    last = Some(outcome);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
         Ok(last)
     }
@@ -2121,10 +2133,61 @@ mod tests {
         rt.message_queue.push_back("msg B".into());
         let result = rt.drain_queue().await;
         assert!(result.is_err(), "expected error, got {:?}", result);
-        // First message was processed (popped from queue).
-        // Second message was popped from queue before the error (pop_front happens before run).
-        // Second message was popped from queue before the error.
-        assert_eq!(rt.queue_len(), 0, "second message was already popped");
+        // Goal-259: the in-flight message must remain at the front of the
+        // queue so it can be retried by calling drain_queue again.
+        assert_eq!(
+            rt.queue_len(),
+            1,
+            "second message should remain in queue for retry"
+        );
+        // Verify it is indeed the second message that was preserved.
+        assert_eq!(
+            rt.message_queue.front().map(String::as_str),
+            Some("msg B"),
+            "msg B should still be at the front of the queue"
+        );
+        // First message was successfully processed and is reflected in the
+        // transcript (user message + assistant reply).
+        assert_eq!(
+            rt.transcript().len(),
+            3,
+            "transcript should hold msg A, reply A, and the in-flight msg B"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_queue_preserves_remaining_messages_on_error() {
+        // Goal-259: 3 messages queued, only 1 completion available. The
+        // second message will fail. The first message must be popped
+        // (success), and the remaining two (B and C) must stay in the
+        // queue for later retry.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "reply A".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.message_queue.push_back("msg A".into());
+        rt.message_queue.push_back("msg B".into());
+        rt.message_queue.push_back("msg C".into());
+        let result = rt.drain_queue().await;
+        assert!(result.is_err(), "expected error, got {:?}", result);
+        // First message was processed and popped; B and C remain.
+        assert_eq!(
+            rt.queue_len(),
+            2,
+            "B and C should remain in queue for retry"
+        );
+        // FIFO order preserved: B at the front, C behind it.
+        assert_eq!(rt.message_queue.front().map(String::as_str), Some("msg B"));
+        // First turn reflected in transcript. The in-flight msg B is also
+        // present (run() appends the user message to the transcript before
+        // the LLM call), but it has no assistant reply yet because the
+        // LLM call failed — the same pre-existing behaviour as in
+        // drain_queue_stops_on_first_error.
+        assert_eq!(rt.transcript().len(), 3);
     }
 
     // ── Goal-201: plan mode tools are registered by the runtime builder ──
