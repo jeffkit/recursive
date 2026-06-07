@@ -222,6 +222,38 @@ pub struct AgentRole {
     pub allowed_tools: Vec<String>,
 }
 
+/// Execution mode for the unified `agent` delegation tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    /// Single worker: manifest must have exactly one entry.
+    Single,
+    /// All workers run concurrently (join_all). Read-only workers benefit most.
+    Parallel,
+    /// Workers run one after another, in manifest key order.
+    Sequential,
+}
+
+impl AgentMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "single" => Some(Self::Single),
+            "parallel" => Some(Self::Parallel),
+            "sequential" => Some(Self::Sequential),
+            _ => None,
+        }
+    }
+}
+
+/// Definition of a single worker entry within the agent manifest.
+#[derive(Clone, Debug)]
+pub struct WorkerManifestEntry {
+    pub system_prompt: String,
+    pub allowed_tools: Vec<String>,
+}
+
+/// Maps worker IDs to their role definitions. Required by the `agent` tool.
+pub type AgentManifest = HashMap<String, WorkerManifestEntry>;
+
 /// An agent pool manages multiple agents with different roles.
 pub struct AgentPool {
     roles: HashMap<String, AgentRole>,

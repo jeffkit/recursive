@@ -29,6 +29,10 @@ pub enum Error {
     #[error("bad tool arguments ({name}): {message}")]
     BadToolArgs { name: String, message: String },
 
+    /// Tool rejected execution (policy, constraints, safety)
+    #[error("tool rejected ({name}): {reason}")]
+    ToolRejected { name: String, reason: String },
+
     /// Tool not found in registry
     #[error("tool `{0}` not found")]
     UnknownTool(String),
