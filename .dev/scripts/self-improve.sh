@@ -7,8 +7,10 @@
 #
 # Safety net:
 #   - Requires a clean working tree and a baseline commit before running.
-#   - On success (agent exit 0 AND post-run `cargo test` green): auto-commits
-#     all changes with a descriptive message.
+#   - On success (agent exit 0 AND post-run `cargo test` green AND
+#     `cargo clippy --all-targets --all-features -- -D warnings` green):
+#     auto-commits all changes with a descriptive message and prints
+#     a "READY TO LAND" pointer for the operator.
 #   - On any failure: hard-resets to baseline. Nothing in src/ survives.
 #
 # Usage:
@@ -534,6 +536,19 @@ Goal:     ${GOAL_SOURCE}
       echo "=== ✓ committed: $(git log --oneline -1) ==="
       echo "=== journaled to ${LOG} ==="
       [[ -f "$OBS_FILE" ]] && echo "=== observed at ${OBS_FILE} ==="
+      echo ""
+      # Surface a clear "ready to land" pointer so the operator (or
+      # a follow-up agent) doesn't have to hunt for the branch /
+      # worktree. The branch comes from parallel-self-improve.sh when
+      # launched via parallel; for a direct invocation we fall back
+      # to `git branch --show-current`.
+      _READY_BRANCH="${BRANCH:-$(git branch --show-current 2>/dev/null || echo HEAD)}"
+      _READY_WORKTREE="${WORKTREE_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo .)}"
+      echo "=== READY TO LAND ==="
+      echo "    branch:   ${_READY_BRANCH}"
+      echo "    worktree: ${_READY_WORKTREE}"
+      echo "    land:     .dev/scripts/land-self-improve.sh ${GOAL_TAG}-${SELECTED_PROVIDER:-?}-${TS}"
+      echo "    merge:    git merge --no-ff ${_READY_BRANCH}"
       exit 0
       ;;
     rolled-back)
@@ -671,6 +686,89 @@ Please fix the compilation/test errors. Do NOT start over — fix the specific i
     fi
   else
     verdict_and_exit "rolled-back" "post-agent cargo test failed"
+  fi
+fi
+
+# ---- Clippy check (-D warnings) ----------------------------------------------
+# Defence in depth #3: enforce `cargo clippy --all-targets --all-features
+# -- -D warnings`. AGENTS.md and CLAUDE.md both name clippy as a
+# mandatory quality gate, and unused-import / needless-borrow / etc.
+# lints are exactly the kind of regression a `cargo test` pass hides
+# (warnings don't fail `cargo test`). Without this gate, agents that
+# skip their own clippy step will land code that the post-land
+# clippy run (i.e. land-self-improve.sh) catches only at merge time.
+#
+# Observed: g262 (deepseek-pro run 20260607T090826Z) committed with
+# 2 unused imports in tests/agent_team_integration.rs that
+# `cargo test` accepted; only the land script's clippy gate caught
+# them. Adding this gate here means the agent gets one resume-fix
+# chance to clean up the warnings before we declare the run green.
+#
+# Disable with RECURSIVE_CLIPPY_CHECK=0 only if a goal genuinely
+# needs to land clippy-dirty code (very rare — almost certainly a
+# bug in the goal spec).
+if [[ "${RECURSIVE_CLIPPY_CHECK:-1}" == "1" ]] \
+   && ! cargo clippy --all-targets --all-features -- -D warnings \
+        >/tmp/cargo-clippy-errors.log 2>&1; then
+  # ---- Resume-based retry on clippy failure -----------------------------------
+  # Same pattern as the cargo test gate: give the agent one chance to fix
+  # its own lint warnings by resuming the conversation with the clippy
+  # errors as context. Mechanical lints (needless_borrow, redundant_clone)
+  # are usually a one-line fix; unused imports the agent can drop without
+  # needing a follow-up compile cycle.
+  if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
+     && [[ -f "$TRANSCRIPT_OUT" ]] \
+     && [[ -z "${_RECURSIVE_CLIPPY_RESUME_ATTEMPTED:-}" ]] \
+     && command -v jq >/dev/null 2>&1; then
+    export _RECURSIVE_CLIPPY_RESUME_ATTEMPTED=1
+    RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
+    if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
+      CLIPPY_ERRORS="$(tail -60 /tmp/cargo-clippy-errors.log)"
+      CLIPPY_FIX_PROMPT="Your code changes caused \`cargo clippy --all-targets --all-features -- -D warnings\` to FAIL. Lint warnings are errors under \`-D warnings\`. Errors:
+
+\`\`\`
+${CLIPPY_ERRORS}
+\`\`\`
+
+Please fix the lint warnings. Mechanical fixes (needless_borrow, redundant_clone, unused_imports) are usually a one-line change. Do NOT start over — fix the specific issues above."
+
+      RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-clippy-fix.json"
+      {
+        echo ""
+        echo "--- CLIPPY-FIX: cargo clippy failed, resuming agent to fix warnings ---"
+        echo ""
+      } | tee -a "$LOG"
+
+      set +e
+      "$BIN" --workspace . \
+        --system-prompt-file "$SYSPROMPT_FILE" \
+        --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+        $PRICING_FLAG \
+        --log warn \
+        replay "$TRANSCRIPT_OUT" \
+        --resume-from "$RESUME_FROM" "$CLIPPY_FIX_PROMPT" 2>&1 | tee -a "$LOG"
+      CLIPPY_FIX_STATUS=${PIPESTATUS[0]}
+      set -e
+
+      # Re-check clippy after the fix attempt
+      if [[ "$CLIPPY_FIX_STATUS" -eq 0 ]] \
+         && cargo clippy --all-targets --all-features -- -D warnings \
+              >/dev/null 2>&1; then
+        echo "[self-improve] CLIPPY-FIX: clippy clean after fix ✓" | tee -a "$LOG"
+        # Re-commit any agent edits made during the clippy-fix replay.
+        if [[ -n "$(git status --porcelain)" ]]; then
+          git add -A
+          git commit --quiet -m "self-improve(${GOAL_TAG}): clippy-fix round"
+        fi
+      else
+        echo "[self-improve] CLIPPY-FIX: still failing after fix attempt" | tee -a "$LOG"
+        verdict_and_exit "rolled-back" "post-agent cargo clippy failed (clippy-fix also failed)"
+      fi
+    else
+      verdict_and_exit "rolled-back" "post-agent cargo clippy failed"
+    fi
+  else
+    verdict_and_exit "rolled-back" "post-agent cargo clippy failed"
   fi
 fi
 
