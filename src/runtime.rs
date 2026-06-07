@@ -590,9 +590,21 @@ impl AgentRuntime {
     /// later processing.
     async fn drain_queue(&mut self) -> Result<Option<RuntimeOutcome>> {
         let mut last: Option<RuntimeOutcome> = None;
-        while let Some(msg) = self.message_queue.pop_front() {
-            let outcome = self.run(msg).await?;
-            last = Some(outcome);
+        // Peek then run: only pop the message from the queue after `run`
+        // returns Ok. Goal-259 — a transient error during `run` would
+        // otherwise permanently lose the in-flight message. The message
+        // stays at the front of the queue and can be retried by calling
+        // `drain_queue` again once the error is handled.
+        while let Some(msg) = self.message_queue.front().cloned() {
+            match self.run(msg).await {
+                Ok(outcome) => {
+                    self.message_queue.pop_front();
+                    last = Some(outcome);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
         Ok(last)
     }
@@ -778,9 +790,6 @@ impl AgentRuntime {
     /// Clear the active goal. Emits `AgentEvent::GoalCleared`.
     pub async fn clear_goal(&self) {
         if let Ok(mut g) = self.goal_state.write() {
-            if let Some(ref mut s) = *g {
-                s.status = GoalStatus::Cleared;
-            }
             *g = None;
         }
         self.event_sink.emit(AgentEvent::GoalCleared).await;
@@ -825,35 +834,47 @@ impl AgentRuntime {
             let outcome = self.run(&next_prompt).await?;
             outcomes.push(outcome);
 
-            // Increment turn counter.
-            let turns = {
-                let mut guard = self.goal_state.write().ok();
-                if let Some(ref mut guard) = guard {
-                    if let Some(ref mut gs) = **guard {
+            // Increment turn counter and check budget in a single write lock
+            // (C-2: TOCTOU fix — previously two separate locks created a window
+            // where an external clear_goal() call could set goal=None between the
+            // increment and the budget check, causing a duplicate GoalCleared emit).
+            enum TurnOutcomeKind {
+                Continue(u32),
+                BudgetExceeded(u32),
+                ExternallyCleared,
+            }
+            let turn_outcome = {
+                let mut guard = match self.goal_state.write().ok() {
+                    Some(g) => g,
+                    None => break,
+                };
+                match *guard {
+                    None => TurnOutcomeKind::ExternallyCleared,
+                    Some(ref mut gs) => {
                         gs.turns += 1;
-                        gs.turns
-                    } else {
-                        break; // goal was cleared externally
+                        let turns = gs.turns;
+                        if turns >= max_turns {
+                            *guard = None;
+                            TurnOutcomeKind::BudgetExceeded(turns)
+                        } else {
+                            TurnOutcomeKind::Continue(turns)
+                        }
                     }
-                } else {
-                    break;
                 }
             };
 
-            // Budget exceeded?
-            if turns >= max_turns {
-                if let Ok(mut g) = self.goal_state.write() {
-                    if let Some(ref mut gs) = *g {
-                        gs.status = GoalStatus::Cleared;
-                    }
-                    *g = None;
+            let turns = match turn_outcome {
+                TurnOutcomeKind::ExternallyCleared => break,
+                TurnOutcomeKind::BudgetExceeded(t) => {
+                    self.event_sink.emit(AgentEvent::GoalCleared).await;
+                    tracing::warn!(
+                        "goal loop: turn budget of {max_turns} exceeded without achieving condition"
+                    );
+                    let _ = t;
+                    break;
                 }
-                self.event_sink.emit(AgentEvent::GoalCleared).await;
-                tracing::warn!(
-                    "goal loop: turn budget of {max_turns} exceeded without achieving condition"
-                );
-                break;
-            }
+                TurnOutcomeKind::Continue(t) => t,
+            };
 
             // Ask the judge.
             let verdict = evaluator.evaluate(&condition, self.transcript()).await?;
@@ -1076,9 +1097,6 @@ pub struct AgentRuntimeBuilder {
     streaming: bool,
     saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
-    /// UUID of the parent agent's last message. Reserved for future
-    /// multi-agent orchestration (g155). Not yet wired to event emission.
-    parent_agent_last_uuid: Option<String>,
     /// When `true`, register `enter_plan_mode`, `exit_plan_mode`, and
     /// `request_plan_mode` tools. These tools block waiting for human
     /// approval via the plan approval gate, so they must only be registered
@@ -1120,7 +1138,6 @@ impl AgentRuntimeBuilder {
             streaming: false,
             saved_event_sink: None,
             compactor: None,
-            parent_agent_last_uuid: None,
             with_plan_mode_tools: false,
         }
     }
@@ -1131,17 +1148,6 @@ impl AgentRuntimeBuilder {
     /// the tools block indefinitely waiting for `confirm_plan()`.
     pub fn with_plan_mode_tools(mut self, enabled: bool) -> Self {
         self.with_plan_mode_tools = enabled;
-        self
-    }
-
-    /// Set the UUID of the parent agent's last message.
-    ///
-    /// When set, this runtime's messages will be stamped with this UUID as
-    /// `parent_uuid` on their first `MessageAppended` event, branching the
-    /// subagent chain off the given point in the parent's conversation tree
-    /// (g155). Currently stored for future multi-agent orchestration.
-    pub fn parent_agent_last_uuid(mut self, uuid: impl Into<String>) -> Self {
-        self.parent_agent_last_uuid = Some(uuid.into());
         self
     }
 
@@ -1317,6 +1323,7 @@ impl AgentRuntimeBuilder {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider};
+    use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -2107,10 +2114,61 @@ mod tests {
         rt.message_queue.push_back("msg B".into());
         let result = rt.drain_queue().await;
         assert!(result.is_err(), "expected error, got {:?}", result);
-        // First message was processed (popped from queue).
-        // Second message was popped from queue before the error (pop_front happens before run).
-        // Second message was popped from queue before the error.
-        assert_eq!(rt.queue_len(), 0, "second message was already popped");
+        // Goal-259: the in-flight message must remain at the front of the
+        // queue so it can be retried by calling drain_queue again.
+        assert_eq!(
+            rt.queue_len(),
+            1,
+            "second message should remain in queue for retry"
+        );
+        // Verify it is indeed the second message that was preserved.
+        assert_eq!(
+            rt.message_queue.front().map(String::as_str),
+            Some("msg B"),
+            "msg B should still be at the front of the queue"
+        );
+        // First message was successfully processed and is reflected in the
+        // transcript (user message + assistant reply).
+        assert_eq!(
+            rt.transcript().len(),
+            3,
+            "transcript should hold msg A, reply A, and the in-flight msg B"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_queue_preserves_remaining_messages_on_error() {
+        // Goal-259: 3 messages queued, only 1 completion available. The
+        // second message will fail. The first message must be popped
+        // (success), and the remaining two (B and C) must stay in the
+        // queue for later retry.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "reply A".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        rt.message_queue.push_back("msg A".into());
+        rt.message_queue.push_back("msg B".into());
+        rt.message_queue.push_back("msg C".into());
+        let result = rt.drain_queue().await;
+        assert!(result.is_err(), "expected error, got {:?}", result);
+        // First message was processed and popped; B and C remain.
+        assert_eq!(
+            rt.queue_len(),
+            2,
+            "B and C should remain in queue for retry"
+        );
+        // FIFO order preserved: B at the front, C behind it.
+        assert_eq!(rt.message_queue.front().map(String::as_str), Some("msg B"));
+        // First turn reflected in transcript. The in-flight msg B is also
+        // present (run() appends the user message to the transcript before
+        // the LLM call), but it has no assistant reply yet because the
+        // LLM call failed — the same pre-existing behaviour as in
+        // drain_queue_stops_on_first_error.
+        assert_eq!(rt.transcript().len(), 3);
     }
 
     // ── Goal-201: plan mode tools are registered by the runtime builder ──
@@ -2128,11 +2186,11 @@ mod tests {
             .unwrap();
         let tools = rt.kernel.tools();
         assert!(
-            tools.get("enter_plan_mode").is_some(),
+            tools.get(ENTER_PLAN_MODE_TOOL_NAME).is_some(),
             "enter_plan_mode must be registered by AgentRuntimeBuilder"
         );
         assert!(
-            tools.get("exit_plan_mode").is_some(),
+            tools.get(EXIT_PLAN_MODE_TOOL_NAME).is_some(),
             "exit_plan_mode must be registered by AgentRuntimeBuilder"
         );
     }

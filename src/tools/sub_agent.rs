@@ -130,8 +130,13 @@ impl SubAgent {
     }
 
     /// Build a restricted tool registry containing only the named tools.
+    ///
+    /// Starts from an empty registry (same transport/permissions/policy as
+    /// the parent) so that only the explicitly listed tools are available.
+    /// Previously used `fork()` which copied all tools, silently defeating
+    /// the read-only sub-agent security boundary.
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
-        let mut reg = self.all_tools.fork();
+        let mut reg = self.all_tools.with_same_transport();
         for name in tool_names {
             if let Some(tool) = self.all_tools.get(name) {
                 reg = reg.register(tool);

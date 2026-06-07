@@ -5,7 +5,6 @@
 //! - `parent_uuid` of each entry (except root) equals the preceding entry's UUID.
 //! - `SessionReader::load_transcript_indexed` builds a UUID → entry index.
 //! - Old JSONL files without `uuid` fields load without error.
-//! - `AgentRuntimeBuilder::parent_agent_last_uuid` can be set (stored).
 
 use recursive::message::Message;
 use recursive::session::{SessionReader, SessionWriter};
@@ -223,25 +222,4 @@ fn open_existing_continues_uuid_chain() {
         Some(last_uuid_before.as_str()),
         "resumed message parent_uuid should continue from previous session"
     );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Test 6: AgentRuntimeBuilder::parent_agent_last_uuid is stored
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `AgentRuntimeBuilder::parent_agent_last_uuid` stores the value on the builder.
-#[test]
-fn builder_stores_parent_agent_last_uuid() {
-    use recursive::llm::MockProvider;
-    use recursive::AgentRuntime;
-    use std::sync::Arc;
-
-    // Verify the builder accepts a parent UUID without panicking.
-    // (Field is private; builder construction is the observable side-effect.)
-    let llm = Arc::new(MockProvider::new(vec![]));
-    let _runtime = AgentRuntime::builder()
-        .llm(llm)
-        .parent_agent_last_uuid("abc-123-def")
-        .build()
-        .expect("build with parent_agent_last_uuid should succeed");
 }

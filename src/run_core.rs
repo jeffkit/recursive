@@ -35,6 +35,7 @@ use crate::hooks::{HookAction, HookEvent, HookRegistry};
 use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
+use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use crate::tools::ToolRegistry;
 
 use crate::agent::{FinishReason, PermissionDecision};
@@ -282,7 +283,7 @@ impl<'a> RunCore<'a> {
             // that is not `exit_plan_mode` itself.
             if self.exploring_plan_mode.load(Ordering::Relaxed)
                 && !self.tools.is_readonly(&call.name)
-                && call.name != "exit_plan_mode"
+                && call.name != EXIT_PLAN_MODE_TOOL_NAME
             {
                 results.push(ToolCallOutcome {
                     id: call.id.clone(),
@@ -303,8 +304,8 @@ impl<'a> RunCore<'a> {
             // tell the agent to enter plan mode first.
             if !self.exploring_plan_mode.load(Ordering::Relaxed)
                 && self.tools.is_plan_mode(&call.name)
-                && call.name != "enter_plan_mode"
-                && call.name != "exit_plan_mode"
+                && call.name != ENTER_PLAN_MODE_TOOL_NAME
+                && call.name != EXIT_PLAN_MODE_TOOL_NAME
             {
                 results.push(ToolCallOutcome {
                     id: call.id.clone(),
@@ -413,10 +414,17 @@ impl<'a> RunCore<'a> {
                 }
 
                 type BatchRow = (String, String, String, crate::tools::AuditMeta, u64);
-                let mut batch_results: Vec<BatchRow> = Vec::new();
+                // Use a HashMap keyed by tool_call_id so that O(1) lookup
+                // preserves the correct audit metadata when multiple parallel
+                // calls complete in arbitrary order (linear find would always
+                // hit the first matching id, causing silent audit mis-attribution).
+                let mut batch_map: std::collections::HashMap<String, BatchRow> =
+                    std::collections::HashMap::new();
                 while let Some(res) = join_set.join_next().await {
                     match res {
-                        Ok(row) => batch_results.push(row),
+                        Ok(row) => {
+                            batch_map.insert(row.0.clone(), row);
+                        }
                         Err(e) => {
                             tracing::error!(target: "recursive::agent", "parallel tool task panicked: {e}");
                         }
@@ -424,9 +432,7 @@ impl<'a> RunCore<'a> {
                 }
 
                 for pc in &batch {
-                    let Some((_, _, result, audit, duration_ms)) =
-                        batch_results.iter().find(|(id, _, _, _, _)| id == &pc.id)
-                    else {
+                    let Some((_, _, result, audit, duration_ms)) = batch_map.get(&pc.id) else {
                         // Task panicked — push a placeholder error result so
                         // the tool-call ↔ tool-result pairing invariant (#8)
                         // is preserved. Without this, the next LLM request

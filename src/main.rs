@@ -683,6 +683,13 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3600);
+            let max_concurrent = config.max_concurrent_runs;
+            let run_semaphore =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(if max_concurrent == 0 {
+                    tokio::sync::Semaphore::MAX_PERMITS
+                } else {
+                    max_concurrent.max(1)
+                }));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -697,7 +704,13 @@ async fn main() -> anyhow::Result<()> {
                 metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
                 slash_commands: std::sync::Arc::new(slash_commands),
                 session_ttl_secs,
+                run_semaphore,
             };
+            // M3: spawn the session reaper so idle sessions are evicted.
+            // Clone the state before consuming it for the router (both share the
+            // same Arc-wrapped inner fields, so no actual data is duplicated).
+            let reaper_state = std::sync::Arc::new(state.clone());
+            recursive::http::spawn_session_reaper(reaper_state, Duration::from_secs(60));
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
@@ -1038,12 +1051,31 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .unwrap_or_else(|| "(none)".to_string());
                 println!("preset:        {preset_label}");
-                if let Some(preset) = config
+                // Resolve preset chain: explicit `provider.preset` from
+                // the file wins; if absent, fall back to a catalog match
+                // against the resolved `api_base`. Surfaces the preset
+                // chain added by the preset-config goal — without it, a
+                // user with `preset = "deepseek"` would only see the raw
+                // fields and have to manually re-derive that they're on
+                // DeepSeek.
+                //
+                // We use `find_preset_extended` (bundled + providers.d/),
+                // so a user override also surfaces here. Since the
+                // surrounding code only reads three `String` fields, we
+                // skip the bundling step and read them directly from the
+                // owned preset.
+                let resolved_preset: Option<recursive::providers::ProviderPreset> = config
                     .preset
                     .as_deref()
-                    .and_then(recursive::providers::find_preset)
-                    .or_else(|| recursive::providers::find_preset_by_api_base(&config.api_base))
-                {
+                    .and_then(recursive::providers::find_preset_extended)
+                    .or_else(|| {
+                        // Bundled fallback by api_base — only the
+                        // bundled catalog is searchable by URL.
+                        let bundled: Option<&'static recursive::providers::ProviderPreset> =
+                            recursive::providers::find_preset_by_api_base(&config.api_base);
+                        bundled.cloned()
+                    });
+                if let Some(preset) = &resolved_preset {
                     let key_env = if preset.key_env.is_empty() {
                         "(none)".to_string()
                     } else {
@@ -2153,6 +2185,7 @@ mod tests {
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         }
     }
 

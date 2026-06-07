@@ -23,9 +23,16 @@ use handlers::{
 use rate_limit::{metrics_middleware, rate_limit_middleware, rate_limiter_from_env};
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
+
+/// Maximum accepted request body size (1 MiB).
+///
+/// Prevents OOM via maliciously large JSON payloads on POST /run and
+/// POST /sessions/:id/messages, both of which accept unbounded user strings.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -273,6 +280,11 @@ pub struct AppState {
     /// Pre-built at startup for cheap `GET /slash-commands` responses.
     pub slash_commands: Arc<Vec<SlashCommandInfo>>,
     pub session_ttl_secs: u64,
+    /// Semaphore limiting concurrent agent runs. Acquired in `run_agent` and
+    /// `send_session_message` before creating an `AgentRuntime`. When the
+    /// configured `max_concurrent_runs` is 0 (unlimited), this is initialised
+    /// with `Semaphore::MAX_PERMITS`.
+    pub run_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -412,11 +424,16 @@ pub fn build_router_with_auth_and_rate_limit(
             state.metrics.clone(),
             metrics_middleware,
         ))
+        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
+        // rate_limit is added last so it is the outermost layer and runs
+        // before auth — this ensures unauthenticated (brute-force) requests
+        // are counted against the IP-based bucket and cannot bypass limits by
+        // rotating API keys (SEC-006).
         .layer(axum::middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
         ))
-        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(state))
 }
 

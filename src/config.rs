@@ -12,6 +12,7 @@ use crate::tools::episodic_recall::episodic_recall_summary;
 use crate::tools::facts::facts_summary;
 use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct Config {
@@ -71,6 +72,10 @@ pub struct Config {
     /// Fraction of steps in the window that must be errors to declare "stuck".
     /// Default 0.8. Set via `RECURSIVE_STUCK_ERROR_RATE`.
     pub stuck_error_rate: f64,
+    /// Maximum number of concurrent agent runs across all HTTP endpoints.
+    /// `0` means unlimited. Defaults to 8.
+    /// Set via `RECURSIVE_MAX_CONCURRENT_RUNS` env var.
+    pub max_concurrent_runs: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -105,6 +110,7 @@ impl std::fmt::Debug for Config {
             .field("max_search_rounds", &self.max_search_rounds)
             .field("stuck_window", &self.stuck_window)
             .field("stuck_error_rate", &self.stuck_error_rate)
+            .field("max_concurrent_runs", &self.max_concurrent_runs)
             .finish()
     }
 }
@@ -220,7 +226,12 @@ impl Config {
             .ok()
             .or_else(|| file_provider.and_then(|p| p.model.clone()))
             .or_else(|| preset.map(|p| p.default_model.clone()))
-            .unwrap_or_else(|| "claude-sonnet-4-6".into());
+            .unwrap_or_else(|| {
+                // Fall back to the default preset's model from the catalog.
+                crate::providers::find_preset("deepseek")
+                    .map(|p| p.default_model.clone())
+                    .unwrap_or_else(|| "claude-sonnet-4-6".into())
+            });
 
         let max_steps = std::env::var("RECURSIVE_MAX_STEPS")
             .ok()
@@ -240,6 +251,23 @@ impl Config {
             })?,
             Err(_) => default_system_prompt(),
         };
+
+        // Warn when the user explicitly set api_key in the config file while
+        // also using a preset whose key_env env var is set. The file's explicit
+        // api_key takes precedence over the preset's key_env env var, which
+        // may surprise users who expected the env var to be used.
+        if let (Some(preset), Some(_)) = (
+            preset.filter(|p| !p.key_env.is_empty()),
+            file_provider.and_then(|p| p.api_key.as_ref()),
+        ) {
+            if std::env::var(&preset.key_env).is_ok() {
+                warn!(
+                    "config: preset={} has api_key set in config file, ignoring ${} env var (file api_key takes precedence)",
+                    preset.id,
+                    preset.key_env,
+                );
+            }
+        }
 
         let retry_max = std::env::var("RECURSIVE_RETRY_MAX")
             .ok()
@@ -293,6 +321,11 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.8f64);
+
+        let max_concurrent_runs = std::env::var("RECURSIVE_MAX_CONCURRENT_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8usize);
 
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
@@ -377,6 +410,7 @@ impl Config {
             max_search_rounds,
             stuck_window,
             stuck_error_rate,
+            max_concurrent_runs,
         })
     }
 
@@ -564,6 +598,7 @@ pub fn load_project_context(workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     #[test]
     fn default_prompt_is_well_under_a_kilobyte() {
@@ -616,6 +651,7 @@ mod tests {
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
@@ -1106,10 +1142,75 @@ preset = "ollama"
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret"));
         assert!(dbg.contains("REDACTED"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn preset_file_api_key_warns_when_key_env_is_set() {
+        // When a preset is used and the user explicitly sets api_key in the
+        // config file, but the preset's key_env env var is also set, a warning
+        // should be emitted explaining that the file's api_key takes precedence.
+        use std::sync::OnceLock;
+
+        let _env_lock = crate::test_util::env_lock();
+        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let tmp = HOME.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("mkdir");
+
+        // Save originals.
+        let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+        let orig_recursive_key = std::env::var("RECURSIVE_API_KEY").ok();
+        let orig_openai_key = std::env::var("OPENAI_API_KEY").ok();
+
+        // Clear everything we touch.
+        for v in &["RECURSIVE_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"] {
+            std::env::remove_var(v);
+        }
+
+        // Set the preset's key_env env var so the warning should fire.
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-from-env");
+
+        // Write config with preset + explicit api_key.
+        std::fs::write(
+            &config_path,
+            r#"[provider]
+preset = "deepseek"
+api_key = "sk-from-file"
+"#,
+        )
+        .expect("write config");
+
+        let _c = Config::from_env().expect("config should load");
+
+        // The warning should have been emitted.
+        assert!(
+            logs_contain("preset=deepseek"),
+            "expected warning about preset=deepseek"
+        );
+        assert!(
+            logs_contain("ignoring $DEEPSEEK_API_KEY env var"),
+            "expected warning about ignoring DEEPSEEK_API_KEY env var"
+        );
+
+        // Restore originals.
+        for (name, prev) in [
+            ("RECURSIVE_API_KEY", orig_recursive_key.as_deref()),
+            ("OPENAI_API_KEY", orig_openai_key.as_deref()),
+            ("DEEPSEEK_API_KEY", orig_deepseek.as_deref()),
+        ] {
+            if let Some(v) = prev {
+                std::env::set_var(name, v);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
     }
 
     #[test]

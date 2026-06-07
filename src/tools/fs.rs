@@ -6,16 +6,59 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use super::{resolve_within, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
+// ---------------------------------------------------------------------------
+// ReadFileState — shared between ReadFile and StrReplaceTool
+// ---------------------------------------------------------------------------
+
+/// Per-file read record written by `ReadFile` and consumed by `StrReplaceTool`.
+#[derive(Debug, Clone)]
+pub struct ReadRecord {
+    /// True when the read used start_line/end_line and did NOT cover the whole
+    /// file. A read with start_line=1 and end_line=total_lines is a full read.
+    pub is_partial: bool,
+}
+
+/// Session-scoped state tracking which files have been read (and whether
+/// those reads were partial). Injected via `Arc<Mutex<ReadFileState>>` into
+/// both `ReadFile` and `StrReplaceTool`.
+#[derive(Debug, Default, Clone)]
+pub struct ReadFileState {
+    records: HashMap<PathBuf, ReadRecord>,
+}
+
+impl ReadFileState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, path: PathBuf, is_partial: bool) {
+        self.records.insert(path, ReadRecord { is_partial });
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&ReadRecord> {
+        self.records.get(path)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadFile
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 pub struct ReadFile {
     pub root: PathBuf,
     pub max_bytes: usize,
+    /// Optional shared state slot. When `Some`, every successful read is
+    /// recorded so `StrReplaceTool` can enforce the partial-read guard.
+    pub read_state: Option<Arc<Mutex<ReadFileState>>>,
 }
 
 impl ReadFile {
@@ -23,7 +66,13 @@ impl ReadFile {
         Self {
             root: root.into(),
             max_bytes: 256 * 1024,
+            read_state: None,
         }
+    }
+
+    pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
+        self.read_state = Some(slot);
+        self
     }
 }
 
@@ -80,15 +129,26 @@ impl Tool for ReadFile {
         let start_line = args["start_line"].as_u64();
         let end_line = args["end_line"].as_u64();
 
-        // If no range specified, return full content
+        // If no range specified, this is a full read.
         if start_line.is_none() && end_line.is_none() {
+            if let Some(slot) = &self.read_state {
+                if let Ok(mut state) = slot.lock() {
+                    state.record(abs.clone(), false);
+                }
+            }
             return Ok(content);
         }
 
         // Count total lines
         let total_lines = content.lines().count();
         if total_lines == 0 {
-            return Ok(content); // Empty file, return as-is
+            // Empty file — record as full read and return as-is.
+            if let Some(slot) = &self.read_state {
+                if let Ok(mut state) = slot.lock() {
+                    state.record(abs.clone(), false);
+                }
+            }
+            return Ok(content);
         }
 
         // Validate and clamp line numbers (1-indexed)
@@ -132,6 +192,14 @@ impl Tool for ReadFile {
                 name: "Read".to_string(),
                 message: format!("start_line {} exceeds total lines {}", start, total_lines),
             });
+        }
+
+        // A range covering the entire file counts as a full read.
+        let is_partial = !(start == 1 && end == total_lines);
+        if let Some(slot) = &self.read_state {
+            if let Ok(mut state) = slot.lock() {
+                state.record(abs.clone(), is_partial);
+            }
         }
 
         // Extract the requested slice (1-indexed, inclusive)
@@ -320,5 +388,54 @@ line3
         assert!(matches!(err, Error::BadToolArgs { .. }));
         let err_msg = format!("{:?}", err);
         assert!(err_msg.contains("start_line") && err_msg.contains("end_line"));
+    }
+
+    // ── ReadFileState tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_state_records_full_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        let r = ReadFile::new(tmp.path()).with_read_state(slot.clone());
+        r.execute(json!({"path": "f.txt"})).await.unwrap();
+        let state = slot.lock().unwrap();
+        let rec = state
+            .get(&tmp.path().join("f.txt"))
+            .expect("should be recorded");
+        assert!(!rec.is_partial, "full read must be is_partial=false");
+    }
+
+    #[tokio::test]
+    async fn read_state_records_partial_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        let r = ReadFile::new(tmp.path()).with_read_state(slot.clone());
+        r.execute(json!({"path": "f.txt", "start_line": 2, "end_line": 5}))
+            .await
+            .unwrap();
+        let state = slot.lock().unwrap();
+        let rec = state
+            .get(&tmp.path().join("f.txt"))
+            .expect("should be recorded");
+        assert!(rec.is_partial, "line-range read must be is_partial=true");
+    }
+
+    #[tokio::test]
+    async fn read_state_full_range_not_partial() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        let r = ReadFile::new(tmp.path()).with_read_state(slot.clone());
+        // start=1 end=5 covers all 5 lines → full read
+        r.execute(json!({"path": "f.txt", "start_line": 1, "end_line": 5}))
+            .await
+            .unwrap();
+        let state = slot.lock().unwrap();
+        let rec = state
+            .get(&tmp.path().join("f.txt"))
+            .expect("should be recorded");
+        assert!(!rec.is_partial, "start=1 end=N must be is_partial=false");
     }
 }

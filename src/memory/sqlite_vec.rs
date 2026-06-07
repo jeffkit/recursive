@@ -40,7 +40,10 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 /// Convert little-endian bytes back to `Vec<f32>`.
 fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .map(|c| {
+            let arr: [u8; 4] = c.try_into().unwrap_or([0u8; 4]);
+            f32::from_le_bytes(arr)
+        })
         .collect()
 }
 
@@ -158,6 +161,7 @@ impl VectorStore for SqliteVecStore {
                 )
                 .map_err(|e| storage_err(e.to_string()))?;
 
+            let query_dim = query_vec.len();
             let mut scored: Vec<(f32, MemoryEntry)> = stmt
                 .query_map([], |row| {
                     let blob: Vec<u8> = row.get(4)?;
@@ -171,11 +175,21 @@ impl VectorStore for SqliteVecStore {
                 })
                 .map_err(|e| storage_err(e.to_string()))?
                 .filter_map(|r| r.ok())
-                .map(|(id, text, tags_json, ts, blob)| {
+                .filter_map(|(id, text, tags_json, ts, blob)| {
                     let vec = blob_to_vec(&blob);
+                    if vec.len() != query_dim {
+                        tracing::warn!(
+                            entry_id = %id,
+                            entry_dim = vec.len(),
+                            query_dim,
+                            "skipping memory entry: embedding dimension mismatch \
+                             (embedding model may have changed)"
+                        );
+                        return None;
+                    }
                     let score = cosine_similarity(&query_vec, &vec);
                     let entry = Self::row_to_entry(id, text, tags_json, ts);
-                    (score, entry)
+                    Some((score, entry))
                 })
                 .collect();
 
@@ -328,5 +342,40 @@ mod tests {
     fn cosine_similarity_basic() {
         assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-5);
         assert!((cosine_similarity(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-5);
+    }
+
+    /// Entries stored with a different embedding dimension than the query vector
+    /// must be silently skipped (not ranked as score=0), so the result set only
+    /// contains dimension-compatible entries.
+    #[tokio::test]
+    async fn sqlite_store_dimension_mismatch_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::open(dir.path().join("test.db")).unwrap();
+
+        // E1: 3-d vector (old model)
+        let e1 = MemoryEntry {
+            id: "E1".into(),
+            text: "old-model entry".into(),
+            tags: vec![],
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        // E2: 2-d vector (new model)
+        let e2 = MemoryEntry {
+            id: "E2".into(),
+            text: "new-model entry".into(),
+            tags: vec![],
+            ts: "2026-01-01T00:00:01Z".into(),
+        };
+        store.upsert(&e1, vec![1.0, 0.0, 0.0]).await.unwrap();
+        store.upsert(&e2, vec![1.0, 0.0]).await.unwrap();
+
+        // Query with a 2-d vector — E1 (3-d) must be skipped, only E2 returned.
+        let results = store.search(vec![1.0, 0.0], "", 10).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "mismatched-dimension entry must be excluded"
+        );
+        assert_eq!(results[0].id, "E2");
     }
 }

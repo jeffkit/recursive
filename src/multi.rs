@@ -652,6 +652,8 @@ mod tests {
             max_search_rounds: 3,
             stuck_window: 10,
             stuck_error_rate: 0.8,
+
+            max_concurrent_runs: 8,
         }
     }
 

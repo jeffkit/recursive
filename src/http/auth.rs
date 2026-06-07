@@ -52,16 +52,16 @@ impl AuthConfig {
     /// Constant-time check whether `presented` is in the configured
     /// API-key set.
     ///
-    /// Returns `true` if no API keys are configured. Endpoints must
-    /// rely on the middleware layering, not this method, for the
-    /// "auth disabled" semantics — see [`auth_middleware`].
+    /// Returns `false` when no API keys are configured — callers must
+    /// use [`AuthConfig::is_enabled`] first to detect the "auth
+    /// disabled" pass-through mode (handled by [`auth_middleware`]).
     ///
     /// The loop runs over **every** configured key regardless of an
     /// early match, to keep the comparison constant-time and avoid
     /// leaking key-set membership timing.
     pub fn is_valid(&self, presented: &str) -> bool {
         if self.keys.is_empty() {
-            return true;
+            return false;
         }
         let mut found = false;
         let presented_bytes = presented.as_bytes();
@@ -164,6 +164,13 @@ pub(super) fn auth_config_from_env() -> AuthConfig {
         .filter(|s| !s.is_empty());
     if let Some(jwt) = JwtConfig::hs256(&jwt_secret, jwt_audience) {
         config = config.with_jwt(jwt);
+    }
+    if !config.is_enabled() {
+        tracing::warn!(
+            "HTTP server authentication is DISABLED — \
+             set RECURSIVE_HTTP_AUTH_KEYS or RECURSIVE_HTTP_AUTH_JWT_SECRET \
+             to protect this endpoint in production"
+        );
     }
     config
 }
