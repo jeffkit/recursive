@@ -302,7 +302,7 @@ mod tests {
         // Part A: no env, no config.toml → Config::from_env hardcoded default
         // (changed from the legacy "gpt-4o-mini" placeholder — the status
         // bar now shows what the runtime will actually use).
-        assert_eq!(detect_model_name(), "claude-sonnet-4-6");
+        assert_eq!(detect_model_name(), "deepseek-v4-flash");
 
         // Part B: write a config.toml under HOME → that wins
         let cfg_dir = home.path().join(".recursive");
