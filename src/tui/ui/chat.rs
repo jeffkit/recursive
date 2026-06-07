@@ -63,26 +63,31 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel: combines recent completed messages (`recent_display`)
-    // with in-flight blocks (index >= last_printed_idx).  Completed blocks
-    // are also pushed to the terminal's native scrollback buffer via
-    // `terminal.insert_before()`, so users can scroll up to see older
-    // history.  The in-viewport `recent_display` ensures the top rows of
-    // the fixed-height viewport always show context instead of blank space.
+    // Messages panel: render the full transcript so scroll_offset covers
+    // all history without a 300-line cap.
+    //
+    // Layout: startup banner (recent_display) followed by all transcript
+    // blocks (app.blocks).  recent_display holds only the styled banner
+    // lines — it is never drained into scrollback while the session is
+    // live (unlike old content that insert_before() pushes out).  The
+    // banner therefore always anchors to the top of the block list and
+    // scrolls naturally with the rest of the conversation.
+    //
+    // insert_before() in the main loop still fires so completed turns
+    // appear in the terminal's native scrollback, preserving the
+    // "shell history is continuous" UX — but the messages widget here
+    // always renders from the full block list, not the 300-line window.
     let messages_area = chunks[0];
-    let inflight = &app.blocks[app.last_printed_idx..];
-    let inflight_lines =
-        transcript::render_blocks(inflight, &app.usage, app.theme, messages_area.width);
-
-    // Build the combined line list: recent display + separator (if needed)
-    // + in-flight content + optional spinner.
+    let block_lines =
+        transcript::render_blocks(&app.blocks, &app.usage, app.theme, messages_area.width);
     let mut lines: Vec<Line<'static>> = app.recent_display.clone();
-    if !inflight_lines.is_empty() {
+    if !block_lines.is_empty() {
         if !lines.is_empty() {
             lines.push(Line::raw(""));
         }
-        lines.extend(inflight_lines);
+        lines.extend(block_lines);
     }
+
     if app.turn.running {
         let elapsed = app
             .turn
