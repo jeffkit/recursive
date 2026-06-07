@@ -2045,9 +2045,9 @@ mod tests {
     // ── Goal-260: transcript_tail accessor ───────────────────────────────
 
     #[test]
-    fn transcript_tail_returns_full_when_n_exceeds_len() {
+    fn transcript_tail_returns_full_when_n_exceeds_len() -> Result<(), Box<dyn std::error::Error>> {
         let llm = Arc::new(MockProvider::new(vec![]));
-        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let mut rt = AgentRuntime::builder().llm(llm).build()?;
         // Build a 3-message transcript directly (no LLM calls).
         rt.set_transcript(vec![
             crate::message::Message::user("one"),
@@ -2058,12 +2058,13 @@ mod tests {
         assert_eq!(tail.len(), 3, "n > len should return the full transcript");
         assert_eq!(tail[0].content, "one");
         assert_eq!(tail[2].content, "three");
+        Ok(())
     }
 
     #[test]
-    fn transcript_tail_returns_last_n() {
+    fn transcript_tail_returns_last_n() -> Result<(), Box<dyn std::error::Error>> {
         let llm = Arc::new(MockProvider::new(vec![]));
-        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let mut rt = AgentRuntime::builder().llm(llm).build()?;
         rt.set_transcript(vec![
             crate::message::Message::user("m0"),
             crate::message::Message::assistant("m1"),
@@ -2075,12 +2076,13 @@ mod tests {
         assert_eq!(tail.len(), 2, "should return exactly the last 2 messages");
         assert_eq!(tail[0].content, "m3");
         assert_eq!(tail[1].content, "m4");
+        Ok(())
     }
 
     #[test]
-    fn transcript_tail_handles_zero() {
+    fn transcript_tail_handles_zero() -> Result<(), Box<dyn std::error::Error>> {
         let llm = Arc::new(MockProvider::new(vec![]));
-        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let mut rt = AgentRuntime::builder().llm(llm).build()?;
         rt.set_transcript(vec![
             crate::message::Message::user("only"),
             crate::message::Message::assistant("reply"),
@@ -2088,6 +2090,7 @@ mod tests {
         let tail = rt.transcript_tail(0);
         assert_eq!(tail.len(), 0, "n == 0 should return an empty slice");
         assert!(tail.is_empty());
+        Ok(())
     }
 
     // ── Goal-181: message queue ───────────────────────────────────────────
