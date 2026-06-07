@@ -143,6 +143,7 @@ fn blake3_canonical_json(v: &Value) -> String {
 
 pub mod a2a;
 pub mod agent;
+pub mod agent_defs;
 pub mod checkpoint;
 #[cfg(feature = "cloud-runtime")]
 pub mod docker_provider;
@@ -180,6 +181,7 @@ pub mod web_search;
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
 pub use agent::{AgentTool, SharedMemoryRead, SharedMemoryWrite};
+pub use agent_defs::{AgentDefinition, AgentDefinitions};
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use edit::EditTool;
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
