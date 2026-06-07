@@ -790,9 +790,6 @@ impl AgentRuntime {
     /// Clear the active goal. Emits `AgentEvent::GoalCleared`.
     pub async fn clear_goal(&self) {
         if let Ok(mut g) = self.goal_state.write() {
-            if let Some(ref mut s) = *g {
-                s.status = GoalStatus::Cleared;
-            }
             *g = None;
         }
         self.event_sink.emit(AgentEvent::GoalCleared).await;
@@ -857,7 +854,6 @@ impl AgentRuntime {
                         gs.turns += 1;
                         let turns = gs.turns;
                         if turns >= max_turns {
-                            gs.status = GoalStatus::Cleared;
                             *guard = None;
                             TurnOutcomeKind::BudgetExceeded(turns)
                         } else {
@@ -1101,9 +1097,6 @@ pub struct AgentRuntimeBuilder {
     streaming: bool,
     saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
-    /// UUID of the parent agent's last message. Reserved for future
-    /// multi-agent orchestration (g155). Not yet wired to event emission.
-    parent_agent_last_uuid: Option<String>,
     /// When `true`, register `enter_plan_mode`, `exit_plan_mode`, and
     /// `request_plan_mode` tools. These tools block waiting for human
     /// approval via the plan approval gate, so they must only be registered
@@ -1145,7 +1138,6 @@ impl AgentRuntimeBuilder {
             streaming: false,
             saved_event_sink: None,
             compactor: None,
-            parent_agent_last_uuid: None,
             with_plan_mode_tools: false,
         }
     }
@@ -1156,17 +1148,6 @@ impl AgentRuntimeBuilder {
     /// the tools block indefinitely waiting for `confirm_plan()`.
     pub fn with_plan_mode_tools(mut self, enabled: bool) -> Self {
         self.with_plan_mode_tools = enabled;
-        self
-    }
-
-    /// Set the UUID of the parent agent's last message.
-    ///
-    /// When set, this runtime's messages will be stamped with this UUID as
-    /// `parent_uuid` on their first `MessageAppended` event, branching the
-    /// subagent chain off the given point in the parent's conversation tree
-    /// (g155). Currently stored for future multi-agent orchestration.
-    pub fn parent_agent_last_uuid(mut self, uuid: impl Into<String>) -> Self {
-        self.parent_agent_last_uuid = Some(uuid.into());
         self
     }
 
