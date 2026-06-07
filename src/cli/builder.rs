@@ -14,8 +14,8 @@ use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::EpisodicRecall,
     tools::{
-        AgentTool, BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool,
-        LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
+        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, EstimateTokens, Forget,
+        GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
         RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
         TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
     },
@@ -301,6 +301,10 @@ pub(crate) async fn build_runtime(
         // Single unified agent tool — replaces SubAgent, SpawnWorkerTool,
         // and SpawnWorkersParallel.  The caller controls execution via
         //  (single / parallel / sequential) and .
+        let defs = AgentDefinitions::load(&config.workspace).unwrap_or_else(|e| {
+            tracing::warn!("Failed to load agent definitions: {e}");
+            AgentDefinitions::default()
+        });
         let agent = AgentTool::new(
             &config.workspace,
             provider.clone(),
@@ -308,7 +312,8 @@ pub(crate) async fn build_runtime(
             max_depth,
             0,
             None,
-        );
+        )
+        .with_definitions(defs);
         tools = tools.register(Arc::new(agent));
     }
 
