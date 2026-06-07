@@ -22,8 +22,11 @@ use std::time::Duration;
 
 use unicode_width::UnicodeWidthStr as _;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::ExecutableCommand as _;
 use ratatui::prelude::*;
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -215,6 +218,7 @@ struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = io::stdout().execute(DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = writeln!(io::stdout());
     }
@@ -266,6 +270,7 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     enable_raw_mode()?;
+    io::stdout().execute(EnableMouseCapture)?;
     let _guard = RawModeGuard;
 
     // Size the viewport to the full terminal height so old shell history is
@@ -360,12 +365,14 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 while event::poll(Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Press {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
                             if let Some(action) = keymap::dispatch(&mut app, key) {
                                 let _ = backend.action_tx.send(action);
                             }
                         }
+                        Event::Mouse(mev) => handle_mouse(&mut app, mev),
+                        _ => {}
                     }
                 }
                 // Detect terminal resize: rebuild the inline viewport so
@@ -408,4 +415,18 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
 
     let _ = backend.action_tx.send(UserAction::Shutdown);
     Ok(())
+}
+
+/// Map trackpad / mouse wheel events onto the transcript scroll offset.
+/// 3 lines per tick matches macOS trackpad feel and real-wheel notch speed.
+fn handle_mouse(app: &mut App, ev: MouseEvent) {
+    match ev.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        _ => {}
+    }
 }
