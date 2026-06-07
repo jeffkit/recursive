@@ -24,8 +24,6 @@ pub enum GoalStatus {
     Pursuing,
     /// Condition confirmed met — goal cleared after success.
     Achieved,
-    /// Explicitly cleared by the user or the turn budget was exceeded.
-    Cleared,
 }
 
 /// Per-session goal state set by `/goal <condition>`.
@@ -153,10 +151,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&GoalStatus::Achieved).unwrap(),
             r#""achieved""#
-        );
-        assert_eq!(
-            serde_json::to_string(&GoalStatus::Cleared).unwrap(),
-            r#""cleared""#
         );
     }
 
