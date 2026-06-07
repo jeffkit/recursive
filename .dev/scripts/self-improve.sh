@@ -910,8 +910,26 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # gitignored build artifacts (see .gitignore `e2e/plugins/dist/`)
   # so a fresh worktree does NOT have them. Without this, the
   # gate would always fail in worktrees.
+  #
+  # Worktree-first try: pnpm install in the worktree can fail
+  # because e2e/plugins/package.json declares
+  #   "argusai-core": "file:../../../infra4agent/argusai/packages/core"
+  # which only resolves from the MAIN repo (where `infra4agent`
+  # is actually a sibling of `Recursive`). From a worktree at
+  # `Recursive/.worktrees/<name>/e2e/plugins/`, `../../../` lands
+  # in `Recursive/.worktrees/`, not `~/projects/`. So the
+  # worktree build is unreliable for cross-repo file: deps.
+  # Fallback: copy the MAIN repo's prebuilt dist/ into the
+  # worktree. This is correct because dist/ is gitignored (never
+  # differs across branches) and e2e/plugins/src/ is only modified
+  # by goals that explicitly touch the E2E suite.
   if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
-    if [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
+    MAIN_DIST="$(cd "$REPO_ROOT" 2>/dev/null && pwd)/e2e/plugins/dist/index.js"
+    if [[ -f "$MAIN_DIST" ]]; then
+      echo "[self-improve] E2E: copying prebuilt dist/ from main repo ($MAIN_DIST)" >&2
+      mkdir -p e2e/plugins/dist
+      cp -R "$REPO_ROOT/e2e/plugins/dist/." e2e/plugins/dist/ 2>&1 | tail -3
+    elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
       echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
       if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
             && pnpm build 2>&1 | tail -5); then
