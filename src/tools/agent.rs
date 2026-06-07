@@ -35,6 +35,7 @@ use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::permissions::PermissionMode;
+use crate::tools::agent_defs::AgentDefinitions;
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
@@ -178,6 +179,7 @@ pub struct AgentTool {
     permission_hook: Option<Arc<dyn PermissionHook>>,
     registry: Option<WorkerRegistry>,
     pool: Option<Arc<RwLock<AgentPool>>>,
+    definitions: Option<AgentDefinitions>,
 }
 
 impl AgentTool {
@@ -198,6 +200,7 @@ impl AgentTool {
             permission_hook,
             registry: None,
             pool: None,
+            definitions: None,
         }
     }
 
@@ -210,6 +213,13 @@ impl AgentTool {
     /// Attach an `AgentPool` for shared-memory coordination between workers.
     pub fn with_pool(mut self, pool: Arc<RwLock<AgentPool>>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Attach an `AgentDefinitions` registry so manifest entries can
+    /// reference definitions by name via the `definition` field.
+    pub fn with_definitions(mut self, defs: AgentDefinitions) -> Self {
+        self.definitions = Some(defs);
         self
     }
 
@@ -414,6 +424,7 @@ impl AgentTool {
         let permission_hook = self.permission_hook.clone();
         let registry = self.registry.clone();
         let pool = self.pool.clone();
+        let definitions = self.definitions.clone();
 
         // Spawn each worker into a tokio task, collecting JoinHandles.
         let mut handles: Vec<tokio::task::JoinHandle<(String, Result<String>)>> = Vec::new();
@@ -427,6 +438,7 @@ impl AgentTool {
             let permission_hook = permission_hook.clone();
             let registry = registry.clone();
             let pool = pool.clone();
+            let definitions = definitions.clone();
 
             handles.push(tokio::spawn(async move {
                 let agent = AgentTool {
@@ -438,6 +450,7 @@ impl AgentTool {
                     permission_hook,
                     registry: registry.clone(),
                     pool: pool.clone(),
+                    definitions,
                 };
                 let result = agent
                     .run_worker(&worker_id, &entry, &prompt, max_steps, child_depth)
@@ -515,11 +528,17 @@ impl AgentTool {
     // ------------------------------------------------------------------
 
     /// Parse a JSON Value into an AgentManifest, with helpful error messages.
-    fn parse_manifest(value: &Value) -> Result<AgentManifest, Error> {
+    ///
+    /// Supports named-definition resolution: if a manifest entry includes a
+    /// `definition` field, the entry is resolved from the loaded
+    /// `AgentDefinitions` registry.  Inline `system_prompt` and
+    /// `allowed_tools` override the definition's values when both are
+    /// provided.
+    fn parse_manifest(&self, value: &Value) -> Result<AgentManifest, Error> {
         let obj = value.as_object().ok_or_else(|| Error::BadToolArgs {
             name: "agent".into(),
             message:
-                "`manifest` must be a JSON object mapping worker_id → {system_prompt, allowed_tools?}"
+                "`manifest` must be a JSON object mapping worker_id → {system_prompt | definition, allowed_tools?}"
                     .to_string(),
         })?;
 
@@ -535,22 +554,62 @@ impl AgentTool {
             let entry_obj = entry_val.as_object().ok_or_else(|| Error::BadToolArgs {
                 name: "agent".into(),
                 message: format!(
-                    "manifest entry '{}' must be an object with `system_prompt` and optional `allowed_tools`",
+                    "manifest entry '{}' must be an object with `system_prompt` or `definition` (and optional `allowed_tools`)",
                     worker_id
                 ),
             })?;
 
+            // --- Resolve definition (if any) ---
+            let def_name = entry_obj.get("definition").and_then(|v| v.as_str());
+
+            let (base_system_prompt, base_allowed_tools) = if let Some(name) = def_name {
+                let defs = self.definitions.as_ref().ok_or_else(|| {
+                    Error::BadToolArgs {
+                        name: "agent".into(),
+                        message: format!(
+                            "manifest entry '{}' references definition '{}', but no agent definitions are loaded (missing .recursive/agents/)",
+                            worker_id, name
+                        ),
+                    }
+                })?;
+                let def = defs.get(name).ok_or_else(|| Error::BadToolArgs {
+                    name: "agent".into(),
+                    message: format!(
+                        "manifest entry '{}' references unknown definition '{}'. Available: {}",
+                        worker_id,
+                        name,
+                        defs.iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                })?;
+                (def.system_prompt.clone(), def.allowed_tools.clone())
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            // --- Resolve system_prompt: inline wins over definition ---
             let system_prompt = entry_obj
                 .get("system_prompt")
                 .and_then(|v| v.as_str())
+                .map(String::from)
+                .or({
+                    if !base_system_prompt.is_empty() {
+                        Some(base_system_prompt)
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| Error::BadToolArgs {
                     name: "agent".into(),
                     message: format!(
-                        "manifest entry '{}' requires a `system_prompt` string",
+                        "manifest entry '{}' requires a `system_prompt` string or a `definition` reference",
                         worker_id
                     ),
                 })?;
 
+            // --- Resolve allowed_tools: inline wins over definition ---
             let allowed_tools: Vec<String> = entry_obj
                 .get("allowed_tools")
                 .and_then(|v| v.as_array())
@@ -559,12 +618,19 @@ impl AgentTool {
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect()
                 })
+                .or({
+                    if !base_allowed_tools.is_empty() {
+                        Some(base_allowed_tools)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_default();
 
             manifest.insert(
                 worker_id.clone(),
                 WorkerManifestEntry {
-                    system_prompt: system_prompt.to_string(),
+                    system_prompt,
                     allowed_tools,
                 },
             );
@@ -660,7 +726,7 @@ impl Tool for AgentTool {
         let max_steps = arguments["max_steps"].as_i64().unwrap_or(30).clamp(1, 100) as usize;
 
         // --- Parse manifest ---
-        let manifest = Self::parse_manifest(&arguments["manifest"])?;
+        let manifest = self.parse_manifest(&arguments["manifest"])?;
 
         // --- Depth limit check ---
         if self.current_depth >= self.max_depth {
@@ -815,5 +881,192 @@ mod tests {
         assert_eq!(AgentMode::parse("parallel"), Some(AgentMode::Parallel));
         assert_eq!(AgentMode::parse("sequential"), Some(AgentMode::Sequential));
         assert_eq!(AgentMode::parse("unknown"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Definition resolution tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_manifest_resolves_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+
+        // Populate agent definitions
+        let agents_dir = tmp.path().join(".recursive").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("reviewer.md"),
+            "---
+name: reviewer
+system_prompt: 'You review code.'
+allowed_tools:
+  - Read
+  - Glob
+---
+",
+        )
+        .unwrap();
+
+        let defs = AgentDefinitions::load(tmp.path()).unwrap();
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None)
+            .with_definitions(defs);
+
+        let manifest = agent
+            .parse_manifest(&json!({
+                "rev": { "definition": "reviewer" }
+            }))
+            .unwrap();
+
+        let entry = manifest.get("rev").unwrap();
+        assert_eq!(entry.system_prompt, "You review code.");
+        assert_eq!(entry.allowed_tools, vec!["Read", "Glob"]);
+    }
+
+    #[test]
+    fn parse_manifest_definition_with_inline_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+
+        let agents_dir = tmp.path().join(".recursive").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("helper.md"),
+            "---
+name: helper
+system_prompt: 'Base prompt.'
+allowed_tools:
+  - Read
+---
+",
+        )
+        .unwrap();
+
+        let defs = AgentDefinitions::load(tmp.path()).unwrap();
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None)
+            .with_definitions(defs);
+
+        // Inline system_prompt overrides the definition's
+        let manifest = agent
+            .parse_manifest(&json!({
+                "h": {
+                    "definition": "helper",
+                    "system_prompt": "Overridden prompt.",
+                    "allowed_tools": ["Write"]
+                }
+            }))
+            .unwrap();
+
+        let entry = manifest.get("h").unwrap();
+        assert_eq!(entry.system_prompt, "Overridden prompt.");
+        assert_eq!(entry.allowed_tools, vec!["Write"]);
+    }
+
+    #[test]
+    fn parse_manifest_unknown_definition_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+
+        // Empty registry
+        let defs = AgentDefinitions::load(tmp.path()).unwrap();
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None)
+            .with_definitions(defs);
+
+        let err = agent
+            .parse_manifest(&json!({
+                "w": { "definition": "nonexistent" }
+            }))
+            .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown definition"), "got: {msg}");
+        assert!(msg.contains("nonexistent"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_manifest_definition_without_registry_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+
+        // No with_definitions() call — definitions is None
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+
+        let err = agent
+            .parse_manifest(&json!({
+                "w": { "definition": "some-agent" }
+            }))
+            .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no agent definitions are loaded"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_manifest_neither_definition_nor_system_prompt_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+
+        let err = agent
+            .parse_manifest(&json!({
+                "w": { "allowed_tools": ["Read"] }
+            }))
+            .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires a `system_prompt` string or a `definition` reference"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_single_mode_with_definition() {
+        let provider = mock_provider(vec![Completion {
+            content: "review done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+
+        // Set up agent definitions
+        let agents_dir = tmp.path().join(".recursive").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("inspector.md"),
+            "---
+name: inspector
+system_prompt: 'Inspect thoroughly.'
+allowed_tools:
+  - Read
+---
+",
+        )
+        .unwrap();
+
+        let defs = AgentDefinitions::load(tmp.path()).unwrap();
+        let agent =
+            AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None).with_definitions(defs);
+
+        let result = agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": {
+                    "inspector": { "definition": "inspector" }
+                },
+                "prompt": "inspect this"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("inspector"));
+        assert!(result.contains("review done"));
     }
 }
