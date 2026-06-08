@@ -24,6 +24,11 @@ service:
       RUST_LOG: info
       RECURSIVE_RATE_LIMIT_BURST: "200"
       RECURSIVE_RATE_LIMIT_RPM: "6000"
+      # Store all sessions under /workspace so test assertions can find them
+      # via container paths without knowing the per-user data dir hash.
+      RECURSIVE_HOME: /workspace
+      # Passed through for live integration tests (06, 23)
+      DEEPSEEK_API_KEY: "{{env.DEEPSEEK_API_KEY}}"
 
 mocks:
   aimock:
@@ -130,3 +135,7 @@ tests:
     - name: "Context compaction multi-turn"
       id: compaction
       file: tests/22-compaction.yaml
+
+    - name: "Deferred Tool Loading (Real LLM)"
+      id: deferred-tool-loading
+      file: tests/23-deferred-tool-loading.yaml

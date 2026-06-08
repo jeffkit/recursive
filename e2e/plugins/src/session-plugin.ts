@@ -18,6 +18,12 @@ import type { AssertionPlugin, AssertionResult } from 'argusai-core';
 // =====================================================================
 
 export interface SessionAssertionConfig {
+  /**
+   * Only consider session directories whose parent directory name matches
+   * this slug (e.g. "workspace-test-23-anthropic"). Useful when multiple
+   * sessions exist under the same base search path.
+   */
+  slug?: string;
   /** Session status must equal this (e.g., "completed", "success") */
   status?: string | string[];
   /** Minimum message count in transcript */
@@ -94,7 +100,7 @@ export const recursiveSessionPlugin: AssertionPlugin = {
       }];
     }
 
-    return assertRecursiveSession(sessionDir, options);
+    return assertRecursiveSession(sessionDir, options, options.slug);
   },
 };
 
@@ -105,12 +111,13 @@ export const recursiveSessionPlugin: AssertionPlugin = {
 function assertRecursiveSession(
   sessionDir: string,
   options: SessionAssertionConfig,
+  slugFilter?: string,
 ): AssertionResult[] {
   const results: AssertionResult[] = [];
   const basePath = `session:${path.basename(sessionDir)}`;
 
   // Find session directory (may need to search)
-  const resolvedDir = findSessionDir(sessionDir);
+  const resolvedDir = findSessionDir(sessionDir, slugFilter);
   if (!resolvedDir) {
     results.push({
       path: basePath,
@@ -352,24 +359,37 @@ function assertRecursiveSession(
  * Find session directory by searching for .meta.json recursively.
  * Handles the nested structure: sessions/<slug>/<session-id>/.meta.json
  */
-function findSessionDir(baseDir: string): string | null {
+/**
+ * Find a session directory containing `.meta.json` by searching under `baseDir`.
+ *
+ * When `slugFilter` is provided, only directories whose **parent** directory
+ * name matches the slug are considered.  This lets callers search a broad root
+ * like `/workspace/workspaces` while still targeting a specific session group
+ * (e.g. `workspace-test-23-anthropic`).
+ *
+ * Searches up to 5 levels deep to cover the structure:
+ *   /workspace/workspaces/<hash>/sessions/<slug>/<ts>/.meta.json
+ */
+function findSessionDir(baseDir: string, slugFilter?: string): string | null {
   if (!fs.existsSync(baseDir)) return null;
 
-  // Direct check
-  if (fs.existsSync(path.join(baseDir, '.meta.json'))) {
+  // Direct check (no slug needed when the dir itself is the session dir)
+  if (!slugFilter && fs.existsSync(path.join(baseDir, '.meta.json'))) {
     return baseDir;
   }
 
-  // Search recursively (max 3 levels)
   const search = (dir: string, depth: number): string | null => {
-    if (depth > 3) return null;
+    if (depth > 5) return null;
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const subDir = path.join(dir, entry.name);
         if (fs.existsSync(path.join(subDir, '.meta.json'))) {
-          return subDir;
+          // When slug filter is set, the session dir's *parent* must match.
+          if (!slugFilter || path.basename(dir) === slugFilter) {
+            return subDir;
+          }
         }
         const found = search(subDir, depth + 1);
         if (found) return found;
