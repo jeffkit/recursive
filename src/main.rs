@@ -397,6 +397,16 @@ enum ConfigCmd {
         /// Value to set.
         value: String,
     },
+    /// Persist a secret (typically an API key) to a 0600 shell-sourceable
+    /// file at ~/.recursive/secrets.env. The binary reads the key from
+    /// the process env at runtime — never from the config file —
+    /// so an agent with `run_shell` cannot `cat` the key out of disk.
+    SetSecret {
+        /// Env var name to export, e.g. `DEEPSEEK_API_KEY`.
+        env_name: String,
+        /// The secret value.
+        value: String,
+    },
     /// Print the config file path.
     Path,
 }
@@ -1102,10 +1112,37 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             ConfigCmd::Set { key, value } => {
+                // L1: provider.api_key must never land in config.toml.
+                // set_value() itself refuses the write, but we pre-empt
+                // with a more helpful message pointing the user at
+                // set-secret.
+                if key == "provider.api_key" || key.starts_with("provider.api_key.") {
+                    anyhow::bail!(
+                        "refusing to persist {} to config.toml.\n\
+                         \n\
+                         The binary reads API keys from the process env at runtime,\n\
+                         never from the config file. Use:\n\
+                         \n  \
+                         recursive config set-secret <ENV_NAME> <KEY>\n\
+                         \n\
+                         or set the env var directly:  export DEEPSEEK_API_KEY='...'",
+                        key
+                    );
+                }
                 recursive::config_file::set_value(&key, &value)?;
                 if let Some(path) = recursive::config_file::config_file_path() {
                     println!("Set {} = {} in {}", key, value, path.display());
                 }
+                Ok(())
+            }
+            ConfigCmd::SetSecret { env_name, value } => {
+                recursive::config_file::set_secret(&env_name, &value)?;
+                let path = recursive::config_file::secrets_env_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.recursive/secrets.env".to_string());
+                println!("Secret written to {path} (mode 0600).");
+                println!("Add `source {path}` to your shell rc to load it into the env.");
+                println!("(or set the env var directly:  export {env_name}='...')");
                 Ok(())
             }
             ConfigCmd::Path => {

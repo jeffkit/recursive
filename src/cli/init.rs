@@ -320,9 +320,12 @@ pub(crate) async fn run_init(
     };
 
     // 3. API key. Precedence: --api-key flag > preset's key_env env var >
-    // interactive prompt. The flag IS written to the file (explicit user
-    // choice); env-var prefill is NOT (the env wins at runtime; persisting
-    // would risk staleness if the env later changes).
+    // interactive prompt. The flag is written to ~/.recursive/secrets.env
+    // (mode 0600, shell-sourceable) — NOT to ~/.recursive/config.toml.
+    // A key on disk in config.toml can be `cat`'d by an agent's
+    // `run_shell` tool and end up in a tracked .dev/journal/*.md; the
+    // secrets.env file is never read by the binary, only sourced by the
+    // user's shell, so the key only lives in process env. (L1 fix.)
     let mut api_key_was_env_prefilled = false;
     let api_key = if let Some(k) = api_key_prefill {
         println!("  API key (from --api-key): set (won't echo)");
@@ -332,7 +335,7 @@ pub(crate) async fn run_init(
     } else {
         match std::env::var(&key_env) {
             Ok(existing) if !existing.is_empty() => {
-                println!("\n  ✓ {key_env} detected, using it (skipping write to config file).");
+                println!("\n  ✓ {key_env} detected, using it (skipping write to secrets file).");
                 println!("    To override, pass --api-key or unset {key_env}.");
                 api_key_was_env_prefilled = true;
                 existing
@@ -348,7 +351,7 @@ pub(crate) async fn run_init(
                 let key = input.trim().to_string();
                 if key.is_empty() {
                     println!("\n  Warning: no API key set. Add it later with one of:");
-                    println!("    recursive config set provider.api_key <KEY>");
+                    println!("    recursive config set-secret {key_env} <KEY>");
                     println!("    export {key_env}=<KEY>");
                 }
                 key
@@ -368,7 +371,16 @@ pub(crate) async fn run_init(
     }
     recursive::config_file::set_value("provider.model", &model)?;
     if !api_key.is_empty() && !api_key_was_env_prefilled {
-        recursive::config_file::set_value("provider.api_key", &api_key)?;
+        // Route the secret to ~/.recursive/secrets.env (mode 0600),
+        // not to ~/.recursive/config.toml. The binary reads the env
+        // at runtime, never the file. (L1 fix.)
+        recursive::config_file::set_secret(&key_env, &api_key)?;
+        let secrets_path = recursive::config_file::secrets_env_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.recursive/secrets.env".to_string());
+        println!("\n  ✓ API key saved to {secrets_path}");
+        println!("    Add to your shell rc:  source ~/.recursive/secrets.env");
+        println!("    (or `export {key_env}=<key>` directly)");
     }
 
     println!("\n  Config saved to: {}", config_path.display());
