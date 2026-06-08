@@ -14,12 +14,24 @@ impl App {
                 self.append_streaming_assistant(&text);
             }
             UiEvent::Reasoning { content } => {
-                // Each step's reasoning arrives as a single block.
-                // Push a new TranscriptBlock::Reasoning; the renderer
-                // draws a `thinking…` header followed by the
-                // reasoning text in dim grey italics.
-                self.blocks
-                    .push(TranscriptBlock::Reasoning { text: content });
+                // Reasoning arrives as a single block after the streaming
+                // content tokens. If a streaming Assistant block already
+                // exists (created by PartialToken events), insert Reasoning
+                // before it so the visual order is: thinking → answer.
+                let insert_before_last = matches!(
+                    self.blocks.last(),
+                    Some(TranscriptBlock::Assistant {
+                        streaming: true,
+                        ..
+                    })
+                );
+                let block = TranscriptBlock::Reasoning { text: content };
+                if insert_before_last {
+                    let last_idx = self.blocks.len() - 1;
+                    self.blocks.insert(last_idx, block);
+                } else {
+                    self.blocks.push(block);
+                }
             }
             UiEvent::AssistantMessage { content } => {
                 // Goal-147: the legacy `"plan:"` / `"## plan"` text

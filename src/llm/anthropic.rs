@@ -994,11 +994,19 @@ fn build_request_with_partition(
             }));
         }
         for (spec, _) in deferred_tools {
+            // Deferred tools are sent without their full input_schema so the
+            // model cannot invoke them directly. The model must call
+            // ToolSearchTool first to fetch the full schema. Anthropic's API
+            // ignores unknown fields like `defer_loading`, so withholding the
+            // schema is the only reliable enforcement mechanism.
+            let stub_desc = format!(
+                "[deferred — call ToolSearchTool to load schema] {}",
+                spec.description
+            );
             tools_json.push(serde_json::json!({
                 "name": spec.name,
-                "description": spec.description,
-                "input_schema": spec.parameters,
-                "defer_loading": true,
+                "description": stub_desc,
+                "input_schema": {"type": "object", "properties": {}},
             }));
         }
         req["tools"] = Value::Array(tools_json);
@@ -1873,9 +1881,17 @@ data: {\"type\":\"message_stop\"}
         // Eager has no `defer_loading` key.
         assert!(tools[0].get("defer_loading").is_none());
         assert_eq!(tools[0]["name"], "Read");
-        // Deferred has `defer_loading: true`.
-        assert_eq!(tools[1]["defer_loading"], true);
+        // Deferred: no defer_loading field, empty schema, description has stub prefix.
+        assert!(tools[1].get("defer_loading").is_none());
         assert_eq!(tools[1]["name"], "notebook_edit");
+        assert_eq!(
+            tools[1]["input_schema"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert!(tools[1]["description"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("[deferred"));
     }
 
     #[test]
@@ -2060,9 +2076,25 @@ data: {\"type\":\"message_stop\"}
             .iter()
             .find(|t| t["name"] == "notebook_edit")
             .unwrap();
+        // Deferred tools now use empty schema + description prefix instead of
+        // defer_loading (which Anthropic API ignores as an unknown field).
+        assert!(
+            notebook_def.get("defer_loading").is_none(),
+            "defer_loading should be absent: {:?}",
+            notebook_def
+        );
+        assert!(
+            notebook_def["description"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("[deferred"),
+            "notebook_edit should have deferred description prefix: {:?}",
+            notebook_def
+        );
         assert_eq!(
-            notebook_def["defer_loading"], true,
-            "notebook_edit should be deferred: {:?}",
+            notebook_def["input_schema"],
+            json!({"type": "object", "properties": {}}),
+            "deferred tool should have empty schema: {:?}",
             notebook_def
         );
 
