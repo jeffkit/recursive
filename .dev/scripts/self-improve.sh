@@ -890,7 +890,7 @@ fi
 # provides proper worktree isolation via isolation.namespace in e2e.yaml —
 # each worktree gets its own Docker container/network, parallel runs don't collide.
 
-# Resolve mcp2cli (may not be on PATH in non-interactive subprocess)
+# Resolve mcp2cli and argusai-mcp binary path
 MCP2CLI=""
 for _candidate in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/homebrew/bin/mcp2cli"; do
   if [[ -x "$_candidate" ]]; then
@@ -899,33 +899,51 @@ for _candidate in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/home
   fi
 done
 
-# Call one argusai MCP tool via mcp2cli
+# Resolve argusai-mcp Node.js entry point (installed as dep of argusai-cli)
+ARGUSAI_MCP_BIN=""
+for _npm_root in     "$(npm root -g 2>/dev/null)"     "$HOME/.local/share/fnm/node-versions"/*/installation/lib/node_modules; do
+  _candidate="$_npm_root/argusai-cli/node_modules/argusai-mcp/dist/index.js"
+  if [[ -f "$_candidate" ]]; then
+    ARGUSAI_MCP_BIN="$_candidate"
+    break
+  fi
+done
+
+# Call one argusai MCP tool via a named mcp2cli session.
+# MCP server is stateful — init/setup/run/clean must share the same process.
+# Usage: _argus <session-name> <tool-name> [--flag value ...]
 _argus() {
-  local tool="$1" args="$2"
-  "$MCP2CLI" --mcp-stdio "npx argusai-mcp" "$tool" "$args" 2>&1
+  local session="$1"; shift
+  "$MCP2CLI" --session "$session" "$@" 2>&1
 }
 
-if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]    && [[ -n "$MCP2CLI" ]]    && [[ -f "e2e/e2e.yaml" ]]; then
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]    && [[ -n "$MCP2CLI" ]]    && [[ -n "$ARGUSAI_MCP_BIN" ]]    && [[ -f "e2e/e2e.yaml" ]]; then
   echo "[self-improve] running E2E smoke gate (via mcp2cli → argusai MCP)..."
 
-  # Rebuild binary so the container image gets the new binary.
+  # Rebuild binary so the container gets the new code.
   cargo build -q 2>/dev/null
 
-  # Per-worktree namespace for Docker isolation (prevents parallel run collisions)
+  # Per-worktree namespace — each run gets isolated Docker container + network.
   WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo 'main')"
   export WORKTREE_ID
   E2E_PROJECT="$(pwd)/e2e"
+  MCP_SESSION="argusai-$WORKTREE_ID"
 
-  # Setup isolated environment for this worktree
-  _argus argus_setup "{\"projectPath\": \"$E2E_PROJECT\"}" | tail -3
+  # Start a persistent MCP server session so init/setup/run share state.
+  # WORKTREE_ID must be in env BEFORE session-start so the server inherits it.
+  WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "node $ARGUSAI_MCP_BIN"     --session-start "$MCP_SESSION" >/dev/null 2>&1
 
-  if _argus argus_run "{\"projectPath\": \"$E2E_PROJECT\", \"filter\": \"smoke\"}" | grep -q '"passed"'; then
+  _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1
+  _argus "$MCP_SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
+
+  if _argus "$MCP_SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | grep -q '"passed"'; then
     echo "[self-improve] E2E smoke: PASSED ✓"
-    _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
+    _argus "$MCP_SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
   else
     echo "[self-improve] E2E smoke: FAILED ✗"
-    SMOKE_ERRORS="$(_argus argus_run "{\"projectPath\": \"$E2E_PROJECT\", \"filter\": \"smoke\"}" 2>&1 | tail -30)"
-    _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
+    SMOKE_ERRORS="$(_argus "$MCP_SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | tail -30)"
+    _argus "$MCP_SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+    "$MCP2CLI" --session-stop "$MCP_SESSION" >/dev/null 2>&1 || true
 
     # Give the agent one chance to fix the regression before rolling back.
     if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
@@ -957,13 +975,19 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
         set -e
 
         cargo build -q 2>/dev/null
-        _argus argus_setup "{\"projectPath\": \"$E2E_PROJECT\"}" | tail -3
+        # Re-start session for the retry run
+        WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "node $ARGUSAI_MCP_BIN" \
+          --session-start "$MCP_SESSION" >/dev/null 2>&1
+        _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1
+        _argus "$MCP_SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
         if [[ "$SMOKE_FIX_STATUS" -eq 0 ]] && \
-           _argus argus_run "{\"projectPath\": \"$E2E_PROJECT\", \"filter\": \"smoke\"}" 2>/dev/null | grep -q '"passed"'; then
+           _argus "$MCP_SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>/dev/null | grep -q '"passed"'; then
           echo "[self-improve] SMOKE-FIX: smoke passes after fix ✓" | tee -a "$LOG"
-          _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
+          _argus "$MCP_SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+          "$MCP2CLI" --session-stop "$MCP_SESSION" >/dev/null 2>&1 || true
         else
-          _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
+          _argus "$MCP_SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+          "$MCP2CLI" --session-stop "$MCP_SESSION" >/dev/null 2>&1 || true
           echo "[self-improve] SMOKE-FIX: still failing after fix attempt" | tee -a "$LOG"
           verdict_and_exit "rolled-back" "E2E smoke test failed (smoke-fix also failed)"
         fi
@@ -974,6 +998,7 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
       verdict_and_exit "rolled-back" "E2E smoke test failed (new binary broken)"
     fi
   fi
+  "$MCP2CLI" --session-stop "$MCP_SESSION" >/dev/null 2>&1 || true
 fi
 
 if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && [[ -z "$MCP2CLI" ]]; then
