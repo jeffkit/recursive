@@ -3,21 +3,24 @@ description: |
   Validates deferred tool loading with real LLM API calls against deepseek-v4-flash.
   Requires DEEPSEEK_API_KEY. Skips gracefully when the key is absent.
 
-  Test A (Anthropic provider): WebFetch is deferred. The model must discover it
-  via ToolSearchTool before calling it. Verified by deferred-tool-order plugin
-  (ToolSearchTool line < WebFetch line in transcript) and LLM Judge (semantic
-  confirmation that the model correctly used the deferred-loading flow).
+  Test A (Anthropic provider — deferred mode):
+    WebFetch is deferred. ToolSearchTool is injected into the registry.
+    The model discovers WebFetch via ToolSearchTool before calling it.
+    Verified by deferred-tool-order (ToolSearchTool < WebFetch in transcript)
+    and LLM Judge (semantic confirmation of the deferred-loading flow).
 
-  Test B (OpenAI provider — control group): Same model, same prompt, OpenAI
-  endpoint. All tools are sent eagerly; the model calls WebFetch directly.
-  Verified by deferred-tool-absent plugin (ToolSearchTool never appears).
+  Test B (OpenAI provider — eager mode):
+    supports_deferred_tools() = false, so ToolSearchTool is NOT registered.
+    All tools are sent eagerly (WebFetch in the initial tools array).
+    The model calls WebFetch directly without going through ToolSearchTool.
+    Verified by deferred-tool-absent (ToolSearchTool absent from transcript).
 
-  Comparison of A vs B proves the mechanism changes observable model behaviour,
-  not just the wire format.
+  A vs B comparison proves the mechanism: provider capability gates whether
+  deferred loading activates, changing observable model behaviour.
 
-  Session storage: RECURSIVE_HOME=/workspace, so sessions land under
-  /workspace/workspaces/<hash>/sessions/<slug>/. Assertions use the `slug`
-  field to target the right session group when searching from /workspace/workspaces.
+  Session storage: RECURSIVE_HOME=/workspace so sessions land under
+  /workspace/workspaces/<hash>/sessions/<slug>/. The `slug` field targets
+  the right session group when searching from /workspace/workspaces.
 sequential: true
 
 setup:
@@ -63,9 +66,9 @@ setup:
       exitCode: 0
 
 cases:
-  # ── A: structural assertions ──────────────────────────────────────────────
+  # ── A: structural assertions (Anthropic — deferred) ───────────────────────
 
-  - name: "A — ToolSearchTool called before WebFetch (deferred-tool-order)"
+  - name: "A — ToolSearchTool called before WebFetch"
     deferred-tool-order:
       container: recursive-e2e
       input: /workspace/workspaces
@@ -73,7 +76,7 @@ cases:
       before: ToolSearchTool
       after: WebFetch
 
-  - name: "A — Session structure valid (Anthropic mode)"
+  - name: "A — Session contains ToolSearchTool call"
     recursive-session:
       container: recursive-e2e
       input: /workspace/workspaces
@@ -82,8 +85,6 @@ cases:
       hasRoles: ["user", "assistant"]
       hasToolCalls: ["ToolSearchTool"]
       finalized: true
-
-  # ── A: LLM Judge — semantic confirmation ──────────────────────────────────
 
   - name: "A — LLM Judge: model used deferred-loading flow correctly"
     llm-judge:
@@ -98,19 +99,23 @@ cases:
         after discovery); score 1 if neither appears or order is wrong.
       minScore: 3
 
-  # ── B: structural assertions (OpenAI provider) ────────────────────────────
-  # ToolSearchTool is a registry-level tool — it works with all providers.
-  # In OpenAI mode the model also calls it to discover deferred tools.
-  # B validates that the task completes and ToolSearchTool is called.
+  # ── B: structural assertions (OpenAI — eager) ─────────────────────────────
 
-  - name: "B — Session structure valid (OpenAI mode)"
+  - name: "B — ToolSearchTool absent (eager mode, not registered)"
+    deferred-tool-absent:
+      container: recursive-e2e
+      input: /workspace/workspaces
+      slug: workspace-test-23-openai
+      tool: ToolSearchTool
+
+  - name: "B — Session valid, WebFetch called directly without ToolSearch"
     recursive-session:
       container: recursive-e2e
       input: /workspace/workspaces
       slug: workspace-test-23-openai
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
-      hasToolCalls: ["ToolSearchTool"]
+      noToolCalls: ["ToolSearchTool"]
       finalized: true
 
 teardown:

@@ -225,6 +225,21 @@ pub struct Completion {
 pub trait LlmProvider: Send + Sync {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion>;
 
+    /// Whether this provider supports deferred tool loading via
+    /// `tool_reference` content blocks (Anthropic API feature).
+    ///
+    /// When `true`, `run_core` will:
+    /// - Strip deferred tools from the `tools` array sent to the LLM
+    /// - Inject `<available-deferred-tools>` into the messages
+    /// - Rely on `serialize_messages_anthropic` to convert ToolSearchTool
+    ///   results into `tool_reference` blocks for schema expansion.
+    ///
+    /// When `false` (default), all tools are sent eagerly and
+    /// `ToolSearchTool` is NOT registered in the registry.
+    fn supports_deferred_tools(&self) -> bool {
+        false
+    }
+
     /// Variant that accepts a partition between eager and deferred
     /// tools. Providers that support native deferred loading (e.g.
     /// Anthropic via `defer_loading: true` + `tool_reference` content

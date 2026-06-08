@@ -1329,8 +1329,12 @@ impl AgentRuntimeBuilder {
                 )));
         }
 
-        // Register ToolSearchTool if any deferred tools are present.
-        kernel.tools_mut().freeze_deferred_specs();
+        // Register ToolSearchTool only when the provider supports deferred
+        // tool loading via tool_reference (Anthropic API feature).
+        // OpenAI and compatible providers get all tools eagerly.
+        if kernel.llm().supports_deferred_tools() {
+            kernel.tools_mut().freeze_deferred_specs();
+        }
 
         Ok(AgentRuntime {
             kernel,
