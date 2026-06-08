@@ -899,15 +899,31 @@ for _candidate in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/home
   fi
 done
 
-# Resolve argusai-mcp Node.js entry point (installed as dep of argusai-cli)
+# Resolve argusai-mcp entry point.
+# Priority:
+#   1. argusai-mcp installed as a standalone global package (npm i -g argusai-mcp)
+#   2. argusai-mcp bundled inside argusai-cli global install
+#   3. npx (pulls from npm on first run; slower but always up-to-date)
 ARGUSAI_MCP_BIN=""
-for _npm_root in     "$(npm root -g 2>/dev/null)"     "$HOME/.local/share/fnm/node-versions"/*/installation/lib/node_modules; do
-  _candidate="$_npm_root/argusai-cli/node_modules/argusai-mcp/dist/index.js"
-  if [[ -f "$_candidate" ]]; then
-    ARGUSAI_MCP_BIN="$_candidate"
+_argusai_mcp_npx=""
+for _npm_root in \
+    "$(npm root -g 2>/dev/null)" \
+    "$HOME/.local/share/fnm/node-versions"/*/installation/lib/node_modules; do
+  # Standalone install takes priority
+  if [[ -f "$_npm_root/argusai-mcp/dist/index.js" ]]; then
+    ARGUSAI_MCP_BIN="$_npm_root/argusai-mcp/dist/index.js"
+    break
+  fi
+  # Fallback: bundled inside argusai-cli
+  if [[ -f "$_npm_root/argusai-cli/node_modules/argusai-mcp/dist/index.js" ]]; then
+    ARGUSAI_MCP_BIN="$_npm_root/argusai-cli/node_modules/argusai-mcp/dist/index.js"
     break
   fi
 done
+# If no local install found, fall back to npx (requires network on first use)
+if [[ -z "$ARGUSAI_MCP_BIN" ]] && command -v npx >/dev/null 2>&1; then
+  _argusai_mcp_npx="npx argusai-mcp"
+fi
 
 # Call one argusai MCP tool via a named mcp2cli session.
 # MCP server is stateful — init/setup/run/clean must share the same process.
@@ -917,7 +933,17 @@ _argus() {
   "$MCP2CLI" --session "$session" "$@" 2>&1
 }
 
-if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]    && [[ -n "$MCP2CLI" ]]    && [[ -n "$ARGUSAI_MCP_BIN" ]]    && [[ -f "e2e/e2e.yaml" ]]; then
+# Build the MCP stdio command: prefer node <path>, fall back to npx
+if [[ -n "$ARGUSAI_MCP_BIN" ]]; then
+  _MCP_STDIO_CMD="node $ARGUSAI_MCP_BIN"
+else
+  _MCP_STDIO_CMD="$_argusai_mcp_npx"
+fi
+
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
+   && [[ -n "$MCP2CLI" ]] \
+   && [[ -n "$_MCP_STDIO_CMD" ]] \
+   && [[ -f "e2e/e2e.yaml" ]]; then
   echo "[self-improve] running E2E smoke gate (via mcp2cli → argusai MCP)..."
 
   # Rebuild binary so the container gets the new code.
@@ -931,7 +957,7 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]    && [[ -n "$MCP2CLI" ]]    && [[ 
 
   # Start a persistent MCP server session so init/setup/run share state.
   # WORKTREE_ID must be in env BEFORE session-start so the server inherits it.
-  WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "node $ARGUSAI_MCP_BIN"     --session-start "$MCP_SESSION" >/dev/null 2>&1
+  WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD"     --session-start "$MCP_SESSION" >/dev/null 2>&1
 
   _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1
   _argus "$MCP_SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
@@ -976,7 +1002,7 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
 
         cargo build -q 2>/dev/null
         # Re-start session for the retry run
-        WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "node $ARGUSAI_MCP_BIN" \
+        WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD" \
           --session-start "$MCP_SESSION" >/dev/null 2>&1
         _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1
         _argus "$MCP_SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
@@ -1001,13 +1027,12 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
   "$MCP2CLI" --session-stop "$MCP_SESSION" >/dev/null 2>&1 || true
 fi
 
-if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && [[ -z "$MCP2CLI" ]]; then
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && { [[ -z "$MCP2CLI" ]] || [[ -z "$_MCP_STDIO_CMD" ]]; }; then
   # ---- Hard gate: missing E2E prerequisites must fail the run ---------------
-  # mcp2cli is required for the E2E smoke gate. If it's not found, fail hard
-  # so the operator knows to install it (~/.local/bin/mcp2cli).
   _missing=()
-  [[ -n "$MCP2CLI" ]]      || _missing+=("mcp2cli (~/.local/bin/mcp2cli)")
-  [[ -f "e2e/e2e.yaml" ]]  || _missing+=("e2e/e2e.yaml")
+  [[ -n "$MCP2CLI" ]]          || _missing+=("mcp2cli — install: uv tool install mcp2cli")
+  [[ -n "$_MCP_STDIO_CMD" ]]   || _missing+=("argusai-mcp — install: npm install -g argusai-mcp")
+  [[ -f "e2e/e2e.yaml" ]]      || _missing+=("e2e/e2e.yaml")
   echo "[self-improve] E2E: HARD GATE FAILED — missing prerequisites:" >&2
   printf '  - %s\n' "${_missing[@]}" >&2
   echo "[self-improve] E2E: fix the environment (install mcp2cli: uv tool install mcp2cli)" >&2

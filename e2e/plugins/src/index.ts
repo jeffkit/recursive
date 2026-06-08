@@ -29,14 +29,38 @@ const plugin: PluginModule = {
     const realApiBase = process.env['DEEPSEEK_API_BASE'] ?? 'https://api.deepseek.com/v1';
     const apiKey = process.env['DEEPSEEK_API_KEY'] ?? '';
 
-    // Auto-start aimock container if not running
+    // Auto-start aimock container, joining the correct Docker network.
+    // If aimock is already running but on a different network (e.g. a stale
+    // container from a previous worktree run), remove it and restart on the
+    // correct network so the recursive-e2e container can reach it.
     try {
+      // Determine the target network before checking if aimock is running.
+      const allNetworks = execSync('docker network ls --format "{{.Name}}"', { encoding: 'utf-8' }).trim().split('\n');
+      const worktreeId = process.env['WORKTREE_ID'];
+      const namespacedNetwork = worktreeId ? `argusai-${worktreeId}-network` : null;
+      const targetNetwork = (namespacedNetwork && allNetworks.includes(namespacedNetwork) ? namespacedNetwork : null)
+        || (allNetworks.includes('e2e-network') ? 'e2e-network' : null)
+        || '';
+      const networkFlag = targetNetwork ? `--network ${targetNetwork}` : '';
+
+      // Check if aimock is already on the correct network; remove if not.
       const running = execSync('docker ps --filter name=aimock --format "{{.Names}}"', { encoding: 'utf-8' }).trim();
-      if (!running.includes('aimock')) {
+      if (running.includes('aimock') && targetNetwork) {
+        const aimockNetworks = execSync(
+          'docker inspect aimock --format "{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}"',
+          { encoding: 'utf-8' }
+        ).trim();
+        if (!aimockNetworks.includes(targetNetwork)) {
+          // Stale aimock on wrong network — remove and let it restart below.
+          execSync('docker rm -f aimock', { stdio: 'pipe' });
+          console.log(`[recursive-agent] aimock was on wrong network (${aimockNetworks.trim()}); restarting on ${targetNetwork}`);
+        }
+      }
+
+      const stillRunning = execSync('docker ps --filter name=aimock --format "{{.Names}}"', { encoding: 'utf-8' }).trim();
+      if (!stillRunning.includes('aimock')) {
         const fixturesDir = path.resolve(import.meta.dirname, '../../fixtures');
         const recordedDir = path.resolve(fixturesDir, 'recorded');
-        const network = execSync('docker network ls --filter name=e2e-network --format "{{.Name}}"', { encoding: 'utf-8' }).trim();
-        const networkFlag = network ? `--network ${network}` : '';
 
         let aimockCmd: string;
         if (recordMode && apiKey) {
