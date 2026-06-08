@@ -172,10 +172,16 @@ impl AnthropicProvider {
             .iter()
             .partition(|(spec, _)| discovered.contains(&spec.name));
 
-        // Build eager list: ToolSearchTool + caller-eager + promoted-discovered.
+        // Only inject ToolSearchTool when there are still-deferred tools the
+        // model can search for. If everything is either eager or already
+        // discovered (promoted), ToolSearchTool serves no purpose.
+        let has_searchable_deferred = !still_deferred.is_empty();
+
         let mut all_eager: Vec<SpecWithHint> =
             Vec::with_capacity(1 + eager_tools.len() + promoted.len());
-        all_eager.push(Self::tool_search_spec());
+        if has_searchable_deferred {
+            all_eager.push(Self::tool_search_spec());
+        }
         all_eager.extend_from_slice(eager_tools);
         all_eager.extend(promoted.into_iter().cloned());
 
@@ -403,9 +409,12 @@ impl AnthropicProvider {
             .iter()
             .partition(|(spec, _)| discovered.contains(&spec.name));
 
+        let has_searchable_deferred = !still_deferred.is_empty();
         let mut all_eager: Vec<SpecWithHint> =
             Vec::with_capacity(1 + eager_tools.len() + promoted.len());
-        all_eager.push(Self::tool_search_spec());
+        if has_searchable_deferred {
+            all_eager.push(Self::tool_search_spec());
+        }
         all_eager.extend_from_slice(eager_tools);
         all_eager.extend(promoted.into_iter().cloned());
 
