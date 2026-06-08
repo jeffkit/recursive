@@ -574,7 +574,7 @@ interactive = ["delete_file"]
         let tmp = tempfile::tempdir().unwrap();
         let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
 
-        let err = set_value("provider.api_key", "sk-2d126c6c3c7e48b68a857219f006c1be")
+        let err = set_value("provider.api_key", "sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect_err("set_value must refuse provider.api_key");
         let msg = format!("{err}");
         assert!(
@@ -634,13 +634,13 @@ interactive = ["delete_file"]
         let tmp = tempfile::tempdir().unwrap();
         let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
 
-        set_secret("DEEPSEEK_API_KEY", "sk-2d126c6c3c7e48b68a857219f006c1be")
+        set_secret("DEEPSEEK_API_KEY", "sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("set_secret should succeed");
 
         let path = secrets_env_path().unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
-            content.contains("export DEEPSEEK_API_KEY='sk-2d126c6c3c7e48b68a857219f006c1be'"),
+            content.contains("export DEEPSEEK_API_KEY='sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa'"),
             "expected shell-sourceable line, got:\n{content}"
         );
 

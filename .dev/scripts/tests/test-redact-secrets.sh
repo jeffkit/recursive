@@ -43,7 +43,7 @@ assert_not_contains() {
 }
 
 # 1. The real DeepSeek key that produced the original journal leak.
-LEAKED_KEY="sk-2d126c6c3c7e48b68a857219f006c1be"
+LEAKED_KEY="sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 out="$(printf '%s\n' "api_key = \"$LEAKED_KEY\"" | redact_secrets)"
 assert_contains "TOML api_key value redacted" "<REDACTED>" "$out"
 assert_not_contains "TOML api_key value: raw key gone" "$LEAKED_KEY" "$out"
