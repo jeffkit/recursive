@@ -5,6 +5,9 @@ project:
   description: "Recursive Agent E2E Integration Tests"
   version: "0.6.0"
 
+isolation:
+  namespace: "{{env.WORKTREE_ID}}"
+
 plugins:
   - ./plugins/dist/index.js
 

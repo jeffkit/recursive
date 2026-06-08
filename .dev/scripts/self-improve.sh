@@ -881,95 +881,48 @@ fi
 # Uses ArgusAI replay mode with fixtures — deterministic, no API key needed.
 # Disable with RECURSIVE_SMOKE_TEST=0 for debugging or when Docker is unavailable.
 #
-# argusai is normally on PATH via fnm, but fnm's multishell bin path
-# (e.g. /Users/<user>/.local/state/fnm_multishells/<session-id>/bin)
-# is per-shell. When self-improve.sh runs in a non-interactive subprocess
-# the multishell path may not be inherited, so `command -v argusai`
-# fails even though argusai is correctly installed. Fall back to the
-# stable fnm install path (and a few common system-wide locations) so
-# the gate actually runs.
-if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && ! command -v argusai >/dev/null 2>&1; then
-  for argusai_candidate in \
-      "${FNM_DIR:-}/node-versions"/*/installation/bin/argusai \
-      "${XDG_DATA_HOME:-$HOME/.local/share}/fnm/node-versions"/*/installation/bin/argusai \
-      /opt/homebrew/bin/argusai \
-      /usr/local/bin/argusai \
-      "$HOME/.local/bin/argusai"; do
-    if [[ -x "$argusai_candidate" ]]; then
-      export PATH="$(dirname "$argusai_candidate"):$PATH"
-      echo "[self-improve] E2E: found argusai at $argusai_candidate (added to PATH)" >&2
-      break
-    fi
-  done
-fi
+# Invocation: uses mcp2cli to call argusai MCP tools (argus_setup, argus_run,
+# argus_clean) via the argusai MCP server (npx argusai-mcp). The MCP path
+# provides proper worktree isolation via isolation.namespace in e2e.yaml —
+# each worktree gets its own Docker container/network, parallel runs don't collide.
 
-if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
-   && command -v argusai >/dev/null 2>&1 \
-   && [[ -f "e2e/e2e.yaml" ]]; then
-  # Auto-build e2e/plugins/dist/ if missing. The plugins are
-  # gitignored build artifacts (see .gitignore `e2e/plugins/dist/`)
-  # so a fresh worktree does NOT have them. Without this, the
-  # gate would always fail in worktrees.
-  #
-  # Worktree-first try: pnpm install in the worktree can fail
-  # because e2e/plugins/package.json declares
-  #   "argusai-core": "file:../../../infra4agent/argusai/packages/core"
-  # which only resolves from the MAIN repo (where `infra4agent`
-  # is actually a sibling of `Recursive`). From a worktree at
-  # `Recursive/.worktrees/<name>/e2e/plugins/`, `../../../` lands
-  # in `Recursive/.worktrees/`, not `~/projects/`. So the
-  # worktree build is unreliable for cross-repo file: deps.
-  # Fallback: copy the MAIN repo's prebuilt dist/ into the
-  # worktree. This is correct because dist/ is gitignored (never
-  # differs across branches) and e2e/plugins/src/ is only modified
-  # by goals that explicitly touch the E2E suite.
-  if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
-    # REPO_ROOT in a worktree points to the worktree itself (BASH_SOURCE
-    # resolves relative to where the script lives). The MAIN repo's
-    # root is the parent of the shared .git dir — git rev-parse's
-    # --git-common-dir gives that path. Use it to find the main
-    # repo's prebuilt dist.
-    MAIN_REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null \
-      && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
-        | xargs -I{} dirname {} 2>/dev/null)"
-    if [[ -n "$MAIN_REPO_ROOT" && -d "$MAIN_REPO_ROOT" ]]; then
-      MAIN_DIST="$MAIN_REPO_ROOT/e2e/plugins/dist/index.js"
-      if [[ -f "$MAIN_DIST" ]]; then
-        echo "[self-improve] E2E: copying prebuilt dist/ from main repo ($MAIN_REPO_ROOT)" >&2
-        mkdir -p e2e/plugins/dist
-        cp -R "$MAIN_REPO_ROOT/e2e/plugins/dist/." e2e/plugins/dist/ 2>&1 | tail -3
-      elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
-        echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
-        if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
-              && pnpm build 2>&1 | tail -5); then
-          echo "[self-improve] E2E: pnpm build FAILED — plugins still missing" >&2
-        fi
-      fi
-    elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
-      echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
-      if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
-            && pnpm build 2>&1 | tail -5); then
-        echo "[self-improve] E2E: pnpm build FAILED — plugins still missing" >&2
-      fi
-    fi
+# Resolve mcp2cli (may not be on PATH in non-interactive subprocess)
+MCP2CLI=""
+for _candidate in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/homebrew/bin/mcp2cli"; do
+  if [[ -x "$_candidate" ]]; then
+    MCP2CLI="$_candidate"
+    break
   fi
-fi
+done
 
-if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
-   && command -v argusai >/dev/null 2>&1 \
-   && [[ -f "e2e/e2e.yaml" ]] \
-   && [[ -f "e2e/plugins/dist/index.js" ]]; then
-  echo "[self-improve] running E2E smoke gate..."
-  # Rebuild binary from modified src (agent was running the OLD binary;
-  # we need to test the NEW binary that includes this goal's changes)
+# Call one argusai MCP tool via mcp2cli
+_argus() {
+  local tool="$1" args="$2"
+  "$MCP2CLI" --mcp-stdio "npx argusai-mcp" "$tool" "$args" 2>&1
+}
+
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]    && [[ -n "$MCP2CLI" ]]    && [[ -f "e2e/e2e.yaml" ]]; then
+  echo "[self-improve] running E2E smoke gate (via mcp2cli → argusai MCP)..."
+
+  # Rebuild binary so the container image gets the new binary.
   cargo build -q 2>/dev/null
 
-  # argusai resolves 'file:' paths relative to CWD, not relative to e2e.yaml,
-  # so we must cd into e2e/ before invoking it.
-  if (cd e2e && argusai -c e2e.yaml run -s smoke 2>&1 | tail -5); then
+  # Per-worktree namespace for Docker isolation (prevents parallel run collisions)
+  WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo 'main')"
+  export WORKTREE_ID
+  E2E_PROJECT="$(pwd)/e2e"
+
+  # Setup isolated environment for this worktree
+  _argus argus_setup "{\"projectPath\": \"$E2E_PROJECT\"}" | tail -3
+
+  if _argus argus_run "{\"projectPath\": \"$E2E_PROJECT\", \"filter\": \"smoke\"}" | grep -q '"passed"'; then
     echo "[self-improve] E2E smoke: PASSED ✓"
+    _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
   else
     echo "[self-improve] E2E smoke: FAILED ✗"
+    SMOKE_ERRORS="$(_argus argus_run "{\"projectPath\": \"$E2E_PROJECT\", \"filter\": \"smoke\"}" 2>&1 | tail -30)"
+    _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
+
     # Give the agent one chance to fix the regression before rolling back.
     if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
        && [[ -f "$TRANSCRIPT_OUT" ]] \
@@ -978,7 +931,6 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
       export _RECURSIVE_SMOKE_RESUME_ATTEMPTED=1
       RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
       if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
-        SMOKE_ERRORS="$(cd e2e && argusai -c e2e.yaml run -s smoke 2>&1 | tail -30 || true)"
         SMOKE_PROMPT="The E2E smoke suite failed after your changes. Output:
 
 \`\`\`
@@ -1001,9 +953,13 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
         set -e
 
         cargo build -q 2>/dev/null
-        if [[ "$SMOKE_FIX_STATUS" -eq 0 ]] && (cd e2e && argusai -c e2e.yaml run -s smoke >/dev/null 2>&1); then
+        _argus argus_setup "{\"projectPath\": \"$E2E_PROJECT\"}" | tail -3
+        if [[ "$SMOKE_FIX_STATUS" -eq 0 ]] && \
+           _argus argus_run "{\"projectPath\": \"$E2E_PROJECT\", \"filter\": \"smoke\"}" 2>/dev/null | grep -q '"passed"'; then
           echo "[self-improve] SMOKE-FIX: smoke passes after fix ✓" | tee -a "$LOG"
+          _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
         else
+          _argus argus_clean "{\"projectPath\": \"$E2E_PROJECT\"}" >/dev/null 2>&1 || true
           echo "[self-improve] SMOKE-FIX: still failing after fix attempt" | tee -a "$LOG"
           verdict_and_exit "rolled-back" "E2E smoke test failed (smoke-fix also failed)"
         fi
@@ -1014,23 +970,18 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
       verdict_and_exit "rolled-back" "E2E smoke test failed (new binary broken)"
     fi
   fi
-elif [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]; then
+fi
+
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && [[ -z "$MCP2CLI" ]]; then
   # ---- Hard gate: missing E2E prerequisites must fail the run ---------------
-  # E2E has been quietly skipped in many recent runs because argusai's
-  # fnm-multishell PATH was not inherited. That hid regressions (e.g. a
-  # goal that broke write_file) and meant self-improve runs were never
-  # actually exercising the binary end-to-end. Treat any missing
-  # prerequisite as a hard error so the operator sees the problem
-  # and fixes the environment, rather than letting the run commit
-  # unverified code.
+  # mcp2cli is required for the E2E smoke gate. If it's not found, fail hard
+  # so the operator knows to install it (~/.local/bin/mcp2cli).
   _missing=()
-  command -v argusai >/dev/null 2>&1 || _missing+=("argusai-on-PATH")
-  [[ -f "e2e/e2e.yaml" ]]               || _missing+=("e2e/e2e.yaml")
-  [[ -f "e2e/plugins/dist/index.js" ]]  || _missing+=("e2e/plugins/dist/index.js")
+  [[ -n "$MCP2CLI" ]]      || _missing+=("mcp2cli (~/.local/bin/mcp2cli)")
+  [[ -f "e2e/e2e.yaml" ]]  || _missing+=("e2e/e2e.yaml")
   echo "[self-improve] E2E: HARD GATE FAILED — missing prerequisites:" >&2
   printf '  - %s\n' "${_missing[@]}" >&2
-  echo "[self-improve] E2E: fix the environment (e.g. add argusai to a stable PATH location," >&2
-  echo "[self-improve]      run \`pnpm install -g argusai-cli\`, or build the plugins)" >&2
+  echo "[self-improve] E2E: fix the environment (install mcp2cli: uv tool install mcp2cli)" >&2
   echo "[self-improve]      then re-run self-improve.sh." >&2
   echo "[self-improve]      To skip intentionally: RECURSIVE_SMOKE_TEST=0 .dev/scripts/self-improve.sh ..." >&2
   verdict_and_exit "rolled-back" "E2E prerequisites missing: ${_missing[*]}"
