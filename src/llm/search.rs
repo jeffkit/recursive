@@ -87,6 +87,22 @@ pub(crate) fn resolve(query: &str, candidates: &[SpecWithHint], max_results: usi
         return Vec::new();
     }
 
+    // `select:A,B,C` — return named tools in order, skipping unknowns.
+    if let Some(names_str) = query_trim.strip_prefix("select:") {
+        let requested: Vec<&str> = names_str.split(',').map(|s| s.trim()).collect();
+        let mut result = Vec::new();
+        for req in requested {
+            if let Some((spec, _)) = candidates
+                .iter()
+                .find(|(s, _)| s.name.to_lowercase() == req)
+            {
+                result.push(spec.name.clone());
+            }
+        }
+        result.truncate(max_results);
+        return result;
+    }
+
     // Fast path: exact (case-insensitive) name match.
     if let Some((spec, _)) = candidates
         .iter()
