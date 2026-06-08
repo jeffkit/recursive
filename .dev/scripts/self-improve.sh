@@ -329,6 +329,10 @@ TRANSCRIPT_DIR="$DEV_DIR/transcripts"
 TRANSCRIPT_OUT="$TRANSCRIPT_DIR/run-${TS}.json"
 mkdir -p "$TRANSCRIPT_DIR"
 
+# Source the redact-secrets filter. Same dir as this script.
+# shellcheck disable=SC1091
+source "$DEV_DIR/scripts/redact-secrets.sh"
+
 {
   echo "# Run ${TS}"
   echo ""
@@ -368,7 +372,7 @@ set +e
   --transcript-out "$TRANSCRIPT_OUT" \
   $PRICING_FLAG \
   --log warn \
-  run "$GOAL_BODY" 2>&1 | tee -a "$LOG"
+  run "$GOAL_BODY" 2>&1 | redact_secrets | tee -a "$LOG"
 AGENT_STATUS=${PIPESTATUS[0]}
 set -e
 
@@ -398,7 +402,7 @@ if [[ "$AGENT_STATUS" -ne 0 ]] \
       $PRICING_FLAG \
       --log warn \
       replay "$TRANSCRIPT_OUT" \
-      --resume-from "$RESUME_FROM" "$GOAL_BODY" 2>&1 | tee -a "$LOG"
+      --resume-from "$RESUME_FROM" "$GOAL_BODY" 2>&1 | redact_secrets | tee -a "$LOG"
     AGENT_STATUS=${PIPESTATUS[0]}
     set -e
 
@@ -752,7 +756,7 @@ Please fix the compilation/test errors. Do NOT start over — fix the specific i
         $PRICING_FLAG \
         --log warn \
         replay "$TRANSCRIPT_OUT" \
-        --resume-from "$RESUME_FROM" "$FIX_PROMPT" 2>&1 | tee -a "$LOG"
+        --resume-from "$RESUME_FROM" "$FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
       FIX_STATUS=${PIPESTATUS[0]}
       set -e
 
@@ -829,7 +833,7 @@ Please fix the lint warnings. Mechanical fixes (needless_borrow, redundant_clone
         $PRICING_FLAG \
         --log warn \
         replay "$TRANSCRIPT_OUT" \
-        --resume-from "$RESUME_FROM" "$CLIPPY_FIX_PROMPT" 2>&1 | tee -a "$LOG"
+        --resume-from "$RESUME_FROM" "$CLIPPY_FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
       CLIPPY_FIX_STATUS=${PIPESTATUS[0]}
       set -e
 
@@ -872,7 +876,7 @@ if [[ "${RECURSIVE_FMT_CHECK:-1}" == "1" ]] \
     tail -20 /tmp/cargo-fmt-errors.log
     echo ""
   } | tee -a "$LOG"
-  cargo fmt --all 2>&1 | tee -a "$LOG"
+  cargo fmt --all 2>&1 | redact_secrets | tee -a "$LOG"
   echo "[self-improve] FMT-CHECK: auto-fixed with cargo fmt --all ✓" | tee -a "$LOG"
 fi
 
@@ -948,7 +952,7 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
           $PRICING_FLAG \
           --log warn \
           replay "$TRANSCRIPT_OUT" \
-          --resume-from "$RESUME_FROM" "$SMOKE_PROMPT" 2>&1 | tee -a "$LOG"
+          --resume-from "$RESUME_FROM" "$SMOKE_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
         SMOKE_FIX_STATUS=${PIPESTATUS[0]}
         set -e
 
@@ -1032,7 +1036,7 @@ Fix ONLY the issues listed above. Do not rewrite other code."
       --transcript-out "${TRANSCRIPT_OUT%.json}-revision-${REVISION_ROUND}.json" \
       $PRICING_FLAG \
       --log warn \
-      run "$REVISION_GOAL" 2>&1 | tee -a "$LOG"
+      run "$REVISION_GOAL" 2>&1 | redact_secrets | tee -a "$LOG"
     REVISION_STATUS=${PIPESTATUS[0]}
     set -e
 
