@@ -142,6 +142,10 @@ impl LlmProvider for AnthropicProvider {
     /// only eager tool specs. ToolSearchTool results in the message history
     /// are serialized as `tool_reference` blocks by
     /// `serialize_messages_anthropic`.
+    fn supports_deferred_tools(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let (system, messages) = extract_system_message(messages);
         let messages = filter_leading_assistant(&messages);

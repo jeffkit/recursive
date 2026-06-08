@@ -132,36 +132,45 @@ impl<'a> RunCore<'a> {
         stream_sender: Option<crate::llm::StreamSender>,
         step: usize,
     ) -> crate::error::Result<Completion> {
-        // Split specs into eager and deferred based on registry metadata.
-        let (eager_specs, deferred_specs): (Vec<_>, Vec<_>) = specs
-            .iter()
-            .cloned()
-            .partition(|s| !self.tools.is_deferred_spec(s));
-
-        // Prepend <available-deferred-tools> when any deferred tools exist.
+        // Deferred-tool partition: only when the provider supports tool_reference
+        // (Anthropic). Other providers (OpenAI-compatible) receive all tools eagerly
+        // — ToolSearchTool is not registered for them (see AgentRuntimeBuilder::build).
+        let eager_specs_owned: Vec<crate::llm::ToolSpec>;
         let messages_with_deferred: Vec<crate::message::Message>;
-        let messages: &[crate::message::Message] = if deferred_specs.is_empty() {
-            &self.messages
-        } else {
-            let names: Vec<&str> = deferred_specs.iter().map(|s| s.name.as_str()).collect();
-            let block = format!(
-                "<available-deferred-tools>\n{}\n</available-deferred-tools>",
-                names.join("\n")
-            );
-            messages_with_deferred = std::iter::once(crate::message::Message::user(block))
-                .chain(self.messages.iter().cloned())
-                .collect();
-            &messages_with_deferred
-        };
+
+        let (call_specs, messages): (&[crate::llm::ToolSpec], &[crate::message::Message]) =
+            if self.llm.supports_deferred_tools() {
+                let (eager, deferred): (Vec<_>, Vec<_>) = specs
+                    .iter()
+                    .cloned()
+                    .partition(|s| !self.tools.is_deferred_spec(s));
+
+                if deferred.is_empty() {
+                    (specs, &self.messages)
+                } else {
+                    let names: Vec<&str> = deferred.iter().map(|s| s.name.as_str()).collect();
+                    let block = format!(
+                        "<available-deferred-tools>\n{}\n</available-deferred-tools>",
+                        names.join("\n")
+                    );
+                    messages_with_deferred = std::iter::once(crate::message::Message::user(block))
+                        .chain(self.messages.iter().cloned())
+                        .collect();
+                    eager_specs_owned = eager;
+                    (&eager_specs_owned, &messages_with_deferred)
+                }
+            } else {
+                (specs, &self.messages)
+            };
 
         let mut attempt = 0u32;
         loop {
             let result = if let Some(ref tx) = stream_sender {
                 self.llm
-                    .stream(messages, &eager_specs, Some(tx.clone()))
+                    .stream(messages, call_specs, Some(tx.clone()))
                     .await
             } else {
-                self.llm.complete(messages, &eager_specs).await
+                self.llm.complete(messages, call_specs).await
             };
             match result {
                 Ok(c) => return Ok(c),
