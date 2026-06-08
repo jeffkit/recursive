@@ -14,11 +14,10 @@ use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
     tools::EpisodicRecall,
     tools::{
-        BackgroundJobManager, CheckBackground, EstimateTokens, Forget, GlobTool, LoadSkill,
-        LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell, RunSkillScript,
-        ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles, SpawnWorkerTool,
-        SpawnWorkersParallel, SubAgent, TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool,
-        WriteFile,
+        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, EstimateTokens, Forget,
+        GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
+        RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
+        TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, RetryPolicy, ToolRegistry,
@@ -271,15 +270,13 @@ pub(crate) async fn build_runtime(
             };
             let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(anthropic_retry)
-                .with_max_search_rounds(config.max_search_rounds);
+                .with_retry_policy(anthropic_retry);
             Arc::new(anthropic)
         }
         _ => {
             let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(retry)
-                .with_max_search_rounds(config.max_search_rounds);
+                .with_retry_policy(retry);
             Arc::new(openai)
         }
     };
@@ -299,38 +296,23 @@ pub(crate) async fn build_runtime(
         || std::env::var("RECURSIVE_TEAM_ENABLED").as_deref() == Ok("1");
     if sub_agent_enabled {
         let max_depth = config.subagent_max_depth;
-        let sub = SubAgent::new(
+        // Single unified agent tool — replaces SubAgent, SpawnWorkerTool,
+        // and SpawnWorkersParallel.  The caller controls execution via
+        //  (single / parallel / sequential) and .
+        let defs = AgentDefinitions::load(&config.workspace).unwrap_or_else(|e| {
+            tracing::warn!("Failed to load agent definitions: {e}");
+            AgentDefinitions::default()
+        });
+        let agent = AgentTool::new(
             &config.workspace,
             provider.clone(),
             tools.clone(),
             max_depth,
             0,
             None,
-        );
-        tools = tools.register(Arc::new(sub));
-
-        // Also register spawn_worker — the coordinator-pattern first-class
-        // delegation tool.  Uses the same depth limit as sub_agent.
-        let worker = SpawnWorkerTool::new(
-            &config.workspace,
-            provider.clone(),
-            tools.clone(),
-            max_depth,
-            0,
-            None,
-        );
-        tools = tools.register(Arc::new(worker));
-
-        // spawn_workers_parallel — run multiple workers concurrently.
-        let parallel_worker = SpawnWorkersParallel::new(
-            &config.workspace,
-            provider.clone(),
-            tools.clone(),
-            max_depth,
-            0,
-            None,
-        );
-        tools = tools.register(Arc::new(parallel_worker));
+        )
+        .with_definitions(defs);
+        tools = tools.register(Arc::new(agent));
     }
 
     let skills = discover_loaded_skills(config);

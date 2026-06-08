@@ -29,6 +29,10 @@ pub enum Error {
     #[error("bad tool arguments ({name}): {message}")]
     BadToolArgs { name: String, message: String },
 
+    /// Tool rejected execution (policy, constraints, safety)
+    #[error("tool rejected ({name}): {reason}")]
+    ToolRejected { name: String, reason: String },
+
     /// Tool not found in registry
     #[error("tool `{0}` not found")]
     UnknownTool(String),
@@ -75,6 +79,10 @@ pub enum Error {
     /// Storage backend error (I/O, serialization, remote storage, etc.)
     #[error("storage error: {message}")]
     Storage { message: String },
+
+    /// A named resource (team, task, etc.) was requested but does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
 
     /// Catch-all for errors that don't fit elsewhere
     #[error("{0}")]

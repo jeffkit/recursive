@@ -7,8 +7,10 @@
 #
 # Safety net:
 #   - Requires a clean working tree and a baseline commit before running.
-#   - On success (agent exit 0 AND post-run `cargo test` green): auto-commits
-#     all changes with a descriptive message.
+#   - On success (agent exit 0 AND post-run `cargo test` green AND
+#     `cargo clippy --all-targets --all-features -- -D warnings` green):
+#     auto-commits all changes with a descriptive message and prints
+#     a "READY TO LAND" pointer for the operator.
 #   - On any failure: hard-resets to baseline. Nothing in src/ survives.
 #
 # Usage:
@@ -43,6 +45,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEV_DIR="$REPO_ROOT/.dev"
 cd "$REPO_ROOT"
+
+# Create runtime directories the script writes to. Several of these
+# are .gitignore'd (so a fresh worktree does NOT have them); the
+# script must mkdir -p before any write. Observed on g263 (first
+# run after the E2E hard-gate fix): verdict_and_exit's
+# failure-context write crashed with "No such file or directory"
+# because the rolled-back path did not mkdir .dev/runs/ first.
+mkdir -p "$DEV_DIR/runs" "$DEV_DIR/journal" "$DEV_DIR/metrics" "$DEV_DIR/observations"
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <goal-file-or-text>" >&2
@@ -98,6 +108,62 @@ if [[ -n "$(git status --porcelain)" ]]; then
   git status --short >&2
   exit 2
 fi
+
+# ---- EXIT trap: force-reset the worktree on abnormal exit ------------------
+# Background: g262 minimax run died with a network error at step 141.
+# The script's verdict_and_exit "rolled-back" path was reached and
+# the journal claim "rolled back" was written, but the actual
+# `git reset --hard $BASELINE_HEAD` did NOT run — the script
+# exited before reaching it, leaving the worktree dirty (modified
+# src/multi.rs + untracked journal). The next run of self-improve.sh
+# refused to launch because the tree was dirty, and the operator
+# had to manually `cd .worktrees/... && git checkout . && git clean -fd`.
+#
+# The fix: a single EXIT trap that runs on ANY exit (normal,
+# `set -e` failure, signal). Three flag-based exceptions:
+#   - _CLEANUP_DONE: set by verdict_and_exit() once it has fully
+#     handled the cleanup (committed, rolled-back) — back off.
+#   - _INTENTIONAL_DIRTY: set by skip-commit / panic-preserved
+#     before exit — the worktree is meant to stay dirty for
+#     diagnosis, do not touch it.
+#   - _WORKTREE_BASELINE empty: pre-flight failure (e.g. no
+#     baseline commit, dirty working tree) — there is nothing
+#     to reset to. Back off.
+# Anything else is an abnormal exit: force-reset to baseline and
+# commit the journal (if any) so the worktree is clean for the
+# next launch.
+_INTENTIONAL_DIRTY=0
+_CLEANUP_DONE=0
+_WORKTREE_BASELINE=""
+
+cleanup_on_exit() {
+  local exit_code=$?
+  [[ "$_CLEANUP_DONE"     -eq 1 ]] && return 0
+  [[ "$_INTENTIONAL_DIRTY" -eq 1 ]] && return 0
+  [[ -z "$_WORKTREE_BASELINE"   ]] && return 0
+
+  echo "!! self-improve.sh: abnormal exit (code $exit_code); force-resetting to $_WORKTREE_BASELINE" >&2
+  cd "$REPO_ROOT" 2>/dev/null || cd /
+  if ! git reset --hard "$_WORKTREE_BASELINE" --quiet 2>/dev/null; then
+    echo "!! self-improve.sh: git reset --hard FAILED; worktree may still be dirty" >&2
+    return 1
+  fi
+  # Best-effort: also clean untracked files (target/, .dev/journal/, etc.)
+  # that the agent may have created. The worktree is meant to be
+  # reusable for the next run, so leaving artifacts is unhelpful.
+  git clean -fd --quiet 2>/dev/null || true
+  if [[ -f "$LOG" ]]; then
+    git add "$LOG" 2>/dev/null || true
+    git commit --quiet -m "dev: journal — abnormal-exit cleanup (code $exit_code) on $(basename "$LOG")" 2>/dev/null || true
+  fi
+}
+
+trap 'cleanup_on_exit' EXIT
+# Note: _WORKTREE_BASELINE is set later, right before the agent is
+# launched. This ensures that pre-flight failures (provider selection,
+# tool checks, sysprompt build) leave _WORKTREE_BASELINE empty and
+# the trap backs off — no spurious `git reset`/`git clean` of the
+# user's main checkout or freshly-created worktree.
 
 # ---- Build system prompt ----------------------------------------------------
 
@@ -289,6 +355,12 @@ mkdir -p "$TRANSCRIPT_DIR"
 PRICING_FILE="$DEV_DIR/pricing.yaml"
 PRICING_FLAG=""
 [[ -f "$PRICING_FILE" ]] && PRICING_FLAG="--pricing-file $PRICING_FILE"
+
+# From this point on, an abnormal exit (set -e failure, signal,
+# process crash) should reset the worktree to the baseline and
+# commit the journal. Set the baseline flag so the EXIT trap
+# knows to act.
+_WORKTREE_BASELINE="$BASELINE_HEAD"
 
 set +e
 "$BIN" --workspace . \
@@ -508,6 +580,16 @@ verdict_and_exit() {
   append_result_footer "$verdict" "$detail"
   emit_metrics "$verdict" "$detail"
 
+  # The exit-trap sees _CLEANUP_DONE=1 and backs off — this function
+  # is the authoritative cleanup path. For the skip-commit verdict
+  # the worktree is *intentionally* left dirty, so we set
+  # _INTENTIONAL_DIRTY=1 instead and re-mark _CLEANUP_DONE=0 below.
+  if [[ "$verdict" == "skip-commit" ]]; then
+    _INTENTIONAL_DIRTY=1
+  else
+    _CLEANUP_DONE=1
+  fi
+
   case "$verdict" in
     committed)
       # Commit log + agent output together.
@@ -534,6 +616,19 @@ Goal:     ${GOAL_SOURCE}
       echo "=== ✓ committed: $(git log --oneline -1) ==="
       echo "=== journaled to ${LOG} ==="
       [[ -f "$OBS_FILE" ]] && echo "=== observed at ${OBS_FILE} ==="
+      echo ""
+      # Surface a clear "ready to land" pointer so the operator (or
+      # a follow-up agent) doesn't have to hunt for the branch /
+      # worktree. The branch comes from parallel-self-improve.sh when
+      # launched via parallel; for a direct invocation we fall back
+      # to `git branch --show-current`.
+      _READY_BRANCH="${BRANCH:-$(git branch --show-current 2>/dev/null || echo HEAD)}"
+      _READY_WORKTREE="${WORKTREE_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo .)}"
+      echo "=== READY TO LAND ==="
+      echo "    branch:   ${_READY_BRANCH}"
+      echo "    worktree: ${_READY_WORKTREE}"
+      echo "    land:     .dev/scripts/land-self-improve.sh ${GOAL_TAG}-${SELECTED_PROVIDER:-?}-${TS}"
+      echo "    merge:    git merge --no-ff ${_READY_BRANCH}"
       exit 0
       ;;
     rolled-back)
@@ -607,6 +702,9 @@ if [[ "$AGENT_STATUS" -ne 0 ]]; then
     # Commit journal + metrics without resetting — preserve the code state
     git add "$LOG" "$METRICS_FILE" 2>/dev/null || true
     git commit --quiet -m "dev: journal — PANIC run ${TS} (${GOAL_TAG}: exit ${AGENT_STATUS})" 2>/dev/null || true
+    # Tell the EXIT trap to back off: this path is *intentionally*
+    # leaving the worktree dirty (src/ + journal) for diagnosis.
+    _INTENTIONAL_DIRTY=1
     echo ""
     echo "=== ⚠ PANIC preserved (exit ${AGENT_STATUS}); worktree left dirty for diagnosis ==="
     echo "=== journaled to ${LOG} ==="
@@ -674,6 +772,89 @@ Please fix the compilation/test errors. Do NOT start over — fix the specific i
   fi
 fi
 
+# ---- Clippy check (-D warnings) ----------------------------------------------
+# Defence in depth #3: enforce `cargo clippy --all-targets --all-features
+# -- -D warnings`. AGENTS.md and CLAUDE.md both name clippy as a
+# mandatory quality gate, and unused-import / needless-borrow / etc.
+# lints are exactly the kind of regression a `cargo test` pass hides
+# (warnings don't fail `cargo test`). Without this gate, agents that
+# skip their own clippy step will land code that the post-land
+# clippy run (i.e. land-self-improve.sh) catches only at merge time.
+#
+# Observed: g262 (deepseek-pro run 20260607T090826Z) committed with
+# 2 unused imports in tests/agent_team_integration.rs that
+# `cargo test` accepted; only the land script's clippy gate caught
+# them. Adding this gate here means the agent gets one resume-fix
+# chance to clean up the warnings before we declare the run green.
+#
+# Disable with RECURSIVE_CLIPPY_CHECK=0 only if a goal genuinely
+# needs to land clippy-dirty code (very rare — almost certainly a
+# bug in the goal spec).
+if [[ "${RECURSIVE_CLIPPY_CHECK:-1}" == "1" ]] \
+   && ! cargo clippy --all-targets --all-features -- -D warnings \
+        >/tmp/cargo-clippy-errors.log 2>&1; then
+  # ---- Resume-based retry on clippy failure -----------------------------------
+  # Same pattern as the cargo test gate: give the agent one chance to fix
+  # its own lint warnings by resuming the conversation with the clippy
+  # errors as context. Mechanical lints (needless_borrow, redundant_clone)
+  # are usually a one-line fix; unused imports the agent can drop without
+  # needing a follow-up compile cycle.
+  if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
+     && [[ -f "$TRANSCRIPT_OUT" ]] \
+     && [[ -z "${_RECURSIVE_CLIPPY_RESUME_ATTEMPTED:-}" ]] \
+     && command -v jq >/dev/null 2>&1; then
+    export _RECURSIVE_CLIPPY_RESUME_ATTEMPTED=1
+    RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
+    if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
+      CLIPPY_ERRORS="$(tail -60 /tmp/cargo-clippy-errors.log)"
+      CLIPPY_FIX_PROMPT="Your code changes caused \`cargo clippy --all-targets --all-features -- -D warnings\` to FAIL. Lint warnings are errors under \`-D warnings\`. Errors:
+
+\`\`\`
+${CLIPPY_ERRORS}
+\`\`\`
+
+Please fix the lint warnings. Mechanical fixes (needless_borrow, redundant_clone, unused_imports) are usually a one-line change. Do NOT start over — fix the specific issues above."
+
+      RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-clippy-fix.json"
+      {
+        echo ""
+        echo "--- CLIPPY-FIX: cargo clippy failed, resuming agent to fix warnings ---"
+        echo ""
+      } | tee -a "$LOG"
+
+      set +e
+      "$BIN" --workspace . \
+        --system-prompt-file "$SYSPROMPT_FILE" \
+        --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+        $PRICING_FLAG \
+        --log warn \
+        replay "$TRANSCRIPT_OUT" \
+        --resume-from "$RESUME_FROM" "$CLIPPY_FIX_PROMPT" 2>&1 | tee -a "$LOG"
+      CLIPPY_FIX_STATUS=${PIPESTATUS[0]}
+      set -e
+
+      # Re-check clippy after the fix attempt
+      if [[ "$CLIPPY_FIX_STATUS" -eq 0 ]] \
+         && cargo clippy --all-targets --all-features -- -D warnings \
+              >/dev/null 2>&1; then
+        echo "[self-improve] CLIPPY-FIX: clippy clean after fix ✓" | tee -a "$LOG"
+        # Re-commit any agent edits made during the clippy-fix replay.
+        if [[ -n "$(git status --porcelain)" ]]; then
+          git add -A
+          git commit --quiet -m "self-improve(${GOAL_TAG}): clippy-fix round"
+        fi
+      else
+        echo "[self-improve] CLIPPY-FIX: still failing after fix attempt" | tee -a "$LOG"
+        verdict_and_exit "rolled-back" "post-agent cargo clippy failed (clippy-fix also failed)"
+      fi
+    else
+      verdict_and_exit "rolled-back" "post-agent cargo clippy failed"
+    fi
+  else
+    verdict_and_exit "rolled-back" "post-agent cargo clippy failed"
+  fi
+fi
+
 # ---- Format check (cargo fmt) -----------------------------------------------
 # Defence in depth #2: enforce `cargo fmt --all -- --check` so that goals
 # don't accumulate formatting debt across runs (g133 leaked unformatted code
@@ -699,6 +880,81 @@ fi
 # Verify the newly-built binary actually works as an agent (not just compiles).
 # Uses ArgusAI replay mode with fixtures — deterministic, no API key needed.
 # Disable with RECURSIVE_SMOKE_TEST=0 for debugging or when Docker is unavailable.
+#
+# argusai is normally on PATH via fnm, but fnm's multishell bin path
+# (e.g. /Users/<user>/.local/state/fnm_multishells/<session-id>/bin)
+# is per-shell. When self-improve.sh runs in a non-interactive subprocess
+# the multishell path may not be inherited, so `command -v argusai`
+# fails even though argusai is correctly installed. Fall back to the
+# stable fnm install path (and a few common system-wide locations) so
+# the gate actually runs.
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] && ! command -v argusai >/dev/null 2>&1; then
+  for argusai_candidate in \
+      "${FNM_DIR:-}/node-versions"/*/installation/bin/argusai \
+      "${XDG_DATA_HOME:-$HOME/.local/share}/fnm/node-versions"/*/installation/bin/argusai \
+      /opt/homebrew/bin/argusai \
+      /usr/local/bin/argusai \
+      "$HOME/.local/bin/argusai"; do
+    if [[ -x "$argusai_candidate" ]]; then
+      export PATH="$(dirname "$argusai_candidate"):$PATH"
+      echo "[self-improve] E2E: found argusai at $argusai_candidate (added to PATH)" >&2
+      break
+    fi
+  done
+fi
+
+if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
+   && command -v argusai >/dev/null 2>&1 \
+   && [[ -f "e2e/e2e.yaml" ]]; then
+  # Auto-build e2e/plugins/dist/ if missing. The plugins are
+  # gitignored build artifacts (see .gitignore `e2e/plugins/dist/`)
+  # so a fresh worktree does NOT have them. Without this, the
+  # gate would always fail in worktrees.
+  #
+  # Worktree-first try: pnpm install in the worktree can fail
+  # because e2e/plugins/package.json declares
+  #   "argusai-core": "file:../../../infra4agent/argusai/packages/core"
+  # which only resolves from the MAIN repo (where `infra4agent`
+  # is actually a sibling of `Recursive`). From a worktree at
+  # `Recursive/.worktrees/<name>/e2e/plugins/`, `../../../` lands
+  # in `Recursive/.worktrees/`, not `~/projects/`. So the
+  # worktree build is unreliable for cross-repo file: deps.
+  # Fallback: copy the MAIN repo's prebuilt dist/ into the
+  # worktree. This is correct because dist/ is gitignored (never
+  # differs across branches) and e2e/plugins/src/ is only modified
+  # by goals that explicitly touch the E2E suite.
+  if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
+    # REPO_ROOT in a worktree points to the worktree itself (BASH_SOURCE
+    # resolves relative to where the script lives). The MAIN repo's
+    # root is the parent of the shared .git dir — git rev-parse's
+    # --git-common-dir gives that path. Use it to find the main
+    # repo's prebuilt dist.
+    MAIN_REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null \
+      && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+        | xargs -I{} dirname {} 2>/dev/null)"
+    if [[ -n "$MAIN_REPO_ROOT" && -d "$MAIN_REPO_ROOT" ]]; then
+      MAIN_DIST="$MAIN_REPO_ROOT/e2e/plugins/dist/index.js"
+      if [[ -f "$MAIN_DIST" ]]; then
+        echo "[self-improve] E2E: copying prebuilt dist/ from main repo ($MAIN_REPO_ROOT)" >&2
+        mkdir -p e2e/plugins/dist
+        cp -R "$MAIN_REPO_ROOT/e2e/plugins/dist/." e2e/plugins/dist/ 2>&1 | tail -3
+      elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
+        echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
+        if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
+              && pnpm build 2>&1 | tail -5); then
+          echo "[self-improve] E2E: pnpm build FAILED — plugins still missing" >&2
+        fi
+      fi
+    elif [[ -f "e2e/plugins/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
+      echo "[self-improve] E2E: building plugins (pnpm install + pnpm build)..." >&2
+      if ! (cd e2e/plugins && pnpm install --silent 2>&1 | tail -5 \
+            && pnpm build 2>&1 | tail -5); then
+        echo "[self-improve] E2E: pnpm build FAILED — plugins still missing" >&2
+      fi
+    fi
+  fi
+fi
+
 if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
    && command -v argusai >/dev/null 2>&1 \
    && [[ -f "e2e/e2e.yaml" ]] \
@@ -759,7 +1015,25 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
     fi
   fi
 elif [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]]; then
-  echo "[self-improve] WARN: E2E smoke skipped (argusai not found, e2e/e2e.yaml missing, or plugins not built)"
+  # ---- Hard gate: missing E2E prerequisites must fail the run ---------------
+  # E2E has been quietly skipped in many recent runs because argusai's
+  # fnm-multishell PATH was not inherited. That hid regressions (e.g. a
+  # goal that broke write_file) and meant self-improve runs were never
+  # actually exercising the binary end-to-end. Treat any missing
+  # prerequisite as a hard error so the operator sees the problem
+  # and fixes the environment, rather than letting the run commit
+  # unverified code.
+  _missing=()
+  command -v argusai >/dev/null 2>&1 || _missing+=("argusai-on-PATH")
+  [[ -f "e2e/e2e.yaml" ]]               || _missing+=("e2e/e2e.yaml")
+  [[ -f "e2e/plugins/dist/index.js" ]]  || _missing+=("e2e/plugins/dist/index.js")
+  echo "[self-improve] E2E: HARD GATE FAILED — missing prerequisites:" >&2
+  printf '  - %s\n' "${_missing[@]}" >&2
+  echo "[self-improve] E2E: fix the environment (e.g. add argusai to a stable PATH location," >&2
+  echo "[self-improve]      run \`pnpm install -g argusai-cli\`, or build the plugins)" >&2
+  echo "[self-improve]      then re-run self-improve.sh." >&2
+  echo "[self-improve]      To skip intentionally: RECURSIVE_SMOKE_TEST=0 .dev/scripts/self-improve.sh ..." >&2
+  verdict_and_exit "rolled-back" "E2E prerequisites missing: ${_missing[*]}"
 fi
 
 # ---- Self-review pipeline (default ON since batch 36) ----------------------

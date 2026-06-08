@@ -10,13 +10,11 @@
 //! - Coordinator → worker mid-run message injection via a mock round-trip
 
 use recursive::llm::{mock::MockProvider, Completion};
-use recursive::multi::{AgentPool, AgentRole};
+use recursive::tasks::TaskRegistry;
 use recursive::tools::send_message::{SendMessageTool, WorkerMailbox, WorkerRegistry};
-use recursive::tools::team_manage::{TeamAddRole, TeamListRoles, TeamRemoveRole};
 use recursive::tools::Tool;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -138,7 +136,7 @@ async fn send_message_tool_delivers_to_registered_worker() {
     let reg = WorkerRegistry::new();
     let mailbox = reg.register("target-worker").await;
 
-    let tool = SendMessageTool::new(reg);
+    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
     let result = tool
         .execute(json!({
             "worker_id": "target-worker",
@@ -156,7 +154,7 @@ async fn send_message_tool_unknown_worker_returns_helpful_error() {
     let reg = WorkerRegistry::new();
     reg.register("active-worker").await;
 
-    let tool = SendMessageTool::new(reg);
+    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
     let result = tool
         .execute(json!({
             "worker_id": "nonexistent",
@@ -174,8 +172,10 @@ async fn send_message_tool_unknown_worker_returns_helpful_error() {
 
 #[tokio::test]
 async fn send_message_tool_spec_has_required_fields() {
+    // Phase D: only `message` is strictly required; `task_id` (preferred) and
+    // `worker_id` (legacy fallback) are alternative routing parameters.
     let reg = WorkerRegistry::new();
-    let tool = SendMessageTool::new(reg);
+    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
     let spec = tool.spec();
 
     assert_eq!(spec.name, "send_message");
@@ -183,8 +183,19 @@ async fn send_message_tool_spec_has_required_fields() {
         .as_array()
         .expect("required array");
     let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-    assert!(required_strs.contains(&"worker_id"));
-    assert!(required_strs.contains(&"message"));
+    assert!(
+        required_strs.contains(&"message"),
+        "expected `message` in required: {required_strs:?}"
+    );
+
+    let props = spec.parameters["properties"]
+        .as_object()
+        .expect("properties object");
+    assert!(props.contains_key("task_id"), "spec should mention task_id");
+    assert!(
+        props.contains_key("worker_id"),
+        "spec should still mention worker_id (legacy)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -241,190 +252,3 @@ async fn worker_receives_coordinator_message_via_mailbox() {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic team management (TeamAddRole / TeamRemoveRole / TeamListRoles)
-// ---------------------------------------------------------------------------
-
-fn test_config() -> recursive::Config {
-    recursive::Config {
-        workspace: std::path::PathBuf::from("."),
-        api_base: "http://localhost:4010/v1".into(),
-        api_key: Some("test-key".into()),
-        model: "mock-model".into(),
-        provider_type: "openai".into(),
-        preset: None,
-        max_steps: 10,
-        temperature: 0.2,
-        system_prompt: "You are a helpful assistant.".into(),
-        retry_max: 0,
-        retry_initial_backoff_secs: 1,
-        retry_max_backoff_secs: 10,
-        shell_timeout_secs: 30,
-        headless: false,
-        memory_summary_limit: 5,
-        thinking_budget: None,
-        session_name: None,
-        max_budget_usd: None,
-        extra_dirs: Vec::new(),
-        allow_tools: Vec::new(),
-        context_window_override: None,
-        subagent_max_depth: 2,
-        allow_bypass_permissions: false,
-        max_search_rounds: 3,
-        stuck_window: 10,
-        stuck_error_rate: 0.8,
-
-        max_concurrent_runs: 8,
-    }
-}
-
-fn make_pool() -> Arc<RwLock<AgentPool>> {
-    let provider: Arc<dyn recursive::LlmProvider> = mock_provider(vec![completion("ok")]);
-
-    let mut pool = AgentPool::new(provider, test_config());
-    pool.add_role(AgentRole {
-        name: "analyst".into(),
-        system_prompt: "Analyse data.".into(),
-        allowed_tools: vec![],
-        max_steps: 10,
-    });
-    Arc::new(RwLock::new(pool))
-}
-
-#[tokio::test]
-async fn team_add_role_creates_new_role() {
-    let pool = make_pool();
-    let tool = TeamAddRole::new(pool.clone());
-
-    let result = tool
-        .execute(json!({
-            "name": "reviewer",
-            "system_prompt": "Review code carefully.",
-            "max_steps": 15
-        }))
-        .await
-        .unwrap();
-
-    assert!(result.contains("reviewer"), "result: {result}");
-
-    let p = pool.read().await;
-    assert!(p.get_role("reviewer").is_some(), "reviewer should exist");
-}
-
-#[tokio::test]
-async fn team_add_role_updates_existing_role() {
-    let pool = make_pool();
-    let tool = TeamAddRole::new(pool.clone());
-
-    // Add analyst with new system prompt
-    let result = tool
-        .execute(json!({
-            "name": "analyst",
-            "system_prompt": "Updated analysis prompt.",
-            "max_steps": 20
-        }))
-        .await
-        .unwrap();
-
-    assert!(result.contains("analyst"), "result: {result}");
-
-    let p = pool.read().await;
-    assert!(p.get_role("analyst").is_some());
-    let role = p.get_role("analyst").unwrap();
-    assert_eq!(role.system_prompt, "Updated analysis prompt.");
-    assert_eq!(role.max_steps, 20);
-}
-
-#[tokio::test]
-async fn team_remove_role_removes_existing_role() {
-    let pool = make_pool();
-    let tool = TeamRemoveRole::new(pool.clone());
-
-    let result = tool.execute(json!({"name": "analyst"})).await.unwrap();
-
-    assert!(result.contains("analyst"), "result: {result}");
-    assert!(pool.read().await.get_role("analyst").is_none());
-}
-
-#[tokio::test]
-async fn team_remove_role_nonexistent_returns_message() {
-    let pool = make_pool();
-    let tool = TeamRemoveRole::new(pool.clone());
-
-    let result = tool
-        .execute(json!({"name": "nonexistent-role"}))
-        .await
-        .unwrap();
-
-    assert!(result.contains("nonexistent-role"), "result: {result}");
-}
-
-#[tokio::test]
-async fn team_list_roles_shows_all_roles() {
-    let pool = make_pool();
-    {
-        let mut p = pool.write().await;
-        p.add_role(AgentRole {
-            name: "coder".into(),
-            system_prompt: "Write code.".into(),
-            allowed_tools: vec![],
-            max_steps: 30,
-        });
-    }
-
-    let tool = TeamListRoles::new(pool.clone());
-    let result = tool.execute(json!({})).await.unwrap();
-
-    assert!(result.contains("analyst"), "should list analyst: {result}");
-    assert!(result.contains("coder"), "should list coder: {result}");
-}
-
-#[tokio::test]
-async fn team_list_roles_empty_pool() {
-    let provider: Arc<dyn recursive::LlmProvider> = mock_provider(vec![completion("ok")]);
-    let pool = Arc::new(RwLock::new(AgentPool::new(provider, test_config())));
-    let tool = TeamListRoles::new(pool);
-
-    let result = tool.execute(json!({})).await.unwrap();
-    assert!(
-        result.contains("No roles")
-            || result.contains("empty")
-            || result.is_empty()
-            || result.len() < 50,
-        "result should indicate no roles: {result}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// AgentPool dynamic role management (lower-level API)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn agent_pool_add_and_remove_role() {
-    let provider: Arc<dyn recursive::LlmProvider> = mock_provider(vec![completion("ok")]);
-    let mut pool = AgentPool::new(provider, test_config());
-
-    pool.add_role(AgentRole {
-        name: "tester".into(),
-        system_prompt: "Write tests.".into(),
-        allowed_tools: vec![],
-        max_steps: 20,
-    });
-
-    assert!(
-        pool.get_role("tester").is_some(),
-        "role should be present after add"
-    );
-    let removed = pool.remove_role("tester");
-    assert!(removed, "remove_role should return true for existing role");
-    assert!(
-        pool.get_role("tester").is_none(),
-        "role should be gone after remove"
-    );
-}
-
-#[tokio::test]
-async fn agent_pool_remove_nonexistent_returns_false() {
-    let provider: Arc<dyn recursive::LlmProvider> = mock_provider(vec![completion("ok")]);
-    let mut pool = AgentPool::new(provider, test_config());
-    assert!(!pool.remove_role("phantom"));
-}

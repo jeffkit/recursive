@@ -120,50 +120,57 @@ impl<'a> RunCore<'a> {
 
     /// Call the LLM with exponential back-off retry for retryable errors.
     ///
-    /// Retries up to `LLM_MAX_RETRIES` times on `RateLimited` or `Timeout`.
-    /// For `RateLimited` with a `retry_after_ms` hint, waits exactly that
-    /// duration; otherwise uses `LLM_RETRY_BASE_MS * 2^attempt`.
+    /// When the registry has deferred tools, their names are injected as an
+    /// `<available-deferred-tools>` user message prepended to the transcript,
+    /// and only eager tool specs are passed to the provider. ToolSearchTool
+    /// (registered by `freeze_deferred_specs`) appears in the eager list and
+    /// its results in the message history are serialized as `tool_reference`
+    /// blocks by `serialize_messages_anthropic`.
     async fn call_llm_with_retry(
         &self,
         specs: &[crate::llm::ToolSpec],
         stream_sender: Option<crate::llm::StreamSender>,
         step: usize,
     ) -> crate::error::Result<Completion> {
-        // Split into eager (full schema) and deferred (name-only) tool lists.
-        let (eager, deferred): (Vec<_>, Vec<_>) = specs
-            .iter()
-            .cloned()
-            .map(|s| {
-                let hint = s
-                    .description
-                    .split('.')
-                    .next()
-                    .map(|h| h.trim().to_string())
-                    .filter(|h| !h.is_empty());
-                let is_deferred = self.tools.is_deferred_spec(&s);
-                (s, hint, is_deferred)
-            })
-            .partition(|(_, _, d)| !d);
-        let eager_pairs: Vec<(crate::llm::ToolSpec, Option<String>)> =
-            eager.into_iter().map(|(s, hint, _)| (s, hint)).collect();
-        let deferred_pairs: Vec<(crate::llm::ToolSpec, Option<String>)> =
-            deferred.into_iter().map(|(s, hint, _)| (s, hint)).collect();
+        // Deferred-tool partition: only when the provider supports tool_reference
+        // (Anthropic). Other providers (OpenAI-compatible) receive all tools eagerly
+        // — ToolSearchTool is not registered for them (see AgentRuntimeBuilder::build).
+        let eager_specs_owned: Vec<crate::llm::ToolSpec>;
+        let messages_with_deferred: Vec<crate::message::Message>;
+
+        let (call_specs, messages): (&[crate::llm::ToolSpec], &[crate::message::Message]) =
+            if self.llm.supports_deferred_tools() {
+                let (eager, deferred): (Vec<_>, Vec<_>) = specs
+                    .iter()
+                    .cloned()
+                    .partition(|s| !self.tools.is_deferred_spec(s));
+
+                if deferred.is_empty() {
+                    (specs, &self.messages)
+                } else {
+                    let names: Vec<&str> = deferred.iter().map(|s| s.name.as_str()).collect();
+                    let block = format!(
+                        "<available-deferred-tools>\n{}\n</available-deferred-tools>",
+                        names.join("\n")
+                    );
+                    messages_with_deferred = std::iter::once(crate::message::Message::user(block))
+                        .chain(self.messages.iter().cloned())
+                        .collect();
+                    eager_specs_owned = eager;
+                    (&eager_specs_owned, &messages_with_deferred)
+                }
+            } else {
+                (specs, &self.messages)
+            };
 
         let mut attempt = 0u32;
         loop {
             let result = if let Some(ref tx) = stream_sender {
                 self.llm
-                    .stream_with_search(
-                        &self.messages,
-                        &eager_pairs,
-                        &deferred_pairs,
-                        Some(tx.clone()),
-                    )
+                    .stream(messages, call_specs, Some(tx.clone()))
                     .await
             } else {
-                self.llm
-                    .complete_with_search(&self.messages, &eager_pairs, &deferred_pairs)
-                    .await
+                self.llm.complete(messages, call_specs).await
             };
             match result {
                 Ok(c) => return Ok(c),

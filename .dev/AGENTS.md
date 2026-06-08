@@ -164,6 +164,33 @@ tests/
    set `RECURSIVE_FMT_CHECK=0` if you have a documented reason in the
    journal entry.
 
+   **`cargo clippy --all-targets --all-features -- -D warnings` is also
+   a hard gate by `self-improve.sh`** (since g262 — added after a
+   deepseek-pro run landed 2 unused imports that `cargo test` accepted
+   but `cargo clippy` rejected): if the clippy run is non-zero after
+   your edits, the wrapper invokes a one-shot resume-fix replay
+   asking you to clean up the lints, then re-runs the gate. A
+   mechanical lint (needless_borrow, redundant_clone, unused_imports)
+   is almost always a one-line change — do not push back. Only set
+   `RECURSIVE_CLIPPY_CHECK=0` if a goal genuinely needs to land
+   clippy-dirty code (very rare; document the reason in the journal
+   entry).
+
+   **E2E smoke is a hard gate by `self-improve.sh`** (restored after
+   being silently skipped on g262): the wrapper runs
+   `cd e2e && argusai -c e2e.yaml run -s smoke` (3 scenarios: basic
+   write_file, basic read_file, session-recording assertions).
+   Replay mode — deterministic, no API key, ~700ms. If it fails the
+   wrapper invokes a one-shot resume-fix replay asking you to fix
+   the regression. If the E2E prerequisites are missing (argusai not
+   on PATH, no `e2e/e2e.yaml`, or `e2e/plugins/dist/index.js` not
+   built) the gate is HARD-FAIL — the wrapper rolls back. argusai
+   is normally picked up via fnm's multishell path, but the wrapper
+   has a fallback to the stable fnm install path
+   (`$FNM_DIR/node-versions/*/installation/bin/argusai`) for
+   non-interactive subprocesses. Only set `RECURSIVE_SMOKE_TEST=0`
+   if Docker is genuinely unavailable in the run environment.
+
    **Verify behavior through `cargo test`, never through `cargo run | jq`.**
    On a fresh worktree, `cargo run` first does a full `cargo build`, whose
    "Compiling …" / "Finished …" lines spill onto stderr *and sometimes

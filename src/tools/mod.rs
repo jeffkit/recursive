@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::permissions::auto_classifier::AutoClassifier;
 use crate::permissions::SharedPermissions;
-use crate::permissions::{DecisionReason, Permission, PermissionMode, PermissionsConfig};
+use crate::permissions::{DecisionReason, PermissionMode, PermissionsConfig};
 use crate::tools::fs::ReadFileState;
 use tokio::sync::RwLock;
 
@@ -142,6 +142,8 @@ fn blake3_canonical_json(v: &Value) -> String {
 }
 
 pub mod a2a;
+pub mod agent;
+pub mod agent_defs;
 pub mod checkpoint;
 #[cfg(feature = "cloud-runtime")]
 pub mod docker_provider;
@@ -161,6 +163,7 @@ pub mod glob;
 pub mod install_skill;
 pub mod load_skill;
 pub mod memory;
+pub mod permission_pipeline;
 pub mod plan_mode;
 pub mod policy_sandbox;
 pub mod run_background;
@@ -169,11 +172,25 @@ pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
 pub mod shell;
-pub mod spawn_worker;
-pub mod spawn_workers_parallel;
-pub mod sub_agent;
-pub mod team_manage;
+
+#[cfg(feature = "coordinator-mode")]
+pub mod task_create;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_get;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_list;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_output;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_stop;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_update;
+#[cfg(feature = "coordinator-mode")]
+pub mod team_create;
+#[cfg(feature = "coordinator-mode")]
+pub mod team_delete;
 pub mod todo;
+pub mod tool_search;
 pub mod transport;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
@@ -181,6 +198,8 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
+pub use agent::{AgentTool, SharedMemoryRead, SharedMemoryWrite};
+pub use agent_defs::{AgentDefinition, AgentDefinitions};
 pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
 pub use edit::EditTool;
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};
@@ -201,6 +220,7 @@ pub use memory::{
     ScratchpadGet, ScratchpadList, WorkingMemoryTool,
 };
 pub use memory::{Forget, Recall, Remember};
+pub use permission_pipeline::{CheckOutcome, PermissionPipeline};
 pub use plan_mode::{
     EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult, PlanModeRequestGate,
     PlanModeRequestResult, RequestPlanModeTool,
@@ -212,13 +232,25 @@ pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
-pub use spawn_worker::{SpawnWorkerTool, WorkerType};
-pub use spawn_workers_parallel::SpawnWorkersParallel;
-pub use sub_agent::SubAgent;
-pub use team_manage::{
-    SharedMemoryRead, SharedMemoryWrite, TeamAddRole, TeamListRoles, TeamRemoveRole,
-};
+
+#[cfg(feature = "coordinator-mode")]
+pub use task_create::TaskCreateTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_get::TaskGetTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_list::TaskListTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_output::TaskOutputTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_stop::TaskStopTool;
+#[cfg(feature = "coordinator-mode")]
+pub use task_update::TaskUpdateTool;
+#[cfg(feature = "coordinator-mode")]
+pub use team_create::TeamCreateTool;
+#[cfg(feature = "coordinator-mode")]
+pub use team_delete::TeamDeleteTool;
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
+pub use tool_search::{DeferredCatalog, ToolSearchTool, TOOL_SEARCH_TOOL_NAME};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
@@ -650,6 +682,23 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
+    /// Return (eager_specs, deferred_specs).
+    /// Eager tools are sent to the LLM with full schemas.
+    /// Deferred tools are not — their names appear in
+    /// `<available-deferred-tools>` so the model can call ToolSearchTool.
+    pub fn specs_partitioned(&self) -> (Vec<ToolSpec>, Vec<ToolSpec>) {
+        let mut eager = Vec::new();
+        let mut deferred = Vec::new();
+        for tool in self.tools.values() {
+            if tool.is_deferred() {
+                deferred.push(tool.spec());
+            } else {
+                eager.push(tool.spec());
+            }
+        }
+        (eager, deferred)
+    }
+
     /// Restrict the registry to only the named tools, removing all others.
     /// Tool names are matched case-insensitively. Aliases for removed tools
     /// are also dropped. Used by `--allow-tools` to give agents a limited
@@ -698,6 +747,28 @@ impl ToolRegistry {
             .get(&spec.name)
             .map(|t| t.is_deferred())
             .unwrap_or(false)
+    }
+
+    /// Finalize deferred tool support: collect all deferred tool specs into a
+    /// shared catalog and register a `ToolSearchTool` backed by that catalog.
+    ///
+    /// Call this once after all other tools have been registered. If there are
+    /// no deferred tools, this is a no-op (ToolSearchTool is not registered).
+    pub fn freeze_deferred_specs(&mut self) {
+        let deferred_specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .filter(|t| t.is_deferred())
+            .map(|t| t.spec())
+            .collect();
+
+        if deferred_specs.is_empty() {
+            return;
+        }
+
+        let catalog: DeferredCatalog = Arc::new(std::sync::RwLock::new(deferred_specs));
+        let tool = Arc::new(ToolSearchTool::new(catalog));
+        self.tools.insert(TOOL_SEARCH_TOOL_NAME.to_string(), tool);
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -750,204 +821,31 @@ impl ToolRegistry {
     /// [`AuditMeta`]. Callers that need to persist audit data should
     /// use this method; callers that don't can call `invoke` which
     /// discards the audit half.
-    pub async fn invoke_with_audit(&self, name: &str, mut arguments: Value) -> ToolDispatch {
-        // Static permission check before any tool execution.
-        // Goal-196: extract the file-path "content" from arguments and
-        // pass it to `check_static` so the safety check (protected paths
-        // like `.git`, `.ssh`, `.env`) can fire on file tools.
-        let safety_content = safety_content_for_tool(name, &arguments);
-        // Goal-197: read through the shared permissions lock so that
-        // runtime session rules (add_session_rule / remove_session_rule)
-        // take effect immediately. The lock is held only for the
-        // permission check, not during tool execution.
-        if let Some(ref sp) = self.permissions {
-            let guard = sp.read().await;
-
-            // Goal-200: Auto mode — delegate to the LLM classifier before
-            // falling through to the static permission check. If the
-            // classifier blocks, return denial immediately. If the denial
-            // tracker is over limit, return a special error that the agent
-            // loop can use to set FinishReason::PermissionDenialLimit.
-            if matches!(guard.mode, PermissionMode::Auto) {
-                if let Some(ref classifier) = self.auto_classifier {
-                    let args_summary =
-                        serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into());
-                    let mut c = classifier.lock().await;
-                    match c.classify(name, &args_summary, "").await {
-                        Ok((true, _reason)) => {
-                            if c.tracker.is_over_limit() {
-                                return ToolDispatch {
-                                    result: Err(Error::PermissionDeniedLimit { name: name.into() }),
-                                    audit: AuditMeta::synthetic_unknown_tool(name),
-                                };
-                            }
-                            return ToolDispatch {
-                                result: Err(Error::PermissionDenied {
-                                    name: name.into(),
-                                    reason: DecisionReason::Mode(PermissionMode::Auto),
-                                }),
-                                audit: AuditMeta::synthetic_unknown_tool(name),
-                            };
-                        }
-                        Ok((false, _)) => {
-                            // Allowed — fall through to static check.
-                        }
-                        Err(_e) => {
-                            // Classifier error — conservative: allow.
-                        }
-                    }
-                }
-                // If no classifier configured in Auto mode, fall through
-                // to static check (safe default).
-            }
-
-            let is_readonly = self.is_readonly(name);
-            // Pre-compute interactive flag before the match so we can use it
-            // after without holding `guard` across an await point.
-            let is_interactive_tool = guard.any_interactive(name);
-            let mut perm_is_unknown = false;
-            match guard.check_static(name, is_readonly, safety_content.as_deref()) {
-                Permission::Denied(reason, _msg) => {
-                    return ToolDispatch {
-                        result: Err(Error::PermissionDenied {
-                            name: name.into(),
-                            reason: reason.clone(),
-                        }),
-                        audit: AuditMeta::synthetic_unknown_tool(name),
-                    };
-                }
-                Permission::Unknown => {
-                    perm_is_unknown = true;
-                }
-                Permission::Allowed(_) => {}
-            }
-
-            // In Strict mode, any tool without an explicit allow rule is denied.
-            if perm_is_unknown && matches!(guard.mode, PermissionMode::Strict) {
-                return ToolDispatch {
-                    result: Err(Error::PermissionDenied {
-                        name: name.into(),
-                        reason: DecisionReason::Mode(PermissionMode::Strict),
-                    }),
-                    audit: AuditMeta::synthetic_unknown_tool(name),
-                };
-            }
-
-            // Goal-212: When no rule explicitly matched (Unknown) and the tool
-            // is in the interactive list, delegate to the registered
-            // PermissionHook as a safety net for non-headless callers (e.g.
-            // agent loop calling invoke_with_audit directly, bypassing
-            // invoke()). Headless interactive tools are handled below.
-            // Explicitly Allowed tools skip this check to avoid double-asking.
-            if perm_is_unknown && !self.headless && is_interactive_tool {
-                if let Some(hook) = &self.permission_hook {
-                    drop(guard);
-                    match hook.check(name, &arguments).await {
-                        PermissionDecision::Deny(reason) => {
-                            return ToolDispatch {
-                                result: Err(Error::PermissionDenied {
-                                    name: name.into(),
-                                    reason: DecisionReason::Hook { name: reason },
-                                }),
-                                audit: AuditMeta::synthetic_unknown_tool(name),
-                            };
-                        }
-                        PermissionDecision::Transform(new_args) => {
-                            // Re-run policy check on the transformed arguments.
-                            // A malicious/compromised hook could use `updated_input`
-                            // to substitute a different command/path that bypasses
-                            // the policy check already performed above.
-                            if let Some(ref policy) = self.policy {
-                                if let Some(cmd) = new_args.get("command").and_then(|v| v.as_str())
-                                {
-                                    if let Err(e) = policy.check_shell(cmd) {
-                                        return ToolDispatch {
-                                            result: Err(e),
-                                            audit: AuditMeta::synthetic_unknown_tool(name),
-                                        };
-                                    }
-                                }
-                                let is_write = matches!(name, "Write" | "Edit" | "StrReplace");
-                                let path_arg = new_args
-                                    .get("path")
-                                    .or_else(|| new_args.get("file_path"))
-                                    .and_then(|v| v.as_str());
-                                if let Some(path) = path_arg {
-                                    if let Err(e) = policy.check_fs_path(path, is_write) {
-                                        return ToolDispatch {
-                                            result: Err(e),
-                                            audit: AuditMeta::synthetic_unknown_tool(name),
-                                        };
-                                    }
-                                }
-                            }
-                            arguments = new_args;
-                        }
-                        PermissionDecision::Allow => {}
-                    }
-                    // Hook allowed/transformed; guard already dropped, skip headless block.
-                } else {
-                    // No hook registered — non-headless library caller → allow.
-                    drop(guard);
-                }
-            } else
-            // Goal-199: headless mode — interactive tools go through external hooks.
-            if self.headless && is_interactive_tool {
-                // If no external hooks are registered → auto-deny.
-                if self.hook_runner.is_empty() {
-                    return ToolDispatch {
-                        result: Err(Error::PermissionDenied {
-                            name: name.into(),
-                            reason: DecisionReason::Hook {
-                                name: "PermissionRequest".into(),
-                            },
-                        }),
-                        audit: AuditMeta::synthetic_unknown_tool(name),
-                    };
-                }
-                let hook_input = crate::hooks::external::HookInput {
-                    event: crate::hooks::external::HookEvent::PermissionRequest,
-                    tool_name: Some(name.to_string()),
-                    args: Some(arguments.clone()),
-                    mode: format!("{:?}", self.permission_mode),
-                    content: None,
-                    message: None,
-                    depth: None,
-                    reason: None,
-                    error: None,
-                };
-                // Drop the read guard before the async hook dispatch to
-                // avoid holding the lock across an await point.
-                drop(guard);
-                let hook_result = self.hook_runner.dispatch(&hook_input).await;
-                if !matches!(hook_result.action, crate::hooks::HookAction::Continue) {
-                    return ToolDispatch {
-                        result: Err(Error::PermissionDenied {
-                            name: name.into(),
-                            reason: DecisionReason::Hook {
-                                name: "PermissionRequest".into(),
-                            },
-                        }),
-                        audit: AuditMeta::synthetic_unknown_tool(name),
-                    };
-                }
-            } else {
-                // Drop guard before tool execution (not holding across await).
-                if perm_is_unknown {
-                    // No explicit rule matched for this tool. It is being allowed
-                    // implicitly because the current permission mode is not Strict.
-                    // Consider using PermissionMode::Strict or adding an explicit
-                    // allow rule to silence this warning.
-                    tracing::warn!(
-                        tool = %name,
-                        "tool has no explicit permission rule; \
-                         allowing implicitly (use strict mode to deny by default)"
-                    );
-                }
-                drop(guard);
+    pub async fn invoke_with_audit(&self, name: &str, arguments: Value) -> ToolDispatch {
+        // Goal-261: pre-execution permission checks are delegated to
+        // `PermissionPipeline`. This method keeps only `touched_files`
+        // recording, tool lookup, L1 policy check, side-effect
+        // classification, step_id/hash generation, and tool execution
+        // + audit construction. The pipeline owns the 7 permission-
+        // orchestration phases and exposes a public `recheck_policy`
+        // method for callers that need to re-validate hook-mutated args.
+        let pipeline = permission_pipeline::PermissionPipeline::new(self);
+        match pipeline.check(name, arguments).await {
+            permission_pipeline::CheckOutcome::Deny { error, audit } => ToolDispatch {
+                result: Err(error),
+                audit,
+            },
+            permission_pipeline::CheckOutcome::Allow { arguments } => {
+                self.dispatch_after_permission_check(name, arguments).await
             }
         }
+    }
 
+    /// Goal-261: the execution half of `invoke_with_audit` — invoked
+    /// after `PermissionPipeline::check` has returned `Allow`. Records
+    /// touched files, looks up the tool, runs the L1 policy check, and
+    /// constructs the `AuditMeta` around `tool.execute()`.
+    async fn dispatch_after_permission_check(&self, name: &str, arguments: Value) -> ToolDispatch {
         // Record touched files for the active turn (if a collector is attached).
         if let Some(slot) = &self.touched {
             record_touched(name, &arguments, slot);
@@ -959,35 +857,6 @@ impl ToolRegistry {
                 audit: AuditMeta::synthetic_unknown_tool(name),
             };
         };
-
-        // L1 policy check: enforce shell/fs policies from the registry-level
-        // PolicyConfig before executing any tool. This runs in the framework
-        // layer so individual tool implementations don't need to opt in.
-        if let Some(ref policy) = self.policy {
-            // Shell tools: check the "command" argument.
-            if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
-                if let Err(e) = policy.check_shell(cmd) {
-                    return ToolDispatch {
-                        result: Err(e),
-                        audit: AuditMeta::synthetic_unknown_tool(name),
-                    };
-                }
-            }
-            // Filesystem tools: check "path" / "file_path" arguments.
-            let is_write = matches!(name, "Write" | "Edit" | "StrReplace");
-            let path_arg = arguments
-                .get("path")
-                .or_else(|| arguments.get("file_path"))
-                .and_then(|v| v.as_str());
-            if let Some(path) = path_arg {
-                if let Err(e) = policy.check_fs_path(path, is_write) {
-                    return ToolDispatch {
-                        result: Err(e),
-                        audit: AuditMeta::synthetic_unknown_tool(name),
-                    };
-                }
-            }
-        }
 
         let side_effect = tool.side_effect_class();
         let step_id = uuid::Uuid::now_v7().hyphenated().to_string();
@@ -1243,23 +1112,6 @@ pub fn build_standard_tools(
     }
 
     registry
-}
-
-// ── Goal-196: Safety path content extraction ───────────────────────────────
-
-/// Extract the file-path "content" from tool arguments for the safety
-/// check in `check_static`. Returns `None` for tools that don't operate
-/// on a file path.
-///
-/// - `Write` / `Read`: extract `args["path"]`
-/// - `Edit`: extract `args["file_path"]`
-/// - All other tools: `None`
-fn safety_content_for_tool(name: &str, args: &serde_json::Value) -> Option<String> {
-    match name {
-        "Write" | "Read" => args["path"].as_str().map(String::from),
-        "Edit" => args["file_path"].as_str().map(String::from),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
