@@ -25,6 +25,8 @@
 //! below for completeness even if those tools don't exist in the
 //! current kernel.
 
+use crate::tools::ToolRegistry;
+
 /// Returns `true` iff this process is running in coordinator mode.
 ///
 /// Both the env var (`RECURSIVE_COORDINATOR_MODE=1`) AND the
@@ -113,6 +115,23 @@ pub fn is_allowed_in_coordinator_mode(tool_name: &str) -> bool {
     is_coordinator_tool(tool_name) && !coordinator_deny_list().contains(&tool_name)
 }
 
+/// Prune a [`ToolRegistry`] down to the coordinator allow-list when the
+/// process is running in coordinator mode.  No-op otherwise.  This is
+/// the wiring point that the kernel calls right after
+/// `build_tools()` — see `src/cli/builder.rs`.
+pub fn filter_registry(registry: &mut ToolRegistry) {
+    if !is_coordinator_mode() {
+        return;
+    }
+    let allow: Vec<String> = coordinator_tool_set()
+        .iter()
+        .copied()
+        .filter(|name| is_allowed_in_coordinator_mode(name))
+        .map(str::to_string)
+        .collect();
+    registry.retain_tools(&allow);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -154,7 +173,13 @@ mod tests {
 
     #[test]
     fn allow_list_includes_agent_and_read_only_introspection() {
-        for required in ["agent", "list_files", "read_file", "grep", "shared_memory_read"] {
+        for required in [
+            "agent",
+            "list_files",
+            "read_file",
+            "grep",
+            "shared_memory_read",
+        ] {
             assert!(is_allowed_in_coordinator_mode(required));
         }
     }
@@ -178,7 +203,7 @@ mod tests {
         std::env::set_var("RECURSIVE_COORDINATOR_MODE", "1");
         let on_with_feature = cfg!(feature = "coordinator-mode");
         let _ = is_coordinator_mode(); // shouldn't panic
-        // Restore
+                                       // Restore
         match prev {
             Some(v) => std::env::set_var("RECURSIVE_COORDINATOR_MODE", v),
             None => std::env::remove_var("RECURSIVE_COORDINATOR_MODE"),
