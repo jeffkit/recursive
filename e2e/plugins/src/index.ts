@@ -19,6 +19,7 @@ import { recursiveSessionPlugin } from './session-plugin.js';
 import { recursiveCostPlugin } from './cost-plugin.js';
 import { llmJudgePlugin } from './llm-judge-plugin.js';
 import { agentJudgePlugin } from './agent-judge-plugin.js';
+import { deferredToolOrderPlugin, deferredToolAbsentPlugin } from './deferred-tool-plugin.js';
 
 const plugin: PluginModule = {
   name: 'recursive-agent',
@@ -88,6 +89,8 @@ const plugin: PluginModule = {
     recursiveCostPlugin,
     llmJudgePlugin,
     agentJudgePlugin,
+    deferredToolOrderPlugin,
+    deferredToolAbsentPlugin,
   ],
 };
 
@@ -96,3 +99,4 @@ export { recursiveSessionPlugin } from './session-plugin.js';
 export { recursiveCostPlugin } from './cost-plugin.js';
 export { llmJudgePlugin } from './llm-judge-plugin.js';
 export { agentJudgePlugin } from './agent-judge-plugin.js';
+export { deferredToolOrderPlugin, deferredToolAbsentPlugin } from './deferred-tool-plugin.js';

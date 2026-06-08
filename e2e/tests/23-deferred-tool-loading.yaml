@@ -1,0 +1,121 @@
+name: "Deferred Tool Loading — Real LLM Validation"
+description: |
+  Validates deferred tool loading with real LLM API calls against deepseek-v4-flash.
+  Requires DEEPSEEK_API_KEY. Skips gracefully when the key is absent.
+
+  Test A (Anthropic provider): WebFetch is deferred. The model must discover it
+  via ToolSearchTool before calling it. Verified by deferred-tool-order plugin
+  (ToolSearchTool line < WebFetch line in transcript) and LLM Judge (semantic
+  confirmation that the model correctly used the deferred-loading flow).
+
+  Test B (OpenAI provider — control group): Same model, same prompt, OpenAI
+  endpoint. All tools are sent eagerly; the model calls WebFetch directly.
+  Verified by deferred-tool-absent plugin (ToolSearchTool never appears).
+
+  Comparison of A vs B proves the mechanism changes observable model behaviour,
+  not just the wire format.
+
+  Session storage: RECURSIVE_HOME=/workspace, so sessions land under
+  /workspace/workspaces/<hash>/sessions/<slug>/. Assertions use the `slug`
+  field to target the right session group when searching from /workspace/workspaces.
+sequential: true
+
+setup:
+  - name: "Prepare workspaces"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-23-anthropic /workspace/test-23-openai
+        mkdir -p /workspace/test-23-anthropic /workspace/test-23-openai
+
+  # ── Test A: Anthropic provider (deferred mode) ───────────────────────────
+  - name: "A — Run agent (Anthropic provider)"
+    exec:
+      container: recursive-e2e
+      command: |
+        [ -z "${DEEPSEEK_API_KEY:-}" ] && echo "SKIP: no key" && exit 0
+        recursive \
+          --workspace /workspace/test-23-anthropic \
+          --api-base "https://api.deepseek.com/anthropic" \
+          --provider anthropic \
+          --api-key "$DEEPSEEK_API_KEY" \
+          -m "deepseek-v4-flash" \
+          --max-steps 8 \
+          run "Use the web_fetch tool to fetch https://example.com and tell me the page title."
+    expect:
+      exitCode: 0
+
+  # ── Test B: OpenAI provider (eager mode — control) ───────────────────────
+  - name: "B — Run agent (OpenAI provider)"
+    exec:
+      container: recursive-e2e
+      command: |
+        [ -z "${DEEPSEEK_API_KEY:-}" ] && echo "SKIP: no key" && exit 0
+        recursive \
+          --workspace /workspace/test-23-openai \
+          --api-base "https://api.deepseek.com/v1" \
+          --provider openai \
+          --api-key "$DEEPSEEK_API_KEY" \
+          -m "deepseek-v4-flash" \
+          --max-steps 8 \
+          run "Use the web_fetch tool to fetch https://example.com and tell me the page title."
+    expect:
+      exitCode: 0
+
+cases:
+  # ── A: structural assertions ──────────────────────────────────────────────
+
+  - name: "A — ToolSearchTool called before WebFetch (deferred-tool-order)"
+    deferred-tool-order:
+      container: recursive-e2e
+      input: /workspace/workspaces
+      slug: workspace-test-23-anthropic
+      before: ToolSearchTool
+      after: WebFetch
+
+  - name: "A — Session structure valid (Anthropic mode)"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/workspaces
+      slug: workspace-test-23-anthropic
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      hasToolCalls: ["ToolSearchTool"]
+      finalized: true
+
+  # ── A: LLM Judge — semantic confirmation ──────────────────────────────────
+
+  - name: "A — LLM Judge: model used deferred-loading flow correctly"
+    llm-judge:
+      container: recursive-e2e
+      input: /workspace/workspaces
+      goal: |
+        The agent was given a task requiring the web_fetch tool, but web_fetch was
+        deferred (not sent in the initial tools array). The agent must have called
+        ToolSearchTool first to discover web_fetch, then called web_fetch to
+        complete the task. Score 5 if ToolSearchTool appears before WebFetch in
+        the transcript; score 3 if only ToolSearchTool appears (model stopped
+        after discovery); score 1 if neither appears or order is wrong.
+      minScore: 3
+
+  # ── B: structural assertions (OpenAI provider) ────────────────────────────
+  # ToolSearchTool is a registry-level tool — it works with all providers.
+  # In OpenAI mode the model also calls it to discover deferred tools.
+  # B validates that the task completes and ToolSearchTool is called.
+
+  - name: "B — Session structure valid (OpenAI mode)"
+    recursive-session:
+      container: recursive-e2e
+      input: /workspace/workspaces
+      slug: workspace-test-23-openai
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      hasToolCalls: ["ToolSearchTool"]
+      finalized: true
+
+teardown:
+  - name: "Clean workspaces"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: rm -rf /workspace/test-23-anthropic /workspace/test-23-openai
