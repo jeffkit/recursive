@@ -270,15 +270,13 @@ pub(crate) async fn build_runtime(
             };
             let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(anthropic_retry)
-                .with_max_search_rounds(config.max_search_rounds);
+                .with_retry_policy(anthropic_retry);
             Arc::new(anthropic)
         }
         _ => {
             let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(retry)
-                .with_max_search_rounds(config.max_search_rounds);
+                .with_retry_policy(retry);
             Arc::new(openai)
         }
     };

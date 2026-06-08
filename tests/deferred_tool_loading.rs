@@ -290,16 +290,22 @@ async fn deferred_tool_absent_from_initial_tools_array() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: after ToolSearch resolves a name, the tool is promoted to the
-//         tools array and the tool_result carries tool_reference blocks.
+// Test 2: ToolSearchTool runs as a normal tool via run_core; its result is
+//         serialized as tool_reference blocks so Anthropic can expand schemas.
+//         WebFetch remains deferred (not in tools array) but the API expands
+//         it via tool_reference in the message history.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn discovered_tool_promoted_and_tool_result_has_references() {
+async fn toolsearch_result_serialized_as_tool_references() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
+    // Step 1: model calls ToolSearchTool (run_core executes it, gets ["WebFetch"])
+    // Step 2: model calls WebFetch (run_core tries to execute it — will error,
+    //         but that's fine for this test)
+    // Step 3: model returns final text
     let server = MockServer::spawn(vec![
-        // Round 0: model calls ToolSearchTool
+        // LLM step 1: model calls ToolSearchTool
         serde_json::json!({
             "type": "message",
             "content": [{
@@ -312,7 +318,7 @@ async fn discovered_tool_promoted_and_tool_result_has_references() {
             "usage": {"input_tokens": 100, "output_tokens": 20}
         })
         .to_string(),
-        // Round 1: model calls WebFetch (should be in tools now)
+        // LLM step 2: model calls WebFetch (after seeing tool_reference expansion)
         serde_json::json!({
             "type": "message",
             "content": [{
@@ -325,7 +331,7 @@ async fn discovered_tool_promoted_and_tool_result_has_references() {
             "usage": {"input_tokens": 150, "output_tokens": 30}
         })
         .to_string(),
-        // Round 2: final text
+        // LLM step 3: final text
         serde_json::json!({
             "type": "message",
             "content": [{"type": "text", "text": "Done."}],
@@ -368,42 +374,24 @@ async fn discovered_tool_promoted_and_tool_result_has_references() {
         captured.len()
     );
 
+    // ── Assertions on step 2 (after ToolSearchTool was executed) ─────────────
+    // The second LLM request should include the ToolSearch tool_result serialized
+    // as tool_reference blocks, not as a plain string.
     let body1: serde_json::Value =
-        serde_json::from_str(&captured[1].1).expect("round-1 body is valid JSON");
+        serde_json::from_str(&captured[1].1).expect("step-2 body is valid JSON");
 
-    // ── Assertions on round 1 ──────────────────────────────────────────────
-
+    // WebFetch is still deferred — it must NOT be in the tools array.
+    // Anthropic expands it via the tool_reference block in the messages.
     let names1 = tool_names_in_request(&body1);
-
-    // WebFetch must now be in the tools array (promoted after ToolSearch).
     assert!(
-        names1.contains(&"WebFetch".to_string()),
-        "WebFetch should be promoted to round-1 tools array: {:?}",
+        !names1.contains(&"WebFetch".to_string()),
+        "WebFetch should remain deferred (not in tools array): {:?}",
         names1
     );
 
-    // The promoted tool must NOT have defer_loading (it's now fully loaded).
-    let wf_def = body1["tools"]
-        .as_array()
-        .and_then(|arr| arr.iter().find(|t| t["name"] == "WebFetch"));
-    if let Some(wf) = wf_def {
-        assert!(
-            wf.get("defer_loading").is_none(),
-            "promoted WebFetch should not have defer_loading: {:?}",
-            wf
-        );
-        // Must have a real input_schema (not empty).
-        assert!(
-            wf["input_schema"].is_object(),
-            "promoted WebFetch must have input_schema: {:?}",
-            wf
-        );
-    }
-
-    // The tool_result for the ToolSearch call must have tool_reference blocks
-    // (not a plain string) so the API can expand schemas in the model context.
+    // The tool_result for the ToolSearch call must have tool_reference blocks.
     let tr = find_tool_result(&body1, "ts_call_1");
-    let tr = tr.expect("tool_result for ts_call_1 should be in round-1 messages");
+    let tr = tr.expect("tool_result for ts_call_1 should be in step-2 messages");
     let content = tr["content"]
         .as_array()
         .expect("tool_result content should be an array of tool_reference blocks");
@@ -417,13 +405,8 @@ async fn discovered_tool_promoted_and_tool_result_has_references() {
             "each item should be a tool_reference block: {:?}",
             block
         );
-        assert!(
-            block["tool_name"].is_string(),
-            "tool_reference.tool_name should be a string: {:?}",
-            block
-        );
+        assert!(block["tool_name"].is_string());
     }
-    // The resolved name should include WebFetch.
     let resolved_names: Vec<&str> = content
         .iter()
         .filter_map(|b| b["tool_name"].as_str())

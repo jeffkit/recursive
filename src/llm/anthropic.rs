@@ -3,26 +3,17 @@
 //! Targets the `/v1/messages` endpoint that Anthropic and compatible
 //! providers (MiniMax, DeepSeek) speak.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
 use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
 
-/// The name of the `ToolSearchTool` we register as a regular tool
-/// in the eager list. The model calls it like any other function
-/// tool; we recognize it by name and short-circuit the response
-/// with `tool_reference` content blocks.
-pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
-
-/// Beta header required for `defer_loading` and `tool_reference` support.
-/// Without this header, Anthropic's API ignores `defer_loading: true` and
-/// does not understand `tool_reference` content blocks.
+/// Beta header required for `tool_reference` block support in the
+/// Anthropic Messages API.
 const TOOL_SEARCH_BETA_HEADER: &str = "advanced-tool-use-2025-11-20";
 
 use crate::error::{Error, Result};
@@ -37,13 +28,6 @@ pub struct AnthropicProvider {
     temperature: f64,
     max_tokens: u32,
     retry: RetryPolicy,
-    /// Algorithm used to resolve a `ToolSearchTool` query into a
-    /// list of deferred tool names. Always non-null (defaults to
-    /// `KeywordSearchEngine`).
-    search_engine: Arc<dyn ToolSearchEngine>,
-    /// Maximum number of ToolSearchTool round-trips per
-    /// `complete_with_search` / `stream_with_search` call.
-    max_search_rounds: usize,
 }
 
 impl AnthropicProvider {
@@ -66,8 +50,6 @@ impl AnthropicProvider {
             temperature: 0.2,
             max_tokens: 4096,
             retry: RetryPolicy::default(),
-            search_engine: Arc::new(KeywordSearchEngine::new()),
-            max_search_rounds: 3,
         })
     }
 
@@ -94,186 +76,7 @@ impl AnthropicProvider {
         self
     }
 
-    /// Replace the default `KeywordSearchEngine` with a custom
-    /// implementation. Useful for tests that want to assert on
-    /// which tools the search returns.
-    pub fn with_search_engine(mut self, engine: Arc<dyn ToolSearchEngine>) -> Self {
-        self.search_engine = engine;
-        self
-    }
-
-    /// Set the maximum number of ToolSearchTool round-trips per
-    /// `complete_with_search` / `stream_with_search` call.
-    pub fn with_max_search_rounds(mut self, n: usize) -> Self {
-        self.max_search_rounds = n;
-        self
-    }
-
-    /// The `ToolSearchTool` spec — registered as a regular tool in
-    /// the eager list. The model calls it like any other function
-    /// tool; we recognize the call by `name == "ToolSearchTool"`.
-    fn tool_search_spec() -> (ToolSpec, Option<String>) {
-        let description = "Fetches full schema definitions for deferred tools so they can be \
-            called. Until fetched, only the name is known — there is no parameter schema, so \
-            the tool cannot be invoked. Use `select:<tool_name>` for direct selection, or \
-            keywords to search."
-            .to_string();
-        let search_hint = Some("find search discover discover tools lookup".to_string());
-        let spec = ToolSpec {
-            name: TOOL_SEARCH_TOOL_NAME.to_string(),
-            description,
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Query to find deferred tools. Use \"select:<tool_name>\" \
-                            for direct selection, or keywords to search."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 5)",
-                        "default": 5
-                    }
-                },
-                "required": ["query"]
-            }),
-        };
-        (spec, search_hint)
-    }
-
-    /// The core search-aware loop. Each iteration:
-    ///
-    /// 1. Partition deferred tools into "discovered" (previously found via
-    ///    ToolSearchTool in message history) and "still-deferred".
-    /// 2. Discovered tools are promoted into the eager list with their full
-    ///    schema so the model can call them directly this round.
-    /// 3. Still-deferred tools are NOT sent in the tools array at all.
-    ///    Their names are injected as an `<available-deferred-tools>` block
-    ///    in the first user message so the model knows they exist.
-    /// 4. Build the request with: ToolSearchTool + caller-eager + discovered.
-    /// 5. Send and parse.
-    /// 6. If the model called ToolSearchTool, resolve the query, store the
-    ///    resolved names in the marker message content (JSON array), and
-    ///    recurse so the next round can promote them to eager.
-    async fn run_search_aware_loop(
-        &self,
-        messages: &[Message],
-        eager_tools: &[SpecWithHint],
-        deferred_tools: &[SpecWithHint],
-        round: usize,
-    ) -> Result<Completion> {
-        let (system, msgs) = extract_system_message(messages);
-        let msgs = filter_leading_assistant(&msgs);
-
-        // Promote deferred tools that were discovered in earlier ToolSearch rounds.
-        let discovered = extract_discovered_tool_names(&msgs);
-        let (promoted, still_deferred): (Vec<_>, Vec<_>) = deferred_tools
-            .iter()
-            .partition(|(spec, _)| discovered.contains(&spec.name));
-
-        // Only inject ToolSearchTool when there are still-deferred tools the
-        // model can search for. If everything is either eager or already
-        // discovered (promoted), ToolSearchTool serves no purpose.
-        let has_searchable_deferred = !still_deferred.is_empty();
-
-        let mut all_eager: Vec<SpecWithHint> =
-            Vec::with_capacity(1 + eager_tools.len() + promoted.len());
-        if has_searchable_deferred {
-            all_eager.push(Self::tool_search_spec());
-        }
-        all_eager.extend_from_slice(eager_tools);
-        all_eager.extend(promoted.into_iter().cloned());
-
-        // Inject still-deferred names as the first user message so the model
-        // knows what it can search for, without exposing full schemas.
-        let msgs = inject_available_deferred(&msgs, &still_deferred);
-
-        let body = build_request_with_eager_only(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            system.as_deref(),
-            &msgs,
-            &all_eager,
-        );
-        let url = format!("{}/v1/messages", self.base_url);
-
-        let text = self.post_with_retry(&url, &body).await?;
-        let parsed: AnthropicResponse = serde_json::from_str(&text)
-            .map_err(|e| self.make_err(format!("failed to parse response: {e}; body: {text}")))?;
-        let completion = parse_completion(parsed);
-
-        // If the model called ToolSearchTool, resolve and recurse.
-        if let Some(search_call) = completion
-            .tool_calls
-            .iter()
-            .find(|c| c.name == TOOL_SEARCH_TOOL_NAME)
-        {
-            if round >= self.max_search_rounds {
-                tracing::warn!(
-                    target: "recursive::llm",
-                    round,
-                    max = self.max_search_rounds,
-                    "ToolSearchTool: hit max_search_rounds, returning current completion"
-                );
-                return Ok(completion);
-            }
-            let query = search_call
-                .arguments
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let max_results = search_call
-                .arguments
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            let names = self.search_engine.resolve(query, deferred_tools);
-            let names: Vec<String> = match max_results {
-                Some(n) => names.into_iter().take(n).collect(),
-                None => names,
-            };
-
-            // Store resolved names as JSON in the marker message content so
-            // extract_discovered_tool_names can find them in the next round.
-            let names_json = serde_json::to_string(&names).unwrap_or_default();
-
-            let mut next_messages = msgs.clone();
-            next_messages.push(Message {
-                role: Role::Assistant,
-                content: completion.content.clone(),
-                tool_calls: completion.tool_calls.clone(),
-                tool_call_id: None,
-                reasoning_content: completion.reasoning_content.clone(),
-            });
-            // Marker user message: tool_call_id identifies it as a ToolSearch
-            // result; content holds the resolved names as a JSON array string
-            // so the next round can extract them via extract_discovered_tool_names.
-            next_messages.push(Message {
-                role: Role::User,
-                content: names_json,
-                tool_calls: Vec::new(),
-                tool_call_id: Some(search_call.id.clone()),
-                reasoning_content: None,
-            });
-
-            return Box::pin(self.run_search_aware_loop(
-                &next_messages,
-                eager_tools,
-                deferred_tools,
-                round + 1,
-            ))
-            .await;
-        }
-
-        Ok(completion)
-    }
-
-    /// POST `body` to `url` with the standard retry policy. Returns
-    /// the response body as a string. Used by both
-    /// `complete_with_search` (via `run_search_aware_loop`) and
-    /// `stream_inner`.
+    /// POST `body` to `url` with the standard retry policy.
     async fn post_with_retry(&self, url: &str, body: &Value) -> Result<String> {
         let mut attempt = 0;
         loop {
@@ -334,6 +137,11 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    /// Send a completion request. The caller (`run_core`) is responsible for
+    /// injecting `<available-deferred-tools>` into the messages and passing
+    /// only eager tool specs. ToolSearchTool results in the message history
+    /// are serialized as `tool_reference` blocks by
+    /// `serialize_messages_anthropic`.
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let (system, messages) = extract_system_message(messages);
         let messages = filter_leading_assistant(&messages);
@@ -360,202 +168,11 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<Completion> {
         self.stream_inner(messages, tools, stream_tx).await
     }
-
-    /// Search-aware completion: model sees eager tools + the
-    /// `ToolSearchTool`; deferred tools are sent with
-    /// `defer_loading: true` and only become callable after the
-    /// model asks for them via `ToolSearchTool`.
-    async fn complete_with_search(
-        &self,
-        messages: &[Message],
-        eager_tools: &[(ToolSpec, Option<String>)],
-        deferred_tools: &[(ToolSpec, Option<String>)],
-    ) -> Result<Completion> {
-        self.run_search_aware_loop(messages, eager_tools, deferred_tools, 0)
-            .await
-    }
-
-    /// Search-aware streaming: promotes already-discovered deferred tools,
-    /// injects `<available-deferred-tools>` for the rest, and handles
-    /// multi-round ToolSearch across streaming calls.
-    async fn stream_with_search(
-        &self,
-        messages: &[Message],
-        eager_tools: &[(ToolSpec, Option<String>)],
-        deferred_tools: &[(ToolSpec, Option<String>)],
-        stream_tx: Option<StreamSender>,
-    ) -> Result<Completion> {
-        self.run_stream_search_loop(messages, eager_tools, deferred_tools, 0, stream_tx)
-            .await
-    }
 }
 
 impl AnthropicProvider {
-    /// Streaming version of the search-aware loop. Mirrors `run_search_aware_loop`
-    /// but uses SSE streaming so the user sees tokens as they arrive.
-    async fn run_stream_search_loop(
-        &self,
-        messages: &[Message],
-        eager_tools: &[SpecWithHint],
-        deferred_tools: &[SpecWithHint],
-        round: usize,
-        stream_tx: Option<StreamSender>,
-    ) -> Result<Completion> {
-        let (system, msgs) = extract_system_message(messages);
-        let msgs = filter_leading_assistant(&msgs);
-
-        let discovered = extract_discovered_tool_names(&msgs);
-        let (promoted, still_deferred): (Vec<_>, Vec<_>) = deferred_tools
-            .iter()
-            .partition(|(spec, _)| discovered.contains(&spec.name));
-
-        let has_searchable_deferred = !still_deferred.is_empty();
-        let mut all_eager: Vec<SpecWithHint> =
-            Vec::with_capacity(1 + eager_tools.len() + promoted.len());
-        if has_searchable_deferred {
-            all_eager.push(Self::tool_search_spec());
-        }
-        all_eager.extend_from_slice(eager_tools);
-        all_eager.extend(promoted.into_iter().cloned());
-
-        let msgs = inject_available_deferred(&msgs, &still_deferred);
-
-        let mut body = build_request_with_eager_only(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            system.as_deref(),
-            &msgs,
-            &all_eager,
-        );
-        body["stream"] = Value::Bool(true);
-
-        let completion = self.stream_with_body(body, stream_tx.clone()).await?;
-
-        if let Some(search_call) = completion
-            .tool_calls
-            .iter()
-            .find(|c| c.name == TOOL_SEARCH_TOOL_NAME)
-        {
-            if round >= self.max_search_rounds {
-                tracing::warn!(
-                    target: "recursive::llm",
-                    round,
-                    max = self.max_search_rounds,
-                    "ToolSearchTool (stream): hit max_search_rounds, returning current completion"
-                );
-                return Ok(completion);
-            }
-            let query = search_call
-                .arguments
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let max_results = search_call
-                .arguments
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            let names = self.search_engine.resolve(query, deferred_tools);
-            let names: Vec<String> = match max_results {
-                Some(n) => names.into_iter().take(n).collect(),
-                None => names,
-            };
-            let names_json = serde_json::to_string(&names).unwrap_or_default();
-
-            let mut next_messages = msgs.clone();
-            next_messages.push(Message {
-                role: Role::Assistant,
-                content: completion.content.clone(),
-                tool_calls: completion.tool_calls.clone(),
-                tool_call_id: None,
-                reasoning_content: completion.reasoning_content.clone(),
-            });
-            next_messages.push(Message {
-                role: Role::User,
-                content: names_json,
-                tool_calls: Vec::new(),
-                tool_call_id: Some(search_call.id.clone()),
-                reasoning_content: None,
-            });
-
-            return Box::pin(self.run_stream_search_loop(
-                &next_messages,
-                eager_tools,
-                deferred_tools,
-                round + 1,
-                stream_tx,
-            ))
-            .await;
-        }
-
-        Ok(completion)
-    }
-
     /// Send a pre-built request body as a streaming call and return the
     /// accumulated `Completion`. Handles HTTP retry internally.
-    async fn stream_with_body(
-        &self,
-        body: Value,
-        stream_tx: Option<StreamSender>,
-    ) -> Result<Completion> {
-        let url = format!("{}/v1/messages", self.base_url);
-        let mut attempt = 0;
-        loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (stream/search)", url);
-            let result = self
-                .client
-                .post(&url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", TOOL_SEARCH_BETA_HEADER)
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return self.parse_sse_stream(resp, stream_tx).await;
-                    }
-                    let text = resp.text().await?;
-                    if let Some(backoff) =
-                        self.retry
-                            .backoff_for(attempt, Some(status.as_u16()), false)
-                    {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            status = status.as_u16(),
-                            "transient HTTP error, retrying (stream/search)"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
-                }
-                Err(e) => {
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
-                        tracing::warn!(
-                            target: "recursive::llm",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                            error = %e,
-                            "network error, retrying (stream/search)"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(self.make_err(format!("request failed: {e}")));
-                }
-            }
-        }
-    }
-
     /// Internal streaming implementation.
     async fn stream_inner(
         &self,
@@ -586,6 +203,7 @@ impl AnthropicProvider {
                 .post(&url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", TOOL_SEARCH_BETA_HEADER)
                 .header("content-type", "application/json")
                 .json(&body)
                 .send()
@@ -933,89 +551,6 @@ fn build_request(
     req
 }
 
-/// Build a request body with only eager tools. Used by the search-aware
-/// completion path: deferred tools are handled by injecting an
-/// `<available-deferred-tools>` block into the messages instead of being
-/// sent in the tools array.
-fn build_request_with_eager_only(
-    model: &str,
-    temperature: f64,
-    max_tokens: u32,
-    system: Option<&str>,
-    messages: &[Message],
-    eager_tools: &[SpecWithHint],
-) -> Value {
-    let mut req = serde_json::json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    });
-
-    if let Some(sys) = system {
-        req["system"] = Value::String(sys.to_string());
-    }
-
-    req["messages"] = Value::Array(serialize_messages_anthropic(messages));
-
-    if !eager_tools.is_empty() {
-        let tools_json: Vec<Value> = eager_tools
-            .iter()
-            .map(|(spec, _)| {
-                serde_json::json!({
-                    "name": spec.name,
-                    "description": spec.description,
-                    "input_schema": spec.parameters,
-                })
-            })
-            .collect();
-        req["tools"] = Value::Array(tools_json);
-    }
-
-    req
-}
-
-/// Extract the set of tool names that have been discovered via ToolSearchTool
-/// in the message history. A tool is "discovered" when a ToolSearch marker
-/// message (tool_call_id set, content is a JSON array of names) exists in
-/// the transcript. These tools can be promoted to eager (full schema) for the
-/// next LLM round.
-fn extract_discovered_tool_names(messages: &[Message]) -> std::collections::HashSet<String> {
-    let mut discovered = std::collections::HashSet::new();
-    for msg in messages {
-        if msg.tool_call_id.is_some() && msg.content.starts_with('[') {
-            if let Ok(names) = serde_json::from_str::<Vec<String>>(&msg.content) {
-                discovered.extend(names);
-            }
-        }
-    }
-    discovered
-}
-
-/// Inject an `<available-deferred-tools>` block as the first user message
-/// so the model knows which deferred tools it can ask for via ToolSearchTool.
-/// Returns a new message list with the block prepended (or the original list
-/// unchanged if there are no still-deferred tools).
-fn inject_available_deferred(
-    messages: &[Message],
-    still_deferred: &[&SpecWithHint],
-) -> Vec<Message> {
-    if still_deferred.is_empty() {
-        return messages.to_vec();
-    }
-    let names: Vec<&str> = still_deferred
-        .iter()
-        .map(|(s, _)| s.name.as_str())
-        .collect();
-    let block = format!(
-        "<available-deferred-tools>\n{}\n</available-deferred-tools>",
-        names.join("\n")
-    );
-    let mut result = Vec::with_capacity(messages.len() + 1);
-    result.push(Message::user(block));
-    result.extend_from_slice(messages);
-    result
-}
-
 fn serialize_message(m: &Message) -> Value {
     let role = match m.role {
         Role::System => "system",
@@ -1236,6 +771,8 @@ fn parse_completion(response: AnthropicResponse) -> Completion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::TOOL_SEARCH_TOOL_NAME;
+    use serde_json::json;
 
     #[test]
     fn extract_system_message_when_present() {
@@ -1858,50 +1395,42 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(policy.backoff_for(0, Some(404), false), None);
     }
 
-    #[test]
-    fn build_request_with_eager_only_sends_only_eager_tools() {
-        let eager = vec![
-            (
-                ToolSpec {
-                    name: "ToolSearchTool".to_string(),
-                    description: "search".to_string(),
-                    parameters: json!({"type": "object"}),
-                },
-                None,
-            ),
-            (
-                ToolSpec {
-                    name: "Read".to_string(),
-                    description: "Read a file".to_string(),
-                    parameters: json!({"type": "object"}),
-                },
-                None,
-            ),
-        ];
-        let body = build_request_with_eager_only(
-            "claude-3",
-            0.2,
-            4096,
-            None,
-            &[Message::user("hi")],
-            &eager,
-        );
+    // ToolSearchTool is now a regular tool handled by run_core, not by the
+    // provider. The provider only needs to:
+    //   1. Serialize ToolSearch tool_result as tool_reference blocks.
+    //   2. Send whatever specs run_core passes (already filtered to eager).
+    // The following tests verify these two responsibilities.
 
-        let tools = body["tools"].as_array().expect("tools should be an array");
+    #[test]
+    fn build_request_serializes_passed_specs_verbatim() {
+        let specs = vec![
+            ToolSpec {
+                name: "ToolSearchTool".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "Read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+        ];
+        let body = build_request("claude-3", 0.2, 4096, None, &[Message::user("hi")], &specs);
+        let tools = body["tools"].as_array().expect("tools should be array");
         assert_eq!(tools.len(), 2);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ToolSearchTool"));
         assert!(names.contains(&"Read"));
-        // Every tool has full input_schema — no stubs.
         for t in tools {
-            assert!(t.get("defer_loading").is_none());
             assert!(t["input_schema"].is_object());
         }
     }
 
     #[test]
-    fn serialize_messages_encodes_toolsearch_marker_as_tool_references() {
-        // ToolSearch marker: tool_call_id + content = JSON array of names.
+    fn serialize_messages_encodes_toolsearch_result_as_tool_references() {
+        // When a ToolSearchTool result message has content that is a JSON
+        // array of tool names, serialize_messages_anthropic must emit
+        // tool_reference content blocks so Anthropic can expand them.
         let msgs = vec![
             Message::user("search for foo"),
             Message::assistant_with_tool_calls(
@@ -1912,7 +1441,6 @@ data: {\"type\":\"message_stop\"}
                     arguments: json!({"query": "foo"}),
                 }],
             ),
-            // Marker: content is JSON array of resolved names.
             Message {
                 role: Role::User,
                 content: r#"["notebook_edit"]"#.to_string(),
@@ -1937,232 +1465,53 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(inner[0]["tool_name"], "notebook_edit");
     }
 
-    #[test]
-    fn extract_discovered_tool_names_finds_markers() {
-        let msgs = vec![
-            Message::user("hi"),
-            Message {
-                role: Role::User,
-                content: r#"["WebFetch","NotebookEdit"]"#.to_string(),
-                tool_calls: Vec::new(),
-                tool_call_id: Some("call_1".to_string()),
-                reasoning_content: None,
-            },
-        ];
-        let discovered = extract_discovered_tool_names(&msgs);
-        assert!(discovered.contains("WebFetch"));
-        assert!(discovered.contains("NotebookEdit"));
-        assert_eq!(discovered.len(), 2);
-    }
-
-    #[test]
-    fn inject_available_deferred_prepends_block() {
-        let msgs = vec![Message::user("hi")];
-        let deferred_spec = ToolSpec {
-            name: "WebFetch".to_string(),
-            description: "fetch".to_string(),
-            parameters: json!({}),
-        };
-        let deferred: Vec<SpecWithHint> = vec![(deferred_spec, None)];
-        let deferred_refs: Vec<&SpecWithHint> = deferred.iter().collect();
-        let result = inject_available_deferred(&msgs, &deferred_refs);
-        assert_eq!(result.len(), 2);
-        assert!(result[0].content.contains("<available-deferred-tools>"));
-        assert!(result[0].content.contains("WebFetch"));
-        assert_eq!(result[1].content, "hi");
-    }
-
     #[tokio::test]
-    async fn complete_with_search_round_trips_tool_reference() {
-        // Mock server that:
-        //   - On request 1, returns a `ToolSearchTool` tool_use.
-        //   - On request 2, returns a real `notebook_edit` tool_use.
-        // The test asserts:
-        //   - The final Completion is the `notebook_edit` call.
-        //   - The first request's body has ToolSearchTool + Read (eager);
-        //     notebook_edit is NOT in the tools array (only in the
-        //     <available-deferred-tools> message).
-        //   - The second request's tools array contains notebook_edit with
-        //     full schema (promoted after discovery) and the tool_result
-        //     has tool_reference content blocks.
+    async fn complete_sends_specs_and_returns_tool_call() {
+        // Verify the provider sends whatever specs it receives and parses
+        // the response correctly. The deferred-tool filtering is done by
+        // run_core before calling complete(), so the provider sees only
+        // eager specs here.
         use std::io::{Read, Write};
-        use std::sync::{Arc, Mutex};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let captured_clone = captured.clone();
         std::thread::spawn(move || {
-            for i in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 16384];
-                let mut acc = Vec::new();
-                // Read headers + body. For a small test request,
-                // the first read should grab everything.
-                loop {
-                    let n = stream.read(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    acc.extend_from_slice(&buf[..n]);
-                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&acc).to_string();
-                let body = request
-                    .split("\r\n\r\n")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                captured_clone.lock().unwrap().push(body);
-
-                let response_body = if i == 0 {
-                    // First request: model calls ToolSearchTool
-                    // looking for the deferred `notebook_edit`.
-                    r#"{"type":"message","content":[{"type":"tool_use","id":"call_search_1","name":"ToolSearchTool","input":{"query":"jupyter","max_results":3}}],"stop_reason":"tool_use","usage":{"input_tokens":50,"output_tokens":10}}"#
-                } else {
-                    // Second request: model now calls the
-                    // resolved deferred tool.
-                    r#"{"type":"message","content":[{"type":"tool_use","id":"call_real_1","name":"notebook_edit","input":{"path":"analysis.ipynb"}}],"stop_reason":"tool_use","usage":{"input_tokens":80,"output_tokens":20}}"#
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response_body.len(),
-                    response_body,
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-                stream.flush().unwrap();
-            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let response_body = r#"{"type":"message","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"path":"foo.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":50,"output_tokens":10}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
 
-        // Pretend "Read" is eager (always available) and
-        // "notebook_edit" is deferred (needs ToolSearchTool).
-        let eager = vec![(
+        let specs = vec![
+            ToolSpec {
+                name: "ToolSearchTool".to_string(),
+                description: "search for deferred tools".to_string(),
+                parameters: json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+            },
             ToolSpec {
                 name: "Read".to_string(),
-                description: "Read a UTF-8 text file under the workspace.".to_string(),
+                description: "Read a file".to_string(),
                 parameters: json!({"type": "object"}),
             },
-            None,
-        )];
-        let deferred = vec![(
-            ToolSpec {
-                name: "notebook_edit".to_string(),
-                description: "Edit a Jupyter notebook cell.".to_string(),
-                parameters: json!({"type": "object"}),
-            },
-            Some("jupyter notebook".to_string()),
-        )];
+        ];
 
         let result = provider
-            .complete_with_search(&[Message::user("find and read a file")], &eager, &deferred)
-            .await;
+            .complete(&[Message::user("read foo.txt")], &specs)
+            .await
+            .expect("should succeed");
 
-        let captured_bodies = captured.lock().unwrap().clone();
-        assert_eq!(
-            captured_bodies.len(),
-            2,
-            "expected two requests, got {}",
-            captured_bodies.len()
-        );
-
-        // First request: only ToolSearchTool + Read in tools array.
-        // notebook_edit must NOT be in tools — it's deferred and appears
-        // only in the <available-deferred-tools> message.
-        let body1: serde_json::Value = serde_json::from_str(&captured_bodies[0]).unwrap();
-        let tools1 = body1["tools"].as_array().expect("tools should be array");
-        let tool_names: Vec<&str> = tools1
-            .iter()
-            .map(|t| t["name"].as_str().unwrap_or(""))
-            .collect();
-        assert!(
-            tool_names.contains(&"ToolSearchTool"),
-            "missing ToolSearchTool in {:?}",
-            tool_names
-        );
-        assert!(
-            tool_names.contains(&"Read"),
-            "missing Read in {:?}",
-            tool_names
-        );
-        assert!(
-            !tool_names.contains(&"notebook_edit"),
-            "notebook_edit should NOT be in tools array on round 0: {:?}",
-            tool_names
-        );
-        // The deferred tool list should be in the first user message.
-        let msgs1 = body1["messages"].as_array().unwrap();
-        let first_user = msgs1
-            .iter()
-            .find(|m| m["role"] == "user")
-            .expect("should have a user message");
-        let first_content = first_user["content"].as_str().unwrap_or("");
-        assert!(
-            first_content.contains("available-deferred-tools"),
-            "first user message should contain <available-deferred-tools>: {:?}",
-            first_content
-        );
-        assert!(
-            first_content.contains("notebook_edit"),
-            "deferred list should name notebook_edit: {:?}",
-            first_content
-        );
-
-        // Second request: notebook_edit should now be in the tools array
-        // with full schema (promoted after discovery via ToolSearch).
-        let body2: serde_json::Value = serde_json::from_str(&captured_bodies[1]).unwrap();
-        let tools2 = body2["tools"].as_array().expect("tools2 should be array");
-        let tool_names2: Vec<&str> = tools2
-            .iter()
-            .map(|t| t["name"].as_str().unwrap_or(""))
-            .collect();
-        assert!(
-            tool_names2.contains(&"notebook_edit"),
-            "notebook_edit should be promoted to tools array on round 1: {:?}",
-            tool_names2
-        );
-        // Promoted tool must have its real (non-empty) schema.
-        let nb = tools2
-            .iter()
-            .find(|t| t["name"] == "notebook_edit")
-            .unwrap();
-        assert!(
-            nb.get("defer_loading").is_none(),
-            "promoted tool should not have defer_loading: {:?}",
-            nb
-        );
-        // The tool_result message should carry tool_reference blocks.
-        let msgs2 = body2["messages"].as_array().unwrap();
-        let last = &msgs2[msgs2.len() - 1];
-        assert_eq!(last["role"], "user");
-        let content = last["content"].as_array().expect("content should be array");
-        let tool_result = content
-            .iter()
-            .find(|c| c["type"] == "tool_result")
-            .expect("expected a tool_result block");
-        assert_eq!(tool_result["tool_use_id"], "call_search_1");
-        let refs = tool_result["content"]
-            .as_array()
-            .expect("tool_result.content should be an array");
-        assert!(!refs.is_empty(), "tool_reference array should be non-empty");
-        for r in refs {
-            assert_eq!(r["type"], "tool_reference");
-            assert!(r["tool_name"].is_string());
-        }
-
-        // Final completion should be the notebook_edit call
-        // (the deferred tool that the model asked to resolve).
-        let completion = result.expect("should succeed");
-        assert_eq!(completion.tool_calls.len(), 1);
-        let tc = &completion.tool_calls[0];
-        assert_eq!(tc.name, "notebook_edit");
-        assert_eq!(tc.arguments["path"], "analysis.ipynb");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "Read");
     }
 }

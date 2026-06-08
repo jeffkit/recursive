@@ -190,6 +190,7 @@ pub mod team_create;
 #[cfg(feature = "coordinator-mode")]
 pub mod team_delete;
 pub mod todo;
+pub mod tool_search;
 pub mod transport;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
@@ -249,6 +250,7 @@ pub use team_create::TeamCreateTool;
 #[cfg(feature = "coordinator-mode")]
 pub use team_delete::TeamDeleteTool;
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
+pub use tool_search::{DeferredCatalog, ToolSearchTool, TOOL_SEARCH_TOOL_NAME};
 pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
 #[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
@@ -680,6 +682,23 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
+    /// Return (eager_specs, deferred_specs).
+    /// Eager tools are sent to the LLM with full schemas.
+    /// Deferred tools are not — their names appear in
+    /// `<available-deferred-tools>` so the model can call ToolSearchTool.
+    pub fn specs_partitioned(&self) -> (Vec<ToolSpec>, Vec<ToolSpec>) {
+        let mut eager = Vec::new();
+        let mut deferred = Vec::new();
+        for tool in self.tools.values() {
+            if tool.is_deferred() {
+                deferred.push(tool.spec());
+            } else {
+                eager.push(tool.spec());
+            }
+        }
+        (eager, deferred)
+    }
+
     /// Restrict the registry to only the named tools, removing all others.
     /// Tool names are matched case-insensitively. Aliases for removed tools
     /// are also dropped. Used by `--allow-tools` to give agents a limited
@@ -728,6 +747,28 @@ impl ToolRegistry {
             .get(&spec.name)
             .map(|t| t.is_deferred())
             .unwrap_or(false)
+    }
+
+    /// Finalize deferred tool support: collect all deferred tool specs into a
+    /// shared catalog and register a `ToolSearchTool` backed by that catalog.
+    ///
+    /// Call this once after all other tools have been registered. If there are
+    /// no deferred tools, this is a no-op (ToolSearchTool is not registered).
+    pub fn freeze_deferred_specs(&mut self) {
+        let deferred_specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .filter(|t| t.is_deferred())
+            .map(|t| t.spec())
+            .collect();
+
+        if deferred_specs.is_empty() {
+            return;
+        }
+
+        let catalog: DeferredCatalog = Arc::new(std::sync::RwLock::new(deferred_specs));
+        let tool = Arc::new(ToolSearchTool::new(catalog));
+        self.tools.insert(TOOL_SEARCH_TOOL_NAME.to_string(), tool);
     }
 
     pub fn names(&self) -> Vec<String> {

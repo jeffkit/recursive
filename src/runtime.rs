@@ -1329,6 +1329,9 @@ impl AgentRuntimeBuilder {
                 )));
         }
 
+        // Register ToolSearchTool if any deferred tools are present.
+        kernel.tools_mut().freeze_deferred_specs();
+
         Ok(AgentRuntime {
             kernel,
             transcript,
