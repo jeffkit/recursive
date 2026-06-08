@@ -3,43 +3,59 @@ description: "Verify agent can use scratchpad_set and data persists."
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-03
+        rm -rf /tmp/recursive-home-03
+        rm -rf /tmp/sessions-03
+        rm -rf /tmp/scratchpad-03.json
         mkdir -p /workspace/test-03
+        mkdir -p /tmp/recursive-home-03
         echo prepared
 
   - name: "Run agent (act): scratchpad_set + scratchpad_list"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-03
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 10
-        run "Use the scratchpad_set tool to store the key 'test_color' with value 'blue'. Then use scratchpad_list to confirm it's stored. Do nothing else."
+      command: |
+        RECURSIVE_HOME=/tmp/recursive-home-03 \
+        recursive --workspace /workspace/test-03 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 10 \
+          run "Use the scratchpad_set tool to store the key 'test_color' with value 'blue'. Then use scratchpad_list to confirm it's stored. Do nothing else."
+        SESSION_DIR=$(find /tmp/recursive-home-03 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-03
+          cp -r "$SESSION_DIR/." /tmp/sessions-03/
+        fi
+        SP=$(find /tmp/recursive-home-03 -name 'scratchpad.json' 2>/dev/null | head -1)
+        if [ -n "$SP" ]; then
+          cp "$SP" /tmp/scratchpad-03.json
+        fi
 
 cases:
   - name: "scratchpad.json contains the stored key"
     file:
       container: recursive-e2e
-      path: /workspace/test-03/.recursive/scratchpad.json
+      path: /tmp/scratchpad-03.json
       exists: true
       contains: "test_color"
 
   - name: "Session recorded scratchpad_set call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-03/.recursive/sessions
+      input: /tmp/sessions-03
       status: ["completed", "success"]
       hasToolCalls: ["scratchpad_set"]
 
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy + scratchpad"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-03
+      command: |
+        rm -rf /workspace/test-03
+        rm -rf /tmp/recursive-home-03
+        rm -rf /tmp/sessions-03
+        rm -f /tmp/scratchpad-03.json

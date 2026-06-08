@@ -3,36 +3,46 @@ description: "Verify cost.json is produced with valid token data."
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-04
+        rm -rf /tmp/recursive-home-04
+        rm -rf /tmp/sessions-04
         mkdir -p /workspace/test-04
+        mkdir -p /tmp/recursive-home-04
         echo prepared
 
   - name: "Run agent (act): say hello, no tools"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-04
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 5
-        run "Say hello. Do not use any tools."
+      command: |
+        RECURSIVE_HOME=/tmp/recursive-home-04 \
+        recursive --workspace /workspace/test-04 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 5 \
+          run "Say hello. Do not use any tools."
+        SESSION_DIR=$(find /tmp/recursive-home-04 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-04
+          cp -r "$SESSION_DIR/." /tmp/sessions-04/
+        fi
 
 cases:
   - name: "Cost data is valid (file exists, prompt tokens > 0)"
     recursive-cost:
       container: recursive-e2e
-      input: /workspace/test-04/.recursive/sessions
+      input: /tmp/sessions-04
       exists: true
       minPromptTokens: 1
 
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-04
+      command: |
+        rm -rf /workspace/test-04
+        rm -rf /tmp/recursive-home-04
+        rm -rf /tmp/sessions-04

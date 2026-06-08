@@ -3,30 +3,37 @@ description: "Verify session produces valid .meta.json + transcript.jsonl."
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-02
+        rm -rf /tmp/recursive-home-02
+        rm -rf /tmp/sessions-02
         mkdir -p /workspace/test-02
+        mkdir -p /tmp/recursive-home-02
         echo prepared
 
   - name: "Run agent (act): list_dir on workspace root"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-02
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 10
-        run "List the files in the workspace root using list_dir tool."
+      command: |
+        RECURSIVE_HOME=/tmp/recursive-home-02 \
+        recursive --workspace /workspace/test-02 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 10 \
+          run "List the files in the workspace root using list_dir tool."
+        SESSION_DIR=$(find /tmp/recursive-home-02 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-02
+          cp -r "$SESSION_DIR/." /tmp/sessions-02/
+        fi
 
 cases:
   - name: "Session structure is valid"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-02/.recursive/sessions
+      input: /tmp/sessions-02
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
       hasToolCalls: ["list_dir"]
@@ -34,8 +41,11 @@ cases:
       finalized: true
 
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-02
+      command: |
+        rm -rf /workspace/test-02
+        rm -rf /tmp/recursive-home-02
+        rm -rf /tmp/sessions-02

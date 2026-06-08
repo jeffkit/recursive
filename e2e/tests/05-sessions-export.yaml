@@ -3,30 +3,37 @@ description: "Verify `sessions list` command and the resulting session is valid.
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-05
+        rm -rf /tmp/recursive-home-05
+        rm -rf /tmp/sessions-05
         mkdir -p /workspace/test-05
+        mkdir -p /tmp/recursive-home-05
         echo prepared
 
   - name: "Run agent (act): produce a minimal session"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-05
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 5
-        run "Say 'test export' and stop."
+      command: |
+        RECURSIVE_HOME=/tmp/recursive-home-05 \
+        recursive --workspace /workspace/test-05 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 5 \
+          run "Say 'test export' and stop."
+        SESSION_DIR=$(find /tmp/recursive-home-05 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-05
+          cp -r "$SESSION_DIR/." /tmp/sessions-05/
+        fi
 
 cases:
   - name: "`sessions list` succeeds and prints a session entry"
     exec:
       container: recursive-e2e
-      command: "recursive --workspace /workspace/test-05 sessions list"
+      command: "RECURSIVE_HOME=/tmp/recursive-home-05 recursive --workspace /workspace/test-05 sessions list"
     expect:
       exitCode: 0
       output:
@@ -35,13 +42,16 @@ cases:
   - name: "Session is valid"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-05/.recursive/sessions
+      input: /tmp/sessions-05
       status: ["completed", "success"]
       minMessages: 2
 
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-05
+      command: |
+        rm -rf /workspace/test-05
+        rm -rf /tmp/recursive-home-05
+        rm -rf /tmp/sessions-05

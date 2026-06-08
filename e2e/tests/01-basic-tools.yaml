@@ -3,24 +3,31 @@ description: "Verify agent uses write_file to create a file via mock LLM."
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-01
+        rm -rf /tmp/recursive-home-01
+        rm -rf /tmp/sessions-01
         mkdir -p /workspace/test-01
+        mkdir -p /tmp/recursive-home-01
         echo prepared
 
   - name: "Run agent (act): create hello.txt via write_file"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-01
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 10
-        run "Create a file called hello.txt in the workspace root with exactly the content 'world'. Use write_file tool. Do NOT use any other tool after that."
+      command: |
+        RECURSIVE_HOME=/tmp/recursive-home-01 \
+        recursive --workspace /workspace/test-01 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 10 \
+          run "Create a file called hello.txt in the workspace root with exactly the content 'world'. Use write_file tool. Do NOT use any other tool after that."
+        SESSION_DIR=$(find /tmp/recursive-home-01 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-01
+          cp -r "$SESSION_DIR/." /tmp/sessions-01/
+        fi
 
 cases:
   - name: "hello.txt exists with content 'world'"
@@ -33,15 +40,18 @@ cases:
   - name: "Session is valid and recorded write_file"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-01/.recursive/sessions
+      input: /tmp/sessions-01
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
       hasToolCalls: ["write_file"]
       minMessages: 3
 
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-01
+      command: |
+        rm -rf /workspace/test-01
+        rm -rf /tmp/recursive-home-01
+        rm -rf /tmp/sessions-01

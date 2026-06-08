@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use recursive::config::{load_project_context, Config};
+use recursive::coordinator;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
 use recursive::multi::coordinator_system_prompt;
 use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
@@ -29,9 +30,9 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let mut registry = ToolRegistry::new(transport)
-        .register(Arc::new(ReadFile::new(root)))
-        .register(Arc::new(WriteFile::new(root)))
-        .register(Arc::new(GlobTool::new(root)))
+        .register_with_aliases(Arc::new(ReadFile::new(root)), &["read_file"])
+        .register_with_aliases(Arc::new(WriteFile::new(root)), &["write_file"])
+        .register_with_aliases(Arc::new(GlobTool::new(root)), &["list_dir", "glob"])
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
@@ -270,13 +271,15 @@ pub(crate) async fn build_runtime(
             };
             let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(anthropic_retry);
+                .with_retry_policy(anthropic_retry)
+                .with_max_search_rounds(config.max_search_rounds);
             Arc::new(anthropic)
         }
         _ => {
             let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
-                .with_retry_policy(retry);
+                .with_retry_policy(retry)
+                .with_max_search_rounds(config.max_search_rounds);
             Arc::new(openai)
         }
     };
@@ -290,6 +293,11 @@ pub(crate) async fn build_runtime(
     tools = tools.with_touched_files(Arc::new(std::sync::Mutex::new(
         recursive::TouchedFiles::new(),
     )));
+
+    // Coordinator mode: when RECURSIVE_COORDINATOR_MODE=1 is set with the
+    // coordinator-mode feature, prune the tool registry to the coordinator
+    // allow-list (Read/Grep/Glob/team_*/task_*/etc.) and drop Edit/Write/Bash.
+    coordinator::filter_registry(&mut tools);
 
     // Accept both the old name (backward compat) and the clearer new name
     let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1")
