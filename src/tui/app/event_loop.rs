@@ -434,7 +434,11 @@ impl App {
     /// - All other variants — always
     ///
     /// This is idempotent and safe to call after every event.
-    pub fn flush_ready_blocks(&mut self, width: u16) {
+    /// Scan `blocks[last_printed_idx..]` and push any finalized blocks into
+    /// `print_queue`. Returns the total number of visual rows queued so the
+    /// caller can adjust `scroll_offset` to keep the user's view position stable.
+    pub fn flush_ready_blocks(&mut self, width: u16) -> u16 {
+        let mut flushed_rows: u16 = 0;
         loop {
             let i = self.last_printed_idx;
             if i >= self.blocks.len() {
@@ -445,15 +449,22 @@ impl App {
                 TranscriptBlock::Assistant { streaming, .. } => !streaming,
                 TranscriptBlock::ToolCall { result, .. } => result.is_some(),
                 TranscriptBlock::Reasoning { .. } => {
-                    // Defer until the following Assistant is finalized so
-                    // reasoning and its answer always appear together.
-                    !matches!(
-                        self.blocks.get(i + 1),
+                    // Defer flush until the next block (Assistant or ToolCall)
+                    // is finalized, so thinking always appears paired with its
+                    // response in the scrollback rather than disappearing from
+                    // the viewport as soon as it arrives.
+                    match self.blocks.get(i + 1) {
+                        // Still streaming — wait.
                         Some(TranscriptBlock::Assistant {
-                            streaming: true,
-                            ..
-                        })
-                    )
+                            streaming: true, ..
+                        }) => false,
+                        // ToolCall without a result yet — wait.
+                        Some(TranscriptBlock::ToolCall { result: None, .. }) => false,
+                        // Nothing after it yet — keep it in the viewport.
+                        None => false,
+                        // Next block is finalized: flush together.
+                        _ => true,
+                    }
                 }
                 _ => true,
             };
@@ -472,19 +483,23 @@ impl App {
                     // Extra blank before User turns.
                     pre.push(ratatui::text::Line::raw(""));
                 }
+                flushed_rows += pre.len() as u16;
                 self.print_queue.push(pre);
             }
 
             let lines = render_block(&self.blocks[i], self.theme, width);
+            flushed_rows += lines.len() as u16;
             self.print_queue.push(lines);
 
             // Extra blank after User turns (same as render_blocks).
             if is_user {
+                flushed_rows += 1;
                 self.print_queue.push(vec![ratatui::text::Line::raw("")]);
             }
 
             self.last_printed_idx += 1;
         }
+        flushed_rows
     }
 
     /// Toggle the most recent completed tool call's expanded flag.
