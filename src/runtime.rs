@@ -1330,16 +1330,10 @@ impl AgentRuntimeBuilder {
         }
 
         // Register ToolSearchTool only when the provider supports deferred
-        // tool loading (Anthropic provider type). OpenAI-compatible providers
-        // receive all tools eagerly and never see ToolSearchTool.
-        //
-        // Pass native_tool_reference() so the tool knows whether to return a
-        // compact name array (official Anthropic API, which expands it
-        // server-side) or the full JSON schemas inline (DeepSeek / MiniMax
-        // Anthropic-compatible endpoints that do not support tool_reference).
+        // tool loading via tool_reference (Anthropic API feature).
+        // OpenAI and compatible providers get all tools eagerly.
         if kernel.llm().supports_deferred_tools() {
-            let native = kernel.llm().native_tool_reference();
-            kernel.tools_mut().freeze_deferred_specs(native);
+            kernel.tools_mut().freeze_deferred_specs();
         }
 
         Ok(AgentRuntime {

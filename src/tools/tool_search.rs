@@ -33,28 +33,11 @@ pub type DeferredCatalog = Arc<RwLock<Vec<ToolSpec>>>;
 #[derive(Clone)]
 pub struct ToolSearchTool {
     catalog: DeferredCatalog,
-    /// When `true` the tool returns a JSON name array (e.g. `["WebFetch"]`).
-    /// `serialize_messages_anthropic` then converts those names to
-    /// `tool_reference` blocks that the official Anthropic API expands
-    /// server-side into full schemas.
-    ///
-    /// When `false` (non-Anthropic endpoints such as DeepSeek / MiniMax
-    /// Anthropic-compatible), the full JSON schemas are returned inline so
-    /// the model can read them directly without any server-side expansion.
-    native: bool,
 }
 
 impl ToolSearchTool {
     pub fn new(catalog: DeferredCatalog) -> Self {
-        Self {
-            catalog,
-            native: false,
-        }
-    }
-
-    pub fn with_native(mut self, native: bool) -> Self {
-        self.native = native;
-        self
+        Self { catalog }
     }
 }
 
@@ -135,18 +118,12 @@ impl Tool for ToolSearchTool {
             ));
         }
 
-        if self.native {
-            // Official Anthropic API: return a JSON name array.
-            // `serialize_messages_anthropic` converts this to `tool_reference`
-            // blocks and the API expands them into full schemas server-side.
-            let names: Vec<&str> = matched.iter().map(|s| s.name.as_str()).collect();
-            Ok(serde_json::to_string(&names).unwrap_or_default())
-        } else {
-            // Non-native endpoint (DeepSeek / MiniMax Anthropic-compatible, etc.):
-            // return the full JSON schemas so the model can call the tools directly
-            // without any server-side expansion step.
-            Ok(serde_json::to_string(&matched).unwrap_or_default())
-        }
+        // Return the resolved names as a JSON array. The Anthropic provider's
+        // message serializer (`serialize_messages_anthropic`) detects this format
+        // and converts it to `tool_reference` content blocks, which the API uses
+        // to expand full tool schemas into the model's context window.
+        let names: Vec<&str> = matched.iter().map(|s| s.name.as_str()).collect();
+        Ok(serde_json::to_string(&names).unwrap_or_default())
     }
 
     fn side_effect_class(&self) -> ToolSideEffect {
@@ -278,38 +255,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_native_returns_json_array_of_names() {
+    async fn execute_returns_json_array_of_names() {
         let catalog: DeferredCatalog =
             Arc::new(RwLock::new(vec![make_spec("WebFetch", "Fetch a URL")]));
-        let tool = ToolSearchTool::new(catalog).with_native(true);
+        let tool = ToolSearchTool::new(catalog);
         let out = tool
             .execute(json!({"query": "select:WebFetch"}))
             .await
             .unwrap();
-        // native=true: name array for Anthropic API tool_reference expansion.
+        // Output is a JSON array of resolved names — serialized as
+        // tool_reference blocks by serialize_messages_anthropic.
         let names: Vec<String> = serde_json::from_str(&out).expect("valid JSON array");
         assert!(
             names.contains(&"WebFetch".to_string()),
             "missing WebFetch: {out}"
         );
-    }
-
-    #[tokio::test]
-    async fn execute_non_native_returns_full_schemas() {
-        let catalog: DeferredCatalog =
-            Arc::new(RwLock::new(vec![make_spec("WebFetch", "Fetch a URL")]));
-        let tool = ToolSearchTool::new(catalog); // native=false by default
-        let out = tool
-            .execute(json!({"query": "select:WebFetch"}))
-            .await
-            .unwrap();
-        // native=false: full ToolSpec objects so non-Anthropic endpoints can
-        // inject the schema directly into the model's context.
-        let specs: Vec<serde_json::Value> =
-            serde_json::from_str(&out).expect("valid JSON array of specs");
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0]["name"], "WebFetch");
-        assert!(specs[0].get("parameters").is_some(), "missing parameters");
     }
 
     #[tokio::test]
