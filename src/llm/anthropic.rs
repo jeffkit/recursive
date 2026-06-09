@@ -156,13 +156,23 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
-    /// Send a completion request. The caller (`run_core`) is responsible for
-    /// injecting `<available-deferred-tools>` into the messages and passing
-    /// only eager tool specs. ToolSearchTool results in the message history
-    /// are serialized as `tool_reference` blocks by
-    /// `serialize_messages_anthropic`.
+    /// Whether to use deferred tool loading via `tool_reference` blocks.
+    ///
+    /// `tool_reference` is an Anthropic beta feature (`advanced-tool-use-2025-11-20`).
+    /// The official `api.anthropic.com` endpoint supports it; third-party
+    /// Anthropic-compatible endpoints (DeepSeek, MiniMax, etc.) typically do not.
+    /// Mirroring Claude Code's `isFirstPartyAnthropicBaseUrl()` check: only enable
+    /// deferred tools when the endpoint is the official Anthropic API.
+    ///
+    /// Users on compatible proxies can set `RECURSIVE_DEFERRED_TOOLS=true` to opt in.
     fn supports_deferred_tools(&self) -> bool {
-        true
+        if std::env::var("RECURSIVE_DEFERRED_TOOLS")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.base_url.contains("api.anthropic.com")
     }
 
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
