@@ -445,7 +445,17 @@ impl App {
                 break;
             }
             let ready = match &self.blocks[i] {
-                TranscriptBlock::User { .. } => true,
+                // Defer User flush until the response that follows is done, so
+                // the viewport always shows the current question + answer pair
+                // rather than going blank the moment the user hits Enter.
+                TranscriptBlock::User { .. } => !matches!(
+                    self.blocks.get(i + 1),
+                    Some(TranscriptBlock::Assistant {
+                        streaming: true,
+                        ..
+                    }) | Some(TranscriptBlock::ToolCall { result: None, .. })
+                        | None
+                ),
                 TranscriptBlock::Assistant { streaming, .. } => !streaming,
                 TranscriptBlock::ToolCall { result, .. } => result.is_some(),
                 TranscriptBlock::Reasoning { .. } => {
