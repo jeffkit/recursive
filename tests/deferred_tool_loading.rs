@@ -152,6 +152,10 @@ fn find_tool_result<'a>(
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn deferred_tool_absent_from_initial_tools_array() {
+    // Tests use a localhost mock; opt in to deferred tools explicitly since
+    // supports_deferred_tools() only auto-enables for api.anthropic.com.
+    std::env::set_var("RECURSIVE_DEFERRED_TOOLS", "true");
+
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
@@ -297,6 +301,8 @@ async fn deferred_tool_absent_from_initial_tools_array() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn toolsearch_result_serialized_as_tool_references() {
+    std::env::set_var("RECURSIVE_DEFERRED_TOOLS", "true");
+
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
