@@ -349,7 +349,11 @@ async fn toolsearch_result_serialized_as_tool_references() {
             "sk-noop",
             "claude-sonnet-4-6",
         )
-        .unwrap(),
+        .unwrap()
+        // Force native=true so ToolSearchTool returns name arrays and
+        // serialize_messages_anthropic converts them to tool_reference blocks,
+        // matching the real Anthropic API behaviour this test validates.
+        .with_native(true),
     );
 
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);

@@ -37,6 +37,11 @@ pub struct AnthropicProvider {
     /// search loop.
     #[allow(dead_code)]
     max_search_rounds: usize,
+    /// Override for `native_tool_reference()`. `None` means auto-detect from
+    /// `base_url` (only `api.anthropic.com` is native). Set explicitly via
+    /// `with_native(true)` in tests or when the caller knows the endpoint
+    /// supports `tool_reference` blocks.
+    native_override: Option<bool>,
 }
 
 impl AnthropicProvider {
@@ -60,6 +65,7 @@ impl AnthropicProvider {
             max_tokens: 4096,
             retry: RetryPolicy::default(),
             max_search_rounds: 3,
+            native_override: None,
         })
     }
 
@@ -92,6 +98,14 @@ impl AnthropicProvider {
     /// field doc for context).
     pub fn with_max_search_rounds(mut self, n: usize) -> Self {
         self.max_search_rounds = n;
+        self
+    }
+
+    /// Override the `native_tool_reference()` detection. Pass `true` to force
+    /// name-array output (official Anthropic API or test mocks that speak the
+    /// full Anthropic protocol including `tool_reference` expansion).
+    pub fn with_native(mut self, native: bool) -> Self {
+        self.native_override = Some(native);
         self
     }
 
@@ -163,6 +177,15 @@ impl LlmProvider for AnthropicProvider {
     /// `serialize_messages_anthropic`.
     fn supports_deferred_tools(&self) -> bool {
         true
+    }
+
+    fn native_tool_reference(&self) -> bool {
+        // Explicit override wins (used by tests and callers that know their endpoint).
+        // Auto-detect: only the official Anthropic API understands tool_reference.
+        // DeepSeek / MiniMax Anthropic-compatible endpoints do not support this
+        // beta feature, so they get inline full schemas instead.
+        self.native_override
+            .unwrap_or_else(|| self.base_url.contains("api.anthropic.com"))
     }
 
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {

@@ -754,7 +754,15 @@ impl ToolRegistry {
     ///
     /// Call this once after all other tools have been registered. If there are
     /// no deferred tools, this is a no-op (ToolSearchTool is not registered).
-    pub fn freeze_deferred_specs(&mut self) {
+    /// Finalise deferred tool support: collect all deferred tool specs into a
+    /// shared catalog and register a `ToolSearchTool` backed by that catalog.
+    ///
+    /// `native` controls the response format:
+    /// - `true`  → name-array output (official Anthropic API, expands via
+    ///   `tool_reference` blocks server-side).
+    /// - `false` → full JSON schema output (Anthropic-compatible endpoints
+    ///   like DeepSeek / MiniMax that don't support `tool_reference`).
+    pub fn freeze_deferred_specs(&mut self, native: bool) {
         let deferred_specs: Vec<ToolSpec> = self
             .tools
             .values()
@@ -767,7 +775,7 @@ impl ToolRegistry {
         }
 
         let catalog: DeferredCatalog = Arc::new(std::sync::RwLock::new(deferred_specs));
-        let tool = Arc::new(ToolSearchTool::new(catalog));
+        let tool = Arc::new(ToolSearchTool::new(catalog).with_native(native));
         self.tools.insert(TOOL_SEARCH_TOOL_NAME.to_string(), tool);
     }
 

@@ -240,6 +240,20 @@ pub trait LlmProvider: Send + Sync {
         false
     }
 
+    /// Whether the endpoint natively understands `tool_reference` content
+    /// blocks (only the official Anthropic API at `api.anthropic.com`).
+    ///
+    /// When `true`, `ToolSearchTool` returns a JSON name array and
+    /// `serialize_messages_anthropic` converts it to `tool_reference` blocks
+    /// so the Anthropic API expands the full schemas server-side.
+    ///
+    /// When `false` (default, including DeepSeek / MiniMax Anthropic-compatible
+    /// endpoints), `ToolSearchTool` returns the full JSON schemas inline so
+    /// the model receives them directly without any server-side expansion.
+    fn native_tool_reference(&self) -> bool {
+        false
+    }
+
     /// Variant that accepts a partition between eager and deferred
     /// tools. Providers that support native deferred loading (e.g.
     /// Anthropic via `defer_loading: true` + `tool_reference` content
