@@ -185,19 +185,19 @@ impl App {
             // up: user reported scroll keys still drove the input
             // box, root cause was this ordering.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
                 None
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
                 None
             }
             KeyCode::PageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.scroll_offset = self.scroll_offset.saturating_add(20);
                 None
             }
             KeyCode::PageDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.scroll_offset = self.scroll_offset.saturating_sub(20);
                 None
             }
             KeyCode::Up if self.should_walk_history_up() => {
@@ -1545,16 +1545,16 @@ mod tests {
             });
         }
         let _ = app.handle_key(shift(KeyCode::Up));
-        assert_eq!(app.scroll_offset, 1);
+        assert_eq!(app.scroll_offset, 3);
         let _ = app.handle_key(shift(KeyCode::Up));
-        assert_eq!(app.scroll_offset, 2);
+        assert_eq!(app.scroll_offset, 6);
     }
 
     #[test]
     fn shift_down_stops_at_zero() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.scroll_offset = 2;
+        app.scroll_offset = 6;
         let _ = app.handle_key(shift(KeyCode::Down));
         let _ = app.handle_key(shift(KeyCode::Down));
         let _ = app.handle_key(shift(KeyCode::Down));
@@ -1562,18 +1562,18 @@ mod tests {
     }
 
     #[test]
-    fn page_up_scrolls_by_ten() {
+    fn page_up_scrolls_by_twenty() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         let _ = app.handle_key(key(KeyCode::PageUp));
-        assert_eq!(app.scroll_offset, 10);
+        assert_eq!(app.scroll_offset, 20);
     }
 
     #[test]
-    fn page_down_scrolls_by_ten() {
+    fn page_down_scrolls_by_twenty() {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
-        app.scroll_offset = 15;
+        app.scroll_offset = 25;
         let _ = app.handle_key(key(KeyCode::PageDown));
         assert_eq!(app.scroll_offset, 5);
     }
@@ -1585,7 +1585,7 @@ mod tests {
         app.screen = AppScreen::Chat;
         app.set_input("typing");
         let _ = app.handle_key(key(KeyCode::PageUp));
-        assert_eq!(app.scroll_offset, 10);
+        assert_eq!(app.scroll_offset, 20);
     }
 
     /// Goal 150 follow-up: terminal-independent scroll fallbacks

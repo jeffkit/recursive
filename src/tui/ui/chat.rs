@@ -63,24 +63,24 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel: render the full transcript so scroll_offset covers
-    // all history without a 300-line cap.
+    // Messages panel: render only the in-flight (not yet flushed) blocks so
+    // the viewport stays small and scrollable. Completed blocks are pushed
+    // into the terminal's native scrollback by insert_before() in the main
+    // loop; the user scrolls through those with the terminal's own scroll bar.
     //
-    // Layout: startup banner (recent_display) followed by all transcript
-    // blocks (app.blocks).  recent_display holds only the styled banner
-    // lines — it is never drained into scrollback while the session is
-    // live (unlike old content that insert_before() pushes out).  The
-    // banner therefore always anchors to the top of the block list and
-    // scrolls naturally with the rest of the conversation.
-    //
-    // insert_before() in the main loop still fires so completed turns
-    // appear in the terminal's native scrollback, preserving the
-    // "shell history is continuous" UX — but the messages widget here
-    // always renders from the full block list, not the 300-line window.
+    // recent_display holds the startup banner. Show it only when no blocks
+    // have been flushed yet (fresh session), so it anchors directly above
+    // the first live block. Once blocks start flushing it disappears into
+    // native scrollback alongside them.
     let messages_area = chunks[0];
+    let inflight_blocks = &app.blocks[app.last_printed_idx..];
     let block_lines =
-        transcript::render_blocks(&app.blocks, &app.usage, app.theme, messages_area.width);
-    let mut lines: Vec<Line<'static>> = app.recent_display.clone();
+        transcript::render_blocks(inflight_blocks, &app.usage, app.theme, messages_area.width);
+    let mut lines: Vec<Line<'static>> = if app.last_printed_idx == 0 {
+        app.recent_display.clone()
+    } else {
+        Vec::new()
+    };
     if !block_lines.is_empty() {
         if !lines.is_empty() {
             lines.push(Line::raw(""));
