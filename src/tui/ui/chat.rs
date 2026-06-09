@@ -98,19 +98,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     let inner_width = messages_area.width;
     let visible_rows = messages_area.height;
 
-    // Compute the *visual* (post-wrap) row count for proper scroll
-    // capping. Counting `lines.len()` (logical rows) under-counts when
-    // long messages wrap, which silently caps `scroll_offset` and
-    // prevents scrolling all the way to the top of long transcripts.
-    //
-    // ratatui 0.29's `Paragraph::line_count` is unstable, so we
-    // approximate with `Line::width()` (public, unicode-aware) divided
-    // by the inner width and rounded up. Empty lines still count as 1.
-    let total_rows: u16 = if inner_width == 0 {
-        lines.len() as u16
+    // Compute visual (post-wrap) row count as usize to avoid u16 overflow
+    // on long transcripts.
+    let total_rows: usize = if inner_width == 0 {
+        lines.len()
     } else {
         let w = inner_width as usize;
-        let sum: usize = lines
+        lines
             .iter()
             .map(|l| {
                 let lw = l.width();
@@ -120,23 +114,20 @@ pub fn render(frame: &mut Frame, app: &App) {
                     lw.div_ceil(w)
                 }
             })
-            .sum();
-        sum.try_into().unwrap_or(u16::MAX)
+            .sum()
     };
-    let max_scroll = total_rows.saturating_sub(visible_rows);
-    let effective_scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+    let visible = visible_rows as usize;
+    let max_scroll = total_rows.saturating_sub(visible);
+    // Cap scroll_offset so scrolling back down always reaches the bottom.
+    let capped = app.scroll_offset.min(max_scroll);
+    let effective_scroll = (max_scroll - capped) as u16;
 
-    // Bottom-align: when content is fewer rows than the visible area, prepend
-    // blank lines so content sits flush against the status bar rather than
-    // floating at the top. This eliminates the startup blank space and makes
-    // the banner (seeded into recent_display) appear directly above the input.
-    // When content exceeds visible_rows, normal scroll behaviour applies.
-    if total_rows < visible_rows {
-        let pad = (visible_rows - total_rows) as usize;
+    // Bottom-align when content is shorter than the visible area.
+    if total_rows < visible {
+        let pad = visible - total_rows;
         let mut padded: Vec<Line<'static>> = (0..pad).map(|_| Line::raw("")).collect();
         padded.extend(lines);
         lines = padded;
-        // effective_scroll is already 0 in this branch (max_scroll was 0).
     }
 
     let messages_widget = Paragraph::new(lines)

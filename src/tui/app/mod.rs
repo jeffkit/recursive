@@ -49,7 +49,7 @@ pub struct App {
     pub should_quit: bool,
     pub session_id: Option<String>,
     pub connected: bool,
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     pub screen: AppScreen,
     /// Tracks when the TUI session started. Used by `/status` to report uptime.
     pub start_time: Instant,
