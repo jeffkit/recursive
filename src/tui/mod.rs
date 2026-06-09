@@ -20,15 +20,12 @@ pub use model::{AppScreen, DiffHunk, DiffLine, DiffLineKind, TranscriptBlock};
 use std::io::{self, Write as _};
 use std::time::Duration;
 
-use unicode_width::UnicodeWidthStr as _;
-
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand as _;
 use ratatui::prelude::*;
-use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::tui::app::App;
@@ -310,60 +307,10 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     let mut last_modal_count: usize = 0;
 
     loop {
-        // ── Progressive output: flush completed blocks to scrollback ──────
-        // Advance `last_printed_idx` over any newly-finalized blocks and
-        // push their rendered lines into `print_queue`. The viewport renders
-        // only blocks[last_printed_idx..] so it stays small; completed blocks
-        // live in the terminal's native scrollback. Reset scroll_offset to 0
-        // whenever a flush happens — the user was looking at in-flight content
-        // that is now complete, so snapping to the new bottom is correct.
-        let flushed_rows = app.flush_ready_blocks(last_size.0);
-        if flushed_rows > 0 {
-            app.scroll_offset = 0;
-        }
-
-        // Drain the print_queue: push completed blocks into the terminal's
-        // native scrollback via insert_before().  This keeps the inline
-        // viewport height stable (no content accumulates inside it) and
-        // gives the user a continuous scrollback that merges seamlessly
-        // with prior shell history above the TUI.
-        //
-        // The messages widget in chat.rs now renders from app.blocks
-        // (full history), so recent_display is only used for the startup
-        // banner — it is never appended to here.
-        let queued: Vec<Vec<Line<'static>>> = app.print_queue.drain(..).collect();
-
-        // Pre-draw: if a modal was dismissed in the previous event cycle AND
-        // there are blocks queued to process, we must redraw now so the
-        // terminal reflects the modal-free state before any insert_before call.
-        if app.modals.len() < last_modal_count && !queued.is_empty() {
+        // Pre-draw: if a modal was dismissed in the previous event cycle,
+        // redraw first so the terminal reflects the modal-free state.
+        if app.modals.len() < last_modal_count {
             terminal.draw(|frame| ui::chat::render(frame, &app))?;
-        }
-
-        for lines in queued {
-            let h = (lines.len() as u16).max(1);
-            terminal.insert_before(h, |buf| {
-                let area = buf.area;
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .render(area, buf);
-                // Fix wide-char continuation cells: ratatui's draw_lines
-                // initialises them to Cell::EMPTY (symbol=" "), causing a
-                // visible space after each wide (CJK/emoji) character.
-                // Setting them to "" makes Print("") a no-op.
-                let mut i = 0;
-                while i < buf.content.len() {
-                    let w = buf.content[i].symbol().width();
-                    if w >= 2 {
-                        for j in 1..w {
-                            if i + j < buf.content.len() {
-                                buf.content[i + j].set_symbol("");
-                            }
-                        }
-                    }
-                    i += 1;
-                }
-            })?;
         }
 
         terminal.draw(|frame| ui::chat::render(frame, &app))?;

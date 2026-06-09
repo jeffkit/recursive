@@ -63,24 +63,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel: render only the in-flight (not yet flushed) blocks so
-    // the viewport stays small and scrollable. Completed blocks are pushed
-    // into the terminal's native scrollback by insert_before() in the main
-    // loop; the user scrolls through those with the terminal's own scroll bar.
-    //
-    // recent_display holds the startup banner. Show it only when no blocks
-    // have been flushed yet (fresh session), so it anchors directly above
-    // the first live block. Once blocks start flushing it disappears into
-    // native scrollback alongside them.
+    // Messages panel: render the full transcript so the user can scroll
+    // through all history. Logo (recent_display) always anchors at the top.
     let messages_area = chunks[0];
-    let inflight_blocks = &app.blocks[app.last_printed_idx..];
     let block_lines =
-        transcript::render_blocks(inflight_blocks, &app.usage, app.theme, messages_area.width);
-    let mut lines: Vec<Line<'static>> = if app.last_printed_idx == 0 {
-        app.recent_display.clone()
-    } else {
-        Vec::new()
-    };
+        transcript::render_blocks(&app.blocks, &app.usage, app.theme, messages_area.width);
+    let mut lines: Vec<Line<'static>> = app.recent_display.clone();
     if !block_lines.is_empty() {
         if !lines.is_empty() {
             lines.push(Line::raw(""));
