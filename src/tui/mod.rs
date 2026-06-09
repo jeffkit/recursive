@@ -313,7 +313,15 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
         // ── Progressive output: flush completed blocks to scrollback ──────
         // Advance `last_printed_idx` over any newly-finalized blocks and
         // push their rendered lines into `print_queue`.
-        app.flush_ready_blocks(last_size.0);
+        //
+        // When the user has scrolled up (scroll_offset > 0), compensate for
+        // the rows that are leaving the viewport and entering the native
+        // scrollback so their view position stays stable instead of snapping
+        // to the bottom or becoming un-scrollable.
+        let flushed_rows = app.flush_ready_blocks(last_size.0);
+        if flushed_rows > 0 && app.scroll_offset > 0 {
+            app.scroll_offset = app.scroll_offset.saturating_add(flushed_rows);
+        }
 
         // Drain the print_queue: push completed blocks into the terminal's
         // native scrollback via insert_before().  This keeps the inline
