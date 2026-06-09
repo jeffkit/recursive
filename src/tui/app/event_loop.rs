@@ -439,48 +439,48 @@ impl App {
     /// caller can adjust `scroll_offset` to keep the user's view position stable.
     pub fn flush_ready_blocks(&mut self, width: u16) -> u16 {
         let mut flushed_rows: u16 = 0;
-        loop {
-            let i = self.last_printed_idx;
-            if i >= self.blocks.len() {
-                break;
-            }
-            let ready = match &self.blocks[i] {
-                // Defer User flush until the response that follows is done, so
-                // the viewport always shows the current question + answer pair
-                // rather than going blank the moment the user hits Enter.
-                TranscriptBlock::User { .. } => !matches!(
-                    self.blocks.get(i + 1),
-                    Some(TranscriptBlock::Assistant {
-                        streaming: true,
-                        ..
-                    }) | Some(TranscriptBlock::ToolCall { result: None, .. })
-                        | None
-                ),
-                TranscriptBlock::Assistant { streaming, .. } => !streaming,
-                TranscriptBlock::ToolCall { result, .. } => result.is_some(),
-                TranscriptBlock::Reasoning { .. } => {
-                    // Defer flush until the next block (Assistant or ToolCall)
-                    // is finalized, so thinking always appears paired with its
-                    // response in the scrollback rather than disappearing from
-                    // the viewport as soon as it arrives.
-                    match self.blocks.get(i + 1) {
-                        // Still streaming — wait.
-                        Some(TranscriptBlock::Assistant {
-                            streaming: true, ..
-                        }) => false,
-                        // ToolCall without a result yet — wait.
-                        Some(TranscriptBlock::ToolCall { result: None, .. }) => false,
-                        // Nothing after it yet — keep it in the viewport.
-                        None => false,
-                        // Next block is finalized: flush together.
-                        _ => true,
+
+        // Find the index of the last User block whose entire response group is
+        // finalized (no streaming Assistant, no pending ToolCall anywhere after
+        // it). Everything *before* that User block is safe to flush; that block
+        // and everything after it stays in the viewport so the user always sees
+        // at least the most recent question + answer.
+        let last_complete_user: Option<usize> = {
+            let mut candidate: Option<usize> = None;
+            let mut i = self.last_printed_idx;
+            while i < self.blocks.len() {
+                if matches!(self.blocks[i], TranscriptBlock::User { .. }) {
+                    // Peek ahead: is there any unfinished block after this User?
+                    let tail_pending = self.blocks[i + 1..].iter().any(|b| match b {
+                        TranscriptBlock::Assistant { streaming, .. } => *streaming,
+                        TranscriptBlock::ToolCall { result, .. } => result.is_none(),
+                        _ => false,
+                    });
+                    if !tail_pending {
+                        candidate = Some(i);
                     }
                 }
-                _ => true,
-            };
-            if !ready {
+                i += 1;
+            }
+            candidate
+        };
+
+        // Only flush blocks that come before the last complete User turn.
+        // If there is no complete User turn yet (first message still in-flight,
+        // or the very first turn), flush nothing.
+        let flush_limit = match last_complete_user {
+            Some(idx) => idx,
+            None => return 0,
+        };
+
+        loop {
+            let i = self.last_printed_idx;
+            if i >= flush_limit {
                 break;
             }
+            // All blocks before flush_limit are by construction finalized
+            // (they precede a complete User turn), so no per-block readiness
+            // check is needed here.
             let is_user = matches!(&self.blocks[i], TranscriptBlock::User { .. });
             let is_first = i == 0;
 
