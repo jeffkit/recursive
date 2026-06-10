@@ -47,7 +47,7 @@ impl TranscriptFile {
         let json = self
             .to_json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, json)
+        crate::atomic::atomic_write(path, json.as_bytes())
     }
 
     pub fn read_from(path: &Path) -> std::io::Result<Self> {

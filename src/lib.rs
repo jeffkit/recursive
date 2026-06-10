@@ -10,6 +10,7 @@
 //! `Tool` or `LlmProvider`, never by editing the loop.
 
 pub mod agent;
+pub mod atomic;
 pub mod checkpoint;
 pub mod checkpoint_log;
 pub mod compact;

@@ -139,7 +139,7 @@ impl CostTracker {
         let data = self.cost_data();
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&cost_path, json)?;
+        crate::atomic::atomic_write(&cost_path, json.as_bytes())?;
         Ok(cost_path)
     }
 
@@ -207,7 +207,7 @@ impl CostTracker {
 
         let updated = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&meta_path, updated)
+        crate::atomic::atomic_write(&meta_path, updated.as_bytes())
     }
 
     /// Finalise the tracker: write `cost.json` and update `.meta.json`.
@@ -354,9 +354,11 @@ mod tests {
             "status": "active",
         });
         let meta_path = dir.path().join(".meta.json");
-        std::fs::write(
+        crate::atomic::atomic_write(
             &meta_path,
-            serde_json::to_string_pretty(&initial_meta).unwrap(),
+            serde_json::to_string_pretty(&initial_meta)
+                .unwrap()
+                .as_bytes(),
         )
         .unwrap();
 

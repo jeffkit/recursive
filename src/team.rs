@@ -35,7 +35,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -225,36 +225,6 @@ impl TeamFile {
 }
 
 // ---------------------------------------------------------------------------
-// Atomic write helper
-// ---------------------------------------------------------------------------
-
-/// Write `contents` to `path` atomically via a sibling temp file + rename.
-///
-/// The temp file lives in the same directory as `path` so the rename
-/// stays on the same filesystem (atomic on POSIX).  This pattern is
-/// copied from `src/session.rs::atomic_write` and adapted for use here
-/// so the team registry doesn't have a hard dependency on `session.rs`.
-pub(crate) fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".tmp-team-{}-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("team"),
-        std::process::id(),
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // TeamRegistry
 // ---------------------------------------------------------------------------
 
@@ -338,7 +308,7 @@ impl TeamRegistry {
         ensure_teams_dir()?;
         let path = team_file_path(&team.name);
         let json = serde_json::to_string_pretty(team)?;
-        atomic_write(&path, &json)?;
+        crate::atomic::atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -577,11 +547,11 @@ mod tests {
         let g = with_temp_teams_dir();
         let dir = g._tmp.path();
         let p = dir.join("alpha.json");
-        atomic_write(&p, "{\"name\":\"alpha\"}").unwrap();
+        crate::atomic::atomic_write(&p, b"{\"name\":\"alpha\"}").unwrap();
         let s1 = std::fs::read_to_string(&p).unwrap();
         assert_eq!(s1, "{\"name\":\"alpha\"}");
 
-        atomic_write(&p, "{\"name\":\"alpha\",\"v\":2}").unwrap();
+        crate::atomic::atomic_write(&p, b"{\"name\":\"alpha\",\"v\":2}").unwrap();
         let s2 = std::fs::read_to_string(&p).unwrap();
         assert_eq!(s2, "{\"name\":\"alpha\",\"v\":2}");
 

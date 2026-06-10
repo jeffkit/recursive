@@ -77,7 +77,7 @@ impl SessionFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, json)
+        crate::atomic::atomic_write(path, json.as_bytes())
     }
 
     /// Read a session from a JSON file at `path`.
@@ -467,31 +467,6 @@ pub fn entry_to_message(entry: TranscriptEntry) -> Message {
         reasoning_content: entry.reasoning_content,
     }
 }
-
-/// Write `contents` to `path` atomically via a sibling temp file + rename.
-///
-/// Prevents corrupt reads when a crash occurs mid-write. The temp file is
-/// placed in the same directory as `path` so the rename stays on the same
-/// filesystem (required for atomicity on most OSes).
-fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("meta"),
-        std::process::id(),
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// Writer for appending messages to a JSONL session file.
 ///
 /// Opens (or creates) a `.jsonl` file in append mode and writes one
@@ -608,7 +583,7 @@ impl SessionWriter {
         let meta_path = session_dir.join(".meta.json");
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        atomic_write(&meta_path, &meta_json)?;
+        crate::atomic::atomic_write(&meta_path, meta_json.as_bytes())?;
 
         Ok(Self {
             session_id,
@@ -847,7 +822,7 @@ impl SessionWriter {
         }
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        atomic_write(&meta_path, &json)
+        crate::atomic::atomic_write(&meta_path, json.as_bytes())
     }
 
     /// Finalise the session: flush the writer and update the meta file
@@ -884,7 +859,7 @@ impl SessionWriter {
 
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        atomic_write(&meta_path, &meta_json)
+        crate::atomic::atomic_write(&meta_path, meta_json.as_bytes())
     }
 
     /// Set an optional human-readable display name for this session.
@@ -1014,7 +989,7 @@ pub fn truncate_transcript_to_turn(
                 meta.message_count = kept;
                 meta.updated_at = chrono_lite_now();
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                    let _ = std::fs::write(&meta_path, json);
+                    let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
                 }
             }
         }

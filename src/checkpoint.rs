@@ -387,7 +387,7 @@ impl ShadowRepo {
                             message: format!("cannot create dir for {path}: {e}"),
                         })?;
                     }
-                    std::fs::write(&abs, &want).map_err(|e| Error::Tool {
+                    crate::atomic::atomic_write(&abs, &want).map_err(|e| Error::Tool {
                         name: "checkpoint".into(),
                         message: format!("cannot restore {path}: {e}"),
                     })?;
