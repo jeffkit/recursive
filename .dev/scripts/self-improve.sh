@@ -949,6 +949,19 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # Rebuild binary so the container gets the new code.
   cargo build -q 2>/dev/null
 
+  # Build e2e plugins (e2e/plugins/dist/) before argus-init. The worktree
+  # is a fresh git checkout — node_modules and dist/ are gitignored, so
+  # `e2e.yaml`'s `plugins: - ./plugins/dist/index.js` reference will
+  # otherwise fail with PLUGIN_LOAD_ERROR. Discovered when g270 (a
+  # trivial 1-line goal) failed e2e gate with this exact error after
+  # the 2b50e08 init-capture fix made the error visible.
+  if [[ -d "e2e/plugins" ]] && [[ -f "e2e/plugins/package.json" ]]; then
+    if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
+      echo "[self-improve] building e2e/plugins (dist/ missing)..."
+      (cd e2e/plugins && pnpm install --frozen-lockfile 2>/dev/null && pnpm build 2>&1 | tail -3)
+    fi
+  fi
+
   # Per-worktree namespace — each run gets isolated Docker container + network.
   WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo 'main')"
   export WORKTREE_ID
