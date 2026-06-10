@@ -959,7 +959,14 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # WORKTREE_ID must be in env BEFORE session-start so the server inherits it.
   WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD"     --session-start "$MCP_SESSION" >/dev/null 2>&1
 
-  _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1
+  # Capture init output to a side file so e2e failures can be diagnosed.
+  # Previously this was silenced (`>/dev/null 2>&1`), which made SESSION_NOT_FOUND
+  # errors at argus-run time untraceable to the actual init failure.
+  E2E_INIT_LOG="$(pwd)/.dev/runs/e2e-init-${MCP_SESSION}.log"
+  if ! _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >"$E2E_INIT_LOG" 2>&1; then
+    echo "[self-improve] E2E smoke: argus-init FAILED — see $E2E_INIT_LOG"
+    cat "$E2E_INIT_LOG" | head -20
+  fi
   _argus "$MCP_SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
 
   if _argus "$MCP_SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | grep -q '"passed"'; then
@@ -1004,7 +1011,11 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
         # Re-start session for the retry run
         WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD" \
           --session-start "$MCP_SESSION" >/dev/null 2>&1
-        _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1
+        E2E_INIT_LOG="$(pwd)/.dev/runs/e2e-init-${MCP_SESSION}.log"
+        if ! _argus "$MCP_SESSION" argus-init --project-path "$E2E_PROJECT" >"$E2E_INIT_LOG" 2>&1; then
+          echo "[self-improve] E2E smoke: argus-init (retry) FAILED — see $E2E_INIT_LOG"
+          cat "$E2E_INIT_LOG" | head -20
+        fi
         _argus "$MCP_SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
         if [[ "$SMOKE_FIX_STATUS" -eq 0 ]] && \
            _argus "$MCP_SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>/dev/null | grep -q '"passed"'; then
