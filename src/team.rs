@@ -242,9 +242,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
         ".tmp-team-{}-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("team"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("team"),
         std::process::id(),
     ));
     {
@@ -288,7 +286,11 @@ impl TeamRegistry {
     /// registry is queryable via `get`/`list` after a tool call.
     /// Returns the previous value if a team with the same name existed.
     pub async fn register_team(&self, team: TeamFile) -> Option<TeamFile> {
-        self.inner.write().await.teams.insert(team.name.clone(), team)
+        self.inner
+            .write()
+            .await
+            .teams
+            .insert(team.name.clone(), team)
     }
 
     /// Load a team from disk.  Errors if the team file does not exist
@@ -443,9 +445,7 @@ mod tests {
     }
 
     fn with_temp_teams_dir() -> TeamsDirGuard {
-        let lock = TEAMS_DIR_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let lock = TEAMS_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("RECURSIVE_TEAMS_DIR");
         std::env::set_var("RECURSIVE_TEAMS_DIR", tmp.path());
@@ -483,7 +483,10 @@ mod tests {
         assert_eq!(tf.get_member("researcher"), Some(&m));
         assert!(tf.remove_member("researcher"));
         assert_eq!(tf.member_count(), 0);
-        assert!(!tf.remove_member("researcher"), "double-remove returns false");
+        assert!(
+            !tf.remove_member("researcher"),
+            "double-remove returns false"
+        );
     }
 
     #[test]

@@ -54,7 +54,11 @@ impl Tool for TaskStopTool {
 
     async fn execute(&self, arguments: Value) -> Result<String> {
         let id = lookup_task_id(&self.registry, &arguments, "task_stop").await?;
-        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
+        let task = self
+            .registry
+            .get(&id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         let s = task.status().await;
         if s.is_terminal() {
             return Ok(format!("Task {id} is already {}.", s.as_str()));
@@ -65,7 +69,9 @@ impl Tool for TaskStopTool {
         } else {
             // No JoinHandle attached (e.g. it already finished, or the
             // task was never spawned). Still report success.
-            Ok(format!("Task {id} has no live handle to stop (already finished?)."))
+            Ok(format!(
+                "Task {id} has no live handle to stop (already finished?)."
+            ))
         }
     }
 }

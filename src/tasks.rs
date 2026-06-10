@@ -428,7 +428,11 @@ mod tests {
         let (state, id) = TaskState::new("t", "", "");
         let _ = reg.register(state).await;
 
-        reg.get(&id).await.unwrap().mark_completed("done".into()).await;
+        reg.get(&id)
+            .await
+            .unwrap()
+            .mark_completed("done".into())
+            .await;
         let got = reg.get(&id).await.unwrap();
         assert_eq!(got.status().await, TaskStatus::Completed);
         let r = got.final_result.lock().await.clone();

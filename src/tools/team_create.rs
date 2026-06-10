@@ -149,7 +149,11 @@ impl Tool for TeamCreateTool {
         TeamRegistry::save_team(&team)?;
         self.registry.register_team(team.clone()).await;
 
-        let team = self.registry.get(&name).await.ok_or_else(|| Error::NotFound(format!("team '{name}'")))?;
+        let team = self
+            .registry
+            .get(&name)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("team '{name}'")))?;
         Ok(format!(
             "Created team '{name}' ({} members).",
             team.member_count()
@@ -198,10 +202,7 @@ mod tests {
         let _g = with_temp_teams_dir();
         let reg = Arc::new(TeamRegistry::new());
         let tool = TeamCreateTool::new(reg.clone());
-        let result = tool
-            .execute(json!({ "name": "alpha" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "name": "alpha" })).await.unwrap();
         assert!(result.contains("alpha"));
         assert!(result.contains("0 members"));
         assert!(crate::team::team_file_path("alpha").exists());

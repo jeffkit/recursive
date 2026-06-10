@@ -55,16 +55,17 @@ impl Tool for TaskListTool {
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {
-        let status_filter = arguments
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(|s| match s {
-                "running" => Some(TaskStatus::Running),
-                "completed" => Some(TaskStatus::Completed),
-                "failed" => Some(TaskStatus::Failed),
-                "stopped" => Some(TaskStatus::Stopped),
-                _ => None,
-            });
+        let status_filter =
+            arguments
+                .get("status")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s {
+                    "running" => Some(TaskStatus::Running),
+                    "completed" => Some(TaskStatus::Completed),
+                    "failed" => Some(TaskStatus::Failed),
+                    "stopped" => Some(TaskStatus::Stopped),
+                    _ => None,
+                });
         let team_filter = arguments.get("team").and_then(|v| v.as_str());
         let name_filter = arguments.get("name").and_then(|v| v.as_str());
 
@@ -152,10 +153,7 @@ mod tests {
         let tool = TaskListTool::new(reg.clone());
         let all = tool.execute(json!({})).await.unwrap();
         assert!(all.contains("3 task(s)"));
-        let alpha = tool
-            .execute(json!({ "team": "alpha" }))
-            .await
-            .unwrap();
+        let alpha = tool.execute(json!({ "team": "alpha" })).await.unwrap();
         assert!(alpha.contains("2 task(s)"));
         let alpha_r = tool
             .execute(json!({ "team": "alpha", "name": "r" }))

@@ -46,7 +46,11 @@ impl Tool for TaskGetTool {
 
     async fn execute(&self, arguments: Value) -> Result<String> {
         let id = lookup_task_id(&self.registry, &arguments, "task_get").await?;
-        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
+        let task = self
+            .registry
+            .get(&id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         // Drain any pending output so the snapshot is current.
         let _ = self.registry.drain_output(&id).await;
         let status = task.status().await;

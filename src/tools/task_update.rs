@@ -77,25 +77,31 @@ impl Tool for TaskUpdateTool {
                 message: "missing required parameter: status".to_string(),
             })?;
 
-        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
+        let task = self
+            .registry
+            .get(&id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         let current = task.status().await;
         // Allow transition from any non-terminal state.
         if current.is_terminal() {
             return Err(Error::BadToolArgs {
                 name: "task_update".into(),
-                message: format!("task {id} is already in terminal state '{current}'", current = current.as_str()),
+                message: format!(
+                    "task {id} is already in terminal state '{current}'",
+                    current = current.as_str()
+                ),
             });
         }
 
         match new_status_str {
             "completed" => {
-                let result =
-                    arguments["result"]
-                        .as_str()
-                        .ok_or_else(|| Error::BadToolArgs {
-                            name: "task_update".into(),
-                            message: "status='completed' requires 'result'".to_string(),
-                        })?;
+                let result = arguments["result"]
+                    .as_str()
+                    .ok_or_else(|| Error::BadToolArgs {
+                        name: "task_update".into(),
+                        message: "status='completed' requires 'result'".to_string(),
+                    })?;
                 task.mark_completed(result.to_string()).await;
                 Ok(format!("Task {id} marked completed."))
             }

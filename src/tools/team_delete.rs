@@ -139,16 +139,10 @@ mod tests {
     async fn delete_nonexistent_is_idempotent() {
         let _g = with_temp_teams_dir();
         let tool = TeamDeleteTool::new();
-        let result = tool
-            .execute(json!({ "name": "ghost" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "name": "ghost" })).await.unwrap();
         assert!(result.contains("did not exist"));
         // Second delete is still a no-op.
-        let result2 = tool
-            .execute(json!({ "name": "ghost" }))
-            .await
-            .unwrap();
+        let result2 = tool.execute(json!({ "name": "ghost" })).await.unwrap();
         assert!(result2.contains("did not exist"));
     }
 

@@ -91,10 +91,12 @@ pub(crate) async fn lookup_task_id(
     arguments: &Value,
     tool_name: &str,
 ) -> Result<TaskId> {
-    let id_str = arguments["task_id"].as_str().ok_or_else(|| Error::BadToolArgs {
-        name: tool_name.into(),
-        message: "missing required parameter: task_id".to_string(),
-    })?;
+    let id_str = arguments["task_id"]
+        .as_str()
+        .ok_or_else(|| Error::BadToolArgs {
+            name: tool_name.into(),
+            message: "missing required parameter: task_id".to_string(),
+        })?;
     let id = TaskId(id_str.to_string());
     if registry.get(&id).await.is_none() {
         return Err(Error::NotFound(format!("task '{id_str}'")));

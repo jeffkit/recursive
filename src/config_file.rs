@@ -574,8 +574,11 @@ interactive = ["delete_file"]
         let tmp = tempfile::tempdir().unwrap();
         let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
 
-        let err = set_value("provider.api_key", "sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .expect_err("set_value must refuse provider.api_key");
+        let err = set_value(
+            "provider.api_key",
+            "sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect_err("set_value must refuse provider.api_key");
         let msg = format!("{err}");
         assert!(
             msg.contains("refusing to persist"),
@@ -634,8 +637,11 @@ interactive = ["delete_file"]
         let tmp = tempfile::tempdir().unwrap();
         let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
 
-        set_secret("DEEPSEEK_API_KEY", "sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .expect("set_secret should succeed");
+        set_secret(
+            "DEEPSEEK_API_KEY",
+            "sk-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("set_secret should succeed");
 
         let path = secrets_env_path().unwrap();
         let content = std::fs::read_to_string(&path).unwrap();

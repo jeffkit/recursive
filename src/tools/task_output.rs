@@ -78,7 +78,13 @@ impl Tool for TaskOutputTool {
         if block {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {
-                let s = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?.status().await;
+                let s = self
+                    .registry
+                    .get(&id)
+                    .await
+                    .ok_or_else(|| Error::NotFound(format!("task '{id}'")))?
+                    .status()
+                    .await;
                 if s.is_terminal() {
                     break;
                 }
@@ -91,7 +97,11 @@ impl Tool for TaskOutputTool {
 
         // Drain output buffer.
         let _ = self.registry.drain_output(&id).await;
-        let task = self.registry.get(&id).await.ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
+        let task = self
+            .registry
+            .get(&id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
         let lines = task.output_snapshot().await;
         // Clear it (drain consumed the channel, but the snapshot buffer is separate).
         {
@@ -139,9 +149,7 @@ mod tests {
     async fn missing_task_errors() {
         let reg = Arc::new(TaskRegistry::new());
         let tool = TaskOutputTool::new(reg);
-        let res = tool
-            .execute(json!({ "task_id": "task-bogus" }))
-            .await;
+        let res = tool.execute(json!({ "task_id": "task-bogus" })).await;
         assert!(res.is_err());
     }
 }

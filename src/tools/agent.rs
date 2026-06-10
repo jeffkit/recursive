@@ -35,8 +35,8 @@ use crate::llm::{LlmProvider, ToolSpec};
 use crate::message::Message;
 use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::permissions::PermissionMode;
-use crate::tools::agent_defs::AgentDefinitions;
 use crate::tasks::TaskRegistry;
+use crate::tools::agent_defs::AgentDefinitions;
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
@@ -317,8 +317,14 @@ impl AgentTool {
 
         // Inject inter-worker messaging tools if registry is available
         if let Some(reg) = &self.registry {
-            sub_registry = sub_registry.register(Arc::new(SendMessageTool::new(reg.clone(), self.task_registry.clone())));
-            sub_registry = sub_registry.register(Arc::new(ListWorkersTool::new(reg.clone(), self.task_registry.clone())));
+            sub_registry = sub_registry.register(Arc::new(SendMessageTool::new(
+                reg.clone(),
+                self.task_registry.clone(),
+            )));
+            sub_registry = sub_registry.register(Arc::new(ListWorkersTool::new(
+                reg.clone(),
+                self.task_registry.clone(),
+            )));
         }
 
         // Build the system prompt with shared-memory context
@@ -405,13 +411,10 @@ impl AgentTool {
         // `ok_or_else` (not `unwrap()`) to satisfy AGENTS.md invariant #5
         // (no `unwrap()` in non-test code) while preserving the same error
         // type.
-        let (worker_id, entry) = manifest
-            .iter()
-            .next()
-            .ok_or_else(|| Error::BadToolArgs {
-                name: "agent".into(),
-                message: "mode 'single' requires exactly one manifest entry".to_string(),
-            })?;
+        let (worker_id, entry) = manifest.iter().next().ok_or_else(|| Error::BadToolArgs {
+            name: "agent".into(),
+            message: "mode 'single' requires exactly one manifest entry".to_string(),
+        })?;
         self.run_worker(worker_id, entry, prompt, max_steps, child_depth)
             .await
     }
