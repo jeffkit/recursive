@@ -952,13 +952,35 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
   # Build e2e plugins (e2e/plugins/dist/) before argus-init. The worktree
   # is a fresh git checkout — node_modules and dist/ are gitignored, so
   # `e2e.yaml`'s `plugins: - ./plugins/dist/index.js` reference will
-  # otherwise fail with PLUGIN_LOAD_ERROR. Discovered when g270 (a
-  # trivial 1-line goal) failed e2e gate with this exact error after
-  # the 2b50e08 init-capture fix made the error visible.
+  # otherwise fail with PLUGIN_LOAD_ERROR.
+  #
+  # The `argusai-core` dep in e2e/plugins/package.json is declared as
+  # `file:../../../infra4agent/argusai/packages/core`. The `../../../`
+  # resolves relative to e2e/plugins/. From the main repo
+  # (3 levels up = repo root) it works. From a worktree
+  # (e2e/plugins/ is at .worktrees/<name>/e2e/plugins/, so 3 levels up
+  # = .worktrees/<name>/) it does NOT. Patch the dep to an absolute
+  # path for the duration of the build, then restore the original
+  # package.json. Resolve the absolute path from the git **common**
+  # dir (the shared .git), so it works from any worktree.
   if [[ -d "e2e/plugins" ]] && [[ -f "e2e/plugins/package.json" ]]; then
     if [[ ! -f "e2e/plugins/dist/index.js" ]]; then
       echo "[self-improve] building e2e/plugins (dist/ missing)..."
-      (cd e2e/plugins && pnpm install --frozen-lockfile 2>/dev/null && pnpm build 2>&1 | tail -3)
+      PLUGIN_PKG="e2e/plugins/package.json"
+      PLUGIN_BAK="$(mktemp -t recursive-plugin-pkg-XXXXXX.json)"
+      cp "$PLUGIN_PKG" "$PLUGIN_BAK"
+      GIT_COMMON="$(git rev-parse --git-common-dir)"
+      REPO_ROOT="$(cd "$GIT_COMMON/.." && pwd)"
+      ARGUSAI_CORE_ABS="$REPO_ROOT/../infra4agent/argusai/packages/core"
+      if [[ -d "$ARGUSAI_CORE_ABS" ]]; then
+        sed -i '' "s|file:../../../infra4agent/argusai/packages/core|file:${ARGUSAI_CORE_ABS}|" "$PLUGIN_PKG"
+      fi
+      (cd e2e/plugins && pnpm install --no-frozen-lockfile 2>/dev/null && pnpm build 2>&1 | tail -3)
+      cp "$PLUGIN_BAK" "$PLUGIN_PKG"
+      # `--no-frozen-lockfile` may have rewritten pnpm-lock.yaml.
+      # Restore it from git to avoid leaving a dirty worktree.
+      (cd e2e/plugins && git checkout -- pnpm-lock.yaml 2>/dev/null)
+      rm -f "$PLUGIN_BAK"
     fi
   fi
 
