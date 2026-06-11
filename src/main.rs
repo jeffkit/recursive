@@ -448,6 +448,7 @@ async fn main() -> anyhow::Result<()> {
         cli.log.clone()
     };
     init_logging(&early_log)?;
+    tracing::trace!("recursive main starting");
 
     if cli.session_out.is_some() {
         eprintln!(
