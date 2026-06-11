@@ -1,0 +1,15 @@
+{
+  "name": "recursive-self-improve-flow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "recursive 的 self-improve 编排（flowx flow）：可审计 / 可观测 / 可断点续跑",
+  "scripts": {
+    "self-improve": "node self-improve.flow.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@force-lab/flowx": "file:../../../flowx"
+  },
+  "engines": { "node": ">=20" }
+}
