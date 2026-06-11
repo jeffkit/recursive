@@ -304,9 +304,13 @@ RECURSIVE_AUTO_RESUME="${RECURSIVE_AUTO_RESUME:-1}"
 #
 # Context compaction (g31): when the transcript exceeds this many
 # characters, the agent asks the model to summarize older messages.
-# 200000 chars ≈ 50K tokens; large enough that easy goals never
-# trigger it, but big enough that long runs (g37/g42-style) will.
-export RECURSIVE_COMPACT_THRESHOLD="${RECURSIVE_COMPACT_THRESHOLD:-200000}"
+# Lowered from 200K to 50K chars in 2026-06 after observing that
+# 4/4 self-improve runs in 2026-06 hit the MiniMax M3 context
+# window limit (2013 chars per request) when the transcript
+# exceeded ~50K chars. 50K ≈ 12K tokens, which is well below the
+# model's window — leaving headroom for prompt caching / system
+# prompt / new turns. Easy goals still fit comfortably.
+export RECURSIVE_COMPACT_THRESHOLD="${RECURSIVE_COMPACT_THRESHOLD:-50000}"
 
 # OpenTelemetry-style span timings (g42): emit a stderr line at each
 # instrumented function's close with its duration. Cheap, visible,
