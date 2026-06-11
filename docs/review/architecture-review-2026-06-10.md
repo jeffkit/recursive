@@ -352,3 +352,62 @@ P3 tech-debt（drip-feed）:
 2. **把 uncommitted diff 单独抽出来**让 1-2 个 sub-agent 集中审 — 这次 tools sub-agent 验证了我的怀疑（"逻辑改动"是错的，实际是 rustfmt 格式化），这是重要结论
 3. **每个 sub-agent 给定一份 git log -20**：避免 5 个新 commit 没人看见
 4. **不要让 lead 预先写"状态总览"**：因为 lead 一定会基于上次 review 文字做假设。改让 lead 收集完所有 sub-agent 报告**之后**再写总览
+
+---
+
+## Superseded by (J4 followup)
+
+This review was followed up by a multi-batch lead-completion campaign
+(2026-06-10 → 2026-06-11) that closed every P0 and most of the
+P1 listed above. New doc: see `docs/review/architecture-review-followups-2026-06-11.md`.
+
+Summary of what landed in that followup:
+- g267 (NEW-STORE-2/3) ✓ unified atomic_write helper (src/atomic.rs)
+- g268 (NEW-HTTP-2) ✓ `/agui` run_semaphore cap (NEW-COST-1, J2)
+- g269 (NEW-STORE-4) ✓ SessionMeta schema_version (defends against
+  silent session loss on future non-backward-compatible field adds)
+- g272 (NEW-HTTP-6) ✓ route-level auth bypass (Router::merge)
+- g273 (NEW-COST-1) ✓ reasoning_tokens in TokenUsage + cost + meta
+- H1 ✓ compaction threshold 200K → 50K chars (recovers context-budget
+  margin after 4/4 self-improve runs hit the MiniMax window limit)
+- H2 (NEW-PERM-1 + NEW-PERM-2) ✓ permission pipeline: hook Allow
+  path now re-runs recheck_policy; safety check runs even when
+  permissions is None
+- J1 ✓ e2e smoke-01 session assertion (RECURSIVE_SESSIONS_DIR
+  override + fixture path correction)
+- J2 ✓ try_acquire_owned for /agui (immediate 503 instead of
+  indefinite await)
+- J3 (NEW-HTTP-7) ✓ X-Forwarded-For rate-limit key
+
+What was NOT done in that followup (still in review):
+- NEW-MEM-2 (embedding LRU + batching) — needs `lru` crate
+  addition which violates "no new deps without justification"
+  rule; deferred to a follow-up that justifies the dep
+- NEW-STORE-5/6 (S3 multipart, Redis pipelining) — cloud-only
+  value, deferred until first cloud deployment
+
+What was closed **as designed-out** (not bugs):
+- Agent-tool naming drift (`apply_patch` / `write_file` in
+  CLAUDE.md vs `Edit` / `Write` in the registry) — fixed
+  via the docs sync commit `be7bba9`. Future self-improve
+  runs now see Edit / Write in their tool registry AND in
+  the docs, so patch discipline will improve.
+
+What was **learned about self-improve itself**:
+- 4/4 self-improve runs in 2026-06 hit the MiniMax M3
+  context window limit (2013 chars per request) when the
+  transcript exceeded ~50K chars. Two compounding factors:
+  the default `RECURSIVE_COMPACT_THRESHOLD` of 200K chars
+  was too high, and agent LLM calls do not compact
+  mid-run. Lowering to 50K chars (H1) should prevent
+  the failure mode for transcripts up to ~50K chars; for
+  longer ones, the agent's compaction step still triggers
+  but with more headroom. Deeper fix (auto-compact on
+  threshold breach) is a follow-up.
+
+- The agent used 0 `apply_patch` / 0 `write_file` invocations
+  in every run — entirely relying on `Bash` + `sed` /
+  `python3` heredocs to write files. The doc-sync commit
+  fixes the *advertised* tool names; the *actual* tool
+  registry is correct (Edit / Write). A future observation
+  is whether 0/0 changes to a healthier ratio.

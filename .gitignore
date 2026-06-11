@@ -21,6 +21,14 @@ Cargo.lock.bak
 # but never committed — they're huge JSON dumps that bloat the repo).
 .dev/transcripts/
 
+# self-improve per-run process logs and metric dumps (J4).
+# Each parallel-self-improve.sh invocation writes a run-<ts>-<pid>.{md,yaml}
+# pair. Useful in isolation, noise in the git tree. The
+# `journal/manual-*.md` and `observations/*.md` files are tracked
+# (they're curated, not auto-generated).
+.dev/journal/run-*.md
+.dev/metrics/
+
 # Personal IDE / AI assistant config (per-user, not project policy).
 .claude/
 .cursor/local/
