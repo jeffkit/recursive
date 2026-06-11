@@ -16,7 +16,7 @@ use recursive::{
     tools::fs::ReadFileState,
     tools::EpisodicRecall,
     tools::{
-        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, EditTool,
+        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, CountLines, EditTool,
         EstimateTokens, Forget, GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember,
         RunBackground, RunShell, RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList,
         SearchFiles, TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
@@ -54,6 +54,7 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
         registry = registry.register(Arc::new(WebSearch::new()));
     }
     registry = registry.register(Arc::new(EstimateTokens::new(root)));
+    registry = registry.register(Arc::new(CountLines::new(root)));
     registry = registry
         .register(Arc::new(Remember::new(root)))
         .register(Arc::new(Recall::new(root)))
