@@ -35,7 +35,7 @@ script treats clippy failures as rollback triggers.
 
 ## Code conventions
 
-- **Prefer `apply_patch` discipline mentally**: when editing existing files,
+- **Prefer `Edit` discipline mentally**: when editing existing files,
   make minimal, surgical changes. Don't rewrite a whole file to fix one thing.
 - **New tool** → new file under `src/tools/`, register in `src/tools/mod.rs`.
 - **New provider** → new file under `src/llm/`, implement `LlmProvider` trait.

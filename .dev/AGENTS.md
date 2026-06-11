@@ -24,8 +24,8 @@ src/
     openai.rs       OpenAI-compatible HTTP adapter
   tools/
     mod.rs          Tool trait + ToolRegistry + path sandboxing
-    fs.rs           read_file, write_file, list_dir
-    shell.rs        run_shell (timeout, output cap)
+    fs.rs           Read, Write, Glob
+    shell.rs        Bash (timeout, output cap)
   main.rs           CLI: run / repl / tools
 
 tests/
@@ -74,14 +74,14 @@ tests/
 
 1. Read this file fully.
 2. Read the goal you were given (it's usually in your prompt verbatim).
-3. `list_dir src/` then read the files you'll touch.
+3. `Glob src/` then read the files you'll touch.
 4. Make the smallest possible change. If you add a tool, add it as a new file
    under `src/tools/` and register it in `src/tools/mod.rs`.
-5. **Prefer `apply_patch` over `write_file`** for any change to a file you
-   didn't just create. `write_file` overwrites the entire file and risks
-   silently dropping unrelated code; `apply_patch` requires you to quote
+5. **Prefer `Edit` over `Write`** for any change to a file you
+   didn't just create. `Write` overwrites the entire file and risks
+   silently dropping unrelated code; `Edit` requires you to quote
    the context you're editing, which catches drift early.
-   - Use `write_file` only for: brand-new files, or whole-file rewrites
+   - Use `Write` only for: brand-new files, or whole-file rewrites
      when you have read the entire current contents and intentionally
      want to replace them.
    - **V4A patch format — read this carefully, it is NOT unified diff:**
@@ -149,10 +149,10 @@ tests/
        the file byte-for-byte; `+` adds; `-` removes.
 6. After writing code, **always**:
    ```
-   run_shell: cargo build 2>&1 | tail -40
-   run_shell: cargo test 2>&1 | tail -40
-   run_shell: cargo fmt --all
-   run_shell: cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -40
+   Bash: cargo build 2>&1 | tail -40
+   Bash: cargo test 2>&1 | tail -40
+   Bash: cargo fmt --all
+   Bash: cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -40
    ```
    All four must be green before you stop. `-D warnings` means even a
    clippy *warning* will fail the build.
@@ -179,7 +179,7 @@ tests/
    **E2E smoke is a hard gate by `self-improve.sh`** (restored after
    being silently skipped on g262): the wrapper runs
    `cd e2e && argusai -c e2e.yaml run -s smoke` (3 scenarios: basic
-   write_file, basic read_file, session-recording assertions).
+   Write, basic Read, session-recording assertions).
    Replay mode — deterministic, no API key, ~700ms. If it fails the
    wrapper invokes a one-shot resume-fix replay asking you to fix
    the regression. If the E2E prerequisites are missing (argusai not
@@ -226,7 +226,7 @@ tests/
   `head` / `tail` / `cat heredoc` / `sed -i` / `mv` to rewrite or splice a
   file under `src/` or `tests/`. They look surgical but routinely truncate
   files mid-block, leaving unclosed `{` or unterminated strings. Always use
-  `apply_patch` (preferred) or `write_file` (whole file, contents provided
+  `Edit` (preferred) or `Write` (whole file, contents provided
   in one call). Both are atomic; shell pipelines are not.
 - **Never run `git` against the working tree.** No `git checkout`, no
   `git reset`, no `git restore`, no `git stash`. The wrapper script owns
