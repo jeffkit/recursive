@@ -85,12 +85,19 @@ pub struct TokenUsage {
     pub total_tokens: u32,
     pub cache_hit_tokens: u32,
     pub cache_miss_tokens: u32,
+    /// Reasoning / thinking tokens emitted by models that support
+    /// extended thinking (DeepSeek R1, OpenAI o1, Anthropic
+    /// extended thinking). Adds to the cost total because the
+    /// model spent compute producing them. Default 0 for models
+    /// that don't report this separately.
+    pub reasoning_tokens: u32,
 }
 
 impl TokenUsage {
     /// Saturating element-wise sum. Used to accumulate across LLM calls.
     pub fn accumulate(self, other: TokenUsage) -> TokenUsage {
         TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
             completion_tokens: self
                 .completion_tokens
@@ -129,7 +136,10 @@ impl ModelPricing {
         } else {
             (usage.prompt_tokens as f64) * self.input_per_million / 1_000_000.0
         };
-        let out_cost = (usage.completion_tokens as f64) * self.output_per_million / 1_000_000.0;
+        let total_output_tokens = usage
+            .completion_tokens
+            .saturating_add(usage.reasoning_tokens);
+        let out_cost = total_output_tokens as f64 * self.output_per_million / 1_000_000.0;
         in_cost + out_cost
     }
 }
@@ -368,6 +378,7 @@ mod tests {
     #[test]
     fn token_usage_accumulate_is_saturating() {
         let u1 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
@@ -375,6 +386,7 @@ mod tests {
             cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 20,
             completion_tokens: 30,
             total_tokens: 50,
@@ -390,6 +402,7 @@ mod tests {
     #[test]
     fn token_usage_accumulate_is_commutative() {
         let u1 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
@@ -397,6 +410,7 @@ mod tests {
             cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 20,
             completion_tokens: 30,
             total_tokens: 50,
@@ -409,6 +423,7 @@ mod tests {
     #[test]
     fn token_usage_accumulate_saturates() {
         let u1 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: u32::MAX,
             completion_tokens: 1,
             total_tokens: u32::MAX,
@@ -416,6 +431,7 @@ mod tests {
             cache_miss_tokens: 0,
         };
         let u2 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1,
             completion_tokens: u32::MAX,
             total_tokens: u32::MAX,
@@ -449,6 +465,7 @@ mod tests {
         };
         // 1M input tokens, 0 output
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1_000_000,
             completion_tokens: 0,
             total_tokens: 1_000_000,
@@ -468,6 +485,7 @@ mod tests {
         };
         // 500K input + 250K output
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 500_000,
             completion_tokens: 250_000,
             total_tokens: 750_000,
@@ -499,6 +517,7 @@ mod tests {
     #[test]
     fn token_usage_accumulate_cache_fields() {
         let u1 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
@@ -506,6 +525,7 @@ mod tests {
             cache_miss_tokens: 40,
         };
         let u2 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 200,
             completion_tokens: 100,
             total_tokens: 300,
@@ -530,6 +550,7 @@ mod tests {
         };
         // No cache hits
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1_000_000,
             completion_tokens: 500_000,
             total_tokens: 1_500_000,
@@ -552,6 +573,7 @@ mod tests {
         };
         // 900 cache hit + 100 cache miss = 1000 prompt tokens
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1_000,
             completion_tokens: 500,
             total_tokens: 1_500,
@@ -588,6 +610,7 @@ mod tests {
     #[test]
     fn token_usage_accumulate_preserves_cache_tokens() {
         let u1 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1000,
             completion_tokens: 100,
             total_tokens: 1100,
@@ -595,6 +618,7 @@ mod tests {
             cache_miss_tokens: 100,
         };
         let u2 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 2000,
             completion_tokens: 200,
             total_tokens: 2200,

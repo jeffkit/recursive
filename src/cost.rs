@@ -199,6 +199,15 @@ impl CostTracker {
                     self.accumulated_usage.cache_miss_tokens,
                 )),
             );
+            // Goal 273: surface reasoning tokens in .meta.json so
+            // users running R1 / o1 can see the cost driver
+            // separately from visible output.
+            obj.insert(
+                "reasoning_tokens".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.accumulated_usage.reasoning_tokens,
+                )),
+            );
             obj.insert(
                 "total_llm_latency_ms".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(self.accumulated_latency_ms)),
@@ -248,6 +257,7 @@ mod tests {
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage1 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
@@ -262,6 +272,7 @@ mod tests {
         assert_eq!(tracker.accumulated_latency_ms, 500);
 
         let usage2 = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 200,
             completion_tokens: 100,
             total_tokens: 300,
@@ -283,6 +294,7 @@ mod tests {
 
         // deepseek-chat pricing: $0.27/M input, $1.10/M output
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1_000_000,
             completion_tokens: 500_000,
             total_tokens: 1_500_000,
@@ -312,6 +324,7 @@ mod tests {
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1000,
             completion_tokens: 500,
             total_tokens: 1500,
@@ -365,6 +378,7 @@ mod tests {
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 500,
             completion_tokens: 300,
             total_tokens: 800,
@@ -407,6 +421,7 @@ mod tests {
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
@@ -430,6 +445,7 @@ mod tests {
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
@@ -449,6 +465,7 @@ mod tests {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             total_usage: TokenUsage {
+                reasoning_tokens: 0,
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
@@ -488,6 +505,7 @@ mod tests {
 
         // deepseek-chat: $0.14/M input, $0.28/M output, $0.0028/M cache hit
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 1_000_000,
             completion_tokens: 500_000,
             total_tokens: 1_500_000,

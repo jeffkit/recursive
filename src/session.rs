@@ -265,7 +265,10 @@ impl UsageMeta {
             } else {
                 None
             },
-            reasoning_tokens: None,
+            // Goal 273: pass through reasoning tokens so they can be
+            // summed into SessionCost and priced (treated as output
+            // by `ModelPricing::cost_usd`).
+            reasoning_tokens: Some(tu.reasoning_tokens),
         }
     }
 
@@ -284,6 +287,11 @@ pub struct SessionCost {
     pub total_cache_creation_tokens: u64,
     #[serde(default)]
     pub total_cache_read_tokens: u64,
+    /// Goal 273: reasoning / thinking tokens summed across the
+    /// session. Priced at the model's output rate (see
+    /// `ModelPricing::cost_usd`).
+    #[serde(default)]
+    pub total_reasoning_tokens: u64,
 }
 
 impl SessionCost {
@@ -292,6 +300,7 @@ impl SessionCost {
         self.total_output_tokens += usage.output_tokens as u64;
         self.total_cache_creation_tokens += usage.cache_creation_tokens.unwrap_or(0) as u64;
         self.total_cache_read_tokens += usage.cache_read_tokens.unwrap_or(0) as u64;
+        self.total_reasoning_tokens += usage.reasoning_tokens.unwrap_or(0) as u64;
     }
 }
 

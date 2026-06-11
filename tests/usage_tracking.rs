@@ -19,6 +19,7 @@ fn completion_with_usage(text: &str, input: u32, output: u32) -> Completion {
         tool_calls: vec![],
         finish_reason: Some("stop".to_string()),
         usage: Some(TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input + output,
@@ -177,6 +178,7 @@ fn old_jsonl_without_usage_loads_without_error() {
 #[test]
 fn usage_meta_from_token_usage_maps_correctly() {
     let tu = TokenUsage {
+        reasoning_tokens: 0,
         prompt_tokens: 100,
         completion_tokens: 50,
         total_tokens: 150,

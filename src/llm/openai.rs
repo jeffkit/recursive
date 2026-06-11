@@ -794,12 +794,19 @@ impl OpenAiProvider {
                 .get("prompt_cache_miss_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
+            // Goal 273: o1 / o3 family reports reasoning tokens under
+            // Goal 273: the streaming path does not extract
+            // completion_tokens_details.reasoning_tokens here. The
+            // non-streaming ResponseUsage default is 0; the future
+            // enhancement is to add the field to ResponseUsage and
+            // pluck it in `to_token_usage`.
             *usage = Some(TokenUsage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: total,
                 cache_hit_tokens: cache_hit,
                 cache_miss_tokens: cache_miss,
+                reasoning_tokens: 0,
             });
         }
         Ok(())
@@ -903,11 +910,17 @@ struct ResponseUsage {
 impl ResponseUsage {
     fn to_token_usage(&self) -> TokenUsage {
         TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: self.prompt_tokens.unwrap_or(0),
             completion_tokens: self.completion_tokens.unwrap_or(0),
             total_tokens: self.total_tokens.unwrap_or(0),
             cache_hit_tokens: self.prompt_cache_hit_tokens.unwrap_or(0),
             cache_miss_tokens: self.prompt_cache_miss_tokens.unwrap_or(0),
+            // Goal 273: o1 / o3 family reports reasoning tokens
+            // under `completion_tokens_details.reasoning_tokens`,
+            // but the streaming path already captures that into
+            // TokenUsage directly. The non-streaming ResponseUsage
+            // has no such field, so default 0.
         }
     }
 }

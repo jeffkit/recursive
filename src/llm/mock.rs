@@ -191,11 +191,13 @@ mod tracing_tests {
     #[tokio::test]
     async fn llm_complete_records_token_fields() {
         let usage = TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
             cache_hit_tokens: 0,
             cache_miss_tokens: 0,
+            // Goal 273: default 0 for MockProvider (no reasoning).
         };
         let provider = MockProvider::new(vec![Completion {
             content: "response".into(),

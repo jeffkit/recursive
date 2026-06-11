@@ -479,11 +479,13 @@ impl AnthropicProvider {
             let prompt = input_tokens.unwrap_or(0);
             let completion = output_tokens.unwrap_or(0);
             usage = Some(TokenUsage {
+                reasoning_tokens: 0,
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: prompt.saturating_add(completion),
                 cache_hit_tokens: cache_read.unwrap_or(0),
                 cache_miss_tokens: cache_creation.unwrap_or(0),
+                // Goal 273: not yet reported by Anthropic. Default 0.
             });
         }
 
@@ -745,6 +747,7 @@ struct AnthropicUsage {
 impl AnthropicUsage {
     fn to_token_usage(&self) -> TokenUsage {
         TokenUsage {
+            reasoning_tokens: 0,
             prompt_tokens: self.input_tokens.unwrap_or(0),
             completion_tokens: self.output_tokens.unwrap_or(0),
             total_tokens: self
@@ -753,6 +756,9 @@ impl AnthropicUsage {
                 .saturating_add(self.output_tokens.unwrap_or(0)),
             cache_hit_tokens: self.cache_read_input_tokens.unwrap_or(0),
             cache_miss_tokens: self.cache_creation_input_tokens.unwrap_or(0),
+            // Goal 273: Anthropic extended-thinking emits a separate
+            // `thinking_tokens` field. Default 0 — the field may be
+            // added once Anthropic's response shape is finalised.
         }
     }
 }
