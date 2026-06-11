@@ -85,6 +85,30 @@ impl<'a> PermissionPipeline<'a> {
         // Phase 1: safety content (file-path content for protected-path check).
         let safety_content = safety_content_for_tool(tool_name, &arguments);
 
+        // NEW-PERM-2 (Goal H2): safety check for protected paths must
+        // run independently of whether `permissions` is configured.
+        // `with_policy` alone (no `with_permissions`) used to skip
+        // safety entirely — a user who deliberately registered an L1
+        // policy for shell/FS but no permission layers could still
+        // write to `.git/hooks/`. Compute the safety decision
+        // upfront; the per-permission-mode code below may also call
+        // `check_static` (which does its own safety check) but the
+        // second call is idempotent — both Deny with the same path.
+        let is_readonly = self.registry.is_readonly(tool_name);
+        if let Some(path) = crate::permissions::check_protected_path(
+            tool_name,
+            is_readonly,
+            safety_content.as_deref(),
+        ) {
+            return CheckOutcome::Deny {
+                error: Error::PermissionDenied {
+                    name: tool_name.into(),
+                    reason: DecisionReason::SafetyCheck { path },
+                },
+                audit: AuditMeta::synthetic_unknown_tool(tool_name),
+            };
+        }
+
         // Phases 2-6: read shared permissions lock and run all permission checks.
         if let Some(ref sp) = self.registry.permissions {
             let guard = sp.read().await;
@@ -184,7 +208,20 @@ impl<'a> PermissionPipeline<'a> {
                             }
                             arguments = new_args;
                         }
-                        PermissionDecision::Allow => {}
+                        PermissionDecision::Allow => {
+                            // NEW-PERM-1 (Goal H2): re-run policy check
+                            // on the hook-approved args. A malicious or
+                            // buggy hook could `Allow` a tool+args that
+                            // the policy would have denied above; the
+                            // Transform path already rechecks but the
+                            // Allow path historically skipped it.
+                            if let Err(e) = self.recheck_policy(tool_name, &arguments) {
+                                return CheckOutcome::Deny {
+                                    error: e,
+                                    audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                                };
+                            }
+                        }
                     }
                     // Hook allowed/transformed; guard already dropped, skip headless block.
                 } else {
@@ -616,5 +653,61 @@ mod tests {
             .check("Bash", serde_json::json!({"command": "dangerous_cmd"}))
             .await;
         assert!(outcome.is_deny());
+    }
+}
+
+// =====================================================================
+// Goal H2 (NEW-PERM-1 + NEW-PERM-2) — source-grep snapshot tests
+// pin the structural fixes:
+//   - hook Allow path must re-run recheck_policy
+//   - safety check (protected paths) must run even when
+//     `permissions` is None
+// =====================================================================
+#[cfg(test)]
+mod goal_h2_perm_pipeline {
+    #[test]
+    fn hook_allow_path_runs_recheck_policy() {
+        let src = include_str!("permission_pipeline.rs");
+        // The fix: the `PermissionDecision::Allow` arm of the hook
+        // block must call `recheck_policy`. Match the closing brace
+        // of the Transform arm (which already had a recheck) and
+        // the Allow arm, then assert that both mention
+        // `recheck_policy`.
+        let hook_block = src
+            .split("PermissionDecision::Deny(reason) =>")
+            .nth(1)
+            .expect("hook block must exist")
+            .split("// Hook allowed/transformed;")
+            .next()
+            .expect("hook block must include the post-hook marker");
+        let allow_arm = hook_block
+            .split("PermissionDecision::Allow =>")
+            .nth(1)
+            .expect("Allow arm must exist")
+            .split('}')
+            .next()
+            .expect("Allow arm must terminate");
+        assert!(
+            allow_arm.contains("recheck_policy"),
+            "PermissionDecision::Allow arm must re-run recheck_policy"
+        );
+    }
+
+    #[test]
+    fn safety_check_runs_without_permissions() {
+        // The fix: the `if let Some(ref sp) = self.registry.permissions`
+        // block must come AFTER the protected-path check, not before.
+        let src = include_str!("permission_pipeline.rs");
+        let safety_idx = src
+            .find("check_protected_path")
+            .expect("NEW-PERM-2 safety check call must exist");
+        let perms_idx = src
+            .find("if let Some(ref sp) = self.registry.permissions")
+            .expect("permissions block must still exist (per-mode checks)");
+        assert!(
+            safety_idx < perms_idx,
+            "safety check must run BEFORE the permissions block (so it \
+             runs even when `permissions` is None)"
+        );
     }
 }

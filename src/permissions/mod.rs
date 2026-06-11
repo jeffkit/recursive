@@ -644,6 +644,31 @@ fn path_contains_protected(path: &str, protected: &str) -> bool {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Check whether a file path is in the protected-paths list (NEW-PERM-2,
+/// Goal H2). Used by the permission pipeline to enforce the safety
+/// check independently of whether `permissions` is configured —
+/// `with_policy` alone used to skip this check entirely, allowing
+/// writes to `.git/hooks/`, `.env`, etc. Returns the offending
+/// protected path component if matched, `None` otherwise.
+///
+/// `is_readonly` exempts `Read` and `Grep` from the check.
+pub fn check_protected_path(
+    tool_name: &str,
+    is_readonly: bool,
+    content: Option<&str>,
+) -> Option<String> {
+    if is_readonly {
+        return None;
+    }
+    let path = extract_file_path_from_content(tool_name, content)?;
+    for protected in PROTECTED_PATHS {
+        if path_contains_protected(&path, protected) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Match a tool name against a pattern that may end with `*`.
 ///
 /// - `"Bash"` matches exactly `"Bash"`
