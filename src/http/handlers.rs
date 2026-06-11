@@ -1251,11 +1251,16 @@ pub(super) async fn agui_run(
         })?;
 
     // Acquire a semaphore permit to limit concurrent runs.
+    // Goal-H J2: use `try_acquire_owned` so a saturated semaphore
+    // returns immediately with a 503 (rather than awaiting
+    // indefinitely via `acquire_owned().await`, which would hang
+    // every /agui request when the pool is full). The previous
+    // behaviour was documented in the g268 lead-completion
+    // journal entry but the fix was deferred. Closing it here.
     let _permit = state
         .run_semaphore
         .clone()
-        .acquire_owned()
-        .await
+        .try_acquire_owned()
         .map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1582,10 +1587,14 @@ mod tests {
         assert_eq!(elapsed_ms, 0);
     }
 
-    /// Goal-268: /agui must respect run_semaphore. When the semaphore is
-    /// closed, `acquire_owned()` returns `AcquireError` immediately, which
-    /// the handler maps to `SERVICE_UNAVAILABLE`. A 0-permit semaphore would
-    /// block forever (not what we want to test), so we use `close()`.
+    /// Goal-268 + Goal-H J2: /agui must respect run_semaphore. The
+    /// handler uses `try_acquire_owned` (J2) so a saturated (0-
+    /// permit) semaphore returns 503 SERVICE_UNAVAILABLE
+    /// **immediately** rather than blocking forever on
+    /// `acquire_owned().await`. A 0-permit `Semaphore` is the
+    /// natural test fixture — no `close()` workaround needed
+    /// (the previous form tested a *closed* semaphore, which is
+    /// a different code path inside `try_acquire_owned`).
     #[tokio::test]
     async fn agui_run_respects_run_semaphore() {
         use crate::llm::MockProvider;
@@ -1597,8 +1606,9 @@ mod tests {
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         let config = crate::config::Config::from_env().unwrap();
 
-        let sem = Arc::new(Semaphore::new(1));
-        sem.close(); // acquire_owned() → Err(AcquireError)
+        // 0-permit semaphore: every `try_acquire_owned` call
+        // returns `TryAcquireError::NoPermits` immediately.
+        let sem = Arc::new(Semaphore::new(0));
 
         let state = Arc::new(crate::http::AppState {
             tools: vec![],
