@@ -392,8 +392,26 @@ pub fn build_router_with_auth_and_rate_limit(
     auth: AuthConfig,
     limiter: RateLimiter,
 ) -> Router {
-    Router::new()
+    let state_arc = Arc::new(state);
+
+    // Public sub-router: no auth or rate-limit middleware. Routes
+    // added here are implicitly reachable without credentials. This
+    // makes the bypass **structural** (the route lives outside the
+    // auth layer entirely) instead of a string-compare in
+    // `auth_middleware` — the previous implementation, which
+    // silently let `/openapi.json` 401 because it was added to the
+    // router but not to the bypass list.
+    let public = Router::new()
         .route("/health", get(health))
+        .route("/openapi.json", get(openapi_spec))
+        .route("/metrics", get(metrics_handler));
+
+    // Protected sub-router: every other route goes through auth and
+    // rate-limit. The rate-limit layer is the **outermost** of the
+    // two so it runs first — unauthenticated (brute-force) requests
+    // are counted against the IP-based bucket and cannot bypass
+    // limits by rotating API keys (SEC-006).
+    let protected = Router::new()
         .route("/tools", get(list_tools))
         .route("/run", post(run_agent))
         .route("/sessions", post(create_session))
@@ -405,36 +423,33 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/events", get(session_events))
         .route("/sessions/{id}/plan/confirm", post(session_plan_confirm))
         .route("/sessions/{id}/plan/reject", post(session_plan_reject))
-        // Goal-168: goal loop endpoints.
         .route("/sessions/{id}/goal", post(session_set_goal))
         .route(
             "/sessions/{id}/goal",
             axum::routing::delete(session_clear_goal),
         )
-        // Goal-170: interrupt the current agent turn.
         .route("/sessions/{id}/interrupt", post(session_interrupt))
-        // SDK Phase C: fork a session.
         .route("/sessions/{id}/fork", post(fork_session))
-        // Goal-169: slash commands listing.
         .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
-        .route("/openapi.json", get(openapi_spec))
-        .route("/metrics", get(metrics_handler))
-        .layer(axum::middleware::from_fn_with_state(
-            state.metrics.clone(),
-            metrics_middleware,
-        ))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
-        // rate_limit is added last so it is the outermost layer and runs
-        // before auth — this ensures unauthenticated (brute-force) requests
-        // are counted against the IP-based bucket and cannot bypass limits by
-        // rotating API keys (SEC-006).
         .layer(axum::middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
+        ));
+
+    // Top router: merge public + protected, then add the cross-cutting
+    // layers (metrics, body-limit) that apply to both. metrics counts
+    // every request (public + protected); body-limit caps every body.
+    Router::new()
+        .merge(public)
+        .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            state_arc.metrics.clone(),
+            metrics_middleware,
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(Arc::new(state))
+        .with_state(state_arc)
 }
 
 /// Build a static OpenAPI 3.0.3 specification describing all API endpoints.
@@ -868,4 +883,87 @@ pub fn spawn_session_reaper(
             }
         }
     })
+}
+
+// =====================================================================
+// Goal 272 — auth bypass is structural (route-level merge), not string-
+// compare inside auth_middleware. These tests pin that invariant via
+// source-grep so a future refactor that re-introduces the string-compare
+// breaks CI instead of silently 401-ing /openapi.json.
+//
+// We use the source-grep form because the existing test harness
+// (tests/http.rs) requires a full AppState builder; a runtime test here
+// would add a fixture crate. Per the g268 post-mortem, deterministic
+// source-level assertions are preferred over runtime tests for invariants
+// that are already enforced by the type system + a structural merge.
+// =====================================================================
+#[cfg(test)]
+mod goal_272_route_level_auth_bypass {
+
+    #[test]
+    fn public_subrouter_has_no_auth_layer() {
+        let src = include_str!("mod.rs");
+        // Slice the public sub-router block: from
+        // `let public = Router::new()` to `let protected = Router::new()`.
+        let between = src
+            .split("let public = Router::new()")
+            .nth(1)
+            .expect("public sub-router block must exist");
+        let public_block = between
+            .split("let protected = Router::new()")
+            .next()
+            .expect("public block must end before protected");
+        assert!(
+            !public_block.contains("auth_middleware"),
+            "public sub-router must NOT include auth_middleware layer"
+        );
+        assert!(
+            !public_block.contains("rate_limit_middleware"),
+            "public sub-router must NOT include rate_limit_middleware layer"
+        );
+        // All three public routes must be present.
+        assert!(public_block.contains("/health"));
+        assert!(public_block.contains("/openapi.json"));
+        assert!(public_block.contains("/metrics"));
+    }
+
+    #[test]
+    fn auth_middleware_no_longer_short_circuits_on_path() {
+        // Previously `if path == "/health" || path == "/metrics"` lived
+        // inside `auth_middleware`. The string-compare is gone now.
+        let auth_src = include_str!("auth.rs");
+        assert!(
+            !auth_src.contains("path == \"/health\""),
+            "auth_middleware must not hardcode /health bypass"
+        );
+        assert!(
+            !auth_src.contains("path == \"/metrics\""),
+            "auth_middleware must not hardcode /metrics bypass"
+        );
+        assert!(
+            !auth_src.contains("path == \"/openapi.json\""),
+            "auth_middleware must not hardcode /openapi.json bypass"
+        );
+    }
+
+    #[test]
+    fn protected_routes_built_with_auth_layer() {
+        let src = include_str!("mod.rs");
+        let protected_block = src
+            .split("let protected = Router::new()")
+            .nth(1)
+            .expect("protected sub-router block must exist");
+        let protected_end = protected_block
+            .split(".merge(protected)")
+            .next()
+            .expect("protected merge call must exist");
+        assert!(
+            protected_end.contains("auth_middleware"),
+            "protected sub-router must include auth_middleware layer"
+        );
+        assert!(
+            protected_end.contains("rate_limit_middleware"),
+            "protected sub-router must include rate_limit_middleware layer"
+        );
+    }
 }

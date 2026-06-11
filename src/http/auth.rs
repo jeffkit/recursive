@@ -181,9 +181,10 @@ pub(super) fn auth_config_from_env() -> AuthConfig {
 /// `Authorization: Bearer <jwt>`. Either valid credential lets the
 /// request through.
 ///
-/// Layered after the router so that all routes pass through it, but
-/// `/health` and `/metrics` are explicitly exempted to keep liveness
-/// probes and metrics scraping reachable without credentials.
+/// Layered only over the protected sub-router — public routes
+/// (`/health`, `/metrics`, `/openapi.json`) are merged in at the
+/// top level without going through this middleware. See
+/// `build_router_with_auth_and_rate_limit` in `src/http/mod.rs`.
 ///
 /// When auth is disabled (no API keys AND no JWT verifier
 /// configured), the middleware is a no-op pass-through — preserving
@@ -194,10 +195,6 @@ pub(super) async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if !auth.is_enabled() {
-        return next.run(req).await;
-    }
-    let path = req.uri().path();
-    if path == "/health" || path == "/metrics" {
         return next.run(req).await;
     }
     // Try X-API-Key first (cheaper than JWT verify).
