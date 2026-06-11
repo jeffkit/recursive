@@ -1606,9 +1606,7 @@ mod tests {
             config,
             provider: Arc::new(MockProvider::new(vec![])),
             sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            event_channels: Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
