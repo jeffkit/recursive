@@ -111,15 +111,42 @@ fn hash_key(value: &str) -> String {
 ///
 /// Uses the `X-API-Key` header if present, hashing the value so the raw
 /// credential is never stored in the rate-limit bucket map (prevents leaking
-/// keys via memory dumps). Falls back to the remote IP address when no
-/// `X-API-Key` header is present.
+/// keys via memory dumps). Falls back to the **leftmost** entry of
+/// `X-Forwarded-For` when present (reverse-proxy deployments — the
+/// previous form fell back to the **proxy** IP via `ConnectInfo`,
+/// which is the same value for every client behind a load balancer;
+/// NEW-HTTP-7 fix), then to the socket IP, then to `ip:unknown`.
+///
+/// The leftmost XFF entry is the original client per the de-facto
+/// convention; **operators must configure their proxy to append
+/// the client IP** (nginx `proxy_set_header X-Forwarded-For
+/// $remote_addr;` does this by default). For a deployment
+/// without a trusted proxy, the XFF header can be **forged** by
+/// clients — in that case the proxy's own IP (the second XFF
+/// entry) is more honest. We do not currently detect the
+/// "no trusted proxy" case; documented as a follow-up.
 pub(super) fn extract_client_key(req: &axum::extract::Request) -> String {
     if let Some(api_key) = req.headers().get("x-api-key") {
         if let Ok(key) = api_key.to_str() {
             return format!("apikey:{}", hash_key(key));
         }
     }
-    // Fall back to remote IP
+    // XFF first — leftmost is the original client per de-facto
+    // convention. Trims whitespace; falls through if header is
+    // present but empty.
+    if let Some(xff) = req.headers().get("x-forwarded-for") {
+        if let Ok(s) = xff.to_str() {
+            if let Some(first) = s.split(',').next() {
+                let first = first.trim();
+                if !first.is_empty() {
+                    return format!("xff:{first}");
+                }
+            }
+        }
+    }
+    // Fall back to socket IP (the proxy's own IP behind a load
+    // balancer, but still better than `ip:unknown` for direct
+    // connections).
     req.extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| format!("ip:{}", info.ip()))
@@ -285,5 +312,58 @@ mod tests {
             assert!(limiter.check("default-client").await);
         }
         assert!(!limiter.check("default-client").await, "burst exceeded");
+    }
+}
+
+#[cfg(test)]
+mod goal_h3_xff {
+    use super::*;
+    use axum::extract::Request;
+
+    fn build_request_with_xff(xff: Option<&str>) -> Request {
+        let mut req = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        if let Some(xff) = xff {
+            req.headers_mut()
+                .insert("x-forwarded-for", xff.parse().expect("valid header value"));
+        }
+        req
+    }
+
+    #[test]
+    fn extract_client_key_uses_xff_when_no_apikey() {
+        // NEW-HTTP-7: reverse-proxy deployments. The
+        // leftmost XFF entry is the original client per the
+        // de-facto convention. The previous form fell back
+        // to the proxy's socket IP, which is the same value
+        // for every client behind a load balancer — every
+        // request shared one rate-limit bucket, so the
+        // rate-limit effectively applied to the LB, not the
+        // client. With XFF support each client gets its own
+        // bucket.
+        let req = build_request_with_xff(Some("203.0.113.42, 10.0.0.1"));
+        let key = extract_client_key(&req);
+        assert_eq!(key, "xff:203.0.113.42");
+    }
+
+    #[test]
+    fn extract_client_key_trims_whitespace_in_xff() {
+        let req = build_request_with_xff(Some("  203.0.113.42  ,  10.0.0.1  "));
+        let key = extract_client_key(&req);
+        assert_eq!(key, "xff:203.0.113.42");
+    }
+
+    #[test]
+    fn extract_client_key_falls_back_when_xff_empty() {
+        // An XFF header that is present but empty is treated as
+        // absent — fall through to the socket-IP branch.
+        let req = build_request_with_xff(Some(""));
+        let key = extract_client_key(&req);
+        assert!(
+            key.starts_with("ip:"),
+            "empty XFF should fall through to socket IP, got {key}"
+        );
     }
 }
