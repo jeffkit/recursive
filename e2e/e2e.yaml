@@ -31,6 +31,11 @@ service:
       # Store all sessions under /workspace so test assertions can find them
       # via container paths without knowing the per-user data dir hash.
       RECURSIVE_HOME: /workspace
+      # Goal-H J1: pin the session dir to a stable location so the
+      # recursive-session assertion can find sessions without
+      # discovering the workspace hash. Production runs leave this
+      # unset and get the default `<RECURSIVE_HOME>/workspaces/<hash>/sessions/`.
+      RECURSIVE_SESSIONS_DIR: /workspace/sessions
       # Passed through for live integration tests (06, 23)
       DEEPSEEK_API_KEY: "{{env.DEEPSEEK_API_KEY}}"
 

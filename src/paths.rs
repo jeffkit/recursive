@@ -54,8 +54,15 @@ pub fn user_workspace_dir(workspace: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `<user_workspace_dir>/sessions/`.
+/// `<user_workspace_dir>/sessions/`. Honors `RECURSIVE_SESSIONS_DIR`
+/// as a hard override (Goal-H J1) — useful for tests and
+/// integrations that need to know exactly where the binary writes
+/// a session for a given workspace, without going through the
+/// user-data + workspace-hash layout.
 pub fn user_sessions_dir(workspace: &Path) -> Result<PathBuf> {
+    if let Some(custom) = std::env::var_os("RECURSIVE_SESSIONS_DIR") {
+        return Ok(PathBuf::from(custom));
+    }
     let dir = user_workspace_dir(workspace)?.join("sessions");
     if !dir.exists() {
         std::fs::create_dir_all(&dir).map_err(Error::Io)?;
@@ -131,6 +138,28 @@ mod tests {
     fn user_data_dir_honors_env_override() {
         let _g = PinnedRecursiveHome::new("/tmp/recursive-test-fixed");
         assert_eq!(user_data_dir(), PathBuf::from("/tmp/recursive-test-fixed"));
+    }
+
+    #[test]
+    fn sessions_dir_honors_recursive_sessions_dir_override() {
+        // Goal-H J1: the e2e smoke-01 session assertion
+        // previously pointed at <workspace>/.recursive/sessions/
+        // while the binary wrote to
+        // <RECURSIVE_HOME>/workspaces/<hash>/sessions/. The fix
+        // is RECURSIVE_SESSIONS_DIR — a hard override that
+        // bypasses the user-data + workspace-hash layout. This
+        // test pins that the override is honored and that
+        // user_workspace_dir is **not** called (which would
+        // canonicalize the path and crash on the empty
+        // /tmp/recursive-test-fixed fixture).
+        let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_SESSIONS_DIR", "/tmp/explicit-sessions");
+        let dir = user_sessions_dir(Path::new("/tmp/recursive-test-fixed")).unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/explicit-sessions"));
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+            None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+        }
     }
 
     #[test]

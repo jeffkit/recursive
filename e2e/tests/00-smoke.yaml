@@ -47,7 +47,7 @@ cases:
   - name: "smoke-01: session recorded write_file tool call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/smoke-01/.recursive/sessions
+      input: /workspace/sessions
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
       hasToolCalls: ["write_file"]
@@ -56,7 +56,7 @@ cases:
   - name: "smoke-02: session recorded read_file tool call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/smoke-02/.recursive/sessions
+      input: /workspace/sessions
       status: ["completed", "success"]
       hasToolCalls: ["read_file"]
 
