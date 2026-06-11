@@ -295,9 +295,34 @@ impl SessionCost {
     }
 }
 
+/// `schema_version` written into a `SessionMeta` whose on-disk
+/// representation predates the field. Pre-Goal-269 session files
+/// have no `schema_version`; defaulting to 1 (the current value)
+/// keeps them loadable.
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// Maximum `schema_version` this build of the binary can interpret.
+/// `SessionReader::load_meta` rejects anything strictly greater
+/// than this. Bump this constant (and the helper above) when
+/// making a non-backward-compatible change to `SessionMeta`.
+const SUPPORTED_SESSION_SCHEMA_VERSION: u32 = 1;
+
 /// Metadata for a JSONL session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// Schema version of the persisted `SessionMeta`. Bumped
+    /// whenever a non-backward-compatible field is added (e.g.
+    /// dropping a `#[serde(default)]` attribute). The on-disk
+    /// format is read by `SessionReader::load_meta`, which checks
+    /// this field and refuses to load a session with a
+    /// `schema_version` it does not understand.
+    ///
+    /// Defaults to `1` for pre-Goal-269 session files (the field
+    /// was introduced in Goal 269, 2026-06-11).
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub session_id: String,
     pub goal: String,
     pub model: String,
@@ -563,6 +588,7 @@ impl SessionWriter {
             Some(hash_tool_specs(tool_specs))
         };
         let meta = SessionMeta {
+            schema_version: SUPPORTED_SESSION_SCHEMA_VERSION,
             session_id: session_id.clone(),
             goal: goal.to_string(),
             model: model.to_string(),
@@ -1162,11 +1188,29 @@ impl SessionReader {
     }
 
     /// Load the session metadata from a session directory.
+    ///
+    /// Refuses to deserialize a session whose `schema_version` is
+    /// newer than this build supports (Goal 269). Pre-Goal-269
+    /// session files have no `schema_version` field and load
+    /// successfully via the `#[serde(default)]` on the struct.
     pub fn load_meta(session_dir: &Path) -> std::io::Result<SessionMeta> {
         let meta_path = session_dir.join(".meta.json");
         let bytes = std::fs::read(&meta_path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let meta: SessionMeta = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if meta.schema_version > SUPPORTED_SESSION_SCHEMA_VERSION {
+            let err = crate::error::Error::SchemaTooNew {
+                session_id: meta.session_id.clone(),
+                found: meta.schema_version,
+                supported: SUPPORTED_SESSION_SCHEMA_VERSION,
+            };
+            tracing::warn!("{}", err);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ));
+        }
+        Ok(meta)
     }
 
     /// List all session directories for a given workspace.
@@ -2430,5 +2474,118 @@ mod tests {
         assert!(hour < 24, "hour out of range: {hour}");
         assert!(min < 60, "minute out of range: {min}");
         assert!(sec < 60, "second out of range: {sec}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionMeta schema_version tests (Goal 269)
+    // -----------------------------------------------------------------------
+
+    /// Build a `SessionMeta` with the minimum required fields populated
+    /// for tests that care only about the schema-version behaviour.
+    /// `schema_version` is intentionally set via the helper, not
+    /// hard-coded, so changing the supported version only requires
+    /// updating `SUPPORTED_SESSION_SCHEMA_VERSION` in one place.
+    fn meta_for_test(schema_version: u32) -> SessionMeta {
+        SessionMeta {
+            schema_version,
+            session_id: "20260611T120000Z-test".into(),
+            goal: "schema version test".into(),
+            model: "gpt-4o-mini".into(),
+            provider: "openai".into(),
+            created_at: "2026-06-11T12:00:00Z".into(),
+            updated_at: "2026-06-11T12:00:00Z".into(),
+            message_count: 0,
+            status: "active".into(),
+            tool_registry_hash: None,
+            first_prompt: None,
+            last_prompt: None,
+            cost: None,
+            preset: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn test_session_meta_round_trip() {
+        // Goal 269 — the `schema_version` field is preserved across
+        // a serialize/deserialize round-trip.
+        let original = meta_for_test(SUPPORTED_SESSION_SCHEMA_VERSION);
+        let json = serde_json::to_string(&original).expect("serialize SessionMeta");
+        let restored: SessionMeta = serde_json::from_str(&json).expect("deserialize SessionMeta");
+        assert_eq!(restored.schema_version, SUPPORTED_SESSION_SCHEMA_VERSION);
+        assert_eq!(restored.schema_version, 1);
+        assert_eq!(restored.session_id, original.session_id);
+        assert_eq!(restored.goal, original.goal);
+    }
+
+    #[test]
+    fn test_session_meta_default_schema_version() {
+        // Goal 269 — pre-Goal-269 `.meta.json` files omit
+        // `schema_version`. The `#[serde(default)]` attribute must
+        // fill in the current value so they remain loadable.
+        let legacy_json = serde_json::json!({
+            "session_id": "20260610T120000Z-legacy",
+            "goal": "legacy session",
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "created_at": "2026-06-10T12:00:00Z",
+            "updated_at": "2026-06-10T12:00:00Z",
+            "message_count": 0,
+            "status": "completed"
+        });
+        // The key assertion: no `schema_version` key, but deserialization
+        // still succeeds and the field is populated by the helper.
+        assert!(
+            legacy_json.get("schema_version").is_none(),
+            "test fixture must omit schema_version to exercise the default"
+        );
+        let restored: SessionMeta =
+            serde_json::from_value(legacy_json).expect("deserialize legacy SessionMeta");
+        assert_eq!(restored.schema_version, default_schema_version());
+        assert_eq!(restored.schema_version, 1);
+    }
+
+    #[test]
+    fn test_load_rejects_future_schema_version() {
+        // Goal 269 — `SessionReader::load_meta` must refuse to load a
+        // session whose `schema_version` is newer than this build
+        // supports. The error message must surface both the found
+        // and the supported values, so the user can tell which build
+        // produced the session.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_dir = tmp.path();
+        std::fs::create_dir_all(session_dir).expect("mkdir session dir");
+        let future = serde_json::json!({
+            "schema_version": 999,
+            "session_id": "2099-01-01T00:00:00Z-future",
+            "goal": "future session",
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "created_at": "2099-01-01T00:00:00Z",
+            "updated_at": "2099-01-01T00:00:00Z",
+            "message_count": 0,
+            "status": "active"
+        });
+        let meta_path = session_dir.join(".meta.json");
+        std::fs::write(
+            &meta_path,
+            serde_json::to_string_pretty(&future).expect("serialize future meta"),
+        )
+        .expect("write future .meta.json");
+
+        let err = SessionReader::load_meta(session_dir)
+            .expect_err("load_meta must reject future schema_version");
+        let msg = err.to_string();
+        // The `crate::error::Error::SchemaTooNew` display format we
+        // registered must reach the caller, even after the conversion
+        // to `std::io::Error::InvalidData`.
+        assert!(
+            msg.contains("schema_version=999"),
+            "error must include found version; got: {msg}"
+        );
+        assert!(
+            msg.contains("supported up to 1"),
+            "error must include supported version; got: {msg}"
+        );
     }
 }

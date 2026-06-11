@@ -84,6 +84,18 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// Session metadata on disk has a `schema_version` newer than this
+    /// build of the binary knows how to interpret. Raised by
+    /// `SessionReader::load_meta` when it sees a version greater than
+    /// the supported maximum — the safe action is to refuse to load
+    /// the session, not to silently drop fields.
+    #[error("session {session_id} has schema_version={found}, supported up to {supported}")]
+    SchemaTooNew {
+        session_id: String,
+        found: u32,
+        supported: u32,
+    },
+
     /// Catch-all for errors that don't fit elsewhere
     #[error("{0}")]
     Other(String),
