@@ -1250,6 +1250,22 @@ pub(super) async fn agui_run(
             )
         })?;
 
+    // Acquire a semaphore permit to limit concurrent runs.
+    let _permit = state
+        .run_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: "too many concurrent runs, try again later".into(),
+                }),
+            )
+        })?;
+
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
         .tools(state.tool_registry.clone())
@@ -1564,5 +1580,49 @@ mod tests {
         };
         // No panic; elapsed defaults to 0 when no matching ToolCall.
         assert_eq!(elapsed_ms, 0);
+    }
+
+    /// Goal-268: /agui must respect run_semaphore. When the semaphore is
+    /// closed, `acquire_owned()` returns `AcquireError` immediately, which
+    /// the handler maps to `SERVICE_UNAVAILABLE`. A 0-permit semaphore would
+    /// block forever (not what we want to test), so we use `close()`.
+    #[tokio::test]
+    async fn agui_run_respects_run_semaphore() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+
+        let sem = Arc::new(Semaphore::new(1));
+        sem.close(); // acquire_owned() → Err(AcquireError)
+
+        let state = Arc::new(crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            event_channels: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            session_ttl_secs: 3600,
+            run_semaphore: sem,
+        });
+
+        let body = serde_json::json!({
+            "threadId": "t1",
+            "runId": "r1",
+            "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+        });
+        let (status, _err) = agui_run(State(state), Json(body))
+            .await
+            .expect_err("expected SERVICE_UNAVAILABLE");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
