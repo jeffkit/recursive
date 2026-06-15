@@ -107,6 +107,7 @@ pub use session::OrphanToolCall;
 pub use session::SessionFile;
 pub use session::SessionPersistenceSink;
 pub use session::SessionReader;
+pub use session::SessionStatus;
 pub use session::SessionWriter;
 pub use session::{
     entry_to_message, truncate_transcript_to_turn, SessionLock, SessionMeta, TranscriptEntry,

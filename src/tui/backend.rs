@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::event::CompositeSink;
-use crate::session::{SessionPersistenceSink, SessionWriter};
+use crate::session::{SessionPersistenceSink, SessionStatus, SessionWriter};
 use crate::tools::PermissionHook;
 use crate::{AgentEvent, AgentRuntime, EventSink};
 use async_trait::async_trait;
@@ -410,7 +410,7 @@ async fn worker_loop(
             UserAction::Shutdown => {
                 if let Some(sw_arc) = session_writer.take() {
                     if let Ok(mut sw) = sw_arc.lock() {
-                        let _ = sw.finish("success");
+                        let _ = sw.finish(SessionStatus::Completed);
                     }
                 }
                 break;

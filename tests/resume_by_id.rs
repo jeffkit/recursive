@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use recursive::llm::ToolSpec;
 use recursive::message::{Message, Role};
-use recursive::session::{hash_tool_specs, SessionLock, SessionMeta, SessionReader, SessionWriter};
+use recursive::session::{
+    hash_tool_specs, SessionLock, SessionMeta, SessionReader, SessionStatus, SessionWriter,
+};
 use recursive::test_util::PinnedRecursiveHome;
 
 /// Pin RECURSIVE_HOME for the duration of the test so per-user
@@ -65,7 +67,7 @@ fn resume_by_full_id_round_trips_seed() {
         .unwrap();
     w.append(&Message::assistant("hi".to_string()), None, None)
         .unwrap();
-    w.finish("interrupted").unwrap();
+    w.finish(SessionStatus::Interrupted).unwrap();
     drop(w);
 
     let messages = SessionReader::load_messages(&dir).unwrap();
@@ -84,7 +86,7 @@ fn most_recent_shortcut_picks_active_or_interrupted() {
     let mut a = SessionWriter::create(&ws, "A", "m", "p").unwrap();
     a.append(&Message::user("a".to_string()), None, None)
         .unwrap();
-    a.finish("success").unwrap();
+    a.finish(SessionStatus::Completed).unwrap();
     let dir_a = a.session_dir().to_path_buf();
     drop(a);
 
@@ -103,7 +105,7 @@ fn most_recent_shortcut_picks_active_or_interrupted() {
     let mut c = SessionWriter::create(&ws, "C", "m", "p").unwrap();
     c.append(&Message::user("c".to_string()), None, None)
         .unwrap();
-    c.finish("success").unwrap();
+    c.finish(SessionStatus::Completed).unwrap();
     let dir_c = c.session_dir().to_path_buf();
     drop(c);
 
@@ -120,10 +122,10 @@ fn most_recent_shortcut_picks_active_or_interrupted() {
     // B is the one we want, since it has status="active".
     let pick = sorted
         .into_iter()
-        .find(|(_, m)| matches!(m.status.as_str(), "active" | "interrupted"));
+        .find(|(_, m)| matches!(m.status, SessionStatus::Active | SessionStatus::Interrupted));
     let (picked_dir, picked_meta) = pick.expect("expected an active session");
     assert_eq!(picked_dir, dir_b);
-    assert_eq!(picked_meta.status, "active");
+    assert_eq!(picked_meta.status, SessionStatus::Active);
 }
 
 #[test]
@@ -252,7 +254,7 @@ fn load_messages_round_trips_tool_calls_and_reasoning() {
     w.append(&assistant, None, None).unwrap();
     w.append(&Message::tool_result("call_001", "result body"), None, None)
         .unwrap();
-    w.finish("success").unwrap();
+    w.finish(SessionStatus::Completed).unwrap();
     drop(w);
 
     let msgs = SessionReader::load_messages(&dir).unwrap();

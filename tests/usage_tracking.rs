@@ -8,7 +8,7 @@
 use recursive::event::{CompositeSink, EventSink, NullSink};
 use recursive::llm::{Completion, MockProvider, TokenUsage};
 use recursive::session::SessionPersistenceSink;
-use recursive::session::{SessionReader, SessionWriter, UsageMeta};
+use recursive::session::{SessionReader, SessionStatus, SessionWriter, UsageMeta};
 use recursive::test_util::IsolatedWorkspace;
 use recursive::AgentRuntime;
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,7 @@ async fn assistant_messages_have_usage_in_jsonl() {
     rt.run("hello").await.unwrap();
     rt.run("bye").await.unwrap();
     drop(rt);
-    sw.lock().unwrap().finish("done").ok();
+    sw.lock().unwrap().finish(SessionStatus::Completed).ok();
 
     let entries = SessionReader::load_transcript(&dir).unwrap();
     let assistant_entries: Vec<_> = entries.iter().filter(|e| e.role == "assistant").collect();
@@ -114,7 +114,7 @@ async fn cost_accumulated_in_meta_after_finish() {
     rt.run("turn1").await.unwrap();
     rt.run("turn2").await.unwrap();
     drop(rt);
-    sw.lock().unwrap().finish("done").unwrap();
+    sw.lock().unwrap().finish(SessionStatus::Completed).unwrap();
 
     let meta = SessionReader::load_meta(&dir).unwrap();
     let cost = meta.cost.expect("cost should be in meta after finish");

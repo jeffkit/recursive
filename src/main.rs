@@ -18,6 +18,7 @@ use tracing::Level;
 
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::SessionFile;
+use recursive::SessionStatus;
 use recursive::SessionWriter;
 use recursive::{
     config::Config,
@@ -1448,7 +1449,7 @@ fn cmd_agents(workspace: &std::path::Path) -> anyhow::Result<()> {
         .iter()
         .filter_map(|dir| {
             let meta = recursive::session::SessionReader::load_meta(dir).ok()?;
-            if meta.status == "active" {
+            if meta.status == SessionStatus::Active {
                 Some((dir, meta))
             } else {
                 None
@@ -1781,9 +1782,9 @@ async fn run_once(
     }
 
     let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-        "success"
+        SessionStatus::Completed
     } else {
-        "incomplete"
+        SessionStatus::Crashed
     };
     cli::output::finalize_session_writer(session_writer, finish_status);
     cli::output::finalize_cost_tracker(

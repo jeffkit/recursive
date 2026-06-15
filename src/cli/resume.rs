@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use recursive::{
-    ChannelSink, CompositeSink, EventSink, FinishReason, SessionPersistenceSink, SessionWriter,
+    ChannelSink, CompositeSink, EventSink, FinishReason, SessionPersistenceSink, SessionStatus,
+    SessionWriter,
 };
 
 use crate::cli::builder::{build_runtime, build_tools};
@@ -127,7 +128,7 @@ fn resolve_resume_target(
     })?;
     let pick = sorted
         .into_iter()
-        .find(|(_, m)| matches!(m.status.as_str(), "active" | "interrupted"));
+        .find(|(_, m)| matches!(m.status, SessionStatus::Active | SessionStatus::Interrupted));
     match pick {
         Some((dir, _meta)) => Ok(dir),
         None => anyhow::bail!(
@@ -447,9 +448,9 @@ pub(crate) async fn run_resumed(
     }
 
     let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-        "success"
+        SessionStatus::Completed
     } else {
-        "incomplete"
+        SessionStatus::Crashed
     };
     finalize_session_writer(session_writer, finish_status);
     finalize_cost_tracker(

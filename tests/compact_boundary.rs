@@ -13,7 +13,7 @@ use recursive::event::{CompositeSink, EventSink, NullSink};
 use recursive::llm::MockProvider;
 use recursive::message::Message;
 use recursive::session::SessionPersistenceSink;
-use recursive::session::{SessionReader, SessionWriter};
+use recursive::session::{SessionReader, SessionStatus, SessionWriter};
 use recursive::test_util::IsolatedWorkspace;
 use recursive::{AgentRuntime, Compactor};
 use std::sync::{Arc, Mutex};
@@ -66,7 +66,7 @@ async fn compact_boundary_written_to_jsonl() {
     rt.run("turn2").await.unwrap();
     rt.run("turn3").await.unwrap();
     drop(rt);
-    sw.lock().unwrap().finish("done").ok();
+    sw.lock().unwrap().finish(SessionStatus::Completed).ok();
 
     // Read the raw JSONL and look for the compact_boundary entry.
     let raw = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap();
@@ -117,7 +117,7 @@ async fn load_transcript_skips_pre_boundary_messages() {
     rt.run("turn2").await.unwrap();
     rt.run("turn3").await.unwrap();
     drop(rt);
-    sw.lock().unwrap().finish("done").ok();
+    sw.lock().unwrap().finish(SessionStatus::Completed).ok();
 
     let entries = SessionReader::load_transcript(&dir).unwrap();
 
@@ -158,7 +158,7 @@ fn first_and_last_prompt_written_to_meta() {
         .unwrap();
     w.append(&Message::assistant("second answer"), None, None)
         .unwrap();
-    w.finish("done").unwrap();
+    w.finish(SessionStatus::Completed).unwrap();
     drop(w);
 
     let meta = SessionReader::load_meta(&dir).unwrap();
@@ -219,7 +219,7 @@ fn no_boundary_loads_all_messages() {
     w.append(&Message::user("q1"), None, None).unwrap();
     w.append(&Message::assistant("a1"), None, None).unwrap();
     w.append(&Message::user("q2"), None, None).unwrap();
-    w.finish("done").unwrap();
+    w.finish(SessionStatus::Completed).unwrap();
     drop(w);
 
     let entries = SessionReader::load_transcript(&dir).unwrap();

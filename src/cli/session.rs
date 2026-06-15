@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use recursive::{SessionFile, SessionWriter};
+use recursive::{SessionFile, SessionStatus, SessionWriter};
 
 /// Implementation of `recursive migrate`.
 pub(crate) fn cmd_migrate(workspace: &Path, dry_run: bool) -> anyhow::Result<()> {
@@ -167,7 +167,7 @@ pub(crate) fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyho
         writer.append(msg, None, None)?;
     }
     let session_dir = writer.session_dir().to_path_buf();
-    writer.finish("interrupted").ok();
+    writer.finish(SessionStatus::Interrupted).ok();
     drop(writer);
 
     // Patch `.meta.json` to carry over the legacy `tool_registry_hash`.

@@ -302,7 +302,9 @@ mod tests {
             };
             writer.append(&msg, None, None).unwrap();
         }
-        writer.finish("completed").unwrap();
+        writer
+            .finish(crate::session::SessionStatus::Completed)
+            .unwrap();
         session_dir
             .file_name()
             .unwrap()

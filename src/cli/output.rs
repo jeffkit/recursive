@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use recursive::llm::{pricing_for, TokenUsage};
-use recursive::{AgentEvent, FinishReason, SessionFile, SessionWriter, TranscriptFile};
+use recursive::{
+    AgentEvent, FinishReason, SessionFile, SessionStatus, SessionWriter, TranscriptFile,
+};
 use tokio::sync::mpsc;
 
 pub(crate) fn print_usage(usage: TokenUsage, model: &str, total_llm_latency_ms: u64, steps: usize) {
@@ -124,7 +126,7 @@ pub(crate) fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Re
 
 pub(crate) fn finalize_session_writer(
     session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
-    status: &str,
+    status: SessionStatus,
 ) {
     let Some(sw) = session_writer else { return };
     match Arc::into_inner(sw) {

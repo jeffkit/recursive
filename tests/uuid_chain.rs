@@ -7,7 +7,7 @@
 //! - Old JSONL files without `uuid` fields load without error.
 
 use recursive::message::Message;
-use recursive::session::{SessionReader, SessionWriter};
+use recursive::session::{SessionReader, SessionStatus, SessionWriter};
 use recursive::test_util::IsolatedWorkspace;
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +44,7 @@ fn uuid_chain_is_correct() {
         w.append(&Message::assistant("hi"), None, None).unwrap();
         w.append(&Message::tool_result("call_1", "result"), None, None)
             .unwrap();
-        w.finish("done").unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
     }
 
     let entries = SessionReader::load_transcript(&dir).unwrap();
@@ -101,7 +101,7 @@ fn load_transcript_indexed_builds_uuid_index() {
         let mut w = sw.lock().unwrap();
         w.append(&Message::user("q"), None, None).unwrap();
         w.append(&Message::assistant("a"), None, None).unwrap();
-        w.finish("done").unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
     }
 
     let (entries, index) = SessionReader::load_transcript_indexed(&dir).unwrap();
@@ -168,7 +168,7 @@ fn tool_result_source_uuid_points_to_assistant() {
             .unwrap();
         w.append(&Message::tool_result("call_1", "output"), None, None)
             .unwrap();
-        w.finish("done").unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
     }
 
     let entries = SessionReader::load_transcript(&dir).unwrap();
@@ -210,7 +210,7 @@ fn open_existing_continues_uuid_chain() {
     // Resume: open_existing should recover last_uuid.
     let mut w2 = SessionWriter::open_existing(&dir).unwrap();
     w2.append(&Message::user("resumed"), None, None).unwrap();
-    w2.finish("done").unwrap();
+    w2.finish(SessionStatus::Completed).unwrap();
     drop(w2);
 
     let all_entries = SessionReader::load_transcript(&dir).unwrap();

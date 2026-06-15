@@ -13,8 +13,8 @@ use recursive::llm::{Completion, MockProvider, ToolCall};
 use recursive::test_util::PinnedRecursiveHome;
 use recursive::tools::{TouchedFiles, WriteFile};
 use recursive::{
-    apply_rewind, plan_rewind, truncate_transcript_to_turn, AgentRuntime, SessionWriter,
-    ShadowRepo, ToolRegistry,
+    apply_rewind, plan_rewind, truncate_transcript_to_turn, AgentRuntime, SessionStatus,
+    SessionWriter, ShadowRepo, ToolRegistry,
 };
 use serde_json::json;
 
@@ -141,7 +141,7 @@ async fn rewind_undoes_turn_and_restores_files_and_transcript() {
     for m in runtime.transcript().iter().skip(prev) {
         sw.append(m, None, None).unwrap();
     }
-    sw.finish("done").unwrap();
+    sw.finish(SessionStatus::Completed).unwrap();
 
     // Both files should exist on disk now.
     let a_path = dir.path().join("a.txt");

@@ -23,6 +23,118 @@ use crate::message::Message;
 /// Increment when the format changes in a breaking way.
 const SESSION_SCHEMA_VERSION: u32 = 1;
 
+/// Status of a session. Persisted as a lowercase string.
+///
+/// Backward compatibility has THREE complementary mechanisms, all
+/// required for this enum to load files written by every prior build:
+///
+/// 1. **`#[serde(alias = ...)]` on individual variants** — accepts
+///    legacy on-disk strings that map to the same semantic state.
+///    For example, `Completed` accepts both `"completed"` (current)
+///    and `"success"` (the string the pre-Goal-276 writer emitted).
+///    Without these aliases, old session files would silently load
+///    as `Active` (the `other` catch-all) instead of `Completed`.
+///
+/// 2. **`#[serde(other)]` on the last variant (`Active`)** — catches
+///    any *unknown* string the build does not recognise (e.g.
+///    `"stalled"` written by a future version, or a typo). It MUST
+///    stay last; serde requires the catch-all at the end.
+///
+/// 3. **`#[serde(default)]` on the field in `SessionMeta`** (see
+///    below) — handles a *missing* `status` field on disk. Without
+///    it, a `.meta.json` written before the field existed would
+///    fail to load.
+///
+/// Aliases handle **known** legacy values and preserve semantics;
+/// `#[serde(other)]` handles **unknown** values and degrades safely
+/// to `Active`; the field-level `#[serde(default)]` handles a
+/// **missing** field. They are distinct and not interchangeable.
+///
+/// New variants added here must:
+/// - Provide aliases for any prior string literals mapping to the
+///   same semantic state.
+/// - Keep `Active` as the LAST variant (the `#[serde(other)]` arm
+///   must remain terminal — moving it earlier is a serde error).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatus {
+    /// Session finished its goal successfully.
+    /// Legacy alias: `"success"` (written by `cli/resume.rs` and
+    /// `main.rs` before Goal 276).
+    #[serde(alias = "success")]
+    Completed,
+    /// Session ended because of an unrecoverable error
+    /// (provider crash, panic, transcript-limit hard stop, etc.).
+    /// Legacy alias: `"incomplete"` (written by the pre-Goal-276
+    /// finish_status mapping for non-`NoMoreToolCalls` outcomes).
+    #[serde(alias = "incomplete")]
+    Crashed,
+    /// Session was cancelled by a shutdown signal (SIGINT/SIGTERM).
+    /// Legacy alias: `"cancelled"` (the string `FinishReason::Cancelled`
+    /// emits via its `Display` impl; that string was used in
+    /// `cli/session.rs` for the `interrupt` path).
+    #[serde(alias = "cancelled")]
+    Interrupted,
+    /// Session is parked for later resume (e.g. via
+    /// `recursive pause <id>`).
+    Paused,
+    /// Session is the live, currently-running state. Also acts as
+    /// the catch-all (`#[serde(other)]`) for unknown on-disk
+    /// statuses — see the type-level doc comment above.
+    ///
+    /// MUST remain the last variant. Adding a new variant after
+    /// `Active` is a compile error; reorder first.
+    ///
+    /// `#[default]` makes this the `Default::default()` value,
+    /// which `#[serde(default)]` on the field in `SessionMeta`
+    /// relies on when a `.meta.json` file omits the `status`
+    /// key.  The `#[serde(other)]` arm above is a separate
+    /// catch-all for *unknown* string values — see the
+    /// type-level doc comment.
+    #[serde(other)]
+    #[default]
+    Active,
+}
+
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The lowercase string MUST match what serde produces via
+        // `#[serde(rename_all = "lowercase")]`. The test
+        // `session_status_display_matches_serde` guards against
+        // accidental drift between this hand-written impl and the
+        // derived serialization.
+        match self {
+            Self::Completed => write!(f, "completed"),
+            Self::Crashed => write!(f, "crashed"),
+            Self::Interrupted => write!(f, "interrupted"),
+            Self::Paused => write!(f, "paused"),
+            Self::Active => write!(f, "active"),
+        }
+    }
+}
+
+impl SessionStatus {
+    /// Map a [`FinishReason`] to the canonical `SessionStatus` written
+    /// when the writer is finalised.
+    ///
+    /// The mapping is EXHAUSTIVE: there is no wildcard arm, so
+    /// adding a new variant to `FinishReason` becomes a compile error
+    /// in this function rather than silently falling back to
+    /// `Crashed`. The compiler is the safety net.
+    pub fn for_finish(reason: &crate::agent::FinishReason) -> Self {
+        use crate::agent::FinishReason;
+        match reason {
+            FinishReason::NoMoreToolCalls => Self::Completed,
+            FinishReason::BudgetExceeded
+            | FinishReason::ProviderStop(_)
+            | FinishReason::Stuck { .. }
+            | FinishReason::TranscriptLimit { .. }
+            | FinishReason::PermissionDenialLimit => Self::Crashed,
+            FinishReason::Cancelled => Self::Interrupted,
+        }
+    }
+}
+
 /// A saved session that can be resumed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
@@ -339,7 +451,12 @@ pub struct SessionMeta {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: u64,
-    pub status: String,
+    /// Lifecycle state of the session. Defaults to `Active` for
+    /// `.meta.json` files written before Goal 276 (no `status`
+    /// key) and degrades to `Active` for unknown string values
+    /// (caught by `SessionStatus::Active`'s `#[serde(other)]` arm).
+    #[serde(default)]
+    pub status: SessionStatus,
     /// BLAKE3 hash of the tool registry specs at session creation
     /// time. Used by `recursive resume` (g151) to refuse loading a
     /// session whose tool inventory has drifted. `None` for
@@ -376,7 +493,10 @@ pub struct ExportedTranscript {
     pub model: String,
     pub goal: String,
     pub created_at: String,
-    pub status: String,
+    /// Status at the moment of export. Mirrors `SessionMeta::status`
+    /// — the same enum is used in both structs to keep the
+    /// wire shape consistent for external SDK consumers.
+    pub status: SessionStatus,
     pub messages: Vec<TranscriptEntry>,
     pub message_count: u64,
 }
@@ -605,7 +725,7 @@ impl SessionWriter {
             created_at: now.clone(),
             updated_at: now.clone(),
             message_count: 0,
-            status: "active".to_string(),
+            status: SessionStatus::Active,
             tool_registry_hash,
             first_prompt: None,
             last_prompt: None,
@@ -862,7 +982,13 @@ impl SessionWriter {
 
     /// Finalise the session: flush the writer and update the meta file
     /// with the final message count, status, prompts, and cumulative cost.
-    pub fn finish(&mut self, status: &str) -> std::io::Result<()> {
+    ///
+    /// `status` is a [`SessionStatus`] enum value. Callers that have a
+    /// `FinishReason` in hand should prefer
+    /// `SessionStatus::for_finish(&reason)` so the mapping stays
+    /// exhaustive — adding a new `FinishReason` variant will not
+    /// silently fall back to `Crashed`.
+    pub fn finish(&mut self, status: SessionStatus) -> std::io::Result<()> {
         self.writer.flush()?;
 
         // Read-modify-write so we preserve fields we don't own here
@@ -873,7 +999,7 @@ impl SessionWriter {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         meta.updated_at = chrono_lite_now();
         meta.message_count = self.message_count;
-        meta.status = status.to_string();
+        meta.status = status;
         // g157: final prompt snapshot.
         if self.first_prompt.is_some() {
             meta.first_prompt = self.first_prompt.clone();
@@ -1811,13 +1937,13 @@ mod tests {
         assert_eq!(meta.model, "gpt-4o");
         assert_eq!(meta.provider, "openai");
         assert_eq!(meta.message_count, 0);
-        assert_eq!(meta.status, "active");
+        assert_eq!(meta.status, SessionStatus::Active);
 
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         let meta = SessionReader::load_meta(&session_dir).unwrap();
         assert_eq!(meta.message_count, 0);
-        assert_eq!(meta.status, "completed");
+        assert_eq!(meta.status, SessionStatus::Completed);
     }
 
     #[test]
@@ -1838,7 +1964,7 @@ mod tests {
         assert_ne!(id1, id2, "each message gets a unique uuid");
 
         let session_dir = writer.session_dir().to_path_buf();
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         // Load and verify — sequential id/parent_id are still written (g155 compat)
         let entries = SessionReader::load_transcript(&session_dir).unwrap();
@@ -1879,7 +2005,7 @@ mod tests {
             .unwrap();
 
         let session_dir = writer.session_dir().to_path_buf();
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         let entries = SessionReader::load_transcript(&session_dir).unwrap();
         assert_eq!(entries.len(), 3);
@@ -1899,11 +2025,11 @@ mod tests {
             .append(&Message::assistant("msg2"), None, None)
             .unwrap();
         let session_dir = writer.session_dir().to_path_buf();
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         let meta = SessionReader::load_meta(&session_dir).unwrap();
         assert_eq!(meta.message_count, 2);
-        assert_eq!(meta.status, "completed");
+        assert_eq!(meta.status, SessionStatus::Completed);
     }
 
     /// Preset-config goal: the `preset` field is recorded on
@@ -1934,7 +2060,7 @@ mod tests {
             )
             .unwrap();
             let dir = writer.session_dir().to_path_buf();
-            writer.finish("completed").unwrap();
+            writer.finish(SessionStatus::Completed).unwrap();
             let meta = SessionReader::load_meta(&dir).unwrap();
             (dir, meta.preset)
         };
@@ -1975,7 +2101,7 @@ mod tests {
             .unwrap();
         assert_eq!(writer.name.as_deref(), Some("hello world"));
 
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         // name should be persisted in meta.json.
         let meta = SessionReader::load_meta(&session_dir).unwrap();
@@ -1998,7 +2124,7 @@ mod tests {
         // Auto-fill should not replace the explicitly set name.
         assert_eq!(writer.name.as_deref(), Some("my custom name"));
 
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         let meta = SessionReader::load_meta(&session_dir).unwrap();
         assert_eq!(meta.name.as_deref(), Some("my custom name"));
@@ -2015,7 +2141,7 @@ mod tests {
         writer
             .append(&Message::user(long_prompt.clone()), None, None)
             .unwrap();
-        writer.finish("completed").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
 
         let session_dir = writer.session_dir().to_path_buf();
         let meta = SessionReader::load_meta(&session_dir).unwrap();
@@ -2054,7 +2180,7 @@ mod tests {
             .append(&Message::user("good line"), None, None)
             .unwrap();
         let session_dir = writer.session_dir().to_path_buf();
-        writer.finish("crashed").unwrap();
+        writer.finish(SessionStatus::Crashed).unwrap();
 
         // Append a corrupt line manually
         use std::io::Write;
@@ -2115,7 +2241,7 @@ mod tests {
             .unwrap();
         w.append(&Message::assistant("a2".to_string()), None, None)
             .unwrap();
-        w.finish("done").unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
 
         let session_dir = w.session_dir().to_path_buf();
 
@@ -2147,7 +2273,7 @@ mod tests {
             .unwrap();
         w.append(&Message::assistant("a0".to_string()), None, None)
             .unwrap();
-        w.finish("done").unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
         let session_dir = w.session_dir().to_path_buf();
 
         let stats = truncate_transcript_to_turn(&session_dir, 0).unwrap();
@@ -2185,7 +2311,7 @@ mod tests {
         writer
             .append(&Message::assistant("hi back".to_string()), None, None)
             .unwrap();
-        writer.finish("success").unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
         drop(writer);
 
         // load_messages strips id / parent_id / timestamp.
@@ -2440,6 +2566,182 @@ mod tests {
         assert_eq!(transcript[0].content, "after poison");
     }
 
+    // ── Goal 276: SessionStatus enum + backward-compatibility surface ─────
+
+    #[test]
+    fn session_status_serializes_lowercase() {
+        // The lowercase string is part of the wire contract — external
+        // SDK consumers parse `status: "completed"` as a known state.
+        // A drift here would silently break their pipelines.
+        for (variant, expected) in [
+            (SessionStatus::Active, "active"),
+            (SessionStatus::Completed, "completed"),
+            (SessionStatus::Crashed, "crashed"),
+            (SessionStatus::Interrupted, "interrupted"),
+            (SessionStatus::Paused, "paused"),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{expected}\""), "mismatch for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn session_status_display_matches_serde() {
+        // The hand-written Display impl is what CLI output and format
+        // strings see. The derived serde impl is what the on-disk
+        // JSON sees. They must agree — if a future contributor adds
+        // a variant or renames one, this test catches the drift.
+        for variant in [
+            SessionStatus::Active,
+            SessionStatus::Completed,
+            SessionStatus::Crashed,
+            SessionStatus::Interrupted,
+            SessionStatus::Paused,
+        ] {
+            let from_display = format!("{variant}");
+            let from_serde = serde_json::to_string(&variant)
+                .unwrap()
+                .trim_matches('"')
+                .to_string();
+            assert_eq!(
+                from_display, from_serde,
+                "Display and serde disagree for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_status_legacy_aliases_round_trip() {
+        // Pre-Goal-276 writer emitted `"success"` for completed runs and
+        // `"incomplete"` for everything else; the migrate path also
+        // accepts `"cancelled"`. The aliases must read back as the
+        // correct modern variant — silent loss of "success" -> "active"
+        // would be a corruption bug visible only after a real
+        // production write.
+        let cases = [
+            ("success", SessionStatus::Completed),
+            ("incomplete", SessionStatus::Crashed),
+            ("cancelled", SessionStatus::Interrupted),
+            ("completed", SessionStatus::Completed),
+            ("crashed", SessionStatus::Crashed),
+            ("interrupted", SessionStatus::Interrupted),
+            ("paused", SessionStatus::Paused),
+        ];
+        for (legacy_str, expected) in cases {
+            let parsed: SessionStatus = serde_json::from_str(&format!("\"{legacy_str}\""))
+                .unwrap_or_else(|e| panic!("legacy alias {legacy_str:?} did not deserialize: {e}"));
+            assert_eq!(parsed, expected, "wrong mapping for {legacy_str:?}");
+        }
+    }
+
+    #[test]
+    fn session_meta_unknown_status_deserializes_to_active() {
+        // Old on-disk `.meta.json` files (or files written by a future
+        // build) may contain a `status` value this build doesn't
+        // recognise — e.g. `"stalled"` from a future hang-detection
+        // feature. The `#[serde(other)]` catch-all on `Active` must
+        // convert that to `Active` instead of refusing to load the
+        // session.
+        let json = serde_json::json!({
+            "session_id": "future",
+            "goal": "future session",
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "created_at": "2099-01-01T00:00:00Z",
+            "updated_at": "2099-01-01T00:00:00Z",
+            "message_count": 0,
+            "status": "stalled"
+        });
+        let restored: SessionMeta = serde_json::from_value(json)
+            .expect("unknown status string must not break SessionMeta deserialization");
+        assert_eq!(
+            restored.status,
+            SessionStatus::Active,
+            "unknown status should map to Active via #[serde(other)]"
+        );
+    }
+
+    #[test]
+    fn session_meta_missing_status_field_defaults_to_active() {
+        // The `#[serde(default)]` on the `status` field covers the case
+        // where the key is absent (e.g. a `.meta.json` written before
+        // the field existed). This is distinct from the
+        // unknown-string case above (which `#[serde(other)]` handles).
+        let json = serde_json::json!({
+            "session_id": "missing-status",
+            "goal": "no status key",
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "created_at": "2099-01-01T00:00:00Z",
+            "updated_at": "2099-01-01T00:00:00Z",
+            "message_count": 0
+            // NB: no `status` key
+        });
+        let restored: SessionMeta = serde_json::from_value(json)
+            .expect("missing status field must not break SessionMeta deserialization");
+        assert_eq!(
+            restored.status,
+            SessionStatus::Active,
+            "missing status key should default to Active via #[serde(default)]"
+        );
+    }
+
+    #[test]
+    fn session_meta_status_active_round_trip() {
+        // Build a SessionMeta with the new status enum, serialize, then
+        // deserialize, and confirm the variant is preserved.
+        let meta = SessionMeta {
+            status: SessionStatus::Active,
+            ..meta_for_test(SUPPORTED_SESSION_SCHEMA_VERSION)
+        };
+        let json = serde_json::to_string(&meta).expect("serialize SessionMeta");
+        let restored: SessionMeta = serde_json::from_str(&json).expect("deserialize SessionMeta");
+        assert_eq!(restored.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn for_finish_maps_exhaustively() {
+        // Every `FinishReason` variant must map to a `SessionStatus`.
+        // If a new `FinishReason` is added without updating
+        // `SessionStatus::for_finish`, the compiler will surface the
+        // non-exhaustive match (no `_` arm) — this test just
+        // double-checks the currently-known mapping is correct.
+        use crate::agent::FinishReason;
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::NoMoreToolCalls),
+            SessionStatus::Completed
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::BudgetExceeded),
+            SessionStatus::Crashed
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::ProviderStop("rate_limited".into())),
+            SessionStatus::Crashed
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::Stuck {
+                repeated_call: "Read".into(),
+                repeats: 5
+            }),
+            SessionStatus::Crashed
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::TranscriptLimit {
+                chars: 100_000,
+                limit: 80_000
+            }),
+            SessionStatus::Crashed
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::Cancelled),
+            SessionStatus::Interrupted
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::PermissionDenialLimit),
+            SessionStatus::Crashed
+        );
+    }
     // ── chrono_lite_now / epoch_day_to_ymd ──────────────────────────────────
 
     #[test]
@@ -2504,7 +2806,7 @@ mod tests {
             created_at: "2026-06-11T12:00:00Z".into(),
             updated_at: "2026-06-11T12:00:00Z".into(),
             message_count: 0,
-            status: "active".into(),
+            status: SessionStatus::Active,
             tool_registry_hash: None,
             first_prompt: None,
             last_prompt: None,
