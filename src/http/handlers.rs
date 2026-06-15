@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, wrappers::IntervalStream, StreamExt};
 
 use crate::event::{AgentEvent, ChannelSink, NullSink};
+use crate::message::Role;
 use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
 
@@ -807,9 +808,25 @@ pub(super) async fn send_session_message(
     // Spawn a forwarder: AgentEvent → SseEvent → broadcast channel.
     // SDK Phase B: track tool call start times so we can emit tool_progress
     // events with elapsed_ms when each tool finishes.
+    // Goal 274: also maintain the non_system_message_count atomic so the
+    // count stays correct even when the turn errors out mid-run.
+    let initial_count = msg_count_arc.load(std::sync::atomic::Ordering::Relaxed);
+    let count_arc = msg_count_arc.clone();
     let forward_handle = tokio::spawn(async move {
         let mut tool_start_times: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut count: usize = initial_count;
         while let Some(ref agent_event) = event_rx.recv().await {
+            // Increment the count for every non-System message appended.
+            match agent_event {
+                AgentEvent::MessageAppended { message, .. }
+                | AgentEvent::MessageAppendedWithAudit { message, .. }
+                    if message.role != Role::System =>
+                {
+                    count += 1;
+                    count_arc.store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
             // Record start time for each tool call so we can compute elapsed
             // when the result arrives.
             if let AgentEvent::ToolCall { id, .. } = agent_event {
@@ -864,15 +881,6 @@ pub(super) async fn send_session_message(
             }),
         )
     })?;
-
-    // Update the lock-free message counter so list_sessions doesn't need to
-    // acquire the runtime mutex.
-    let new_count = runtime
-        .transcript()
-        .iter()
-        .filter(|m| m.role != crate::message::Role::System)
-        .count();
-    msg_count_arc.store(new_count, std::sync::atomic::Ordering::Relaxed);
 
     // Extract the last assistant message from the runtime's transcript.
     let last_assistant = runtime
