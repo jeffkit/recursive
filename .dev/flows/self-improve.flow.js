@@ -105,6 +105,9 @@ async function main() {
   // 排除 runs/ 既避免 run 产物污染 clean 检查，又不挡住配置文件入仓。
   ensureGitExclude(repo, FC_REL + '/runs/')
 
+  // ── 殭尸进程清理：杀掉本 repo 下挂起的旧 recursive 进程 ─────────
+  killStaleRecursiveProcs(repo, runId)
+
   // ── 预检：捕获 baseline（持久化，续跑复用同一 baseline）──────────
   const baseline = await cp.step('preflight.baseline', () =>
     captureBaseline(repo, { requireClean: true }),
@@ -115,6 +118,9 @@ async function main() {
   const sysPromptFile = await cp.step('preflight.system-prompt', () =>
     buildSystemPrompt(),
   )
+
+  // ── 预检：provider API 健康探测（快速失败，避免 agent 挂死数分钟）─
+  await cp.step('preflight.provider-ping', () => pingProvider(buildEnv()))
 
   // ── 自改安全沙箱：整个尝试在 guard 内执行，verdict 决定提交/回滚 ──
   const transcriptOut = join(cp.dir, 'transcript.json')
@@ -442,4 +448,68 @@ function listRuns() {
       console.log(`${id}  status=${s.status}  verdict=${s.summary?.verdict ?? '-'}  step=${s.currentStep ?? s.status}`)
     } catch { /* 跳过损坏的 state */ }
   })
+}
+
+/**
+ * 杀掉与本仓库关联的、非当前 run 的残留 recursive 进程。
+ * 通过 ps 检查命令行中是否包含本仓库路径来识别，排除当前 runId 关联的进程。
+ * 非致命：失败只打警告，不影响主流程。
+ */
+function killStaleRecursiveProcs(repoPath, currentRunId) {
+  try {
+    // 用顶层已导入的 execFileSync 列出候选 PID
+    let psOut
+    try {
+      psOut = execFileSync('pgrep', ['-af', 'recursive'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch { return } // pgrep 无匹配时 exit 1，直接返回
+    const lines = psOut.trim().split('\n').filter(Boolean)
+    const killed = []
+    for (const line of lines) {
+      const m = line.match(/^(\d+)\s+/)
+      if (!m) continue
+      const pid = parseInt(m[1], 10)
+      if (pid === process.pid) continue               // 不杀自己
+      if (line.includes(currentRunId)) continue       // 不杀当前 run 的进程
+      if (!line.includes(repoPath) && !line.includes('target/release/recursive') && !line.includes('target/debug/recursive')) continue
+      // 只杀 recursive 二进制进程（不杀 node flow 进程）
+      if (!line.includes('/recursive ') && !line.includes('/recursive\t')) continue
+      try {
+        process.kill(pid, 'SIGKILL')
+        killed.push(pid)
+      } catch { /* 进程已消失 */ }
+    }
+    if (killed.length > 0) {
+      console.log(`  [preflight] killed stale recursive procs: ${killed.join(', ')}`)
+    }
+  } catch (e) {
+    console.warn(`  [preflight] stale-proc cleanup failed (non-fatal): ${e.message}`)
+  }
+}
+
+/**
+ * Provider API 健康探测：向 /models 发一个带短超时的 GET 请求。
+ * 只要服务器有响应（包括 401/404）就认为 API 可达，挂死或连接拒绝才失败。
+ * 这样能提前 10s 而非 5min 发现 API 不可用。
+ */
+async function pingProvider(env) {
+  const apiBase = env.RECURSIVE_API_BASE
+  const apiKey  = env.RECURSIVE_API_KEY
+  if (!apiBase || !apiKey) { console.log('  [provider-ping] skipped (no provider env)'); return 'skipped' }
+
+  const url = apiBase.replace(/\/$/, '') + '/models'
+  console.log(`  [provider-ping] GET ${url} ...`)
+  try {
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(12_000), // 12s 超时，比一次 LLM retry 短
+    })
+    // 任何 HTTP 响应（即使 404/401）都说明服务可达
+    console.log(`  [provider-ping] ok (HTTP ${resp.status})`)
+    return `ok:${resp.status}`
+  } catch (e) {
+    const msg = e.name === 'TimeoutError'
+      ? `Provider ping timed out after 12s (${apiBase}) — API may be down or unreachable`
+      : `Provider ping failed: ${e.message} (${apiBase})`
+    throw new Error(msg)
+  }
 }

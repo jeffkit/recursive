@@ -51,3 +51,4 @@ e2e/.argusai/
 # Local docs and assets (not committed to git)
 local_docs/
 scripts/apply_goal_261.py
+.flowcast/logs/
