@@ -54,7 +54,7 @@ struct Cli {
     #[arg(long, value_parser = ["openai", "anthropic"])]
     provider: Option<String>,
 
-    /// Maximum agent loop iterations per goal.
+    /// Maximum agent loop iterations per goal. `0` = unlimited.
     #[arg(long, env = "RECURSIVE_MAX_STEPS")]
     max_steps: Option<usize>,
 
@@ -1096,7 +1096,11 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 println!("workspace:     {}", config.workspace.display());
-                println!("max_steps:     {}", config.max_steps);
+                if config.max_steps == 0 {
+                    println!("max_steps:     unlimited");
+                } else {
+                    println!("max_steps:     {}", config.max_steps);
+                }
                 println!("temperature:   {}", config.temperature);
                 println!("shell_timeout: {}s", config.shell_timeout_secs);
                 if let Some(path) = recursive::config_file::config_file_path() {

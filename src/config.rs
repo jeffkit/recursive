@@ -24,6 +24,8 @@ pub struct Config {
     /// Preset id resolved from `provider.preset` in the config file.
     /// `None` when the user did not opt in (or the file was absent).
     pub preset: Option<String>,
+    /// Maximum agent loop iterations per turn/goal.
+    /// `0` = unlimited (agent stops on `NoMoreToolCalls`, stuck, transcript limit, etc.).
     pub max_steps: usize,
     pub temperature: f64,
     pub system_prompt: String,
@@ -237,7 +239,7 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .or_else(|| file_agent.and_then(|a| a.max_steps))
-            .unwrap_or(32);
+            .unwrap_or(0);
 
         let temperature = std::env::var("RECURSIVE_TEMPERATURE")
             .ok()
@@ -619,6 +621,22 @@ mod tests {
         let prompt = default_system_prompt();
         assert!(prompt.contains("Edit"));
         assert!(prompt.contains("git checkout"));
+    }
+
+    #[test]
+    fn default_max_steps_is_unlimited() {
+        let orig = std::env::var("RECURSIVE_MAX_STEPS").ok();
+        std::env::remove_var("RECURSIVE_MAX_STEPS");
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.max_steps, 0,
+            "default max_steps should be 0 (unlimited)"
+        );
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_MAX_STEPS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MAX_STEPS");
+        }
     }
 
     #[test]

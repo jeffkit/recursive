@@ -78,7 +78,8 @@ node .dev/flows/self-improve.flow.js --list
 | `--run-id <id>` | 指定 run id；续跑用同一个 | `selfimprove-<ts>` |
 | `--repo <path>` | 目标仓路径 | 当前目录 |
 | `--bin <path>` | recursive 二进制路径 | `<repo>/target/release/recursive` |
-| `--budget <N>` | 步数预算（RECURSIVE_MAX_STEPS） | recursive 默认 |
+| `--max-steps <N>` | agent 步数上限（`RECURSIVE_MAX_STEPS`）；`0` = 不限 | **不限**（recursive 默认 `max_steps=0`） |
+| `--budget <N>` | `--max-steps` 的旧别名（兼容） | 同上 |
 | `--hitl terminal\|wecom` | Human-in-the-loop 后端 | `terminal` |
 | `--no-review` | 跳过 self-review | 关 |
 | `--no-commit` | 全绿也不提交（只保留改动） | 关 |

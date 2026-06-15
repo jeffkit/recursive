@@ -61,10 +61,12 @@ pub(crate) struct RunInnerOutcome {
     pub(crate) total_usage: TokenUsage,
     pub(crate) total_llm_latency_ms: u64,
     pub(crate) steps: usize,
-    /// Goal-153: audit metadata for tool results, keyed by `tool_call_id`.
+    /// Goal-153: audit metadata for tool results, keyed by `(turn, tool_call_id)`.
     /// Only entries for successfully-dispatched tool calls are present;
-    /// the key matches `Message.tool_call_id` on `Role::Tool` messages.
-    pub(crate) tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta>,
+    /// the key matches `Message.tool_call_id` on `Role::Tool` messages scoped
+    /// by turn to prevent cross-turn id collisions.
+    pub(crate) tool_audits:
+        std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
 }
 
 /// Private core holding all state needed for one run of the ReAct loop.
@@ -105,6 +107,9 @@ pub(crate) struct RunCore<'a> {
     pub(crate) stuck_window: usize,
     /// Error rate threshold to declare stuck (from Config).
     pub(crate) stuck_error_rate: f64,
+    /// Turn index (0-based), scopes [`crate::tools::AuditKey`] prefixes so
+    /// that cross-turn tool_call_id reuse cannot corrupt audit metadata.
+    pub(crate) turn: u32,
 }
 
 impl<'a> RunCore<'a> {
@@ -509,12 +514,15 @@ impl<'a> RunCore<'a> {
         let mut recent_errors: std::collections::VecDeque<bool> =
             std::collections::VecDeque::with_capacity(self.stuck_window);
         let mut total_usage = TokenUsage::default();
-        // Goal-153: audit metadata for tool calls, keyed by tool_call_id.
-        let mut tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta> =
-            std::collections::HashMap::new();
+        // Goal-153: audit metadata for tool calls, keyed by (turn, tool_call_id).
+        let mut tool_audits: std::collections::HashMap<
+            crate::tools::AuditKey,
+            crate::tools::AuditMeta,
+        > = std::collections::HashMap::new();
         self.total_llm_latency_ms = 0;
 
-        for step in 1..=self.max_steps {
+        let step_cap = effective_step_limit(self.max_steps);
+        for step in 1..=step_cap {
             let step_span = tracing::info_span!("agent.step", step);
             let _guard = step_span.enter();
 
@@ -734,7 +742,7 @@ impl<'a> RunCore<'a> {
                     } in &results
                     {
                         if let Some(a) = pending_audit {
-                            tool_audits.insert(pending_id.clone(), a.clone());
+                            tool_audits.insert((self.turn, pending_id.clone()), a.clone());
                         }
                         self.push_message(Message::tool_result(
                             pending_id.clone(),
@@ -765,9 +773,9 @@ impl<'a> RunCore<'a> {
                     step,
                     is_error,
                 });
-                // Goal-153: accumulate audit keyed by tool_call_id.
+                // Goal-153: accumulate audit keyed by (turn, tool_call_id).
                 if let Some(a) = audit {
-                    tool_audits.insert(id.clone(), a.clone());
+                    tool_audits.insert((self.turn, id.clone()), a.clone());
                 }
 
                 // Sliding-window stuck detection: track whether each tool call
@@ -827,8 +835,25 @@ impl<'a> RunCore<'a> {
     }
 }
 
+/// Step cap for the agent loop. `0` means unlimited (no `BudgetExceeded`).
+fn effective_step_limit(max_steps: usize) -> usize {
+    if max_steps == 0 {
+        usize::MAX
+    } else {
+        max_steps
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::effective_step_limit;
+
+    #[test]
+    fn effective_step_limit_zero_means_unbounded() {
+        assert_eq!(effective_step_limit(0), usize::MAX);
+        assert_eq!(effective_step_limit(32), 32);
+    }
+
     /// Verify the stuck-detection window/rate math that RunCore uses.
     /// This tests the same logic as the sliding-window check in run_inner().
     #[test]

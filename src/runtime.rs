@@ -493,6 +493,7 @@ impl AgentRuntime {
             exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
             permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
+            turn: self.checkpoints.turn_index as u32,
         };
 
         let turn_outcome = self.kernel.run(ctx).await?;
@@ -525,7 +526,7 @@ impl AgentRuntime {
         for (idx, msg) in new_messages.iter().enumerate() {
             let event = if msg.role == crate::message::Role::Tool {
                 if let Some(tcid) = &msg.tool_call_id {
-                    if let Some(audit) = tool_audits.remove(tcid) {
+                    if let Some(audit) = tool_audits.remove(&(outcome.turn, tcid.clone())) {
                         AgentEvent::MessageAppendedWithAudit {
                             message: msg.clone(),
                             audit,
@@ -2326,5 +2327,151 @@ second line";
         let result = truncate_label(&s);
         assert_eq!(result.chars().count(), 121); // 120 chars + ellipsis
         assert!(result.ends_with('…'));
+    }
+
+    // ── Goal-275: tool_audits keyed by (turn, tool_call_id) ──────────────
+
+    /// When two turns reuse the same `tool_call_id`, the new `(turn, id)`
+    /// keying prevents the second turn's audit from overwriting the first
+    /// turn's audit before it can be emitted.
+    #[tokio::test]
+    async fn audit_survives_collision_across_turns() {
+        let llm = Arc::new(MockProvider::new(vec![
+            // Turn 1: tool call "c1" (adder)
+            Completion {
+                content: "calculating...".into(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a": 1, "b": 2}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Turn 1: finish
+            Completion {
+                content: "3".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Turn 2: tool call "c1" (SAME id reused)
+            Completion {
+                content: "calculating again...".into(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a": 5, "b": 7}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Turn 2: finish
+            Completion {
+                content: "12".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        let sink_arc = Arc::new(sink);
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .event_sink(sink_arc)
+            .build()
+            .unwrap();
+
+        // Drain events from builder registration.
+        while let Ok(_ev) = rx.try_recv() {}
+
+        let _ = rt.run("turn 1").await.unwrap();
+        let _ = rt.run("turn 2").await.unwrap();
+
+        let mut audit_count = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, AgentEvent::MessageAppendedWithAudit { .. }) {
+                audit_count += 1;
+            }
+        }
+
+        // Both turns should produce a tool result with audit metadata.
+        // Without (turn, id) keying, turn-2's audit overwrites turn-1's
+        // entry before emit_turn_messages processes either, so
+        // audit_count would be 1 instead of 2.
+        assert_eq!(
+            audit_count, 2,
+            "expected both turns' tool results to have audit metadata"
+        );
+    }
+
+    /// A buggy model that emits the same `tool_call_id` twice in a single
+    /// assistant message.  The `remove()` semantics mean only the first
+    /// tool-result message gets the audit, but at least it gets *one*.
+    /// Before the (turn, id) keying fix, cross-turn collisions could
+    /// nuke even this one.
+    #[tokio::test]
+    async fn duplicate_tool_call_id_in_same_response_attaches_at_least_one() {
+        let llm = Arc::new(MockProvider::new(vec![
+            // Turn 1: two tool calls, both with id "c1"
+            Completion {
+                content: "doing two things...".into(),
+                tool_calls: vec![
+                    crate::llm::ToolCall {
+                        id: "c1".into(),
+                        name: "add".into(),
+                        arguments: json!({"a": 1, "b": 2}),
+                    },
+                    crate::llm::ToolCall {
+                        id: "c1".into(), // duplicate id
+                        name: "add".into(),
+                        arguments: json!({"a": 3, "b": 4}),
+                    },
+                ],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Turn 1: finish
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let tools = ToolRegistry::local().register(Arc::new(Adder));
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        let sink_arc = Arc::new(sink);
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .event_sink(sink_arc)
+            .build()
+            .unwrap();
+
+        while let Ok(_ev) = rx.try_recv() {}
+
+        let _ = rt.run("do it").await.unwrap();
+
+        let mut audit_count = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, AgentEvent::MessageAppendedWithAudit { .. }) {
+                audit_count += 1;
+            }
+        }
+
+        // At least one of the two tool results should carry audit metadata.
+        assert!(
+            audit_count >= 1,
+            "expected at least one tool result to have audit metadata, got {audit_count}"
+        );
     }
 }

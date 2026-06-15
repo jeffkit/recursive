@@ -40,7 +40,7 @@ pub enum PlanningMode {
 /// # Variants
 ///
 /// - `NoMoreToolCalls`: Model produced a response without tool calls (natural completion).
-/// - `BudgetExceeded`: Ran out of steps (hit `max_steps`). Agent likely unfinished.
+/// - `BudgetExceeded`: Ran out of steps (when `max_steps > 0`). Agent likely unfinished.
 /// - `ProviderStop(reason)`: LLM provider stopped unexpectedly. `reason` may be "length"
 ///   (truncated by token limit), "stop"/"end_turn", or a provider-specific code.
 /// - `Stuck`: Agent got stuck calling the same tool repeatedly with the same arguments.

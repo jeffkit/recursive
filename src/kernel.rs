@@ -91,6 +91,11 @@ pub struct TurnContext {
     /// and appends any pending messages as user turns.  This powers the
     /// `send_message` tool's bidirectional coordinator ↔ worker flow.
     pub mailbox: Option<crate::tools::send_message::WorkerMailbox>,
+
+    /// Turn index (0-based), used to scope [`crate::tools::AuditMeta`]
+    /// keys so that tool-call-id collisions across turns cannot cause
+    /// audit metadata to be overwritten or lost.
+    pub turn: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,10 +127,14 @@ pub struct TurnOutcome {
     /// Number of steps (LLM invocations) executed in this turn.
     pub steps: usize,
 
-    /// Goal-153: audit records for tool results, keyed by `tool_call_id`.
+    /// Goal-153: audit records for tool results, keyed by `(turn, tool_call_id)`.
     /// Passed through from `RunInnerOutcome` so the persistence layer
     /// can emit `MessageAppendedWithAudit` for tool messages.
-    pub tool_audits: std::collections::HashMap<String, crate::tools::AuditMeta>,
+    pub tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
+
+    /// Turn index (0-based) this outcome belongs to. Redundant with the key
+    /// prefix in `tool_audits`, but needed for `emit_turn_messages` lookup.
+    pub turn: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +294,7 @@ impl AgentKernel {
             mailbox: ctx.mailbox,
             stuck_window: self.stuck_window,
             stuck_error_rate: self.stuck_error_rate,
+            turn: ctx.turn,
         };
 
         let inner = core.run_inner().await?;
@@ -314,6 +324,7 @@ impl AgentKernel {
             llm_latency_ms: inner.total_llm_latency_ms,
             steps: inner.steps,
             tool_audits: inner.tool_audits,
+            turn: ctx.turn,
         })
     }
 }
@@ -467,7 +478,7 @@ impl AgentKernelBuilder {
         } else {
             ToolRegistry::local()
         };
-        let max_steps = self.max_steps.unwrap_or(32);
+        let max_steps = self.max_steps.unwrap_or(0);
         let hooks = self.hooks.unwrap_or_default();
         // Storage defaults: local filesystem, no-op session store.
         let storage: Arc<dyn StorageBackend> = self.storage.unwrap_or_else(|| {
@@ -537,7 +548,7 @@ mod tests {
             .tools(tools)
             .build()
             .expect("build should succeed");
-        assert_eq!(kernel.max_steps, 32);
+        assert_eq!(kernel.max_steps, 0);
     }
 
     // -- Clone / with_tools tests ------------------------------------------
@@ -598,6 +609,7 @@ mod tests {
             llm_latency_ms: 0,
             steps: 0,
             tool_audits: std::collections::HashMap::new(),
+            turn: 0,
         };
         assert!(outcome.new_messages.is_empty());
         assert!(outcome.final_text.is_none());

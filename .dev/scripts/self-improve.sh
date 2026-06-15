@@ -21,7 +21,7 @@
 #   RECURSIVE_API_KEY (required; falls back to GLM_API_KEY / MINIMAX_API_KEY)
 #   RECURSIVE_API_BASE (default: MiniMax)
 #   RECURSIVE_MODEL    (default: MiniMax-M3)
-#   RECURSIVE_MAX_STEPS (default: 200, matches Cursor's per-turn ceiling)
+#   RECURSIVE_MAX_STEPS (default: 0 = unlimited; set N to cap steps per pass)
 #   RECURSIVE_NO_COMMIT (set to 1 to skip the auto-commit step)
 #   RECURSIVE_AUTO_RESUME (default: 1; set to 0 to disable). When the
 #                         first agent attempt exits with BudgetExceeded,
@@ -295,7 +295,7 @@ fi
 
 echo "[self-improve] provider=$SELECTED_PROVIDER  model=${RECURSIVE_MODEL}" >&2
 
-export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-200}"
+export RECURSIVE_MAX_STEPS="${RECURSIVE_MAX_STEPS:-0}"
 RECURSIVE_AUTO_RESUME="${RECURSIVE_AUTO_RESUME:-1}"
 
 # Dogfood feature wiring. Each variable defaults to "exercise the

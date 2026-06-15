@@ -340,6 +340,7 @@ impl AgentPool {
             exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             permission_mode: PermissionMode::Default,
             mailbox: None,
+            turn: 0,
         };
 
         kernel.run(ctx).await

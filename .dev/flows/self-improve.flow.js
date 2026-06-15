@@ -47,7 +47,8 @@ const { values: opts } = parseArgs({
     'goal-file':{ type: 'string' },
     provider:   { type: 'string' },                 // 注入 recursive 的 provider（env）
     model:      { type: 'string' },
-    budget:     { type: 'string' },                 // 美元预算上限（env）
+    budget:     { type: 'string' },                 // 兼容旧名；同 --max-steps → RECURSIVE_MAX_STEPS
+    'max-steps':{ type: 'string' },                 // agent 步数上限（RECURSIVE_MAX_STEPS）
     'reviewer-provider': { type: 'string' },         // 跨 provider self-review
     hitl:       { type: 'string', default: 'terminal' }, // terminal | wecom
     'project-name': { type: 'string', default: 'recursive' },
@@ -365,11 +366,22 @@ function goalSubject() {
 // 通用解析（resolveProvider）+ recursive 专属 env 翻译（recursiveProviderEnv）分两层。
 // RECURSIVE_HEADLESS=1：禁用 interactive plan-mode tools（enter/exit_plan_mode），
 // 防止 agent 在无人值守的 batch run 中调用 exit_plan_mode 后永久等待审批信号（deadlock）。
+function resolveMaxSteps() {
+  // 仅当 CLI 显式传入时才覆盖 recursive 默认（0 = 不限步数）。
+  return opts['max-steps'] ?? opts.budget ?? null
+}
+
 function buildEnv(providerOverride) {
+  const maxSteps = resolveMaxSteps()
+  const headless = { RECURSIVE_HEADLESS: 'true' }
+  if (maxSteps != null && maxSteps !== '') {
+    headless.RECURSIVE_MAX_STEPS = String(maxSteps)
+  }
   const bundle = resolveProvider(providerOverride ?? opts.provider, PROVIDERS)
-  if (!bundle) return { RECURSIVE_HEADLESS: 'true' }
+  if (!bundle) return headless
   if (opts.model) bundle.model = opts.model // --model 覆盖 profile 默认模型
-  return { ...recursiveProviderEnv({ ...bundle, maxSteps: opts.budget }), RECURSIVE_HEADLESS: 'true' }
+  const env = { ...recursiveProviderEnv(maxSteps != null && maxSteps !== '' ? { ...bundle, maxSteps } : bundle), ...headless }
+  return env
 }
 
 
