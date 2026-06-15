@@ -1,0 +1,10 @@
+{
+  "_comment": "recursive 项目特定质量门（committed）。flowcast self-improve flow 经 loadGates 加载，与内置 cargo test/clippy/fmt 门用 mergeGates 合并（项目门追加在后）。新增门或覆盖同名内置门都在这里声明，不改 flow 代码。",
+  "gates": {
+    "e2e": {
+      "cmd": "sh .dev/scripts/e2e-gate.sh",
+      "onFail": "resume-fix",
+      "timeout": 600000
+    }
+  }
+}
