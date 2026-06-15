@@ -30,20 +30,24 @@ fi
 TIMESTAMP="$(date +%Y%m%dT%H%M%S)"
 LOG_FILE="$LOGS_DIR/flow-${TIMESTAMP}.log"
 
-# ── 3. 用 setsid 创建新会话（彻底脱离控制终端，免疫 SIGHUP）─────
-#   setsid -f: fork + new session，父进程立即返回
-#   nohup 作为 fallback（macOS 上 setsid 可能不在 PATH）
-if command -v setsid &>/dev/null; then
-  LAUNCHER="setsid -f"
-else
-  LAUNCHER="nohup"
-fi
+# ── 3. 彻底脱离控制终端，免疫 SIGHUP ───────────────────────────
+# 策略（按优先级）：
+#   a. node 内置：在 JS 中 process.setsid() — 最干净，无外部依赖
+#   b. nohup + disown — macOS/Linux 均支持，nohup 忽略 SIGHUP
+# 注：macOS 的 setsid(1) 命令不存在（只有 setsid(2) 系统调用），
+#     Linux 的 setsid -f 虽可用但不必要——nohup + disown 已经足够。
 
 echo "[launch-flow] starting flow → log: $LOG_FILE"
 echo "[launch-flow] args: $*"
 
-$LAUNCHER node "$FLOW_SCRIPT" "$@" >> "$LOG_FILE" 2>&1 &
+# 用 bash 子 shell + disown 双保险：子 shell 自己 disown 自己
+(
+  # 忽略 SIGHUP，防止父 shell 退出时信号传播
+  trap '' HUP
+  exec node "$FLOW_SCRIPT" "$@" >> "$LOG_FILE" 2>&1
+) &
 FLOW_PID=$!
+disown "$FLOW_PID" 2>/dev/null || true
 
 # ── 4. 短暂等待确认进程存活（检测立即崩溃） ──────────────────────
 sleep 2
