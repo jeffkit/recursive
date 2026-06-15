@@ -9,7 +9,7 @@
     "test": "node --test test/"
   },
   "dependencies": {
-    "flowcast": "^0.2.4"
+    "flowcast": "^0.2.5"
   },
   "engines": {
     "node": ">=20"

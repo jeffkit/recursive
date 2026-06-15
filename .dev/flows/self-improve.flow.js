@@ -367,9 +367,9 @@ function goalSubject() {
 // 防止 agent 在无人值守的 batch run 中调用 exit_plan_mode 后永久等待审批信号（deadlock）。
 function buildEnv(providerOverride) {
   const bundle = resolveProvider(providerOverride ?? opts.provider, PROVIDERS)
-  if (!bundle) return { RECURSIVE_HEADLESS: '1' }
+  if (!bundle) return { RECURSIVE_HEADLESS: 'true' }
   if (opts.model) bundle.model = opts.model // --model 覆盖 profile 默认模型
-  return { ...recursiveProviderEnv({ ...bundle, maxSteps: opts.budget }), RECURSIVE_HEADLESS: '1' }
+  return { ...recursiveProviderEnv({ ...bundle, maxSteps: opts.budget }), RECURSIVE_HEADLESS: 'true' }
 }
 
 
