@@ -58,6 +58,13 @@ if [[ ${#_missing[@]} -gt 0 ]]; then
   exit 3
 fi
 
+# ---- 构建 e2e 插件（首次或 src 变动后）-------------------------------------
+if [[ -f "e2e/plugins/package.json" ]] && [[ ! -f "e2e/plugins/dist/index.js" || \
+    "e2e/plugins/src" -nt "e2e/plugins/dist/index.js" ]]; then
+  echo "[e2e-gate] 构建 e2e/plugins ..."
+  (cd e2e/plugins && npm run build 2>&1) || { echo "[e2e-gate] e2e/plugins build 失败" >&2; exit 4; }
+fi
+
 # ---- 重建二进制，让容器拿到新代码 ------------------------------------------
 cargo build -q 2>/dev/null || { echo "[e2e-gate] cargo build 失败" >&2; exit 4; }
 
@@ -67,7 +74,20 @@ export WORKTREE_ID
 E2E_PROJECT="$(pwd)/e2e"
 SESSION="argusai-$WORKTREE_ID"
 
-_argus() { local s="$1"; shift; "$MCP2CLI" --session "$s" "$@" 2>&1; }
+# _argus：调用 argusai MCP 工具并检测 JSON `"success":false`（mcp2cli 对工具级错误返回 exit 0）
+_argus() {
+  local s="$1"; shift
+  local out
+  out="$("$MCP2CLI" --session "$s" "$@" 2>&1)"
+  local rc=$?
+  echo "$out"
+  # 若 JSON 含 "success":false，视为失败
+  if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('success',True) else 1)" 2>/dev/null; then
+    return $rc
+  else
+    return 1
+  fi
+}
 
 # 有状态 MCP server：init/setup/run 共享同一进程
 WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD" \
