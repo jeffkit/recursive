@@ -131,17 +131,21 @@ impl Tool for RunSkillScript {
             });
         }
 
-        // Build the command
-        let args_str = arguments["args"].as_str().unwrap_or("");
-        let shell_command = if args_str.is_empty() {
-            script.path.to_string_lossy().to_string()
+        // Parse args with shell-words: each arg is passed as a discrete argv
+        // element — no shell injection, no glob expansion, no command
+        // substitution.  The script's own shebang determines the interpreter.
+        let args_raw = arguments["args"].as_str().unwrap_or("");
+        let args_vec: Vec<String> = if args_raw.is_empty() {
+            Vec::new()
         } else {
-            format!("{} {}", script.path.display(), args_str)
+            shell_words::split(args_raw).map_err(|e| Error::Tool {
+                name: "run_skill_script".into(),
+                message: format!("failed to parse args: {e}"),
+            })?
         };
 
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(&shell_command)
+        let mut cmd = Command::new(&script.path);
+        cmd.args(&args_vec)
             .current_dir(&self.workspace)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -364,5 +368,202 @@ mod tests {
 
         assert!(result.contains("exit: 0"));
         assert!(result.contains("hi"));
+    }
+
+    // ── Goal 283: shell-words arg safety ──────────────────────────────
+
+    /// Shell metacharacters in args are passed as discrete argv elements
+    /// — no shell injection.  The test script prints each argv element on
+    /// its own line.  `shell_words::split` strips shell quoting, so the
+    /// inner text `; rm -rf /; echo pwned` (without quotes) is the single
+    /// arg the script receives.  We assert the sentinel file was NOT created.
+    #[tokio::test]
+    async fn args_with_shell_metachars_are_passed_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        // Sentinel file to prove no command execution happened
+        let sentinel = tmp.path().join("PWNED");
+        let skills = make_skill_with_scripts(
+            &tmp,
+            &[(
+                "argv.sh",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\"",
+                "Print each arg",
+            )],
+        );
+        let tool = RunSkillScript::new(skills, tmp.path().to_path_buf(), Duration::from_secs(30));
+
+        // Malicious args that would trigger command execution under sh -c.
+        // shell_words strips the outer quotes; the script receives the
+        // literal text `; rm -rf /; echo pwned` as a single argv element.
+        let result = tool
+            .execute(json!({
+                "skill": "test-skill",
+                "script": "argv.sh",
+                "args": "\"; rm -rf /; echo pwned\""
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("exit: 0"));
+        // The literal inner text (quotes stripped by shell_words) must
+        // appear verbatim — the `;` was NOT interpreted as a shell separator.
+        assert!(
+            result.contains("; rm -rf /; echo pwned"),
+            "malicious args should appear verbatim, not be executed. Got: {result}"
+        );
+        // Sentinel must NOT exist — no shell execution happened
+        assert!(
+            !sentinel.exists(),
+            "sentinel file was created — shell injection succeeded!"
+        );
+    }
+
+    /// Command substitution syntax in args is passed as literal text —
+    /// no `$(...)` expansion occurs because we exec the script directly
+    /// (no sh -c wrapper).  `shell_words::split` treats the unquoted
+    /// space inside `$(...)` as a word boundary, so the script receives
+    /// two args: `$(touch` and `/tmp/pwned_by_subshell)`.
+    #[tokio::test]
+    async fn args_with_command_substitution_are_passed_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let sentinel = tmp.path().join("pwned_by_subshell");
+        let skills = make_skill_with_scripts(
+            &tmp,
+            &[(
+                "argv.sh",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\"",
+                "Print each arg",
+            )],
+        );
+        let tool = RunSkillScript::new(skills, tmp.path().to_path_buf(), Duration::from_secs(30));
+
+        let result = tool
+            .execute(json!({
+                "skill": "test-skill",
+                "script": "argv.sh",
+                "args": "$(touch /tmp/pwned_by_subshell)"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("exit: 0"));
+        // The text appears but split as separate argv elements —
+        // the `$(...)` was NOT expanded.
+        assert!(
+            result.contains("$(touch"),
+            "command substitution fragment should appear verbatim. Got: {result}"
+        );
+        assert!(
+            result.contains("/tmp/pwned_by_subshell)"),
+            "command substitution fragment should appear verbatim. Got: {result}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "sentinel file was created — command substitution executed!"
+        );
+    }
+
+    /// When a deny rule for "run_skill_script" is configured, calling
+    /// through the ToolRegistry (and thus the PermissionPipeline) must
+    /// return Error::PermissionDenied.
+    #[tokio::test]
+    async fn run_skill_script_respects_permission_pipeline() {
+        let tmp = TempDir::new().unwrap();
+        let skills = make_skill_with_scripts(&tmp, &[("hello.sh", "#!/bin/sh\necho hi", "Say hi")]);
+
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: crate::permissions::PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                deny: vec!["run_skill_script".into()],
+                ..Default::default()
+            }],
+        };
+
+        let reg = crate::tools::ToolRegistry::local()
+            .with_permissions(config)
+            .register(Arc::new(RunSkillScript::new(
+                skills,
+                tmp.path().to_path_buf(),
+                Duration::from_secs(30),
+            )));
+
+        let dispatch = reg
+            .invoke_with_audit(
+                "run_skill_script",
+                json!({"skill": "test-skill", "script": "hello.sh"}),
+            )
+            .await;
+
+        assert!(
+            matches!(dispatch.result, Err(Error::PermissionDenied { .. })),
+            "run_skill_script with deny rule should be PermissionDenied, got: {:?}",
+            dispatch.result
+        );
+    }
+
+    /// When the script file lacks execute permission, the OS refuses to
+    /// exec it and the tool returns Error::Tool with a "spawn failed"
+    /// message (not a silent success or crash).
+    #[tokio::test]
+    async fn run_skill_script_fails_on_non_executable_script() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("bad-skill");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: bad-skill\ndescription: Bad\n---\n\nBody",
+        )
+        .unwrap();
+
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir(&scripts_dir).unwrap();
+        let script_path = scripts_dir.join("noexec.sh");
+        std::fs::write(&script_path, "#!/bin/sh\necho 'should not run'").unwrap();
+
+        // Explicitly remove execute permission — mode 0o644
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&script_path).unwrap().permissions();
+            let mut new_perms = perms;
+            new_perms.set_mode(0o644);
+            std::fs::set_permissions(&script_path, new_perms).unwrap();
+        }
+
+        let skill = Skill {
+            name: "bad-skill".to_string(),
+            description: "Bad".to_string(),
+            path: skill_dir.join("SKILL.md"),
+            refs: vec![],
+            params: vec![],
+            scripts: vec![SkillScript {
+                name: "noexec.sh".to_string(),
+                path: script_path,
+                description: "not executable".to_string(),
+            }],
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            sections: vec![],
+        };
+
+        let tool = RunSkillScript::new(
+            vec![skill],
+            tmp.path().to_path_buf(),
+            Duration::from_secs(30),
+        );
+
+        let result = tool
+            .execute(json!({"skill": "bad-skill", "script": "noexec.sh"}))
+            .await;
+
+        assert!(result.is_err(), "non-executable script should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("spawn failed") || err.contains("PermissionDenied"),
+            "should get spawn-failed or permission-denied error, got: {err}"
+        );
     }
 }
