@@ -165,8 +165,23 @@ impl ShadowRepo {
                 "--force",
                 "--",
                 ".",
+                // Never snapshot recursive's own internals or session state.
                 ":!.recursive/**",
                 ":!.recursive",
+                // Exclude large build / cache directories that are git-ignored
+                // in the project but would be captured by --force. Including
+                // them inflates each snapshot by gigabytes and causes the
+                // blocking git-add to take minutes rather than milliseconds.
+                ":!target/**",
+                ":!target",
+                // Common large auto-generated dirs across projects.
+                ":!node_modules/**",
+                ":!node_modules",
+                ":!.flowcast/runs/**",
+                ":!.flowcast/logs/**",
+                ":!.dev/runs/**",
+                ":!.dev/transcripts/**",
+                ":!.worktrees/**",
             ])
             .output()
             .map_err(git_err)?;
