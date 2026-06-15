@@ -67,6 +67,12 @@ pub enum ExitStatus {
     },
 }
 
+/// Key type for [`AuditMeta`] maps, scoped by (turn, tool_call_id).
+///
+/// Each turn may reuse tool_call_ids (e.g. MockProvider recycles them),
+/// so the turn index disambiguates collisions across turns.
+pub type AuditKey = (u32 /* turn */, String /* tool_call_id */);
+
 /// Per-call audit record returned by [`ToolRegistry::invoke_with_audit`]
 /// and stored in [`crate::session::TranscriptEntry::audit`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
