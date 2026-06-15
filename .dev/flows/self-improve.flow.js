@@ -62,6 +62,18 @@ if (opts.list) { listRuns(); process.exit(0) }
 const runId = opts['run-id'] ?? `selfimprove-${Date.now()}`
 const repo = opts.repo
 
+// Batch-run constraint prepended to every system prompt:
+// plan mode tools block indefinitely when no interactive channel is present.
+const HEADLESS_CONSTRAINT = `# Headless batch-run constraints
+
+You are running non-interactively (no human in the loop).
+
+**DO NOT call \`enter_plan_mode\` or \`exit_plan_mode\`.** These tools block
+forever waiting for a human to approve the plan — in batch mode there is no
+approval channel, so calling them causes an unrecoverable deadlock.
+
+Implement directly: read → think → patch → test. No plan-mode ceremony needed.`
+
 // provider 定义不再硬编码在 flow 里：从 ~/.flowcast/providers.* + <repo>/.flowcast/providers.* 加载（向后兼容 .flowx/）。
 // 顶层 await（在 main() 前）拿到 map，buildEnv 同步消费。
 const PROVIDERS = await loadProviders({ repo })
@@ -276,18 +288,6 @@ async function selfReview() {
 }
 
 // ── system prompt 构建 ───────────────────────────────────────────
-
-// Batch-run constraint prepended to every system prompt:
-// plan mode tools block indefinitely when no interactive channel is present.
-const HEADLESS_CONSTRAINT = `# Headless batch-run constraints
-
-You are running non-interactively (no human in the loop).
-
-**DO NOT call \`enter_plan_mode\` or \`exit_plan_mode\`.** These tools block
-forever waiting for a human to approve the plan — in batch mode there is no
-approval channel, so calling them causes an unrecoverable deadlock.
-
-Implement directly: read → think → patch → test. No plan-mode ceremony needed.`
 
 function buildSystemPrompt() {
   const parts = [HEADLESS_CONSTRAINT]
