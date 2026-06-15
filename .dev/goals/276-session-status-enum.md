@@ -181,3 +181,53 @@ src/run_core.rs, src/runtime.rs (different lines), src/tools/mod.rs,
 src/llm/mock.rs. The runtime.rs overlap is non-overlapping
 methods — safe to run in parallel after quick coordination on
 which methods are touched.
+
+## Review feedback from attempt #1 (NEEDS_FIX — must address)
+
+The first attempt passed all quality gates but was rolled back by
+self-review. **Address ALL of these before finishing**:
+
+### Critical (causes silent data corruption)
+1. **Legacy-value migration** — existing sessions on disk use status
+   strings `"success"` and `"incomplete"` (written by `cli/resume.rs`
+   before this change). With `#[serde(other)]` on `Active`, loading
+   those sessions will silently return `Active` instead of `Completed`
+   / `Crashed`. Fix with **serde aliases**:
+   ```rust
+   #[serde(alias = "success", alias = "completed")]
+   Completed,
+   #[serde(alias = "incomplete", alias = "crashed")]
+   Crashed,
+   #[serde(alias = "cancelled")]
+   Interrupted,
+   ```
+   This makes old on-disk files round-trip correctly without a
+   migration script.
+
+### Medium (compile-correctness / doc accuracy)
+2. **`#[serde(other)]` vs `#[serde(default)]` confusion** — fix the
+   doc comment on `SessionStatus` to accurately describe that
+   `#[serde(other)]` handles **unknown string values** (catch-all),
+   while `#[serde(default)]` (on the field in `SessionMeta`) handles
+   a **missing field**. Both are needed; the doc currently conflates
+   them.
+
+3. **`session_status_for_finish` wildcard arm** — the match has a
+   `_ => SessionStatus::Crashed` fallback. Since `FinishReason` is
+   NOT `#[non_exhaustive]`, this silently compiles even when a new
+   variant is added without updating the mapping. **Remove the `_`
+   arm** so the compiler enforces exhaustiveness.
+
+4. **Import consistency** — use `recursive::SessionStatus` everywhere
+   (via the re-export in `lib.rs`), not a mix of the short path and
+   the full `recursive::session::SessionStatus` path.
+
+### Minor (robustness)
+5. **`Display` drift risk** — add a doc-test or `#[test]` that
+   asserts `format!("{}", SessionStatus::Completed) == "completed"`
+   (and one more variant) so the manual `Display` can't drift from
+   the serde serialization.
+
+6. **Keep `Active` last** — add a comment that future contributors
+   must keep `Active` as the last variant because `#[serde(other)]`
+   requires the catch-all to be last.
