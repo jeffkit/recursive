@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# e2e-gate.sh — argusai E2E smoke 门（供 flowcast self-improve flow 经
+# .flowcast/gates.json 调用）。
+#
+# 职责（刻意单一）：在当前工作树里跑 recursive 的 argusai smoke 套件，
+# 用退出码表达红/绿：
+#   exit 0  → smoke 通过（绿灯）
+#   exit !0 → smoke 失败 / 前置缺失（红灯）
+#
+# resume-fix（把失败喂回 agent 修一次）与 rollback 策略由 flow 的质量门
+# 接管（见 .flowcast/gates.json 的 onFail），本脚本不做——它只回答
+# 「现在这棵工作树的 smoke 过不过」。
+#
+# 这等价于老 self-improve.sh 里那段 argusai 编排的「纯判定」内核，
+# 但抽成独立、可被任意门复用的命令。AGENTS.md 把 E2E smoke 列为强制门，
+# 故前置缺失（mcp2cli / argusai-mcp / e2e.yaml）一律 HARD-FAIL（红灯），
+# 不静默跳过。需要在含 Docker + argusai 的环境运行。
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+E2E_YAML="e2e/e2e.yaml"
+
+# ---- 解析 mcp2cli ----------------------------------------------------------
+MCP2CLI=""
+for _c in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/homebrew/bin/mcp2cli"; do
+  [[ -x "$_c" ]] && { MCP2CLI="$_c"; break; }
+done
+
+# ---- 解析 argusai-mcp 入口（standalone → bundled → npx 兜底）---------------
+ARGUSAI_MCP_BIN=""
+for _root in "$(npm root -g 2>/dev/null)" \
+    "$HOME/.local/share/fnm/node-versions"/*/installation/lib/node_modules; do
+  if [[ -f "$_root/argusai-mcp/dist/index.js" ]]; then
+    ARGUSAI_MCP_BIN="$_root/argusai-mcp/dist/index.js"; break
+  fi
+  if [[ -f "$_root/argusai-cli/node_modules/argusai-mcp/dist/index.js" ]]; then
+    ARGUSAI_MCP_BIN="$_root/argusai-cli/node_modules/argusai-mcp/dist/index.js"; break
+  fi
+done
+_MCP_STDIO_CMD=""
+if [[ -n "$ARGUSAI_MCP_BIN" ]]; then
+  _MCP_STDIO_CMD="node $ARGUSAI_MCP_BIN"
+elif command -v npx >/dev/null 2>&1; then
+  _MCP_STDIO_CMD="npx argusai-mcp"
+fi
+
+# ---- HARD-GATE：前置缺失即红灯 ---------------------------------------------
+_missing=()
+[[ -n "$MCP2CLI" ]]        || _missing+=("mcp2cli（uv tool install mcp2cli）")
+[[ -n "$_MCP_STDIO_CMD" ]] || _missing+=("argusai-mcp（npm i -g argusai-mcp）")
+[[ -f "$E2E_YAML" ]]       || _missing+=("$E2E_YAML")
+if [[ ${#_missing[@]} -gt 0 ]]; then
+  echo "[e2e-gate] HARD-FAIL — 缺少 E2E 前置：" >&2
+  printf '  - %s\n' "${_missing[@]}" >&2
+  exit 3
+fi
+
+# ---- 重建二进制，让容器拿到新代码 ------------------------------------------
+cargo build -q 2>/dev/null || { echo "[e2e-gate] cargo build 失败" >&2; exit 4; }
+
+# ---- 跑 smoke --------------------------------------------------------------
+WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo main)"
+export WORKTREE_ID
+E2E_PROJECT="$(pwd)/e2e"
+SESSION="argusai-$WORKTREE_ID"
+
+_argus() { local s="$1"; shift; "$MCP2CLI" --session "$s" "$@" 2>&1; }
+
+# 有状态 MCP server：init/setup/run 共享同一进程
+WORKTREE_ID="$WORKTREE_ID" "$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD" \
+  --session-start "$SESSION" >/dev/null 2>&1
+
+INIT_LOG="$(pwd)/.flowcast/runs/e2e-init-${SESSION}.log"
+mkdir -p "$(dirname "$INIT_LOG")"
+if ! _argus "$SESSION" argus-init --project-path "$E2E_PROJECT" >"$INIT_LOG" 2>&1; then
+  echo "[e2e-gate] argus-init 失败 — 见 $INIT_LOG" >&2
+  head -20 "$INIT_LOG" >&2
+  "$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
+  exit 5
+fi
+_argus "$SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
+
+RC=1
+if _argus "$SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | grep -q '"passed"'; then
+  echo "[e2e-gate] smoke PASSED ✓"
+  RC=0
+else
+  echo "[e2e-gate] smoke FAILED ✗" >&2
+  _argus "$SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | tail -30 >&2
+fi
+
+_argus "$SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+"$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
+exit "$RC"
