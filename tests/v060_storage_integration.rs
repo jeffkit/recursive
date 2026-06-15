@@ -48,6 +48,7 @@ mod v060 {
                 tool_calls: vec![],
                 tool_call_id: None,
                 reasoning_content: None,
+                is_compaction_summary: false,
             },
             Message {
                 role: Role::Assistant,
@@ -55,6 +56,7 @@ mod v060 {
                 tool_calls: vec![],
                 tool_call_id: None,
                 reasoning_content: None,
+                is_compaction_summary: false,
             },
         ];
 

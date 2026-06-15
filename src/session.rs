@@ -619,6 +619,7 @@ pub fn entry_to_message(entry: TranscriptEntry) -> Message {
         tool_calls: entry.tool_calls,
         tool_call_id: entry.tool_call_id,
         reasoning_content: entry.reasoning_content,
+        is_compaction_summary: false,
     }
 }
 /// Writer for appending messages to a JSONL session file.
@@ -2494,6 +2495,7 @@ mod tests {
             tool_calls: vec![tc],
             tool_call_id: None,
             reasoning_content: Some("I thought about it".into()),
+            is_compaction_summary: false,
         };
         sink.emit(AgentEvent::MessageAppended {
             message: msg.clone(),

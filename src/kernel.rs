@@ -301,18 +301,16 @@ impl AgentKernel {
 
         // Extract only the messages produced during this turn.
         //
-        // If `RunCore` performed intra-turn compaction, a `[compacted: ...]`
-        // summary message is inserted at position 0.  `inner.messages[input_len..]`
-        // would miss that summary, so detect it and prepend.
+        // If `RunCore` performed intra-turn compaction, a summary message
+        // (marked with `is_compaction_summary`) is inserted at position 0.
+        // `inner.messages[input_len..]` would miss that summary, so detect
+        // it and prepend.
         let mut new_messages = if inner.messages.len() > input_len {
             inner.messages[input_len..].to_vec()
         } else {
             Vec::new()
         };
-        if !inner.messages.is_empty()
-            && inner.messages[0].role == crate::message::Role::System
-            && inner.messages[0].content.contains("[compacted:")
-        {
+        if !inner.messages.is_empty() && inner.messages[0].is_compaction_summary {
             new_messages.insert(0, inner.messages[0].clone());
         }
 

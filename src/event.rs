@@ -470,6 +470,7 @@ mod tests {
             tool_calls: vec![tc.clone()],
             tool_call_id: None,
             reasoning_content: Some("my reasoning".into()),
+            is_compaction_summary: false,
         };
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),

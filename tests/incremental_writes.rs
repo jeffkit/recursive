@@ -382,6 +382,7 @@ async fn resume_after_crash_orphan_visible() {
                 }],
                 tool_call_id: None,
                 reasoning_content: None,
+                is_compaction_summary: false,
             },
             None,
             None,

@@ -1486,6 +1486,7 @@ data: {\"type\":\"message_stop\"}
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_xyz".to_string()),
                 reasoning_content: None,
+                is_compaction_summary: false,
             },
         ];
 

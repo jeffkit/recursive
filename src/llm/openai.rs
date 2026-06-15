@@ -406,6 +406,7 @@ impl OpenAiProvider {
             tool_calls: completion.tool_calls.clone(),
             tool_call_id: None,
             reasoning_content: completion.reasoning_content.clone(),
+            is_compaction_summary: false,
         });
         next_messages.push(Message {
             role: Role::Tool,
@@ -413,6 +414,7 @@ impl OpenAiProvider {
             tool_calls: vec![],
             tool_call_id: Some(search_call.id.clone()),
             reasoning_content: None,
+            is_compaction_summary: false,
         });
 
         let mut next_loaded = loaded_tools.to_vec();
@@ -486,6 +488,7 @@ impl OpenAiProvider {
             tool_calls: completion.tool_calls.clone(),
             tool_call_id: None,
             reasoning_content: completion.reasoning_content.clone(),
+            is_compaction_summary: false,
         });
         next_messages.push(Message {
             role: Role::Tool,
@@ -493,6 +496,7 @@ impl OpenAiProvider {
             tool_calls: vec![],
             tool_call_id: Some(search_call.id.clone()),
             reasoning_content: None,
+            is_compaction_summary: false,
         });
 
         let mut next_loaded = loaded_tools.to_vec();

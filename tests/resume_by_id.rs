@@ -248,6 +248,7 @@ fn load_messages_round_trips_tool_calls_and_reasoning() {
         tool_calls: tool_calls.clone(),
         tool_call_id: None,
         reasoning_content: Some("internal monologue".into()),
+        is_compaction_summary: false,
     };
     w.append(&Message::user("u".to_string()), None, None)
         .unwrap();

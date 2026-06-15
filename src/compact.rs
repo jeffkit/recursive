@@ -293,7 +293,7 @@ impl Compactor {
             summary
         );
 
-        Ok(Message::system(header))
+        Ok(Message::system(header).with_compaction_summary())
     }
 }
 
@@ -324,7 +324,14 @@ mod tests {
         let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
-        assert!(summary_msg.content.contains("[compacted:"));
+        assert!(
+            summary_msg.is_compaction_summary,
+            "compactor must mark summary message with the bit"
+        );
+        assert!(
+            summary_msg.content.contains("[compacted:"),
+            "compactor must still include the [compacted: header for debuggability"
+        );
         assert!(summary_msg.content.contains("Key decisions:"));
         assert!(summary_msg.content.contains("Tests pass."));
     }
@@ -374,7 +381,14 @@ mod tests {
 
         // Should still produce a summary (even if older portion is empty-ish)
         assert_eq!(summary_msg.role, crate::message::Role::System);
-        assert!(summary_msg.content.contains("[compacted:"));
+        assert!(
+            summary_msg.is_compaction_summary,
+            "compactor must mark summary message with the bit"
+        );
+        assert!(
+            summary_msg.content.contains("[compacted:"),
+            "compactor must still include the [compacted: header for debuggability"
+        );
     }
 
     #[test]
@@ -469,7 +483,14 @@ mod tests {
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should have fallen back to free-text format
-        assert!(summary_msg.content.contains("[compacted:"));
+        assert!(
+            summary_msg.is_compaction_summary,
+            "compactor must mark summary message with the bit"
+        );
+        assert!(
+            summary_msg.content.contains("[compacted:"),
+            "compactor must still include the [compacted: header for debuggability"
+        );
         assert!(summary_msg.content.contains("Free-text fallback summary."));
     }
 
@@ -498,7 +519,14 @@ mod tests {
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should have fallen back to free-text format
-        assert!(summary_msg.content.contains("[compacted:"));
+        assert!(
+            summary_msg.is_compaction_summary,
+            "compactor must mark summary message with the bit"
+        );
+        assert!(
+            summary_msg.content.contains("[compacted:"),
+            "compactor must still include the [compacted: header for debuggability"
+        );
         assert!(summary_msg
             .content
             .contains("Fallback after invalid structured response."));

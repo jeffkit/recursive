@@ -1043,6 +1043,7 @@ mod http_tests {
                 tool_calls: vec![],
                 tool_call_id: None,
                 reasoning_content: None,
+                is_compaction_summary: false,
             },
             usage: None,
         };
@@ -1076,6 +1077,7 @@ mod http_tests {
                 }],
                 tool_call_id: None,
                 reasoning_content: None,
+                is_compaction_summary: false,
             },
             usage: None,
         };
@@ -1105,6 +1107,7 @@ mod http_tests {
                     tool_calls: vec![],
                     tool_call_id: Some("tc".into()),
                     reasoning_content: None,
+                    is_compaction_summary: false,
                 },
                 usage: None,
             };

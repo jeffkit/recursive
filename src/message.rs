@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::ToolCall;
 
+/// Serde helper: skip serializing `is_compaction_summary` when false, so old
+/// JSONL transcripts on disk deserialize cleanly without the field.
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -29,6 +36,13 @@ pub struct Message {
     /// when present, otherwise the API returns a 400 error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// True when this message was inserted by `Compactor` as a summary of
+    /// older messages. Used by AgentKernel::run to detect intra-turn
+    /// compaction summaries without sniffing the rendered content text.
+    /// Defaults to false; old transcripts on disk serialize as false
+    /// (field omitted).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_compaction_summary: bool,
 }
 
 impl Message {
@@ -39,6 +53,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_content: None,
+            is_compaction_summary: false,
         }
     }
 
@@ -49,6 +64,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_content: None,
+            is_compaction_summary: false,
         }
     }
 
@@ -59,6 +75,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_content: None,
+            is_compaction_summary: false,
         }
     }
 
@@ -72,6 +89,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             reasoning_content: None,
+            is_compaction_summary: false,
         }
     }
 
@@ -82,6 +100,41 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
+            is_compaction_summary: false,
         }
+    }
+
+    /// Mark this message as a compaction summary.
+    ///
+    /// Used by `Compactor` so that `AgentKernel::run` can detect intra-turn
+    /// compaction summaries via a typed field instead of sniffing the
+    /// rendered content text.
+    pub fn with_compaction_summary(mut self) -> Self {
+        self.is_compaction_summary = true;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_summary_bit_default_false() {
+        let m = Message::user("hi");
+        assert!(!m.is_compaction_summary);
+    }
+
+    #[test]
+    fn with_compaction_summary_sets_bit() {
+        let m = Message::system("...").with_compaction_summary();
+        assert!(m.is_compaction_summary);
+    }
+
+    #[test]
+    fn compaction_summary_bit_omitted_from_json_when_false() {
+        let m = Message::user("hi");
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("is_compaction_summary"));
     }
 }

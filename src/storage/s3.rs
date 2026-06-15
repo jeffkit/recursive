@@ -214,6 +214,7 @@ mod tests {
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: None,
+            is_compaction_summary: false,
         }];
         let session_id = "test-session";
         timeout(
