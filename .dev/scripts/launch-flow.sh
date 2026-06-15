@@ -40,11 +40,24 @@ LOG_FILE="$LOGS_DIR/flow-${TIMESTAMP}.log"
 echo "[launch-flow] starting flow → log: $LOG_FILE"
 echo "[launch-flow] args: $*"
 
+# 默认追加 --reviewer-agent claude（若调用方已显式指定则不重复添加）
+EXTRA_ARGS=()
+HAS_REVIEWER=0
+for arg in "$@"; do
+  if [[ "$arg" == "--reviewer-agent" || "$arg" == "--reviewer-provider" || "$arg" == "--no-review" ]]; then
+    HAS_REVIEWER=1; break
+  fi
+done
+if [ "$HAS_REVIEWER" = "0" ] && command -v claude &>/dev/null; then
+  EXTRA_ARGS=("--reviewer-agent" "claude")
+  echo "[launch-flow] 自动附加 --reviewer-agent claude（claude CLI 可用）"
+fi
+
 # 用 bash 子 shell + disown 双保险：子 shell 自己 disown 自己
 (
   # 忽略 SIGHUP，防止父 shell 退出时信号传播
   trap '' HUP
-  exec node "$FLOW_SCRIPT" "$@" >> "$LOG_FILE" 2>&1
+  exec node "$FLOW_SCRIPT" "$@" "${EXTRA_ARGS[@]}" >> "$LOG_FILE" 2>&1
 ) &
 FLOW_PID=$!
 disown "$FLOW_PID" 2>/dev/null || true

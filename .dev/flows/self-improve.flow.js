@@ -29,7 +29,7 @@ import { execFileSync } from 'child_process'
 
 import {
   Checkpoint,
-  recursive, recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
+  recursive, recursiveProviderEnv, claude, setWorkdir, setHitlBackend, notify, waitForInput,
   withSelfModGuard, captureBaseline,
   runGate, loadGates, mergeGates,
   writeFailureContext, readAndConsumeFailureContext,
@@ -49,7 +49,8 @@ const { values: opts } = parseArgs({
     model:      { type: 'string' },
     budget:     { type: 'string' },                 // 兼容旧名；同 --max-steps → RECURSIVE_MAX_STEPS
     'max-steps':{ type: 'string' },                 // agent 步数上限（RECURSIVE_MAX_STEPS）
-    'reviewer-provider': { type: 'string' },         // 跨 provider self-review
+    'reviewer-provider': { type: 'string' },         // 跨 provider self-review（用 recursive 执行器）
+    'reviewer-agent':   { type: 'string' },          // 跨 agent self-review（如 claude，自管鉴权）
     hitl:       { type: 'string', default: 'terminal' }, // terminal | wecom
     'project-name': { type: 'string', default: 'recursive' },
     'no-review':{ type: 'boolean', default: false },
@@ -281,9 +282,23 @@ async function reviewWithRetry(maxAttempts = 2) {
 
 async function selfReview() {
   const diff = gitDiff(repo).slice(0, 20_000)
-  const out = await recursive(
+  const prompt =
     `You are an independent reviewer (different provider). Review the following diff for correctness, ` +
-    `regressions and contract violations. Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".\n\n${diff}`,
+    `regressions and contract violations. Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".\n\n${diff}`
+
+  // --reviewer-agent claude：用 claude CLI 做 review（自管鉴权，不需要外部 provider）
+  if (opts['reviewer-agent'] === 'claude') {
+    try {
+      const text = await claude(prompt, { cwd: repo, timeout: 120_000 })
+      return { text: String(text), ok: true }
+    } catch (err) {
+      return { text: String(err), ok: false }
+    }
+  }
+
+  // 默认：recursive executor + reviewer-provider
+  const out = await recursive(
+    prompt,
     {
       cwd: repo, workspace: '.', bin: opts.bin, allowTools: 'Read,Glob,Grep',
       pricingFile: pricingFileOf(repo), env: buildEnv(opts['reviewer-provider']), onData: tee,
