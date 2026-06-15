@@ -191,3 +191,31 @@ ship with this PR.)
 **Disjoint file guarantee**: This goal touches src/http/auth.rs,
 README.md, CHANGELOG.md. Goals 274/275/276 don't touch
 auth.rs. Safe to run in parallel.
+## Review feedback from attempt #1 (rolled back)
+
+**Verdict**: rolled-back (gate.test failed — 2 tests + 8 tests failing)
+
+**Root cause**: The agent added new tests and updated auth_middleware but
+two categories of test failures were NOT addressed:
+
+1. **`sample_state_with_provider()` missing INSECURE_OK guard** (CRITICAL, already fixed in commit e5bdd31):
+   `tests/http.rs` has two helper functions (`sample_state()` and
+   `sample_state_with_provider()`) that create test AppState. The agent only
+   added `SET_INSECURE_OK.call_once(...)` to `sample_state()` but forgot
+   `sample_state_with_provider()`. Tests using the latter all got 503.
+   **This is already fixed** — commit e5bdd31 patched both helpers.
+
+2. **New test `auth_disabled_passes_through` was failing** (CRITICAL):
+   The agent added a test named `auth_disabled_passes_through` that was
+   itself failing. Re-examine what this test should assert — likely it
+   should verify that with `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` the server
+   returns 200, NOT 503. Make sure the test sets the env var before the
+   request.
+
+**What to do this attempt**:
+- The `tests/http.rs` helper functions are already fixed (don't re-add).
+- Focus on `src/http/auth.rs` changes and any new tests.
+- New tests for `auth_disabled_passes_through` must set
+  `std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1")` before
+  invoking the middleware.
+- All existing tests in http.rs already have INSECURE_OK guards now.
