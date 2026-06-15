@@ -385,6 +385,20 @@ enum SessionCmd {
         /// Path to the legacy `.json` session file.
         path: PathBuf,
     },
+    /// Run git garbage collection on the workspace's shadow-git repo to
+    /// reclaim disk space. Prunes all unreachable objects left by rewinds
+    /// and by the historical snapshots that captured build artifacts.
+    /// Safe to run at any time; does not affect ongoing sessions.
+    GcCheckpoints,
+    /// Delete the workspace's shadow-git repo entirely, reclaiming all
+    /// disk space it occupies. Future sessions will start a fresh
+    /// shadow repo; historical rewind for existing sessions will no
+    /// longer be available. Use this when gc is not enough.
+    CleanCheckpoints {
+        /// Skip confirmation prompt.
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1037,6 +1051,12 @@ async fn main() -> anyhow::Result<()> {
             ),
             SessionCmd::MigrateLegacy { path } => {
                 cli::session::cmd_session_migrate_legacy(&config.workspace, &path)
+            }
+            SessionCmd::GcCheckpoints => {
+                cli::session::cmd_session_gc_checkpoints(&config.workspace)
+            }
+            SessionCmd::CleanCheckpoints { force } => {
+                cli::session::cmd_session_clean_checkpoints(&config.workspace, force)
             }
         },
         Cmd::Config { cmd } => match cmd {

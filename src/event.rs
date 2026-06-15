@@ -112,10 +112,6 @@ pub enum AgentEvent {
     /// can write the canonical record without reassembling it from the finer
     /// `AssistantText` / `ToolCall` / `ToolResult` streaming events.
     ///
-    /// `parent_uuid` — if `Some`, the emitter wants this message to be written
-    /// as a branch off the given UUID rather than the SessionWriter's internal
-    /// chain pointer. Used by subagent runtimes (g155).
-    ///
     /// `usage` — token usage for this message (non-None for assistant messages
     /// produced by an LLM call, g156).
     ///
@@ -123,8 +119,6 @@ pub enum AgentEvent {
     /// session on resume (those are already on disk).
     MessageAppended {
         message: crate::message::Message,
-        /// Explicit parent UUID override for subagent branch points (g155).
-        parent_uuid: Option<String>,
         /// Token usage for this message (g156).
         usage: Option<crate::session::UsageMeta>,
     },
@@ -479,7 +473,6 @@ mod tests {
         };
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),
-            parent_uuid: None,
             usage: None,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -510,7 +503,6 @@ mod tests {
         let msg = Message::user("hello");
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),
-            parent_uuid: None,
             usage: None,
         };
         composite.emit(event.clone()).await;
@@ -525,4 +517,23 @@ mod tests {
         assert_eq!(rx1.recv().await.unwrap(), AgentEvent::PlanConfirmed);
         assert_eq!(rx2.recv().await.unwrap(), AgentEvent::PlanConfirmed);
     }
+}
+
+/// Regression test for Goal 278: MessageAppended no longer has parent_uuid field.
+#[test]
+fn message_appended_no_longer_has_parent_uuid_field() {
+    // Source-grep check that src/event.rs doesn't define
+    // parent_uuid inside AgentEvent::MessageAppended.
+    let src = include_str!("event.rs");
+    let arm = src
+        .split("MessageAppended {")
+        .nth(1)
+        .expect("MessageAppended arm must exist")
+        .split("}")
+        .next()
+        .expect("MessageAppended arm must close");
+    assert!(
+        !arm.contains("parent_uuid"),
+        "MessageAppended arm must not reference parent_uuid: {arm}"
+    );
 }

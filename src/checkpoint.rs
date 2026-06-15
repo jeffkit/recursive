@@ -175,8 +175,10 @@ impl ShadowRepo {
                 ":!target/**",
                 ":!target",
                 // Common large auto-generated dirs across projects.
-                ":!node_modules/**",
-                ":!node_modules",
+                // Use `:**/` prefix so nested copies (e.g. website/node_modules/)
+                // are excluded in addition to the workspace root copy.
+                ":!**/node_modules/**",
+                ":!**/node_modules",
                 ":!.flowcast/runs/**",
                 ":!.flowcast/logs/**",
                 ":!.dev/runs/**",
@@ -473,6 +475,56 @@ impl ShadowRepo {
         Ok(())
     }
 
+    /// Run git garbage collection on the shadow repo, pruning all unreachable
+    /// objects immediately. This reclaims disk space after rewinds (which
+    /// orphan commits) and after the pathspec exclusion fixes (which left
+    /// large build-artifact blobs in the object store from earlier snapshots).
+    ///
+    /// The operation is intentionally best-effort: if git gc fails (e.g.
+    /// another process holds a lock) we log a warning and continue rather than
+    /// propagating an error that would break the caller's primary workflow.
+    pub fn gc(&self) -> Result<()> {
+        if !self.shadow_dir.exists() {
+            return Ok(());
+        }
+
+        // Expire all reflog entries immediately so the subsequent gc can
+        // collect commits that were orphaned by rewinds.
+        let reflog_out = git_cmd()
+            .env("GIT_DIR", &self.shadow_dir)
+            .args(["reflog", "expire", "--all", "--expire=now"])
+            .output()
+            .map_err(git_err)?;
+
+        if !reflog_out.status.success() {
+            let stderr = String::from_utf8_lossy(&reflog_out.stderr);
+            if !stderr.trim().is_empty() && !stderr.contains("warning:") {
+                return Err(Error::Tool {
+                    name: "checkpoint".into(),
+                    message: format!("git reflog expire failed: {stderr}"),
+                });
+            }
+        }
+
+        let gc_out = git_cmd()
+            .env("GIT_DIR", &self.shadow_dir)
+            .args(["gc", "--prune=now", "--quiet"])
+            .output()
+            .map_err(git_err)?;
+
+        if !gc_out.status.success() {
+            let stderr = String::from_utf8_lossy(&gc_out.stderr);
+            if !stderr.trim().is_empty() && !stderr.contains("warning:") {
+                return Err(Error::Tool {
+                    name: "checkpoint".into(),
+                    message: format!("git gc failed: {stderr}"),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     // ── private helpers ───────────────────────────────────────────────────────
 
     fn session_head_full_sha(&self, session_id: &str) -> Option<String> {
@@ -511,6 +563,15 @@ impl ShadowRepo {
                 ".",
                 ":!.recursive/**",
                 ":!.recursive",
+                ":!target/**",
+                ":!target",
+                ":!**/node_modules/**",
+                ":!**/node_modules",
+                ":!.flowcast/runs/**",
+                ":!.flowcast/logs/**",
+                ":!.dev/runs/**",
+                ":!.dev/transcripts/**",
+                ":!.worktrees/**",
             ])
             .output();
 

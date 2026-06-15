@@ -1527,27 +1527,13 @@ impl SessionPersistenceSink {
 impl EventSink for SessionPersistenceSink {
     async fn emit(&self, event: AgentEvent) {
         match event {
-            AgentEvent::MessageAppended {
-                message,
-                parent_uuid,
-                usage,
-            } => {
+            AgentEvent::MessageAppended { message, usage } => {
                 let result = {
                     match self.writer.lock() {
-                        Ok(mut w) => w.append_with_audit(
-                            &message,
-                            None,
-                            parent_uuid.as_deref(),
-                            usage.as_ref(),
-                        ),
+                        Ok(mut w) => w.append_with_audit(&message, None, None, usage.as_ref()),
                         Err(poisoned) => {
                             let mut w = poisoned.into_inner();
-                            w.append_with_audit(
-                                &message,
-                                None,
-                                parent_uuid.as_deref(),
-                                usage.as_ref(),
-                            )
+                            w.append_with_audit(&message, None, None, usage.as_ref())
                         }
                     }
                 };
@@ -2511,7 +2497,6 @@ mod tests {
         };
         sink.emit(AgentEvent::MessageAppended {
             message: msg.clone(),
-            parent_uuid: None,
             usage: None,
         })
         .await;
@@ -2556,7 +2541,6 @@ mod tests {
         // This must not panic even though the mutex is poisoned.
         sink.emit(AgentEvent::MessageAppended {
             message: Message::user("after poison"),
-            parent_uuid: None,
             usage: None,
         })
         .await;

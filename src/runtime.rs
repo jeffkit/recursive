@@ -411,7 +411,6 @@ impl AgentRuntime {
         self.event_sink
             .emit(AgentEvent::MessageAppended {
                 message: user_msg,
-                parent_uuid: None,
                 usage: None,
             })
             .await;
@@ -455,7 +454,6 @@ impl AgentRuntime {
             self.event_sink
                 .emit(AgentEvent::MessageAppended {
                     message: summary,
-                    parent_uuid: None,
                     usage: None,
                 })
                 .await;
@@ -534,14 +532,12 @@ impl AgentRuntime {
                     } else {
                         AgentEvent::MessageAppended {
                             message: msg.clone(),
-                            parent_uuid: None,
                             usage: None,
                         }
                     }
                 } else {
                     AgentEvent::MessageAppended {
                         message: msg.clone(),
-                        parent_uuid: None,
                         usage: None,
                     }
                 }
@@ -555,7 +551,6 @@ impl AgentRuntime {
                 };
                 AgentEvent::MessageAppended {
                     message: msg.clone(),
-                    parent_uuid: None,
                     usage,
                 }
             };

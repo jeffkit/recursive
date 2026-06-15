@@ -1044,7 +1044,6 @@ mod http_tests {
                 tool_call_id: None,
                 reasoning_content: None,
             },
-            parent_uuid: None,
             usage: None,
         };
         let sse = map_agent_event(&event).unwrap();
@@ -1078,7 +1077,6 @@ mod http_tests {
                 tool_call_id: None,
                 reasoning_content: None,
             },
-            parent_uuid: None,
             usage: None,
         };
         let sse = map_agent_event(&event).unwrap();
@@ -1108,7 +1106,6 @@ mod http_tests {
                     tool_call_id: Some("tc".into()),
                     reasoning_content: None,
                 },
-                parent_uuid: None,
                 usage: None,
             };
             assert!(

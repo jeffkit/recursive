@@ -245,6 +245,12 @@ pub(crate) fn cmd_session_rewind(
         result.dropped_turns.len()
     );
 
+    // Prune orphaned objects left by the rewind so the shadow repo
+    // doesn't grow unboundedly across many rewind operations.
+    if let Err(e) = repo.gc() {
+        eprintln!("warning: shadow-git gc failed (non-fatal): {e}");
+    }
+
     // Also truncate transcript.jsonl so the conversation state matches
     // the restored workspace state.
     match recursive::truncate_transcript_to_turn(&session_path, to_turn) {
@@ -258,5 +264,40 @@ pub(crate) fn cmd_session_rewind(
             eprintln!("warning: transcript truncation failed: {e}");
         }
     }
+    Ok(())
+}
+
+/// `recursive sessions gc-checkpoints` — run git gc on the shadow repo.
+pub(crate) fn cmd_session_gc_checkpoints(workspace: &Path) -> anyhow::Result<()> {
+    let repo = recursive::ShadowRepo::open(workspace)
+        .map_err(|e| anyhow::anyhow!("cannot open shadow repo for {}: {e}", workspace.display()))?;
+    println!("Running git gc on shadow repo (this may take a moment)…");
+    repo.gc().map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Done. Shadow repo pruned.");
+    Ok(())
+}
+
+/// `recursive sessions clean-checkpoints` — delete the shadow repo entirely.
+pub(crate) fn cmd_session_clean_checkpoints(workspace: &Path, force: bool) -> anyhow::Result<()> {
+    let repo = recursive::ShadowRepo::open(workspace)
+        .map_err(|e| anyhow::anyhow!("cannot open shadow repo for {}: {e}", workspace.display()))?;
+
+    if !force {
+        eprint!(
+            "This will delete the shadow-git repo for {}.\n\
+             Historical rewind for all sessions in this workspace will no longer work.\n\
+             Continue? [y/N] ",
+            workspace.display()
+        );
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim().to_lowercase() != "y" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    repo.clean().map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Shadow-git repo deleted. A fresh repo will be created on the next session.");
     Ok(())
 }
