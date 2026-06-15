@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # launch-flow.sh — 健壮启动 self-improve.flow.js，免疫 SIGHUP，自动记录日志
 #
-# 解决四个反复出现的坑（2026-06-15 经验沉淀）：
+# 解决五个反复出现的坑（2026-06-15 经验沉淀）：
 #   1. 直接用 & 后台启动 → shell 退出 → SIGHUP 杀死 flow 进程
 #   2. 无日志文件 → flow 崩溃无任何可查证据
 #   3. 忘记先 npm install → flow 启动报 "Cannot find module"
 #   4. 工作树不干净（.dev/ 文件未 commit）→ withSelfModGuard 拒绝启动
 #      ★ 重要：每次修改 .dev/ 文件后必须先 commit，再运行本脚本！
+#   5. nohup Node.js 在 macOS 跑 20-40 分钟后被系统回收（App Nap）
+#      ★ 根本解法：优先用 tmux，tmux session 不受 macOS 进程回收影响
 #
 # 关于日志"冻住"的假象：
 #   Node.js stdout 重定向到文件时默认全缓冲，[step N] 等日志会积压在内存。
 #   进度应通过 transcript.jsonl 文件大小来判断，而非日志行数。
-#   本脚本已用 stdbuf -oL（需 coreutils）或 nohup 来缓解缓冲问题。
+#   本脚本已用 stdbuf -oL（需 coreutils）来缓解缓冲问题。
 #
 # 用法（在仓库根目录执行）：
 #   .dev/scripts/launch-flow.sh --goal-file .dev/goals/276-xxx.md --provider deepseek --hitl wecom
@@ -45,18 +47,9 @@ fi
 # ── 2. 生成带时间戳的日志文件 ─────────────────────────────────────
 TIMESTAMP="$(date +%Y%m%dT%H%M%S)"
 LOG_FILE="$LOGS_DIR/flow-${TIMESTAMP}.log"
+TMUX_SESSION="recursive-flow-${TIMESTAMP}"
 
-# ── 3. 彻底脱离控制终端，免疫 SIGHUP ───────────────────────────
-# 策略（按优先级）：
-#   a. node 内置：在 JS 中 process.setsid() — 最干净，无外部依赖
-#   b. nohup + disown — macOS/Linux 均支持，nohup 忽略 SIGHUP
-# 注：macOS 的 setsid(1) 命令不存在（只有 setsid(2) 系统调用），
-#     Linux 的 setsid -f 虽可用但不必要——nohup + disown 已经足够。
-
-echo "[launch-flow] starting flow → log: $LOG_FILE"
-echo "[launch-flow] args: $*"
-
-# 默认追加 --reviewer-agent claude（若调用方已显式指定则不重复添加）
+# ── 3. 默认追加 --reviewer-agent claude ───────────────────────────
 EXTRA_ARGS=()
 HAS_REVIEWER=0
 for arg in "$@"; do
@@ -69,11 +62,7 @@ if [ "$HAS_REVIEWER" = "0" ] && command -v claude &>/dev/null; then
   echo "[launch-flow] 自动附加 --reviewer-agent claude（claude CLI 可用）"
 fi
 
-# nohup + & 保活：nohup 忽略 SIGHUP，重定向到日志文件。
-# 注：Node.js 重定向到文件时 stdout 是全缓冲，日志行会有延迟。
-#     进度应通过 transcript.jsonl 文件大小判断，而非日志行数。
-#     若安装了 GNU coreutils（brew install coreutils），可改用：
-#       stdbuf -oL node "$FLOW_SCRIPT" ...  # 强制行缓冲，日志实时
+# ── 4. stdbuf 行缓冲（日志实时写入）──────────────────────────────
 STDBUF=$(command -v stdbuf 2>/dev/null || true)
 if [ -n "$STDBUF" ]; then
   NODE_CMD="$STDBUF -oL node"
@@ -81,29 +70,59 @@ else
   NODE_CMD="node"
 fi
 
-nohup $NODE_CMD "$FLOW_SCRIPT" "$@" "${EXTRA_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
-FLOW_PID=$!
+echo "[launch-flow] starting flow → log: $LOG_FILE"
+echo "[launch-flow] args: $*"
 
-# ── 4. 短暂等待确认进程存活（检测立即崩溃） ──────────────────────
-sleep 2
-if kill -0 "$FLOW_PID" 2>/dev/null; then
-  echo "[launch-flow] ✅ flow running  pid=$FLOW_PID  log=$LOG_FILE"
-  echo "$FLOW_PID" > "$LOGS_DIR/last-flow.pid"
+# ── 5. 启动策略：优先 tmux，fallback 到 nohup ─────────────────────
+# tmux session 是独立的 pseudo-TTY，macOS 不会主动回收，适合 20-40 分钟的 flow。
+# nohup 对短 flow（< 5 分钟）足够，但长 flow 有被 App Nap 回收的风险。
+FLOW_CMD="cd $REPO_ROOT && $NODE_CMD $FLOW_SCRIPT $* ${EXTRA_ARGS[*]:-} 2>&1 | tee $LOG_FILE; echo '[flow done]' >> $LOG_FILE"
+
+if command -v tmux &>/dev/null; then
+  tmux new-session -d -s "$TMUX_SESSION" -x 200 -y 50
+  tmux send-keys -t "$TMUX_SESSION" "$FLOW_CMD" Enter
+  echo "[launch-flow] ✅ tmux session: $TMUX_SESSION  log: $LOG_FILE"
+  echo "[launch-flow]    attach: tmux attach -t $TMUX_SESSION"
+  echo "[launch-flow]    detach: Ctrl+B, D"
+  echo "$TMUX_SESSION" > "$LOGS_DIR/last-flow.tmux"
+  echo "" > "$LOGS_DIR/last-flow.pid"
 else
-  echo "[launch-flow] ❌ flow exited immediately — check log:"
-  tail -20 "$LOG_FILE"
-  exit 1
+  # fallback: nohup（适合 < 5 分钟的短 flow 或 tmux 不可用时）
+  echo "[launch-flow] ⚠️  tmux 不可用，fallback 到 nohup（长 flow 可能被 macOS 杀死）"
+  nohup $NODE_CMD "$FLOW_SCRIPT" "$@" "${EXTRA_ARGS[@]:-}" >> "$LOG_FILE" 2>&1 &
+  FLOW_PID=$!
+  sleep 2
+  if kill -0 "$FLOW_PID" 2>/dev/null; then
+    echo "[launch-flow] ✅ nohup running  pid=$FLOW_PID  log=$LOG_FILE"
+    echo "$FLOW_PID" > "$LOGS_DIR/last-flow.pid"
+  else
+    echo "[launch-flow] ❌ flow exited immediately — check log:"
+    tail -20 "$LOG_FILE"
+    exit 1
+  fi
 fi
 
-# ── 5. 持续监视（可选）：如果加了 --wait 参数则阻塞等待完成 ─────
+# ── 6. 等待首行日志（确认 flow 实际启动，而非 tmux 静默失败）───────
+echo "[launch-flow] 等待 flow 输出首行..."
+for i in $(seq 1 10); do
+  sleep 2
+  if [ -s "$LOG_FILE" ]; then
+    echo "[launch-flow] ✅ log active:"
+    head -5 "$LOG_FILE"
+    break
+  fi
+done
+
+if [ ! -s "$LOG_FILE" ]; then
+  echo "[launch-flow] ⚠️  10 秒内无日志输出，请检查："
+  echo "   tmux attach -t $TMUX_SESSION  （查看实时输出）"
+fi
+
+# ── 7. --wait 模式：阻塞直到完成 ──────────────────────────────────
 for arg in "$@"; do
   if [ "$arg" = "--wait" ]; then
     echo "[launch-flow] --wait: tailing log (Ctrl-C to detach, flow keeps running)..."
-    tail -f "$LOG_FILE" &
-    TAIL_PID=$!
-    wait "$FLOW_PID" || true
-    kill "$TAIL_PID" 2>/dev/null || true
-    echo "[launch-flow] flow finished"
+    tail -f "$LOG_FILE"
     exit 0
   fi
 done

@@ -57,41 +57,122 @@ M .dev/scripts/launch-flow.sh
 `screen -dmS` 静默失败，`screen -ls` 显示 "No Sockets found"。
 Homebrew 版 `screen` 也遇到类似问题（权限/tmp 目录不同）。
 
-**可靠替代方案**：`nohup node ... > log 2>&1 &`，虽然没有 screen 那样的重连能力，
-但对无人值守的单次 flow 运行来说足够稳定。
+---
+
+### 坑 4：nohup Node.js 跑 20-40 分钟后被 macOS 杀死（根本问题）
+
+**现象**：`nohup node self-improve.flow.js` 启动后，preflight 全通过，
+`run.recursive start` 写入 run log，然后约 2-5 分钟后 Node.js 进程无声消失。
+`run.log.jsonl` 里只有 `run.recursive start`，没有 `done`，`.flowcast/runs/<id>/state.json`
+的 `status` 停在 `"running"`，不更新。
+
+**根本原因**：macOS 对 nohup 后台进程有 App Nap / 内存压力回收机制。
+Node.js 进程在 `run.recursive` 期间：
+- 父进程（Node.js/flowcast）保持 spawn 了 `recursive` 二进制的管道
+- `recursive` 本身运行正常，但 Node.js 父进程在 macOS 后台被回收
+- 导致 recursive 子进程也随之终止，flow 状态悬空
+
+**验证**：单独运行 `nohup recursive run "say: ok"` ——正常，20 秒完成。
+问题特指 Node.js（flowcast）层的 nohup 后台运行。
+
+**根本解法：用 tmux**
+
+```bash
+# tmux session 是独立的 pseudo-TTY 会话，macOS 不会主动回收
+tmux new-session -d -s "recursive-loop" -x 200 -y 50
+tmux send-keys -t "recursive-loop" \
+  "node .dev/flows/self-improve.flow.js --goal-file ... 2>&1 | tee .flowcast/logs/tmux-g<NN>.log" \
+  Enter
+# 验证存活
+tmux ls
+```
+
+tmux session 在本次实测中连续跑完 Goal 280→281→282→283（共 40 分钟），零中断。
 
 ---
 
-## 有效的后台启动命令（标准做法）
+### 坑 5：resume 时 `--run-id` 必须同时带 `--goal-file`
+
+flow 进程异常终止后，checkpoint 的 `pauseContext` 未保存 goal 文本
+（进程没有走到正常暂停点）。再次运行时：
+
+```bash
+# ❌ 错误：只传 --run-id，报 "缺少 --goal 或 --goal-file"
+node .dev/flows/self-improve.flow.js --run-id selfimprove-xxx
+
+# ✅ 正确：同时传 --goal-file
+node .dev/flows/self-improve.flow.js \
+  --run-id selfimprove-xxx \
+  --goal-file .dev/goals/<NN>-xxx.md \
+  --provider deepseek
+```
+
+另外，若 `state.json` 的 `status` 是 `"running"`（进程死后未更新），
+需要手动改为 `"interrupted"` 才能触发续跑逻辑：
+
+```bash
+python3 -c "
+import json
+with open('.flowcast/runs/<run-id>/state.json') as f: s=json.load(f)
+s['status'] = 'interrupted'
+with open('.flowcast/runs/<run-id>/state.json', 'w') as f: json.dump(s, f, indent=2)
+print('reset to interrupted')
+"
+```
+
+---
+
+### 坑 6：orchestrator bash 脚本用 `grep -oP`，macOS BSD grep 不支持 `-P`
+
+bash 脚本里用 `grep -oP "verdict=\S+"` 提取 verdict，在 macOS 下失败：
+
+```
+grep: invalid option -- P
+usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]...
+```
+
+macOS 自带 BSD grep，不支持 Perl 正则 `-P`。
+
+**修复**：改用 `grep -oE "verdict=[^ ]+"` 或 `sed 's/.*verdict=\([^ ]*\).*/\1/'`
+
+---
+
+## 有效的后台启动命令（标准做法 — tmux）
 
 ```bash
 # 1. 确保工作树干净（最重要！）
 git status --porcelain | wc -l   # 必须为 0
 
-# 2. 用 nohup 启动，日志写到固定位置
+# 2. 用 tmux 启动 loop（单个 goal 或多 goal 串行）
+tmux new-session -d -s "recursive-loop" -x 200 -y 50
+tmux send-keys -t "recursive-loop" "
 cd /Users/kongjie/projects/Recursive
-LOG=.flowcast/logs/flow-g<NN>-$(date +%H%M).log
-nohup node .dev/flows/self-improve.flow.js \
+node .dev/flows/self-improve.flow.js \
   --goal-file .dev/goals/<NN>-xxx.md \
   --provider deepseek \
   --reviewer-agent claude \
-  --hitl wecom > "$LOG" 2>&1 &
-echo "PID: $!  LOG: $LOG"
+  --hitl wecom 2>&1 | tee .flowcast/logs/tmux-g<NN>.log
+" Enter
 
-# 3. 8-10 秒后确认存活
-sleep 10 && kill -0 $! && echo "alive" || echo "dead, check $LOG"
+# 3. 确认启动
+sleep 5 && tmux ls
 
-# 4. 监控进度（看 transcript 增长，不看日志行数）
-watch -n 30 'ls -la ~/.recursive/workspaces/*/sessions/*/*/transcript.jsonl | tail -3'
+# 4. 监控进度（看 log 实时输出）
+tail -f .flowcast/logs/tmux-g<NN>.log
+
+# 5. 进入 tmux 会话查看完整输出（可选）
+tmux attach -t recursive-loop
+# 退出不关闭：Ctrl+B, D
 ```
 
 ---
 
-## launch-flow.sh 的改进清单（待做）
+## launch-flow.sh 改进清单
 
-- [ ] 改用 `stdbuf -oL node ...`（已写入脚本但需测试）
-- [ ] 启动前自动检测工作树是否干净，不干净时直接报错退出
-- [ ] PID 写入 `.flowcast/logs/last-flow.pid` 并记录启动时间
+- [x] 改用 `stdbuf -oL node ...`（已写入脚本）
+- [x] 启动前自动检测工作树是否干净，不干净时直接报错退出
+- [ ] **改用 tmux 替代 nohup**（根本解法，坑 4）
+- [ ] 自动检测 tmux 是否可用，可用时优先用 tmux，否则 fallback 到 nohup
 
 ---
 
