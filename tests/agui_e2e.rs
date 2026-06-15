@@ -138,6 +138,11 @@ fn input_with(thread: &str, run: &str, messages: Vec<Message>) -> RunAgentInput 
 
 /// Bind to 127.0.0.1:0, spawn the server, return its base URL.
 async fn spawn_server(workspace: PathBuf, provider: Arc<MockProvider>) -> url::Url {
+    // Since Goal 277, the HTTP server refuses requests when auth is
+    // not configured unless INSECURE_OK=1 is set. These e2e tests
+    // don't need auth — they talk to loopback.
+    std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
     // Disable auth (default = empty key set) and effectively disable
     // rate limiting (huge bucket, fast refill).
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

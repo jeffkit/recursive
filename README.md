@@ -164,6 +164,11 @@ docker run -p 3000:3000 \
 
 The image defaults to `recursive http --addr 0.0.0.0:3000` and exposes `/health` for probes.
 
+> **⚠️ Auth required**: The HTTP server now rejects requests with 503
+> unless `RECURSIVE_HTTP_AUTH_KEYS` or `RECURSIVE_HTTP_AUTH_JWT_SECRET` is
+> configured. For local dev, set `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` as a
+> debug escape hatch — never use this in production.
+
 ### Full cloud stack (Redis + S3)
 
 Use the bundled `docker-compose.yml` to spin up Redis (session hot-state) and
@@ -208,7 +213,10 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | Env | Default | Purpose |
 |-----|---------|---------|
 | `RECURSIVE_HTTP_ADDR` | `0.0.0.0:3000` | Bind address |
-| `RECURSIVE_HTTP_AUTH_KEYS` | _(none, open)_ | Comma-separated `X-API-Key` allowlist |
+| `RECURSIVE_HTTP_AUTH_KEYS` | _(required for prod)_ | Comma-separated `X-API-Key` allowlist |
+| `RECURSIVE_HTTP_AUTH_JWT_SECRET` | _(none)_ | HMAC secret for JWT bearer-token auth |
+| `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` | _(none)_ | Optional `aud` claim for JWT validation |
+| `RECURSIVE_HTTP_AUTH_INSECURE_OK` | _(none)_ | Set to `1` to bypass auth (local dev ONLY) |
 
 #### Cloud storage — Redis (session hot-state)
 

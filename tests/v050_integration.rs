@@ -59,6 +59,10 @@ mod v050_integration {
     }
 
     fn test_app_state() -> AppState {
+        // Since Goal 277, the HTTP server default-deny requires the
+        // insecure-ok escape hatch for no-auth integration tests.
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
         AppState {
             tools: vec![ToolInfo {
                 name: "Read".into(),

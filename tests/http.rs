@@ -1349,6 +1349,7 @@ mod http_tests {
     #[tokio::test]
     async fn auth_disabled_passes_through() {
         // AuthConfig::default() == empty key set == auth disabled.
+        // sample_state() sets INSECURE_OK=1, so the request passes through.
         let app = build_router_with_auth(sample_state(), AuthConfig::default());
 
         let response = app

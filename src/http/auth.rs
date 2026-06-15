@@ -1,8 +1,10 @@
 //! Authentication middleware and configuration for the HTTP server.
 //!
-//! Provides API-key and JWT bearer-token authentication. When no credentials
-//! are configured (the default), all routes are reachable without auth —
-//! preserving the zero-config backward-compatible behavior.
+//! Provides API-key and JWT bearer-token authentication. When no
+//! credentials are configured (the default), the middleware returns
+//! 503 Service Unavailable unless the explicit debug escape hatch
+//! `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` is set — this must NEVER be
+//! used in production.
 
 use axum::http::StatusCode;
 use std::sync::Arc;
@@ -166,10 +168,11 @@ pub(super) fn auth_config_from_env() -> AuthConfig {
         config = config.with_jwt(jwt);
     }
     if !config.is_enabled() {
-        tracing::warn!(
-            "HTTP server authentication is DISABLED — \
-             set RECURSIVE_HTTP_AUTH_KEYS or RECURSIVE_HTTP_AUTH_JWT_SECRET \
-             to protect this endpoint in production"
+        tracing::error!(
+            "HTTP auth is NOT configured. Set \
+             RECURSIVE_HTTP_AUTH_KEYS=... or RECURSIVE_HTTP_AUTH_JWT_SECRET=... \
+             to enable. For local dev only, set \
+             RECURSIVE_HTTP_AUTH_INSECURE_OK=1 to bypass (NEVER in production)."
         );
     }
     config
@@ -187,14 +190,37 @@ pub(super) fn auth_config_from_env() -> AuthConfig {
 /// `build_router_with_auth_and_rate_limit` in `src/http/mod.rs`.
 ///
 /// When auth is disabled (no API keys AND no JWT verifier
-/// configured), the middleware is a no-op pass-through — preserving
-/// back-compat zero-config behavior.
+/// configured) and `RECURSIVE_HTTP_AUTH_INSECURE_OK` is not set to
+/// `1` or `true`, the middleware returns 503 — default-deny for
+/// production safety (Goal 277 / SEC-003).
 pub(super) async fn auth_middleware(
     axum::extract::State(auth): axum::extract::State<AuthConfig>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if !auth.is_enabled() {
+        if !std::env::var("RECURSIVE_HTTP_AUTH_INSECURE_OK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            tracing::error!(
+                "HTTP server is running with NO auth configured. \
+                 Set RECURSIVE_HTTP_AUTH_KEYS=<comma-separated-keys> \
+                 or RECURSIVE_HTTP_AUTH_JWT_SECRET=<secret>. \
+                 To override for local dev only, set \
+                 RECURSIVE_HTTP_AUTH_INSECURE_OK=1."
+            );
+            let mut resp = axum::response::Response::new(axum::body::Body::from(
+                "auth not configured; set RECURSIVE_HTTP_AUTH_KEYS or \
+                 RECURSIVE_HTTP_AUTH_INSECURE_OK=1 (local dev only)",
+            ));
+            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            return resp;
+        }
+        tracing::warn!(
+            "RECURSIVE_HTTP_AUTH_INSECURE_OK=1 set — bypassing auth. \
+             This must NEVER be used in production."
+        );
         return next.run(req).await;
     }
     // Try X-API-Key first (cheaper than JWT verify).
@@ -222,4 +248,121 @@ pub(super) async fn auth_middleware(
     let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
     *resp.status_mut() = StatusCode::UNAUTHORIZED;
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn router_with_auth(auth: AuthConfig) -> axum::Router {
+        axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
+    }
+
+    /// Goal 277: When auth is not configured and INSECURE_OK is unset,
+    /// the middleware returns 503. With INSECURE_OK=1, it passes through.
+    /// Single combined test to avoid env-var races.
+    #[tokio::test]
+    async fn auth_inscure_ok_toggles() {
+        // Ensure we start from a clean env for this test binary.
+        unsafe {
+            std::env::remove_var("RECURSIVE_HTTP_AUTH_INSECURE_OK");
+        }
+
+        let auth = AuthConfig::default(); // is_enabled() == false
+
+        // --- Without INSECURE_OK: expect 503 ---
+        {
+            let app = router_with_auth(auth.clone());
+            let resp = app
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "expected 503 without INSECURE_OK"
+            );
+        }
+
+        // --- INSECURE_OK=1: passes through (200) ---
+        unsafe {
+            std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+        }
+        {
+            let app = router_with_auth(auth.clone());
+            let resp = app
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "expected 200 with INSECURE_OK=1"
+            );
+        }
+
+        // --- INSECURE_OK=0 (falsy): expect 503 ---
+        unsafe {
+            std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "0");
+        }
+        {
+            let app = router_with_auth(auth.clone());
+            let resp = app
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "expected 503 with INSECURE_OK=0"
+            );
+        }
+
+        // --- INSECURE_OK=true (case-insensitive): passes through (200) ---
+        unsafe {
+            std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "true");
+        }
+        {
+            let app = router_with_auth(auth.clone());
+            let resp = app
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "expected 200 with INSECURE_OK=true"
+            );
+        }
+
+        // Clean up.
+        unsafe {
+            std::env::remove_var("RECURSIVE_HTTP_AUTH_INSECURE_OK");
+        }
+    }
 }
