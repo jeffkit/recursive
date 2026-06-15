@@ -19,6 +19,10 @@ mod http_tests {
     use tokio::sync::{broadcast, RwLock};
     use tower::ServiceExt;
 
+    /// Since Goal 277, the HTTP server default-deny requires the
+    /// insecure-ok debug escape hatch for no-auth integration tests.
+    static SET_INSECURE_OK: std::sync::Once = std::sync::Once::new();
+
     fn mock_config() -> Config {
         Config {
             workspace: PathBuf::from("/tmp"),
@@ -52,6 +56,9 @@ mod http_tests {
     }
 
     fn sample_state() -> AppState {
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
         let provider = Arc::new(MockProvider::new(vec![Completion {
             content: "hello".into(),
             tool_calls: vec![],
@@ -98,6 +105,9 @@ mod http_tests {
     }
 
     fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
         AppState {
             tools: vec![],
             config: mock_config(),
