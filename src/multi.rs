@@ -4,7 +4,7 @@ use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::{Config, LlmProvider};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,24 +136,44 @@ fn now_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Maximum messages retained in `MessageBus.messages` history.
+/// 1000 messages × ~200 bytes/msg ≈ 200 KiB — bounded for
+/// long-running pools while still giving plenty of recent
+/// context for the goal-judge and history inspection.
+pub const MESSAGE_BUS_CAPACITY: usize = 1000;
+
 /// An inter-agent message bus supporting publish/subscribe and history.
 #[derive(Clone)]
 pub struct MessageBus {
-    messages: Arc<RwLock<Vec<AgentMessage>>>,
+    /// Bounded ring buffer of recent messages. Oldest evicted
+    /// on overflow. Capacity is `MESSAGE_BUS_CAPACITY` to bound
+    /// memory in long-running multi-agent pools.
+    messages: Arc<RwLock<VecDeque<AgentMessage>>>,
     subscribers: Arc<RwLock<HashMap<String, broadcast::Sender<AgentMessage>>>>,
+    /// Maximum number of messages to retain. Defaults to
+    /// `MESSAGE_BUS_CAPACITY`; overridable via `with_capacity`.
+    capacity: usize,
 }
 
 impl MessageBus {
     pub fn new() -> Self {
         Self {
-            messages: Arc::new(RwLock::new(Vec::new())),
+            messages: Arc::new(RwLock::new(VecDeque::with_capacity(MESSAGE_BUS_CAPACITY))),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
+            capacity: MESSAGE_BUS_CAPACITY,
         }
     }
 
-    /// Send a message. Stores in history and notifies relevant subscribers.
+    /// Send a message. Stores in history with bounded eviction and notifies
+    /// relevant subscribers.
     pub async fn send(&self, msg: AgentMessage) {
-        self.messages.write().await.push(msg.clone());
+        {
+            let mut history = self.messages.write().await;
+            if history.len() >= self.capacity {
+                history.pop_front();
+            }
+            history.push_back(msg.clone());
+        }
         let subs = self.subscribers.read().await;
         if msg.to == "broadcast" {
             for tx in subs.values() {
@@ -161,6 +181,15 @@ impl MessageBus {
             }
         } else if let Some(tx) = subs.get(&msg.to) {
             let _ = tx.send(msg);
+        }
+    }
+
+    /// Create a `MessageBus` with a custom capacity (for testing).
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            messages: Arc::new(RwLock::new(VecDeque::with_capacity(cap))),
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
+            capacity: cap,
         }
     }
 
@@ -196,8 +225,8 @@ impl MessageBus {
             .collect()
     }
 
-    /// Get the full message history.
-    pub async fn history(&self) -> Vec<AgentMessage> {
+    /// Get the full message history (bounded to `MESSAGE_BUS_CAPACITY`).
+    pub async fn history(&self) -> VecDeque<AgentMessage> {
         self.messages.read().await.clone()
     }
 
@@ -815,5 +844,36 @@ mod tests {
 
         let history = pool.bus().history().await;
         assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn message_bus_evicts_oldest_on_overflow() {
+        let bus = MessageBus::with_capacity(3);
+        for i in 0..5 {
+            bus.send(make_msg(
+                &format!("a{i}"),
+                "broadcast",
+                &format!("msg-{i}"),
+                MessageType::Feedback,
+            ))
+            .await;
+        }
+        let history = bus.history().await;
+        let contents: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+        // msg-0 and msg-1 evicted; msg-2,3,4 are the most recent 3
+        assert_eq!(contents, vec!["msg-2", "msg-3", "msg-4"]);
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn message_bus_default_capacity_is_bounded() {
+        let bus = MessageBus::new();
+        assert_eq!(MESSAGE_BUS_CAPACITY, 1000);
+        // Verify the bus uses this capacity: 10 messages should all be retained
+        for i in 0..10 {
+            bus.send(make_msg("a", "b", &format!("m{i}"), MessageType::Task))
+                .await;
+        }
+        assert_eq!(bus.history().await.len(), 10);
     }
 }
