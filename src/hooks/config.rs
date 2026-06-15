@@ -54,6 +54,21 @@ pub struct HookMatcher {
     pub hooks: Vec<HookCommand>,
 }
 
+/// Fail behavior for an external hook when the command times out,
+/// errors, exits non-zero, or returns unparseable output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HookFailMode {
+    /// Treat failures as `HookAction::Continue` — same as today.
+    /// Use for notification hooks (PostToolCall, SessionStart, etc.).
+    #[default]
+    Open,
+    /// Treat failures as a blocking decision:
+    /// - `PreToolCall`, `UserPromptSubmit`, `PermissionRequest` → `Error(reason)`
+    /// - All other events → `Continue` (Closed is a no-op for notifications).
+    Closed,
+}
+
 /// A single hook command entry.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HookCommand {
@@ -81,6 +96,10 @@ pub struct HookCommand {
     /// exits with code 2.
     #[serde(default)]
     pub async_rewake: bool,
+    /// Fail behavior on timeout / error / non-zero exit.
+    /// Default: `open` (fail-open, same as pre-Goal-281 behavior).
+    #[serde(default)]
+    pub fail_mode: HookFailMode,
 }
 
 /// Supported hook execution types.
@@ -279,6 +298,14 @@ mod tests {
         assert!(!cmd.once);
         assert!(!cmd.r#async);
         assert!(!cmd.async_rewake);
+        assert_eq!(cmd.fail_mode, HookFailMode::Open);
+    }
+
+    #[test]
+    fn hook_command_explicit_closed() {
+        let json = r#"{"type": "command", "command": "echo hi", "fail_mode": "closed"}"#;
+        let cmd: HookCommand = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.fail_mode, HookFailMode::Closed);
     }
 
     #[test]

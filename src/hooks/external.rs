@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::event::AgentEvent;
-use crate::hooks::config::{matches_hook, HookCommand, HookCommandType, HooksConfig};
+use crate::hooks::config::{matches_hook, HookCommand, HookCommandType, HookFailMode, HooksConfig};
 use crate::llm::LlmProvider;
 use crate::message::Message;
 use serde::{Deserialize, Serialize};
@@ -195,6 +195,33 @@ impl HookResult {
     pub fn continue_default() -> Self {
         Self::default()
     }
+
+    /// Produce a hook result based on the fail mode.
+    ///
+    /// - `Open` (default): returns `Continue` — preserves pre-Goal-281
+    ///   fail-open behavior for notification hooks.
+    /// - `Closed`: for gating events (`PreToolCall`, `UserPromptSubmit`,
+    ///   `PermissionRequest`) returns `Error(reason)` so the agent sees
+    ///   the failure as a rejection. For all other event types
+    ///   (notification hooks like `PostToolCall`, `SessionStart`, etc.)
+    ///   returns `Continue` since a notification failure shouldn't block.
+    pub fn from_fail_mode(mode: HookFailMode, reason: &str, event: &HookEvent) -> Self {
+        match mode {
+            HookFailMode::Open => Self::continue_default(),
+            HookFailMode::Closed => {
+                let action = match event {
+                    HookEvent::PreToolCall
+                    | HookEvent::UserPromptSubmit
+                    | HookEvent::PermissionRequest => HookAction::Error(reason.to_string()),
+                    _ => HookAction::Continue,
+                };
+                Self {
+                    action,
+                    ..Self::default()
+                }
+            }
+        }
+    }
 }
 
 impl HookOutput {
@@ -262,6 +289,8 @@ struct ResolvedHook {
     r#async: bool,
     /// When `true`, run in background and cancel Agent on exit code 2.
     async_rewake: bool,
+    /// Fail behavior on timeout / error / non-zero exit.
+    fail_mode: HookFailMode,
 }
 
 // ── Runner ─────────────────────────────────────────────────────────
@@ -308,6 +337,7 @@ impl ExternalHookRunner {
                             once: false,
                             r#async: false,
                             async_rewake: false,
+                            fail_mode: HookFailMode::Open,
                         });
                     }
                 }
@@ -391,6 +421,7 @@ impl ExternalHookRunner {
             once: cmd.once,
             r#async: cmd.r#async,
             async_rewake: cmd.async_rewake,
+            fail_mode: cmd.fail_mode,
         };
 
         match cmd.r#type {
@@ -560,13 +591,16 @@ impl ExternalHookRunner {
                     hook_timeout.as_secs(),
                     headers.as_ref(),
                     allowed_env_vars.as_deref(),
+                    hook.fail_mode,
                 )
                 .await;
                 Ok(result)
             }
             ResolvedHookKind::Prompt { prompt } => {
                 if let Some(llm) = &self.llm {
-                    let result = run_prompt_hook(llm.as_ref(), prompt, input, hook_timeout).await;
+                    let result =
+                        run_prompt_hook(llm.as_ref(), prompt, input, hook_timeout, hook.fail_mode)
+                            .await;
                     Ok(result)
                 } else {
                     // No LLM configured — fail-open with a warning.
@@ -577,7 +611,8 @@ impl ExternalHookRunner {
                 }
             }
             ResolvedHookKind::Command(path) => {
-                self.run_command_hook(path, input, hook_timeout).await
+                self.run_command_hook(path, input, hook_timeout, hook.fail_mode)
+                    .await
             }
         }
     }
@@ -627,19 +662,34 @@ impl ExternalHookRunner {
         path: &PathBuf,
         input: &HookInput,
         hook_timeout: Duration,
+        fail_mode: HookFailMode,
     ) -> Result<HookResult> {
-        let input_json = serde_json::to_string(input).map_err(|e| Error::Config {
-            message: format!("hook input serialize: {e}"),
-        })?;
+        let input_json = match serde_json::to_string(input) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(HookResult::from_fail_mode(
+                    fail_mode,
+                    &format!("hook input serialize: {e}"),
+                    &input.event,
+                ));
+            }
+        };
 
-        let mut child = Command::new(path)
+        let mut child = match Command::new(path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| Error::Config {
-                message: format!("hook spawn {}: {e}", path.display()),
-            })?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(HookResult::from_fail_mode(
+                    fail_mode,
+                    &format!("hook spawn {}: {e}", path.display()),
+                    &input.event,
+                ));
+            }
+        };
 
         // Write stdin then wait for output, respecting per-hook timeout.
         let output = timeout(hook_timeout, async {
@@ -651,21 +701,43 @@ impl ExternalHookRunner {
             }
             child.wait_with_output().await
         })
-        .await
-        .map_err(|_| Error::Config {
-            message: format!("hook timeout: {}", path.display()),
-        })?
-        .map_err(|e| Error::Config {
-            message: format!("hook wait {}: {e}", path.display()),
-        })?;
+        .await;
+
+        let output = match output {
+            Err(_elapsed) => {
+                return Ok(HookResult::from_fail_mode(
+                    fail_mode,
+                    "hook timed out",
+                    &input.event,
+                ));
+            }
+            Ok(Err(e)) => {
+                return Ok(HookResult::from_fail_mode(
+                    fail_mode,
+                    &format!("hook wait {}: {e}", path.display()),
+                    &input.event,
+                ));
+            }
+            Ok(Ok(o)) => o,
+        };
+
+        if !output.status.success() {
+            return Ok(HookResult::from_fail_mode(
+                fail_mode,
+                &format!("hook exited with code {:?}", output.status.code()),
+                &input.event,
+            ));
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: HookOutput =
-            serde_json::from_str(stdout.trim()).map_err(|e| Error::Config {
-                message: format!("hook output parse {}: {e}", path.display()),
-            })?;
-
-        Ok(parsed.into_hook_result())
+        match serde_json::from_str::<HookOutput>(stdout.trim()) {
+            Ok(parsed) => Ok(parsed.into_hook_result()),
+            Err(e) => Ok(HookResult::from_fail_mode(
+                fail_mode,
+                &format!("hook output parse {}: {e}", path.display()),
+                &input.event,
+            )),
+        }
     }
 }
 
@@ -687,12 +759,13 @@ fn event_names_match(config_name: &str, wire_name: &str) -> bool {
 // ── Prompt hook ────────────────────────────────────────────────────
 
 /// Evaluate a prompt template via `llm`, replacing `$ARGUMENTS` with
-/// the serialised `HookInput`. Fail-open on timeout or LLM error.
+/// the serialised `HookInput`. Respects `fail_mode` on timeout or LLM error.
 async fn run_prompt_hook(
     llm: &dyn LlmProvider,
     prompt_template: &str,
     input: &HookInput,
     hook_timeout: Duration,
+    fail_mode: HookFailMode,
 ) -> HookResult {
     let args_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
     let prompt = prompt_template.replace("$ARGUMENTS", &args_json);
@@ -703,19 +776,23 @@ async fn run_prompt_hook(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             tracing::warn!("prompt hook LLM error: {e}");
-            return HookResult::continue_default();
+            return HookResult::from_fail_mode(
+                fail_mode,
+                &format!("prompt hook LLM error: {e}"),
+                &input.event,
+            );
         }
         Err(_) => {
             tracing::warn!("prompt hook timeout");
-            return HookResult::continue_default();
+            return HookResult::from_fail_mode(fail_mode, "prompt hook timeout", &input.event);
         }
     };
 
     match serde_json::from_str::<HookOutput>(completion.content.trim()) {
         Ok(output) => output.into_hook_result(),
         Err(_) => {
-            // Non-JSON or empty response — fail-open.
-            HookResult::continue_default()
+            // Non-JSON or empty response — use fail_mode.
+            HookResult::from_fail_mode(fail_mode, "prompt hook returned non-JSON", &input.event)
         }
     }
 }
@@ -724,13 +801,15 @@ async fn run_prompt_hook(
 
 /// POST `input` as JSON to `url` and parse the response as `HookOutput`.
 ///
-/// Fail-open: returns `HookResult::continue_default()` on timeout or error.
+/// Respects `fail_mode`: returns `Continue` on failure when Open,
+/// returns `Error(reason)` on failure when Closed (for gating events).
 pub(crate) async fn run_http_hook(
     url: &str,
     input: &HookInput,
     timeout_secs: u64,
     headers: Option<&std::collections::HashMap<String, String>>,
     allowed_env_vars: Option<&[String]>,
+    fail_mode: HookFailMode,
 ) -> HookResult {
     let client_result = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -739,7 +818,13 @@ pub(crate) async fn run_http_hook(
 
     let client = match client_result {
         Ok(c) => c,
-        Err(_) => return HookResult::continue_default(),
+        Err(_) => {
+            return HookResult::from_fail_mode(
+                fail_mode,
+                "http hook client build failed",
+                &input.event,
+            );
+        }
     };
 
     let mut builder = client.post(url).json(input);
@@ -755,7 +840,11 @@ pub(crate) async fn run_http_hook(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("http hook request failed: {e}");
-            return HookResult::continue_default();
+            return HookResult::from_fail_mode(
+                fail_mode,
+                &format!("http hook request failed: {e}"),
+                &input.event,
+            );
         }
     };
 
@@ -763,7 +852,11 @@ pub(crate) async fn run_http_hook(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("http hook response read failed: {e}");
-            return HookResult::continue_default();
+            return HookResult::from_fail_mode(
+                fail_mode,
+                &format!("http hook response read failed: {e}"),
+                &input.event,
+            );
         }
     };
 
@@ -771,7 +864,11 @@ pub(crate) async fn run_http_hook(
         Ok(output) => output.into_hook_result(),
         Err(e) => {
             tracing::warn!("http hook response parse failed: {e}");
-            HookResult::continue_default()
+            HookResult::from_fail_mode(
+                fail_mode,
+                &format!("http hook response parse failed: {e}"),
+                &input.event,
+            )
         }
     }
 }
@@ -1325,7 +1422,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
 
         let input = make_non_tool_input();
         let url = format!("{}/hook", server.url());
-        let result = run_http_hook(&url, &input, 10, None, None).await;
+        let result = run_http_hook(&url, &input, 10, None, None, HookFailMode::Open).await;
         assert!(matches!(result.action, HookAction::Skip));
         mock.assert_async().await;
     }
@@ -1343,7 +1440,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
 
         let input = make_non_tool_input();
         let url = format!("{}/hook", server.url());
-        let result = run_http_hook(&url, &input, 10, None, None).await;
+        let result = run_http_hook(&url, &input, 10, None, None, HookFailMode::Open).await;
         assert!(matches!(result.action, HookAction::Continue));
     }
 
@@ -1351,7 +1448,15 @@ echo '{"action":"skip","message":"blocked by test hook"}'
     async fn http_hook_connection_error_returns_continue() {
         // Connect to a port that doesn't exist — should fail-open.
         let input = make_non_tool_input();
-        let result = run_http_hook("http://127.0.0.1:19999/hook", &input, 2, None, None).await;
+        let result = run_http_hook(
+            "http://127.0.0.1:19999/hook",
+            &input,
+            2,
+            None,
+            None,
+            HookFailMode::Open,
+        )
+        .await;
         assert!(matches!(result.action, HookAction::Continue));
     }
 
@@ -1367,7 +1472,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
 
         let input = make_non_tool_input();
         let url = format!("{}/hook", server.url());
-        let result = run_http_hook(&url, &input, 10, None, None).await;
+        let result = run_http_hook(&url, &input, 10, None, None, HookFailMode::Open).await;
         assert!(matches!(result.action, HookAction::Continue));
     }
 
@@ -1425,6 +1530,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             "Is this safe? $ARGUMENTS",
             &input,
             Duration::from_secs(10),
+            HookFailMode::Open,
         )
         .await;
         assert!(matches!(result.action, HookAction::Skip));
@@ -1443,6 +1549,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             "Check: $ARGUMENTS",
             &input,
             Duration::from_secs(10),
+            HookFailMode::Open,
         )
         .await;
         assert!(matches!(result.action, HookAction::Continue));
@@ -1461,6 +1568,7 @@ echo '{"action":"skip","message":"blocked by test hook"}'
             "Is this safe? $ARGUMENTS",
             &input,
             Duration::from_secs(10),
+            HookFailMode::Open,
         )
         .await;
         // Non-JSON → fail-open → Continue.
@@ -1754,6 +1862,184 @@ echo '{"action":"skip","message":"blocked by test hook"}'
         assert!(
             !token.is_cancelled(),
             "exit code 0 should NOT trigger cancellation"
+        );
+    }
+
+    // ── Goal 281: fail_mode tests ──────────────────────────────────
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn open_hook_times_out_returns_continue() {
+        use crate::hooks::config::{HookCommand, HookCommandType, HookMatcher, HooksConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("open_hang.sh");
+        let script = "#!/bin/sh\nsleep 30\n";
+        std::fs::write(&hook_path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+        let cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PreToolCall".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        r#type: HookCommandType::Command,
+                        command: Some(hook_path.to_string_lossy().to_string()),
+                        timeout: 1,
+                        fail_mode: HookFailMode::Open,
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+        let runner = ExternalHookRunner::from_config(cfg);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "Bash",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        // Fail-open: timeout → Continue.
+        assert!(
+            matches!(result.action, HookAction::Continue),
+            "Open hook timeout should return Continue, got {:?}",
+            result.action
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn closed_hook_times_out_returns_error() {
+        use crate::hooks::config::{HookCommand, HookCommandType, HookMatcher, HooksConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("closed_hang.sh");
+        let script = "#!/bin/sh\nsleep 30\n";
+        std::fs::write(&hook_path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+        let cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PreToolCall".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        r#type: HookCommandType::Command,
+                        command: Some(hook_path.to_string_lossy().to_string()),
+                        timeout: 1,
+                        fail_mode: HookFailMode::Closed,
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+        let runner = ExternalHookRunner::from_config(cfg);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "Bash",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        // Fail-closed on PreToolCall: timeout → Error.
+        assert!(
+            matches!(result.action, HookAction::Error(_)),
+            "Closed hook timeout should return Error, got {:?}",
+            result.action
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn closed_hook_exits_nonzero_returns_error() {
+        use crate::hooks::config::{HookCommand, HookCommandType, HookMatcher, HooksConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("closed_exit1.sh");
+        let script = "#!/bin/sh\nexit 1\n";
+        std::fs::write(&hook_path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+        let cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PreToolCall".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        r#type: HookCommandType::Command,
+                        command: Some(hook_path.to_string_lossy().to_string()),
+                        timeout: 5,
+                        fail_mode: HookFailMode::Closed,
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+        let runner = ExternalHookRunner::from_config(cfg);
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "Bash",
+            serde_json::json!({"command": "rm -rf /"}),
+        );
+        let result = runner.dispatch(&input).await;
+        // Fail-closed on PreToolCall: non-zero exit → Error.
+        assert!(
+            matches!(result.action, HookAction::Error(_)),
+            "Closed hook non-zero exit should return Error, got {:?}",
+            result.action
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn closed_hook_post_tool_call_timeout_returns_continue() {
+        use crate::hooks::config::{HookCommand, HookCommandType, HookMatcher, HooksConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("closed_post_hang.sh");
+        let script = "#!/bin/sh\nsleep 30\n";
+        std::fs::write(&hook_path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+        let cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PostToolCall".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        r#type: HookCommandType::Command,
+                        command: Some(hook_path.to_string_lossy().to_string()),
+                        timeout: 1,
+                        fail_mode: HookFailMode::Closed,
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+        let runner = ExternalHookRunner::from_config(cfg);
+        let input = make_tool_input(
+            HookEvent::PostToolCall,
+            "Bash",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        // Closed on PostToolCall is a no-op: timeout → Continue.
+        assert!(
+            matches!(result.action, HookAction::Continue),
+            "Closed PostToolCall timeout should return Continue, got {:?}",
+            result.action
         );
     }
 }
