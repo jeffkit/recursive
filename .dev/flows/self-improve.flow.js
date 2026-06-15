@@ -277,8 +277,20 @@ async function selfReview() {
 
 // ── system prompt 构建 ───────────────────────────────────────────
 
+// Batch-run constraint prepended to every system prompt:
+// plan mode tools block indefinitely when no interactive channel is present.
+const HEADLESS_CONSTRAINT = `# Headless batch-run constraints
+
+You are running non-interactively (no human in the loop).
+
+**DO NOT call \`enter_plan_mode\` or \`exit_plan_mode\`.** These tools block
+forever waiting for a human to approve the plan — in batch mode there is no
+approval channel, so calling them causes an unrecoverable deadlock.
+
+Implement directly: read → think → patch → test. No plan-mode ceremony needed.`
+
 function buildSystemPrompt() {
-  const parts = []
+  const parts = [HEADLESS_CONSTRAINT]
   // 契约：AGENTS.md / CLAUDE.md
   for (const f of ['AGENTS.md', 'CLAUDE.md']) {
     const p = join(repo, f)
@@ -351,11 +363,13 @@ function goalSubject() {
 
 // recursive 通过 env 读取 provider 配置（与 self-improve.sh 一致），不走 --provider flag。
 // 通用解析（resolveProvider）+ recursive 专属 env 翻译（recursiveProviderEnv）分两层。
+// RECURSIVE_HEADLESS=1：禁用 interactive plan-mode tools（enter/exit_plan_mode），
+// 防止 agent 在无人值守的 batch run 中调用 exit_plan_mode 后永久等待审批信号（deadlock）。
 function buildEnv(providerOverride) {
   const bundle = resolveProvider(providerOverride ?? opts.provider, PROVIDERS)
-  if (!bundle) return {}
+  if (!bundle) return { RECURSIVE_HEADLESS: '1' }
   if (opts.model) bundle.model = opts.model // --model 覆盖 profile 默认模型
-  return recursiveProviderEnv({ ...bundle, maxSteps: opts.budget })
+  return { ...recursiveProviderEnv({ ...bundle, maxSteps: opts.budget }), RECURSIVE_HEADLESS: '1' }
 }
 
 
