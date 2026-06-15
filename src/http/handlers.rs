@@ -657,41 +657,75 @@ pub(super) async fn session_set_goal(
 pub(super) async fn session_clear_goal(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let sessions = state.sessions.read().await;
-    let Some(session) = sessions.get(&session_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "session not found"})),
-        );
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let runtime_arc = {
+        let sessions = state.sessions.read().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "session not found"})),
+            )
+                .into_response();
+        };
+        session.runtime.clone()
     };
 
-    match session.runtime.try_lock() {
+    let lock_result = runtime_arc.try_lock();
+
+    match lock_result {
         Ok(runtime) => {
             runtime.clear_goal().await;
+            drop(runtime);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "cleared", "session_id": session_id})),
+            )
+                .into_response()
         }
         Err(_) => {
-            // Runtime is busy; force-clear via the shared goal_state.
-            let _ = runtime_goal_state_clear(&session.runtime).await;
+            // Runtime is busy with an in-flight turn; retry briefly.
+            if runtime_goal_state_clear(&runtime_arc).await {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "cleared", "session_id": session_id})),
+                )
+                    .into_response();
+            }
+            let mut resp = (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session runtime is busy; goal not cleared",
+                    "session_id": session_id,
+                    "hint": "retry after the current turn completes"
+                })),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+            resp
         }
     }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "cleared", "session_id": session_id})),
-    )
 }
 
 /// Force-clear goal state when the runtime Mutex is held.
-async fn runtime_goal_state_clear(runtime: &Arc<tokio::sync::Mutex<crate::runtime::AgentRuntime>>) {
-    // Best-effort: try up to 5 times with a small delay.
-    for _ in 0..5u8 {
+///
+/// Retries up to 10 times × 100ms (1s total). Returns `true` if the
+/// goal was cleared, `false` if the runtime is still busy.
+async fn runtime_goal_state_clear(
+    runtime: &Arc<tokio::sync::Mutex<crate::runtime::AgentRuntime>>,
+) -> bool {
+    for _ in 0..10u8 {
         if let Ok(rt) = runtime.try_lock() {
             rt.clear_goal().await;
-            return;
+            return true;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    false
 }
 
 // ── Goal-170: interrupt endpoint ───────────────────────────────────────────
@@ -1640,5 +1674,75 @@ mod tests {
             .await
             .expect_err("expected SERVICE_UNAVAILABLE");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Goal-280: clear_goal returns 409 when runtime busy ────────────
+
+    /// Simulate a busy runtime (mutex held by an in-flight turn) and
+    /// verify `session_clear_goal` returns 409 with Retry-After: 5.
+    /// Then release the lock and verify the next call returns 200.
+    #[tokio::test]
+    async fn clear_goal_returns_409_when_runtime_busy() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
+
+        let session_id = "test-busy-session".to_string();
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        let session = SessionState {
+            id: session_id.clone(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Default::default(),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        };
+
+        let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
+        let state = Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            session_ttl_secs: 3600,
+            run_semaphore: Arc::new(Semaphore::new(8)),
+        });
+
+        // Acquire the runtime mutex to simulate a busy runtime.
+        let guard = runtime_arc.lock().await;
+
+        // Call the handler while the mutex is held → should get 409.
+        let resp = session_clear_goal(State(state.clone()), Path(session_id.clone())).await;
+        let status = resp.status();
+        assert_eq!(status, StatusCode::CONFLICT, "expected 409 Conflict");
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header missing")
+            .to_str()
+            .unwrap();
+        assert_eq!(retry_after, "5", "expected Retry-After: 5");
+
+        // Drop the guard and retry → should get 200.
+        drop(guard);
+        let resp = session_clear_goal(State(state), Path(session_id)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
     }
 }
