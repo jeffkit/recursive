@@ -1,0 +1,35 @@
+{
+  "//": "Recursive 项目 agent pool（项目级，覆盖/补充机器级 ~/.flowcast/agents.json）",
+  "//provider": "claude 可绑定 provider 网关（anthropic 协议），agy/cursor 自管鉴权，不接受外部 provider",
+  "agents": {
+    "agy": {
+      "executor": "agy",
+      "extraArgs": ["--dangerously-skip-permissions"],
+      "timeout": 1800000
+    },
+    "claude": {
+      "executor": "claude",
+      "timeout": 1800000
+    },
+    "claude-minimax": {
+      "executor": "claude",
+      "provider": "anthropic-minimax",
+      "timeout": 1800000
+    },
+    "claude-deepseek": {
+      "executor": "claude",
+      "provider": "anthropic-deepseek",
+      "timeout": 1800000
+    },
+    "recursive-deepseek": {
+      "executor": "recursive",
+      "provider": "deepseek",
+      "maxSteps": 60
+    },
+    "recursive-minimax": {
+      "executor": "recursive",
+      "provider": "minimax",
+      "maxSteps": 60
+    }
+  }
+}
