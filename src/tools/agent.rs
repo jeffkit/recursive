@@ -25,7 +25,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 use crate::agent::FinishReason;
@@ -37,6 +37,8 @@ use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::permissions::PermissionMode;
 use crate::tasks::TaskRegistry;
 use crate::tools::agent_defs::AgentDefinitions;
+use crate::tools::edit::EditTool;
+use crate::tools::fs::{ReadFile, ReadFileState};
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
@@ -243,12 +245,37 @@ impl AgentTool {
     /// Uses `with_same_transport()` to start from an empty registry with the
     /// same transport/permissions/policy as the parent, so only explicitly
     /// listed tools are available — no accidental tool leakage.
+    ///
+    /// Sub-agents receive a **fresh** `ReadFileState` so their read history
+    /// is independent from the parent's.
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
-        let mut reg = self.all_tools.with_same_transport();
+        let sub_read_state = Arc::new(Mutex::new(ReadFileState::new()));
+        // Start from parent's transport/permissions/policy but override
+        // read_file_state with a fresh instance for isolation.
+        let mut reg = self
+            .all_tools
+            .with_same_transport()
+            .with_read_file_state(sub_read_state.clone());
         for name in tool_names {
-            if let Some(tool) = self.all_tools.get(name) {
-                reg = reg.register(tool);
-            }
+            // ReadFile and EditTool carry internal read_state references;
+            // create new instances bound to the sub-agent's fresh state rather
+            // than inheriting the parent's Arc.
+            let tool: Arc<dyn Tool> = match name.as_str() {
+                "Read" => {
+                    Arc::new(ReadFile::new(&self.workspace).with_read_state(sub_read_state.clone()))
+                }
+                "Edit" => {
+                    Arc::new(EditTool::new(&self.workspace).with_read_state(sub_read_state.clone()))
+                }
+                _ => {
+                    if let Some(t) = self.all_tools.get(name) {
+                        t
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            reg = reg.register(tool);
         }
         reg
     }

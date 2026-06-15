@@ -24,17 +24,18 @@
 
 import { parseArgs } from 'util'
 import { readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs'
-import { join } from 'path'
+import { join, relative } from 'path'
 import { execFileSync } from 'child_process'
 
 import {
   Checkpoint,
   recursive, recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
   withSelfModGuard, captureBaseline,
-  runGate,
+  runGate, loadGates, mergeGates,
   writeFailureContext, readAndConsumeFailureContext,
   loadProviders, resolveProvider,
-} from '@force-lab/flowx'
+  flowcastDir,
+} from 'flowcast'
 
 // ── CLI 参数 ─────────────────────────────────────────────────────
 const { values: opts } = parseArgs({
@@ -61,11 +62,15 @@ if (opts.list) { listRuns(); process.exit(0) }
 const runId = opts['run-id'] ?? `selfimprove-${Date.now()}`
 const repo = opts.repo
 
-// provider 定义不再硬编码在 flow 里：从 ~/.flowx/providers.* + <repo>/.flowx/providers.* 加载。
+// provider 定义不再硬编码在 flow 里：从 ~/.flowcast/providers.* + <repo>/.flowcast/providers.* 加载（向后兼容 .flowx/）。
 // 顶层 await（在 main() 前）拿到 map，buildEnv 同步消费。
 const PROVIDERS = await loadProviders({ repo })
 
-const cp = new Checkpoint(runId)
+// flowcast 数据目录：新项目 .flowcast/，旧项目自动黏住 .flowx/（dirs.js 兜底）。
+// 显式传 stateDir，避免依赖 process.cwd()（--repo 可能与 cwd 不同）。
+const FC_DIR = flowcastDir(repo)                       // 绝对路径
+const FC_REL = (relative(repo, FC_DIR) || '.flowcast') // 仓内相对目录名（.flowcast / .flowx）
+const cp = new Checkpoint(runId, join(FC_DIR, 'runs'))
 
 // 续跑时从 pauseContext 恢复 goal
 const goal = resolveGoal() ?? cp.getPauseContext().goal
@@ -82,8 +87,10 @@ await main()
 // ── 主流程 ───────────────────────────────────────────────────────
 
 async function main() {
-  // flowx 自身的 run 产物写在目标仓的 .flowx/ 下，本地排除以免污染 clean 检查
-  ensureGitExclude(repo, '.flowx/')
+  // 只本地排除「运行产物」子目录 <FC>/runs/，不排除整个 .flowcast/——
+  // 因为项目配置（providers/agents/gates.json）就放在 .flowcast/ 下且应 committed。
+  // 排除 runs/ 既避免 run 产物污染 clean 检查，又不挡住配置文件入仓。
+  ensureGitExclude(repo, FC_REL + '/runs/')
 
   // ── 预检：捕获 baseline（持久化，续跑复用同一 baseline）──────────
   const baseline = await cp.step('preflight.baseline', () =>
@@ -210,25 +217,25 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env }) {
     return true
   }
 
-  const gates = qualityGatesFor(repo)
+  // 内置默认门（语言相关：cargo test/clippy/fmt）+ 项目自定义门。
+  // 项目门来自 <repo>/.flowcast/gates.json（committed），与 provider/agent 配置对称——
+  // recursive 的 argusai E2E 门即在那里声明，不再靠 flow 里硬编码探测脚本路径。
+  const builtin = qualityGatesFor(repo)
+  const projectGates = await loadGates({ repo })
+  // 项目门未显式写 cwd 时默认在仓根跑；写了则尊重项目声明。
+  const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: repo, ...g }))
   for (const g of gates) {
     await cp.step(`gate.${g.name}`, () => runGate(g, { resumeFix }))
   }
 }
 
-/** recursive（Rust）默认质量门；可按 repo 实际情况调整。 */
+/** recursive（Rust）内置默认质量门。项目特定门（含 E2E）走 <repo>/.flowcast/gates.json。 */
 function qualityGatesFor(repoPath) {
-  const gates = [
+  return [
     { name: 'test',   cmd: 'cargo test --quiet',                                       cwd: repoPath, onFail: 'resume-fix', timeout: 1_200_000 },
     { name: 'clippy', cmd: 'cargo clippy --all-targets --all-features -- -D warnings', cwd: repoPath, onFail: 'resume-fix', timeout: 600_000 },
     { name: 'fmt',    cmd: 'cargo fmt --all -- --check',                               cwd: repoPath, onFail: 'autofix', autofixCmd: 'cargo fmt --all' },
   ]
-  // 可选 E2E smoke：仓里有脚本才跑
-  const e2e = join(repoPath, '.dev/scripts/e2e-smoke.sh')
-  if (existsSync(e2e)) {
-    gates.push({ name: 'e2e', cmd: `sh ${e2e}`, cwd: repoPath, onFail: 'rollback', timeout: 600_000 })
-  }
-  return gates
 }
 
 // ── 跨 provider self-review ──────────────────────────────────────
@@ -290,7 +297,7 @@ function buildSystemPrompt() {
 }
 
 function latestJournal(repoPath) {
-  const dir = join(repoPath, 'journal')
+  const dir = join(repoPath, '.dev', 'journal')
   if (!existsSync(dir)) return null
   const files = readdirSync(dir).filter(f => f.endsWith('.md')).sort()
   if (!files.length) return null
@@ -351,6 +358,7 @@ function buildEnv(providerOverride) {
   return recursiveProviderEnv({ ...bundle, maxSteps: opts.budget })
 }
 
+
 function configureHitl() {
   if (opts.hitl === 'wecom') {
     setHitlBackend('wecom', { projectName: opts['project-name'] })
@@ -400,7 +408,7 @@ function gitDiff(cwd) { return git(['diff', 'HEAD'], cwd) }
 function currentBranch(cwd) { try { return git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd) } catch { return '?' } }
 
 function listRuns() {
-  const dir = '.flowx/runs'
+  const dir = join(flowcastDir(opts.repo), 'runs')
   if (!existsSync(dir)) { console.log('无历史 run'); return }
   readdirSync(dir).forEach(id => {
     try {

@@ -22,8 +22,9 @@ baseline/clean 预检
   → verdict：committed / rolled-back / skip-commit / panic-preserved
 ```
 
-每一步都写进 `.flowx/runs/<run-id>/`（state.json + run.log.jsonl + report.md +
+每一步都写进 `.flowcast/runs/<run-id>/`（state.json + run.log.jsonl + report.md +
 transcript.json），中断后用同一个 `--run-id` 即可从断点续跑。
+（目录名跟随 flowcast 约定：新仓 `.flowcast/`，已有 `.flowx/` 的旧仓自动兼容。）
 
 ---
 
@@ -37,7 +38,7 @@ transcript.json），中断后用同一个 `--run-id` 即可从断点续跑。
    ```bash
    cargo build --release
    ```
-3. **配置 provider**（机器级，一次即可）：`~/.flowx/providers.json` 已含
+3. **配置 provider**（机器级，一次即可）：`~/.flowcast/providers.json`（向后兼容 `~/.flowx/`）已含
    `deepseek` / `minimax` / `glm` 等 profile，API Key 走 `${ENV_VAR}` 插值。
    确认对应环境变量已导出（如 `DEEPSEEK_API_KEY`）。
 
@@ -45,7 +46,7 @@ transcript.json），中断后用同一个 `--run-id` 即可从断点续跑。
 
 ## 怎么跑
 
-**在 recursive 仓根目录执行**（cwd=仓根，`.flowx/` 产物落在仓根并被自动本地排除）：
+**在 recursive 仓根目录执行**（cwd=仓根，`.flowcast/runs/` 产物落在仓根并被自动本地排除）：
 
 ```bash
 # 1) 直接给目标
@@ -71,7 +72,7 @@ node .dev/flows/self-improve.flow.js --list
 |------|------|------|
 | `--goal "<文本>"` | 自改目标 | — |
 | `--goal-file <path>` | 从文件读目标 | — |
-| `--provider <name>` | recursive 用的 provider profile（`~/.flowx/providers.json` 里的名字） | 无（不注入） |
+| `--provider <name>` | recursive 用的 provider profile（`~/.flowcast/providers.json` 里的名字） | 无（不注入） |
 | `--reviewer-provider <name>` | 跨 provider self-review 用的 profile（建议与 `--provider` 不同） | 同 `--provider` |
 | `--model <name>` | 覆盖 profile 默认模型 | profile 默认 |
 | `--run-id <id>` | 指定 run id；续跑用同一个 | `selfimprove-<ts>` |
@@ -107,12 +108,28 @@ git -C <repo> checkout main && git merge <branch>
 
 ## 质量门
 
-默认门（见 flow 里 `qualityGatesFor`）：
+门链 = **内置默认门**（flow 里 `qualityGatesFor`，语言相关）+ **项目自定义门**
+（`<repo>/.flowcast/gates.json`，committed），两者经 `mergeGates` 合并：项目门同名覆盖内置、
+新增门追加在后。
+
+内置默认门：
 
 - `cargo test --quiet` — 失败 → resume-fix（把失败输出喂回 recursive 修一次）
 - `cargo clippy --all-targets --all-features -- -D warnings` — 失败 → resume-fix
 - `cargo fmt --all -- --check` — 失败 → autofix（`cargo fmt --all`）
-- `e2e`（可选）— 仓里存在 `.dev/scripts/e2e-smoke.sh` 才跑，失败 → rollback
+
+项目自定义门（`.dev/../.flowcast/gates.json`，与 provider/agent 配置同属项目仓）：
+
+- `e2e` — `sh .dev/scripts/e2e-gate.sh`（argusai smoke），失败 → resume-fix。
+  这是 AGENTS.md 列为强制的 E2E 门：脚本封装 argusai 的 init/setup/run-smoke 判定，
+  前置缺失（mcp2cli / argusai-mcp / `e2e/e2e.yaml`）一律 HARD-FAIL（红灯），不静默跳过。
+  需在含 Docker + argusai 的环境运行。
+
+> 配置形态（map by name，门字段与 `runGate` 一致）：
+> ```json
+> { "gates": { "e2e": { "cmd": "sh .dev/scripts/e2e-gate.sh", "onFail": "resume-fix", "timeout": 600000 } } }
+> ```
+> 新增门 / 覆盖同名内置门都在 `gates.json` 里声明，**不改 flow 代码**。
 
 pricing 文件自动探测 `.dev/pricing.yaml` → `pricing.yaml` → `pricing.json`。
 
@@ -120,7 +137,7 @@ pricing 文件自动探测 `.dev/pricing.yaml` → `pricing.yaml` → `pricing.j
 
 ## 产物与审计
 
-每次 run 在 `<repo>/.flowx/runs/<run-id>/`：
+每次 run 在 `<repo>/.flowcast/runs/<run-id>/`（旧仓兼容 `.flowx/`）：
 
 - `state.json` — 步骤状态机（续跑入口）
 - `run.log.jsonl` — 结构化事件日志
@@ -128,7 +145,9 @@ pricing 文件自动探测 `.dev/pricing.yaml` → `pricing.yaml` → `pricing.j
 - `system-prompt.md` — 本次注入的契约/journal/失败上下文
 - `transcript.json` — recursive 的完整 transcript（支持 replay/resume）
 
-`.flowx/` 会被 flow 自动写入 `.git/info/exclude`（本地排除，不污染 clean 检查）。
+`.flowcast/runs/` 会被 flow 自动写入 `.git/info/exclude`（本地排除运行产物，不污染 clean
+检查）——只排除 `runs/`，**不排除整个 `.flowcast/`**，这样项目配置 `.flowcast/gates.json`
+（以及 providers/agents）仍可正常 committed。
 
 ---
 
@@ -148,7 +167,8 @@ cd .dev/flows && npm test
 
 - 行为对齐：baseline 预检、system prompt 注入、budget resume、质量门 resume-fix、
   跨 provider review、verdict 语义，都忠实迁移自 `.dev/scripts/self-improve.sh`。
-- 新增：可断点续跑、结构化审计产物、可插拔 HITL、provider 配置外置到 `~/.flowx/`。
+- 新增：可断点续跑、结构化审计产物、可插拔 HITL、provider 配置外置到 `~/.flowcast/`、
+  质量门可经 `.flowcast/gates.json` 项目级自定义（含强制 E2E 门）。
 - 老脚本保留作参考，新自改一律走本 flow。
 
 ## 待办（改进本 flow 自身）

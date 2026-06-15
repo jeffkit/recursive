@@ -1,7 +1,7 @@
 //! Build helpers: tool registry, agent runtime, MCP registration, skill discovery.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use recursive::config::{load_project_context, Config};
@@ -13,12 +13,13 @@ use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skil
 use recursive::tools::WebSearch;
 use recursive::{
     llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
+    tools::fs::ReadFileState,
     tools::EpisodicRecall,
     tools::{
-        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, EstimateTokens, Forget,
-        GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
-        RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
-        TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
+        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, EditTool,
+        EstimateTokens, Forget, GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember,
+        RunBackground, RunShell, RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList,
+        SearchFiles, TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, RetryPolicy, ToolRegistry,
@@ -29,9 +30,17 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
     let root = &config.workspace;
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
+    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
     let mut registry = ToolRegistry::new(transport)
-        .register_with_aliases(Arc::new(ReadFile::new(root)), &["read_file"])
+        .with_read_file_state(read_state.clone())
+        .register_with_aliases(
+            Arc::new(ReadFile::new(root).with_read_state(read_state.clone())),
+            &["read_file"],
+        )
         .register_with_aliases(Arc::new(WriteFile::new(root)), &["write_file"])
+        .register(Arc::new(
+            EditTool::new(root).with_read_state(read_state.clone()),
+        ))
         .register_with_aliases(Arc::new(GlobTool::new(root)), &["list_dir", "glob"])
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),

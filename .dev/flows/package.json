@@ -9,7 +9,9 @@
     "test": "node --test test/"
   },
   "dependencies": {
-    "@force-lab/flowx": "file:../../../flowx"
+    "flowcast": "^0.2.3"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }
