@@ -511,7 +511,7 @@ impl<'a> RunCore<'a> {
         let specs = self.tools.specs();
 
         let mut final_message: Option<String> = None;
-        let mut recent_errors: std::collections::VecDeque<bool> =
+        let mut recent_errors: std::collections::VecDeque<(bool, String)> =
             std::collections::VecDeque::with_capacity(self.stuck_window);
         let mut total_usage = TokenUsage::default();
         // Goal-153: audit metadata for tool calls, keyed by (turn, tool_call_id).
@@ -790,14 +790,30 @@ impl<'a> RunCore<'a> {
                 if recent_errors.len() == self.stuck_window {
                     recent_errors.pop_front();
                 }
-                recent_errors.push_back(is_error);
+                recent_errors.push_back((is_error, name.clone()));
 
                 if recent_errors.len() == self.stuck_window {
-                    let error_count = recent_errors.iter().filter(|&&e| e).count();
+                    let error_entries: Vec<&str> = recent_errors
+                        .iter()
+                        .filter(|(is_err, _)| *is_err)
+                        .map(|(_, n)| n.as_str())
+                        .collect();
+                    let error_count = error_entries.len();
                     let rate = error_count as f64 / self.stuck_window as f64;
                     if rate >= self.stuck_error_rate {
+                        // Find the most frequently appearing tool name in the error window.
+                        let mut counts: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::new();
+                        for n in &error_entries {
+                            *counts.entry(n).or_default() += 1;
+                        }
+                        let top_tool = counts
+                            .into_iter()
+                            .max_by_key(|&(_, c)| c)
+                            .map(|(n, _)| n)
+                            .unwrap_or(name.as_str());
                         let finish = FinishReason::Stuck {
-                            repeated_call: name.clone(),
+                            repeated_call: top_tool.to_string(),
                             repeats: error_count,
                         };
                         self.emit(AgentEvent::TurnFinished {
@@ -867,17 +883,18 @@ mod tests {
         let stuck_window = 3usize;
         let stuck_error_rate = 1.0f64;
 
-        let mut recent_errors: std::collections::VecDeque<bool> =
+        let mut recent_errors: std::collections::VecDeque<(bool, String)> =
             std::collections::VecDeque::with_capacity(stuck_window);
 
         // Push 2 errors — should not trigger yet
-        for _ in 0..2 {
+        for i in 0..2 {
             if recent_errors.len() == stuck_window {
                 recent_errors.pop_front();
             }
-            recent_errors.push_back(true);
-            let rate =
-                recent_errors.iter().filter(|&&e| e).count() as f64 / recent_errors.len() as f64;
+            let name = format!("tool_{i}");
+            recent_errors.push_back((true, name));
+            let rate = recent_errors.iter().filter(|(e, _)| *e).count() as f64
+                / recent_errors.len() as f64;
             assert!(
                 recent_errors.len() < stuck_window || rate < stuck_error_rate,
                 "should not trigger before window is full"
@@ -888,14 +905,28 @@ mod tests {
         if recent_errors.len() == stuck_window {
             recent_errors.pop_front();
         }
-        recent_errors.push_back(true);
+        recent_errors.push_back((true, "tool_2".to_string()));
         assert_eq!(recent_errors.len(), stuck_window);
-        let error_count = recent_errors.iter().filter(|&&e| e).count();
+        let error_count = recent_errors.iter().filter(|(e, _)| *e).count();
         let rate = error_count as f64 / stuck_window as f64;
         assert!(
             rate >= stuck_error_rate,
             "rate {rate} should trigger stuck at threshold {stuck_error_rate}"
         );
+
+        // Verify most-repeated tool reporting logic
+        let error_entries: Vec<&str> = recent_errors
+            .iter()
+            .filter(|(e, _)| *e)
+            .map(|(_, n)| n.as_str())
+            .collect();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for n in &error_entries {
+            *counts.entry(n).or_default() += 1;
+        }
+        let top_tool = counts.into_iter().max_by_key(|&(_, c)| c).map(|(n, _)| n);
+        // All three are distinct so any one could be "top"; just verify it exists
+        assert!(top_tool.is_some());
     }
 
     #[test]
@@ -905,22 +936,80 @@ mod tests {
         let stuck_window = 4usize;
         let stuck_error_rate = 0.8f64;
 
-        let mut recent_errors: std::collections::VecDeque<bool> =
+        let mut recent_errors: std::collections::VecDeque<(bool, String)> =
             std::collections::VecDeque::with_capacity(stuck_window);
 
-        let pattern = [true, true, true, false]; // 3/4 errors = 0.75
-        for &is_error in &pattern {
+        let pattern = [
+            (true, "tool_a"),
+            (true, "tool_b"),
+            (true, "tool_a"),
+            (false, "tool_c"),
+        ]; // 3/4 errors = 0.75
+        for (is_error, name) in &pattern {
             if recent_errors.len() == stuck_window {
                 recent_errors.pop_front();
             }
-            recent_errors.push_back(is_error);
+            recent_errors.push_back((*is_error, name.to_string()));
         }
 
         assert_eq!(recent_errors.len(), stuck_window);
-        let rate = recent_errors.iter().filter(|&&e| e).count() as f64 / stuck_window as f64;
+        let rate = recent_errors.iter().filter(|(e, _)| *e).count() as f64 / stuck_window as f64;
         assert!(
             rate < stuck_error_rate,
             "rate {rate} should be below threshold {stuck_error_rate}"
+        );
+    }
+
+    #[test]
+    fn stuck_detection_reports_most_repeated_tool() {
+        // window=4, rate=0.75, pattern: tool_a err, tool_b err, tool_a err, tool_b ok
+        // error_count=3, rate=0.75, most repeated should be tool_a (appears 2× in errors)
+        let stuck_window = 4usize;
+        let stuck_error_rate = 0.75f64;
+
+        let mut recent_errors: std::collections::VecDeque<(bool, String)> =
+            std::collections::VecDeque::with_capacity(stuck_window);
+
+        let pattern = [
+            (true, "tool_a"),
+            (true, "tool_b"),
+            (true, "tool_a"),
+            (false, "tool_b"),
+        ];
+        for (is_error, name) in &pattern {
+            if recent_errors.len() == stuck_window {
+                recent_errors.pop_front();
+            }
+            recent_errors.push_back((*is_error, name.to_string()));
+        }
+
+        assert_eq!(recent_errors.len(), stuck_window);
+
+        let error_entries: Vec<&str> = recent_errors
+            .iter()
+            .filter(|(is_err, _)| *is_err)
+            .map(|(_, n)| n.as_str())
+            .collect();
+        let error_count = error_entries.len();
+        let rate = error_count as f64 / stuck_window as f64;
+        assert!(
+            rate >= stuck_error_rate,
+            "rate {rate} should trigger stuck at threshold {stuck_error_rate}"
+        );
+
+        // Find the most frequently appearing tool name in the error window.
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for n in &error_entries {
+            *counts.entry(n).or_default() += 1;
+        }
+        let top_tool = counts
+            .into_iter()
+            .max_by_key(|&(_, c)| c)
+            .map(|(n, _)| n)
+            .unwrap();
+        assert_eq!(
+            top_tool, "tool_a",
+            "most repeated tool should be tool_a (2 errors), not tool_b (1 error)"
         );
     }
 }
