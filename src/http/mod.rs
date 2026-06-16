@@ -811,6 +811,26 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/metrics": {
+                "get": {
+                    "summary": "Prometheus metrics",
+                    "description": "Returns Prometheus-compatible metrics exposition. \
+                        Includes the standard counters (requests, agent runs, tokens) plus \
+                        `recursive_sessions_active` (gauge, count of currently open sessions) \
+                        and `recursive_rate_limits_rejected_total` (counter, requests rejected \
+                        by rate limiting). Added in G292, documented in G298.",
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus text format",
+                            "content": {
+                                "text/plain": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/openapi.json": {
                 "get": {
                     "summary": "OpenAPI specification",
@@ -903,7 +923,8 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     "properties": {
                         "id": { "type": "string" },
                         "created_at": { "type": "string" },
-                        "message_count": { "type": "integer" }
+                        "message_count": { "type": "integer" },
+                        "title": { "type": "string", "nullable": true }
                     },
                     "required": ["id", "created_at", "message_count"]
                 },
@@ -928,9 +949,27 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     "properties": {
                         "id": { "type": "string" },
                         "created_at": { "type": "string" },
-                        "messages": { "type": "array", "items": { "type": "object" } }
+                        "title": { "type": "string", "nullable": true },
+                        "messages": { "type": "array", "items": { "type": "object" } },
+                        "todos": { "type": "array", "items": { "type": "object" } },
+                        "status": {
+                            "type": "string",
+                            "description": "Session lifecycle state: idle | plan_pending_approval"
+                        },
+                        "pending_plan": { "type": "string", "nullable": true },
+                        "goal": { "type": "object", "nullable": true },
+                        "first_prompt": { "type": "string", "nullable": true },
+                        "last_prompt": { "type": "string", "nullable": true },
+                        "prompt_tokens": {
+                            "type": "integer",
+                            "description": "Cumulative prompt tokens for this session"
+                        },
+                        "completion_tokens": {
+                            "type": "integer",
+                            "description": "Cumulative completion tokens for this session"
+                        }
                     },
-                    "required": ["id", "created_at", "messages"]
+                    "required": ["id", "created_at", "messages", "status", "todos", "prompt_tokens", "completion_tokens"]
                 },
                 "SessionMessageRequest": {
                     "type": "object",

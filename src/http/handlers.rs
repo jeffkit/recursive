@@ -1956,4 +1956,81 @@ mod tests {
             "sessions_active should decrement to 0 after delete"
         );
     }
+
+    // ── G298: OpenAPI spec sync ───────────────────────────────────────
+
+    /// Verify that `build_openapi_spec()` correctly describes the
+    /// `SessionDetailResponse` schema with all the fields added in
+    /// G293, G294, G295, G296, etc.
+    #[test]
+    fn openapi_session_detail_has_complete_schema() {
+        let spec = super::build_openapi_spec();
+        let props = &spec["components"]["schemas"]["SessionDetailResponse"]["properties"];
+
+        // Fields from the original (G-pre) spec.
+        assert!(props.get("id").is_some(), "id missing");
+        assert!(props.get("created_at").is_some(), "created_at missing");
+        assert!(props.get("messages").is_some(), "messages missing");
+
+        // Fields added by G293-G296 that the goal explicitly requires.
+        assert!(
+            props.get("prompt_tokens").is_some(),
+            "prompt_tokens missing"
+        );
+        assert!(
+            props.get("completion_tokens").is_some(),
+            "completion_tokens missing"
+        );
+        assert!(props.get("status").is_some(), "status missing");
+        assert!(props.get("todos").is_some(), "todos missing");
+        assert!(props.get("goal").is_some(), "goal missing");
+
+        // Remaining fields: title, pending_plan, first_prompt, last_prompt.
+        assert!(props.get("title").is_some(), "title missing");
+        assert!(props.get("pending_plan").is_some(), "pending_plan missing");
+        assert!(props.get("first_prompt").is_some(), "first_prompt missing");
+        assert!(props.get("last_prompt").is_some(), "last_prompt missing");
+
+        // Verify we have at least 10 properties total.
+        let obj = props.as_object().expect("properties is an object");
+        assert!(
+            obj.len() >= 10,
+            "SessionDetailResponse should have ≥10 properties, got {}",
+            obj.len()
+        );
+    }
+
+    /// Verify `SessionInfo` schema includes `message_count` and `title`.
+    #[test]
+    fn openapi_session_info_has_message_count_and_title() {
+        let spec = super::build_openapi_spec();
+        let props = &spec["components"]["schemas"]["SessionInfo"]["properties"];
+
+        assert!(props.get("id").is_some(), "id missing");
+        assert!(props.get("created_at").is_some(), "created_at missing");
+        assert!(
+            props.get("message_count").is_some(),
+            "message_count missing"
+        );
+        assert!(props.get("title").is_some(), "title missing");
+    }
+
+    /// Verify the `/metrics` path exists and mentions the two G292
+    /// metrics in its description.
+    #[test]
+    fn openapi_metrics_path_documents_new_metrics() {
+        let spec = super::build_openapi_spec();
+        let description = spec["paths"]["/metrics"]["get"]["description"]
+            .as_str()
+            .expect("metrics path description is a string");
+
+        assert!(
+            description.contains("recursive_sessions_active"),
+            "metrics description should mention recursive_sessions_active: {description}"
+        );
+        assert!(
+            description.contains("recursive_rate_limits_rejected_total"),
+            "metrics description should mention recursive_rate_limits_rejected_total: {description}"
+        );
+    }
 }
