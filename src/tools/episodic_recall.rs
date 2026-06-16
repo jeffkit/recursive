@@ -283,6 +283,7 @@ mod tests {
     use super::*;
     use crate::message::Message;
     use crate::session::SessionWriter;
+    use crate::SessionStatus;
     use std::time::Duration;
 
     /// Helper: create a temporary workspace and write some session data.
@@ -302,9 +303,7 @@ mod tests {
             };
             writer.append(&msg, None, None).unwrap();
         }
-        writer
-            .finish(crate::session::SessionStatus::Completed)
-            .unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
         session_dir
             .file_name()
             .unwrap()

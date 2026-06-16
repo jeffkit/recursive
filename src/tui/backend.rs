@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::event::CompositeSink;
-use crate::session::{SessionPersistenceSink, SessionStatus, SessionWriter};
+use crate::session::{SessionPersistenceSink, SessionWriter};
 use crate::tools::PermissionHook;
-use crate::{AgentEvent, AgentRuntime, EventSink};
+use crate::{AgentEvent, AgentRuntime, EventSink, SessionStatus};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
