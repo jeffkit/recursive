@@ -481,11 +481,13 @@ pub(super) async fn patch_session(
         session.title = if title.is_empty() { None } else { Some(title) };
     }
 
-    // Build response without taking the runtime lock (message_count is approximate here).
+    // Read the pre-computed non-system message count directly from the
+    // atomic. It is updated whenever a non-system message is appended, so
+    // we don't need to acquire the runtime lock here.
     Ok(Json(SessionInfo {
         id: session.id.clone(),
         created_at: session.created_at.clone(),
-        message_count: 0, // omitted in patch response; caller can re-fetch if needed
+        message_count: session.non_system_message_count.load(Ordering::Relaxed),
         title: session.title.clone(),
     }))
 }

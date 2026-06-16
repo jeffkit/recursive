@@ -836,6 +836,98 @@ mod http_tests {
         assert_eq!(response.status(), 404);
     }
 
+    /// Goal-297: PATCH /sessions/:id must echo the actual non-system
+    /// message count, not 0. `SessionState::non_system_message_count`
+    /// is an `Arc<AtomicUsize>` kept in lock-step with the runtime's
+    /// transcript by the SSE forwarder; the patch handler reads it
+    /// directly instead of returning a placeholder.
+    #[tokio::test]
+    async fn patch_session_returns_actual_message_count() {
+        // One canned response for the assistant turn.
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hi".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        // 1) Create a session (count starts at 0).
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // 2) Send a user message so the forwarder increments the
+        //    atomic to 2 (user + assistant). By the time send_session_message
+        //    returns 200 it has awaited the forwarder task to completion.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "hi"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "send_message must succeed");
+
+        // 3) PATCH the session title.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/sessions/{session_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"rename me"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "PATCH must succeed");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let patched: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // 4) message_count must be the actual count (2), not 0.
+        assert_eq!(
+            patched["message_count"], 2,
+            "patch_session must return the real non-system message count, got: {patched}"
+        );
+        assert_eq!(
+            patched["title"], "rename me",
+            "title must reflect the patched value, got: {patched}"
+        );
+        assert_eq!(
+            patched["id"], session_id,
+            "id must round-trip, got: {patched}"
+        );
+    }
+
     // ── SSE endpoint tests ───────────────────────────────────────────────
 
     #[tokio::test]

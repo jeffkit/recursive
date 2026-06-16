@@ -326,7 +326,7 @@ impl Tool for Remember {
             })
             .unwrap_or_default();
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = memory_path(&self.workspace);
         let mut file_store = MemoryStore::load(&path)?;
         let id = file_store.add(text.clone(), tags.clone());
@@ -531,7 +531,7 @@ impl Tool for Forget {
             })?
             .to_string();
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = memory_path(&self.workspace);
         let mut store = MemoryStore::load(&path)?;
         if store.remove(&id) {
@@ -733,7 +733,7 @@ impl Tool for WorkingMemoryTool {
             })?
             .to_string();
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = scratchpad_path(&self.workspace);
         let mut pad = Scratchpad::load(&path)?;
         pad.set(key.clone(), value);
@@ -844,7 +844,7 @@ impl Tool for ScratchpadDelete {
             })?
             .to_string();
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = scratchpad_path(&self.workspace);
         let mut pad = Scratchpad::load(&path)?;
         if pad.delete(&key) {
