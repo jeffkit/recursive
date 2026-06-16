@@ -11,7 +11,7 @@ mod rate_limit;
 
 pub use auth::{AuthConfig, JwtConfig};
 pub use handlers::map_agent_event;
-pub use rate_limit::RateLimiter;
+pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
@@ -20,7 +20,7 @@ use handlers::{
     send_session_message, session_clear_goal, session_events, session_interrupt,
     session_plan_confirm, session_plan_reject, session_set_goal,
 };
-use rate_limit::{metrics_middleware, rate_limit_middleware, rate_limiter_from_env};
+use rate_limit::{metrics_middleware, rate_limit_middleware};
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -285,6 +285,9 @@ pub struct AppState {
     /// configured `max_concurrent_runs` is 0 (unlimited), this is initialised
     /// with `Semaphore::MAX_PERMITS`.
     pub run_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Shared rate limiter for all API requests. Stored on `AppState` so the
+    /// session reaper can prune idle token buckets.
+    pub rate_limiter: RateLimiter,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -373,11 +376,14 @@ pub fn build_router(state: AppState) -> Router {
 /// Tests use this to inject a known auth state without touching
 /// process-global env vars. Production code paths use [`build_router`].
 ///
-/// The rate limiter is sourced from env (`rate_limiter_from_env`).
-/// Tests that need deterministic rate-limit behavior should use
+/// The rate limiter is taken from `AppState.rate_limiter`. Callers should
+/// populate it via [`rate_limiter_from_env`] for production or with
+/// [`RateLimiter::new`] for deterministic tests. Tests that need
+/// race-free rate-limit assertions should use
 /// [`build_router_with_auth_and_rate_limit`] instead.
 pub fn build_router_with_auth(state: AppState, auth: AuthConfig) -> Router {
-    build_router_with_auth_and_rate_limit(state, auth, rate_limiter_from_env())
+    let limiter = state.rate_limiter.clone();
+    build_router_with_auth_and_rate_limit(state, auth, limiter)
 }
 
 /// Build the HTTP router with an explicit `AuthConfig` AND an explicit
@@ -864,6 +870,9 @@ pub fn spawn_session_reaper(
                     }
                 }
             }
+            // Prune idle rate-limit buckets (goal-290). Runs every
+            // reaper tick so the bucket map doesn't grow unboundedly.
+            state.rate_limiter.prune().await;
             if to_evict.is_empty() {
                 continue;
             }

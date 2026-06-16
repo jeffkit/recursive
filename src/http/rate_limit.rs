@@ -76,13 +76,28 @@ impl RateLimiter {
             false
         }
     }
+
+    /// Remove idle token buckets (tokens fully refilled to capacity).
+    ///
+    /// Safe to drop: a re-arriving client gets a fresh full bucket,
+    /// which is the same as the stored state.
+    pub(super) async fn prune(&self) {
+        let mut buckets = self.buckets.lock().await;
+        buckets.retain(|_, b| b.tokens < self.capacity as f64);
+    }
+
+    /// Return the number of client buckets currently stored.
+    #[allow(dead_code)]
+    pub(super) async fn bucket_count(&self) -> usize {
+        self.buckets.lock().await.len()
+    }
 }
 
 /// Build a `RateLimiter` from environment variables.
 ///
 /// - `RECURSIVE_RATE_LIMIT_RPM`: requests per minute (default: 60)
 /// - `RECURSIVE_RATE_LIMIT_BURST`: burst capacity (default: 10)
-pub(super) fn rate_limiter_from_env() -> RateLimiter {
+pub fn rate_limiter_from_env() -> RateLimiter {
     let rpm = std::env::var("RECURSIVE_RATE_LIMIT_RPM")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -312,6 +327,59 @@ mod tests {
             assert!(limiter.check("default-client").await);
         }
         assert!(!limiter.check("default-client").await, "burst exceeded");
+    }
+
+    #[tokio::test]
+    async fn prune_removes_full_buckets() {
+        let limiter = RateLimiter::new(2, 1.0);
+        // Create entries and drain them partially
+        limiter.check("client-a").await;
+        limiter.check("client-b").await;
+        limiter.check("client-new-full").await;
+        // At this point all entries are partially drained (1 token left each).
+        // prune() should remove nothing.
+        limiter.prune().await;
+        let count_after = limiter.bucket_count().await;
+        assert_eq!(
+            count_after, 3,
+            "all partially drained, none should be removed"
+        );
+
+        // Insert a full bucket (tokens == capacity) to test eviction
+        {
+            let mut b = limiter.buckets.lock().await;
+            b.insert(
+                "idle-client".to_string(),
+                TokenBucket {
+                    tokens: 2.0, // == capacity → idle
+                    last_refill: std::time::Instant::now(),
+                },
+            );
+        }
+        limiter.prune().await;
+        // idle-client evicted, 3 partial buckets remain
+        assert_eq!(
+            limiter.bucket_count().await,
+            3,
+            "idle-client should be evicted"
+        );
+
+        // Directly refill the remaining buckets to capacity so
+        // prune() evicts them.
+        {
+            let mut b = limiter.buckets.lock().await;
+            let now = std::time::Instant::now();
+            for bucket in b.values_mut() {
+                bucket.tokens = 2.0;
+                bucket.last_refill = now;
+            }
+        }
+        limiter.prune().await;
+        assert_eq!(
+            limiter.bucket_count().await,
+            0,
+            "all buckets should be idle after manual refill"
+        );
     }
 }
 

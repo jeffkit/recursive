@@ -6,7 +6,7 @@
 mod v050_integration {
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use recursive::http::{build_router, AppState, Metrics, ToolInfo};
+    use recursive::http::{build_router, AppState, Metrics, RateLimiter, ToolInfo};
     use recursive::llm::{mock::MockProvider, Completion};
     use recursive::multi::{default_roles, AgentPool};
     use recursive::tools::ToolRegistry;
@@ -78,6 +78,7 @@ mod v050_integration {
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            rate_limiter: RateLimiter::new(10, 1.0),
         }
     }
 

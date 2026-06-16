@@ -109,6 +109,7 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
         slash_commands: Arc::new(Vec::new()),
         session_ttl_secs: 0,
         run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+        rate_limiter: RateLimiter::new(10, 1.0),
     }
 }
 

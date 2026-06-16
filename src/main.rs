@@ -729,6 +729,7 @@ async fn main() -> anyhow::Result<()> {
                 slash_commands: std::sync::Arc::new(slash_commands),
                 session_ttl_secs,
                 run_semaphore,
+                rate_limiter: recursive::http::rate_limiter_from_env(),
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the

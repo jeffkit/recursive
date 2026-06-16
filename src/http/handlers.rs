@@ -1663,6 +1663,7 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
             run_semaphore: sem,
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
         });
 
         let body = serde_json::json!({
@@ -1723,6 +1724,7 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
             run_semaphore: Arc::new(Semaphore::new(8)),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
