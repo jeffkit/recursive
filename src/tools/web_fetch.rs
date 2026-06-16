@@ -28,8 +28,12 @@ impl WebFetch {
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .user_agent(format!("recursive-agent/{}", env!("CARGO_PKG_VERSION")))
+            // Construction carve-out: if TLS backend fails to initialize, the
+            // process cannot perform HTTP requests at all. This is a fatal
+            // startup condition equivalent to the providers.rs TOML parse
+            // (Invariant #5 §construction).
             .build()
-            .expect("reqwest client build");
+            .expect("reqwest client build: TLS backend unavailable");
         Self { client }
     }
 
@@ -430,6 +434,12 @@ mod tests {
         let html = "Hello   World";
         let md = WebFetch::html_to_markdown(html);
         assert!(md.contains("Hello World"));
+    }
+
+    #[test]
+    fn web_fetch_construction_smoke() {
+        let tool = WebFetch::new();
+        assert_eq!(tool.spec().name, "WebFetch");
     }
 
     #[tokio::test]

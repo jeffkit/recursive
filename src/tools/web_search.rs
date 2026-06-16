@@ -69,8 +69,12 @@ impl WebSearch {
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .user_agent(format!("recursive-agent/{}", env!("CARGO_PKG_VERSION")))
+            // Construction carve-out: if TLS backend fails to initialize, the
+            // process cannot perform HTTP requests at all. This is a fatal
+            // startup condition equivalent to the providers.rs TOML parse
+            // (Invariant #5 §construction).
             .build()
-            .expect("reqwest client build");
+            .expect("reqwest client build: TLS backend unavailable");
         Self {
             client,
             test_base_url: None,
@@ -602,6 +606,12 @@ mod tests {
         assert_eq!(spec.name, "WebSearch");
         assert!(spec.description.contains("RECURSIVE_WEB_SEARCH_PROVIDER"));
         assert!(spec.description.contains("Jina"));
+    }
+
+    #[test]
+    fn web_search_construction_smoke() {
+        let tool = WebSearch::new();
+        assert_eq!(tool.spec().name, "WebSearch");
     }
 
     // ── Integration tests with mockito (no real API key needed) ─────────────
