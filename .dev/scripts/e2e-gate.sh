@@ -61,6 +61,17 @@ fi
 # ---- 构建 e2e 插件（首次或 src 变动后）-------------------------------------
 if [[ -f "e2e/plugins/package.json" ]] && [[ ! -f "e2e/plugins/dist/index.js" || \
     "e2e/plugins/src" -nt "e2e/plugins/dist/index.js" ]]; then
+  # `npm run build` 走 tsc，需要 @types/node；node_modules 在 clean worktree
+  # 下被 .gitignore 排除。 缺失时 `tsc` 报 TS2688，整个门会变红。 在 build
+  # 之前确认 node_modules 存在且与 lockfile / package.json 同步。
+  if [[ ! -d "e2e/plugins/node_modules" || \
+      "e2e/plugins/package.json" -nt "e2e/plugins/node_modules" || \
+      ( -f "e2e/plugins/pnpm-lock.yaml" && \
+        "e2e/plugins/pnpm-lock.yaml" -nt "e2e/plugins/node_modules" ) ]]; then
+    echo "[e2e-gate] 安装 e2e/plugins 依赖（node_modules 缺失或过期）..."
+    (cd e2e/plugins && npm install --no-audit --no-fund 2>&1) \
+      || { echo "[e2e-gate] e2e/plugins npm install 失败" >&2; exit 4; }
+  fi
   echo "[e2e-gate] 构建 e2e/plugins ..."
   (cd e2e/plugins && npm run build 2>&1) || { echo "[e2e-gate] e2e/plugins build 失败" >&2; exit 4; }
 fi

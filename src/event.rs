@@ -531,23 +531,23 @@ mod tests {
         assert_eq!(rx1.recv().await.unwrap(), AgentEvent::PlanConfirmed);
         assert_eq!(rx2.recv().await.unwrap(), AgentEvent::PlanConfirmed);
     }
-}
 
-/// Regression test for Goal 278: MessageAppended no longer has parent_uuid field.
-#[test]
-fn message_appended_no_longer_has_parent_uuid_field() {
-    // Source-grep check that src/event.rs doesn't define
-    // parent_uuid inside AgentEvent::MessageAppended.
-    let src = include_str!("event.rs");
-    let arm = src
-        .split("MessageAppended {")
-        .nth(1)
-        .expect("MessageAppended arm must exist")
-        .split("}")
-        .next()
-        .expect("MessageAppended arm must close");
-    assert!(
-        !arm.contains("parent_uuid"),
-        "MessageAppended arm must not reference parent_uuid: {arm}"
-    );
+    /// Regression test for Goal 278: MessageAppended no longer has parent_uuid field.
+    #[test]
+    fn message_appended_no_longer_has_parent_uuid_field() {
+        // Source-grep check that src/event.rs doesn't define
+        // parent_uuid inside AgentEvent::MessageAppended.
+        let src = include_str!("event.rs");
+        let arm = src
+            .split("MessageAppended {")
+            .nth(1)
+            .expect("MessageAppended arm must exist")
+            .split("}")
+            .next()
+            .expect("MessageAppended arm must close");
+        assert!(
+            !arm.contains("parent_uuid"),
+            "MessageAppended arm must not reference parent_uuid: {arm}"
+        );
+    }
 }
