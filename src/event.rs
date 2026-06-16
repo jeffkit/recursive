@@ -204,6 +204,19 @@ pub enum AgentEvent {
     },
     /// A hook produced a system message to show to the user.
     HookSystemMessage { text: String },
+
+    /// Emitted when the LLM call fails with a retryable error (rate limit or timeout)
+    /// and the agent will back off before retrying.
+    LlmRetry {
+        /// Which step (ReAct iteration) triggered the retry.
+        step: usize,
+        /// Which retry attempt this is (1 = first retry after initial failure).
+        attempt: u32,
+        /// How many milliseconds the agent will sleep before the next attempt.
+        wait_ms: u64,
+        /// Short human-readable description of the error ("rate_limited" or "timeout").
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

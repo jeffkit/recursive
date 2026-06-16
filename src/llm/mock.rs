@@ -17,6 +17,10 @@ use tracing::Instrument;
 #[derive(Default)]
 pub struct MockProvider {
     scripted: Mutex<Vec<Completion>>,
+    /// Queue of pre-baked errors to return before consuming scripted completions.
+    /// Each call to `complete()` pops from this queue first; if non-empty,
+    /// the error is returned instead of the next scripted completion.
+    errors: Mutex<Vec<Error>>,
     /// Queue of pre-baked JSON responses for `complete_structured`.
     structured_responses: Mutex<Vec<Result<serde_json::Value>>>,
     calls: Mutex<Vec<Vec<Message>>>,
@@ -42,6 +46,7 @@ impl MockProvider {
         Self {
             scripted: Mutex::new(scripted),
             calls: Mutex::new(Vec::new()),
+            errors: Mutex::new(Vec::new()),
             structured_responses: Mutex::new(Vec::new()),
             on_complete: None,
             on_complete_fn: None,
@@ -67,6 +72,14 @@ impl MockProvider {
         self
     }
 
+    /// Set a queue of errors to return from `complete()` before the scripted
+    /// completions are consumed. Each call to `complete()` pops the next error;
+    /// when the error queue is empty, scripted completions are returned as usual.
+    pub fn with_errors(self, errors: Vec<Error>) -> Self {
+        *self.errors.lock().unwrap() = errors;
+        self
+    }
+
     /// Snapshot of the transcripts the agent has sent to this provider.
     pub fn calls(&self) -> Vec<Vec<Message>> {
         self.calls.lock().unwrap().clone()
@@ -89,6 +102,14 @@ impl LlmProvider for MockProvider {
             // Emit info log so tracing-test can capture the span
             tracing::info!("mock llm call");
             self.calls.lock().unwrap().push(messages.to_vec());
+            // Check error queue first — errors are injected before scripted completions.
+            {
+                let mut errors = self.errors.lock().unwrap();
+                if !errors.is_empty() {
+                    let err = errors.remove(0);
+                    return Err(err);
+                }
+            }
             let mut queue = self.scripted.lock().unwrap();
             if queue.is_empty() {
                 return Err(Error::Llm {

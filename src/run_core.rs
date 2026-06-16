@@ -193,6 +193,16 @@ impl<'a> RunCore<'a> {
                         error = %e,
                         "llm retryable error — backing off"
                     );
+                    // Goal-287: surface retry to event consumers (TUI, SDK).
+                    self.emit(AgentEvent::LlmRetry {
+                        step,
+                        attempt: attempt + 1,
+                        wait_ms,
+                        reason: match &e {
+                            crate::error::Error::RateLimited { .. } => "rate_limited".to_string(),
+                            _ => "timeout".to_string(),
+                        },
+                    });
                     tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                     attempt += 1;
                 }

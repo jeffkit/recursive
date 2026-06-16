@@ -2341,4 +2341,70 @@ mod tests {
             rt.transcript().len()
         );
     }
+
+    /// Goal 287: verify that `AgentEvent::LlmRetry` is emitted when the LLM
+    /// returns a retryable error (rate limit) before eventually succeeding.
+    #[tokio::test]
+    async fn llm_retry_emits_event() {
+        use crate::event::{AgentEvent, ChannelSink};
+
+        let (sink, mut event_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+
+        // First call → rate limited, second call → success
+        let provider = Arc::new(
+            MockProvider::new(vec![Completion {
+                content: "Hello!".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            }])
+            .with_errors(vec![crate::error::Error::RateLimited {
+                provider: "mock".into(),
+                retry_after_ms: 1, // 1ms sleep to keep the test fast
+            }]),
+        );
+
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .event_sink(sink)
+            .build()
+            .unwrap();
+
+        let out = rt.run("hi").await.unwrap();
+        assert_eq!(out.final_text.as_deref(), Some("Hello!"));
+        assert_eq!(out.steps, 1);
+
+        // Collect all events; drop the sink so the channel closes.
+        drop(rt);
+        let mut events: Vec<AgentEvent> = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Must contain at least one LlmRetry event.
+        let retries: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|ev| matches!(ev, AgentEvent::LlmRetry { .. }))
+            .collect();
+        assert!(
+            !retries.is_empty(),
+            "expected at least one LlmRetry event, got {events:?}"
+        );
+
+        // The first retry should be attempt 1 with reason "rate_limited".
+        if let AgentEvent::LlmRetry {
+            attempt,
+            reason,
+            step,
+            wait_ms,
+        } = retries[0]
+        {
+            assert_eq!(*attempt, 1, "first retry attempt should be 1");
+            assert_eq!(reason, "rate_limited");
+            assert_eq!(*step, 1, "retry should happen on step 1");
+            assert_eq!(*wait_ms, 1, "wait_ms should match retry_after_ms");
+        }
+    }
 }
