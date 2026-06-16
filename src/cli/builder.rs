@@ -324,7 +324,7 @@ pub(crate) async fn build_runtime(
         let agent = AgentTool::new(
             &config.workspace,
             provider.clone(),
-            tools.clone(),
+            tools.fork(),
             max_depth,
             0,
             None,

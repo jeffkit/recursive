@@ -318,7 +318,7 @@ impl AgentTool {
         let mut child_agent = AgentTool::new(
             &self.workspace,
             self.provider.clone(),
-            self.all_tools.clone(),
+            self.all_tools.fork(),
             self.max_depth,
             child_depth,
             self.permission_hook.clone(),
@@ -474,7 +474,7 @@ impl AgentTool {
         // worker gets its own clone of the relevant fields.
         let workspace = self.workspace.clone();
         let provider = self.provider.clone();
-        let all_tools = self.all_tools.clone();
+        let all_tools = self.all_tools.fork();
         let max_depth = self.max_depth;
         let permission_hook = self.permission_hook.clone();
         let registry = self.registry.clone();
