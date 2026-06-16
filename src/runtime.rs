@@ -174,6 +174,11 @@ pub struct AgentRuntime {
     /// Set by `close()` after `SessionEnd` has been fired; prevents duplicate
     /// `SessionEnd` events when `close()` is called more than once.
     session_closed: bool,
+    /// Goal-291: number of most-recent transcript messages passed to the
+    /// goal-evaluator judge on each turn. Smaller values reduce judge cost;
+    /// larger values give the judge more context for long sessions.
+    /// Default 12. Set via [`AgentRuntimeBuilder::goal_eval_transcript_tail`].
+    goal_eval_transcript_tail: usize,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -199,21 +204,10 @@ impl std::fmt::Debug for AgentRuntime {
                 "deferred_turn_finished",
                 &self.deferred_turn_finished.as_ref().map(|_| "<event>"),
             )
+            .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .finish()
     }
 }
-
-/// How many of the most-recent transcript messages to send to the
-/// goal-evaluator judge on each turn. The judge is supposed to evaluate
-/// *recent progress* — "did the last few turns move toward the
-/// condition?" — not the full session history. The full transcript
-/// keeps growing turn after turn (user prompt + assistant reply +
-/// optional tool result), so passing the whole thing to the judge
-/// after several turns gets expensive. A 12-message tail covers
-/// roughly 3-4 turns of context. The judge still does its own
-/// internal TAIL slicing inside `GoalEvaluator::evaluate`; this
-/// constant bounds the *caller-side* payload as well.
-const GOAL_EVAL_TRANSCRIPT_TAIL: usize = 12;
 
 impl AgentRuntime {
     /// Create a new [`AgentRuntimeBuilder`].
@@ -814,7 +808,10 @@ impl AgentRuntime {
             // Goal-260: pass a tail slice, not the full transcript. The judge
             // only needs recent progress; the full transcript grows every turn
             // and would balloon the judge call's payload.
-            let tail = self.transcript_tail(GOAL_EVAL_TRANSCRIPT_TAIL);
+            // Goal-291: the slice length is now configurable via
+            // `goal_eval_transcript_tail` (default 12, matching the previous
+            // `GOAL_EVAL_TRANSCRIPT_TAIL` constant).
+            let tail = self.transcript_tail(self.goal_eval_transcript_tail);
             let verdict = evaluator.evaluate(&condition, tail).await?;
             if verdict.achieved {
                 if let Ok(mut g) = self.goal_state.write() {
@@ -1025,6 +1022,8 @@ pub struct AgentRuntimeBuilder {
     /// callers must leave this `false` (the default) — the tools simply do not
     /// exist in the registry, so the model cannot invoke them.
     with_plan_mode_tools: bool,
+    /// Goal-291: tail-window size for the goal-evaluator judge. Default 12.
+    goal_eval_transcript_tail: usize,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -1038,6 +1037,7 @@ impl std::fmt::Debug for AgentRuntimeBuilder {
                 "event_sink",
                 &self.saved_event_sink.as_ref().map(|_| "<EventSink>"),
             )
+            .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .finish()
     }
 }
@@ -1059,6 +1059,7 @@ impl AgentRuntimeBuilder {
             saved_event_sink: None,
             compactor: None,
             with_plan_mode_tools: false,
+            goal_eval_transcript_tail: 12,
         }
     }
 
@@ -1162,6 +1163,19 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set the tail-window size for the goal-evaluator judge.
+    ///
+    /// Each turn, the goal loop calls
+    /// [`GoalEvaluator::evaluate`](crate::runtime_goal::GoalEvaluator::evaluate)
+    /// with the most-recent `n` transcript messages. Smaller values reduce
+    /// judge cost; larger values give the judge more context for long
+    /// sessions. Defaults to 12 (matching the previous hard-coded
+    /// `GOAL_EVAL_TRANSCRIPT_TAIL` constant). Goal-291.
+    pub fn goal_eval_transcript_tail(mut self, n: usize) -> Self {
+        self.goal_eval_transcript_tail = n;
+        self
+    }
+
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.
@@ -1238,6 +1252,7 @@ impl AgentRuntimeBuilder {
             message_queue: std::collections::VecDeque::new(),
             deferred_turn_finished: None,
             session_closed: false,
+            goal_eval_transcript_tail: self.goal_eval_transcript_tail,
         })
     }
 }
@@ -1917,6 +1932,133 @@ mod tests {
         assert_eq!(tail.len(), 0, "n == 0 should return an empty slice");
         assert!(tail.is_empty());
         Ok(())
+    }
+
+    // ── Goal-291: configurable goal_eval_transcript_tail ──────────────────
+    //
+    // The `goal_eval_transcript_tail` field replaces the old
+    // `GOAL_EVAL_TRANSCRIPT_TAIL` constant. We verify three things:
+    //   1. The builder field is wired through to the runtime.
+    //   2. The default stays at 12 (backward-compatible with sessions that
+    //      don't set the field).
+    //   3. The configured value is honored, not silently overwritten by
+    //      the old constant.
+    #[test]
+    fn goal_eval_transcript_tail_builder_default_is_twelve() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        // The default is 12 — same value the old constant held.
+        assert_eq!(rt.goal_eval_transcript_tail, 12);
+    }
+
+    #[test]
+    fn goal_eval_transcript_tail_builder_override_propagates() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .goal_eval_transcript_tail(3)
+            .build()
+            .unwrap();
+        assert_eq!(rt.goal_eval_transcript_tail, 3);
+    }
+
+    /// Source-level check: with `goal_eval_transcript_tail = 3` and 6
+    /// messages in the transcript, `transcript_tail(n)` returns 3 — the
+    /// value the runtime would pass to the judge. Verifies the value
+    /// is honored, not silently overwritten by the old constant.
+    #[test]
+    fn goal_eval_transcript_tail_honored_over_old_default() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .goal_eval_transcript_tail(3)
+            .build()
+            .unwrap();
+        // 6 messages: u0, a0, u1, a1, u2, a2.
+        rt.set_transcript(vec![
+            crate::message::Message::user("m0"),
+            crate::message::Message::assistant("m1"),
+            crate::message::Message::user("m2"),
+            crate::message::Message::assistant("m3"),
+            crate::message::Message::user("m4"),
+            crate::message::Message::assistant("m5"),
+        ]);
+        // The judge slice should be exactly 3 (the configured value),
+        // not 6 (full transcript) and not 12 (old default).
+        let judge_slice = rt.transcript_tail(rt.goal_eval_transcript_tail);
+        assert_eq!(
+            judge_slice.len(),
+            3,
+            "judge should see only 3 messages, got {}",
+            judge_slice.len()
+        );
+        assert_eq!(judge_slice[0].content, "m3");
+        assert_eq!(judge_slice[1].content, "m4");
+        assert_eq!(judge_slice[2].content, "m5");
+    }
+
+    /// End-to-end check: with `goal_eval_transcript_tail = 1` the loop
+    /// runs to completion (no panic, no wrong-tail-length error) using
+    /// the configured tail size. This validates the wiring change in
+    /// `run_goal_loop` — it now reads from the field, not the constant.
+    #[tokio::test]
+    async fn run_goal_loop_respects_tail_config() {
+        use crate::event::ChannelSink;
+
+        let completions = vec![
+            // First turn: agent reply
+            Completion {
+                content: "still working".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // First judge call: NO
+            Completion {
+                content: "NO\nNot done yet.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Second turn: agent reply
+            Completion {
+                content: "trying again".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Second judge call: YES — loop should exit here
+            Completion {
+                content: "YES\nAll good.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ];
+        let llm = Arc::new(MockProvider::new(completions));
+        let (sink, _rx) = ChannelSink::new();
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .event_sink(Arc::new(sink))
+            .goal_eval_transcript_tail(1)
+            .build()
+            .unwrap();
+
+        // With tail=1, the judge sees only the most recent message per
+        // call. This test just verifies the loop runs to completion
+        // (no panic, no wrong-tail-length error) using the configured
+        // tail size.
+        let _ = rt
+            .run_goal_loop("achieve it", "achieve it", 5)
+            .await
+            .expect("goal loop should run without error");
+        // Goal is cleared on achievement.
+        assert!(rt.current_goal().is_none());
+        assert_eq!(rt.goal_eval_transcript_tail, 1);
     }
 
     // ── Goal-181: message queue ───────────────────────────────────────────

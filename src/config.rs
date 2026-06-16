@@ -78,6 +78,12 @@ pub struct Config {
     /// `0` means unlimited. Defaults to 8.
     /// Set via `RECURSIVE_MAX_CONCURRENT_RUNS` env var.
     pub max_concurrent_runs: usize,
+    /// Number of most-recent transcript messages passed to the goal
+    /// evaluator judge on each turn. Smaller values reduce judge cost;
+    /// larger values give the judge more context for long sessions.
+    /// Default 12. Set via `RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL` env var.
+    /// Goal-291.
+    pub goal_eval_transcript_tail: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -113,6 +119,7 @@ impl std::fmt::Debug for Config {
             .field("stuck_window", &self.stuck_window)
             .field("stuck_error_rate", &self.stuck_error_rate)
             .field("max_concurrent_runs", &self.max_concurrent_runs)
+            .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .finish()
     }
 }
@@ -329,6 +336,14 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(8usize);
 
+        // Goal-291: tail window for the goal-evaluator judge. Default 12,
+        // matching the previous hard-coded `GOAL_EVAL_TRANSCRIPT_TAIL`
+        // constant in src/runtime.rs.
+        let goal_eval_transcript_tail = std::env::var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12usize);
+
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
         // This helps LLM prefix caching.
@@ -413,6 +428,7 @@ impl Config {
             stuck_window,
             stuck_error_rate,
             max_concurrent_runs,
+            goal_eval_transcript_tail,
         })
     }
 
@@ -670,6 +686,7 @@ mod tests {
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
@@ -1161,6 +1178,7 @@ preset = "ollama"
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret"));
@@ -1251,5 +1269,34 @@ api_key = "sk-from-file"
             .unwrap_or(0.8);
         assert!((rate - 0.5).abs() < 1e-9);
         std::env::remove_var("RECURSIVE_STUCK_ERROR_RATE");
+    }
+
+    // ── Goal-291: goal_eval_transcript_tail env var override ────────────
+    //
+    // Consolidated per .dev/AGENTS.md §5: set_var/remove_var are
+    // process-global, so we hold env_lock for the whole test body and
+    // check both the default (env unset) and the override (env set).
+    #[test]
+    fn goal_eval_transcript_tail_default_and_env_override() {
+        let _env_lock = crate::test_util::env_lock();
+        let original = std::env::var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        // Default: env unset → 12 (matches the old hard-coded constant).
+        std::env::remove_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.goal_eval_transcript_tail, 12);
+
+        // Override: env=3 → 3.
+        std::env::set_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL", "3");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.goal_eval_transcript_tail, 3);
+
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL");
+        }
     }
 }

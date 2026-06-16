@@ -52,6 +52,7 @@ mod http_tests {
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
         }
     }
 

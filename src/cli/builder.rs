@@ -426,7 +426,8 @@ pub(crate) async fn build_runtime(
         .max_steps(config.max_steps)
         .streaming(stream)
         .stuck_window(config.stuck_window)
-        .stuck_error_rate(config.stuck_error_rate);
+        .stuck_error_rate(config.stuck_error_rate)
+        .goal_eval_transcript_tail(config.goal_eval_transcript_tail);
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
     }
