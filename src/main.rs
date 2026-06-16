@@ -1710,7 +1710,11 @@ async fn run_once(
 
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
         session_writer.as_ref().map(|w| {
-            let session_dir = w.lock().unwrap().session_dir().to_path_buf();
+            let session_dir = w
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .session_dir()
+                .to_path_buf();
             std::sync::Mutex::new(recursive::cost::CostTracker::new(
                 session_dir,
                 &config.model,
@@ -1750,8 +1754,16 @@ async fn run_once(
     if let Some(ref sw) = session_writer {
         match recursive::ShadowRepo::open(&config.workspace) {
             Ok(repo) => {
-                let session_id = sw.lock().unwrap().session_id().to_string();
-                let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
+                let session_id = sw
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .session_id()
+                    .to_string();
+                let session_dir = sw
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .session_dir()
+                    .to_path_buf();
                 let log_path = session_dir.join("checkpoints.jsonl");
                 let touched = runtime.kernel().tools().touched_files();
                 if let Err(e) =
