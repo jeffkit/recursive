@@ -332,7 +332,9 @@ impl AgentRuntime {
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
-                0,
+                self.checkpoints
+                    .turn_index
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
             .await?
         else {
@@ -656,7 +658,9 @@ impl AgentRuntime {
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
-                0,
+                self.checkpoints
+                    .turn_index
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
             .await?;
         Ok(())
@@ -1689,6 +1693,58 @@ mod tests {
         let before = rt.transcript().len();
         rt.compact_now().await.unwrap();
         assert_eq!(rt.transcript().len(), before);
+    }
+
+    // ── Goal-305: turn index propagated to compaction summary header ──
+
+    #[tokio::test]
+    async fn compact_now_uses_turn_index_in_header() {
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first reply".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "second reply".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "compacted summary text".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        // keep_recent_n = 1 → transcript after compaction is [summary, last message].
+        // The summary is always at index 0, so we can inspect its header.
+        let compactor = crate::compact::Compactor::new(usize::MAX).keep_recent_n(1);
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+
+        // 2 turns → turn_index advances to 2.
+        rt.run("turn 1").await.unwrap();
+        rt.run("turn 2").await.unwrap();
+        assert_eq!(rt.turn_index(), 2, "turn_index should be 2 after 2 turns");
+
+        rt.compact_now().await.unwrap();
+
+        // Transcript: [compaction summary, last verbatim message].
+        assert_eq!(rt.transcript().len(), 2);
+        let summary = &rt.transcript()[0].content;
+        assert!(
+            summary.contains("at step 2"),
+            "compaction header should contain 'at step 2', got: {summary}"
+        );
     }
 
     // ── Goal-168: GoalState / GoalEvaluator / run_goal_loop tests ──────────
