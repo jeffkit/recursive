@@ -319,10 +319,10 @@ pub(super) async fn list_sessions(
             title: s.title.clone(),
         });
     }
-    // Sort by session_id for stable, deterministic pagination across requests.
-    // Without this, HashMap iteration order is non-deterministic and pages
-    // would shift between calls.
-    infos.sort_by(|a, b| a.id.cmp(&b.id));
+    // Sort by creation time (ISO 8601 lexicographic = chronological) so clients
+    // receive sessions in a predictable, meaningful order. Use `id` as a secondary
+    // key to break ties between sessions created in the same second.
+    infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     // `total` is the count BEFORE pagination so clients can compute total pages.
     let total = infos.len();
     // Apply offset + limit pagination.
@@ -2032,5 +2032,60 @@ mod tests {
             description.contains("recursive_rate_limits_rejected_total"),
             "metrics description should mention recursive_rate_limits_rejected_total: {description}"
         );
+    }
+
+    // ── Goal-303: sort GET /sessions results by created_at ───────────
+
+    /// Verify that sorting SessionInfo by `created_at` yields
+    /// chronological order (oldest first).
+    #[test]
+    fn list_sessions_sort_is_chronological() {
+        let mut infos = [
+            SessionInfo {
+                id: "c".into(),
+                created_at: "2026-01-03T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+            SessionInfo {
+                id: "a".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+            SessionInfo {
+                id: "b".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+        ];
+        infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        assert_eq!(infos[0].id, "a");
+        assert_eq!(infos[1].id, "b");
+        assert_eq!(infos[2].id, "c");
+    }
+
+    /// Verify that sessions created in the same second are tie-broken
+    /// by `id` so the sort remains fully deterministic.
+    #[test]
+    fn list_sessions_same_second_tiebreak_by_id() {
+        let mut infos = [
+            SessionInfo {
+                id: "z".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+            SessionInfo {
+                id: "a".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+        ];
+        infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        assert_eq!(infos[0].id, "a");
+        assert_eq!(infos[1].id, "z");
     }
 }
