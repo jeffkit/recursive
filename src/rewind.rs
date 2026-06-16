@@ -47,9 +47,13 @@ pub struct RewindPlan {
 /// restore. So `to_turn = 0` undoes everything; `to_turn = 3`
 /// preserves turns 0..=2 and undoes 3 and later.
 ///
-/// Returns an error if the log doesn't contain `to_turn` (e.g. the
-/// session never reached that turn) or if no `pre` checkpoint was
-/// recorded for it.
+/// **Goal 284**: with on-demand checkpoints, the target checkpoint is
+/// the `id` field of the most recent log entry with `turn < to_turn`,
+/// or the `pre` field of the entry for `to_turn` (old auto-snapshot
+/// sessions). If neither is available, returns an error.
+///
+/// Returns an error if the log doesn't reach `to_turn` or if no
+/// suitable checkpoint was recorded.
 pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
     let recs = read_log(log_path)?;
     if recs.is_empty() {
@@ -59,21 +63,48 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
         });
     }
 
-    let target_rec = recs
-        .iter()
-        .find(|r| r.turn == to_turn)
-        .ok_or_else(|| Error::Tool {
-            name: "rewind".into(),
-            message: format!("turn {to_turn} is not in this session's checkpoint log"),
-        })?;
-
-    let target = target_rec.pre.clone().ok_or_else(|| Error::Tool {
-        name: "rewind".into(),
-        message: format!(
-            "turn {to_turn} has no pre-snapshot recorded; \
-             cannot rewind to its start"
-        ),
-    })?;
+    // Find the target checkpoint: prefer the `id` of the most recent
+    // entry before `to_turn`, falling back to the `pre` field of the
+    // entry for `to_turn` (old auto-snapshot sessions).
+    let target: CheckpointId = if to_turn == 0 {
+        // Rewind to start: use first record's pre (old auto-snapshot
+        // sessions), falling back to its id (new on-demand sessions).
+        // The id of the first record is the closest thing to "before
+        // turn 0" we have in the on-demand model.
+        recs.first()
+            .and_then(|r| r.pre.clone().or_else(|| Some(r.id.clone())))
+            .ok_or_else(|| Error::Tool {
+                name: "rewind".into(),
+                message: "no checkpoint recorded before turn 0".into(),
+            })?
+    } else {
+        // Find the most recent entry with turn < to_turn.
+        let prev = recs.iter().rev().find(|r| r.turn < to_turn);
+        match prev {
+            Some(r) => r.id.clone(),
+            None => {
+                // Fall back to the pre field of the entry at to_turn
+                // (for old auto-snapshot sessions where pre marks the
+                // state before this turn's changes).
+                let target_rec =
+                    recs.iter()
+                        .find(|r| r.turn == to_turn)
+                        .ok_or_else(|| Error::Tool {
+                            name: "rewind".into(),
+                            message: format!(
+                                "turn {to_turn} is not in this session's checkpoint log"
+                            ),
+                        })?;
+                target_rec.pre.clone().ok_or_else(|| Error::Tool {
+                    name: "rewind".into(),
+                    message: format!(
+                        "turn {to_turn} has no pre-snapshot recorded; \
+                         cannot rewind to its start"
+                    ),
+                })?
+            }
+        }
+    };
 
     let mut touched: HashSet<String> = HashSet::new();
     let mut turns_to_drop = Vec::new();
@@ -88,7 +119,7 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
     let mut touched_paths: Vec<String> = touched.into_iter().collect();
     touched_paths.sort();
 
-    let last_known_post = recs.last().map(|r| r.post.clone());
+    let last_known_post = recs.last().map(|r| r.id.clone());
 
     Ok(RewindPlan {
         target,
@@ -219,15 +250,17 @@ mod tests {
         }
     }
 
-    fn rec(turn: usize, pre: Option<&str>, post: &str, touched: &[&str]) -> CheckpointRecord {
+    fn rec(turn: usize, pre: Option<&str>, id: &str, touched: &[&str]) -> CheckpointRecord {
         CheckpointRecord {
             turn,
             pre: pre.map(|s| CheckpointId(s.to_string())),
-            post: CheckpointId(post.to_string()),
+            id: CheckpointId(id.to_string()),
+            message: None,
             touched_files: touched.iter().map(|s| s.to_string()).collect(),
             touched_via: TouchedVia::Structured,
             started_at: 0,
             finished_at: 0,
+            saved_at: 0,
         }
     }
 
@@ -268,12 +301,35 @@ mod tests {
         assert_eq!(plan.turns_to_drop, vec![0, 1]);
     }
 
+    /// Goal 284: on-demand checkpoints have no `pre` field. Verify
+    /// `plan_rewind(to_turn=0)` uses the `id` of the first record
+    /// as the target when `pre` is absent.
     #[test]
-    fn plan_rewind_errors_on_unknown_turn() {
+    fn plan_rewind_to_zero_uses_first_id_when_no_pre() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("c.jsonl");
-        write_log(&log, &[rec(0, Some("p0"), "q0", &[])]);
-        assert!(plan_rewind(&log, 5).is_err());
+        write_log(
+            &log,
+            &[
+                rec(0, None, "q0", &["a.txt"]),
+                rec(1, None, "q1", &["b.txt"]),
+            ],
+        );
+        let plan = plan_rewind(&log, 0).unwrap();
+        assert_eq!(plan.target.0, "q0");
+        assert_eq!(plan.turns_to_drop, vec![0, 1]);
+    }
+
+    #[test]
+    fn plan_rewind_uses_closest_previous_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("c.jsonl");
+        write_log(&log, &[rec(0, Some("p0"), "q0", &["a.txt"])]);
+        // to_turn=5 is beyond the last recorded turn; use turn 0's id.
+        let plan = plan_rewind(&log, 5).unwrap();
+        assert_eq!(plan.target.0, "q0");
+        assert!(plan.turns_to_drop.is_empty());
+        assert!(plan.touched_paths.is_empty());
     }
 
     #[test]
@@ -320,11 +376,13 @@ mod tests {
             &[CheckpointRecord {
                 turn: 0,
                 pre: Some(pre.clone()),
-                post: post.clone(),
+                id: post.clone(),
+                message: None,
                 touched_files: vec!["file.txt".into()],
                 touched_via: TouchedVia::Structured,
                 started_at: 0,
                 finished_at: 0,
+                saved_at: 0,
             }],
         );
 
@@ -354,11 +412,13 @@ mod tests {
             &[CheckpointRecord {
                 turn: 0,
                 pre: Some(pre.clone()),
-                post: post.clone(),
+                id: post.clone(),
+                message: None,
                 touched_files: vec!["file.txt".into()],
                 touched_via: TouchedVia::Structured,
                 started_at: 0,
                 finished_at: 0,
+                saved_at: 0,
             }],
         );
 
@@ -389,11 +449,13 @@ mod tests {
             &[CheckpointRecord {
                 turn: 0,
                 pre: Some(pre.clone()),
-                post: post.clone(),
+                id: post.clone(),
+                message: None,
                 touched_files: vec!["file.txt".into()],
                 touched_via: TouchedVia::Structured,
                 started_at: 0,
                 finished_at: 0,
+                saved_at: 0,
             }],
         );
 
@@ -429,11 +491,13 @@ mod tests {
             &[CheckpointRecord {
                 turn: 0,
                 pre: Some(pre_a.clone()),
-                post: post_a.clone(),
+                id: post_a.clone(),
+                message: None,
                 touched_files: vec!["mine.txt".into()],
                 touched_via: TouchedVia::Structured,
                 started_at: 0,
                 finished_at: 0,
+                saved_at: 0,
             }],
         );
 

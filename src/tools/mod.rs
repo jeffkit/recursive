@@ -207,7 +207,10 @@ pub mod web_search;
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
 pub use agent::{AgentTool, SharedMemoryRead, SharedMemoryWrite};
 pub use agent_defs::{AgentDefinition, AgentDefinitions};
-pub use checkpoint::{build_checkpoint_tools, CheckpointDiff, CheckpointList, CheckpointToolCtx};
+pub use checkpoint::{
+    build_checkpoint_save_tool, build_checkpoint_tools, CheckpointDiff, CheckpointList,
+    CheckpointSave, CheckpointSaveCtx, CheckpointToolCtx,
+};
 pub use count_lines::CountLines;
 pub use edit::EditTool;
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};

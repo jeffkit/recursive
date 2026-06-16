@@ -313,8 +313,11 @@ async fn agui_client_4xx_when_no_messages_and_no_context() {
     }
 }
 
+/// Goal 284: with on-demand checkpoints, no `checkpoint_post` event
+/// is emitted automatically. Verify that the stream completes without
+/// it (no panic, RunFinished arrives cleanly).
 #[tokio::test]
-async fn agui_endpoint_emits_checkpoint_post_before_run_finished() {
+async fn agui_endpoint_no_checkpoint_post_without_agent_save() {
     if !has_git() {
         eprintln!("git not available; skipping");
         return;
@@ -341,37 +344,28 @@ async fn agui_endpoint_emits_checkpoint_post_before_run_finished() {
     }
 
     let names: Vec<&str> = events.iter().map(event_name).collect();
-    let cp_idx = events
-        .iter()
-        .position(|e| match e {
-            Event::Custom(c) => c.name == "agui-tui/checkpoint_post",
-            _ => false,
-        })
-        .unwrap_or_else(|| panic!("missing checkpoint_post Custom event in {names:?}"));
-    let finished_idx = names
-        .iter()
-        .position(|n| *n == "RunFinished")
-        .unwrap_or_else(|| panic!("missing RunFinished in {names:?}"));
-
+    // Goal 284: no checkpoint_post without agent calling checkpoint_save.
+    let has_cp_post = events.iter().any(|e| match e {
+        Event::Custom(c) => c.name == "agui-tui/checkpoint_post",
+        _ => false,
+    });
     assert!(
-        cp_idx < finished_idx,
-        "checkpoint_post must precede RunFinished, got {names:?}"
+        !has_cp_post,
+        "checkpoint_post should NOT be emitted automatically (Goal 284); got {names:?}"
     );
 
-    if let Event::Custom(c) = &events[cp_idx] {
-        let turn = c.value.get("turn").and_then(|v| v.as_u64());
-        let post_id = c.value.get("postId").and_then(|v| v.as_str());
-        assert_eq!(turn, Some(0), "first turn should be turn 0: {:?}", c.value);
-        let post = post_id.expect("postId is a string");
-        assert!(
-            post.len() >= 8,
-            "postId should look like a short SHA, got `{post}`"
-        );
-    }
+    // RunFinished should still arrive.
+    assert!(
+        names.contains(&"RunFinished"),
+        "RunFinished must still be emitted; got {names:?}"
+    );
 }
 
+/// Goal 284: with on-demand checkpoints, no `checkpoint_post` events
+/// are emitted automatically. Verify that multiple runs still complete
+/// cleanly with RunStarted / RunFinished.
 #[tokio::test]
-async fn agui_endpoint_increments_turn_across_runs_in_same_thread() {
+async fn agui_endpoint_multiple_runs_no_checkpoint_post() {
     if !has_git() {
         return;
     }
@@ -407,66 +401,33 @@ async fn agui_endpoint_increments_turn_across_runs_in_same_thread() {
         out
     }
 
-    fn checkpoint_turn(events: &[Event]) -> Option<u64> {
-        events.iter().find_map(|e| match e {
-            Event::Custom(c) if c.name == "agui-tui/checkpoint_post" => {
-                c.value.get("turn").and_then(|v| v.as_u64())
-            }
-            _ => None,
-        })
-    }
-
-    // Note: each /agui POST today builds a fresh AgentRuntime, so the
-    // in-memory turn counter resets to 0. The shadow-git ref chain
-    // still grows across runs (g141 stores it persistently), so the
-    // checkpoint_post.postId values for the two runs differ even
-    // though both report turn = 0. This test asserts that part:
-    // distinct post ids per run, no panic, no missing events.
     let run1 = run_and_collect(
         &client,
         input_with("multi", "multi-0", vec![user_msg("u1", "first")]),
     )
     .await;
-    let turn1 = checkpoint_turn(&run1).expect("run 1 missing checkpoint_post");
-
     let run2 = run_and_collect(
         &client,
         input_with("multi", "multi-1", vec![user_msg("u2", "second")]),
     )
     .await;
-    let turn2 = checkpoint_turn(&run2).expect("run 2 missing checkpoint_post");
 
-    assert_eq!(turn1, 0);
-    assert_eq!(turn2, 0);
-
-    let post1 = run1
-        .iter()
-        .find_map(|e| match e {
-            Event::Custom(c) if c.name == "agui-tui/checkpoint_post" => c
-                .value
-                .get("postId")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            _ => None,
-        })
-        .expect("run 1 postId");
-    let post2 = run2
-        .iter()
-        .find_map(|e| match e {
-            Event::Custom(c) if c.name == "agui-tui/checkpoint_post" => c
-                .value
-                .get("postId")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            _ => None,
-        })
-        .expect("run 2 postId");
-
-    assert_ne!(
-        post1, post2,
-        "two consecutive runs with content changes should produce distinct \
-         checkpoint ids (post1={post1}, post2={post2})"
-    );
+    // Both runs should complete with RunFinished and no errors.
+    for (i, events) in [&run1, &run2].iter().enumerate() {
+        let names: Vec<&str> = events.iter().map(event_name).collect();
+        assert!(
+            names.contains(&"RunFinished"),
+            "run {i} missing RunFinished in {names:?}"
+        );
+        let has_cp = events.iter().any(|e| match e {
+            Event::Custom(c) => c.name == "agui-tui/checkpoint_post",
+            _ => false,
+        });
+        assert!(
+            !has_cp,
+            "run {i} should NOT have checkpoint_post (Goal 284)"
+        );
+    }
 }
 
 fn event_name(ev: &Event) -> &'static str {

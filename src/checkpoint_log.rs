@@ -19,27 +19,55 @@ use std::path::{Path, PathBuf};
 use crate::checkpoint::CheckpointId;
 use crate::error::{Error, Result};
 
-/// One record per turn.
+/// One record per checkpoint.
+///
+/// **Goal 284**: With on-demand checkpoints (no automatic pre/post
+/// per turn), the schema is:
+/// - `turn` — which turn the agent was in when it saved.
+/// - `id` — the checkpoint id (was `post`).
+/// - `message` — agent-supplied label (optional).
+/// - `touched_files` — files touched up to this point.
+/// - `touched_via` — attribution method.
+/// - `saved_at` — Unix timestamp of the save.
+///
+/// **Backwards compatibility**: old `pre`/`post`/`started_at`/
+/// `finished_at` fields are accepted on deserialization but ignored
+/// in favour of the new fields. New records always use the new names.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointRecord {
     /// 0-indexed turn within the session.
     pub turn: usize,
-    /// Checkpoint id captured at the start of the turn (before LLM
-    /// + tools). May be absent for the very first turn of legacy
-    ///   sessions.
+    /// Deprecated (auto-snapshot era). Present on old records;
+    /// ignored when `id` is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre: Option<CheckpointId>,
-    /// Checkpoint id captured at the end of the turn.
-    pub post: CheckpointId,
+    /// Checkpoint id (was `post` in auto-snapshot era).
+    #[serde(alias = "post")]
+    pub id: CheckpointId,
+    /// Agent-supplied label for this checkpoint. Defaults to empty
+    /// for auto-snapshot records that lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     /// Workspace-relative paths the agent touched this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touched_files: Vec<String>,
     /// "structured" if all touched files came from typed tool args;
     /// "shell-diff" if at least one file was attributed via fallback
     /// pre/post tree diff after a `run_shell` call.
     pub touched_via: TouchedVia,
-    /// Unix seconds.
+    /// Deprecated (auto-snapshot era). Present on old records.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub started_at: i64,
-    /// Unix seconds.
+    /// Deprecated (auto-snapshot era). Present on old records.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub finished_at: i64,
+    /// Unix timestamp of when this checkpoint was saved.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub saved_at: i64,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,15 +161,17 @@ pub fn truncate_to_turn(path: &Path, cutoff: usize) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn rec(turn: usize, post: &str) -> CheckpointRecord {
+    fn rec(turn: usize, id: &str) -> CheckpointRecord {
         CheckpointRecord {
             turn,
             pre: None,
-            post: CheckpointId(post.to_string()),
+            id: CheckpointId(id.to_string()),
+            message: None,
             touched_files: vec!["a.txt".into()],
             touched_via: TouchedVia::Structured,
             started_at: 0,
             finished_at: 0,
+            saved_at: 0,
         }
     }
 
@@ -155,7 +185,7 @@ mod tests {
         let read = read_log(&path).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].turn, 0);
-        assert_eq!(read[1].post.0, "bbb");
+        assert_eq!(read[1].id.0, "bbb");
     }
 
     #[test]

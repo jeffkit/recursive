@@ -133,11 +133,23 @@ async fn rewind_undoes_turn_and_restores_files_and_transcript() {
     // after each run() call.
     let mut prev = 0usize;
     let _o0 = runtime.run("please write a.txt").await.unwrap();
+    // Goal 284: explicitly save a checkpoint after the turn.
+    {
+        let tools = runtime.kernel().tools();
+        let save = tools.get("checkpoint_save").expect("checkpoint_save tool");
+        save.execute(json!({"message": "turn 0"})).await.unwrap();
+    }
     for m in runtime.transcript().iter().skip(prev) {
         sw.append(m, None, None).unwrap();
     }
     prev = runtime.transcript().len();
     let _o1 = runtime.run("please write b.txt").await.unwrap();
+    // Goal 284: save checkpoint after turn 1.
+    {
+        let tools = runtime.kernel().tools();
+        let save = tools.get("checkpoint_save").expect("checkpoint_save tool");
+        save.execute(json!({"message": "turn 1"})).await.unwrap();
+    }
     for m in runtime.transcript().iter().skip(prev) {
         sw.append(m, None, None).unwrap();
     }
@@ -149,30 +161,31 @@ async fn rewind_undoes_turn_and_restores_files_and_transcript() {
     assert_eq!(std::fs::read_to_string(&a_path).unwrap(), "v-turn-0");
     assert_eq!(std::fs::read_to_string(&b_path).unwrap(), "v-turn-1");
 
-    // Two turn records were written.
+    // Goal 284: checkpoints saved after run() have turns 1 and 2
+    // (turn_index is incremented at end of run()).
     let recs = recursive::read_checkpoint_log(&log_path).unwrap();
     assert_eq!(recs.len(), 2);
-    assert_eq!(recs[0].turn, 0);
-    assert_eq!(recs[1].turn, 1);
+    assert_eq!(recs[0].turn, 1);
+    assert_eq!(recs[1].turn, 2);
     assert!(recs[0].touched_files.iter().any(|p| p == "a.txt"));
     assert!(recs[1].touched_files.iter().any(|p| p == "b.txt"));
 
-    // ── Rewind to turn 1 ───────────────────────────────────────────
-    let plan = plan_rewind(&log_path, 1).unwrap();
+    // ── Rewind to turn 2 (undo turn 2's changes) ────────────────────
+    let plan = plan_rewind(&log_path, 2).unwrap();
     let result = apply_rewind(&shadow, &log_path, &plan, false).expect("apply rewind");
-    assert_eq!(result.dropped_turns, vec![1]);
+    assert_eq!(result.dropped_turns, vec![2]);
 
-    // a.txt unchanged; b.txt deleted (it didn't exist at turn 1's pre).
+    // a.txt unchanged; b.txt deleted (it didn't exist at the turn-1 checkpoint).
     assert_eq!(std::fs::read_to_string(&a_path).unwrap(), "v-turn-0");
     assert!(!b_path.exists(), "b.txt should be gone after rewind");
 
-    // checkpoints.jsonl now only has turn 0.
+    // checkpoints.jsonl now only has turn 1.
     let recs = recursive::read_checkpoint_log(&log_path).unwrap();
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].turn, 0);
+    assert_eq!(recs[0].turn, 1);
 
-    // Truncate transcript.jsonl to turn 1 (drops the user message of
-    // turn 1 and everything that followed).
+    // Truncate transcript.jsonl to turn 1 (drops turn 1's user message
+    // and everything after; keeps turn 0's messages).
     let stats = truncate_transcript_to_turn(&session_dir, 1).unwrap();
     assert!(stats.dropped >= 2); // user "please write b.txt" + assistant final + any tool result
     assert!(stats.kept >= 2);
@@ -243,14 +256,30 @@ async fn rewind_does_not_touch_other_workspace_files() {
         )
         .unwrap();
 
+    // Save an initial checkpoint before any turn (Goal 284: the agent
+    // should checkpoint before starting risky work).
+    {
+        let tools = runtime.kernel().tools();
+        let save = tools.get("checkpoint_save").expect("checkpoint_save tool");
+        save.execute(json!({"message": "initial"})).await.unwrap();
+    }
+
     runtime.run("write agent.txt").await.unwrap();
+    // Goal 284: explicitly save a checkpoint after the turn.
+    {
+        let tools = runtime.kernel().tools();
+        let save = tools.get("checkpoint_save").expect("checkpoint_save tool");
+        save.execute(json!({"message": "after write"}))
+            .await
+            .unwrap();
+    }
 
     // Simulate an external editor modifying untouched.txt after the
     // turn finished.
     std::fs::write(&untouched, "external-edit").unwrap();
 
-    // Rewind to turn 0: agent.txt should be deleted, untouched.txt
-    // should NOT be reverted to "external-state".
+    // Rewind to turn 0 (the initial checkpoint): agent.txt should be
+    // deleted (it didn't exist), untouched.txt should NOT be reverted.
     let plan = plan_rewind(&log_path, 0).unwrap();
     apply_rewind(&shadow, &log_path, &plan, false).unwrap();
     assert!(!dir.path().join("agent.txt").exists());
