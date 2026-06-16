@@ -91,6 +91,10 @@ pub struct SessionState {
     /// the runtime Mutex (which may be held by a running agent turn).
     pub non_system_message_count: Arc<std::sync::atomic::AtomicUsize>,
     pub last_active: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// Cumulative prompt tokens consumed in this session (all turns combined).
+    pub prompt_tokens: Arc<AtomicU64>,
+    /// Cumulative completion tokens generated in this session.
+    pub completion_tokens: Arc<AtomicU64>,
 }
 
 /// Serialized session info for list/detail endpoints.
@@ -169,6 +173,10 @@ pub struct SessionDetailResponse {
     /// Most recent user message in the session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    /// Total prompt tokens consumed across all turns in this session.
+    pub prompt_tokens: u64,
+    /// Total completion tokens generated across all turns in this session.
+    pub completion_tokens: u64,
 }
 
 // ── Goal-168: goal endpoint types ────────────────────────────────────────

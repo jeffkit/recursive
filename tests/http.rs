@@ -2110,6 +2110,8 @@ mod http_tests {
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state
             .sessions

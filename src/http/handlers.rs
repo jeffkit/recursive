@@ -8,7 +8,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
@@ -265,6 +265,8 @@ pub(super) async fn create_session(
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        prompt_tokens: Arc::new(AtomicU64::new(0)),
+        completion_tokens: Arc::new(AtomicU64::new(0)),
     };
 
     state.sessions.write().await.insert(id.clone(), session);
@@ -395,6 +397,10 @@ pub(super) async fn get_session(
         (first, last)
     };
 
+    // Read token usage directly from atomic counters — no lock needed.
+    let prompt_tokens = session.prompt_tokens.load(Ordering::Relaxed);
+    let completion_tokens = session.completion_tokens.load(Ordering::Relaxed);
+
     Ok(Json(SessionDetailResponse {
         id: session.id.clone(),
         created_at: session.created_at.clone(),
@@ -406,6 +412,8 @@ pub(super) async fn get_session(
         goal,
         first_prompt,
         last_prompt,
+        prompt_tokens,
+        completion_tokens,
     }))
 }
 
@@ -541,6 +549,8 @@ pub(super) async fn fork_session(
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
         last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        prompt_tokens: Arc::new(AtomicU64::new(0)),
+        completion_tokens: Arc::new(AtomicU64::new(0)),
     };
 
     state.sessions.write().await.insert(new_id.clone(), session);
@@ -810,8 +820,9 @@ pub(super) async fn send_session_message(
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Get the session's runtime, interrupt token, message counter, and last_active.
-    let (runtime_arc, interrupt_token_arc, msg_count_arc) = {
+    // Get the session's runtime, interrupt token, message counter, last_active,
+    // and token usage counters.
+    let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = {
         let sessions = state.sessions.read().await;
         let session = sessions.get(&id).ok_or((
             StatusCode::NOT_FOUND,
@@ -826,6 +837,8 @@ pub(super) async fn send_session_message(
             session.runtime.clone(),
             session.interrupt_token.clone(),
             session.non_system_message_count.clone(),
+            session.prompt_tokens.clone(),
+            session.completion_tokens.clone(),
         )
     };
 
@@ -938,7 +951,7 @@ pub(super) async fn send_session_message(
     runtime.set_event_sink(Arc::new(NullSink));
     let _ = forward_handle.await;
 
-    let _outcome = run_result.map_err(|e| {
+    let outcome = run_result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -947,6 +960,14 @@ pub(super) async fn send_session_message(
             }),
         )
     })?;
+
+    // Update per-session token counters and global metrics.
+    prompt_tokens_arc.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
+    completion_tokens_arc.fetch_add(
+        outcome.total_usage.completion_tokens as u64,
+        Ordering::Relaxed,
+    );
+    record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
 
     // Extract the last assistant message from the runtime's transcript.
     let last_assistant = runtime
@@ -1750,6 +1771,8 @@ mod tests {
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            prompt_tokens: Arc::new(AtomicU64::new(0)),
+            completion_tokens: Arc::new(AtomicU64::new(0)),
         };
 
         let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
