@@ -483,8 +483,7 @@ pub fn default_system_prompt() -> String {
     [
         "You are Recursive, a minimal but capable coding agent.",
         "",
-        "Tools available: Read, Write, Edit, Bash, Grep, Glob.",
-        "Additional tools: estimate_tokens (estimate token count for text or file).",
+        "All tools registered for this session are provided via the API tool spec — use them freely.",
         "All file paths are workspace-relative; the sandbox will reject anything outside.",
         "",
         "Working principles:",
