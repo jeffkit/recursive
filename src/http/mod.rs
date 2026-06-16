@@ -92,11 +92,26 @@ pub struct SessionState {
     /// are appended. Allows `list_sessions` to read the count without taking
     /// the runtime Mutex (which may be held by a running agent turn).
     pub non_system_message_count: Arc<std::sync::atomic::AtomicUsize>,
-    pub last_active: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// Milliseconds since [`SESSION_EPOCH`] when this session was last active.
+    /// Updated atomically on every message. Used by the session reaper.
+    pub last_active_ms: Arc<AtomicU64>,
     /// Cumulative prompt tokens consumed in this session (all turns combined).
     pub prompt_tokens: Arc<AtomicU64>,
     /// Cumulative completion tokens generated in this session.
     pub completion_tokens: Arc<AtomicU64>,
+}
+
+/// Reference instant for session last_active timestamps.
+/// Stored as a `OnceLock` so it's computed once at startup.
+static SESSION_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn session_epoch() -> std::time::Instant {
+    *SESSION_EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Read the current session timestamp as milliseconds since [`SESSION_EPOCH`].
+pub fn now_session_ms() -> u64 {
+    session_epoch().elapsed().as_millis() as u64
 }
 
 /// Serialized session info for list/detail endpoints.
@@ -951,13 +966,14 @@ pub fn spawn_session_reaper(
         loop {
             tokio::time::sleep(check_interval).await;
             let ttl = std::time::Duration::from_secs(state.session_ttl_secs);
-            let now = std::time::Instant::now();
             let mut to_evict: Vec<String> = Vec::new();
             // Phase 1: collect eviction candidates under a read lock.
             {
                 let sessions = state.sessions.read().await;
                 for (id, session) in sessions.iter() {
-                    if now.saturating_duration_since(*session.last_active.lock().unwrap()) >= ttl {
+                    let last_ms = session.last_active_ms.load(Ordering::Relaxed);
+                    let elapsed = std::time::Duration::from_millis(now_session_ms() - last_ms);
+                    if elapsed >= ttl {
                         to_evict.push(id.clone());
                     }
                 }

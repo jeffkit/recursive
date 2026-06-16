@@ -264,7 +264,7 @@ pub(super) async fn create_session(
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        last_active_ms: Arc::new(AtomicU64::new(super::now_session_ms())),
         prompt_tokens: Arc::new(AtomicU64::new(0)),
         completion_tokens: Arc::new(AtomicU64::new(0)),
     };
@@ -557,7 +557,7 @@ pub(super) async fn fork_session(
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
-        last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        last_active_ms: Arc::new(AtomicU64::new(super::now_session_ms())),
         prompt_tokens: Arc::new(AtomicU64::new(0)),
         completion_tokens: Arc::new(AtomicU64::new(0)),
     };
@@ -840,8 +840,10 @@ pub(super) async fn send_session_message(
                 error: "session not found".into(),
             }),
         ))?;
-        // Update last_active timestamp for this session.
-        *session.last_active.lock().unwrap() = std::time::Instant::now();
+        // Update last_active_ms timestamp for this session.
+        session
+            .last_active_ms
+            .store(super::now_session_ms(), Ordering::Relaxed);
         (
             session.runtime.clone(),
             session.interrupt_token.clone(),
@@ -1779,7 +1781,7 @@ mod tests {
             plan_approval_gate: Default::default(),
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            last_active: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
             prompt_tokens: Arc::new(AtomicU64::new(0)),
             completion_tokens: Arc::new(AtomicU64::new(0)),
         };
