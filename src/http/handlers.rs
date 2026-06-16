@@ -62,16 +62,10 @@ pub(super) async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<T
 pub(super) async fn run_agent(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RunRequest>,
-) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<RunResponse>, ApiError> {
     // Validate: goal must not be empty
     if body.goal.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                status: "error".into(),
-                error: "missing or empty 'goal' field".into(),
-            }),
-        ));
+        return Err(ApiError::bad_request("missing or empty 'goal' field"));
     }
 
     // Acquire a semaphore permit to limit concurrent runs.
@@ -81,12 +75,9 @@ pub(super) async fn run_agent(
         .acquire_owned()
         .await
         .map_err(|_| {
-            (
+            ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: "too many concurrent runs, try again later".into(),
-                }),
+                "too many concurrent runs, try again later",
             )
         })?;
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
@@ -116,25 +107,11 @@ pub(super) async fn run_agent(
         .system_prompt(system_prompt)
         .max_steps(max_steps)
         .build()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: format!("failed to build runtime: {e}"),
-                }),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
     let outcome = runtime.run(&body.goal).await.map_err(|e| {
         record_run_failed(&state.metrics);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                status: "error".into(),
-                error: format!("agent run failed: {e}"),
-            }),
-        )
+        ApiError::internal(format!("agent run failed: {e}"))
     })?;
 
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
@@ -205,7 +182,7 @@ fn format_timestamp(t: SystemTime) -> String {
 pub(super) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
     let system_prompt = match body.system_prompt {
@@ -238,15 +215,7 @@ pub(super) async fn create_session(
         .system_prompt(system_prompt)
         .max_steps(max_steps)
         .build()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: format!("failed to build session runtime: {e}"),
-                }),
-            )
-        })?;
+        .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
     // Register the session ID so all turns emit tracing spans with session_id
     // and transcript is auto-saved to the storage backend after each turn.
@@ -830,18 +799,14 @@ pub(super) async fn send_session_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
-) -> Result<Json<SessionMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<SessionMessageResponse>, ApiError> {
     // Get the session's runtime, interrupt token, message counter, last_active,
     // and token usage counters.
     let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = {
         let sessions = state.sessions.read().await;
-        let session = sessions.get(&id).ok_or((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                status: "error".into(),
-                error: "session not found".into(),
-            }),
-        ))?;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
         // Update last_active_ms timestamp for this session.
         session
             .last_active_ms
@@ -874,12 +839,9 @@ pub(super) async fn send_session_message(
         .acquire_owned()
         .await
         .map_err(|_| {
-            (
+            ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: "too many concurrent runs, try again later".into(),
-                }),
+                "too many concurrent runs, try again later",
             )
         })?;
     let mut runtime = runtime_arc.lock().await;
@@ -964,15 +926,7 @@ pub(super) async fn send_session_message(
     runtime.set_event_sink(Arc::new(NullSink));
     let _ = forward_handle.await;
 
-    let outcome = run_result.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                status: "error".into(),
-                error: format!("agent run failed: {e}"),
-            }),
-        )
-    })?;
+    let outcome = run_result.map_err(|e| ApiError::internal(format!("agent run failed: {e}")))?;
 
     // Update per-session token counters and global metrics.
     prompt_tokens_arc.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);

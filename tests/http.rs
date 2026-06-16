@@ -289,20 +289,13 @@ mod http_tests {
 
     #[tokio::test]
     async fn run_with_missing_goal_returns_400() {
+        // Use `sample_state_with_provider` rather than building AppState
+        // inline: the helper also sets `RECURSIVE_HTTP_AUTH_INSECURE_OK=1`
+        // so the default-deny auth middleware (G277) lets the request
+        // through. Without the env var, the middleware returns 503 and
+        // this test never reaches the run_agent handler.
         let provider = Arc::new(MockProvider::new(vec![]));
-        let state = AppState {
-            tools: vec![],
-            config: mock_config(),
-            tool_registry: ToolRegistry::local(),
-            provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            event_channels: Arc::new(RwLock::new(HashMap::new())),
-            metrics: Arc::new(Metrics::default()),
-            slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
-            rate_limiter: RateLimiter::new(10, 1.0),
-        };
+        let state = sample_state_with_provider(provider);
         let app = build_router(state);
 
         let response = app
@@ -327,7 +320,15 @@ mod http_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(resp["status"], "error");
+        // Goal 304: ApiError envelope is `{"error": "..."}` — no `status` field.
+        assert!(
+            resp.get("status").is_none(),
+            "ApiError envelope must NOT include a top-level `status` field, got: {resp}"
+        );
+        assert!(
+            resp.get("error").is_some(),
+            "ApiError envelope must include an `error` field, got: {resp}"
+        );
         assert!(resp["error"].as_str().unwrap().contains("goal"));
     }
 
@@ -1125,6 +1126,134 @@ mod http_tests {
         assert!(
             body.get("error").is_some(),
             "EVENTS 404 body must have \"error\" key, got: {body}"
+        );
+    }
+
+    // ── Goal 304: G295-migrated handlers emit the `{"error": "..."}` envelope ──
+
+    /// Pin the G304 contract: the three handlers that still used the
+    /// legacy `(StatusCode, Json<ErrorResponse>)` tuple in G295
+    /// (`run_agent`, `create_session`, `send_session_message`) must
+    /// emit the standardized `{"error": "<message>"}` envelope on
+    /// every 4xx/5xx response — never the legacy `{"status","error"}`
+    /// shape from `ErrorResponse`. We pin the error sites we can
+    /// reach from the outside (empty goal, missing session) and the
+    /// success path of `POST /sessions` (whose only error site,
+    /// runtime build failure, requires an internal mock to trigger
+    /// and is covered indirectly by the test passing).
+    #[tokio::test]
+    async fn goal_304_run_sessions_sessions_messages_emit_api_error_envelope() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        // ── POST /run: empty goal → 400, `{"error": "..."}`, no `status` field.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({"goal": ""})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "POST /run with empty goal must 400");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("400 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "POST /run ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        assert!(
+            body.get("error").is_some(),
+            "POST /run ApiError envelope must include an `error` field, got: {body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap().contains("goal"),
+            "POST /run error message should mention `goal`, got: {body}"
+        );
+
+        // ── POST /sessions: success path. The single error site in
+        //    `create_session` is `AgentRuntimeBuilder::build()` failure
+        //    (500), which is not reachable from the HTTP input alone,
+        //    so we pin the SUCCESS path here: the response must NOT
+        //    include a `status` field on the 201 success body.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "POST /sessions must 201 on success");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("201 body must be valid JSON");
+        assert!(
+            body.get("error").is_none(),
+            "POST /sessions success body must NOT include an `error` field, got: {body}"
+        );
+        assert!(
+            body.get("id").is_some(),
+            "POST /sessions success body must include `id`, got: {body}"
+        );
+
+        // ── POST /sessions/:id/messages: missing session → 404, `{"error": "..."}`.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/no-such-session-id/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "hi"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "POST /sessions/:id/messages with missing session must 404"
+        );
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "POST /sessions/:id/messages ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        assert!(
+            body.get("error").is_some(),
+            "POST /sessions/:id/messages ApiError envelope must include an `error` field, got: {body}"
+        );
+        let err = body["error"].as_str().unwrap();
+        assert!(
+            err.contains("session") && err.contains("not found"),
+            "404 error message should mention session not found, got: {err}"
         );
     }
 
