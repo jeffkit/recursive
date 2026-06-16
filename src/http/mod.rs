@@ -551,16 +551,16 @@ pub fn build_openapi_spec() -> serde_json::Value {
             "/sessions": {
                 "get": {
                     "summary": "List sessions",
-                    "description": "Returns all active sessions.",
+                    "description": "Returns all active sessions wrapped in an envelope \
+                        with the un-paginated `total` count plus the `sessions` page slice. \
+                        Clients use `total` to render \"page X of Y\" / scrollbars without \
+                        having to fetch every page just to count sessions.",
                     "responses": {
                         "200": {
-                            "description": "Array of session info objects",
+                            "description": "Envelope with total session count and the paginated slice",
                             "content": {
                                 "application/json": {
-                                    "schema": {
-                                        "type": "array",
-                                        "items": { "$ref": "#/components/schemas/SessionInfo" }
-                                    }
+                                    "schema": { "$ref": "#/components/schemas/SessionList" }
                                 }
                             }
                         }
@@ -819,6 +819,22 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "message_count": { "type": "integer" }
                     },
                     "required": ["id", "created_at", "message_count"]
+                },
+                "SessionList": {
+                    "type": "object",
+                    "description": "Response envelope for GET /sessions. `total` is the count of all sessions before pagination, so clients can compute total pages without fetching every page.",
+                    "properties": {
+                        "total": {
+                            "type": "integer",
+                            "description": "Number of sessions known to the server (before applying limit/offset)."
+                        },
+                        "sessions": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/SessionInfo" },
+                            "description": "The paginated slice of session info objects."
+                        }
+                    },
+                    "required": ["total", "sessions"]
                 },
                 "SessionDetailResponse": {
                     "type": "object",

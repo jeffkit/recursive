@@ -45,6 +45,25 @@ class SessionInfo:
 
 
 @dataclass
+class SessionList:
+    """Response envelope for ``GET /sessions`` (Goal-293).
+
+    Wraps the paginated list of :class:`SessionInfo` with a ``total`` count
+    representing the **un-paginated** number of sessions known to the
+    server, so clients can render "page X of Y" / scrollbars without
+    fetching every page just to count sessions.
+
+    ``limit`` and ``offset`` echo the pagination params back to the caller
+    when available; they may be ``None`` if the caller didn't set them.
+    """
+
+    total: int
+    sessions: List[SessionInfo]
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+
+
+@dataclass
 class SessionDetail:
     """Full session detail with messages."""
 

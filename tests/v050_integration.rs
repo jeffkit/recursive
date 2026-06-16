@@ -123,8 +123,14 @@ mod v050_integration {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(sessions.len(), 1);
+        // Goal-293: GET /sessions now returns a `{ total, sessions }` envelope.
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["total"], 1);
+        assert_eq!(
+            resp["sessions"].as_array().map(|a| a.len()),
+            Some(1),
+            "expected 1 session in envelope"
+        );
 
         // Send message
         let resp = app

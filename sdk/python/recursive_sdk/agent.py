@@ -399,6 +399,15 @@ class Agent:
             from urllib.parse import urlencode
             url = f"/sessions?{urlencode(params)}"
         resp = http.get(url)
+        payload = resp.json()
+        # Goal-293: the server now returns a `{ total, sessions }` envelope
+        # so paginated UIs can render total counts without fetching every
+        # page. Accept both the envelope and a bare list (older servers) so
+        # the SDK is backward-compatible.
+        if isinstance(payload, list):
+            sessions_data = payload
+        else:
+            sessions_data = payload.get("sessions", [])
         return [
             SessionInfo(
                 id=s["id"],
@@ -408,7 +417,7 @@ class Agent:
                 first_prompt=s.get("first_prompt"),
                 goal=s.get("goal"),
             )
-            for s in resp.json()
+            for s in sessions_data
         ]
 
     @staticmethod

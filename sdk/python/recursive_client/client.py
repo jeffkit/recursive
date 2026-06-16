@@ -1,6 +1,6 @@
 """Synchronous Python client for the Recursive Agent HTTP API."""
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -11,6 +11,7 @@ from .models import (
     RunResponse,
     SessionDetail,
     SessionInfo,
+    SessionList,
     SlashCommandInfo,
     ToolInfo,
 )
@@ -61,10 +62,62 @@ class RecursiveClient:
         return resp.json()["id"]
 
     def list_sessions(self) -> List[SessionInfo]:
-        """List active sessions."""
+        """List active sessions.
+
+        Since Goal-293 the server returns a ``{total, sessions}`` envelope
+        instead of a bare JSON array; ``total`` is the un-paginated count of
+        sessions so paginated UIs can render "page X of Y" without
+        fetching every page just to count sessions. This helper flattens
+        ``sessions`` into a list and returns it. Use
+        :meth:`list_sessions_paginated` if you also need ``total``.
+        """
         resp = self.session.get(f"{self.base_url}/sessions")
         resp.raise_for_status()
-        return [SessionInfo(**s) for s in resp.json()]
+        payload = resp.json()
+        # Back-compat: accept a bare list (pre-Goal-293 servers).
+        if isinstance(payload, list):
+            sessions_data = payload
+        else:
+            sessions_data = payload.get("sessions", [])
+        return [SessionInfo(**s) for s in sessions_data]
+
+    def list_sessions_paginated(
+        self, limit: Optional[int] = None, offset: Optional[int] = None,
+    ) -> "SessionList":
+        """List active sessions with the server-reported ``total`` count.
+
+        Args:
+            limit: Optional maximum number of sessions to return. Forwarded
+                to the server as the ``limit`` query param.
+            offset: Optional pagination offset. Forwarded to the server as
+                the ``offset`` query param.
+
+        Returns:
+            :class:`SessionList` with ``total`` (un-paginated count),
+            ``sessions`` (the page slice), and ``limit`` / ``offset`` echoed
+            back for client convenience.
+        """
+        params: Dict[str, int] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = self.session.get(
+            f"{self.base_url}/sessions", params=params or None,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        # Back-compat: accept a bare list (pre-Goal-293 servers).
+        if isinstance(payload, list):
+            return SessionList(total=len(payload), sessions=[
+                SessionInfo(**s) for s in payload
+            ], limit=limit, offset=offset)
+        return SessionList(
+            total=int(payload.get("total", 0)),
+            sessions=[SessionInfo(**s) for s in payload.get("sessions", [])],
+            limit=limit,
+            offset=offset,
+        )
 
     def send_message(self, session_id: str, content: str) -> MessageResponse:
         """Send message to a session."""

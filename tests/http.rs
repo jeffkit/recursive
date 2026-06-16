@@ -610,11 +610,16 @@ mod http_tests {
         assert_eq!(response.status(), 200);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let resp: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        // Goal-293: GET /sessions now returns a `{ total, sessions }` envelope.
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(resp.len(), 1);
-        assert!(resp[0]["id"].is_string());
-        assert_eq!(resp[0]["message_count"], 0);
+        assert_eq!(resp["total"], 1);
+        let sessions = resp["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0]["id"].is_string());
+        assert_eq!(sessions[0]["message_count"], 0);
     }
 
     #[tokio::test]
@@ -2941,8 +2946,12 @@ mod http_tests {
                     .unwrap();
                 assert_eq!(resp.status(), 200);
                 let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-                let sessions: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
-                sessions
+                // Goal-293: response is `{ total, sessions }`. Walk the
+                // `sessions` array to extract ids.
+                let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                resp["sessions"]
+                    .as_array()
+                    .expect("sessions should be an array")
                     .iter()
                     .map(|s| s["id"].as_str().unwrap().to_string())
                     .collect::<Vec<_>>()
@@ -2959,5 +2968,111 @@ mod http_tests {
         let mut sorted = ids_a.clone();
         sorted.sort();
         assert_eq!(ids_a, sorted, "list_sessions ids must be sorted by id");
+    }
+
+    // ── Goal-293: GET /sessions envelope (`total` + paginated slice) ─────
+
+    /// `GET /sessions?limit=2&offset=0` returns `total=3` (the un-paginated
+    /// count) and a `sessions` slice of exactly 2 entries. The remaining
+    /// session shows up on the next page.
+    #[tokio::test]
+    async fn list_sessions_envelope_total_equals_unpaginated_count() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        // Create 3 sessions.
+        for _ in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/sessions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&serde_json::json!({})).unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 201);
+        }
+
+        // First page: limit=2, offset=0 → 2 items, total=3.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/sessions?limit=2&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            page["total"], 3,
+            "total must reflect the un-paginated session count"
+        );
+        let sessions = page["sessions"]
+            .as_array()
+            .expect("sessions must be an array");
+        assert_eq!(
+            sessions.len(),
+            2,
+            "page slice must respect limit (limit=2 → 2 items)"
+        );
+
+        // Second page: limit=2, offset=2 → 1 item, total still 3.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/sessions?limit=2&offset=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["total"], 3, "total stays at 3 across pages");
+        let sessions = page["sessions"]
+            .as_array()
+            .expect("sessions must be an array");
+        assert_eq!(sessions.len(), 1, "offset=2 leaves exactly one item");
+
+        // Concatenating both pages yields all 3 distinct ids in stable order.
+        let mut seen: Vec<String> = Vec::new();
+        for s in page["sessions"].as_array().unwrap() {
+            seen.push(s["id"].as_str().unwrap().to_string());
+        }
+        // Re-fetch page 1 to collect its ids too — keeps the test self-contained.
+        let resp = build_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/sessions?limit=2&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for s in page["sessions"].as_array().unwrap() {
+            seen.push(s["id"].as_str().unwrap().to_string());
+        }
+        let mut unique: Vec<String> = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "both pages together cover all 3 sessions");
     }
 }

@@ -279,13 +279,28 @@ pub(super) async fn create_session(
     ))
 }
 
+/// Response envelope for `GET /sessions`.
+///
+/// Wraps the paginated list of [`SessionInfo`] with a `total` count
+/// representing the **un-paginated** number of sessions known to the
+/// server. Clients use `total` to render "page X of Y" / scrollbars
+/// without having to fetch every page just to count sessions.
+#[derive(serde::Serialize)]
+pub(super) struct SessionList {
+    pub total: usize,
+    pub sessions: Vec<SessionInfo>,
+}
+
 /// GET /sessions — list all sessions, with optional `limit` and `offset` pagination.
 ///
 /// Example: `GET /sessions?limit=10&offset=20`
+///
+/// Returns a [`SessionList`] envelope (`{ "total": N, "sessions": [...] }`)
+/// so paginated UIs can render total counts without fetching every page.
 pub(super) async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ListSessionsQuery>,
-) -> Json<Vec<SessionInfo>> {
+) -> Json<SessionList> {
     let sessions = state.sessions.read().await;
     let mut infos = Vec::with_capacity(sessions.len());
     for s in sessions.values() {
@@ -306,6 +321,8 @@ pub(super) async fn list_sessions(
     // Without this, HashMap iteration order is non-deterministic and pages
     // would shift between calls.
     infos.sort_by(|a, b| a.id.cmp(&b.id));
+    // `total` is the count BEFORE pagination so clients can compute total pages.
+    let total = infos.len();
     // Apply offset + limit pagination.
     let offset = params.offset.unwrap_or(0);
     let page: Vec<SessionInfo> = infos
@@ -313,7 +330,10 @@ pub(super) async fn list_sessions(
         .skip(offset)
         .take(params.limit.unwrap_or(usize::MAX))
         .collect();
-    Json(page)
+    Json(SessionList {
+        total,
+        sessions: page,
+    })
 }
 
 /// GET /sessions/:id — get session detail with messages.
