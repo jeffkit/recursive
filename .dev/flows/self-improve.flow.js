@@ -35,6 +35,7 @@ import {
   writeFailureContext, readAndConsumeFailureContext,
   loadProviders, resolveProvider,
   flowcastDir,
+  gitWorktreeAdd, gitWorktreeRemove,
 } from 'flowcast'
 
 // ── CLI 参数 ─────────────────────────────────────────────────────
@@ -138,6 +139,33 @@ async function main() {
   )
   console.log(`  baseline: ${baseline}`)
 
+  // ── 预编译最新二进制（确保 agent 用到的是最新代码编译出的版本）────
+  await cp.step('preflight.build', () => {
+    console.log('  [preflight.build] cargo build --release ...')
+    execFileSync('cargo', ['build', '--release'], { cwd: repo, stdio: 'inherit' })
+    console.log('  [preflight.build] ✓ done')
+  })
+
+  // ── 创建隔离 worktree（agent 只在 worktree 内改动，main checkout 保持干净）─
+  const worktreeDir = join(repo, '.worktrees', runId)
+  await cp.step('preflight.worktree', () => {
+    gitWorktreeAdd(repo, worktreeDir)
+    console.log(`  [preflight.worktree] created ${worktreeDir}`)
+  })
+  // 续跑时 worktree 可能已被清理：幂等重建
+  if (!existsSync(worktreeDir)) {
+    gitWorktreeAdd(repo, worktreeDir)
+    console.log(`  [preflight.worktree] re-created ${worktreeDir} (resume)`)
+  }
+
+  // 注册退出清理钩子（正常退出 / SIGINT / SIGTERM 均清理 worktree）
+  const cleanupWt = () => {
+    try { gitWorktreeRemove(repo, worktreeDir) } catch { /* already gone */ }
+  }
+  process.once('exit', cleanupWt)
+  process.once('SIGINT',  () => { cleanupWt(); process.exitCode = 130 })
+  process.once('SIGTERM', () => { cleanupWt(); process.exitCode = 143 })
+
   // ── 构建 system prompt（注入契约 + journal + 上次失败上下文）─────
   const sysPromptFile = await cp.step('preflight.system-prompt', () =>
     buildSystemPrompt(),
@@ -146,12 +174,16 @@ async function main() {
   // ── 预检：provider API 健康探测（快速失败，避免 agent 挂死数分钟）─
   await cp.step('preflight.provider-ping', () => pingProvider(buildEnv()))
 
-  // ── 自改安全沙箱：整个尝试在 guard 内执行，verdict 决定提交/回滚 ──
+  // ── 自改安全沙箱：整个尝试在 worktree 内执行，通过后 cherry-pick 回 main ──
+  // withSelfModGuard 保护 repo（main checkout），agent 改动隔离在 worktreeDir；
+  // 若 verdict 非 committed（回滚/跳过），worktree 直接丢弃，main 无需 reset。
   const transcriptOut = join(cp.dir, 'transcript.json')
   const result = await withSelfModGuard(
-    async () => runAttempt({ sysPromptFile, transcriptOut, baseline }),
-    { repo, baseline, requireClean: false }, // 续跑时工作树可能脏，由 baseline 兜底
+    async () => runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir }),
+    { repo, baseline, requireClean: false },
   )
+  cleanupWt()
+  process.removeListener('exit', cleanupWt)
 
   // ── 收尾：metrics + 报告 + 落地指针 / 升级通知 ──────────────────
   const metrics = computeMetrics(baseline, result)
@@ -164,12 +196,18 @@ async function main() {
 /**
  * 单次尝试：跑 recursive → budget resume → 质量门 → review → 产出 verdict。
  * 注意：本函数运行在 withSelfModGuard 内。返回 verdict 对象，guard 据此回滚/保留。
+ *
+ * agent 改动全部发生在 worktreeDir（隔离）；质量门也在 worktreeDir 内跑；
+ * 最终 cherry-pick 回 repo（main checkout）再提交，保持 main 始终干净。
  */
-async function runAttempt({ sysPromptFile, transcriptOut }) {
+async function runAttempt({ sysPromptFile, transcriptOut, worktreeDir }) {
   const env = buildEnv() // provider 配置经 env 注入（RECURSIVE_PROVIDER_TYPE/API_BASE/MODEL/API_KEY）
+  // recursive 二进制固定用 main repo 编译的产物（preflight.build 已确保最新）
+  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
   // recursive 调用的公共选项（pricing / system-prompt / 流式输出）
+  // cwd 指向 worktreeDir，让 agent 在隔离目录内读写文件
   const base = () => ({
-    cwd: repo, workspace: '.', bin: opts.bin, systemPromptFile: sysPromptFile,
+    cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
     pricingFile: pricingFileOf(repo), env, onData: tee,
   })
 
@@ -204,16 +242,17 @@ async function runAttempt({ sysPromptFile, transcriptOut }) {
     }
   }
 
-  // 若 recursive 没产生任何改动，跳过提交
-  if (gitClean(repo)) {
+  // 若 recursive 没产生任何改动（worktree 干净），跳过提交
+  if (gitClean(worktreeDir)) {
     return { verdict: 'skip-commit', detail: 'no changes produced' }
   }
 
   // ③ 质量门：test / clippy / fmt（+ 可选 e2e），各带一次 resume-fix
+  // 所有门在 worktreeDir 内执行，保证测试的是 agent 实际修改的代码。
   try {
-    await runQualityGates({ sysPromptFile, transcriptOut, env })
+    await runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir })
   } catch (err) {
-    // 任意门红灯 → 记录失败上下文，回滚
+    // 任意门红灯 → 记录失败上下文，回滚（worktree 由 main() 清理）
     writeFailureContext(cp.dir, 'recursive', {
       reason: `quality gate '${err.gate}' failed`, tailLog: (err.output ?? '').slice(-2000),
       provider: opts.provider, model: opts.model,
@@ -223,7 +262,7 @@ async function runAttempt({ sysPromptFile, transcriptOut }) {
 
   // ④ 跨 provider self-review（区分「明确 NEEDS_FIX」与「reviewer 不可用」）
   if (!opts['no-review']) {
-    const { decision, text } = await cp.step('review', () => reviewWithRetry())
+    const { decision, text } = await cp.step('review', () => reviewWithRetry(worktreeDir))
     if (decision === 'NEEDS_FIX') {
       writeFailureContext(cp.dir, 'recursive', { reason: 'self-review NEEDS_FIX', tailLog: text.slice(-2000) })
       return { verdict: 'rolled-back', detail: 'self-review NEEDS_FIX' }
@@ -236,10 +275,15 @@ async function runAttempt({ sysPromptFile, transcriptOut }) {
     }
   }
 
-  // ⑤ 全绿 → 提交
+  // ⑤ 全绿 → 将 worktree 改动 cherry-pick 回 main checkout，再统一提交
   if (opts['no-commit']) return { verdict: 'skip-commit', detail: '--no-commit' }
   await cp.step('commit', () => {
-    git(['add', '-A'], repo)
+    // 在 worktree 创建一个临时提交，包含 agent 的所有改动（含新增文件）
+    git(['add', '-A'], worktreeDir)
+    git(['commit', '-m', `wt: ${goalSubject()}`], worktreeDir)
+    const wtSha = git(['rev-parse', 'HEAD'], worktreeDir)
+    // cherry-pick 到 main checkout（--no-commit 保留暂存区，由我们写最终 message）
+    git(['cherry-pick', '--no-commit', wtSha], repo)
     git(['commit', '-m', `self-improve: ${goalSubject()}`], repo)
     return git(['rev-parse', 'HEAD'], repo)
   })
@@ -248,13 +292,14 @@ async function runAttempt({ sysPromptFile, transcriptOut }) {
 
 // ── 质量门 ───────────────────────────────────────────────────────
 
-async function runQualityGates({ sysPromptFile, transcriptOut, env }) {
-  // resume-fix：把失败输出喂回 recursive 修一次（在原 transcript 上续跑）
+async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir }) {
+  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
+  // resume-fix：把失败输出喂回 recursive 修一次（在原 transcript 上续跑，仍在 worktree 内）
   const resumeFix = async (output, gate) => {
     const fixGoal = `The "${gate.name}" check failed. Fix it.\n\n--- check output (tail) ---\n${(output ?? '').slice(-2000)}`
     const fixTranscript = transcriptOut.replace(/\.json$/, `-fix-${gate.name}.json`)
     await recursive(fixGoal, {
-      cwd: repo, workspace: '.', bin: opts.bin, systemPromptFile: sysPromptFile,
+      cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
       transcriptOut: fixTranscript, pricingFile: pricingFileOf(repo), env, onData: tee,
       replayFrom: { transcript: transcriptOut, resumeFrom: transcriptMessagesOf(transcriptOut) },
     })
@@ -264,10 +309,11 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env }) {
   // 内置默认门（语言相关：cargo test/clippy/fmt）+ 项目自定义门。
   // 项目门来自 <repo>/.flowcast/gates.json（committed），与 provider/agent 配置对称——
   // recursive 的 argusai E2E 门即在那里声明，不再靠 flow 里硬编码探测脚本路径。
-  const builtin = qualityGatesFor(repo)
+  // 所有门的 cwd 默认为 worktreeDir，保证测试的是 agent 实际修改的代码。
+  const builtin = qualityGatesFor(worktreeDir)
   const projectGates = await loadGates({ repo })
-  // 项目门未显式写 cwd 时默认在仓根跑；写了则尊重项目声明。
-  const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: repo, ...g }))
+  // 项目门未显式写 cwd 时默认在 worktreeDir 跑；写了则尊重项目声明。
+  const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: worktreeDir, ...g }))
   for (const g of gates) {
     await cp.step(`gate.${g.name}`, () => runGate(g, { resumeFix }))
   }
@@ -291,10 +337,10 @@ function qualityGatesFor(repoPath) {
  *   - NEEDS_FIX    reviewer 明确否决，或正常返回但无 verdict（保守判否）
  *   - UNAVAILABLE  reviewer 多次调用出错（网络/退出码非 0），无法定论 → 不丢弃成果
  */
-async function reviewWithRetry(maxAttempts = 2) {
+async function reviewWithRetry(worktreeDir, maxAttempts = 2) {
   let lastText = ''
   for (let i = 1; i <= maxAttempts; i++) {
-    const { text, ok } = await selfReview()
+    const { text, ok } = await selfReview(worktreeDir)
     lastText = text
     if (/VERDICT:\s*PASS/.test(text)) return { decision: 'PASS', text }
     if (/VERDICT:\s*NEEDS_FIX/.test(text)) return { decision: 'NEEDS_FIX', text }
@@ -304,8 +350,9 @@ async function reviewWithRetry(maxAttempts = 2) {
   return { decision: 'UNAVAILABLE', text: lastText }
 }
 
-async function selfReview() {
-  const diff = gitDiff(repo).slice(0, 20_000)
+async function selfReview(worktreeDir) {
+  // diff 取自 worktree（agent 的实际改动），reviewer 在 worktree 内读文件做上下文
+  const diff = gitDiff(worktreeDir).slice(0, 20_000)
   const prompt =
     `You are an independent reviewer (different provider). Review the following diff for correctness, ` +
     `regressions and contract violations. Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".\n\n${diff}`
@@ -313,18 +360,19 @@ async function selfReview() {
   // --reviewer-agent claude：用 claude CLI 做 review（自管鉴权，不需要外部 provider）
   if (opts['reviewer-agent'] === 'claude') {
     try {
-      const text = await claude(prompt, { cwd: repo, timeout: 120_000 })
+      const text = await claude(prompt, { cwd: worktreeDir, timeout: 120_000 })
       return { text: String(text), ok: true }
     } catch (err) {
       return { text: String(err), ok: false }
     }
   }
 
-  // 默认：recursive executor + reviewer-provider
+  // 默认：recursive executor + reviewer-provider（在 worktree 内可 Read/Glob/Grep 查上下文）
+  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
   const out = await recursive(
     prompt,
     {
-      cwd: repo, workspace: '.', bin: opts.bin, allowTools: 'Read,Glob,Grep',
+      cwd: worktreeDir, workspace: '.', bin: resolvedBin, allowTools: 'Read,Glob,Grep',
       pricingFile: pricingFileOf(repo), env: buildEnv(opts['reviewer-provider']), onData: tee,
     },
   )
