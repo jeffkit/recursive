@@ -242,13 +242,21 @@ async fn compaction_summary_appears_in_jsonl() {
     let home = HomePin::new();
     let sw = make_session(&home);
 
-    // Three turns: first two fill transcript, compactor fires on turn 3.
-    // MockProvider needs replies for: turn1, turn2, compactor-summarise, turn3.
+    // Three turns. MockProvider needs replies for:
+    // - turn1 (reply1)
+    // - turn2 (reply2)
+    // - cross-turn compaction after turn 2 (Goal 289)
+    // - intra-turn compaction during turn 3 (kernel fires maybe_compact before
+    //   each step's LLM call when transcript ≥ keep_recent_n+2)
+    // - turn3 LLM (reply3)
+    // - cross-turn compaction after turn 3
     let llm = Arc::new(MockProvider::new(vec![
         simple_completion("reply1"),
         simple_completion("reply2"),
         simple_completion("compact summary"),
+        simple_completion("compact summary"),
         simple_completion("reply3"),
+        simple_completion("compact summary"),
     ]));
 
     let sink = Arc::new(CompositeSink::new(vec![

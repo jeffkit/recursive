@@ -45,8 +45,14 @@ async fn compact_boundary_written_to_jsonl() {
     let llm = Arc::new(MockProvider::new(vec![
         simple_completion("reply1"),
         simple_completion("reply2"),
+        // Cross-turn compaction after turn 2 (Goal 289).
         simple_completion("compact summary"),
         simple_completion("reply3"),
+        // Intra-turn compaction during turn 3 (kernel's run_core maybe_compact
+        // fires before each step's LLM call when transcript ≥ keep_recent_n+2).
+        simple_completion("compact summary"),
+        // Cross-turn compaction after turn 3.
+        simple_completion("compact summary"),
     ]));
 
     let sink = Arc::new(CompositeSink::new(vec![
@@ -96,8 +102,14 @@ async fn load_transcript_skips_pre_boundary_messages() {
     let llm = Arc::new(MockProvider::new(vec![
         simple_completion("reply1"),
         simple_completion("reply2"),
+        // Cross-turn compaction after turn 2 (Goal 289).
         simple_completion("compact summary"),
         simple_completion("reply3"),
+        // Intra-turn compaction during turn 3 (kernel's run_core maybe_compact
+        // fires before each step's LLM call when transcript ≥ keep_recent_n+2).
+        simple_completion("compact summary"),
+        // Cross-turn compaction after turn 3.
+        simple_completion("compact summary"),
     ]));
 
     let sink = Arc::new(CompositeSink::new(vec![

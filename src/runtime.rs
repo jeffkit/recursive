@@ -255,10 +255,15 @@ impl AgentRuntime {
             content: &user_text,
         });
         self.append_user_message(&user_text).await;
-        self.maybe_compact_cross_turn().await?;
 
         let turn_outcome = self.execute_kernel_turn().await?;
         self.emit_turn_messages(&turn_outcome).await;
+        // Goal 289: cross-turn compaction runs AFTER the turn so the
+        // threshold check sees the full turn's growth (user + assistant +
+        // tool messages) rather than the pessimistic pre-turn size. One
+        // pass per turn covers the entire growth instead of firing
+        // reactively at the start of every turn.
+        self.maybe_compact_cross_turn().await?;
 
         let outcome: RuntimeOutcome = turn_outcome.into();
 
