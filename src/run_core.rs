@@ -724,6 +724,45 @@ impl<'a> RunCore<'a> {
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
+            // ── Goal-285: sentinel pre-pass — detect before any push_message calls ──────
+            // The old code checked for DENIAL_LIMIT_SENTINEL inside the outer loop.
+            // When sentinel appeared at index N > 0, results[0..N] had already been
+            // pushed by the outer loop's push_message; the nested inner loop then
+            // pushed ALL results again, duplicating results[0..N] in the transcript.
+            //
+            // Fix: scan first, flush once atomically, return immediately.
+            if results.iter().any(|o| o.result == DENIAL_LIMIT_SENTINEL) {
+                for o in &results {
+                    if let Some(a) = &o.audit {
+                        tool_audits.insert((self.turn, o.id.clone()), a.clone());
+                    }
+                    let is_error =
+                        o.result.starts_with("ERROR: ") || o.result == DENIAL_LIMIT_SENTINEL;
+                    self.emit(AgentEvent::ToolResult {
+                        id: o.id.clone(),
+                        name: o.name.clone(),
+                        output: o.result.clone(),
+                        step,
+                        is_error,
+                    });
+                    self.push_message(Message::tool_result(o.id.clone(), o.result.clone()));
+                }
+                let finish = FinishReason::PermissionDenialLimit;
+                self.emit(AgentEvent::TurnFinished {
+                    reason: finish_reason_str(&finish),
+                    steps: step,
+                });
+                return Ok(RunInnerOutcome {
+                    messages: self.messages,
+                    final_message,
+                    finish_reason: finish,
+                    total_usage,
+                    total_llm_latency_ms: self.total_llm_latency_ms,
+                    steps: step,
+                    tool_audits,
+                });
+            }
+
             for ToolCallOutcome {
                 id,
                 name,
@@ -731,42 +770,7 @@ impl<'a> RunCore<'a> {
                 audit,
             } in &results
             {
-                // Auto-classifier denial limit — stop the agent immediately.
-                // Push all pending tool results first (including the sentinel) to
-                // preserve Invariant #8 (every tool-call must have a matching tool-result).
-                if result == DENIAL_LIMIT_SENTINEL {
-                    for ToolCallOutcome {
-                        id: pending_id,
-                        result: pending_result,
-                        audit: pending_audit,
-                        ..
-                    } in &results
-                    {
-                        if let Some(a) = pending_audit {
-                            tool_audits.insert((self.turn, pending_id.clone()), a.clone());
-                        }
-                        self.push_message(Message::tool_result(
-                            pending_id.clone(),
-                            pending_result.clone(),
-                        ));
-                    }
-                    let finish = FinishReason::PermissionDenialLimit;
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: step,
-                    });
-                    return Ok(RunInnerOutcome {
-                        messages: self.messages,
-                        final_message,
-                        finish_reason: finish,
-                        total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                        steps: step,
-                        tool_audits,
-                    });
-                }
-
-                let is_error = result.starts_with("ERROR: ") || result == DENIAL_LIMIT_SENTINEL;
+                let is_error = result.starts_with("ERROR: ");
                 self.emit(AgentEvent::ToolResult {
                     id: id.clone(),
                     name: name.clone(),

@@ -881,7 +881,10 @@ impl ToolRegistry {
             .instrument(span)
             .await
             .map_err(|e| match e {
-                Error::Tool { .. } | Error::BadToolArgs { .. } | Error::UnknownTool(_) => e,
+                Error::Tool { .. }
+                | Error::BadToolArgs { .. }
+                | Error::UnknownTool(_)
+                | Error::PermissionDeniedLimit { .. } => e,
                 other => Error::Tool {
                     name: name.into(),
                     message: other.to_string(),

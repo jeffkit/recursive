@@ -2234,4 +2234,111 @@ mod tests {
             "expected at least one tool result to have audit metadata, got {audit_count}"
         );
     }
+
+    // ── Goal-285: DENIAL_LIMIT_SENTINEL double-push regression ──────────
+
+    /// When a batch of tool calls includes a `DENIAL_LIMIT_SENTINEL` as the
+    /// second result, the transcript must have exactly N tool-result messages
+    /// — not N+duplicates. The pre-Goal-285 code pushed earlier non-sentinel
+    /// results twice (once in the outer loop, once in the sentinel inner loop),
+    /// violating Invariant #8 (unique tool-call ↔ tool-result pairing).
+    #[tokio::test]
+    async fn denial_limit_sentinel_no_duplicate_pushes() {
+        use crate::error::Error;
+
+        struct DenialTool;
+
+        #[async_trait]
+        impl Tool for DenialTool {
+            fn spec(&self) -> crate::llm::ToolSpec {
+                crate::llm::ToolSpec {
+                    name: "denial_tool".into(),
+                    description: "always triggers permission denial limit".into(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+                Err(Error::PermissionDeniedLimit {
+                    name: "denial_tool".into(),
+                })
+            }
+        }
+
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "Let me try two things...".into(),
+            tool_calls: vec![
+                crate::llm::ToolCall {
+                    id: "c1".into(),
+                    name: "add".into(),
+                    arguments: json!({"a": 1, "b": 2}),
+                },
+                crate::llm::ToolCall {
+                    id: "c2".into(),
+                    name: "denial_tool".into(),
+                    arguments: json!({}),
+                },
+            ],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+
+        let tools = ToolRegistry::local()
+            .register(Arc::new(Adder))
+            .register(Arc::new(DenialTool));
+
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .build()
+            .unwrap();
+
+        let out = rt.run("test").await.unwrap();
+
+        // Verify finish reason
+        assert_eq!(out.finish_reason, FinishReason::PermissionDenialLimit);
+
+        // Count tool-result messages in transcript.
+        // Should have exactly 2 (add + denial_tool), NOT 3.
+        let tool_msgs: Vec<_> = rt
+            .transcript()
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .collect();
+
+        assert_eq!(
+            tool_msgs.len(),
+            2,
+            "expected exactly 2 tool-result messages, got {} (double-push bug?)",
+            tool_msgs.len()
+        );
+
+        // The first tool result ("add") must appear exactly once.
+        let add_count = tool_msgs
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .count();
+        assert_eq!(
+            add_count, 1,
+            "add result (c1) should appear exactly once, got {add_count}"
+        );
+
+        // The denial tool result must also appear exactly once.
+        let denial_count = tool_msgs
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some("c2"))
+            .count();
+        assert_eq!(
+            denial_count, 1,
+            "denial result (c2) should appear exactly once, got {denial_count}"
+        );
+
+        // Total transcript messages: user(1) + assistant(1) + 2 tool results = 4
+        assert_eq!(
+            rt.transcript().len(),
+            4,
+            "transcript should have 4 messages (user, assistant, 2× tool), got {}",
+            rt.transcript().len()
+        );
+    }
 }
