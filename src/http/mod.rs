@@ -24,8 +24,10 @@ use rate_limit::{metrics_middleware, rate_limit_middleware};
 
 use axum::{
     extract::DefaultBodyLimit,
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 
 /// Maximum accepted request body size (1 MiB).
@@ -349,6 +351,68 @@ pub struct UsageInfo {
 pub struct ErrorResponse {
     pub status: String,
     pub error: String,
+}
+
+// ── Goal 295: standardized JSON error envelope ───────────────────────────
+
+/// JSON body shape for [`ApiError`] responses.
+///
+/// Every endpoint that returns a 4xx/5xx via [`ApiError`] produces a body
+/// of exactly `{"error": "<message>"}`, so clients can write a single
+/// error handler that always parses the response as JSON.
+#[derive(serde::Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+/// A standardized JSON error response for all API endpoints.
+///
+/// Replaces bare `Err(StatusCode::NOT_FOUND)` returns in handlers so every
+/// error carries a parseable `{"error": "..."}` body. Handlers that already
+/// return `(StatusCode, Json(json!(...)))` are intentionally left alone —
+/// they already produce a JSON body; wrapping them in [`ApiError`] would
+/// only add a layer.
+pub(super) struct ApiError(StatusCode, String);
+
+impl ApiError {
+    /// Build an [`ApiError`] from an arbitrary status + message.
+    pub(super) fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self(status, message.into())
+    }
+
+    /// 404 Not Found with a message.
+    pub(super) fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    /// 409 Conflict with a message.
+    pub(super) fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    /// 500 Internal Server Error with a message.
+    pub(super) fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    /// 400 Bad Request with a message.
+    #[allow(dead_code)] // not used by any current handler; reserved for future use
+    pub(super) fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    /// Borrow the HTTP status code (used by handlers that need to vary
+    /// behaviour on the status without dropping the message).
+    #[allow(dead_code)]
+    pub(super) fn status(&self) -> StatusCode {
+        self.0
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (self.0, Json(ErrorBody { error: self.1 })).into_response()
+    }
 }
 
 /// Query parameters for `GET /sessions`.

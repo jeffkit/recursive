@@ -20,8 +20,8 @@ use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
 
 use super::{
-    build_openapi_spec, AppState, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
-    ListSessionsQuery, RunRequest, RunResponse, SessionDetailResponse, SessionInfo,
+    build_openapi_spec, ApiError, AppState, CreateSessionRequest, CreateSessionResponse,
+    ErrorResponse, ListSessionsQuery, RunRequest, RunResponse, SessionDetailResponse, SessionInfo,
     SessionMessageRequest, SessionMessageResponse, SessionState, SetGoalRequest, SlashCommandInfo,
     SseContentBlock, SseEvent, ToolInfo, UsageInfo,
 };
@@ -347,9 +347,11 @@ pub(super) async fn list_sessions(
 pub(super) async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<SessionDetailResponse>, StatusCode> {
+) -> Result<Json<SessionDetailResponse>, ApiError> {
     let sessions = state.sessions.read().await;
-    let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let session = sessions
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
 
     // Read plan status without locking the runtime Mutex so callers can poll
     // while the agent is suspended inside `exit_plan_mode`.
@@ -421,7 +423,7 @@ pub(super) async fn get_session(
 pub(super) async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     // Look up the runtime under a read lock so we can take the per-session
     // runtime Mutex and call `close()` without holding the global write
     // lock across an await point.
@@ -441,9 +443,9 @@ pub(super) async fn delete_session(
             .metrics
             .sessions_active
             .fetch_sub(1, Ordering::Relaxed);
-        StatusCode::NO_CONTENT
+        Ok(StatusCode::NO_CONTENT)
     } else {
-        StatusCode::NOT_FOUND
+        Err(ApiError::not_found("session not found"))
     }
 }
 
@@ -469,9 +471,11 @@ pub(super) async fn patch_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<PatchSessionRequest>,
-) -> Result<Json<SessionInfo>, StatusCode> {
+) -> Result<Json<SessionInfo>, ApiError> {
     let mut sessions = state.sessions.write().await;
-    let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let session = sessions
+        .get_mut(&id)
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
 
     if let Some(title) = body.title {
         session.title = if title.is_empty() { None } else { Some(title) };
@@ -509,12 +513,17 @@ pub(super) struct ForkSessionResponse {
 pub(super) async fn fork_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<ForkSessionResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<ForkSessionResponse>), ApiError> {
     // Snapshot the source transcript while holding the write lock.
     let transcript_snapshot = {
         let sessions = state.sessions.read().await;
-        let src = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-        let rt = src.runtime.try_lock().map_err(|_| StatusCode::CONFLICT)?;
+        let src = sessions
+            .get(&id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
+        let rt = src
+            .runtime
+            .try_lock()
+            .map_err(|_| ApiError::conflict("session is busy"))?;
         rt.transcript().to_vec()
     };
 
@@ -531,7 +540,7 @@ pub(super) async fn fork_session(
         .system_prompt(system_prompt)
         .max_steps(state.config.max_steps)
         .build()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
     let non_system_count = transcript_snapshot
         .iter()
@@ -990,12 +999,12 @@ pub(super) async fn send_session_message(
 pub(super) async fn session_events(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Verify session exists
     {
         let sessions = state.sessions.read().await;
         if !sessions.contains_key(&id) {
-            return Err(StatusCode::NOT_FOUND);
+            return Err(ApiError::not_found("session not found"));
         }
     }
 

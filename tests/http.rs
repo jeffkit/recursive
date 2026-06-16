@@ -907,6 +907,135 @@ mod http_tests {
         assert_eq!(response.status(), 404);
     }
 
+    // ── Goal 295: standardized JSON error body ───────────────────────────
+
+    /// Every 4xx/5xx error response produced by an `ApiError` site must
+    /// carry a JSON body of exactly `{"error": "<message>"}` so clients
+    /// can always parse the failure as JSON. This pins the contract for
+    /// the most common case (`GET /sessions/:id` with a missing id) plus
+    /// the sibling handlers (DELETE/PATCH/fork/events).
+    #[tokio::test]
+    async fn api_error_sites_return_json_error_body() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        // ── GET /sessions/:id (404 → ApiError::not_found) ────────────────
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/sessions/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "GET missing session must 404");
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("error").is_some(),
+            "404 body must have an \"error\" key, got: {body}"
+        );
+        assert!(
+            body["error"].as_str().is_some(),
+            "404 body \"error\" must be a string, got: {body}"
+        );
+        let error_msg = body["error"].as_str().unwrap();
+        assert!(
+            error_msg.contains("session") && error_msg.contains("not found"),
+            "404 error message should mention session not found, got: {error_msg}"
+        );
+
+        // ── DELETE /sessions/:id (404 → ApiError::not_found) ─────────────
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/sessions/nonexistent-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "DELETE missing session must 404");
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("error").is_some(),
+            "DELETE 404 body must have \"error\" key, got: {body}"
+        );
+
+        // ── PATCH /sessions/:id (404 → ApiError::not_found) ──────────────
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri("/sessions/nonexistent-patch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "PATCH missing session must 404");
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("error").is_some(),
+            "PATCH 404 body must have \"error\" key, got: {body}"
+        );
+
+        // ── POST /sessions/:id/fork (404 → ApiError::not_found) ──────────
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent-fork/fork")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "FORK missing session must 404");
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("error").is_some(),
+            "FORK 404 body must have \"error\" key, got: {body}"
+        );
+
+        // ── GET /sessions/:id/events (404 → ApiError::not_found) ─────────
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/sessions/nonexistent-events/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "EVENTS missing session must 404");
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("error").is_some(),
+            "EVENTS 404 body must have \"error\" key, got: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn sse_event_serialization() {
         // Verify SseEvent serializes to expected JSON structure
