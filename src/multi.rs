@@ -358,10 +358,10 @@ impl AgentPool {
             .build()?;
 
         let ctx = TurnContext {
-            messages: vec![
+            messages: Arc::new(vec![
                 Message::system(system_prompt),
                 Message::user(goal.to_string()),
-            ],
+            ]),
             step_events_tx: None,
             tool_specs: kernel.tools().specs(),
             streaming: false,

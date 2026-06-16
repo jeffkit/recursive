@@ -55,11 +55,12 @@ use std::sync::Arc;
 /// so sharing via `Arc` would not eliminate the allocation. The clone is
 /// bounded by the `max_transcript_chars` trim that runs before each turn.
 pub struct TurnContext {
-    /// Owned copy of the wrapper's transcript for this turn.
+    /// Shared reference to the wrapper's transcript for this turn.
     ///
-    /// The kernel may mutate this list in-place; the wrapper's canonical
-    /// transcript is unaffected.
-    pub messages: Vec<Message>,
+    /// The kernel may mutate this list in-place via `Arc::make_mut`;
+    /// the wrapper's canonical transcript is unaffected until the
+    /// kernel drops its reference.
+    pub messages: Arc<Vec<Message>>,
 
     /// Channel to send agent events to the caller (runtime or test harness).
     ///

@@ -55,7 +55,7 @@ fn finish_reason_str(reason: &FinishReason) -> String {
 
 /// Outcome returned by the stateless [`run_inner`] loop.
 pub(crate) struct RunInnerOutcome {
-    pub(crate) messages: Vec<Message>,
+    pub(crate) messages: Arc<Vec<Message>>,
     pub(crate) final_message: Option<String>,
     pub(crate) finish_reason: FinishReason,
     pub(crate) total_usage: TokenUsage,
@@ -75,7 +75,7 @@ pub(crate) struct RunInnerOutcome {
 /// transcript and plan state.  `run_inner()` consumes `self` so the
 /// loop cannot accidentally leave stale state behind.
 pub(crate) struct RunCore<'a> {
-    pub(crate) messages: Vec<Message>,
+    pub(crate) messages: Arc<Vec<Message>>,
     pub(crate) llm: Arc<dyn LlmProvider>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) max_steps: usize,
@@ -120,7 +120,7 @@ impl<'a> RunCore<'a> {
     }
 
     fn push_message(&mut self, msg: Message) {
-        self.messages.push(msg);
+        Arc::make_mut(&mut self.messages).push(msg);
     }
 
     /// Call the LLM with exponential back-off retry for retryable errors.
@@ -221,7 +221,7 @@ impl<'a> RunCore<'a> {
         let mut trimmed_count: usize = 0;
         let placeholder_len = TRIM_PLACEHOLDER.len();
 
-        for msg in self.messages.iter_mut().skip(1) {
+        for msg in Arc::make_mut(&mut self.messages).iter_mut().skip(1) {
             if msg.role == crate::message::Role::Tool && msg.content.len() > 200 {
                 let old_len = msg.content.len();
                 msg.content = TRIM_PLACEHOLDER.to_string();
@@ -268,7 +268,7 @@ impl<'a> RunCore<'a> {
 
         let kept_before = self.messages.len();
         if let Some((removed, summary_chars)) = compactor
-            .apply_to_transcript(self.llm.as_ref(), &mut self.messages, step)
+            .apply_to_transcript(self.llm.as_ref(), Arc::make_mut(&mut self.messages), step)
             .await?
         {
             let kept = kept_before - removed;
@@ -688,7 +688,7 @@ impl<'a> RunCore<'a> {
             if completion.tool_calls.is_empty() {
                 self.push_message(Message::assistant(completion.content.clone()));
                 if completion.reasoning_content.is_some() {
-                    if let Some(msg) = self.messages.last_mut() {
+                    if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
                         msg.reasoning_content = completion.reasoning_content.clone();
                     }
                 }
@@ -717,7 +717,7 @@ impl<'a> RunCore<'a> {
                 completion.tool_calls.clone(),
             ));
             if completion.reasoning_content.is_some() {
-                if let Some(msg) = self.messages.last_mut() {
+                if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
                     msg.reasoning_content = completion.reasoning_content.clone();
                 }
             }

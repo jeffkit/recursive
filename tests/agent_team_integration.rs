@@ -226,10 +226,10 @@ async fn worker_receives_coordinator_message_via_mailbox() {
         .unwrap();
 
     let ctx = TurnContext {
-        messages: vec![
+        messages: Arc::new(vec![
             Message::system("You are a test worker."),
             Message::user("Do the task."),
-        ],
+        ]),
         step_events_tx: None,
         tool_specs: kernel.tools().specs(),
         streaming: false,

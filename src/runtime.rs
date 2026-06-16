@@ -138,8 +138,9 @@ impl CheckpointState {
 pub struct AgentRuntime {
     /// The stateless kernel that executes each turn.
     kernel: AgentKernel,
-    /// Accumulated conversation transcript.
-    transcript: Vec<Message>,
+    /// Accumulated conversation transcript (shared via Arc for O(1) clone
+    /// when building TurnContext).
+    transcript: Arc<Vec<Message>>,
     /// Event sink for streaming events (Arc for sharing with forwarder task).
     event_sink: Arc<dyn EventSink>,
     /// Whether to request streaming responses from the LLM.
@@ -302,7 +303,7 @@ impl AgentRuntime {
     /// Append a user message to the transcript and emit `MessageAppended`.
     async fn append_user_message(&mut self, user_text: &str) {
         let user_msg = Message::user(user_text.to_string());
-        self.transcript.push(user_msg.clone());
+        Arc::make_mut(&mut self.transcript).push(user_msg.clone());
         self.event_sink
             .emit(AgentEvent::MessageAppended {
                 message: user_msg,
@@ -329,7 +330,11 @@ impl AgentRuntime {
             transcript_len: chars,
         });
         let Some((removed, summary_chars)) = compactor
-            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript, 0)
+            .apply_to_transcript(
+                self.kernel.llm().as_ref(),
+                Arc::make_mut(&mut self.transcript),
+                0,
+            )
             .await?
         else {
             return Ok(());
@@ -378,7 +383,7 @@ impl AgentRuntime {
         });
 
         let ctx = TurnContext {
-            messages: self.transcript.clone(),
+            messages: Arc::clone(&self.transcript),
             tool_specs: self.kernel.tools().specs(),
             step_events_tx: Some(event_tx.clone()),
             streaming: self.streaming,
@@ -415,7 +420,7 @@ impl AgentRuntime {
         let last_assistant_idx = new_messages
             .iter()
             .rposition(|m| matches!(m.role, crate::message::Role::Assistant));
-        self.transcript.extend(new_messages.iter().cloned());
+        Arc::make_mut(&mut self.transcript).extend(new_messages.iter().cloned());
         for (idx, msg) in new_messages.iter().enumerate() {
             let event = if msg.role == crate::message::Role::Tool {
                 if let Some(tcid) = &msg.tool_call_id {
@@ -534,24 +539,25 @@ impl AgentRuntime {
     /// per-turn evaluator payload bounded as the transcript grows.
     /// Goal-260.
     pub fn transcript_tail(&self, n: usize) -> &[Message] {
-        let len = self.transcript.len();
+        let t: &Vec<Message> = &self.transcript;
+        let len = t.len();
         if n >= len {
-            &self.transcript
+            t
         } else {
-            &self.transcript[len - n..]
+            &t[len - n..]
         }
     }
 
     /// Replace the current transcript (useful for restoring from a saved session).
     pub fn set_transcript(&mut self, transcript: Vec<Message>) {
-        self.transcript = transcript;
+        self.transcript = Arc::new(transcript);
     }
 
     /// Discard all transcript messages after index `len`, restoring the
     /// transcript to the state it had before a turn started. Used by the
     /// TUI abort path to prevent orphan tool_call entries.
     pub fn truncate_transcript(&mut self, len: usize) {
-        self.transcript.truncate(len);
+        Arc::make_mut(&mut self.transcript).truncate(len);
     }
 
     /// Return a reference to the inner kernel.
@@ -648,7 +654,11 @@ impl AgentRuntime {
             return Ok(());
         };
         compactor
-            .apply_to_transcript(self.kernel.llm().as_ref(), &mut self.transcript, 0)
+            .apply_to_transcript(
+                self.kernel.llm().as_ref(),
+                Arc::make_mut(&mut self.transcript),
+                0,
+            )
             .await?;
         Ok(())
     }
@@ -675,7 +685,7 @@ impl AgentRuntime {
     /// blocking wait (Plan Mode 2.0 gate) with the rejection reason.
     pub fn reject_plan(&mut self, reason: &str) {
         let rejection_msg = Message::user(format!("Plan rejected: {}", reason));
-        self.transcript.push(rejection_msg);
+        Arc::make_mut(&mut self.transcript).push(rejection_msg);
         self.plan_approval_gate.reject(reason);
     }
 
@@ -1211,7 +1221,7 @@ impl AgentRuntimeBuilder {
 
         Ok(AgentRuntime {
             kernel,
-            transcript,
+            transcript: Arc::new(transcript),
             event_sink,
             streaming: self.streaming,
             compactor: self.compactor,
