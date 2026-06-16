@@ -2352,16 +2352,19 @@ mod tests {
         );
     }
 
-    /// Goal 287: verify that `AgentEvent::LlmRetry` is emitted when the LLM
-    /// returns a retryable error (rate limit) before eventually succeeding.
+    /// Goal 287 / Goal 288: verify that LLM errors propagate correctly.
+    /// After Goal 288 removed the outer retry loop, the provider's internal
+    /// `RetryPolicy` handles retries. MockProvider does not retry internally,
+    /// so a `RateLimited` error surfaces immediately as a run error.
     #[tokio::test]
     async fn llm_retry_emits_event() {
-        use crate::event::{AgentEvent, ChannelSink};
+        use crate::event::ChannelSink;
 
-        let (sink, mut event_rx) = ChannelSink::new();
+        let (sink, _event_rx) = ChannelSink::new();
         let sink = Arc::new(sink);
 
-        // First call → rate limited, second call → success
+        // MockProvider returns a RateLimited error — without an outer retry
+        // loop, this propagates to the caller.
         let provider = Arc::new(
             MockProvider::new(vec![Completion {
                 content: "Hello!".into(),
@@ -2372,7 +2375,7 @@ mod tests {
             }])
             .with_errors(vec![crate::error::Error::RateLimited {
                 provider: "mock".into(),
-                retry_after_ms: 1, // 1ms sleep to keep the test fast
+                retry_after_ms: 1,
             }]),
         );
 
@@ -2382,39 +2385,18 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rt.run("hi").await.unwrap();
-        assert_eq!(out.final_text.as_deref(), Some("Hello!"));
-        assert_eq!(out.steps, 1);
-
-        // Collect all events; drop the sink so the channel closes.
-        drop(rt);
-        let mut events: Vec<AgentEvent> = Vec::new();
-        while let Ok(ev) = event_rx.try_recv() {
-            events.push(ev);
-        }
-
-        // Must contain at least one LlmRetry event.
-        let retries: Vec<&AgentEvent> = events
-            .iter()
-            .filter(|ev| matches!(ev, AgentEvent::LlmRetry { .. }))
-            .collect();
+        // The error should propagate — retry is now handled at the provider
+        // layer via `RetryPolicy`, not in `run_core`.
+        let result = rt.run("hi").await;
         assert!(
-            !retries.is_empty(),
-            "expected at least one LlmRetry event, got {events:?}"
+            result.is_err(),
+            "expected error from RateLimited MockProvider without outer retry loop"
         );
-
-        // The first retry should be attempt 1 with reason "rate_limited".
-        if let AgentEvent::LlmRetry {
-            attempt,
-            reason,
-            step,
-            wait_ms,
-        } = retries[0]
-        {
-            assert_eq!(*attempt, 1, "first retry attempt should be 1");
-            assert_eq!(reason, "rate_limited");
-            assert_eq!(*step, 1, "retry should happen on step 1");
-            assert_eq!(*wait_ms, 1, "wait_ms should match retry_after_ms");
-        }
+        let err = result.unwrap_err();
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains("rate limited"),
+            "expected rate-limited error, got: {err_str}"
+        );
     }
 }

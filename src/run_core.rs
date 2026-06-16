@@ -20,10 +20,6 @@ pub(crate) struct ToolCallOutcome {
     pub audit: Option<crate::tools::AuditMeta>,
 }
 
-/// Maximum number of automatic retries for retryable LLM errors (rate limits, timeouts).
-const LLM_MAX_RETRIES: u32 = 3;
-/// Base delay for exponential back-off on LLM retries (milliseconds).
-const LLM_RETRY_BASE_MS: u64 = 1_000;
 /// Sentinel returned in the tool-result string when the permission denial
 /// limit is exceeded.  Matches the check in `run_inner` that breaks the
 /// ReAct loop.  Defined as a constant to avoid scattered string literals.
@@ -123,7 +119,9 @@ impl<'a> RunCore<'a> {
         Arc::make_mut(&mut self.messages).push(msg);
     }
 
-    /// Call the LLM with exponential back-off retry for retryable errors.
+    /// Call the LLM once, delegating retry handling to the provider's
+    /// internal `RetryPolicy`. Goal-288 removed the outer retry loop so
+    /// there is exactly one retry layer.
     ///
     /// When the registry has deferred tools, their names are injected as an
     /// `<available-deferred-tools>` user message prepended to the transcript,
@@ -131,11 +129,10 @@ impl<'a> RunCore<'a> {
     /// (registered by `freeze_deferred_specs`) appears in the eager list and
     /// its results in the message history are serialized as `tool_reference`
     /// blocks by `serialize_messages_anthropic`.
-    async fn call_llm_with_retry(
+    async fn call_llm(
         &self,
         specs: &[crate::llm::ToolSpec],
         stream_sender: Option<crate::llm::StreamSender>,
-        step: usize,
     ) -> crate::error::Result<Completion> {
         // Deferred-tool partition: only when the provider supports tool_reference
         // (Anthropic). Other providers (OpenAI-compatible) receive all tools eagerly
@@ -168,46 +165,12 @@ impl<'a> RunCore<'a> {
                 (specs, &self.messages)
             };
 
-        let mut attempt = 0u32;
-        loop {
-            let result = if let Some(ref tx) = stream_sender {
-                self.llm
-                    .stream(messages, call_specs, Some(tx.clone()))
-                    .await
-            } else {
-                self.llm.complete(messages, call_specs).await
-            };
-            match result {
-                Ok(c) => return Ok(c),
-                Err(e) if e.is_retryable() && attempt < LLM_MAX_RETRIES => {
-                    let wait_ms =
-                        if let crate::error::Error::RateLimited { retry_after_ms, .. } = &e {
-                            *retry_after_ms
-                        } else {
-                            LLM_RETRY_BASE_MS << attempt
-                        };
-                    warn!(
-                        step,
-                        attempt,
-                        wait_ms,
-                        error = %e,
-                        "llm retryable error — backing off"
-                    );
-                    // Goal-287: surface retry to event consumers (TUI, SDK).
-                    self.emit(AgentEvent::LlmRetry {
-                        step,
-                        attempt: attempt + 1,
-                        wait_ms,
-                        reason: match &e {
-                            crate::error::Error::RateLimited { .. } => "rate_limited".to_string(),
-                            _ => "timeout".to_string(),
-                        },
-                    });
-                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
+        if let Some(ref tx) = stream_sender {
+            self.llm
+                .stream(messages, call_specs, Some(tx.clone()))
+                .await
+        } else {
+            self.llm.complete(messages, call_specs).await
         }
     }
 
@@ -642,7 +605,7 @@ impl<'a> RunCore<'a> {
             } else {
                 None
             };
-            let completion: Completion = self.call_llm_with_retry(&specs, stream_tx, step).await?;
+            let completion: Completion = self.call_llm(&specs, stream_tx).await?;
             let llm_ms = start.elapsed().as_millis() as u64;
             self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
             self.emit(AgentEvent::Latency { step, llm_ms });

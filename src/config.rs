@@ -274,7 +274,7 @@ impl Config {
         let retry_max = std::env::var("RECURSIVE_RETRY_MAX")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or(3);
         let retry_initial_backoff_secs = std::env::var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
