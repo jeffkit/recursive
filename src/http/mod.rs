@@ -34,7 +34,7 @@ use axum::{
 /// POST /sessions/:id/messages, both of which accept unbounded user strings.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -57,6 +57,10 @@ pub struct Metrics {
     pub tokens_prompt_total: AtomicU64,
     pub tokens_completion_total: AtomicU64,
     pub agent_steps_total: AtomicU64,
+    /// Number of currently open sessions (gauge).
+    pub sessions_active: AtomicU64,
+    /// Number of requests rejected by rate limiting (counter).
+    pub rate_limits_rejected: AtomicU64,
 }
 
 // ── Session types ──────────────────────────────────────────────────────────
@@ -123,7 +127,7 @@ pub struct CreateSessionRequest {
 }
 
 /// Response body for `POST /sessions`.
-#[derive(serde::Serialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct CreateSessionResponse {
     pub id: String,
     pub created_at: String,
@@ -440,7 +444,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/agui", post(agui_run))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .layer(axum::middleware::from_fn_with_state(
-            limiter,
+            (limiter.clone(), state_arc.metrics.clone()),
             rate_limit_middleware,
         ));
 
@@ -886,6 +890,10 @@ pub fn spawn_session_reaper(
                         if let Ok(mut rt) = session.runtime.try_lock() {
                             rt.close(None).await;
                         }
+                        state
+                            .metrics
+                            .sessions_active
+                            .fetch_sub(1, Ordering::Relaxed);
                         tracing::info!("reaper: evicted idle session {id}");
                     }
                 }

@@ -183,12 +183,13 @@ pub(super) async fn metrics_middleware(
 
 /// Middleware that enforces rate limits on all API requests.
 pub(super) async fn rate_limit_middleware(
-    axum::extract::State(limiter): axum::extract::State<RateLimiter>,
+    axum::extract::State((limiter, metrics)): axum::extract::State<(RateLimiter, Arc<Metrics>)>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let key = extract_client_key(&req);
     if !limiter.check(&key).await {
+        metrics.rate_limits_rejected.fetch_add(1, Ordering::Relaxed);
         let mut resp = axum::response::Response::new(axum::body::Body::from("rate limit exceeded"));
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         return resp;
@@ -199,7 +200,9 @@ pub(super) async fn rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::get;
     use std::time::Duration;
+    use tower::ServiceExt;
 
     /// Helper: create a rate limiter with very small capacity for testing.
     fn test_limiter(capacity: u32, rpm: f64) -> RateLimiter {
@@ -379,6 +382,56 @@ mod tests {
             limiter.bucket_count().await,
             0,
             "all buckets should be idle after manual refill"
+        );
+    }
+
+    /// Goal-292: rate_limits_rejected counter increments when rate-limit fires.
+    #[tokio::test]
+    async fn rate_limits_rejected_counter_increments() {
+        let metrics = Arc::new(Metrics::default());
+        // Capacity 0 means every request is rejected immediately.
+        let limiter = RateLimiter::new(0, 0.0);
+
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                (limiter, metrics.clone()),
+                rate_limit_middleware,
+            ));
+
+        // First request — should get 429 and increment counter.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.rate_limits_rejected.load(Ordering::Relaxed),
+            1,
+            "rate_limits_rejected should increment to 1"
+        );
+
+        // Second request — counter increments to 2.
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.rate_limits_rejected.load(Ordering::Relaxed),
+            2,
+            "rate_limits_rejected should increment to 2"
         );
     }
 }

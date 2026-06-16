@@ -268,6 +268,10 @@ pub(super) async fn create_session(
     };
 
     state.sessions.write().await.insert(id.clone(), session);
+    state
+        .metrics
+        .sessions_active
+        .fetch_add(1, Ordering::Relaxed);
 
     Ok((
         StatusCode::CREATED,
@@ -405,6 +409,10 @@ pub(super) async fn delete_session(
         rt.close(None).await;
         drop(rt);
         state.sessions.write().await.remove(&id);
+        state
+            .metrics
+            .sessions_active
+            .fetch_sub(1, Ordering::Relaxed);
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -516,6 +524,10 @@ pub(super) async fn fork_session(
     };
 
     state.sessions.write().await.insert(new_id.clone(), session);
+    state
+        .metrics
+        .sessions_active
+        .fetch_add(1, Ordering::Relaxed);
 
     Ok((
         StatusCode::CREATED,
@@ -1485,6 +1497,8 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let tokens_prompt_total = metrics.tokens_prompt_total.load(Ordering::Relaxed);
     let tokens_completion_total = metrics.tokens_completion_total.load(Ordering::Relaxed);
     let agent_steps_total = metrics.agent_steps_total.load(Ordering::Relaxed);
+    let sessions_active = metrics.sessions_active.load(Ordering::Relaxed);
+    let rate_limits_rejected = metrics.rate_limits_rejected.load(Ordering::Relaxed);
 
     format!(
         "# HELP recursive_requests_total Total HTTP requests\n\
@@ -1510,7 +1524,13 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          recursive_tokens_completion_total {tokens_completion_total}\n\
          # HELP recursive_agent_steps_total Total agent steps executed\n\
          # TYPE recursive_agent_steps_total counter\n\
-         recursive_agent_steps_total {agent_steps_total}\n"
+         recursive_agent_steps_total {agent_steps_total}\n\
+         # HELP recursive_sessions_active Currently active sessions\n\
+         # TYPE recursive_sessions_active gauge\n\
+         recursive_sessions_active {sessions_active}\n\
+         # HELP recursive_rate_limits_rejected_total Total requests rejected by rate limiting\n\
+         # TYPE recursive_rate_limits_rejected_total counter\n\
+         recursive_rate_limits_rejected_total {rate_limits_rejected}\n"
     )
 }
 
@@ -1746,5 +1766,138 @@ mod tests {
         drop(guard);
         let resp = session_clear_goal(State(state), Path(session_id)).await;
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
+    }
+
+    /// Goal-292: metrics_handler output includes sessions_active and
+    /// rate_limits_rejected.
+    #[tokio::test]
+    async fn metrics_handler_includes_new_fields() {
+        use crate::http::Metrics;
+        use crate::tools::ToolRegistry;
+        use std::sync::atomic::AtomicU64;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Metrics {
+            sessions_active: AtomicU64::new(3),
+            rate_limits_rejected: AtomicU64::new(42),
+            ..Metrics::default()
+        };
+        let state = Arc::new(AppState {
+            metrics: Arc::new(metrics),
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            slash_commands: Arc::new(vec![]),
+            session_ttl_secs: 3600,
+            run_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+        });
+        let output = metrics_handler(State(state)).await;
+        assert!(
+            output.contains("recursive_sessions_active 3"),
+            "output should contain sessions_active: {output}"
+        );
+        assert!(
+            output.contains("recursive_rate_limits_rejected_total 42"),
+            "output should contain rate_limits_rejected_total: {output}"
+        );
+    }
+
+    /// Goal-292: sessions_active increments on create_session and
+    /// decrements on delete_session.
+    #[tokio::test]
+    async fn sessions_active_tracks_session_lifecycle() {
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]));
+        let metrics = Arc::new(crate::http::Metrics::default());
+
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: metrics.clone(),
+            slash_commands: Arc::new(vec![]),
+            session_ttl_secs: 3600,
+            run_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+        };
+
+        let auth = crate::http::auth::AuthConfig::default();
+        let limiter = state.rate_limiter.clone();
+        let app = crate::http::build_router_with_auth_and_rate_limit(state, auth, limiter);
+
+        // Initially sessions_active is 0.
+        assert_eq!(
+            metrics.sessions_active.load(Ordering::Relaxed),
+            0,
+            "sessions_active should start at 0"
+        );
+
+        // Create a session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"session_name":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "expected 201 Created from POST /sessions"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let created: CreateSessionResponse =
+            serde_json::from_slice(&body).expect("valid CreateSessionResponse");
+        let session_id = created.id;
+
+        // sessions_active should now be 1.
+        assert_eq!(
+            metrics.sessions_active.load(Ordering::Relaxed),
+            1,
+            "sessions_active should increment to 1 after create"
+        );
+
+        // Delete the session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "expected 204 No Content from DELETE /sessions/:id"
+        );
+
+        // sessions_active should be back to 0.
+        assert_eq!(
+            metrics.sessions_active.load(Ordering::Relaxed),
+            0,
+            "sessions_active should decrement to 0 after delete"
+        );
     }
 }
