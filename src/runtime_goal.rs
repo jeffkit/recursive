@@ -61,22 +61,19 @@ impl GoalEvaluator {
         Self { provider }
     }
 
-    /// Evaluate `condition` against the last N messages of `transcript`.
+    /// Evaluate `condition` against the given `transcript`.
+    ///
+    /// Callers are responsible for pre-slicing `transcript` to the desired
+    /// number of recent messages (e.g. via
+    /// [`AgentRuntime::transcript_tail`]).  This method uses the full slice
+    /// as-is — it does NOT perform any further truncation.
     ///
     /// Calls the provider with a minimal YES/NO prompt (max_tokens ≈ 256 via
     /// a short system instruction).  The first word of the response determines
     /// the verdict; any remaining text is kept as `reason`.
     pub async fn evaluate(&self, condition: &str, transcript: &[Message]) -> Result<GoalVerdict> {
-        // Only send the last 20 messages to keep the prompt cheap.
-        const TAIL: usize = 20;
-        let tail = if transcript.len() > TAIL {
-            &transcript[transcript.len() - TAIL..]
-        } else {
-            transcript
-        };
-
         // Format the recent transcript as plain text.
-        let transcript_text: String = tail
+        let transcript_text: String = transcript
             .iter()
             .filter_map(|m| {
                 if m.content.is_empty() {
@@ -123,6 +120,12 @@ impl GoalEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use crate::error::Result;
+    use crate::llm::{Completion, LlmProvider};
+    use crate::message::Role;
+    use async_trait::async_trait;
 
     #[test]
     fn goal_state_serializes_and_deserializes() {
@@ -166,5 +169,71 @@ mod tests {
         let first_line_no = text_no.lines().next().unwrap_or("").trim().to_uppercase();
         let achieved_no = first_line_no.starts_with("YES");
         assert!(!achieved_no);
+    }
+
+    /// Mock provider that captures the user prompt for inspection.
+    struct CapturingProvider {
+        captured_user_content: Mutex<String>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        async fn complete(
+            &self,
+            messages: &[Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> Result<Completion> {
+            // Capture the last (user) message content.
+            if let Some(last) = messages.last() {
+                *self.captured_user_content.lock().unwrap() = last.content.clone();
+            }
+            Ok(Completion {
+                content: "YES\nAll conditions met.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Goal-301: a transcript with 25 messages must NOT be further
+    /// truncated inside `evaluate()`.  All 25 messages must contribute
+    /// to the user prompt sent to the provider.
+    #[tokio::test]
+    async fn evaluate_preserves_all_messages_beyond_old_tail_20() {
+        // Build 25 distinct user messages.
+        let transcript: Vec<Message> = (0..25)
+            .map(|i| Message {
+                role: Role::User,
+                content: format!("message-{i:02}"),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            })
+            .collect();
+
+        let provider = Arc::new(CapturingProvider {
+            captured_user_content: Mutex::new(String::new()),
+        });
+        let evaluator = GoalEvaluator::new(provider.clone());
+
+        let verdict = evaluator
+            .evaluate("test condition", &transcript)
+            .await
+            .unwrap();
+        assert!(verdict.achieved);
+
+        let captured = provider.captured_user_content.lock().unwrap().clone();
+        // Each message should appear with its formatted content.
+        for i in 0..25 {
+            let needle = format!("message-{i:02}");
+            assert!(
+                captured.contains(&needle),
+                "transcript message {i} ({needle}) missing from prompt;\n\
+                 prompt was: {captured}"
+            );
+        }
     }
 }
