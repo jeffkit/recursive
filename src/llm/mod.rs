@@ -97,7 +97,7 @@ impl TokenUsage {
     /// Saturating element-wise sum. Used to accumulate across LLM calls.
     pub fn accumulate(self, other: TokenUsage) -> TokenUsage {
         TokenUsage {
-            reasoning_tokens: 0,
+            reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
             prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
             completion_tokens: self
                 .completion_tokens
@@ -629,6 +629,21 @@ mod tests {
         assert_eq!(acc.cache_hit_tokens, 2700);
         assert_eq!(acc.cache_miss_tokens, 300);
         assert_eq!(acc.prompt_tokens, 3000);
+    }
+
+    /// Goal 273: reasoning_tokens must sum correctly in accumulate.
+    #[test]
+    fn token_usage_accumulate_sums_reasoning() {
+        let a = TokenUsage {
+            reasoning_tokens: 100,
+            ..Default::default()
+        };
+        let b = TokenUsage {
+            reasoning_tokens: 250,
+            ..Default::default()
+        };
+        let c = a.accumulate(b);
+        assert_eq!(c.reasoning_tokens, 350);
     }
 
     // ── context_window_tokens_for_model / default_compact_threshold_chars ─────

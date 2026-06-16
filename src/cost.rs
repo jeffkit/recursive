@@ -521,4 +521,33 @@ mod tests {
         // total: $0.19768
         assert!((cost - 0.19768).abs() < 0.001);
     }
+
+    /// Goal 273: reasoning tokens add to the output bill at the model's
+    /// output rate.
+    #[test]
+    fn cost_includes_reasoning_in_output_bill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
+
+        // deepseek-chat: $0.14/M input, $0.28/M output
+        // completion_tokens: 100, reasoning_tokens: 400
+        // input: 200k * 0.14/1M = $0.028
+        // output: (100 + 400) * 0.28/1M = 500 * 0.28/1M = $0.00014
+        // total: $0.02814
+        let usage = TokenUsage {
+            reasoning_tokens: 400,
+            prompt_tokens: 200_000,
+            completion_tokens: 100,
+            total_tokens: 200_500,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 200_000,
+        };
+        tracker.record_usage(usage, 0);
+
+        let cost = tracker.cost_usd().unwrap();
+        // input: 200k * 0.14/1M = 0.028
+        // output: (100 + 400) * 0.28 / 1M = 500 * 0.28 / 1M = 0.00014
+        // total: 0.028 + 0.00014 = 0.02814
+        assert!((cost - 0.02814).abs() < 0.00001);
+    }
 }

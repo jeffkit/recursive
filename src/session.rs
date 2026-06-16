@@ -2885,4 +2885,21 @@ mod tests {
             "error must include supported version; got: {msg}"
         );
     }
+
+    /// Goal 273: SessionCost tracks reasoning tokens across accumulate calls.
+    #[test]
+    fn session_cost_tracks_reasoning_tokens() {
+        let mut cost = SessionCost::default();
+        let usage_a = UsageMeta {
+            reasoning_tokens: Some(1000),
+            ..Default::default()
+        };
+        let usage_b = UsageMeta {
+            reasoning_tokens: Some(500),
+            ..Default::default()
+        };
+        cost.accumulate(&usage_a);
+        cost.accumulate(&usage_b);
+        assert_eq!(cost.total_reasoning_tokens, 1500);
+    }
 }
