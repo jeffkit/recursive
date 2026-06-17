@@ -482,7 +482,7 @@ impl ExternalHookRunner {
             // Skip once-hooks that already ran.
             if hook.once {
                 let already_ran = {
-                    let guard = self.executed_once.lock().unwrap();
+                    let guard = self.executed_once.lock().unwrap_or_else(|e| e.into_inner());
                     guard.contains(&idx)
                 };
                 if already_ran {
@@ -501,7 +501,10 @@ impl ExternalHookRunner {
                     }
                 });
                 if hook.once {
-                    self.executed_once.lock().unwrap().insert(idx);
+                    self.executed_once
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(idx);
                 }
                 continue;
             }
@@ -525,7 +528,10 @@ impl ExternalHookRunner {
                     }
                 });
                 if hook.once {
-                    self.executed_once.lock().unwrap().insert(idx);
+                    self.executed_once
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(idx);
                 }
                 continue;
             }
@@ -547,7 +553,10 @@ impl ExternalHookRunner {
             let start = std::time::Instant::now();
             if let Ok(result) = self.run_hook(hook, input).await {
                 if hook.once {
-                    self.executed_once.lock().unwrap().insert(idx);
+                    self.executed_once
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(idx);
                 }
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let outcome = match &result.action {
