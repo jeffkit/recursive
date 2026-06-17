@@ -1,4 +1,4 @@
-# Goal 229-01 — Unwrap cleanup batch 01: checkpoint.rs + mcp.rs
+# Goal 229-01 — Unwrap cleanup batch 01: run_background.rs + run_skill_script.rs
 
 **Roadmap**: Phase 20 — 0.7 Refactor & Hardening
 **父 goal**: Goal 229
@@ -7,11 +7,13 @@
 
 ## Why
 
-当前生产代码（非测试、非 `unwrap_or` 变体）中，最高密度的两个文件是：
-- `src/checkpoint.rs`：**51 处** `.unwrap()` / `.expect(...)`
-- `src/mcp.rs`：**47 处** `.unwrap()` / `.expect(...)`
+当前生产代码（非测试块、非 `unwrap_or` 变体）中，最高密度的两个文件是：
+- `src/tools/run_background.rs`：**33 处** `.unwrap()` / `.expect(...)`（全在生产代码路径）
+- `src/tools/run_skill_script.rs`：**29 处** `.unwrap()` / `.expect(...)`（全在生产代码路径）
 
-注意：`runtime.rs` 的 83 处 unwrap 大部分在测试代码（line 1300+）或是安全的 `unwrap_or`/`unwrap_or_default`——不需要修改。
+重要说明：
+- `runtime.rs`, `checkpoint.rs`, `mcp.rs` 的 unwrap 大多在测试代码，不是本批目标
+- 只处理真正的生产代码 unwrap（排除 `#[cfg(test)] mod tests` 之后的所有代码）
 
 这是 unwrap 系列清理的第一批，目标是真正有问题的两个文件。
 
@@ -19,8 +21,8 @@
 
 ### 目标文件
 
-- `src/checkpoint.rs`（51 处生产代码 unwrap）
-- `src/mcp.rs`（47 处生产代码 unwrap）
+- `src/tools/run_background.rs`（33 处生产代码 unwrap）
+- `src/tools/run_skill_script.rs`（29 处生产代码 unwrap）
 
 ### 替换策略（按优先级）
 
@@ -53,8 +55,8 @@
 - `cargo test --workspace` 全绿
 - `cargo clippy --all-targets --all-features -- -D warnings` 干净
 - `cargo fmt --all` 通过
-- `grep -c "\.unwrap()\|\.expect(" src/checkpoint.rs` 输出 ≤ 5（剩余必须有 `#[allow]` 注解）
-- `grep -c "\.unwrap()\|\.expect(" src/mcp.rs` 输出 ≤ 10（剩余必须有 `#[allow]` 注解）
+- `grep -c "\.unwrap()\|\.expect(" src/tools/run_background.rs` 输出 ≤ 5（剩余必须有 `#[allow]` 注解）
+- `grep -c "\.unwrap()\|\.expect(" src/tools/run_skill_script.rs` 输出 ≤ 5（剩余必须有 `#[allow]` 注解）
 
 ## 输出说明
 
@@ -68,6 +70,7 @@
 - `runtime.rs` 很长，用 `read_file` 的 `start_line`/`end_line` 参数分段读
 - 避免用 `write_file` 覆盖整个文件——use `apply_patch`
 - 有些 `Mutex::lock().unwrap()` 是"锁不会毒（正常流程不 panic）"的逻辑保证，但仍要加 `#[allow]` + reason
-- **DO NOT modify** src/session.rs, src/runtime.rs, src/tools/, src/agent/, src/main.rs, 或任何其他文件
-- 注意：`runtime.rs` 的 unwrap 大多在测试代码，不是本批目标
-- 先 `grep -n "\.unwrap()\|\.expect(" src/checkpoint.rs | grep -v "cfg(test)\|mod tests" | head -20` 了解分布再下手
+- **DO NOT modify** src/session.rs, src/runtime.rs, src/checkpoint.rs, src/mcp.rs, 或本批目标文件之外的任何文件
+- 注意：只处理 `#[cfg(test)] mod tests` 之前的生产代码，测试代码里的 unwrap 是合法的
+- 先 `grep -n "\.unwrap()\|\.expect(" src/tools/run_background.rs | head -20` 了解分布再下手
+- 在 `#[allow]` 注解里必须写 `reason` 说明为什么这个 unwrap 是安全的（例如 "lock poison is unrecoverable"）
