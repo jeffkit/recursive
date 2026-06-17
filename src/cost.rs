@@ -166,7 +166,7 @@ impl CostTracker {
                 "cost_usd".to_string(),
                 serde_json::Value::Number(
                     serde_json::Number::from_f64(self.cost_usd().unwrap_or(0.0))
-                        .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
+                        .unwrap_or(serde_json::Number::from(0u64)),
                 ),
             );
             obj.insert(
@@ -549,5 +549,19 @@ mod tests {
         // output: (100 + 400) * 0.28 / 1M = 500 * 0.28 / 1M = 0.00014
         // total: 0.028 + 0.00014 = 0.02814
         assert!((cost - 0.02814).abs() < 0.00001);
+    }
+
+    /// Goal 311: `update_meta_with_cost` must not panic even when the
+    /// cost is unknown (e.g. unknown model — `cost_usd()` returns
+    /// `None`) or when no usage has been recorded.
+    #[test]
+    fn update_meta_with_cost_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a valid meta.json
+        std::fs::write(dir.path().join(".meta.json"), r#"{"some": "field"}"#).unwrap();
+        let tracker = CostTracker::new(dir.path().to_path_buf(), "test-model", "openai");
+        // Don't crash even with no usage recorded
+        let res = tracker.update_meta_with_cost();
+        assert!(res.is_ok());
     }
 }
