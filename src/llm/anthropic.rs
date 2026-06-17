@@ -10,7 +10,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
+use super::{ChatProvider, Completion, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
 
 /// Beta header required for `tool_reference` block support in the
 /// Anthropic Messages API.
@@ -155,7 +155,7 @@ impl AnthropicProvider {
 }
 
 #[async_trait]
-impl LlmProvider for AnthropicProvider {
+impl ChatProvider for AnthropicProvider {
     /// Whether to use deferred tool loading via `tool_reference` blocks.
     ///
     /// `tool_reference` is an Anthropic beta feature (`advanced-tool-use-2025-11-20`).

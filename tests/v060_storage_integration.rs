@@ -18,7 +18,7 @@ mod v060 {
 
     // ─── helpers ─────────────────────────────────────────────────────────────
 
-    fn mock_llm() -> Arc<dyn recursive::LlmProvider> {
+    fn mock_llm() -> Arc<dyn recursive::ChatProvider> {
         Arc::new(MockProvider::new(vec![Completion {
             content: "done".into(),
             tool_calls: vec![],

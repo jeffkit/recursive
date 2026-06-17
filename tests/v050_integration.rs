@@ -10,13 +10,13 @@ mod v050_integration {
     use recursive::llm::{mock::MockProvider, Completion};
     use recursive::multi::{default_roles, AgentPool};
     use recursive::tools::ToolRegistry;
-    use recursive::{Config, LlmProvider};
+    use recursive::{ChatProvider, Config};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
-    fn mock_provider() -> Arc<dyn LlmProvider> {
+    fn mock_provider() -> Arc<dyn ChatProvider> {
         Arc::new(MockProvider::new(vec![Completion {
             content: "I'll help you with that. Let me analyze the code.".to_string(),
             tool_calls: vec![],

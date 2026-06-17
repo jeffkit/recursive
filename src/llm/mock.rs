@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::StructuredRequest;
-use super::{Completion, LlmProvider, StreamSender, ToolSpec};
+use super::{ChatProvider, Completion, StreamSender, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::Message;
 use tracing::Instrument;
@@ -95,7 +95,7 @@ impl MockProvider {
 }
 
 #[async_trait]
-impl LlmProvider for MockProvider {
+impl ChatProvider for MockProvider {
     async fn complete(&self, messages: &[Message], _tools: &[ToolSpec]) -> Result<Completion> {
         let span = tracing::info_span!("llm.complete", provider = "mock", model = "mock");
         async move {

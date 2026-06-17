@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
 use super::StructuredRequest;
-use super::{Completion, LlmProvider, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
+use super::{ChatProvider, Completion, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
@@ -211,7 +211,7 @@ impl OpenAiProvider {
 }
 
 #[async_trait]
-impl LlmProvider for OpenAiProvider {
+impl ChatProvider for OpenAiProvider {
     #[tracing::instrument(skip(self, messages, tools), fields(
         provider = %self.base_url.split('/').next_back().unwrap_or("unknown"),
         model = %self.model
