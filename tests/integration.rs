@@ -1104,3 +1104,155 @@ interactive = ["Write"]
         assert_eq!(section.interactive, vec!["Write"]);
     }
 }
+
+// ============================================================================
+// Goal-314: Plan mode write-tool blocking — integration test
+//
+// Verifies that when the agent enters plan mode, any write tool (e.g. Write)
+// is blocked at the RunCore level, and that exit_plan_mode re-enables writes.
+// ============================================================================
+
+#[tokio::test]
+async fn plan_mode_write_tool_blocked_until_exit() {
+    use recursive::event::{EventSink, NullSink};
+    use recursive::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Script: 4 LLM completions.
+    //   Step 1: agent calls enter_plan_mode
+    //   Step 2: agent tries Write → blocked by RunCore
+    //   Step 3: agent calls exit_plan_mode → gate approved from bg task
+    //   Step 4: agent finishes
+    let script = vec![
+        Completion {
+            content: "entering plan mode".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: ENTER_PLAN_MODE_TOOL_NAME.into(),
+                arguments: json!({}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "trying to write".into(),
+            tool_calls: vec![ToolCall {
+                id: "c2".into(),
+                name: "Write".into(),
+                arguments: json!({"path": "test.txt", "content": "hello"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "exiting plan mode".into(),
+            tool_calls: vec![ToolCall {
+                id: "c3".into(),
+                name: EXIT_PLAN_MODE_TOOL_NAME.into(),
+                arguments: json!({"plan": "I will write a file"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "plan approved, session done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let llm = Arc::new(MockProvider::new(script));
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+
+    // Build tool registry with WriteFile only. Plan mode tools will be
+    // registered by with_plan_mode_tools(true).
+    let tools =
+        ToolRegistry::new(transport).register(Arc::new(recursive::tools::WriteFile::new(root)));
+
+    let event_sink: Arc<dyn EventSink> = Arc::new(NullSink);
+
+    let mut runtime = AgentRuntime::builder()
+        .llm(llm)
+        .tools(tools)
+        .system_prompt("you are a test agent with plan mode")
+        .max_steps(10)
+        .event_sink(event_sink)
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+
+    // Clone the gate before running so we can approve from a background task.
+    let gate = runtime.plan_approval_gate();
+
+    // Spawn a background task that approves the plan after enter + write have
+    // completed. The exit_plan_mode tool blocks on wait_for_approval(), so this
+    // prevents the test from deadlocking.
+    let approve_handle = tokio::spawn(async move {
+        // Sleep long enough for enter_plan_mode and the blocked Write to
+        // complete, then approve so exit_plan_mode can return.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        gate.approve();
+    });
+
+    let outcome = runtime
+        .run("enter plan mode and try to write")
+        .await
+        .unwrap();
+
+    approve_handle.await.unwrap();
+
+    // Agent should finish normally (exit_plan_mode approved, then final stop).
+    assert_eq!(
+        outcome.finish_reason,
+        FinishReason::NoMoreToolCalls,
+        "expected NoMoreToolCalls, got {:?}",
+        outcome.finish_reason
+    );
+
+    // The tool-result for step 2 (Write) must contain the blocking error.
+    let tool_msgs: Vec<&Message> = runtime
+        .transcript()
+        .iter()
+        .filter(|m| m.role == recursive::message::Role::Tool)
+        .collect();
+
+    // There should be 3 tool results: enter_plan_mode, blocked Write, exit_plan_mode.
+    assert_eq!(
+        tool_msgs.len(),
+        3,
+        "expected 3 tool-result messages (enter_plan_mode, blocked Write, exit_plan_mode), got {}",
+        tool_msgs.len()
+    );
+
+    // The Write tool result (second tool message) should contain the plan-mode
+    // blocking error.
+    let write_result = &tool_msgs[1].content;
+    assert!(
+        write_result.contains("Cannot execute"),
+        "Write tool result should contain 'Cannot execute', got: {write_result}"
+    );
+    assert!(
+        write_result.contains("plan mode"),
+        "Write tool result should mention 'plan mode', got: {write_result}"
+    );
+
+    // The exit_plan_mode tool result should show approved.
+    let exit_result = &tool_msgs[2].content;
+    assert!(
+        exit_result.contains("approved"),
+        "exit_plan_mode result should contain 'approved', got: {exit_result}"
+    );
+
+    // The file should NOT have been created — the Write was blocked.
+    assert!(
+        !root.join("test.txt").exists(),
+        "test.txt should not exist because Write was blocked in plan mode"
+    );
+}
