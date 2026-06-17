@@ -317,6 +317,9 @@ pub struct AppState {
     /// Shared rate limiter for all API requests. Stored on `AppState` so the
     /// session reaper can prune idle token buckets.
     pub rate_limiter: RateLimiter,
+    /// Discovered skills for skill_index injection into the system prompt.
+    /// Empty if no skills found. Goal-312.
+    pub skills: Vec<crate::skills::Skill>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.

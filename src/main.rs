@@ -703,6 +703,22 @@ async fn main() -> anyhow::Result<()> {
             };
             #[cfg(not(feature = "tui"))]
             let slash_commands: Vec<recursive::http::SlashCommandInfo> = Vec::new();
+            // Goal-312: discover skills for skill_index injection into
+            // the system prompt of every HTTP API run.
+            let skills = {
+                let mut paths = vec![config.workspace.join(".recursive").join("skills")];
+                if let Some(home) = std::env::var_os("HOME") {
+                    paths.push(
+                        std::path::PathBuf::from(home)
+                            .join(".recursive")
+                            .join("skills"),
+                    );
+                }
+                if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
+                    paths = env_paths.split(':').map(std::path::PathBuf::from).collect();
+                }
+                recursive::skills::discover_skills(&paths)
+            };
             let session_ttl_secs: u64 = std::env::var("RECURSIVE_SESSION_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -730,6 +746,7 @@ async fn main() -> anyhow::Result<()> {
                 session_ttl_secs,
                 run_semaphore,
                 rate_limiter: recursive::http::rate_limiter_from_env(),
+                skills,
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the

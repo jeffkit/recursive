@@ -92,6 +92,17 @@ pub(super) async fn run_agent(
             p
         }
     };
+    // Goal-312: append skill index so the agent knows what skills
+    // are available and can call load_skill effectively.
+    let system_prompt = {
+        let mut sp = system_prompt;
+        let idx = crate::skills::skill_index(&state.skills);
+        if !idx.is_empty() {
+            sp.push('\n');
+            sp.push_str(&idx);
+        }
+        sp
+    };
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
@@ -195,6 +206,17 @@ pub(super) async fn create_session(
             }
             p
         }
+    };
+    // Goal-312: append skill index so the agent knows what skills
+    // are available and can call load_skill effectively.
+    let system_prompt = {
+        let mut sp = system_prompt;
+        let idx = crate::skills::skill_index(&state.skills);
+        if !idx.is_empty() {
+            sp.push('\n');
+            sp.push_str(&idx);
+        }
+        sp
     };
     let max_steps = body
         .max_steps
@@ -506,6 +528,16 @@ pub(super) async fn fork_session(
     let new_id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
     let system_prompt = state.config.system_prompt.clone();
+    // Goal-312: append skill index so the forked session also has skills.
+    let system_prompt = {
+        let mut sp = system_prompt;
+        let idx = crate::skills::skill_index(&state.skills);
+        if !idx.is_empty() {
+            sp.push('\n');
+            sp.push_str(&idx);
+        }
+        sp
+    };
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
@@ -1304,10 +1336,21 @@ pub(super) async fn agui_run(
             )
         })?;
 
+    // Goal-312: append skill index to system prompt.
+    let system_prompt = {
+        let mut sp = state.config.system_prompt.clone();
+        let idx = crate::skills::skill_index(&state.skills);
+        if !idx.is_empty() {
+            sp.push('\n');
+            sp.push_str(&idx);
+        }
+        sp
+    };
+
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
         .tools(state.tool_registry.clone())
-        .system_prompt(state.config.system_prompt.clone())
+        .system_prompt(system_prompt)
         .max_steps(state.config.max_steps)
         .build()
         .map_err(|e| {
@@ -1663,6 +1706,7 @@ mod tests {
             session_ttl_secs: 3600,
             run_semaphore: sem,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
         });
 
         let body = serde_json::json!({
@@ -1732,6 +1776,7 @@ mod tests {
             session_ttl_secs: 3600,
             run_semaphore: Arc::new(Semaphore::new(8)),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -1787,6 +1832,7 @@ mod tests {
             session_ttl_secs: 3600,
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -1824,6 +1870,7 @@ mod tests {
             session_ttl_secs: 3600,
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
         };
 
         let auth = crate::http::auth::AuthConfig::default();
@@ -2023,5 +2070,70 @@ mod tests {
         infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         assert_eq!(infos[0].id, "a");
         assert_eq!(infos[1].id, "z");
+    }
+
+    // ── Goal-312: skill_index injection into system prompt ──────────
+
+    /// Verify that system prompt construction logic correctly appends
+    /// the skill index when skills are present in AppState.
+    #[test]
+    fn system_prompt_includes_skill_index_when_skills_present() {
+        let skills = vec![crate::skills::Skill {
+            name: "rust-patch-discipline".to_string(),
+            description: "V4A patch format rules".to_string(),
+            path: std::path::PathBuf::from("/tmp/skills/rust-patch-discipline/SKILL.md"),
+            mode: crate::skills::SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+        }];
+
+        let base_prompt = "You are a helpful agent.";
+        let idx = crate::skills::skill_index(&skills);
+        assert!(!idx.is_empty(), "skill_index should not be empty");
+        assert!(
+            idx.contains("Available skills"),
+            "skill_index should contain header"
+        );
+        assert!(
+            idx.contains("rust-patch-discipline"),
+            "skill_index should list skill names"
+        );
+
+        // Simulate what run_agent/create_session do.
+        let mut sp = base_prompt.to_string();
+        sp.push('\n');
+        sp.push_str(&idx);
+
+        assert!(
+            sp.contains("Available skills"),
+            "system prompt should contain skill index after injection"
+        );
+        assert!(
+            sp.contains("rust-patch-discipline"),
+            "system prompt should contain skill name"
+        );
+    }
+
+    /// skill_index returns empty string when no skills are present,
+    /// so injection is a no-op (no spurious newlines).
+    #[test]
+    fn system_prompt_unchanged_when_no_skills() {
+        let skills: Vec<crate::skills::Skill> = vec![];
+        let idx = crate::skills::skill_index(&skills);
+        assert!(idx.is_empty(), "empty skills should produce empty index");
+
+        let base_prompt = "You are a helpful agent.";
+        let mut sp = base_prompt.to_string();
+        if !idx.is_empty() {
+            sp.push('\n');
+            sp.push_str(&idx);
+        }
+        // The prompt should be unchanged.
+        assert_eq!(sp, base_prompt);
     }
 }

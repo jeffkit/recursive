@@ -103,6 +103,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         }
     }
 
@@ -122,6 +123,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         }
     }
 
@@ -202,6 +204,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         });
 
         let response = app
@@ -251,6 +254,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         };
         let app = build_router(state);
 
@@ -361,6 +365,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         };
         let app = build_router(state);
 
@@ -430,6 +435,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         };
         let app = build_router(state);
 
@@ -506,6 +512,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         };
         let app = build_router(state);
 
@@ -3615,6 +3622,7 @@ mod http_tests {
             session_ttl_secs: 0,
             run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
         };
         let app = build_router(state);
         let resp = app
