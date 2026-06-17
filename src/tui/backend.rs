@@ -315,7 +315,10 @@ async fn worker_loop(
     #[cfg(feature = "weixin")] mut weixin_rx: mpsc::UnboundedReceiver<WeixinBackendRequest>,
 ) {
     if let RuntimeBuild::Ready(rt_opt) = &mut state {
-        let rt = rt_opt.as_mut().unwrap();
+        let Some(rt) = rt_opt.as_mut() else {
+            tracing::warn!("backend: runtime not initialized in worker_loop init");
+            return;
+        };
         rt.set_event_sink(Arc::new(TuiEventSink {
             tx: event_tx.clone(),
         }));
@@ -377,7 +380,10 @@ async fn worker_loop(
             // Run the turn and send response back to WeChat daemon.
             if let RuntimeBuild::Ready(rt_opt) = &mut state {
                 let text = wx_req.text.clone();
-                let rt = rt_opt.take().unwrap();
+                let Some(rt) = rt_opt.take() else {
+                    tracing::warn!("backend: runtime not available for weixin task");
+                    continue;
+                };
                 let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                 let rt_clone = rt_shared.clone();
                 let handle = tokio::task::spawn(async move {
@@ -385,9 +391,11 @@ async fn worker_loop(
                     g.enqueue(text).await
                 });
                 let result = handle.await;
-                let recovered = Arc::try_unwrap(rt_shared)
-                    .expect("single owner after weixin task")
-                    .into_inner();
+                let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
+                    tracing::error!("backend: arc has multiple owners after weixin task");
+                    continue;
+                };
+                let recovered = recovered.into_inner();
                 *rt_opt = Some(recovered);
                 let _ = event_tx.send(UiEvent::TurnFinished);
                 let final_text = match result {
@@ -418,7 +426,13 @@ async fn worker_loop(
 
             UserAction::SendMessage(text) => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
+                    let pre_turn_len = {
+                        let Some(rt_ref) = rt_opt.as_ref() else {
+                            tracing::warn!("backend: runtime not initialized in SendMessage");
+                            continue;
+                        };
+                        rt_ref.transcript().len()
+                    };
 
                     // On the first user message, create a SessionWriter and wire
                     // it into the runtime's event sink via SessionPersistenceSink
@@ -436,12 +450,21 @@ async fn worker_loop(
                                 }) as Box<dyn EventSink>,
                                 Box::new(SessionPersistenceSink::new(sw_arc.clone())),
                             ]));
-                            rt_opt.as_mut().unwrap().set_event_sink(composite);
+                            let Some(rt_mut) = rt_opt.as_mut() else {
+                                tracing::warn!(
+                                    "backend: runtime not available for session sink setup"
+                                );
+                                continue;
+                            };
+                            rt_mut.set_event_sink(composite);
                             session_writer = Some(sw_arc);
                         }
                     }
 
-                    let rt = rt_opt.take().unwrap();
+                    let Some(rt) = rt_opt.take() else {
+                        tracing::warn!("backend: runtime not available for SendMessage task");
+                        continue;
+                    };
                     // Clone the gate before moving the runtime into the spawned task.
                     // This lets us signal plan approval/rejection via action_rx while
                     // the task is blocked inside exit_plan_mode.
@@ -464,9 +487,11 @@ async fn worker_loop(
                         &gate,
                     )
                     .await;
-                    let mut recovered = Arc::try_unwrap(rt_shared)
-                        .expect("single owner after task end")
-                        .into_inner();
+                    let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
+                        tracing::error!("backend: arc has multiple owners after SendMessage task");
+                        continue;
+                    };
+                    let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
                     }
@@ -487,9 +512,16 @@ async fn worker_loop(
 
             UserAction::ConfirmPlan => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    rt_opt.as_mut().unwrap().confirm_plan();
-                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
-                    let rt = rt_opt.take().unwrap();
+                    let Some(rt_mut) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available in ConfirmPlan");
+                        continue;
+                    };
+                    rt_mut.confirm_plan();
+                    let pre_turn_len = rt_mut.transcript().len();
+                    let Some(rt) = rt_opt.take() else {
+                        tracing::warn!("backend: runtime not available for ConfirmPlan task");
+                        continue;
+                    };
                     let gate = rt.plan_approval_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
@@ -509,9 +541,11 @@ async fn worker_loop(
                         &gate,
                     )
                     .await;
-                    let mut recovered = Arc::try_unwrap(rt_shared)
-                        .expect("single owner after task end")
-                        .into_inner();
+                    let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
+                        tracing::error!("backend: arc has multiple owners after ConfirmPlan task");
+                        continue;
+                    };
+                    let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
                     }
@@ -523,25 +557,41 @@ async fn worker_loop(
 
             UserAction::RejectPlan(reason) => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    rt_opt.as_mut().unwrap().reject_plan(&reason);
+                    let Some(rt) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available in RejectPlan");
+                        continue;
+                    };
+                    rt.reject_plan(&reason);
                 }
             }
 
             // Goal-202: plan-mode pre-confirmation responses.
             UserAction::ApprovePlanMode => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    rt_opt.as_ref().unwrap().approve_plan_mode_request();
+                    let Some(rt) = rt_opt.as_ref() else {
+                        tracing::warn!("backend: runtime not available in ApprovePlanMode");
+                        continue;
+                    };
+                    rt.approve_plan_mode_request();
                 }
             }
             UserAction::RejectPlanMode(reason) => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    rt_opt.as_ref().unwrap().reject_plan_mode_request(&reason);
+                    let Some(rt) = rt_opt.as_ref() else {
+                        tracing::warn!("backend: runtime not available in RejectPlanMode");
+                        continue;
+                    };
+                    rt.reject_plan_mode_request(&reason);
                 }
             }
 
             UserAction::Compact => match &mut state {
                 RuntimeBuild::Ready(rt_opt) => {
-                    if let Err(e) = rt_opt.as_mut().unwrap().compact_now().await {
+                    let Some(rt) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available for Compact");
+                        continue;
+                    };
+                    if let Err(e) = rt.compact_now().await {
                         let _ = event_tx.send(UiEvent::Error {
                             message: format!("compact failed: {e}"),
                         });
@@ -571,8 +621,17 @@ async fn worker_loop(
                 max_turns,
             } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
-                    let rt = rt_opt.take().unwrap();
+                    let pre_turn_len = {
+                        let Some(rt_ref) = rt_opt.as_ref() else {
+                            tracing::warn!("backend: runtime not initialized in SetGoal");
+                            continue;
+                        };
+                        rt_ref.transcript().len()
+                    };
+                    let Some(rt) = rt_opt.take() else {
+                        tracing::warn!("backend: runtime not available for SetGoal task");
+                        continue;
+                    };
                     let gate = rt.plan_approval_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
@@ -598,9 +657,11 @@ async fn worker_loop(
                     )
                     .await;
                     // Suppress goal-loop errors; they are surfaced via GoalContinuing/GoalAchieved.
-                    let mut recovered = Arc::try_unwrap(rt_shared)
-                        .expect("single owner after task end")
-                        .into_inner();
+                    let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
+                        tracing::error!("backend: arc has multiple owners after SetGoal task");
+                        continue;
+                    };
+                    let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
                     }
@@ -617,14 +678,21 @@ async fn worker_loop(
             // Goal-168: clear the active goal.
             UserAction::ClearGoal => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    rt_opt.as_mut().unwrap().clear_goal().await;
+                    let Some(rt) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available in ClearGoal");
+                        continue;
+                    };
+                    rt.clear_goal().await;
                 }
             }
 
             // Goal-171: load a saved session transcript into the runtime.
             UserAction::ResumeSession { session_dir } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let rt = rt_opt.as_mut().unwrap();
+                    let Some(rt) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available in ResumeSession");
+                        continue;
+                    };
                     match crate::session::SessionReader::load_messages(&session_dir) {
                         Ok(messages) => {
                             let turn_count = messages.len();
@@ -680,8 +748,17 @@ async fn worker_loop(
             // Goal-169: run an already-expanded skill prompt.
             UserAction::RunSkillPrompt { prompt } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let pre_turn_len = rt_opt.as_ref().unwrap().transcript().len();
-                    let rt = rt_opt.take().unwrap();
+                    let pre_turn_len = {
+                        let Some(rt_ref) = rt_opt.as_ref() else {
+                            tracing::warn!("backend: runtime not initialized in RunSkillPrompt");
+                            continue;
+                        };
+                        rt_ref.transcript().len()
+                    };
+                    let Some(rt) = rt_opt.take() else {
+                        tracing::warn!("backend: runtime not available for RunSkillPrompt task");
+                        continue;
+                    };
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
@@ -710,9 +787,13 @@ async fn worker_loop(
                             true
                         }
                     };
-                    let mut recovered = Arc::try_unwrap(rt_shared)
-                        .expect("single owner after task end")
-                        .into_inner();
+                    let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
+                        tracing::error!(
+                            "backend: arc has multiple owners after RunSkillPrompt task"
+                        );
+                        continue;
+                    };
+                    let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
                     }
