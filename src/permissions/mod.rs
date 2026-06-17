@@ -488,6 +488,10 @@ impl LayeredPermissionsConfig {
     /// Panics if the session layer does not exist — call
     /// `session_layer_mut()` first to ensure it is created.
     pub fn session_rules(&self) -> &PermissionLayer {
+        #[allow(
+            clippy::expect_used,
+            reason = "session_layer_mut() must be called first to ensure existence"
+        )]
         self.layers
             .iter()
             .find(|l| l.source == RuleSource::Session)
@@ -507,6 +511,7 @@ impl LayeredPermissionsConfig {
                 },
             );
         }
+        #[allow(clippy::expect_used, reason = "session layer was just inserted above")]
         self.layers
             .iter_mut()
             .find(|l| l.source == RuleSource::Session)

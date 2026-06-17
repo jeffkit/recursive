@@ -647,6 +647,7 @@ impl Tool for RememberFact {
             .unwrap_or("workspace")
             .to_string();
 
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let _guard = self.lock.lock().unwrap();
         let path = facts_path(&self.workspace, &scope);
         let mut store = FactStore::load(&path)?;
@@ -847,6 +848,7 @@ impl Tool for ForgetFact {
 
         let scope = arguments["scope"].as_str().unwrap_or("workspace");
 
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let _guard = self.lock.lock().unwrap();
         let path = facts_path(&self.workspace, scope);
         let mut store = FactStore::load(&path)?;
@@ -926,6 +928,7 @@ impl Tool for UpdateFact {
 
         let scope = arguments["scope"].as_str().unwrap_or("workspace");
 
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let _guard = self.lock.lock().unwrap();
         let path = facts_path(&self.workspace, scope);
         let mut store = FactStore::load(&path)?;

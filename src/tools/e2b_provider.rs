@@ -309,6 +309,7 @@ impl Tool for E2bShellTool {
                     })?;
             *guard = Some(sandbox);
         }
+        #[allow(clippy::unwrap_used, reason = "guard was just set to Some above")]
         let sandbox = guard.as_ref().unwrap();
         sandbox.exec(command, self.timeout_secs).await
     }

@@ -32,8 +32,12 @@ impl WebFetch {
             // process cannot perform HTTP requests at all. This is a fatal
             // startup condition equivalent to the providers.rs TOML parse
             // (Invariant #5 §construction).
-            .build()
-            .expect("reqwest client build: TLS backend unavailable");
+            .build();
+        #[allow(
+            clippy::expect_used,
+            reason = "TLS backend unavailable is a fatal startup error"
+        )]
+        let client = client.expect("reqwest client build: TLS backend unavailable");
         Self { client }
     }
 

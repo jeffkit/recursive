@@ -128,6 +128,7 @@ impl SqliteVecStore {
 #[async_trait]
 impl VectorStore for SqliteVecStore {
     async fn upsert(&self, entry: &MemoryEntry, vector: Vec<f32>) -> Result<()> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let conn = self.db.lock().unwrap();
         let tags_json = serde_json::to_string(&entry.tags).unwrap_or_else(|_| "[]".into());
         let blob = if vector.is_empty() {
@@ -150,6 +151,7 @@ impl VectorStore for SqliteVecStore {
         query_text: &str,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let conn = self.db.lock().unwrap();
 
         if !query_vec.is_empty() {
@@ -228,6 +230,7 @@ impl VectorStore for SqliteVecStore {
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let conn = self.db.lock().unwrap();
         conn.execute("DELETE FROM memory_entries WHERE id = ?1", [id])
             .map_err(|e| storage_err(e.to_string()))?;
@@ -235,6 +238,7 @@ impl VectorStore for SqliteVecStore {
     }
 
     async fn list_all(&self) -> Result<Vec<MemoryEntry>> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let conn = self.db.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, text, tags, ts FROM memory_entries ORDER BY ts")

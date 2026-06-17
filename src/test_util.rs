@@ -6,6 +6,8 @@
 //!    and for external consumers (examples, downstream crates).
 //!
 //! Both compilations share the **same statics**, which is the entire
+// Test infrastructure module: unwrap/expect acceptable in test helpers.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! point: process-global state (env vars, current dir, signal handlers)
 //! that the tests mutate must serialise across every binary linked
 //! against this crate. A `Mutex` defined per-module would not — each

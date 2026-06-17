@@ -8,6 +8,14 @@
 //!
 //! Everything else is opt-in. New capabilities are added by implementing
 //! `Tool` or `ChatProvider`, never by editing the loop.
+//!
+//! # Lint policy
+//!
+//! `unwrap()` / `expect()` are banned in production code (AGENTS.md invariant #5).
+//! Test code relaxes this via `#![cfg_attr(test, allow(...))]` below.
+//! Any remaining production exception carries `#[allow(..., reason = "...")]`.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agent;
 pub mod atomic;

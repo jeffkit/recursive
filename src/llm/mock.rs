@@ -3,6 +3,9 @@
 //! `MockProvider` is fed a queue of pre-baked completions. The agent treats
 //! it identically to a real provider, so the agent loop is fully testable
 //! without network access.
+// Test infrastructure: lock().unwrap() is acceptable because mock is only
+// used in test contexts and mutex poison would indicate a test bug.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Mutex;
 

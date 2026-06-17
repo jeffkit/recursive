@@ -58,6 +58,10 @@ pub fn all_presets() -> &'static [ProviderPreset] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Vec<ProviderPreset>> = OnceLock::new();
     CACHE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "TOML is bundled at compile time and always valid"
+        )]
         toml::from_str::<PresetsFile>(PRESETS_TOML)
             .expect("providers.toml is bundled at compile time and must be valid")
             .providers

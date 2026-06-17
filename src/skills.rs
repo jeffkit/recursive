@@ -164,6 +164,10 @@ fn parse_sections(content: &str) -> Vec<SkillSection> {
                 if next.starts_with("## ") {
                     break;
                 }
+                #[allow(
+                    clippy::unwrap_used,
+                    reason = "peeked Some just above in while-let condition"
+                )]
                 section_lines.push(lines.next().unwrap());
             }
 
@@ -592,6 +596,10 @@ pub fn skill_index(skills: &[Skill]) -> String {
 
         // Append scripts suffix if present (after the main line)
         if !script_names.is_empty() {
+            #[allow(
+                clippy::unwrap_used,
+                reason = "lines is non-empty: prior push guarantees at least one element"
+            )]
             let last = lines.last_mut().unwrap();
             *last = format!("{} [scripts: {}]", last, script_names.join(", "));
         }

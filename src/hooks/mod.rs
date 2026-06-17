@@ -254,6 +254,7 @@ impl Hook for ToolTimingHook {
     fn on_event(&self, event: HookEvent) -> HookAction {
         match event {
             HookEvent::PreToolCall { name, .. } => {
+                #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
                 let mut map = self.start_times.lock().unwrap();
                 map.insert(name.to_string(), Instant::now());
                 HookAction::Continue

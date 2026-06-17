@@ -62,6 +62,7 @@ impl Default for NoopVectorStore {
 #[async_trait]
 impl VectorStore for NoopVectorStore {
     async fn upsert(&self, entry: &MemoryEntry, _vector: Vec<f32>) -> Result<()> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let mut entries = self.entries.lock().unwrap();
         if let Some(existing) = entries.iter_mut().find(|e| e.id == entry.id) {
             *existing = entry.clone();
@@ -77,6 +78,7 @@ impl VectorStore for NoopVectorStore {
         query_text: &str,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let entries = self.entries.lock().unwrap();
         let q = query_text.to_lowercase();
         let matches: Vec<MemoryEntry> = entries
@@ -92,12 +94,14 @@ impl VectorStore for NoopVectorStore {
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|e| e.id != id);
         Ok(())
     }
 
     async fn list_all(&self) -> Result<Vec<MemoryEntry>> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
         let entries = self.entries.lock().unwrap();
         Ok(entries.clone())
     }
