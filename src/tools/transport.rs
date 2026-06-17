@@ -185,8 +185,12 @@ impl SshTransport {
     async fn ssh_exec(&self, command: &str) -> std::io::Result<ExecResult> {
         let mut child = self.build_ssh_command(command).spawn()?;
 
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe not available")
+        })?;
 
         let max: usize = 128 * 1024;
         let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
@@ -346,8 +350,12 @@ impl ToolTransport for SshTransport {
 
         let mut child = self.build_ssh_command(&remote_cmd).spawn()?;
 
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe not available")
+        })?;
 
         let max = max_output_bytes;
         let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
@@ -433,8 +441,12 @@ impl ToolTransport for LocalTransport {
 
         let mut child = cmd.spawn()?;
 
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe not available")
+        })?;
 
         let max = max_output_bytes;
         let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
