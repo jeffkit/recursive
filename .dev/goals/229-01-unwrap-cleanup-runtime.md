@@ -1,4 +1,4 @@
-# Goal 229-01 — Unwrap cleanup batch 01: runtime.rs + kernel.rs
+# Goal 229-01 — Unwrap cleanup batch 01: checkpoint.rs + mcp.rs
 
 **Roadmap**: Phase 20 — 0.7 Refactor & Hardening
 **父 goal**: Goal 229
@@ -7,16 +7,20 @@
 
 ## Why
 
-当前 `src/runtime.rs` 有 **83 处** `.unwrap()` / `.expect(...)` 调用，`src/kernel.rs` 有 **4 处**，合计 87 处——全部在非测试代码中违反了 AGENTS.md Invariant #5。
+当前生产代码（非测试、非 `unwrap_or` 变体）中，最高密度的两个文件是：
+- `src/checkpoint.rs`：**51 处** `.unwrap()` / `.expect(...)`
+- `src/mcp.rs`：**47 处** `.unwrap()` / `.expect(...)`
 
-这是 unwrap 系列清理的第一批，目标是最高密度的两个文件。
+注意：`runtime.rs` 的 83 处 unwrap 大部分在测试代码（line 1300+）或是安全的 `unwrap_or`/`unwrap_or_default`——不需要修改。
+
+这是 unwrap 系列清理的第一批，目标是真正有问题的两个文件。
 
 ## Scope（只改这两个文件，不动其他）
 
 ### 目标文件
 
-- `src/runtime.rs`（83 处）
-- `src/kernel.rs`（4 处）
+- `src/checkpoint.rs`（51 处生产代码 unwrap）
+- `src/mcp.rs`（47 处生产代码 unwrap）
 
 ### 替换策略（按优先级）
 
@@ -49,8 +53,8 @@
 - `cargo test --workspace` 全绿
 - `cargo clippy --all-targets --all-features -- -D warnings` 干净
 - `cargo fmt --all` 通过
-- `grep -c "\.unwrap()\|\.expect(" src/runtime.rs` 输出 ≤ 5（剩余必须有 `#[allow]` 注解）
-- `grep -c "\.unwrap()\|\.expect(" src/kernel.rs` 输出 = 0
+- `grep -c "\.unwrap()\|\.expect(" src/checkpoint.rs` 输出 ≤ 5（剩余必须有 `#[allow]` 注解）
+- `grep -c "\.unwrap()\|\.expect(" src/mcp.rs` 输出 ≤ 10（剩余必须有 `#[allow]` 注解）
 
 ## 输出说明
 
@@ -64,4 +68,6 @@
 - `runtime.rs` 很长，用 `read_file` 的 `start_line`/`end_line` 参数分段读
 - 避免用 `write_file` 覆盖整个文件——use `apply_patch`
 - 有些 `Mutex::lock().unwrap()` 是"锁不会毒（正常流程不 panic）"的逻辑保证，但仍要加 `#[allow]` + reason
-- **DO NOT modify** src/session.rs, src/mcp.rs, src/tools/, src/agent/, src/main.rs, 或任何其他文件
+- **DO NOT modify** src/session.rs, src/runtime.rs, src/tools/, src/agent/, src/main.rs, 或任何其他文件
+- 注意：`runtime.rs` 的 unwrap 大多在测试代码，不是本批目标
+- 先 `grep -n "\.unwrap()\|\.expect(" src/checkpoint.rs | grep -v "cfg(test)\|mod tests" | head -20` 了解分布再下手
