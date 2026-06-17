@@ -1,16 +1,19 @@
-//! Per-session sentinel lock (Goal 151).
+//! Session lifecycle operations: locking, truncation, and UUID chain recovery.
 //!
-//! Pulled out of `session.rs` so the file there focuses on
-//! [`crate::session::SessionWriter`] / `SessionReader` semantics. The
-//! implementation is unchanged — see the blame on `session.rs` for
-//! historical context. All names re-exported from `crate::session` so
-//! external paths like `recursive::session::SessionLock` keep working.
+//! Merges the former `session_lock.rs` (Goal 151 sentinel lock) with
+//! `truncate_transcript_to_turn` and `read_last_message_uuid` from
+//! `session.rs` during the Goal 221 module refactor.
 
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-// Crate-internal so the test suite under `src/session.rs` can construct
-// custom sentinel files for stale-lock recovery tests.
+// Crate-internal so the test suite can construct custom sentinel files
+// for stale-lock recovery tests.
 pub(crate) const SESSION_LOCK_FILE: &str = ".lock";
+
+// ---------------------------------------------------------------------------
+// Session lock (Goal 151)
+// ---------------------------------------------------------------------------
 
 /// Error type carried inside [`std::io::Error::other`] when
 /// [`SessionLock::acquire`] refuses because another live process
@@ -44,8 +47,8 @@ impl std::error::Error for SessionLockBusy {}
 
 /// Parsed contents of a `.lock` sentinel file.
 ///
-/// `pub(crate)` so the test suite in `src/session.rs` can construct custom
-/// sentinels for stale-lock recovery / cross-host abort tests.
+/// `pub(crate)` so the test suite can construct custom sentinels for
+/// stale-lock recovery / cross-host abort tests.
 pub(crate) struct SentinelInfo {
     pub(crate) pid: u32,
     pub(crate) hostname: String,
@@ -267,13 +270,137 @@ impl Drop for SessionLock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UUID chain recovery
+// ---------------------------------------------------------------------------
+
+/// Read the UUID of the last message-type (TranscriptEntry) line in a JSONL
+/// file. Skips compact_boundary system entries. Returns `None` if the file
+/// is empty, unreadable, or all entries lack a UUID (pre-g155 files).
+pub(crate) fn read_last_message_uuid(jsonl_path: &Path) -> Option<String> {
+    let file = std::fs::File::open(jsonl_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<super::serialize::TranscriptEntry>(&line) {
+            if !entry.uuid.is_empty() {
+                last = Some(entry.uuid);
+            }
+        }
+    }
+    last
+}
+
+// ---------------------------------------------------------------------------
+// Transcript truncation
+// ---------------------------------------------------------------------------
+
+/// Truncate `transcript.jsonl` (and the session's `.meta.json`
+/// `message_count`) so that only the messages from turns
+/// `0..cutoff_turn` survive.
+///
+/// "Turn N" is defined as the N-th non-system, non-tool user message
+/// in the transcript (0-indexed). The system prompt (if any) and any
+/// seed messages preceding the first user turn are always preserved.
+///
+/// Used by `recursive sessions rewind --to-turn N` to keep transcript
+/// state in sync with the workspace state restored from a checkpoint.
+pub fn truncate_transcript_to_turn(
+    session_dir: &Path,
+    cutoff_turn: usize,
+) -> std::io::Result<TruncateStats> {
+    let jsonl_path = session_dir.join("transcript.jsonl");
+    if !jsonl_path.exists() {
+        return Ok(TruncateStats {
+            kept: 0,
+            dropped: 0,
+        });
+    }
+
+    // Stream-read so we don't load the whole transcript into memory.
+    let file = std::fs::File::open(&jsonl_path)?;
+    let reader = std::io::BufReader::new(file);
+
+    let tmp_path = jsonl_path.with_extension("jsonl.rewind-tmp");
+    let tmp = std::fs::File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(tmp);
+
+    let mut user_seen = 0usize;
+    let mut kept = 0u64;
+    let mut dropped = 0u64;
+    let mut stop = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if stop {
+            dropped += 1;
+            continue;
+        }
+
+        // Peek role without full deserialisation.
+        let role = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|v| v.get("role").and_then(|r| r.as_str()).map(str::to_string));
+
+        let is_turn_boundary = matches!(role.as_deref(), Some("user"));
+        if is_turn_boundary {
+            if user_seen >= cutoff_turn {
+                // This user message starts the turn we're rewinding;
+                // drop it and everything after.
+                stop = true;
+                dropped += 1;
+                continue;
+            }
+            user_seen += 1;
+        }
+
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
+        kept += 1;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    std::fs::rename(&tmp_path, &jsonl_path)?;
+
+    // Update .meta.json message_count if present.
+    let meta_path = session_dir.join(".meta.json");
+    if meta_path.exists() {
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            if let Ok(mut meta) = serde_json::from_slice::<super::SessionMeta>(&bytes) {
+                meta.message_count = kept;
+                meta.updated_at = super::chrono_lite_now();
+                if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                    let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
+                }
+            }
+        }
+    }
+
+    Ok(TruncateStats { kept, dropped })
+}
+
+/// Stats returned by [`truncate_transcript_to_turn`].
+#[derive(Debug, Clone, Copy)]
+pub struct TruncateStats {
+    pub kept: u64,
+    pub dropped: u64,
+}
+
 #[cfg(test)]
 mod tests {
-    //! Tests that exercise the sentinel internals live here. The
-    //! "live PID blocks acquire" case stays in `session.rs` because it
-    //! only needs the public API.
-
     use super::*;
+    use crate::message::Message;
+    use crate::session::{SessionReader, SessionStatus, SessionWriter};
+
+    // -- SessionLock tests --------------------------------------------------
 
     #[test]
     fn lock_dead_pid_recovered() {
@@ -337,5 +464,104 @@ mod tests {
 
         // A fresh acquire should succeed.
         let _lock2 = SessionLock::acquire(&session_dir).unwrap();
+    }
+
+    #[test]
+    fn lock_alive_pid_blocks_acquire() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let session_dir = tmp.path().join("session-A");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // First acquire succeeds; lock file now holds OUR pid.
+        let lock = SessionLock::acquire(&session_dir).unwrap();
+
+        // Second acquire by the same process: pid is alive (it's
+        // us!), so it must refuse.
+        let err = SessionLock::acquire(&session_dir).expect_err("second acquire should fail");
+        // Match the inner SessionLockBusy via Display.
+        assert!(
+            err.to_string()
+                .contains(&format!("pid {}", std::process::id())),
+            "expected error to mention our pid {}, got: {}",
+            std::process::id(),
+            err
+        );
+
+        drop(lock);
+    }
+
+    // -- truncate_transcript_to_turn tests -----------------------------------
+
+    #[test]
+    fn truncate_transcript_to_turn_drops_at_user_boundary() {
+        let dir = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
+        // Sequence: system, user(turn 0), assistant, user(turn 1),
+        // assistant, user(turn 2), assistant.
+        w.append(&Message::system("sys".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("u0".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("u1".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a1".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("u2".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a2".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let session_dir = w.session_dir().to_path_buf();
+
+        // Rewind to turn 1 → keep system + u0 + a0; drop u1 onwards.
+        let stats = truncate_transcript_to_turn(&session_dir, 1).unwrap();
+        assert_eq!(stats.kept, 3);
+        assert_eq!(stats.dropped, 4);
+
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].role, "system");
+        assert_eq!(entries[1].role, "user");
+        assert_eq!(entries[1].content, "u0");
+        assert_eq!(entries[2].role, "assistant");
+        assert_eq!(entries[2].content, "a0");
+
+        // Meta should reflect the new count.
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.message_count, 3);
+    }
+
+    #[test]
+    fn truncate_transcript_to_zero_drops_all_turns_keeps_system() {
+        let dir = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
+        w.append(&Message::system("sys".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("u0".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        let stats = truncate_transcript_to_turn(&session_dir, 0).unwrap();
+        assert_eq!(stats.kept, 1, "system message should remain");
+        assert_eq!(stats.dropped, 2);
+
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "system");
+    }
+
+    #[test]
+    fn truncate_transcript_missing_file_is_noop() {
+        let dir = crate::test_util::IsolatedWorkspace::new();
+        // No session created → no transcript.jsonl. Should not panic.
+        let stats = truncate_transcript_to_turn(dir.path(), 5).unwrap();
+        assert_eq!(stats.kept, 0);
+        assert_eq!(stats.dropped, 0);
     }
 }

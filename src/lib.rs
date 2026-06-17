@@ -42,7 +42,6 @@ pub mod run_core;
 pub mod runtime;
 pub mod runtime_goal;
 pub mod session;
-pub mod session_lock;
 pub mod skills;
 pub mod storage;
 pub mod tasks;
