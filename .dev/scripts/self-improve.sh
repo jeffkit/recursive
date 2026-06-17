@@ -780,6 +780,24 @@ Please fix the compilation/test errors. Do NOT start over — fix the specific i
   fi
 fi
 
+# ---- File size check (soft-fail) --------------------------------------------
+# Goal 228: warn when src/*.rs > 800 lines or tests/*.rs > 1000 lines.
+# This is a soft gate — violations are logged but never trigger a rollback.
+# The check alerts the operator and feeds data into Phase 20 refactoring
+# goals (220, 221, 222, 225) which will split oversized files down.
+#
+# Disable with RECURSIVE_FILE_SIZE_CHECK=0 if a goal deliberately grows a
+# file (rare — most goals should shrink or maintain file sizes).
+_CHECK_FS="$DEV_DIR/../scripts/check-file-sizes.sh"
+if [[ "${RECURSIVE_FILE_SIZE_CHECK:-1}" == "1" ]] \
+   && [[ -x "$_CHECK_FS" ]]; then
+  if ! "$_CHECK_FS" 2>&1 | tee -a "$LOG"; then
+    echo "[self-improve] FILE-SIZE: violations detected (soft-fail, continuing)" | tee -a "$LOG"
+  else
+    echo "[self-improve] FILE-SIZE: all files within limits ✓" | tee -a "$LOG"
+  fi
+fi
+
 # ---- Clippy check (-D warnings) ----------------------------------------------
 # Defence in depth #3: enforce `cargo clippy --all-targets --all-features
 # -- -D warnings`. AGENTS.md and CLAUDE.md both name clippy as a
