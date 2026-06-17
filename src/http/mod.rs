@@ -1041,6 +1041,13 @@ pub fn spawn_session_reaper(
                     }
                 }
             }
+            // Prune stale event_channels for evicted sessions.
+            {
+                let mut channels = state.event_channels.write().await;
+                for id in &to_evict {
+                    channels.remove(id);
+                }
+            }
         }
     })
 }

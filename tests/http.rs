@@ -811,6 +811,84 @@ mod http_tests {
         assert_eq!(response.status(), 404);
     }
 
+    /// Goal-310: delete_session must clean up event_channels.
+    #[tokio::test]
+    async fn delete_session_cleans_up_event_channels() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "Hello!".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+
+        // Create a session
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = create_resp["id"].as_str().unwrap().to_string();
+
+        // Send a message to trigger event channel creation.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/messages", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "Hi"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Verify event channel entry exists.
+        assert!(
+            state.event_channels.read().await.contains_key(&session_id),
+            "event channel entry must exist after sending a message"
+        );
+
+        // Delete the session.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+
+        // Verify event channel entry is removed.
+        assert!(
+            !state.event_channels.read().await.contains_key(&session_id),
+            "event channel entry must be removed after session deletion"
+        );
+    }
+
     #[tokio::test]
     async fn post_message_to_nonexistent_session_returns_404() {
         let provider = Arc::new(MockProvider::new(vec![]));

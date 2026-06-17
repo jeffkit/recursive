@@ -412,6 +412,8 @@ pub(super) async fn delete_session(
             .metrics
             .sessions_active
             .fetch_sub(1, Ordering::Relaxed);
+        // Clean up SSE event channel for this session.
+        state.event_channels.write().await.remove(&id);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("session not found"))
