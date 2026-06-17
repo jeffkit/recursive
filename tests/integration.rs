@@ -14,8 +14,9 @@ use recursive::{
     llm::{Completion, MockProvider, ToolCall},
     message::Message,
     runtime::AgentRuntime,
+    skills::{skill_index, Skill, SkillMode},
     tools::PermissionHook,
-    tools::{LocalTransport, ToolRegistry, ToolTransport},
+    tools::{LoadSkill, LocalTransport, Recall, Remember, ToolRegistry, ToolTransport},
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -1254,5 +1255,280 @@ async fn plan_mode_write_tool_blocked_until_exit() {
     assert!(
         !root.join("test.txt").exists(),
         "test.txt should not exist because Write was blocked in plan mode"
+    );
+}
+
+// ============================================================================
+// Goal-317: Memory + skill loading pipeline integration test
+//
+// Verifies the end-to-end `remember`/`recall` round-trip and the
+// `skill_index` → `load_skill` → use-skill pipeline. Both tests use
+// scripted `MockProvider` responses — no real LLM calls — and a
+// per-test `TempDir` workspace for filesystem isolation.
+// ============================================================================
+
+/// Test 1: `remember` → `recall` round-trip in a scripted run.
+///
+/// Simulates an agent that:
+///   1. Calls `remember` to save "Rust" under the tag "project-language".
+///   2. Calls `recall` to search for the project language.
+///   3. Returns a final answer that names the recalled value.
+///
+/// Asserts:
+///   - The run finishes with `FinishReason::NoMoreToolCalls`.
+///   - The transcript contains exactly one `Role::Tool` result for
+///     `remember` (success) and one for `recall` (containing "Rust").
+#[tokio::test]
+async fn remember_recall_roundtrip_in_scripted_run() {
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path();
+
+    let script = vec![
+        // Step 1: agent calls remember.
+        // The actual `Remember` tool takes a `text` argument (the note
+        // body) and optional `tags` for filtering — we use the tag as
+        // a stand-in for the goal's "key".
+        Completion {
+            content: "saving project language note".into(),
+            tool_calls: vec![ToolCall {
+                id: "r1".into(),
+                name: "remember".into(),
+                arguments: json!({"text": "Rust", "tags": ["project-language"]}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        // Step 2: agent calls recall with the same tag to retrieve it.
+        Completion {
+            content: "looking up the project language".into(),
+            tool_calls: vec![ToolCall {
+                id: "r2".into(),
+                name: "recall".into(),
+                arguments: json!({"tag": "project-language"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        // Step 3: agent finishes with a final answer that uses the recall.
+        Completion {
+            content: "The project uses Rust.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let llm = Arc::new(MockProvider::new(script));
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    let tools = ToolRegistry::new(transport)
+        .register(Arc::new(Remember::new(ws)))
+        .register(Arc::new(Recall::new(ws)));
+
+    let mut runtime = AgentRuntime::builder()
+        .llm(llm)
+        .tools(tools)
+        .system_prompt("you are a test agent that uses remember/recall")
+        .max_steps(5)
+        .build()
+        .unwrap();
+
+    let outcome = runtime
+        .run("remember and recall the project language")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.finish_reason,
+        FinishReason::NoMoreToolCalls,
+        "expected NoMoreToolCalls, got {:?}",
+        outcome.finish_reason
+    );
+
+    // The transcript should contain exactly two `Role::Tool` messages:
+    // one for `remember` and one for `recall`, in that order.
+    let tool_msgs: Vec<&Message> = runtime
+        .transcript()
+        .iter()
+        .filter(|m| m.role == recursive::message::Role::Tool)
+        .collect();
+
+    assert_eq!(
+        tool_msgs.len(),
+        2,
+        "expected exactly 2 tool-result messages (remember, recall), got {}",
+        tool_msgs.len()
+    );
+
+    // The first tool result is for `remember`. It should be a success
+    // marker — the `Remember::execute` method returns "saved note N{n}".
+    let remember_result = &tool_msgs[0].content;
+    assert!(
+        remember_result.contains("saved note"),
+        "remember result should report a saved note, got: {remember_result}"
+    );
+
+    // The second tool result is for `recall`. It must contain the
+    // string "Rust" — the value we remembered.
+    let recall_result = &tool_msgs[1].content;
+    assert!(
+        recall_result.contains("Rust"),
+        "recall result should contain 'Rust', got: {recall_result}"
+    );
+
+    // The on-disk memory file should have been created as a side
+    // effect of the `remember` call, proving persistence across the
+    // tool boundary (not just in-process state).
+    let memory_file = ws.join(".recursive").join("memory.json");
+    assert!(
+        memory_file.exists(),
+        "memory file should exist on disk after remember call"
+    );
+    let raw = std::fs::read_to_string(&memory_file).unwrap();
+    assert!(
+        raw.contains("Rust"),
+        "on-disk memory file should contain the note text"
+    );
+    assert!(
+        raw.contains("project-language"),
+        "on-disk memory file should contain the tag"
+    );
+}
+
+/// Test 2: `load_skill` → act pipeline in a scripted run.
+///
+/// Simulates an agent that:
+///   1. Receives a system prompt containing a `skill_index` listing
+///      the "test-task" skill.
+///   2. Calls `load_skill` to load the body of that skill.
+///   3. Uses the returned content ("cargo test") in its final answer.
+///
+/// Asserts:
+///   - The `load_skill` tool result contains the skill body
+///     (specifically the keyword "cargo test").
+///   - The final assistant text mentions "cargo test", demonstrating
+///     the agent integrated the skill into its reasoning.
+#[tokio::test]
+async fn load_skill_then_act_in_scripted_run() {
+    // Build a single-skill registry. The Skill struct requires a
+    // `path` (LoadSkill reads the body from the file), so we write
+    // a SKILL.md to a tempdir and construct the Skill struct with
+    // its path pointing there.
+    let tmp = TempDir::new().unwrap();
+    let skill_dir = tmp.path().join("test-task");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: test-task\ndescription: How to run Rust tests\n---\n\n\
+         Run `cargo test --workspace` to execute all tests.",
+    )
+    .unwrap();
+
+    let skills = vec![Skill {
+        name: "test-task".to_string(),
+        description: "How to run Rust tests".to_string(),
+        path: skill_dir.join("SKILL.md"),
+        mode: SkillMode::Manual,
+        triggers: vec![],
+        hint: String::new(),
+        depends_on: vec![],
+        refs: vec![],
+        params: vec![],
+        scripts: vec![],
+        sections: vec![],
+    }];
+
+    // Sanity: skill_index should list the skill so the agent
+    // knows it exists before it calls `load_skill`.
+    let idx = skill_index(&skills);
+    assert!(
+        idx.contains("test-task"),
+        "skill_index should list the skill"
+    );
+    assert!(
+        idx.contains("How to run Rust tests"),
+        "skill_index should include the description"
+    );
+
+    // Script: load the skill, then finish with an answer that uses it.
+    let script = vec![
+        Completion {
+            content: "loading the test-task skill".into(),
+            tool_calls: vec![ToolCall {
+                id: "ls1".into(),
+                name: "Skill".into(),
+                arguments: json!({"name": "test-task"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "To run tests, use cargo test --workspace.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let llm = Arc::new(MockProvider::new(script));
+    let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
+    let tools = ToolRegistry::new(transport).register(Arc::new(LoadSkill::new(skills.clone())));
+
+    // Inject the skill index into the system prompt so the agent
+    // knows which skills are available.
+    let system_prompt = format!("You are a test agent.\n{idx}");
+
+    let mut runtime = AgentRuntime::builder()
+        .llm(llm)
+        .tools(tools)
+        .system_prompt(system_prompt)
+        .max_steps(5)
+        .build()
+        .unwrap();
+
+    let outcome = runtime.run("how do I run tests?").await.unwrap();
+
+    assert_eq!(
+        outcome.finish_reason,
+        FinishReason::NoMoreToolCalls,
+        "expected NoMoreToolCalls, got {:?}",
+        outcome.finish_reason
+    );
+
+    // The transcript should have exactly one `Role::Tool` message —
+    // the `load_skill` result. (No other tool was registered.)
+    let tool_msgs: Vec<&Message> = runtime
+        .transcript()
+        .iter()
+        .filter(|m| m.role == recursive::message::Role::Tool)
+        .collect();
+    assert_eq!(
+        tool_msgs.len(),
+        1,
+        "expected exactly 1 tool-result message (load_skill), got {}",
+        tool_msgs.len()
+    );
+
+    // The load_skill result must contain the body of the skill
+    // (specifically the "cargo test" command the agent will use).
+    let load_result = &tool_msgs[0].content;
+    assert!(
+        load_result.contains("cargo test"),
+        "load_skill result should contain the skill body 'cargo test', got: {load_result}"
+    );
+
+    // The final assistant text should mention "cargo test" — the
+    // agent has integrated the skill into its reasoning.
+    let final_text = outcome
+        .final_text
+        .as_deref()
+        .expect("expected a final assistant message");
+    assert!(
+        final_text.contains("cargo test"),
+        "final assistant text should reference 'cargo test' (the skill body), got: {final_text}"
     );
 }
