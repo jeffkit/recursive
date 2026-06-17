@@ -1335,6 +1335,370 @@ mod http_tests {
         );
     }
 
+    // ── Goal 313: G295-migrated handlers (plan/goal/interrupt) emit the
+    //    standardized `{"error": "..."}` envelope. Mirrors the G304 test
+    //    for plan_confirm / plan_reject / session_set_goal /
+    //    session_interrupt. The G304 test already covers
+    //    `run_agent` / `create_session` / `send_session_message`.
+
+    /// Pin the G313 contract: `POST /sessions/:id/plan/confirm` against
+    /// a nonexistent session_id returns 404 with `{"error": "..."}` and
+    /// NO `status` field (the standardized ApiError envelope).
+    #[tokio::test]
+    async fn plan_confirm_returns_api_error_envelope_on_404() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent-plan-confirm/plan/confirm")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404, "missing session must 404");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("ApiError envelope must have a string `error` field");
+        assert!(
+            !err.is_empty(),
+            "ApiError envelope `error` must be non-empty, got: {body}"
+        );
+        assert!(
+            err.contains("session") && err.contains("not found"),
+            "404 error should mention session not found, got: {err}"
+        );
+    }
+
+    /// Pin the G313 contract: `POST /sessions/:id/plan/reject` against
+    /// a nonexistent session_id returns 404 with `{"error": "..."}`.
+    #[tokio::test]
+    async fn plan_reject_returns_api_error_envelope_on_404() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent-plan-reject/plan/reject")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"missing"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404, "missing session must 404");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("ApiError envelope must have a string `error` field");
+        assert!(
+            !err.is_empty(),
+            "ApiError envelope `error` must be non-empty, got: {body}"
+        );
+        assert!(
+            err.contains("session") && err.contains("not found"),
+            "404 error should mention session not found, got: {err}"
+        );
+    }
+
+    /// Pin the G313 contract: `POST /sessions/:id/goal` against a
+    /// nonexistent session_id returns 404 with `{"error": "..."}`.
+    #[tokio::test]
+    async fn session_set_goal_returns_api_error_envelope_on_404() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent-set-goal/goal")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"condition":"something"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404, "missing session must 404");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("ApiError envelope must have a string `error` field");
+        assert!(
+            !err.is_empty(),
+            "ApiError envelope `error` must be non-empty, got: {body}"
+        );
+        assert!(
+            err.contains("session") && err.contains("not found"),
+            "404 error should mention session not found, got: {err}"
+        );
+    }
+
+    /// Pin the G313 contract: `POST /sessions/:id/interrupt` against a
+    /// nonexistent session_id returns 404 with `{"error": "..."}`.
+    #[tokio::test]
+    async fn session_interrupt_returns_api_error_envelope_on_404() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/nonexistent-interrupt/interrupt")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404, "missing session must 404");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("404 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("ApiError envelope must have a string `error` field");
+        assert!(
+            !err.is_empty(),
+            "ApiError envelope `error` must be non-empty, got: {body}"
+        );
+        assert!(
+            err.contains("session") && err.contains("not found"),
+            "404 error should mention session not found, got: {err}"
+        );
+    }
+
+    /// Pin the G313 contract: 409 CONFLICT responses on the migrated
+    /// handlers must also use the standardized `{"error": "..."}`
+    /// envelope. This covers the two 409 sites reachable without a
+    /// real agent turn:
+    ///   - `plan_confirm` when no plan is pending ("session is not
+    ///     awaiting plan approval").
+    ///   - `set_goal` when the runtime Mutex is held by an in-flight
+    ///     turn ("session runtime is busy").
+    #[tokio::test]
+    async fn goal_313_plan_and_set_goal_conflicts_use_api_error_envelope() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        // Create a session — needed for the plan_confirm 409 case (the
+        // session exists but has no pending plan).
+        let create_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // ── plan_confirm 409 ──────────────────────────────────────────
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/plan/confirm"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "plan_confirm with no pending plan must 409"
+        );
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("409 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "409 ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("409 envelope must have a string `error` field");
+        assert!(
+            err.contains("plan approval"),
+            "409 error should mention plan approval, got: {err}"
+        );
+
+        // ── set_goal 409 — pin the JSON envelope (the runtime is
+        //    *not* busy in this fixture, so set_goal returns 200; we
+        //    verify the body shape on the SUCCESS path instead, and
+        //    cover the 409 envelope shape via the lower-level ApiError
+        //    unit-level assertions in the per-handler tests above).
+        //    To exercise the 409 we acquire the runtime Mutex first;
+        //    that requires touching AppState directly.
+        let runtime_arc = {
+            let sessions = state.sessions.read().await;
+            sessions.get(&session_id).unwrap().runtime.clone()
+        };
+        let _guard = runtime_arc.lock().await;
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"condition":"something"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "set_goal with busy runtime must 409");
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("409 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "set_goal 409 ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("set_goal 409 envelope must have a string `error` field");
+        assert!(
+            !err.is_empty(),
+            "set_goal 409 envelope `error` must be non-empty, got: {body}"
+        );
+        assert!(
+            err.contains("busy"),
+            "set_goal 409 error should mention busy, got: {err}"
+        );
+    }
+
+    /// Pin the G313 contract: `DELETE /sessions/:id/goal` (clear_goal)
+    /// returns 409 with the standardized `{"error": "..."}` envelope
+    /// AND preserves the `Retry-After: 5` header AND keeps the old
+    /// `retry after` hint text in the error message.
+    #[tokio::test]
+    async fn goal_313_clear_goal_409_envelope_preserves_retry_after_hint() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state.clone());
+
+        // Create a session.
+        let create_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Hold the runtime Mutex so clear_goal hits its 409 path.
+        let runtime_arc = {
+            let sessions = state.sessions.read().await;
+            sessions.get(&session_id).unwrap().runtime.clone()
+        };
+        let _guard = runtime_arc.lock().await;
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{session_id}/goal"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "clear_goal with busy runtime must 409");
+
+        // Retry-After header must still be set so clients can back off.
+        // Check the headers BEFORE consuming the body (into_body moves).
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header missing on clear_goal 409")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            retry_after, "5",
+            "Retry-After must stay at 5s for clear_goal 409"
+        );
+
+        // Standardized envelope — `{"error": "..."}`, no legacy `status` field.
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("409 body must be valid JSON");
+        assert!(
+            body.get("status").is_none(),
+            "clear_goal 409 ApiError envelope must NOT include a `status` field, got: {body}"
+        );
+        let err = body["error"]
+            .as_str()
+            .expect("clear_goal 409 envelope must have a string `error` field");
+        // Goal-313: the original `hint` text must survive in the error
+        // message even though we dropped the separate `hint`/`session_id`
+        // top-level keys (so clients can still parse a uniform envelope).
+        assert!(
+            err.contains("retry after"),
+            "clear_goal 409 error must preserve the original hint text, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn sse_event_serialization() {
         // Verify SseEvent serializes to expected JSON structure

@@ -570,14 +570,11 @@ pub(super) async fn session_plan_confirm(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     Json(body): Json<PlanConfirmRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let sessions = state.sessions.read().await;
-    let Some(session) = sessions.get(&session_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "session not found"})),
-        );
-    };
+    let session = sessions
+        .get(&session_id)
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
     let pending = session
         .plan_approval_gate
         .pending_plan
@@ -585,10 +582,7 @@ pub(super) async fn session_plan_confirm(
         .ok()
         .and_then(|g| g.clone());
     if pending.is_none() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "session is not awaiting plan approval"})),
-        );
+        return Err(ApiError::conflict("session is not awaiting plan approval"));
     }
     // Optionally replace the plan text before approving.
     if let Some(edited) = body.edits {
@@ -597,10 +591,10 @@ pub(super) async fn session_plan_confirm(
         }
     }
     session.plan_approval_gate.approve();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "approved", "session_id": session_id})),
-    )
+    Ok(Json(serde_json::json!({
+        "status": "approved",
+        "session_id": session_id
+    })))
 }
 
 /// POST /sessions/:id/plan/reject — reject the pending plan.
@@ -608,14 +602,11 @@ pub(super) async fn session_plan_reject(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     Json(body): Json<PlanRejectRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let sessions = state.sessions.read().await;
-    let Some(session) = sessions.get(&session_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "session not found"})),
-        );
-    };
+    let session = sessions
+        .get(&session_id)
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
     let pending = session
         .plan_approval_gate
         .pending_plan
@@ -623,17 +614,14 @@ pub(super) async fn session_plan_reject(
         .ok()
         .and_then(|g| g.clone());
     if pending.is_none() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "session is not awaiting plan approval"})),
-        );
+        return Err(ApiError::conflict("session is not awaiting plan approval"));
     }
     let reason = body.reason.unwrap_or_default();
     session.plan_approval_gate.reject(&reason);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "rejected", "session_id": session_id})),
-    )
+    Ok(Json(serde_json::json!({
+        "status": "rejected",
+        "session_id": session_id
+    })))
 }
 
 // ── Goal-168: goal endpoints ──────────────────────────────────────────────
@@ -643,15 +631,12 @@ pub(super) async fn session_set_goal(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     Json(body): Json<SetGoalRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
         let sessions = state.sessions.read().await;
-        let Some(session) = sessions.get(&session_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "session not found"})),
-            );
-        };
+        let session = sessions
+            .get(&session_id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
         session.runtime.clone()
     };
 
@@ -664,35 +649,26 @@ pub(super) async fn session_set_goal(
             runtime.set_goal(condition, max_turns).await;
         }
         Err(_) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "session runtime is busy"})),
-            );
+            return Err(ApiError::conflict("session runtime is busy"));
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "pursuing", "session_id": session_id})),
-    )
+    Ok(Json(serde_json::json!({
+        "status": "pursuing",
+        "session_id": session_id
+    })))
 }
 
 /// DELETE /sessions/:id/goal — clear the active goal.
 pub(super) async fn session_clear_goal(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
+) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
         let sessions = state.sessions.read().await;
-        let Some(session) = sessions.get(&session_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "session not found"})),
-            )
-                .into_response();
-        };
+        let session = sessions
+            .get(&session_id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
         session.runtime.clone()
     };
 
@@ -702,35 +678,27 @@ pub(super) async fn session_clear_goal(
         Ok(runtime) => {
             runtime.clear_goal().await;
             drop(runtime);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "cleared", "session_id": session_id})),
-            )
-                .into_response()
+            Ok(Json(serde_json::json!({
+                "status": "cleared",
+                "session_id": session_id
+            })))
         }
         Err(_) => {
             // Runtime is busy with an in-flight turn; retry briefly.
             if runtime_goal_state_clear(&runtime_arc).await {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"status": "cleared", "session_id": session_id})),
-                )
-                    .into_response();
+                return Ok(Json(serde_json::json!({
+                    "status": "cleared",
+                    "session_id": session_id
+                })));
             }
-            let mut resp = (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "session runtime is busy; goal not cleared",
-                    "session_id": session_id,
-                    "hint": "retry after the current turn completes"
-                })),
+            // Fold the original `hint` text into the error message so the
+            // standardized `{"error": "..."}` envelope preserves it (Goal-313).
+            // Attach `Retry-After: 5` via ApiError::with_retry_after so
+            // clients that respect the hint can back off correctly.
+            Err(ApiError::conflict(
+                "session runtime is busy; goal not cleared — retry after the current turn completes",
             )
-                .into_response();
-            resp.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("5"),
-            );
-            resp
+            .with_retry_after(5))
         }
     }
 }
@@ -763,15 +731,12 @@ async fn runtime_goal_state_clear(
 pub(super) async fn session_interrupt(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let token_arc = {
         let sessions = state.sessions.read().await;
-        let Some(session) = sessions.get(&session_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "session not found"})),
-            );
-        };
+        let session = sessions
+            .get(&session_id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
         session.interrupt_token.clone()
     };
 
@@ -781,10 +746,10 @@ pub(super) async fn session_interrupt(
         token.cancel();
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "interrupted", "session_id": session_id})),
-    )
+    Ok(Json(serde_json::json!({
+        "status": "interrupted",
+        "session_id": session_id
+    })))
 }
 
 // ── Goal-169: slash commands endpoint ─────────────────────────────────────
@@ -1712,10 +1677,16 @@ mod tests {
     /// Simulate a busy runtime (mutex held by an in-flight turn) and
     /// verify `session_clear_goal` returns 409 with Retry-After: 5.
     /// Then release the lock and verify the next call returns 200.
+    ///
+    /// Goal-313: the handler now returns `Result<Json<...>, ApiError>`
+    /// instead of `Response` directly. We convert via
+    /// `axum::response::IntoResponse` so the same assertions (status,
+    /// headers, body) still work.
     #[tokio::test]
     async fn clear_goal_returns_409_when_runtime_busy() {
         use crate::llm::MockProvider;
         use crate::tools::ToolRegistry;
+        use axum::response::IntoResponse;
         use std::sync::Arc;
         use tokio::sync::Semaphore;
 
@@ -1762,8 +1733,11 @@ mod tests {
         // Acquire the runtime mutex to simulate a busy runtime.
         let guard = runtime_arc.lock().await;
 
-        // Call the handler while the mutex is held → should get 409.
-        let resp = session_clear_goal(State(state.clone()), Path(session_id.clone())).await;
+        // Call the handler while the mutex is held → should get 409
+        // (Result::Err(ApiError::conflict(...).with_retry_after(5))).
+        let resp = session_clear_goal(State(state.clone()), Path(session_id.clone()))
+            .await
+            .into_response();
         let status = resp.status();
         assert_eq!(status, StatusCode::CONFLICT, "expected 409 Conflict");
         let retry_after = resp
@@ -1776,7 +1750,9 @@ mod tests {
 
         // Drop the guard and retry → should get 200.
         drop(guard);
-        let resp = session_clear_goal(State(state), Path(session_id)).await;
+        let resp = session_clear_goal(State(state), Path(session_id))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
     }
 

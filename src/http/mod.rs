@@ -387,12 +387,25 @@ struct ErrorBody {
 /// return `(StatusCode, Json(json!(...)))` are intentionally left alone —
 /// they already produce a JSON body; wrapping them in [`ApiError`] would
 /// only add a layer.
-pub(super) struct ApiError(StatusCode, String);
+///
+/// Use [`ApiError::with_retry_after`] to attach a `Retry-After` header
+/// (Goal-313: needed by `session_clear_goal` when the runtime is busy).
+pub(super) struct ApiError {
+    status: StatusCode,
+    message: String,
+    /// Optional `Retry-After: <secs>` header value. `Some(secs)` causes
+    /// [`IntoResponse`] to inject the header into the response.
+    retry_after_secs: Option<u32>,
+}
 
 impl ApiError {
     /// Build an [`ApiError`] from an arbitrary status + message.
     pub(super) fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self(status, message.into())
+        Self {
+            status,
+            message: message.into(),
+            retry_after_secs: None,
+        }
     }
 
     /// 404 Not Found with a message.
@@ -416,17 +429,40 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    /// Attach a `Retry-After: <secs>` header to this error response.
+    ///
+    /// Goal-313: lets `session_clear_goal` preserve the `Retry-After: 5`
+    /// hint it used to emit when the runtime Mutex was held by an
+    /// in-flight turn, while still routing through [`ApiError`] for the
+    /// JSON envelope.
+    pub(super) fn with_retry_after(mut self, secs: u32) -> Self {
+        self.retry_after_secs = Some(secs);
+        self
+    }
+
     /// Borrow the HTTP status code (used by handlers that need to vary
     /// behaviour on the status without dropping the message).
     #[allow(dead_code)]
     pub(super) fn status(&self) -> StatusCode {
-        self.0
+        self.status
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (self.0, Json(ErrorBody { error: self.1 })).into_response()
+        let body = Json(ErrorBody {
+            error: self.message,
+        });
+        let mut resp = (self.status, body).into_response();
+        if let Some(secs) = self.retry_after_secs {
+            // `secs` is u32 (max ~136 years), so the decimal repr fits
+            // comfortably in a single-digit-to-ten-char HeaderValue.
+            if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, val);
+            }
+        }
+        resp
     }
 }
 
