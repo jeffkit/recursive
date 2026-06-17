@@ -58,6 +58,7 @@ impl Tool for CountLines {
             .await
             .map_err(|e| Error::Tool {
                 name: "count_lines".into(),
+                call_id: None,
                 message: format!("{}: {e}", abs.display()),
             })?;
         let count = content.lines().count();

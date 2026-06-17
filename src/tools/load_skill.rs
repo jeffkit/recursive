@@ -53,6 +53,7 @@ impl LoadSkill {
         if depth > MAX_DEPTH {
             return Err(Error::Tool {
                 name: "Skill".into(),
+                call_id: None,
                 message: "dependency tree too deep (max 3 levels)".to_string(),
             });
         }
@@ -80,6 +81,7 @@ impl LoadSkill {
                 .find(|s| s.name.to_lowercase() == dep_name.to_lowercase())
                 .ok_or_else(|| Error::Tool {
                     name: "Skill".into(),
+                    call_id: None,
                     message: format!(
                         "dependency '{}' not found (required by '{}')",
                         dep_name, skill.name
@@ -93,6 +95,7 @@ impl LoadSkill {
             // Read the dependency's body
             let content = fs::read_to_string(&dep_skill.path).map_err(|e| Error::Tool {
                 name: "Skill".into(),
+                call_id: None,
                 message: format!("failed to read dependency '{}': {e}", dep_skill.name),
             })?;
 
@@ -165,6 +168,7 @@ impl Tool for LoadSkill {
             .find(|s| s.name.to_lowercase() == name.to_lowercase())
             .ok_or_else(|| Error::Tool {
                 name: "Skill".into(),
+                call_id: None,
                 message: format!("skill not found: {name}"),
             })?;
 
@@ -192,12 +196,14 @@ impl Tool for LoadSkill {
                     };
                     Error::Tool {
                         name: "Skill".into(),
+                        call_id: None,
                         message: format!("ref not found: '{ref_name}'. {available_list}"),
                     }
                 })?;
 
             let content = fs::read_to_string(&skill_ref.path).map_err(|e| Error::Tool {
                 name: "Skill".into(),
+                call_id: None,
                 message: format!("failed to read ref file: {e}"),
             })?;
 
@@ -229,6 +235,7 @@ impl Tool for LoadSkill {
                     };
                     Error::Tool {
                         name: "Skill".into(),
+                        call_id: None,
                         message: format!("section not found: '{section_name}'. {available_list}"),
                     }
                 })?;
@@ -253,6 +260,7 @@ impl Tool for LoadSkill {
         // No ref or section specified — return the main SKILL.md body
         let content = fs::read_to_string(&skill.path).map_err(|e| Error::Tool {
             name: "Skill".into(),
+            call_id: None,
             message: format!("failed to read skill file: {e}"),
         })?;
 

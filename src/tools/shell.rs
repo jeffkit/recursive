@@ -105,15 +105,18 @@ impl Tool for RunShell {
 
         let mut child = cmd.spawn().map_err(|e| Error::Tool {
             name: "Bash".into(),
+            call_id: None,
             message: format!("spawn failed: {e}"),
         })?;
 
         let mut stdout = child.stdout.take().ok_or_else(|| Error::Tool {
             name: "Bash".into(),
+            call_id: None,
             message: "stdout was not piped".into(),
         })?;
         let mut stderr = child.stderr.take().ok_or_else(|| Error::Tool {
             name: "Bash".into(),
+            call_id: None,
             message: "stderr was not piped".into(),
         })?;
 
@@ -125,11 +128,13 @@ impl Tool for RunShell {
         let status = match tokio::time::timeout(self.timeout, wait).await {
             Ok(s) => s.map_err(|e| Error::Tool {
                 name: "Bash".into(),
+                call_id: None,
                 message: format!("wait failed: {e}"),
             })?,
             Err(_) => {
                 return Err(Error::Tool {
                     name: "Bash".into(),
+                    call_id: None,
                     message: format!("command timed out after {:?}", self.timeout),
                 });
             }

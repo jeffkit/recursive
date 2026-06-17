@@ -272,7 +272,10 @@ impl TeamRegistry {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::NotFound(format!("team '{team_name}'"))
             } else {
-                Error::Other(format!("read team file: {e}"))
+                Error::Internal {
+                    context: "team::load".to_string(),
+                    message: format!("read team file: {e}"),
+                }
             }
         })?;
         let team: TeamFile = serde_json::from_slice(&bytes)?;
@@ -360,7 +363,10 @@ impl TeamRegistry {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(Error::Other(format!("delete team file: {e}"))),
+            Err(e) => Err(Error::Internal {
+                context: "team::delete".to_string(),
+                message: format!("delete team file: {e}"),
+            }),
         }
     }
 

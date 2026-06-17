@@ -95,6 +95,7 @@ impl Tool for EstimateTokens {
                         .await
                         .map_err(|e| Error::Tool {
                             name: "estimate_tokens".into(),
+                            call_id: None,
                             message: format!("failed to read file {}: {}", abs_path.display(), e),
                         })?;
                 self.estimate(&content)

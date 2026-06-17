@@ -163,6 +163,7 @@ impl Tool for TodoWriteTool {
         {
             let mut list = self.todo_list.write().map_err(|_| Error::Tool {
                 name: "TodoWrite".into(),
+                call_id: None,
                 message: "todo list lock poisoned".into(),
             })?;
             *list = items.clone();

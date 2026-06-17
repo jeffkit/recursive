@@ -87,6 +87,7 @@ impl Tool for RunSkillScript {
             .find(|s| s.name.to_lowercase() == skill_name.to_lowercase())
             .ok_or_else(|| Error::Tool {
                 name: "run_skill_script".into(),
+                call_id: None,
                 message: format!("skill not found: {skill_name}"),
             })?;
 
@@ -104,6 +105,7 @@ impl Tool for RunSkillScript {
                 };
                 Error::Tool {
                     name: "run_skill_script".into(),
+                    call_id: None,
                     message: format!("script not found: '{script_name}'. {available_list}"),
                 }
             })?;
@@ -111,22 +113,26 @@ impl Tool for RunSkillScript {
         // Security: script path must be within the skill directory
         let skill_dir = skill.path.parent().ok_or_else(|| Error::Tool {
             name: "run_skill_script".into(),
+            call_id: None,
             message: "cannot determine skill directory".to_string(),
         })?;
 
         let canonical_script = std::fs::canonicalize(&script.path).map_err(|e| Error::Tool {
             name: "run_skill_script".into(),
+            call_id: None,
             message: format!("cannot resolve script path: {e}"),
         })?;
 
         let canonical_skill_dir = std::fs::canonicalize(skill_dir).map_err(|e| Error::Tool {
             name: "run_skill_script".into(),
+            call_id: None,
             message: format!("cannot resolve skill directory: {e}"),
         })?;
 
         if !canonical_script.starts_with(&canonical_skill_dir) {
             return Err(Error::Tool {
                 name: "run_skill_script".into(),
+                call_id: None,
                 message: "script path escapes skill directory".to_string(),
             });
         }
@@ -140,6 +146,7 @@ impl Tool for RunSkillScript {
         } else {
             shell_words::split(args_raw).map_err(|e| Error::Tool {
                 name: "run_skill_script".into(),
+                call_id: None,
                 message: format!("failed to parse args: {e}"),
             })?
         };
@@ -152,6 +159,7 @@ impl Tool for RunSkillScript {
 
         let mut child = cmd.spawn().map_err(|e| Error::Tool {
             name: "run_skill_script".into(),
+            call_id: None,
             message: format!("spawn failed: {e}"),
         })?;
 
@@ -166,11 +174,13 @@ impl Tool for RunSkillScript {
         let status = match tokio::time::timeout(self.timeout, wait).await {
             Ok(s) => s.map_err(|e| Error::Tool {
                 name: "run_skill_script".into(),
+                call_id: None,
                 message: format!("wait failed: {e}"),
             })?,
             Err(_) => {
                 return Err(Error::Tool {
                     name: "run_skill_script".into(),
+                    call_id: None,
                     message: format!("script timed out after {:?}", self.timeout),
                 });
             }

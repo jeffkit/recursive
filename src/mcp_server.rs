@@ -308,6 +308,7 @@ impl McpServerManager {
 
             let client = McpClient::spawn(server).await.map_err(|e| Error::Tool {
                 name: format!("mcp_server:{name}"),
+                call_id: None,
                 message: format!("Failed to start MCP server: {e}"),
             })?;
 
@@ -321,6 +322,7 @@ impl McpServerManager {
                 .await
                 .map_err(|e| Error::Tool {
                     name: format!("mcp_server:{name}"),
+                    call_id: None,
                     message: format!("Failed to discover tools from MCP server: {e}"),
                 })?;
 

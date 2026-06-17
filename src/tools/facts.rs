@@ -69,6 +69,7 @@ impl FactStore {
         }
         let raw = std::fs::read_to_string(path).map_err(|e| Error::Tool {
             name: "facts".into(),
+            call_id: None,
             message: format!("failed to read facts file: {e}"),
         })?;
         let mut facts = Vec::new();
@@ -82,6 +83,7 @@ impl FactStore {
                 Err(e) => {
                     return Err(Error::Tool {
                         name: "facts".into(),
+                        call_id: None,
                         message: format!("malformed fact at line {}: {e}", i + 1),
                     });
                 }
@@ -95,6 +97,7 @@ impl FactStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
                 name: "facts".into(),
+                call_id: None,
                 message: format!("failed to create facts directory: {e}"),
             })?;
         }
@@ -102,12 +105,14 @@ impl FactStore {
         for fact in &self.facts {
             out.push_str(&serde_json::to_string(fact).map_err(|e| Error::Tool {
                 name: "facts".into(),
+                call_id: None,
                 message: format!("failed to serialize fact: {e}"),
             })?);
             out.push('\n');
         }
         std::fs::write(path, out).map_err(|e| Error::Tool {
             name: "facts".into(),
+            call_id: None,
             message: format!("failed to write facts file: {e}"),
         })?;
         Ok(())

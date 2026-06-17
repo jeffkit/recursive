@@ -304,6 +304,7 @@ impl Tool for E2bShellTool {
                     .await
                     .map_err(|e| Error::Tool {
                         name: "Bash".into(),
+                        call_id: None,
                         message: format!("e2b sandbox init failed: {e}"),
                     })?;
             *guard = Some(sandbox);

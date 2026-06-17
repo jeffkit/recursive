@@ -22,8 +22,17 @@ pub enum Error {
     },
 
     /// Tool execution failure (spawn, timeout, I/O)
+    ///
+    /// `call_id` links this error back to the `tool_call_id` of the triggering
+    /// `ToolCall`, enabling audit logs and session persistence to correlate the
+    /// failure with the exact turn that requested the tool.
     #[error("tool error ({name}): {message}")]
-    Tool { name: String, message: String },
+    Tool {
+        name: String,
+        /// The tool_call_id from the triggering ToolCall, if available.
+        call_id: Option<String>,
+        message: String,
+    },
 
     /// Invalid arguments passed to a tool
     #[error("bad tool arguments ({name}): {message}")]
@@ -96,9 +105,10 @@ pub enum Error {
         supported: u32,
     },
 
-    /// Catch-all for errors that don't fit elsewhere
-    #[error("{0}")]
-    Other(String),
+    /// Internal agent error — unexpected state that does not map to any typed
+    /// variant. Prefer a specific variant; use `Internal` only as last resort.
+    #[error("internal error ({context}): {message}")]
+    Internal { context: String, message: String },
 }
 
 impl Error {
@@ -147,6 +157,7 @@ mod tests {
     fn test_tool_error_format() {
         let err = Error::Tool {
             name: "Bash".into(),
+            call_id: None,
             message: "command not found".into(),
         };
         let msg = err.to_string();
@@ -215,6 +226,7 @@ mod tests {
         assert!(Error::Timeout { duration_ms: 5000 }.is_retryable());
         assert!(!Error::Tool {
             name: "x".into(),
+            call_id: None,
             message: "fail".into()
         }
         .is_retryable());
@@ -236,6 +248,7 @@ mod tests {
         // We verify the variant match in the is_transient implementation itself.
         assert!(!Error::Tool {
             name: "x".into(),
+            call_id: None,
             message: "fail".into()
         }
         .is_transient());

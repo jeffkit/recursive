@@ -546,6 +546,7 @@ impl McpClient {
                 .unwrap_or("unknown error");
             return Err(Error::Tool {
                 name: name.to_string(),
+                call_id: None,
                 message: error_msg.to_string(),
             });
         }

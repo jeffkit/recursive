@@ -887,6 +887,7 @@ impl ToolRegistry {
                 | Error::PermissionDeniedLimit { .. } => e,
                 other => Error::Tool {
                     name: name.into(),
+                    call_id: None,
                     message: other.to_string(),
                 },
             });

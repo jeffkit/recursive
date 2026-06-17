@@ -68,6 +68,7 @@ impl Tool for CheckpointList {
         let infos = {
             let repo = self.ctx.repo.lock().map_err(|_| Error::Tool {
                 name: "checkpoint_list".into(),
+                call_id: None,
                 message: "lock poisoned".into(),
             })?;
             repo.list_for_session(&self.ctx.session_id)?
@@ -136,6 +137,7 @@ impl Tool for CheckpointDiff {
         let diff = {
             let repo = self.ctx.repo.lock().map_err(|_| Error::Tool {
                 name: "checkpoint_diff".into(),
+                call_id: None,
                 message: "lock poisoned".into(),
             })?;
             repo.diff(&aid, bid.as_ref(), &[])?
@@ -238,6 +240,7 @@ impl Tool for CheckpointSave {
         let id = {
             let repo = self.ctx.repo.lock().map_err(|_| Error::Tool {
                 name: "checkpoint_save".into(),
+                call_id: None,
                 message: "lock poisoned".into(),
             })?;
             repo.snapshot_for_session(&self.ctx.session_id, &message)?
@@ -251,6 +254,7 @@ impl Tool for CheckpointSave {
             if let Some(ref last) = last_id {
                 let repo = self.ctx.repo.lock().map_err(|_| Error::Tool {
                     name: "checkpoint_save".into(),
+                    call_id: None,
                     message: "lock poisoned".into(),
                 })?;
                 if let Ok(diff_paths) = repo.changed_paths(last, &id) {
@@ -271,6 +275,7 @@ impl Tool for CheckpointSave {
         {
             let writer = self.ctx.writer.lock().map_err(|_| Error::Tool {
                 name: "checkpoint_save".into(),
+                call_id: None,
                 message: "writer lock poisoned".into(),
             })?;
             let rec = CheckpointRecord {
@@ -286,6 +291,7 @@ impl Tool for CheckpointSave {
             };
             writer.append(&rec).map_err(|e| Error::Tool {
                 name: "checkpoint_save".into(),
+                call_id: None,
                 message: format!("failed to append checkpoint record: {e}"),
             })?;
         }

@@ -288,6 +288,7 @@ impl Tool for WebFetch {
             .await
             .map_err(|e| Error::Tool {
                 name: "WebFetch".into(),
+                call_id: None,
                 message: format!("request failed: {}", e),
             })?;
 
@@ -301,6 +302,7 @@ impl Tool for WebFetch {
             };
             return Err(Error::Tool {
                 name: "WebFetch".into(),
+                call_id: None,
                 message: format!("HTTP {}: {}", status.as_u16(), excerpt),
             });
         }
@@ -314,6 +316,7 @@ impl Tool for WebFetch {
 
         let body = response.text().await.map_err(|e| Error::Tool {
             name: "WebFetch".into(),
+            call_id: None,
             message: format!("failed to read response body: {}", e),
         })?;
 

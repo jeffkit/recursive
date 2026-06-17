@@ -242,6 +242,7 @@ impl Tool for RunBackground {
         // Spawn the process
         let mut child = cmd.spawn().map_err(|e| Error::Tool {
             name: "run_background".into(),
+            call_id: None,
             message: format!("spawn failed: {e}"),
         })?;
 

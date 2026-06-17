@@ -251,6 +251,7 @@ impl Tool for A2aCallTool {
 
         let client = Self::build_client().map_err(|e| Error::Tool {
             name: "a2a_call".into(),
+            call_id: None,
             message: format!("failed to build HTTP client: {e}"),
         })?;
 
@@ -279,6 +280,7 @@ impl Tool for A2aCallTool {
 
         let resp = req.send().await.map_err(|e| Error::Tool {
             name: "a2a_call".into(),
+            call_id: None,
             message: format!("network error calling {send_url}: {e}"),
         })?;
 
@@ -290,12 +292,14 @@ impl Tool for A2aCallTool {
 
         let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "a2a_call".into(),
+            call_id: None,
             message: format!("failed to read response body: {e}"),
         })?;
 
         let send_resp: SendMessageResponse =
             serde_json::from_str(&body_text).map_err(|e| Error::Tool {
                 name: "a2a_call".into(),
+                call_id: None,
                 message: format!("invalid A2A response: {e}\nbody: {body_text}"),
             })?;
 
@@ -359,6 +363,7 @@ When the background job completes, a new turn will start automatically with the 
 
                     let poll_resp = poll_req.send().await.map_err(|e| Error::Tool {
                         name: "a2a_call".into(),
+                        call_id: None,
                         message: format!("network error polling {task_url}: {e}"),
                     })?;
 
@@ -372,12 +377,14 @@ When the background job completes, a new turn will start automatically with the 
 
                     let poll_body = poll_resp.text().await.map_err(|e| Error::Tool {
                         name: "a2a_call".into(),
+                        call_id: None,
                         message: format!("failed to read poll response: {e}"),
                     })?;
 
                     let updated: Task =
                         serde_json::from_str(&poll_body).map_err(|e| Error::Tool {
                             name: "a2a_call".into(),
+                            call_id: None,
                             message: format!("invalid task poll response: {e}\nbody: {poll_body}"),
                         })?;
 
@@ -502,6 +509,7 @@ async fn execute_streaming(
 
     let resp = req.send().await.map_err(|e| Error::Tool {
         name: "a2a_call".into(),
+        call_id: None,
         message: format!("network error calling {stream_url}: {e}"),
     })?;
 
@@ -533,10 +541,12 @@ async fn execute_streaming(
             .await
             .map_err(|_| Error::Tool {
                 name: "a2a_call".into(),
+                call_id: None,
                 message: "SSE chunk read timed out (5s idle)".into(),
             })?
             .map_err(|e| Error::Tool {
                 name: "a2a_call".into(),
+                call_id: None,
                 message: format!("SSE read error: {e}"),
             })?;
 
@@ -756,6 +766,7 @@ impl Tool for A2aCardTool {
 
         let client = A2aCallTool::build_client().map_err(|e| Error::Tool {
             name: "a2a_card".into(),
+            call_id: None,
             message: format!("failed to build HTTP client: {e}"),
         })?;
 
@@ -766,6 +777,7 @@ impl Tool for A2aCardTool {
 
         let resp = req.send().await.map_err(|e| Error::Tool {
             name: "a2a_card".into(),
+            call_id: None,
             message: format!("network error fetching {card_url}: {e}"),
         })?;
 
@@ -777,11 +789,13 @@ impl Tool for A2aCardTool {
 
         let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "a2a_card".into(),
+            call_id: None,
             message: format!("failed to read response body: {e}"),
         })?;
 
         let card: AgentCard = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
             name: "a2a_card".into(),
+            call_id: None,
             message: format!("invalid Agent Card JSON: {e}\nbody: {body_text}"),
         })?;
 
@@ -872,6 +886,7 @@ impl Tool for A2aTaskCheckTool {
 
         let client = A2aCallTool::build_client().map_err(|e| Error::Tool {
             name: "a2a_task_check".into(),
+            call_id: None,
             message: format!("failed to build HTTP client: {e}"),
         })?;
 
@@ -882,6 +897,7 @@ impl Tool for A2aTaskCheckTool {
 
         let resp = req.send().await.map_err(|e| Error::Tool {
             name: "a2a_task_check".into(),
+            call_id: None,
             message: format!("network error fetching {task_url}: {e}"),
         })?;
 
@@ -893,11 +909,13 @@ impl Tool for A2aTaskCheckTool {
 
         let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "a2a_task_check".into(),
+            call_id: None,
             message: format!("failed to read response body: {e}"),
         })?;
 
         let task: Task = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
             name: "a2a_task_check".into(),
+            call_id: None,
             message: format!("invalid task JSON: {e}\nbody: {body_text}"),
         })?;
 

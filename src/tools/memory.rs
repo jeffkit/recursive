@@ -47,10 +47,12 @@ impl MemoryStore {
         }
         let raw = std::fs::read_to_string(path).map_err(|e| Error::Tool {
             name: "memory".into(),
+            call_id: None,
             message: format!("failed to read memory file: {e}"),
         })?;
         serde_json::from_str(&raw).map_err(|e| Error::Tool {
             name: "memory".into(),
+            call_id: None,
             message: format!("malformed memory file: {e}"),
         })
     }
@@ -60,15 +62,18 @@ impl MemoryStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
                 name: "memory".into(),
+                call_id: None,
                 message: format!("failed to create memory directory: {e}"),
             })?;
         }
         let raw = serde_json::to_string_pretty(self).map_err(|e| Error::Tool {
             name: "memory".into(),
+            call_id: None,
             message: format!("failed to serialize memory: {e}"),
         })?;
         std::fs::write(path, raw).map_err(|e| Error::Tool {
             name: "memory".into(),
+            call_id: None,
             message: format!("failed to write memory file: {e}"),
         })?;
         Ok(())
@@ -568,10 +573,12 @@ impl Scratchpad {
         }
         let raw = std::fs::read_to_string(path).map_err(|e| Error::Tool {
             name: "scratchpad".into(),
+            call_id: None,
             message: format!("failed to read scratchpad file: {e}"),
         })?;
         serde_json::from_str(&raw).map_err(|e| Error::Tool {
             name: "scratchpad".into(),
+            call_id: None,
             message: format!("malformed scratchpad file: {e}"),
         })
     }
@@ -581,15 +588,18 @@ impl Scratchpad {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
                 name: "scratchpad".into(),
+                call_id: None,
                 message: format!("failed to create scratchpad directory: {e}"),
             })?;
         }
         let raw = serde_json::to_string_pretty(self).map_err(|e| Error::Tool {
             name: "scratchpad".into(),
+            call_id: None,
             message: format!("failed to serialize scratchpad: {e}"),
         })?;
         std::fs::write(path, raw).map_err(|e| Error::Tool {
             name: "scratchpad".into(),
+            call_id: None,
             message: format!("failed to write scratchpad file: {e}"),
         })?;
         Ok(())

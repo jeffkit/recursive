@@ -113,6 +113,7 @@ impl InstallSkill {
         let url = format!("{url}?q={}&limit={SEARCH_LIMIT}", query.replace(' ', "+"));
         let resp = client.get(&url).send().await.map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: format!("skillhub.cn search request failed: {e}"),
         })?;
 
@@ -120,12 +121,14 @@ impl InstallSkill {
             let status = resp.status();
             return Err(Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("skillhub.cn search returned HTTP {status}"),
             });
         }
 
         let body: SearchResponse = resp.json().await.map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: format!("failed to parse skillhub.cn search response: {e}"),
         })?;
 
@@ -143,6 +146,7 @@ impl InstallSkill {
                 .await
                 .map_err(|e| Error::Tool {
                     name: "install_skill".into(),
+                    call_id: None,
                     message: format!("failed to download skill '{slug}': {e}"),
                 }),
         }
@@ -151,12 +155,14 @@ impl InstallSkill {
     async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
         let resp = client.get(url).send().await.map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: e.to_string(),
         })?;
         if !resp.status().is_success() {
             let status = resp.status();
             return Err(Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("HTTP {status} for {url}"),
             });
         }
@@ -165,6 +171,7 @@ impl InstallSkill {
             .map(|b| b.to_vec())
             .map_err(|e| Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: e.to_string(),
             })
     }
@@ -174,6 +181,7 @@ impl InstallSkill {
         let cursor = Cursor::new(data);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: format!("failed to open zip archive: {e}"),
         })?;
 
@@ -181,6 +189,7 @@ impl InstallSkill {
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("failed to read zip entry {i}: {e}"),
             })?;
 
@@ -194,6 +203,7 @@ impl InstallSkill {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(|e| Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("failed to read zip entry '{path}': {e}"),
             })?;
 
@@ -216,12 +226,14 @@ impl InstallSkill {
         let cursor = Cursor::new(data);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: format!("failed to open zip for extraction: {e}"),
         })?;
 
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("zip entry {i} read error: {e}"),
             })?;
 
@@ -237,6 +249,7 @@ impl InstallSkill {
             if entry.is_dir() {
                 std::fs::create_dir_all(&out_path).map_err(|e| Error::Tool {
                     name: "install_skill".into(),
+                    call_id: None,
                     message: format!("failed to create dir '{}: {e}", out_path.display()),
                 })?;
                 continue;
@@ -245,6 +258,7 @@ impl InstallSkill {
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
                     name: "install_skill".into(),
+                    call_id: None,
                     message: format!("mkdir '{}': {e}", parent.display()),
                 })?;
             }
@@ -252,11 +266,13 @@ impl InstallSkill {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(|e| Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("read zip entry '{raw_name}': {e}"),
             })?;
 
             std::fs::write(&out_path, &buf).map_err(|e| Error::Tool {
                 name: "install_skill".into(),
+                call_id: None,
                 message: format!("write '{}': {e}", out_path.display()),
             })?;
         }
@@ -267,6 +283,7 @@ impl InstallSkill {
     fn install_dir(slug: &str) -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: "cannot determine home directory".to_string(),
         })?;
         Ok(home.join(".recursive").join("skills").join(slug))
@@ -327,6 +344,7 @@ impl Tool for InstallSkill {
         // ── Phase 1: search ───────────────────────────────────────────────────
         let client = Self::http_client().map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: format!("failed to build HTTP client: {e}"),
         })?;
 
@@ -347,11 +365,13 @@ impl Tool for InstallSkill {
         }))
         .map_err(|_| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: "TUI skill-install channel closed unexpectedly".to_string(),
         })?;
 
         let selected_slug = reply_rx.await.map_err(|_| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: "TUI did not reply to skill selection (channel dropped)".to_string(),
         })?;
 
@@ -372,11 +392,13 @@ impl Tool for InstallSkill {
         }))
         .map_err(|_| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: "TUI skill-install channel closed unexpectedly (phase 2)".to_string(),
         })?;
 
         let confirmed = confirm_rx.await.map_err(|_| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: "TUI did not reply to install confirmation (channel dropped)".to_string(),
         })?;
 
@@ -388,6 +410,7 @@ impl Tool for InstallSkill {
         let dest = Self::install_dir(&slug)?;
         std::fs::create_dir_all(&dest).map_err(|e| Error::Tool {
             name: "install_skill".into(),
+            call_id: None,
             message: format!(
                 "failed to create install directory '{}': {e}",
                 dest.display()

@@ -59,6 +59,7 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
     if recs.is_empty() {
         return Err(Error::Tool {
             name: "rewind".into(),
+            call_id: None,
             message: "no checkpoints recorded for this session".into(),
         });
     }
@@ -75,6 +76,7 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
             .and_then(|r| r.pre.clone().or_else(|| Some(r.id.clone())))
             .ok_or_else(|| Error::Tool {
                 name: "rewind".into(),
+                call_id: None,
                 message: "no checkpoint recorded before turn 0".into(),
             })?
     } else {
@@ -91,12 +93,14 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
                         .find(|r| r.turn == to_turn)
                         .ok_or_else(|| Error::Tool {
                             name: "rewind".into(),
+                            call_id: None,
                             message: format!(
                                 "turn {to_turn} is not in this session's checkpoint log"
                             ),
                         })?;
                 target_rec.pre.clone().ok_or_else(|| Error::Tool {
                     name: "rewind".into(),
+                    call_id: None,
                     message: format!(
                         "turn {to_turn} has no pre-snapshot recorded; \
                          cannot rewind to its start"
@@ -167,6 +171,7 @@ pub fn apply_rewind(
         if !conflicts.is_empty() {
             return Err(Error::Tool {
                 name: "rewind".into(),
+                call_id: None,
                 message: format!(
                     "rewind blocked by {} conflicting file(s): {}\n\
                      Re-run with --force to overwrite.",

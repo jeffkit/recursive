@@ -108,11 +108,13 @@ impl Tool for ReadFile {
         let abs = resolve_within(&self.root, path)?;
         let bytes = tokio::fs::read(&abs).await.map_err(|e| Error::Tool {
             name: "Read".into(),
+            call_id: None,
             message: format!("{}: {e}", abs.display()),
         })?;
         if bytes.len() > self.max_bytes {
             return Err(Error::Tool {
                 name: "Read".into(),
+                call_id: None,
                 message: format!(
                     "file too large: {} bytes (max {})",
                     bytes.len(),
@@ -122,6 +124,7 @@ impl Tool for ReadFile {
         }
         let content = String::from_utf8(bytes).map_err(|e| Error::Tool {
             name: "Read".into(),
+            call_id: None,
             message: format!("not utf-8: {e}"),
         })?;
 
@@ -266,6 +269,7 @@ impl Tool for WriteFile {
                 .await
                 .map_err(|e| Error::Tool {
                     name: "Write".into(),
+                    call_id: None,
                     message: format!("mkdir {}: {e}", parent.display()),
                 })?;
         }
@@ -273,6 +277,7 @@ impl Tool for WriteFile {
             .await
             .map_err(|e| Error::Tool {
                 name: "Write".into(),
+                call_id: None,
                 message: format!("{}: {e}", abs.display()),
             })?;
         Ok(format!("wrote {} bytes to {}", contents.len(), path))

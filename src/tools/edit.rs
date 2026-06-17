@@ -382,6 +382,7 @@ useful if you want to rename a variable for instance."
                     None => {
                         return Err(Error::Tool {
                             name: "Edit".into(),
+                            call_id: None,
                             message: format!(
                                 "File `{file_path}` has not been read yet. \
                                  Read it first before editing."
@@ -391,6 +392,7 @@ useful if you want to rename a variable for instance."
                     Some(record) if record.is_partial => {
                         return Err(Error::Tool {
                             name: "Edit".into(),
+                            call_id: None,
                             message: format!(
                                 "File `{file_path}` was only partially read \
                                  (line range). Read the complete file before editing."
@@ -409,6 +411,7 @@ useful if you want to rename a variable for instance."
                     .await
                     .map_err(|e| Error::Tool {
                         name: "Edit".into(),
+                        call_id: None,
                         message: format!("mkdir {}: {e}", parent.display()),
                     })?;
             }
@@ -416,6 +419,7 @@ useful if you want to rename a variable for instance."
                 .await
                 .map_err(|e| Error::Tool {
                     name: "Edit".into(),
+                    call_id: None,
                     message: format!("{}: {e}", abs_path.display()),
                 })?;
             return Ok(format!(
@@ -430,6 +434,7 @@ useful if you want to rename a variable for instance."
             .await
             .map_err(|e| Error::Tool {
                 name: "Edit".into(),
+                call_id: None,
                 message: format!("{}: {e}", abs_path.display()),
             })?;
 
@@ -437,6 +442,7 @@ useful if you want to rename a variable for instance."
         if old_string == new_string {
             return Err(Error::Tool {
                 name: "Edit".into(),
+                call_id: None,
                 message: "No changes to make: old_string and new_string are exactly the same."
                     .into(),
             });
@@ -459,6 +465,7 @@ useful if you want to rename a variable for instance."
         // ── Find old_string via fuzzy-match chain ───────────────────────
         let actual_old = try_match(&content, old_string).ok_or_else(|| Error::Tool {
             name: "Edit".into(),
+            call_id: None,
             message: format!("String to replace not found in `{file_path}`.\nString: {old_string}"),
         })?;
 
@@ -467,6 +474,7 @@ useful if you want to rename a variable for instance."
         if !replace_all && occurrence_count > 1 {
             return Err(Error::Tool {
                 name: "Edit".into(),
+                call_id: None,
                 message: format!(
                     "Found {occurrence_count} matches of the string to replace, but \
 replace_all is false. To replace all occurrences, set replace_all to true. \
@@ -487,6 +495,7 @@ the instance.\nString: {old_string}"
             .await
             .map_err(|e| Error::Tool {
                 name: "Edit".into(),
+                call_id: None,
                 message: format!("{}: {e}", abs_path.display()),
             })?;
 

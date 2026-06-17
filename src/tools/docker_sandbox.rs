@@ -102,6 +102,7 @@ impl DockerShellTool {
             .await
             .map_err(|e| Error::Tool {
                 name: "Bash".into(),
+                call_id: None,
                 message: format!("docker exec create: {e}"),
             })?;
 
@@ -112,6 +113,7 @@ impl DockerShellTool {
             .await
             .map_err(|e| Error::Tool {
                 name: "Bash".into(),
+                call_id: None,
                 message: format!("docker exec start: {e}"),
             })? {
             StartExecResults::Attached {

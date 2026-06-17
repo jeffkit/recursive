@@ -46,6 +46,7 @@ pub fn migrate_workspace(workspace: &Path, dry_run: bool) -> Result<MigrateRepor
             .file_name()
             .ok_or_else(|| Error::Tool {
                 name: "migrate".into(),
+                call_id: None,
                 message: format!("legacy path has no file name: {}", src.display()),
             })?
             .to_owned();
@@ -68,6 +69,7 @@ pub fn migrate_workspace(workspace: &Path, dry_run: bool) -> Result<MigrateRepor
             if e.raw_os_error() == Some(libc_exdev()) {
                 copy_recursively(&src, &dst).map_err(|e| Error::Tool {
                     name: "migrate".into(),
+                    call_id: None,
                     message: format!("copy across mounts failed for {}: {e}", src.display()),
                 })?;
                 if src.is_dir() {
@@ -78,6 +80,7 @@ pub fn migrate_workspace(workspace: &Path, dry_run: bool) -> Result<MigrateRepor
             } else {
                 return Err(Error::Tool {
                     name: "migrate".into(),
+                    call_id: None,
                     message: format!("rename {} -> {} failed: {e}", src.display(), dst.display()),
                 });
             }

@@ -371,6 +371,7 @@ impl AgentTool {
             .build()
             .map_err(|e| Error::Tool {
                 name: "agent".into(),
+                call_id: None,
                 message: format!("failed to build worker '{}' kernel: {e}", worker_id),
             })?;
 
@@ -391,6 +392,7 @@ impl AgentTool {
 
         let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
             name: "agent".into(),
+            call_id: None,
             message: format!("worker '{}' failed: {e}", worker_id),
         })?;
 

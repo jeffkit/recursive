@@ -134,18 +134,21 @@ impl WebSearch {
             .await
             .map_err(|e| Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Brave request failed: {e}"),
             })?;
 
         let status = resp.status();
         let body: Value = resp.json().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Brave response parse failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Brave HTTP {status}: {body}"),
             });
         }
@@ -188,18 +191,21 @@ impl WebSearch {
             .await
             .map_err(|e| Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Tavily request failed: {e}"),
             })?;
 
         let status = resp.status();
         let data: Value = resp.json().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Tavily response parse failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Tavily HTTP {status}: {data}"),
             });
         }
@@ -237,18 +243,21 @@ impl WebSearch {
             .await
             .map_err(|e| Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Serper request failed: {e}"),
             })?;
 
         let status = resp.status();
         let data: Value = resp.json().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Serper response parse failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Serper HTTP {status}: {data}"),
             });
         }
@@ -287,18 +296,21 @@ impl WebSearch {
             .await
             .map_err(|e| Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Bocha request failed: {e}"),
             })?;
 
         let status = resp.status();
         let data: Value = resp.json().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Bocha response parse failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Bocha HTTP {status}: {data}"),
             });
         }
@@ -330,18 +342,21 @@ impl WebSearch {
             .await
             .map_err(|e| Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Bing request failed: {e}"),
             })?;
 
         let status = resp.status();
         let data: Value = resp.json().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Bing response parse failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Bing HTTP {status}: {data}"),
             });
         }
@@ -407,18 +422,21 @@ impl WebSearch {
 
         let resp = req.send().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Jina Search request failed: {e}"),
         })?;
 
         let status = resp.status();
         let body = resp.text().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
+            call_id: None,
             message: format!("Jina Search response read failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
+                call_id: None,
                 message: format!("Jina Search HTTP {status}"),
             });
         }

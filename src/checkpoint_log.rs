@@ -130,6 +130,7 @@ pub fn read_log(path: &Path) -> Result<Vec<CheckpointRecord>> {
         }
         let rec: CheckpointRecord = serde_json::from_str(&line).map_err(|e| Error::Tool {
             name: "checkpoint-log".into(),
+            call_id: None,
             message: format!("malformed log line {}: {e}", i + 1),
         })?;
         out.push(rec);

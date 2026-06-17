@@ -72,6 +72,7 @@ impl ShadowRepo {
     pub fn open(workspace: impl Into<PathBuf>) -> Result<Self> {
         let workspace = workspace.into().canonicalize().map_err(|e| Error::Tool {
             name: "checkpoint".into(),
+            call_id: None,
             message: format!("cannot canonicalize workspace: {e}"),
         })?;
         // On Windows, std::fs::canonicalize() returns extended-length UNC paths
@@ -103,6 +104,7 @@ impl ShadowRepo {
         if !shadow_dir.exists() {
             std::fs::create_dir_all(&shadow_dir).map_err(|e| Error::Tool {
                 name: "checkpoint".into(),
+                call_id: None,
                 message: format!("cannot create shadow-git dir: {e}"),
             })?;
             let out = git_cmd()
@@ -111,11 +113,13 @@ impl ShadowRepo {
                 .output()
                 .map_err(|e| Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!("git not found or failed: {e}"),
                 })?;
             if !out.status.success() {
                 return Err(Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!(
                         "git init --bare failed: {}",
                         String::from_utf8_lossy(&out.stderr)
@@ -197,6 +201,7 @@ impl ShadowRepo {
                 let _ = std::fs::remove_file(&tmp_index);
                 return Err(Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!("git add failed: {stderr}"),
                 });
             }
@@ -213,6 +218,7 @@ impl ShadowRepo {
         if !tree_out.status.success() {
             return Err(Error::Tool {
                 name: "checkpoint".into(),
+                call_id: None,
                 message: format!(
                     "git write-tree failed: {}",
                     String::from_utf8_lossy(&tree_out.stderr)
@@ -245,6 +251,7 @@ impl ShadowRepo {
         if !commit_out.status.success() {
             return Err(Error::Tool {
                 name: "checkpoint".into(),
+                call_id: None,
                 message: format!(
                     "git commit-tree failed: {}",
                     String::from_utf8_lossy(&commit_out.stderr)
@@ -271,6 +278,7 @@ impl ShadowRepo {
         if !upd_out.status.success() {
             return Err(Error::Tool {
                 name: "checkpoint".into(),
+                call_id: None,
                 message: format!(
                     "git update-ref failed: {}",
                     String::from_utf8_lossy(&upd_out.stderr)
@@ -353,6 +361,7 @@ impl ShadowRepo {
             } else {
                 Err(Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!("git cat-file failed: {stderr}"),
                 })
             }
@@ -375,6 +384,7 @@ impl ShadowRepo {
             let abs =
                 crate::tools::resolve_within(&self.workspace, path).map_err(|_| Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!("path '{path}' escapes workspace root"),
                 })?;
             let cp_bytes = self.read_file_at(checkpoint, path)?;
@@ -389,6 +399,7 @@ impl ShadowRepo {
                     if abs.exists() {
                         std::fs::remove_file(&abs).map_err(|e| Error::Tool {
                             name: "checkpoint".into(),
+                            call_id: None,
                             message: format!("cannot delete {path}: {e}"),
                         })?;
                         stats.deleted += 1;
@@ -401,11 +412,13 @@ impl ShadowRepo {
                     if let Some(parent) = abs.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
                             name: "checkpoint".into(),
+                            call_id: None,
                             message: format!("cannot create dir for {path}: {e}"),
                         })?;
                     }
                     crate::atomic::atomic_write(&abs, &want).map_err(|e| Error::Tool {
                         name: "checkpoint".into(),
+                        call_id: None,
                         message: format!("cannot restore {path}: {e}"),
                     })?;
                     stats.restored += 1;
@@ -469,6 +482,7 @@ impl ShadowRepo {
         if self.shadow_dir.exists() {
             std::fs::remove_dir_all(&self.shadow_dir).map_err(|e| Error::Tool {
                 name: "checkpoint".into(),
+                call_id: None,
                 message: format!("cannot remove shadow-git: {e}"),
             })?;
         }
@@ -501,6 +515,7 @@ impl ShadowRepo {
             if !stderr.trim().is_empty() && !stderr.contains("warning:") {
                 return Err(Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!("git reflog expire failed: {stderr}"),
                 });
             }
@@ -517,6 +532,7 @@ impl ShadowRepo {
             if !stderr.trim().is_empty() && !stderr.contains("warning:") {
                 return Err(Error::Tool {
                     name: "checkpoint".into(),
+                    call_id: None,
                     message: format!("git gc failed: {stderr}"),
                 });
             }
@@ -585,6 +601,7 @@ impl ShadowRepo {
         if !tree_out.status.success() {
             return Err(Error::Tool {
                 name: "checkpoint".into(),
+                call_id: None,
                 message: format!(
                     "git write-tree failed: {}",
                     String::from_utf8_lossy(&tree_out.stderr)
@@ -615,6 +632,7 @@ impl ShadowRepo {
         }
         Err(Error::Tool {
             name: "checkpoint".into(),
+            call_id: None,
             message: format!("checkpoint '{short}' not found"),
         })
     }
@@ -664,6 +682,7 @@ fn git_cmd() -> Command {
 fn git_err(e: std::io::Error) -> Error {
     Error::Tool {
         name: "checkpoint".into(),
+        call_id: None,
         message: format!("git invocation failed: {e}"),
     }
 }

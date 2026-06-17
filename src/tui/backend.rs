@@ -693,7 +693,10 @@ async fn worker_loop(
                     let aborted = tokio::select! {
                         res = &mut handle => {
                             if let Err(e) = res
-                                .map_err(|e| crate::Error::Other(e.to_string()))
+                                .map_err(|e| crate::Error::Internal {
+                                    context: "tui::task_join".to_string(),
+                                    message: e.to_string(),
+                                })
                                 .and_then(|r| r)
                             {
                                 let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
@@ -764,7 +767,10 @@ async fn run_turn_select_loop(
             biased;
             res = &mut *handle => {
                 if let Err(e) = res
-                    .map_err(|e| crate::Error::Other(e.to_string()))
+                    .map_err(|e| crate::Error::Internal {
+                        context: "tui::task_join".to_string(),
+                        message: e.to_string(),
+                    })
                     .and_then(|r| r)
                 {
                     let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
