@@ -182,7 +182,7 @@ impl Compactor {
     /// Never splits in the middle of a Tool role message — if the natural
     /// split point lands on a Tool message, it backs up until it finds a
     /// non-Tool boundary, preserving tool-call / tool-result pairs.
-    fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
+    pub fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
         let mut split = transcript.len().saturating_sub(keep_n);
         while split > 0 && matches!(transcript[split].role, crate::message::Role::Tool) {
             split -= 1;

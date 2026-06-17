@@ -36,16 +36,23 @@ tests/
 
 1. **Agent loop stays small.** New capabilities are tools or providers, not
    branches inside `agent.rs::Agent::run`.
+   Automated test: `tests/invariants/loop_size_orthogonality.rs` (invariant #1)
 2. **Orthogonality.** Tools must not depend on LLM internals; providers must
    not depend on tools.
+   Automated test: `tests/invariants/loop_size_orthogonality.rs` (invariant #2)
 3. **Sandbox.** Every fs / shell tool resolves paths through
    `tools::resolve_within`. Never bypass it.
+   Automated test: `tests/invariants/sandbox.rs`
 4. **Tests are non-negotiable.** Every new public function / tool / provider
    gets unit tests in the same file (`#[cfg(test)] mod tests`).
+   Automated test: `tests/invariants/test_coverage.rs`
 5. **No `unwrap()` / `expect()` in non-test code.** Return `Result`. The one
    exception is `client build` in `openai.rs` (infallible by construction).
+   Enforced by: `clippy::unwrap_used` deny (added in Goal 224)
 6. **No new dependencies without justification.** State the reason in the
    journal entry. Prefer std + what's already in `Cargo.toml`.
+   Automated test: `tests/invariants/dep_justification.rs` +
+   `scripts/check-new-deps.sh`
 7. **Finish reasons are data, not errors.** `Agent::run` returns
    `Ok(AgentOutcome { finish: ... })` for every termination mode
    (`NoMoreToolCalls`, `BudgetExceeded`, `Stuck`, `TranscriptLimit`,
@@ -56,6 +63,7 @@ tests/
    a new `Error::XxxBudget` or `Error::XxxLimit` variant that
    short-circuits the transcript save. self-improve.sh's auto-resume
    gate depends on the saved transcript existing on disk.
+   Automated test: `tests/invariants/finish_reason_data.rs`
 8. **Tool-call ↔ tool-result pairing.** Every `Role::Tool` message
    in the transcript MUST be immediately preceded by a `Role::Assistant`
    message whose `tool_calls` contains the matching id. OpenAI,
@@ -68,7 +76,7 @@ tests/
    `keep_recent_n=N` split in `agent::Agent::maybe_compact` orphaned
    a tool result whose parent assistant had just been drained. Fix:
    retreat the split until `transcript[split].role != Role::Tool`.
-   Tested by `compaction_keeps_tool_calls_paired_with_results`.
+   Automated test: `tests/invariants/tool_call_pairing.rs`
 
 ## How to do work
 

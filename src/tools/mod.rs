@@ -78,7 +78,7 @@ pub use audit::{
 
 // ── Re-exports from dispatch ────────────────────────────────────────────────
 
-pub(crate) use dispatch::resolve_within;
+pub use dispatch::resolve_within;
 pub use dispatch::{args_preview_for_permission, ToolDispatch};
 
 // ── Re-exports from individual tool modules ─────────────────────────────────

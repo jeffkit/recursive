@@ -204,7 +204,7 @@ pub fn args_preview_for_permission(arguments: &Value) -> String {
 /// For paths that do not yet exist (e.g. a new file being written), only the
 /// lexical normalisation check is performed — the caller is responsible for
 /// ensuring no symlink is created that would bridge outside the root.
-pub(crate) fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf> {
+pub fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf> {
     let candidate = std::path::Path::new(path);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
