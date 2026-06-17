@@ -163,8 +163,16 @@ impl Tool for RunSkillScript {
             message: format!("spawn failed: {e}"),
         })?;
 
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout = child.stdout.take().ok_or_else(|| Error::Tool {
+            name: "run_skill_script".into(),
+            call_id: None,
+            message: "expected stdout to be piped (Stdio::piped() was set above)".to_string(),
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| Error::Tool {
+            name: "run_skill_script".into(),
+            call_id: None,
+            message: "expected stderr to be piped (Stdio::piped() was set above)".to_string(),
+        })?;
 
         let max_output: usize = 10000;
         let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max_output).await });
