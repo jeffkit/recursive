@@ -74,5 +74,16 @@ set_goal while busy) the body also contains `"error"` key.
   if `ApiError` has a `with_retry_after` method — otherwise add one, or
   just set the header via the existing `into_response()` + `headers_mut()`
   pattern while still using ApiError for the 404 path.
+- **IMPORTANT**: The old `session_clear_goal` 409 body was:
+  ```json
+  {"error": "session runtime is busy; goal not cleared",
+   "hint": "retry after the current turn completes",
+   "session_id": "..."}
+  ```
+  Do NOT silently drop the `hint` text. Instead fold it into the error
+  message string:
+  `"session runtime is busy; goal not cleared — retry after the current turn completes"`
+  Add a test in `tests/http.rs` that asserts the 409 body contains this
+  full string (or at least "retry after").
 - Do NOT change the 200 OK response bodies — keep the existing
   `{"status": "approved", ...}` etc shapes for those arms.

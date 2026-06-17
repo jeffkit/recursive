@@ -523,7 +523,13 @@ function ensureGitExclude(cwd, pattern) {
   } catch { /* 非致命：排除失败仅影响 clean 检查整洁度 */ }
 }
 function gitClean(cwd) { return git(['status', '--porcelain'], cwd) === '' }
-function gitDiff(cwd) { return git(['diff', 'HEAD'], cwd) }
+function gitDiff(cwd) {
+  // Use --intent-to-add so brand-new untracked files appear in `git diff HEAD`.
+  // Without this, a goal that only adds new files produces an empty diff and the
+  // reviewer sees nothing (causing a spurious NEEDS_FIX on an empty prompt).
+  try { git(['add', '--intent-to-add', '--', '.'], cwd) } catch { /* best-effort */ }
+  return git(['diff', 'HEAD'], cwd)
+}
 function currentBranch(cwd) { try { return git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd) } catch { return '?' } }
 
 function listRuns() {
