@@ -1761,7 +1761,8 @@ async fn run_once(
         Some(&goal),
         Some(event_sink),
         Some(shutdown.clone()),
-        true, // interactive CLI — plan mode tools enabled
+        false, // headless batch run — no human to approve plans
+               // (plan mode is available in TUI and HTTP API sessions)
     )
     .await?;
 
@@ -1899,7 +1900,8 @@ async fn repl(
         None,
         None,
         None,
-        true, // interactive REPL — plan mode tools enabled
+        false, // plan approval not yet wired into the REPL event loop;
+               // use TUI or HTTP API for plan-mode sessions
     )
     .await?;
 

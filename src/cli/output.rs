@@ -231,6 +231,13 @@ pub(crate) async fn stream_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
 
 /// REPL-specific event handler: clean output without step prefixes on assistant text.
 /// Tool calls are shown briefly; assistant text is printed directly.
+///
+/// TODO(plan-mode-repl): implement y/n approval prompt for PlanProposed events.
+/// When `build_runtime(interactive=true)` is restored for the REPL (see
+/// `src/main.rs:repl`), this handler must:
+///   - on `PlanProposed`: print the plan, ask "Approve plan? [y/n]: ", read stdin,
+///     and call `gate.approve()` or `gate.reject(&reason)`.
+///   - on `PlanConfirmed` / `PlanRejected`: print a note.
 pub(crate) async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
