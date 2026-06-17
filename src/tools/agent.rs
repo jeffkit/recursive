@@ -31,7 +31,7 @@ use tokio::sync::RwLock;
 use crate::agent::FinishReason;
 use crate::error::{Error, Result};
 use crate::kernel::{AgentKernel, TurnContext};
-use crate::llm::{LlmProvider, ToolSpec};
+use crate::llm::{ChatProvider, ToolSpec};
 use crate::message::Message;
 use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::permissions::PermissionMode;
@@ -175,7 +175,7 @@ impl Tool for SharedMemoryWrite {
 /// caller-supplied `manifest` and execution `mode`.
 pub struct AgentTool {
     workspace: std::path::PathBuf,
-    provider: Arc<dyn LlmProvider>,
+    provider: Arc<dyn ChatProvider>,
     all_tools: ToolRegistry,
     max_depth: usize,
     current_depth: usize,
@@ -189,7 +189,7 @@ pub struct AgentTool {
 impl AgentTool {
     pub fn new(
         workspace: impl Into<std::path::PathBuf>,
-        provider: Arc<dyn LlmProvider>,
+        provider: Arc<dyn ChatProvider>,
         all_tools: ToolRegistry,
         max_depth: usize,
         current_depth: usize,
@@ -826,7 +826,7 @@ mod tests {
         GlobTool, LocalTransport, ReadFile, SearchFiles, ToolTransport, WebFetch, WriteFile,
     };
 
-    fn mock_provider(script: Vec<Completion>) -> Arc<dyn LlmProvider> {
+    fn mock_provider(script: Vec<Completion>) -> Arc<dyn ChatProvider> {
         Arc::new(MockProvider::new(script))
     }
 

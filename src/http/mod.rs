@@ -41,7 +41,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::config::Config;
-use crate::llm::LlmProvider;
+use crate::llm::ChatProvider;
 use crate::runtime::AgentRuntime;
 use crate::tools::plan_mode::PlanApprovalGate;
 use crate::tools::ToolRegistry;
@@ -299,7 +299,7 @@ pub struct AppState {
     /// every tool_call from the LLM resolves to "tool not found".
     pub tool_registry: ToolRegistry,
     pub config: Config,
-    pub provider: Arc<dyn LlmProvider>,
+    pub provider: Arc<dyn ChatProvider>,
     /// Session state keyed by session ID.
     pub sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     /// Per-session SSE broadcast channels.

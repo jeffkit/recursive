@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::event::AgentEvent;
 use crate::hooks::config::{matches_hook, HookCommand, HookCommandType, HookFailMode, HooksConfig};
-use crate::llm::LlmProvider;
+use crate::llm::ChatProvider;
 use crate::message::Message;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -308,7 +308,7 @@ struct ResolvedHook {
 pub struct ExternalHookRunner {
     hooks: Vec<ResolvedHook>,
     /// Optional LLM provider for prompt-type hooks.
-    llm: Option<Arc<dyn LlmProvider>>,
+    llm: Option<Arc<dyn ChatProvider>>,
     /// Tracks indices of `once: true` hooks that have already been executed.
     executed_once: Arc<Mutex<HashSet<usize>>>,
     /// Optional cancellation token for `asyncRewake` hooks.
@@ -362,7 +362,7 @@ impl ExternalHookRunner {
 
     /// Build a runner from a structured `HooksConfig`, with an optional LLM
     /// provider for prompt/agent-type hooks.
-    pub fn from_config_with_llm(config: HooksConfig, llm: Option<Arc<dyn LlmProvider>>) -> Self {
+    pub fn from_config_with_llm(config: HooksConfig, llm: Option<Arc<dyn ChatProvider>>) -> Self {
         let mut hooks = Vec::new();
         for (event_name, matchers) in config.events {
             for matcher_entry in matchers {
@@ -770,7 +770,7 @@ fn event_names_match(config_name: &str, wire_name: &str) -> bool {
 /// Evaluate a prompt template via `llm`, replacing `$ARGUMENTS` with
 /// the serialised `HookInput`. Respects `fail_mode` on timeout or LLM error.
 async fn run_prompt_hook(
-    llm: &dyn LlmProvider,
+    llm: &dyn ChatProvider,
     prompt_template: &str,
     input: &HookInput,
     hook_timeout: Duration,

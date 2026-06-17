@@ -9,7 +9,7 @@
 //! it via `AgentBuilder::compactor(...)`.
 
 use crate::error::Result;
-use crate::llm::{LlmProvider, StructuredRequest, ToolSpec};
+use crate::llm::{ChatProvider, StructuredRequest, ToolSpec};
 use crate::message::Message;
 
 /// Configuration for LLM-driven transcript compaction.
@@ -95,7 +95,7 @@ impl Compactor {
     /// Returns None if the provider doesn't support it or the response is invalid.
     async fn try_structured_compact(
         &self,
-        provider: &dyn LlmProvider,
+        provider: &dyn ChatProvider,
         older_text: &str,
         step: usize,
     ) -> Option<String> {
@@ -200,7 +200,7 @@ impl Compactor {
     /// (`< keep_recent_n + 2` messages).
     pub async fn apply_to_transcript(
         &self,
-        provider: &dyn LlmProvider,
+        provider: &dyn ChatProvider,
         transcript: &mut Vec<Message>,
         step: usize,
     ) -> Result<Option<(usize, usize)>> {
@@ -227,7 +227,7 @@ impl Compactor {
     #[tracing::instrument(skip(self, provider, transcript))]
     pub async fn compact(
         &self,
-        provider: &dyn LlmProvider,
+        provider: &dyn ChatProvider,
         transcript: &[Message],
         step: usize,
     ) -> Result<Message> {

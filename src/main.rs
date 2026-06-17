@@ -22,7 +22,7 @@ use recursive::SessionStatus;
 use recursive::SessionWriter;
 use recursive::{
     config::Config,
-    llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
+    llm::{AnthropicProvider, ChatProvider, OpenAiProvider},
     tools::{ScheduleWakeup, WakeupSlot},
     AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink, FinishReason, NullSink,
     RetryPolicy, SessionPersistenceSink, ToolRegistry,
@@ -650,27 +650,27 @@ async fn main() -> anyhow::Result<()> {
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
-            let provider: Arc<dyn recursive::llm::LlmProvider> = match config.provider_type.as_str()
-            {
-                "anthropic" => {
-                    let anthropic_retry = recursive::llm::RetryPolicy {
-                        max_retries: config.retry_max,
-                        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-                    };
-                    let anthropic =
-                        AnthropicProvider::new(&config.api_base, api_key, &config.model)?
+            let provider: Arc<dyn recursive::llm::ChatProvider> =
+                match config.provider_type.as_str() {
+                    "anthropic" => {
+                        let anthropic_retry = recursive::llm::RetryPolicy {
+                            max_retries: config.retry_max,
+                            initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                            max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+                        };
+                        let anthropic =
+                            AnthropicProvider::new(&config.api_base, api_key, &config.model)?
+                                .with_temperature(config.temperature)
+                                .with_retry_policy(anthropic_retry);
+                        Arc::new(anthropic)
+                    }
+                    _ => {
+                        let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                             .with_temperature(config.temperature)
-                            .with_retry_policy(anthropic_retry);
-                    Arc::new(anthropic)
-                }
-                _ => {
-                    let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
-                        .with_temperature(config.temperature)
-                        .with_retry_policy(retry);
-                    Arc::new(openai)
-                }
-            };
+                            .with_retry_policy(retry);
+                        Arc::new(openai)
+                    }
+                };
             // Goal-169: build the slash command list from built-in TUI commands +
             // workspace skill files. Guarded by the `tui` feature since
             // CommandRegistry lives in the tui module.
@@ -1614,7 +1614,7 @@ async fn run_loop(
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let provider: Arc<dyn LlmProvider> = match config.provider_type.as_str() {
+    let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
         "anthropic" => {
             let anthropic_retry = recursive::llm::RetryPolicy {
                 max_retries: config.retry_max,

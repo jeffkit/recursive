@@ -10,7 +10,7 @@
 //! everything, triggering a [`FinishReason::PermissionDenialLimit`].
 
 use crate::error::Result;
-use crate::llm::LlmProvider;
+use crate::llm::ChatProvider;
 use std::sync::Arc;
 
 // ── Classifier prompt ──────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ impl DenialTracker {
 /// auto-approved in [`PermissionMode::Auto`](crate::permissions::PermissionMode::Auto).
 pub struct AutoClassifier {
     /// The LLM provider used for classification calls.
-    provider: Arc<dyn LlmProvider>,
+    provider: Arc<dyn ChatProvider>,
     /// Denial tracker for safety limits.
     pub tracker: DenialTracker,
 }
@@ -87,7 +87,7 @@ struct ClassifierResponse {
 
 impl AutoClassifier {
     /// Create a new classifier backed by the given provider.
-    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
+    pub fn new(provider: Arc<dyn ChatProvider>) -> Self {
         Self {
             provider,
             tracker: DenialTracker::default(),

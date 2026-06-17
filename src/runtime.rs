@@ -30,7 +30,7 @@ use crate::error::Result;
 use crate::event::{AgentEvent, EventSink, NullSink};
 use crate::hooks::{HookEvent, HookRegistry};
 use crate::kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
-use crate::llm::{LlmProvider, TokenUsage};
+use crate::llm::{ChatProvider, TokenUsage};
 use crate::message::Message;
 use crate::tools::plan_mode::{
     EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanModeRequestGate, RequestPlanModeTool,
@@ -1077,7 +1077,7 @@ impl AgentRuntimeBuilder {
     }
 
     /// Set the LLM provider (required).
-    pub fn llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+    pub fn llm(mut self, llm: Arc<dyn ChatProvider>) -> Self {
         self.kernel_builder = self.kernel_builder.llm(llm);
         self
     }

@@ -28,7 +28,7 @@ pub(crate) const DENIAL_LIMIT_SENTINEL: &str = "ERROR_DENIAL_LIMIT:";
 use crate::compact::Compactor;
 use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
-use crate::llm::{Completion, LlmProvider, StreamSender, TokenUsage, ToolCall};
+use crate::llm::{ChatProvider, Completion, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
@@ -72,7 +72,7 @@ pub(crate) struct RunInnerOutcome {
 /// loop cannot accidentally leave stale state behind.
 pub(crate) struct RunCore<'a> {
     pub(crate) messages: Arc<Vec<Message>>,
-    pub(crate) llm: Arc<dyn LlmProvider>,
+    pub(crate) llm: Arc<dyn ChatProvider>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) max_steps: usize,
     pub(crate) max_transcript_chars: Option<usize>,

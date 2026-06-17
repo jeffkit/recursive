@@ -24,7 +24,7 @@ use crate::agent::FinishReason;
 use crate::compact::Compactor;
 use crate::event::AgentEvent;
 use crate::hooks::HookRegistry;
-use crate::llm::{LlmProvider, TokenUsage, ToolSpec};
+use crate::llm::{ChatProvider, TokenUsage, ToolSpec};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::storage::{NoopSessionStore, SessionStore, StorageBackend};
@@ -150,7 +150,7 @@ pub struct TurnOutcome {
 #[derive(Clone)]
 pub struct AgentKernel {
     /// The LLM provider to use for completions.
-    pub(crate) llm: Arc<dyn LlmProvider>,
+    pub(crate) llm: Arc<dyn ChatProvider>,
     /// The tool registry (tools available to the agent).
     pub(crate) tools: ToolRegistry,
     /// Maximum number of LLM calls per turn.
@@ -183,7 +183,7 @@ impl std::fmt::Debug for AgentKernel {
         let tools_count = self.tools.names().len();
         let hooks_count = self.hooks.len();
         f.debug_struct("AgentKernel")
-            .field("llm", &"<LlmProvider>")
+            .field("llm", &"<ChatProvider>")
             .field("tools_count", &tools_count)
             .field("max_steps", &self.max_steps)
             .field("max_transcript_chars", &self.max_transcript_chars)
@@ -202,7 +202,7 @@ impl AgentKernel {
     }
 
     /// Access the LLM provider.
-    pub fn llm(&self) -> &Arc<dyn LlmProvider> {
+    pub fn llm(&self) -> &Arc<dyn ChatProvider> {
         &self.llm
     }
 
@@ -335,7 +335,7 @@ impl AgentKernel {
 /// Builder for [`AgentKernel`].
 #[derive(Default)]
 pub struct AgentKernelBuilder {
-    llm: Option<Arc<dyn LlmProvider>>,
+    llm: Option<Arc<dyn ChatProvider>>,
     tools: Option<ToolRegistry>,
     max_steps: Option<usize>,
     max_transcript_chars: Option<usize>,
@@ -362,7 +362,7 @@ impl std::fmt::Debug for AgentKernelBuilder {
         let tools_desc = self.tools.as_ref().map(|t| t.names().len());
         let hooks_desc = self.hooks.as_ref().map(|h| h.len());
         f.debug_struct("AgentKernelBuilder")
-            .field("llm", &self.llm.as_ref().map(|_| "<LlmProvider>"))
+            .field("llm", &self.llm.as_ref().map(|_| "<ChatProvider>"))
             .field("tools", &tools_desc)
             .field("max_steps", &self.max_steps)
             .field("max_transcript_chars", &self.max_transcript_chars)
@@ -386,7 +386,7 @@ impl std::fmt::Debug for AgentKernelBuilder {
 
 impl AgentKernelBuilder {
     /// Set the LLM provider.
-    pub fn llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+    pub fn llm(mut self, llm: Arc<dyn ChatProvider>) -> Self {
         self.llm = Some(llm);
         self
     }

@@ -12,7 +12,7 @@ use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skil
 #[cfg(feature = "web_search")]
 use recursive::tools::WebSearch;
 use recursive::{
-    llm::{AnthropicProvider, LlmProvider, OpenAiProvider},
+    llm::{AnthropicProvider, ChatProvider, OpenAiProvider},
     tools::fs::ReadFileState,
     tools::EpisodicRecall,
     tools::{
@@ -272,7 +272,7 @@ pub(crate) async fn build_runtime(
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let provider: Arc<dyn LlmProvider> = match provider_type.as_str() {
+    let provider: Arc<dyn ChatProvider> = match provider_type.as_str() {
         "anthropic" => {
             let anthropic_retry = recursive::llm::RetryPolicy {
                 max_retries: config.retry_max,

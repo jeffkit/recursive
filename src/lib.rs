@@ -2,12 +2,12 @@
 //!
 //! The kernel is intentionally tiny:
 //!   - `Message` is the only data primitive shared across the system.
-//!   - `LlmProvider` abstracts model backends (HTTP, mock, future local...).
+//!   - `ChatProvider` abstracts model backends (HTTP, mock, future local...).
 //!   - `Tool` abstracts side effects the model can request.
 //!   - `Agent` is a thin loop that wires them together.
 //!
 //! Everything else is opt-in. New capabilities are added by implementing
-//! `Tool` or `LlmProvider`, never by editing the loop.
+//! `Tool` or `ChatProvider`, never by editing the loop.
 
 pub mod agent;
 pub mod atomic;
@@ -70,8 +70,8 @@ pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
 pub use kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 pub use llm::{
-    context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, Completion,
-    LlmProvider, ModelPricing, RetryPolicy, TokenUsage, ToolCall, ToolSpec,
+    context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, ChatProvider,
+    Completion, ModelPricing, RetryPolicy, TokenUsage, ToolCall, ToolSpec,
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{

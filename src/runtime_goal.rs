@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::llm::LlmProvider;
+use crate::llm::ChatProvider;
 use crate::message::Message;
 
 /// Status of an active goal loop.
@@ -52,12 +52,12 @@ pub struct GoalVerdict {
 
 /// Calls the LLM provider to decide whether a goal condition is met.
 pub struct GoalEvaluator {
-    provider: Arc<dyn LlmProvider>,
+    provider: Arc<dyn ChatProvider>,
 }
 
 impl GoalEvaluator {
     /// Create an evaluator backed by `provider`.
-    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
+    pub fn new(provider: Arc<dyn ChatProvider>) -> Self {
         Self { provider }
     }
 
@@ -123,7 +123,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::error::Result;
-    use crate::llm::{Completion, LlmProvider};
+    use crate::llm::{ChatProvider, Completion};
     use crate::message::Role;
     use async_trait::async_trait;
 
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmProvider for CapturingProvider {
+    impl ChatProvider for CapturingProvider {
         async fn complete(
             &self,
             messages: &[Message],

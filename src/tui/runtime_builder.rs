@@ -3,20 +3,20 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::llm::RetryPolicy;
-use crate::{AgentRuntime, AgentRuntimeBuilder, LlmProvider};
+use crate::{AgentRuntime, AgentRuntimeBuilder, ChatProvider};
 
 pub enum RuntimeBuild {
     Ready(Option<Box<AgentRuntime>>),
     Offline { reason: String },
 }
 
-fn build_provider(config: &Config, api_key: String) -> crate::error::Result<Arc<dyn LlmProvider>> {
+fn build_provider(config: &Config, api_key: String) -> crate::error::Result<Arc<dyn ChatProvider>> {
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let provider: Arc<dyn LlmProvider> = match config.provider_type.as_str() {
+    let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
         "anthropic" => Arc::new(
             crate::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)

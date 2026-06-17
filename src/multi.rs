@@ -3,7 +3,7 @@
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
-use crate::{Config, LlmProvider};
+use crate::{ChatProvider, Config};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -286,7 +286,7 @@ pub type AgentManifest = HashMap<String, WorkerManifestEntry>;
 /// An agent pool manages multiple agents with different roles.
 pub struct AgentPool {
     roles: HashMap<String, AgentRole>,
-    provider: Arc<dyn LlmProvider>,
+    provider: Arc<dyn ChatProvider>,
     #[allow(dead_code)]
     config: Config,
     memory: SharedMemory,
@@ -294,7 +294,7 @@ pub struct AgentPool {
 }
 
 impl AgentPool {
-    pub fn new(provider: Arc<dyn LlmProvider>, config: Config) -> Self {
+    pub fn new(provider: Arc<dyn ChatProvider>, config: Config) -> Self {
         Self {
             roles: HashMap::new(),
             provider,
