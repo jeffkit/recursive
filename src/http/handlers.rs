@@ -472,7 +472,9 @@ pub(super) struct ForkSessionResponse {
     id: String,
     /// Timestamp when the fork was created.
     created_at: String,
-    /// Number of messages copied from the source session.
+    /// Number of non-system messages copied from the source session
+    /// (matches the semantics of `SessionInfo.message_count` from
+    /// `GET /sessions`).
     message_count: usize,
 }
 
@@ -500,8 +502,6 @@ pub(super) async fn fork_session(
         rt.transcript().to_vec()
     };
 
-    let message_count = transcript_snapshot.len();
-
     // Build a new session with the copied transcript.
     let new_id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
@@ -515,6 +515,10 @@ pub(super) async fn fork_session(
         .build()
         .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
+    // Count non-system messages BEFORE set_transcript (which moves the
+    // snapshot). The new session's `non_system_message_count` atomic and
+    // the fork response's `message_count` both use this number so they
+    // agree with `SessionInfo.message_count` from `GET /sessions`.
     let non_system_count = transcript_snapshot
         .iter()
         .filter(|m| m.role != crate::message::Role::System)
@@ -546,7 +550,7 @@ pub(super) async fn fork_session(
         Json(ForkSessionResponse {
             id: new_id,
             created_at,
-            message_count,
+            message_count: non_system_count,
         }),
     ))
 }

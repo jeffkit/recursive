@@ -3702,6 +3702,129 @@ mod http_tests {
         assert_eq!(resp.status(), 404);
     }
 
+    // ── Goal-306: fork_session.message_count must match the non-system
+    //    semantics of `SessionInfo.message_count` from `GET /sessions`,
+    //    not the raw `transcript.len()` (which would include the system
+    //    prompt). Sending one user message produces 2 non-system
+    //    messages (user + assistant) on top of the system prompt, so the
+    //    transcript has length 3 but the count returned by fork should
+    //    be 2. Before the fix the response returned 3.
+
+    /// Regression: `POST /sessions/:id/fork` returns `message_count` equal
+    /// to the **non-system** message count, matching
+    /// `SessionInfo.message_count` from `GET /sessions`. Previously the
+    /// handler used `transcript_snapshot.len()` which inflated the value
+    /// by +1 (the system prompt).
+    #[tokio::test]
+    async fn fork_session_message_count_is_non_system_only() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hi back".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        // 1) Create a session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let src: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let src_id = src["id"].as_str().unwrap().to_string();
+
+        // 2) Send a user message. After the forwarder drains the runtime
+        //    emits a MessageAppended for the user message AND the assistant
+        //    reply, so the non-system count goes from 0 → 2 (user +
+        //    assistant). The system prompt is filtered out.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{src_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "ping"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "send_message must succeed");
+
+        // 3) Fork the session. The forked session should report
+        //    `message_count: 2` (non-system only). Pre-fix, this returned
+        //    `3` because `transcript_snapshot.len()` includes the system
+        //    prompt that was appended by the runtime builder.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{src_id}/fork"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let fork: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let count = fork["message_count"]
+            .as_u64()
+            .expect("message_count must be a number");
+        assert_eq!(
+            count, 2,
+            "fork message_count must reflect non-system messages only (user +              assistant), got: {fork}"
+        );
+
+        // 4) Cross-check: the new session's `GET /sessions` entry must
+        //    report the SAME message_count so a client that calls fork
+        //    and then lists sessions sees a consistent number.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let fork_id = fork["id"].as_str().unwrap();
+        let listed = list["sessions"]
+            .as_array()
+            .expect("sessions is an array")
+            .iter()
+            .find(|s| s["id"].as_str() == Some(fork_id))
+            .expect("forked session must appear in GET /sessions");
+        assert_eq!(
+            listed["message_count"], 2,
+            "GET /sessions must agree with fork response, got: {listed}"
+        );
+    }
+
     /// list_sessions must return sessions sorted by id so that paginated
     /// requests are stable across calls (HashMap iteration order is random).
     #[tokio::test]
