@@ -1,4 +1,5 @@
 ---
+type: Skill
 name: rust-patch-discipline
 description: |
   Surgical-edit guide for Rust files using V4A apply_patch. Read this

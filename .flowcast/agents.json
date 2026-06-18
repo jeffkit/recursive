@@ -23,7 +23,7 @@
     },
     "recursive-deepseek": {
       "executor": "recursive",
-      "provider": "deepseek",
+      "provider": "venus-deepseek",
       "maxSteps": 60
     },
     "recursive-minimax": {

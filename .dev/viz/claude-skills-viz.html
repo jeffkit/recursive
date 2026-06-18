@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Skills (GitNexus + Loop) — OKF Knowledge Graph</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.29.2/cytoscape.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0f1117; color: #e2e8f0; height: 100vh; display: flex;
+         flex-direction: column; overflow: hidden; }
+  header { background: #1a1d27; border-bottom: 1px solid #2d3149;
+           padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  header h1 { font-size: 15px; font-weight: 600; color: #a5b4fc; }
+  .badge { background: #2d3149; color: #818cf8; border-radius: 12px;
+           padding: 2px 8px; font-size: 11px; }
+  .controls { display: flex; gap: 8px; margin-left: auto; align-items: center; }
+  input[type=text] { background: #2d3149; border: 1px solid #3d4266;
+                     color: #e2e8f0; padding: 4px 10px; border-radius: 6px;
+                     font-size: 12px; width: 160px; }
+  select { background: #2d3149; border: 1px solid #3d4266; color: #e2e8f0;
+           padding: 4px 8px; border-radius: 6px; font-size: 12px; }
+  .main { display: flex; flex: 1; overflow: hidden; }
+  #cy { flex: 1; background: #0f1117; }
+  .panel { width: 340px; background: #1a1d27; border-left: 1px solid #2d3149;
+           overflow-y: auto; padding: 16px; flex-shrink: 0; }
+  .panel h2 { font-size: 14px; color: #a5b4fc; margin-bottom: 8px; }
+  .panel .meta { margin-bottom: 12px; }
+  .panel .meta dt { font-size: 11px; color: #64748b; text-transform: uppercase;
+                    letter-spacing: .05em; margin-top: 6px; }
+  .panel .meta dd { font-size: 12px; color: #cbd5e1; margin-left: 0; }
+  .tag { display: inline-block; background: #1e293b; color: #7dd3fc;
+         border-radius: 4px; padding: 1px 6px; font-size: 11px; margin: 2px 2px 0 0; }
+  .body-content { font-size: 12px; line-height: 1.6; color: #cbd5e1; margin-top: 12px; }
+  .body-content h1,.body-content h2 { color: #a5b4fc; font-size: 13px; margin: 10px 0 4px; }
+  .body-content h3 { color: #818cf8; font-size: 12px; margin: 8px 0 3px; }
+  .body-content code { background: #1e293b; padding: 1px 4px; border-radius: 3px;
+                       font-size: 11px; }
+  .body-content pre { background: #1e293b; padding: 8px; border-radius: 6px;
+                      overflow-x: auto; margin: 6px 0; }
+  .body-content pre code { background: none; padding: 0; }
+  .body-content table { border-collapse: collapse; width: 100%; font-size: 11px; }
+  .body-content th, .body-content td { border: 1px solid #2d3149;
+                                        padding: 3px 6px; text-align: left; }
+  .body-content th { background: #2d3149; color: #a5b4fc; }
+  .body-content a { color: #818cf8; cursor: pointer; }
+  .backlinks { margin-top: 14px; }
+  .backlinks h3 { font-size: 12px; color: #64748b; margin-bottom: 6px; }
+  .backlink-item { font-size: 11px; color: #818cf8; cursor: pointer;
+                   padding: 2px 0; text-decoration: underline; }
+  .placeholder { color: #4a5568; font-size: 13px; text-align: center;
+                 padding: 40px 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude Skills (GitNexus + Loop)</h1>
+  <span class="badge" id="node-count">— concepts</span>
+  <div class="controls">
+    <input type="text" id="search" placeholder="Search concepts…">
+    <select id="type-filter"><option value="">All types</option></select>
+    <select id="layout-select">
+      <option value="cose">Force</option>
+      <option value="concentric">Concentric</option>
+      <option value="breadthfirst">Tree</option>
+      <option value="circle">Circle</option>
+      <option value="grid">Grid</option>
+    </select>
+  </div>
+</header>
+<div class="main">
+  <div id="cy"></div>
+  <div class="panel" id="panel">
+    <div class="placeholder">Click a node to explore</div>
+  </div>
+</div>
+<script>
+const BUNDLE = {"nodes": [{"id": "gitnexus/gitnexus-cli/SKILL", "fm": {"type": "Skill", "name": "gitnexus-cli", "description": "\"Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: \\\"Index this repo\\\", \\\"Reanalyze the codebase\\\", \\\"Generate a wiki\\\"\""}, "body": "\n# GitNexus CLI Commands\n\nAll commands work via `npx` — no global install required.\n\n## Commands\n\n### analyze — Build or refresh the index\n\n```bash\nnpx gitnexus analyze\n```\n\nRun from the project root. This parses all source files, builds the knowledge graph, writes it to `.gitnexus/`, and generates CLAUDE.md / AGENTS.md context files.\n\n| Flag           | Effect                                                           |\n| -------------- | ---------------------------------------------------------------- |\n| `--force`      | Force full re-index even if up to date                           |\n| `--embeddings` | Enable embedding generation for semantic search (off by default) |\n\n**When to run:** First time in a project, after major code changes, or when `gitnexus://repo/{name}/context` reports the index is stale. In Claude Code, a PostToolUse hook runs `analyze` automatically after `git commit` and `git merge`, preserving embeddings if previously generated.\n\n### status — Check index freshness\n\n```bash\nnpx gitnexus status\n```\n\nShows whether the current repo has a GitNexus index, when it was last updated, and symbol/relationship counts. Use this to check if re-indexing is needed.\n\n### clean — Delete the index\n\n```bash\nnpx gitnexus clean\n```\n\nDeletes the `.gitnexus/` directory and unregisters the repo from the global registry. Use before re-indexing if the index is corrupt or after removing GitNexus from a project.\n\n| Flag      | Effect                                            |\n| --------- | ------------------------------------------------- |\n| `--force` | Skip confirmation prompt                          |\n| `--all`   | Clean all indexed repos, not just the current one |\n\n### wiki — Generate documentation from the graph\n\n```bash\nnpx gitnexus wiki\n```\n\nGenerates repository documentation from the knowledge graph using an LLM. Requires an API key (saved to `~/.gitnexus/config.json` on first use).\n\n| Flag                | Effect                                    |\n| ------------------- | ----------------------------------------- |\n| `--force`           | Force full regeneration                   |\n| `--model <model>`   | LLM model (default: minimax/minimax-m2.5) |\n| `--base-url <url>`  | LLM API base URL                          |\n| `--api-key <key>`   | LLM API key                               |\n| `--concurrency <n>` | Parallel LLM calls (default: 3)           |\n| `--gist`            | Publish wiki as a public GitHub Gist      |\n\n### list — Show all indexed repos\n\n```bash\nnpx gitnexus list\n```\n\nLists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_repos` tool provides the same information.\n\n## After Indexing\n\n1. **Read `gitnexus://repo/{name}/context`** to verify the index loaded\n2. Use the other GitNexus skills (`exploring`, `debugging`, `impact-analysis`, `refactoring`) for your task\n\n## Troubleshooting\n\n- **\"Not inside a git repository\"**: Run from a directory inside a git repo\n- **Index is stale after re-analyzing**: Restart Claude Code to reload the MCP server\n- **Embeddings slow**: Omit `--embeddings` (it's off by default) or set `OPENAI_API_KEY` for faster API-based embedding\n"}, {"id": "gitnexus/gitnexus-debugging/SKILL", "fm": {"type": "Skill", "name": "gitnexus-debugging", "description": "\"Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: \\\"Why is X failing?\\\", \\\"Where does this error come from?\\\", \\\"Trace this bug\\\"\""}, "body": "\n# Debugging with GitNexus\n\n## When to Use\n\n- \"Why is this function failing?\"\n- \"Trace where this error comes from\"\n- \"Who calls this method?\"\n- \"This endpoint returns 500\"\n- Investigating bugs, errors, or unexpected behavior\n\n## Workflow\n\n```\n1. gitnexus_query({query: \"<error or symptom>\"})            → Find related execution flows\n2. gitnexus_context({name: \"<suspect>\"})                    → See callers/callees/processes\n3. READ gitnexus://repo/{name}/process/{name}                → Trace execution flow\n4. gitnexus_cypher({query: \"MATCH path...\"})                 → Custom traces if needed\n```\n\n> If \"Index is stale\" → run `npx gitnexus analyze` in terminal.\n\n## Checklist\n\n```\n- [ ] Understand the symptom (error message, unexpected behavior)\n- [ ] gitnexus_query for error text or related code\n- [ ] Identify the suspect function from returned processes\n- [ ] gitnexus_context to see callers and callees\n- [ ] Trace execution flow via process resource if applicable\n- [ ] gitnexus_cypher for custom call chain traces if needed\n- [ ] Read source files to confirm root cause\n```\n\n## Debugging Patterns\n\n| Symptom              | GitNexus Approach                                          |\n| -------------------- | ---------------------------------------------------------- |\n| Error message        | `gitnexus_query` for error text → `context` on throw sites |\n| Wrong return value   | `context` on the function → trace callees for data flow    |\n| Intermittent failure | `context` → look for external calls, async deps            |\n| Performance issue    | `context` → find symbols with many callers (hot paths)     |\n| Recent regression    | `detect_changes` to see what your changes affect           |\n\n## Tools\n\n**gitnexus_query** — find code related to error:\n\n```\ngitnexus_query({query: \"payment validation error\"})\n→ Processes: CheckoutFlow, ErrorHandling\n→ Symbols: validatePayment, handlePaymentError, PaymentException\n```\n\n**gitnexus_context** — full context for a suspect:\n\n```\ngitnexus_context({name: \"validatePayment\"})\n→ Incoming calls: processCheckout, webhookHandler\n→ Outgoing calls: verifyCard, fetchRates (external API!)\n→ Processes: CheckoutFlow (step 3/7)\n```\n\n**gitnexus_cypher** — custom call chain traces:\n\n```cypher\nMATCH path = (a)-[:CodeRelation {type: 'CALLS'}*1..2]->(b:Function {name: \"validatePayment\"})\nRETURN [n IN nodes(path) | n.name] AS chain\n```\n\n## Example: \"Payment endpoint returns 500 intermittently\"\n\n```\n1. gitnexus_query({query: \"payment error handling\"})\n   → Processes: CheckoutFlow, ErrorHandling\n   → Symbols: validatePayment, handlePaymentError\n\n2. gitnexus_context({name: \"validatePayment\"})\n   → Outgoing calls: verifyCard, fetchRates (external API!)\n\n3. READ gitnexus://repo/my-app/process/CheckoutFlow\n   → Step 3: validatePayment → calls fetchRates (external)\n\n4. Root cause: fetchRates calls external API without proper timeout\n```\n"}, {"id": "gitnexus/gitnexus-exploring/SKILL", "fm": {"type": "Skill", "name": "gitnexus-exploring", "description": "\"Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: \\\"How does X work?\\\", \\\"What calls this function?\\\", \\\"Show me the auth flow\\\"\""}, "body": "\n# Exploring Codebases with GitNexus\n\n## When to Use\n\n- \"How does authentication work?\"\n- \"What's the project structure?\"\n- \"Show me the main components\"\n- \"Where is the database logic?\"\n- Understanding code you haven't seen before\n\n## Workflow\n\n```\n1. READ gitnexus://repos                          → Discover indexed repos\n2. READ gitnexus://repo/{name}/context             → Codebase overview, check staleness\n3. gitnexus_query({query: \"<what you want to understand>\"})  → Find related execution flows\n4. gitnexus_context({name: \"<symbol>\"})            → Deep dive on specific symbol\n5. READ gitnexus://repo/{name}/process/{name}      → Trace full execution flow\n```\n\n> If step 2 says \"Index is stale\" → run `npx gitnexus analyze` in terminal.\n\n## Checklist\n\n```\n- [ ] READ gitnexus://repo/{name}/context\n- [ ] gitnexus_query for the concept you want to understand\n- [ ] Review returned processes (execution flows)\n- [ ] gitnexus_context on key symbols for callers/callees\n- [ ] READ process resource for full execution traces\n- [ ] Read source files for implementation details\n```\n\n## Resources\n\n| Resource                                | What you get                                            |\n| --------------------------------------- | ------------------------------------------------------- |\n| `gitnexus://repo/{name}/context`        | Stats, staleness warning (~150 tokens)                  |\n| `gitnexus://repo/{name}/clusters`       | All functional areas with cohesion scores (~300 tokens) |\n| `gitnexus://repo/{name}/cluster/{name}` | Area members with file paths (~500 tokens)              |\n| `gitnexus://repo/{name}/process/{name}` | Step-by-step execution trace (~200 tokens)              |\n\n## Tools\n\n**gitnexus_query** — find execution flows related to a concept:\n\n```\ngitnexus_query({query: \"payment processing\"})\n→ Processes: CheckoutFlow, RefundFlow, WebhookHandler\n→ Symbols grouped by flow with file locations\n```\n\n**gitnexus_context** — 360-degree view of a symbol:\n\n```\ngitnexus_context({name: \"validateUser\"})\n→ Incoming calls: loginHandler, apiMiddleware\n→ Outgoing calls: checkToken, getUserById\n→ Processes: LoginFlow (step 2/5), TokenRefresh (step 1/3)\n```\n\n## Example: \"How does payment processing work?\"\n\n```\n1. READ gitnexus://repo/my-app/context       → 918 symbols, 45 processes\n2. gitnexus_query({query: \"payment processing\"})\n   → CheckoutFlow: processPayment → validateCard → chargeStripe\n   → RefundFlow: initiateRefund → calculateRefund → processRefund\n3. gitnexus_context({name: \"processPayment\"})\n   → Incoming: checkoutHandler, webhookHandler\n   → Outgoing: validateCard, chargeStripe, saveTransaction\n4. Read src/payments/processor.ts for implementation details\n```\n"}, {"id": "gitnexus/gitnexus-guide/SKILL", "fm": {"type": "Skill", "name": "gitnexus-guide", "description": "\"Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: \\\"What GitNexus tools are available?\\\", \\\"How do I use GitNexus?\\\"\""}, "body": "\n# GitNexus Guide\n\nQuick reference for all GitNexus MCP tools, resources, and the knowledge graph schema.\n\n## Always Start Here\n\nFor any task involving code understanding, debugging, impact analysis, or refactoring:\n\n1. **Read `gitnexus://repo/{name}/context`** — codebase overview + check index freshness\n2. **Match your task to a skill below** and **read that skill file**\n3. **Follow the skill's workflow and checklist**\n\n> If step 1 warns the index is stale, run `npx gitnexus analyze` in the terminal first.\n\n## Skills\n\n| Task                                         | Skill to read       |\n| -------------------------------------------- | ------------------- |\n| Understand architecture / \"How does X work?\" | `gitnexus-exploring`         |\n| Blast radius / \"What breaks if I change X?\"  | `gitnexus-impact-analysis`   |\n| Trace bugs / \"Why is X failing?\"             | `gitnexus-debugging`         |\n| Rename / extract / split / refactor          | `gitnexus-refactoring`       |\n| Tools, resources, schema reference           | `gitnexus-guide` (this file) |\n| Index, status, clean, wiki CLI commands      | `gitnexus-cli`               |\n\n## Tools Reference\n\n| Tool             | What it gives you                                                        |\n| ---------------- | ------------------------------------------------------------------------ |\n| `query`          | Process-grouped code intelligence — execution flows related to a concept |\n| `context`        | 360-degree symbol view — categorized refs, processes it participates in  |\n| `impact`         | Symbol blast radius — what breaks at depth 1/2/3 with confidence         |\n| `detect_changes` | Git-diff impact — what do your current changes affect                    |\n| `rename`         | Multi-file coordinated rename with confidence-tagged edits               |\n| `cypher`         | Raw graph queries (read `gitnexus://repo/{name}/schema` first)           |\n| `list_repos`     | Discover indexed repos                                                   |\n\n## Resources Reference\n\nLightweight reads (~100-500 tokens) for navigation:\n\n| Resource                                       | Content                                   |\n| ---------------------------------------------- | ----------------------------------------- |\n| `gitnexus://repo/{name}/context`               | Stats, staleness check                    |\n| `gitnexus://repo/{name}/clusters`              | All functional areas with cohesion scores |\n| `gitnexus://repo/{name}/cluster/{clusterName}` | Area members                              |\n| `gitnexus://repo/{name}/processes`             | All execution flows                       |\n| `gitnexus://repo/{name}/process/{processName}` | Step-by-step trace                        |\n| `gitnexus://repo/{name}/schema`                | Graph schema for Cypher                   |\n\n## Graph Schema\n\n**Nodes:** File, Function, Class, Interface, Method, Community, Process\n**Edges (via CodeRelation.type):** CALLS, IMPORTS, EXTENDS, IMPLEMENTS, DEFINES, MEMBER_OF, STEP_IN_PROCESS\n\n```cypher\nMATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: \"myFunc\"})\nRETURN caller.name, caller.filePath\n```\n"}, {"id": "gitnexus/gitnexus-impact-analysis/SKILL", "fm": {"type": "Skill", "name": "gitnexus-impact-analysis", "description": "\"Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: \\\"Is it safe to change X?\\\", \\\"What depends on this?\\\", \\\"What will break?\\\"\""}, "body": "\n# Impact Analysis with GitNexus\n\n## When to Use\n\n- \"Is it safe to change this function?\"\n- \"What will break if I modify X?\"\n- \"Show me the blast radius\"\n- \"Who uses this code?\"\n- Before making non-trivial code changes\n- Before committing — to understand what your changes affect\n\n## Workflow\n\n```\n1. gitnexus_impact({target: \"X\", direction: \"upstream\"})  → What depends on this\n2. READ gitnexus://repo/{name}/processes                   → Check affected execution flows\n3. gitnexus_detect_changes()                               → Map current git changes to affected flows\n4. Assess risk and report to user\n```\n\n> If \"Index is stale\" → run `npx gitnexus analyze` in terminal.\n\n## Checklist\n\n```\n- [ ] gitnexus_impact({target, direction: \"upstream\"}) to find dependents\n- [ ] Review d=1 items first (these WILL BREAK)\n- [ ] Check high-confidence (>0.8) dependencies\n- [ ] READ processes to check affected execution flows\n- [ ] gitnexus_detect_changes() for pre-commit check\n- [ ] Assess risk level and report to user\n```\n\n## Understanding Output\n\n| Depth | Risk Level       | Meaning                  |\n| ----- | ---------------- | ------------------------ |\n| d=1   | **WILL BREAK**   | Direct callers/importers |\n| d=2   | LIKELY AFFECTED  | Indirect dependencies    |\n| d=3   | MAY NEED TESTING | Transitive effects       |\n\n## Risk Assessment\n\n| Affected                       | Risk     |\n| ------------------------------ | -------- |\n| <5 symbols, few processes      | LOW      |\n| 5-15 symbols, 2-5 processes    | MEDIUM   |\n| >15 symbols or many processes  | HIGH     |\n| Critical path (auth, payments) | CRITICAL |\n\n## Tools\n\n**gitnexus_impact** — the primary tool for symbol blast radius:\n\n```\ngitnexus_impact({\n  target: \"validateUser\",\n  direction: \"upstream\",\n  minConfidence: 0.8,\n  maxDepth: 3\n})\n\n→ d=1 (WILL BREAK):\n  - loginHandler (src/auth/login.ts:42) [CALLS, 100%]\n  - apiMiddleware (src/api/middleware.ts:15) [CALLS, 100%]\n\n→ d=2 (LIKELY AFFECTED):\n  - authRouter (src/routes/auth.ts:22) [CALLS, 95%]\n```\n\n**gitnexus_detect_changes** — git-diff based impact analysis:\n\n```\ngitnexus_detect_changes({scope: \"staged\"})\n\n→ Changed: 5 symbols in 3 files\n→ Affected: LoginFlow, TokenRefresh, APIMiddlewarePipeline\n→ Risk: MEDIUM\n```\n\n## Example: \"What breaks if I change validateUser?\"\n\n```\n1. gitnexus_impact({target: \"validateUser\", direction: \"upstream\"})\n   → d=1: loginHandler, apiMiddleware (WILL BREAK)\n   → d=2: authRouter, sessionManager (LIKELY AFFECTED)\n\n2. READ gitnexus://repo/my-app/processes\n   → LoginFlow and TokenRefresh touch validateUser\n\n3. Risk: 2 direct callers, 2 processes = MEDIUM\n```\n"}, {"id": "gitnexus/gitnexus-refactoring/SKILL", "fm": {"type": "Skill", "name": "gitnexus-refactoring", "description": "\"Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: \\\"Rename this function\\\", \\\"Extract this into a module\\\", \\\"Refactor this class\\\", \\\"Move this to a separate file\\\"\""}, "body": "\n# Refactoring with GitNexus\n\n## When to Use\n\n- \"Rename this function safely\"\n- \"Extract this into a module\"\n- \"Split this service\"\n- \"Move this to a new file\"\n- Any task involving renaming, extracting, splitting, or restructuring code\n\n## Workflow\n\n```\n1. gitnexus_impact({target: \"X\", direction: \"upstream\"})  → Map all dependents\n2. gitnexus_query({query: \"X\"})                            → Find execution flows involving X\n3. gitnexus_context({name: \"X\"})                           → See all incoming/outgoing refs\n4. Plan update order: interfaces → implementations → callers → tests\n```\n\n> If \"Index is stale\" → run `npx gitnexus analyze` in terminal.\n\n## Checklists\n\n### Rename Symbol\n\n```\n- [ ] gitnexus_rename({symbol_name: \"oldName\", new_name: \"newName\", dry_run: true}) — preview all edits\n- [ ] Review graph edits (high confidence) and ast_search edits (review carefully)\n- [ ] If satisfied: gitnexus_rename({..., dry_run: false}) — apply edits\n- [ ] gitnexus_detect_changes() — verify only expected files changed\n- [ ] Run tests for affected processes\n```\n\n### Extract Module\n\n```\n- [ ] gitnexus_context({name: target}) — see all incoming/outgoing refs\n- [ ] gitnexus_impact({target, direction: \"upstream\"}) — find all external callers\n- [ ] Define new module interface\n- [ ] Extract code, update imports\n- [ ] gitnexus_detect_changes() — verify affected scope\n- [ ] Run tests for affected processes\n```\n\n### Split Function/Service\n\n```\n- [ ] gitnexus_context({name: target}) — understand all callees\n- [ ] Group callees by responsibility\n- [ ] gitnexus_impact({target, direction: \"upstream\"}) — map callers to update\n- [ ] Create new functions/services\n- [ ] Update callers\n- [ ] gitnexus_detect_changes() — verify affected scope\n- [ ] Run tests for affected processes\n```\n\n## Tools\n\n**gitnexus_rename** — automated multi-file rename:\n\n```\ngitnexus_rename({symbol_name: \"validateUser\", new_name: \"authenticateUser\", dry_run: true})\n→ 12 edits across 8 files\n→ 10 graph edits (high confidence), 2 ast_search edits (review)\n→ Changes: [{file_path, edits: [{line, old_text, new_text, confidence}]}]\n```\n\n**gitnexus_impact** — map all dependents first:\n\n```\ngitnexus_impact({target: \"validateUser\", direction: \"upstream\"})\n→ d=1: loginHandler, apiMiddleware, testUtils\n→ Affected Processes: LoginFlow, TokenRefresh\n```\n\n**gitnexus_detect_changes** — verify your changes after refactoring:\n\n```\ngitnexus_detect_changes({scope: \"all\"})\n→ Changed: 8 files, 12 symbols\n→ Affected processes: LoginFlow, TokenRefresh\n→ Risk: MEDIUM\n```\n\n**gitnexus_cypher** — custom reference queries:\n\n```cypher\nMATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: \"validateUser\"})\nRETURN caller.name, caller.filePath ORDER BY caller.filePath\n```\n\n## Risk Rules\n\n| Risk Factor         | Mitigation                                |\n| ------------------- | ----------------------------------------- |\n| Many callers (>5)   | Use gitnexus_rename for automated updates |\n| Cross-area refs     | Use detect_changes after to verify scope  |\n| String/dynamic refs | gitnexus_query to find them               |\n| External/public API | Version and deprecate properly            |\n\n## Example: Rename `validateUser` to `authenticateUser`\n\n```\n1. gitnexus_rename({symbol_name: \"validateUser\", new_name: \"authenticateUser\", dry_run: true})\n   → 12 edits: 10 graph (safe), 2 ast_search (review)\n   → Files: validator.ts, login.ts, middleware.ts, config.json...\n\n2. Review ast_search edits (config.json: dynamic reference!)\n\n3. gitnexus_rename({symbol_name: \"validateUser\", new_name: \"authenticateUser\", dry_run: false})\n   → Applied 12 edits across 8 files\n\n4. gitnexus_detect_changes({scope: \"all\"})\n   → Affected: LoginFlow, TokenRefresh\n   → Risk: MEDIUM — run tests for these flows\n```\n"}, {"id": "recursive-loop/SKILL", "fm": {"type": "Skill", "name": "recursive-loop", "description": "\"Loop orchestrator for the Recursive self-improvement workflow. Reads the roadmap, picks goals, launches self-improve.sh, and handles results.\""}, "body": "\n# recursive-loop — Loop Orchestrator for Recursive Self-Improvement\n\n## When to invoke\n\nUse this skill whenever the user wants to advance the Recursive project\nvia its self-improvement loop. Trigger phrases:\n\n- \"推进 Recursive\"、\"跑一批 goal\"、\"让 Recursive 自己改\"\n- \"run a self-improve batch\"、\"advance the roadmap\"\n- \"orchestrate a batch\"、\"start the loop\"\n\nDo NOT invoke for:\n- Direct code edits (use `force-dev` instead)\n- Pure Q&A about the codebase\n\n---\n\n## Role\n\nYou are the **loop orchestrator** for the Recursive project.\nYour job: read state → pick goals → launch the self-improve flow → handle results → repeat.\n\n> **新编排入口**：`self-improve.flow.js`（flowcast flow）已取代老的 `self-improve.sh`。\n> 详见 `.dev/flows/SELF_IMPROVE.md`。\n\n---\n\n## Step-by-step SOP\n\n### 1. Orient (do this first, every time)\n\n```bash\n# What phase are we on?\ncat .dev/ROADMAP-v3.md\n\n# What recently landed?\ngit log --oneline -15\n\n# Any in-flight flowcast runs?\nnode .dev/flows/self-improve.flow.js --list 2>/dev/null || true\nls .worktrees/ 2>/dev/null\n\n# Latest goal number?\nls .dev/goals/ | sort -t'-' -k1 -n | grep -v deferred | tail -5\n\n# Recent run outcomes?\nls .flowcast/runs/ 2>/dev/null | sort | tail -5\n```\n\n### 2. Pick the next goal(s)\n\n- Read the active roadmap phase for the next 🔴 (not started) items.\n- If roadmap is complete, check `.dev/ROADMAP-v3.md` for any deferred/\n  future section, or ask the human for a new roadmap direction (HITL §6).\n- For each candidate goal, check if a goal file already exists:\n  `ls .dev/goals/ | grep <NN>-`\n- If the goal file doesn't exist yet, **write it** following the format\n  in `.dev/OPERATIONS.md` §5.\n- Default: pick 1-2 goals per batch. Two goals must touch disjoint files\n  (see `.dev/OPERATIONS.md` §4.1).\n\n### 3. Launch\n\n**首先确保依赖已安装**（首次或 package.json 变动后）：\n```bash\ncd .dev/flows && npm install && cd -\ncargo build --release   # 确保 recursive 二进制是最新的\n```\n\nSingle goal (serial)：\n```bash\n# ★ 推荐：用 launch-flow.sh，自动选 tmux 保活（macOS nohup 长跑会被杀死）\ncd /Users/kongjie/projects/Recursive\n.dev/scripts/launch-flow.sh \\\n  --goal-file .dev/goals/<NN>-<tag>.md \\\n  --provider deepseek \\\n  --hitl wecom\n\n# 也可直接用 tmux（等价，更灵活）：\ntmux new-session -d -s \"recursive-g<NN>\" -x 200 -y 50\ntmux send-keys -t \"recursive-g<NN>\" \"\n  cd /Users/kongjie/projects/Recursive && \\\n  node .dev/flows/self-improve.flow.js \\\n    --goal-file .dev/goals/<NN>-<tag>.md \\\n    --provider deepseek \\\n    --reviewer-agent claude \\\n    --hitl wecom 2>&1 | tee .flowcast/logs/tmux-g<NN>.log\n\" Enter\n```\n\n断点续跑（进程异常终止后）：\n```bash\n# ⚠️  必须同时传 --run-id 和 --goal-file：\n#   进程异常死亡时 pauseContext 未保存 goal，仅 --run-id 会报\"缺少 --goal\"\n# ⚠️  若 state.json status 是 \"running\"（不是 \"interrupted\"），先手动重置：\npython3 -c \"\nimport json\nwith open('.flowcast/runs/<run-id>/state.json') as f: s=json.load(f)\ns['status'] = 'interrupted'\nwith open('.flowcast/runs/<run-id>/state.json','w') as f: json.dump(s,f,indent=2)\nprint('reset to interrupted')\n\"\n\n# 然后续跑：\ntmux new-session -d -s \"recursive-resume\" -x 200 -y 50\ntmux send-keys -t \"recursive-resume\" \"\n  cd /Users/kongjie/projects/Recursive && \\\n  node .dev/flows/self-improve.flow.js \\\n    --run-id <上次的 run-id> \\\n    --goal-file .dev/goals/<NN>-<tag>.md \\\n    --provider deepseek \\\n    --reviewer-agent claude \\\n    --hitl wecom 2>&1 | tee .flowcast/logs/tmux-g<NN>-resume.log\n\" Enter\n```\n\n查看历史 run：\n```bash\nnode .dev/flows/self-improve.flow.js --list\n```\n\nProvider selection:\n- Default: `deepseek`（DeepSeek V4-Flash，外科式修改）\n- New-file goals: `minimax` 也可\n- 跨 provider review：加 `--reviewer-provider minimax`\n- 回滚后重试：换 `--provider deepseek-pro`\n\nStep budget:\n- Recursive **默认不限步数**（`max_steps=0`）；agent 在 `NoMoreToolCalls` / stuck / transcript limit 等条件下自然结束\n- 需要 cap 时显式 `--max-steps N`（例如 HTTP 测试用 `--max-steps 32`）\n- Flow 在 BudgetExceeded 后仍会 auto-resume 一次（仅当设置了有限步数时才有意义）\n\n> **老脚本（self-improve.sh / parallel-self-improve.sh）**：仍保留作参考，\n> 但新运行一律走 `self-improve.flow.js`。\n\n### 3.5 监控进度\n\n```bash\n# tmux 实时日志\ntail -f .flowcast/logs/tmux-g<NN>.log\n\n# 判断 agent 是否在工作（看 transcript 增长，比日志行数更可靠）\nwatch -n 15 'wc -c ~/.recursive/workspaces/*/sessions/*/*/transcript.jsonl 2>/dev/null | sort -n | tail -3'\n\n# macOS BSD grep 不支持 -P（Perl 正则），提取 verdict 用 -E：\ngrep -oE \"verdict=[^ ]+\" .flowcast/logs/tmux-g<NN>.log | tail -1\n# ❌ 错误（Linux GNU grep 语法，macOS 不支持）：\n# grep -oP \"verdict=\\S+\" ...\n```\n\n### 4. Wait and handle results\n\nFlow 结束后（通过 HITL wecom 或终端查看 verdict）：\n\n**`verdict=committed`（成功）：**\n- Flow 已自动提交。验证：`git log --oneline -3`\n- 查看产物：`ls .flowcast/runs/<run-id>/`\n- 更新 roadmap：`.dev/ROADMAP-v3.md`（🔴→✅ 或 🔄→✅）\n\n**`verdict=rolled-back`（回滚）：**\n- Flow 已硬回滚到 baseline。查看原因：\n  `cat .flowcast/runs/<run-id>/state.json | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('summary',{}).get('detail',''))\"`\n- 一次回滚正常，换 `--provider deepseek-pro` 重跑。\n- 同一 goal 两次失败 → HITL §6。\n\n**`verdict=skip-commit`（无改动/budget 超限）：**\n- 查看 detail 原因，可能需要调整 goal 描述或增大 budget。\n\n**`verdict=panic-preserved`：**\n- Recursive 进程 panic，保留现场。查看：`cat .flowcast/runs/<run-id>/transcript.json`\n\n### 5. After each batch\n\n```bash\n# Quick sanity\ncargo test --workspace 2>&1 | tail -5\ncargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -5\n```\n\nProceed to next batch or wake human if any HITL condition triggers.\n\n### 6. HITL — when to stop and ask the user\n\nStop and present findings (don't continue autonomously) when:\n\n- A goal rolled back AND the re-run also failed → goal is misspecified\n- Two consecutive batches each had a rollback\n- Roadmap is complete and no new phase has been approved\n- A single batch would cost > ~$2.00\n- A goal requires branching inside `src/agent.rs::Agent::run` main loop\n\nWhen waking human: summarize (a) what landed, (b) what failed and why,\n(c) what you recommend next.\n\n---\n\n## Goal file template\n\n```markdown\n# Goal NN — <title>\n\n**Roadmap**: Phase X.Y — <phase name> (part N/M)\n\n**Design principle check**:\n- Implemented as: <how it fits the architecture>\n- ❌ Does NOT branch inside `agent.rs::Agent::run`'s main loop\n\n## Why\n<motivation, 2-4 sentences>\n\n## Scope (do exactly this, no more)\n### 1. <file or module>\n<what to do, with code sketch if helpful>\n### 2. Tests\n<what tests to add>\n\n## Acceptance\n- `cargo test` green\n- `cargo clippy --all-targets --all-features -- -D warnings` clean\n- <specific functional criteria>\n\n## Notes for the agent\n- <reading suggestions>\n- <traps to avoid>\n- **DO NOT modify <files outside scope>.**\n```\n\n---\n\n## Quick reference\n\n| Question | Command |\n|---|---|\n| What's done? | `git log --oneline \\| grep \"feat(g\"` |\n| What's next? | `cat .dev/ROADMAP-v3.md` |\n| Did goal NN succeed? | `ls .dev/observations/ \\| grep <tag>` |\n| Live runs? | `ls .dev/runs/ .worktrees/ 2>/dev/null` |\n| Latest goal number | `ls .dev/goals/ \\| sort -t'-' -k1 -n \\| tail -1` |\n"}], "edges": []};
+
+// ── colour palette per type ───────────────────────────────────────────────────
+const TYPE_COLORS = [
+  "#818cf8","#34d399","#f472b6","#fbbf24","#60a5fa","#a78bfa",
+  "#fb923c","#4ade80","#38bdf8","#e879f9"
+];
+const typeColorMap = {};
+let colorIdx = 0;
+function colorFor(type) {
+  if (!typeColorMap[type]) typeColorMap[type] = TYPE_COLORS[colorIdx++ % TYPE_COLORS.length];
+  return typeColorMap[type];
+}
+
+// ── build backlink index ──────────────────────────────────────────────────────
+const backlinks = {};
+BUNDLE.edges.forEach(e => {
+  if (!backlinks[e.target]) backlinks[e.target] = [];
+  backlinks[e.target].push(e.source);
+});
+
+// ── populate type filter ──────────────────────────────────────────────────────
+const types = [...new Set(BUNDLE.nodes.map(n => n.fm.type || "unknown"))].sort();
+const sel = document.getElementById("type-filter");
+types.forEach(t => {
+  const opt = document.createElement("option");
+  opt.value = t; opt.textContent = t;
+  sel.appendChild(opt);
+});
+
+// ── init Cytoscape ────────────────────────────────────────────────────────────
+const cy = cytoscape({
+  container: document.getElementById("cy"),
+  elements: [
+    ...BUNDLE.nodes.map(n => ({ data: {
+      id: n.id,
+      label: n.fm.title || n.id.split("/").pop(),
+      type: n.fm.type || "unknown",
+      color: colorFor(n.fm.type || "unknown"),
+    }})),
+    ...BUNDLE.edges.map(e => ({ data: { source: e.source, target: e.target }})),
+  ],
+  style: [
+    { selector: "node", style: {
+      "background-color": "data(color)", label: "data(label)",
+      "font-size": 10, color: "#e2e8f0", "text-valign": "bottom",
+      "text-margin-y": 4, width: 22, height: 22,
+      "text-max-width": 100, "text-wrap": "ellipsis",
+    }},
+    { selector: "node:selected", style: {
+      "border-width": 3, "border-color": "#fff", width: 28, height: 28,
+    }},
+    { selector: "edge", style: {
+      width: 1, "line-color": "#2d3149", "target-arrow-color": "#3d4266",
+      "target-arrow-shape": "triangle", "curve-style": "bezier",
+    }},
+  ],
+  layout: { name: "cose", animate: false, randomize: true,
+            nodeRepulsion: 8000, gravity: 0.5 },
+});
+
+document.getElementById("node-count").textContent =
+  `${BUNDLE.nodes.length} concepts, ${BUNDLE.edges.length} links`;
+
+// ── layout switcher ───────────────────────────────────────────────────────────
+document.getElementById("layout-select").addEventListener("change", e => {
+  cy.layout({ name: e.target.value, animate: true }).run();
+});
+
+// ── type filter ───────────────────────────────────────────────────────────────
+document.getElementById("type-filter").addEventListener("change", e => {
+  const val = e.target.value;
+  cy.nodes().forEach(n => {
+    n.style("display", (!val || n.data("type") === val) ? "element" : "none");
+  });
+});
+
+// ── search ────────────────────────────────────────────────────────────────────
+document.getElementById("search").addEventListener("input", e => {
+  const q = e.target.value.toLowerCase();
+  cy.nodes().forEach(n => {
+    const match = !q || n.data("label").toLowerCase().includes(q) ||
+                  n.data("id").toLowerCase().includes(q);
+    n.style("opacity", match ? 1 : 0.15);
+  });
+});
+
+// ── node click → detail panel ─────────────────────────────────────────────────
+const nodeMap = Object.fromEntries(BUNDLE.nodes.map(n => [n.id, n]));
+
+cy.on("tap", "node", e => showPanel(e.target.data("id")));
+
+function showPanel(conceptId) {
+  const node = nodeMap[conceptId];
+  if (!node) return;
+  const fm = node.fm;
+  const tags = Array.isArray(fm.tags) ? fm.tags : (fm.tags ? [fm.tags] : []);
+  const bodyHtml = marked.parse(node.body || "");
+  const blinks = (backlinks[conceptId] || []).map(id =>
+    `<div class="backlink-item" onclick="showPanel('${id}');selectNode('${id}')">${id}</div>`
+  ).join("");
+
+  const metaRows = Object.entries(fm)
+    .filter(([k]) => !["title","description","type","tags"].includes(k))
+    .map(([k,v]) => `<dt>${k}</dt><dd>${Array.isArray(v) ? v.join(", ") : v}</dd>`)
+    .join("");
+
+  document.getElementById("panel").innerHTML = `
+    <h2>${fm.title || conceptId}</h2>
+    <div style="font-size:11px;color:#64748b;margin-bottom:8px">${conceptId}</div>
+    ${fm.type ? `<span class="tag" style="background:#1e293b;color:${colorFor(fm.type)}">${fm.type}</span>` : ""}
+    ${tags.map(t => `<span class="tag">${t}</span>`).join("")}
+    <div class="meta">
+      ${fm.description ? `<dt>description</dt><dd>${fm.description}</dd>` : ""}
+      ${metaRows}
+    </div>
+    <div class="body-content">${bodyHtml}</div>
+    ${blinks ? `<div class="backlinks"><h3>Cited by</h3>${blinks}</div>` : ""}
+  `;
+
+  // Rewire internal links in the rendered body
+  document.querySelectorAll(".body-content a").forEach(a => {
+    const href = a.getAttribute("href") || "";
+    if (!href.startsWith("http")) {
+      const target = href.replace(/^\//, "").replace(/\.md$/, "");
+      if (nodeMap[target]) {
+        a.addEventListener("click", ev => {
+          ev.preventDefault();
+          showPanel(target);
+          selectNode(target);
+        });
+      }
+    }
+  });
+}
+
+function selectNode(id) {
+  cy.nodes().unselect();
+  const n = cy.getElementById(id);
+  if (n) { n.select(); cy.animate({ fit: { eles: n, padding: 80 }}); }
+}
+</script>
+</body>
+</html>
