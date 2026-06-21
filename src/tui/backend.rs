@@ -166,6 +166,7 @@ impl EventSink for TuiEventSink {
 pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
     match event {
         AgentEvent::PartialToken { text, .. } => Some(UiEvent::AssistantPartial { text }),
+        AgentEvent::PartialReasoning { text, .. } => Some(UiEvent::ReasoningPartial { text }),
         AgentEvent::Reasoning { text, .. } => Some(UiEvent::Reasoning { content: text }),
         AgentEvent::AssistantText { text, .. } => Some(UiEvent::AssistantMessage { content: text }),
         AgentEvent::ToolCall {
@@ -196,10 +197,14 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         AgentEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_hit_tokens,
+            cache_miss_tokens,
             ..
         } => Some(UiEvent::Usage {
             input_tokens: input_tokens as u64,
             output_tokens: output_tokens as u64,
+            cache_hit_tokens: cache_hit_tokens as u64,
+            cache_miss_tokens: cache_miss_tokens as u64,
         }),
         AgentEvent::Latency { llm_ms, .. } => Some(UiEvent::Latency { llm_ms }),
         AgentEvent::Compacted { removed, kept, .. } => Some(UiEvent::Compacted { removed, kept }),
@@ -339,11 +344,21 @@ async fn worker_loop(
     // and write to disk in real-time on every MessageAppended event.
     let mut session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = None;
 
+    // Messages the user submitted while a turn was already running. The select
+    // loop inside `run_turn_select_loop` buffers them here instead of dropping
+    // them, and this loop drains them FIFO once the current turn completes —
+    // type-ahead queueing rather than silent message loss.
+    let mut queued_messages: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
     loop {
-        // Select on both the user-action channel and the WeChat side-channel.
-        // WeChat messages processed here behave like SendMessage turns but
-        // without plan-mode interaction.
-        let action = {
+        // Drain any messages queued during the previous turn before blocking on
+        // new input, so type-ahead is processed in submission order.
+        let action = if let Some(text) = queued_messages.pop_front() {
+            Either::Left(UserAction::SendMessage(text))
+        } else {
+            // Select on both the user-action channel and the WeChat side-channel.
+            // WeChat messages processed here behave like SendMessage turns but
+            // without plan-mode interaction.
             #[cfg(feature = "weixin")]
             {
                 tokio::select! {
@@ -465,14 +480,19 @@ async fn worker_loop(
                         tracing::warn!("backend: runtime not available for SendMessage task");
                         continue;
                     };
-                    // Clone the gate before moving the runtime into the spawned task.
+                    // Clone both gates before moving the runtime into the spawned task.
                     // This lets us signal plan approval/rejection via action_rx while
-                    // the task is blocked inside exit_plan_mode.
+                    // the task is blocked inside exit_plan_mode or request_plan_mode.
                     let gate = rt.plan_approval_gate();
+                    let plan_mode_request_gate = rt.plan_mode_request_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
                     let cancel_clone = cancel_flag.clone();
+                    // Re-arm the UI spinner for this turn. Required so a turn
+                    // drained from the type-ahead queue shows progress even
+                    // though the previous turn's TurnFinished cleared it.
+                    let _ = event_tx.send(UiEvent::TurnStarted);
                     let mut handle = tokio::task::spawn(async move {
                         let mut g = rt_clone.lock().await;
                         g.enqueue(text).await.map(|_| ())
@@ -485,6 +505,8 @@ async fn worker_loop(
                         cancel_clone,
                         cancel_notify.clone(),
                         &gate,
+                        &plan_mode_request_gate,
+                        &mut queued_messages,
                     )
                     .await;
                     let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
@@ -494,6 +516,10 @@ async fn worker_loop(
                     let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
+                        // The user interrupted (or is shutting down); drop any
+                        // type-ahead they queued during the aborted turn rather
+                        // than running it against their wishes.
+                        queued_messages.clear();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
@@ -523,6 +549,7 @@ async fn worker_loop(
                         continue;
                     };
                     let gate = rt.plan_approval_gate();
+                    let plan_mode_request_gate = rt.plan_mode_request_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
@@ -539,6 +566,8 @@ async fn worker_loop(
                         cancel_clone,
                         cancel_notify.clone(),
                         &gate,
+                        &plan_mode_request_gate,
+                        &mut queued_messages,
                     )
                     .await;
                     let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
@@ -548,6 +577,7 @@ async fn worker_loop(
                     let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
+                        queued_messages.clear();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
@@ -633,6 +663,7 @@ async fn worker_loop(
                         continue;
                     };
                     let gate = rt.plan_approval_gate();
+                    let plan_mode_request_gate = rt.plan_mode_request_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
                     cancel_flag.store(false, Ordering::SeqCst);
@@ -654,6 +685,8 @@ async fn worker_loop(
                         cancel_clone,
                         cancel_notify.clone(),
                         &gate,
+                        &plan_mode_request_gate,
+                        &mut queued_messages,
                     )
                     .await;
                     // Suppress goal-loop errors; they are surfaced via GoalContinuing/GoalAchieved.
@@ -664,6 +697,7 @@ async fn worker_loop(
                     let mut recovered = recovered.into_inner();
                     if aborted {
                         recovered.truncate_transcript(pre_turn_len);
+                        queued_messages.clear();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
@@ -834,6 +868,7 @@ pub async fn wait_for_cancel(flag: Arc<AtomicBool>, notify: Arc<tokio::sync::Not
 /// requiring a new turn. `UserAction::Interrupt` sets the cancel flag.
 /// Any other actions received during the turn are silently discarded
 /// (they cannot be acted on without the runtime, which is inside the task).
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_select_loop(
     handle: &mut tokio::task::JoinHandle<Result<(), crate::Error>>,
     action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UserAction>,
@@ -842,6 +877,8 @@ async fn run_turn_select_loop(
     cancel_clone: Arc<AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
     gate: &Arc<crate::tools::plan_mode::PlanApprovalGate>,
+    plan_mode_request_gate: &Arc<crate::tools::plan_mode::PlanModeRequestGate>,
+    queued: &mut std::collections::VecDeque<String>,
 ) -> bool {
     loop {
         tokio::select! {
@@ -868,6 +905,14 @@ async fn run_turn_select_loop(
                 match maybe_action {
                     Some(UserAction::ConfirmPlan) => gate.approve(),
                     Some(UserAction::RejectPlan(reason)) => gate.reject(&reason),
+                    // Goal-202: forward plan-mode entry approval/rejection to the
+                    // PlanModeRequestGate while the runtime is inside the spawned
+                    // task. Without this the gate never wakes and the tool blocks
+                    // forever — the root cause of request_plan_mode hanging.
+                    Some(UserAction::ApprovePlanMode) => plan_mode_request_gate.approve(),
+                    Some(UserAction::RejectPlanMode(reason)) => {
+                        plan_mode_request_gate.reject(&reason);
+                    }
                     Some(UserAction::Interrupt) => {
                         cancel_flag.store(true, Ordering::SeqCst);
                         cancel_notify.notify_waiters();
@@ -876,6 +921,12 @@ async fn run_turn_select_loop(
                         handle.abort();
                         let _ = handle.await;
                         return true;
+                    }
+                    // A message submitted while the turn is running is buffered
+                    // for FIFO processing after the turn completes (type-ahead
+                    // queueing) instead of being silently dropped.
+                    Some(UserAction::SendMessage(text)) => {
+                        queued.push_back(text);
                     }
                     // Other actions cannot be serviced while the runtime is
                     // inside the spawned task. Discard them — in normal usage

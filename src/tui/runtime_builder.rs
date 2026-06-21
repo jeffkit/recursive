@@ -73,6 +73,10 @@ pub fn build_runtime() -> RuntimeBuild {
         .system_prompt(&config.system_prompt)
         .max_steps(config.max_steps)
         .with_plan_mode_tools(true)
+        // Stream partial tokens so the TUI shows the answer building up live
+        // and so reasoner models that only expose `reasoning_content` through
+        // the streaming SSE channel surface their thinking block.
+        .streaming(true)
         .build()
     {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
@@ -152,6 +156,10 @@ fn build_runtime_with_skill_tx(
         .system_prompt(&config.system_prompt)
         .max_steps(config.max_steps)
         .with_plan_mode_tools(true)
+        // Stream partial tokens so the TUI shows the answer building up live
+        // and so reasoner models that only expose `reasoning_content` through
+        // the streaming SSE channel surface their thinking block.
+        .streaming(true)
         .build()
     {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),

@@ -51,6 +51,7 @@ pub mod runtime;
 pub mod runtime_goal;
 pub mod session;
 pub mod skills;
+pub mod skills_injector;
 pub mod storage;
 pub mod tasks;
 pub mod team;

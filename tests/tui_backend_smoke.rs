@@ -136,6 +136,130 @@ async fn streaming_partial_tokens_are_forwarded() {
     let _ = saw_partial; // observed when the race happens to favour us
 }
 
+/// Type-ahead queueing: a message submitted *while a turn is running* must
+/// be buffered and processed after the turn completes, not silently dropped.
+///
+/// Regression for the backend select loop, which previously discarded any
+/// `SendMessage` that arrived mid-turn (`Some(_) => {}`), losing the user's
+/// input entirely. We drive turn 1 across two LLM calls (via a tool) and use
+/// the MockProvider's synchronous `on_complete` hook to inject the second
+/// message during turn 1's first LLM call — guaranteeing it lands while the
+/// turn is still in flight.
+#[tokio::test]
+async fn messages_submitted_during_running_turn_are_queued_not_dropped() {
+    use async_trait::async_trait;
+    use recursive::llm::{ToolCall, ToolSpec};
+    use recursive::tools::{Tool, ToolRegistry};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    struct Ping;
+    #[async_trait]
+    impl Tool for Ping {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ping".into(),
+                description: "returns pong".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> recursive::Result<String> {
+            Ok("pong".into())
+        }
+    }
+
+    // The on_complete hook needs the action sender, which only exists after
+    // the backend is spawned — but the provider must be built before that.
+    // Bridge the two via a shared slot populated post-spawn.
+    let slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<UserAction>>>> =
+        Arc::new(Mutex::new(None));
+    let slot_hook = slot.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+
+    let llm = MockProvider::new(vec![
+        // turn 1 / call 1: request a tool so this turn spans two LLM calls.
+        Completion {
+            content: "checking".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "ping".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        // turn 1 / call 2: final answer.
+        Completion {
+            content: "first done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        // turn 2 (the message queued mid-turn): final answer.
+        Completion {
+            content: "second done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ])
+    .with_on_complete_fn(move || {
+        // Fire exactly once, during turn 1's first LLM call, so the second
+        // message arrives while turn 1 is still running.
+        if !fired.swap(true, Ordering::SeqCst) {
+            if let Ok(guard) = slot_hook.lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.send(UserAction::SendMessage("second".into()));
+                }
+            }
+        }
+    });
+
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(Arc::new(llm))
+        .tools(ToolRegistry::local().register(Arc::new(Ping)))
+        .build()
+        .expect("runtime build");
+
+    let mut backend = Backend::spawn_with_runtime(runtime);
+    *slot.lock().unwrap() = Some(backend.action_tx.clone());
+
+    backend
+        .action_tx
+        .send(UserAction::SendMessage("first".into()))
+        .expect("send first");
+
+    let mut saw_first = false;
+    let mut saw_second = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !(saw_first && saw_second) {
+        match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
+            Ok(Some(UiEvent::AssistantMessage { content })) => {
+                if content.contains("first done") {
+                    saw_first = true;
+                }
+                if content.contains("second done") {
+                    saw_second = true;
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    let _ = backend.action_tx.send(UserAction::Shutdown);
+
+    assert!(saw_first, "expected the first turn's assistant message");
+    assert!(
+        saw_second,
+        "a message submitted mid-turn must be queued and processed, not dropped"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Goal 145 — multi-mode PromptInput integration
 // ──────────────────────────────────────────────────────────────────────

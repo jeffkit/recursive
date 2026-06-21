@@ -1,9 +1,10 @@
 //! Top-level rendering dispatch.
 //!
 //! The single entry point [`render`] delegates to the chat renderer.
-//! The splash screen was removed in favour of a startup banner printed
-//! to stdout before the inline TUI viewport starts — see
-//! [`crate::tui::print_startup_banner`].
+//! The TUI runs full-screen on the alternate screen; when the transcript
+//! is empty the chat renderer draws a centred startup splash (logo + hints)
+//! instead of a separate splash screen — see
+//! [`crate::tui::ui::chat::render`].
 
 use ratatui::Frame;
 

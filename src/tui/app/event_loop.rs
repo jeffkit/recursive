@@ -1,7 +1,6 @@
 //! Event-loop reducers: `handle_ui_event` and streaming helpers.
 
 use crate::tui::events::UiEvent;
-use crate::tui::ui::transcript::render_block;
 
 use super::render::extract_write_file_path_from_result;
 use super::{preview_args, verb_for_tool, App, ToolResultData, TranscriptBlock};
@@ -13,25 +12,11 @@ impl App {
             UiEvent::AssistantPartial { text } => {
                 self.append_streaming_assistant(&text);
             }
+            UiEvent::ReasoningPartial { text } => {
+                self.append_streaming_reasoning(&text);
+            }
             UiEvent::Reasoning { content } => {
-                // Reasoning arrives as a single block after the streaming
-                // content tokens. If a streaming Assistant block already
-                // exists (created by PartialToken events), insert Reasoning
-                // before it so the visual order is: thinking → answer.
-                let insert_before_last = matches!(
-                    self.blocks.last(),
-                    Some(TranscriptBlock::Assistant {
-                        streaming: true,
-                        ..
-                    })
-                );
-                let block = TranscriptBlock::Reasoning { text: content };
-                if insert_before_last {
-                    let last_idx = self.blocks.len() - 1;
-                    self.blocks.insert(last_idx, block);
-                } else {
-                    self.blocks.push(block);
-                }
+                self.finalise_streaming_reasoning(content);
             }
             UiEvent::AssistantMessage { content } => {
                 // Goal-147: the legacy `"plan:"` / `"## plan"` text
@@ -142,8 +127,15 @@ impl App {
             UiEvent::Usage {
                 input_tokens,
                 output_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
             } => {
-                self.usage.record(input_tokens, output_tokens);
+                self.usage.record_with_cache(
+                    input_tokens,
+                    output_tokens,
+                    cache_hit_tokens,
+                    cache_miss_tokens,
+                );
             }
             UiEvent::Latency { llm_ms } => {
                 self.usage.last_latency_ms = llm_ms;
@@ -161,6 +153,13 @@ impl App {
             UiEvent::Compacted { removed, kept } => {
                 self.blocks
                     .push(TranscriptBlock::Compacted { removed, kept });
+            }
+            UiEvent::TurnStarted => {
+                // (Re)arm the spinner for the turn the backend is starting.
+                // Idempotent for a freshly-submitted turn (the UI already
+                // armed it on submit); essential for queued turns, whose
+                // predecessor's TurnFinished cleared the running state.
+                self.turn.start();
             }
             UiEvent::TurnFinished => {
                 // Make sure the last streaming assistant block is
@@ -397,6 +396,63 @@ impl App {
         }
     }
 
+    /// Append a streamed reasoning chunk to the in-flight `thinking…`
+    /// block. Reasoning deltas arrive before the answer's text deltas,
+    /// so the streaming Reasoning block is created first and naturally
+    /// sits above the streaming Assistant block.
+    fn append_streaming_reasoning(&mut self, chunk: &str) {
+        if let Some(TranscriptBlock::Reasoning {
+            text,
+            streaming: true,
+        }) = self.blocks.last_mut()
+        {
+            text.push_str(chunk);
+        } else {
+            self.blocks.push(TranscriptBlock::Reasoning {
+                text: chunk.to_string(),
+                streaming: true,
+            });
+        }
+    }
+
+    /// Finalise the reasoning block with the authoritative full text.
+    ///
+    /// If reasoning was streamed live, a `streaming` Reasoning block
+    /// already exists (just above any streaming Assistant block); we
+    /// replace its text and clear the flag. Otherwise — non-streaming
+    /// providers, or chain-of-thought recovered from inline
+    /// `<think>` tags — no such block exists, so we insert a fresh
+    /// one before a trailing streaming Assistant block (keeping the
+    /// visual order thinking → answer), or push it.
+    fn finalise_streaming_reasoning(&mut self, content: String) {
+        for block in self.blocks.iter_mut().rev() {
+            if let TranscriptBlock::Reasoning { text, streaming } = block {
+                if *streaming {
+                    *text = content;
+                    *streaming = false;
+                    return;
+                }
+            }
+        }
+        let block = TranscriptBlock::Reasoning {
+            text: content,
+            streaming: false,
+        };
+        let insert_before_last = matches!(
+            self.blocks.last(),
+            Some(TranscriptBlock::Assistant {
+                streaming: true,
+                ..
+            })
+        );
+        if insert_before_last {
+            let last_idx = self.blocks.len() - 1;
+            self.blocks.insert(last_idx, block);
+        } else {
+            self.blocks.push(block);
+        }
+    }
+
     fn finalise_streaming_assistant(&mut self, content: String) {
         if let Some(TranscriptBlock::Assistant {
             text,
@@ -418,98 +474,6 @@ impl App {
             streaming: false,
             latency_ms: self.pending_latency_ms,
         });
-    }
-
-    /// Scan `blocks[last_printed_idx..]` and push any "finalized"
-    /// blocks into `print_queue` so the main loop can flush them to
-    /// the terminal's scrollback buffer via `terminal.insert_before()`.
-    ///
-    /// A block is considered finalized when:
-    /// - `User` — always
-    /// - `Assistant` — when `!streaming`
-    /// - `ToolCall` — when `result.is_some()`
-    /// - `Reasoning` — only when the immediately following block is NOT
-    ///   a streaming `Assistant` (prevents the reasoning from being
-    ///   separated from its answer in the scrollback)
-    /// - All other variants — always
-    ///
-    /// This is idempotent and safe to call after every event.
-    /// Scan `blocks[last_printed_idx..]` and push any finalized blocks into
-    /// `print_queue`. Returns the total number of visual rows queued so the
-    /// caller can adjust `scroll_offset` to keep the user's view position stable.
-    pub fn flush_ready_blocks(&mut self, width: u16) -> u16 {
-        let mut flushed_rows: u16 = 0;
-
-        // Find the index of the last User block whose entire response group is
-        // finalized (no streaming Assistant, no pending ToolCall anywhere after
-        // it). Everything *before* that User block is safe to flush; that block
-        // and everything after it stays in the viewport so the user always sees
-        // at least the most recent question + answer.
-        let last_complete_user: Option<usize> = {
-            let mut candidate: Option<usize> = None;
-            let mut i = self.last_printed_idx;
-            while i < self.blocks.len() {
-                if matches!(self.blocks[i], TranscriptBlock::User { .. }) {
-                    // Peek ahead: is there any unfinished block after this User?
-                    let tail_pending = self.blocks[i + 1..].iter().any(|b| match b {
-                        TranscriptBlock::Assistant { streaming, .. } => *streaming,
-                        TranscriptBlock::ToolCall { result, .. } => result.is_none(),
-                        _ => false,
-                    });
-                    if !tail_pending {
-                        candidate = Some(i);
-                    }
-                }
-                i += 1;
-            }
-            candidate
-        };
-
-        // Only flush blocks that come before the last complete User turn.
-        // If there is no complete User turn yet (first message still in-flight,
-        // or the very first turn), flush nothing.
-        let flush_limit = match last_complete_user {
-            Some(idx) => idx,
-            None => return 0,
-        };
-
-        loop {
-            let i = self.last_printed_idx;
-            if i >= flush_limit {
-                break;
-            }
-            // All blocks before flush_limit are by construction finalized
-            // (they precede a complete User turn), so no per-block readiness
-            // check is needed here.
-            let is_user = matches!(&self.blocks[i], TranscriptBlock::User { .. });
-            let is_first = i == 0;
-
-            // Mirror the spacing from render_blocks(): add blank lines between
-            // blocks and extra blank lines around User blocks so the scrollback
-            // has the same visual breathing room as the live viewport.
-            if !is_first {
-                let mut pre: Vec<ratatui::text::Line<'static>> = vec![ratatui::text::Line::raw("")];
-                if is_user {
-                    // Extra blank before User turns.
-                    pre.push(ratatui::text::Line::raw(""));
-                }
-                flushed_rows += pre.len() as u16;
-                self.print_queue.push(pre);
-            }
-
-            let lines = render_block(&self.blocks[i], self.theme, width);
-            flushed_rows += lines.len() as u16;
-            self.print_queue.push(lines);
-
-            // Extra blank after User turns (same as render_blocks).
-            if is_user {
-                flushed_rows += 1;
-                self.print_queue.push(vec![ratatui::text::Line::raw("")]);
-            }
-
-            self.last_printed_idx += 1;
-        }
-        flushed_rows
     }
 
     /// Toggle the most recent completed tool call's expanded flag.
@@ -557,6 +521,86 @@ mod tests {
             }
             other => panic!("expected streaming Assistant, got {other:?}"),
         }
+    }
+
+    // ── streaming reasoning ────────────────────────────────────────
+
+    #[test]
+    fn reasoning_partials_stream_then_finalise_above_answer() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        // Model thinks first: reasoning deltas arrive before the answer.
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "Step one. ".into(),
+        });
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "Step two.".into(),
+        });
+        // Mid-stream the reasoning block is live.
+        match app.blocks.last() {
+            Some(TranscriptBlock::Reasoning { text, streaming }) => {
+                assert_eq!(text, "Step one. Step two.");
+                assert!(*streaming);
+            }
+            other => panic!("expected streaming Reasoning, got {other:?}"),
+        }
+        // Then the answer starts streaming.
+        app.handle_ui_event(UiEvent::AssistantPartial {
+            text: "The answer.".into(),
+        });
+        // Finalisers arrive: reasoning first, then the assistant text.
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "Step one. Step two.".into(),
+        });
+        app.handle_ui_event(UiEvent::AssistantMessage {
+            content: "The answer.".into(),
+        });
+
+        // Visual order: Reasoning (finalised) above Assistant (finalised).
+        assert_eq!(app.blocks.len(), 2);
+        match &app.blocks[0] {
+            TranscriptBlock::Reasoning { text, streaming } => {
+                assert_eq!(text, "Step one. Step two.");
+                assert!(!*streaming);
+            }
+            other => panic!("expected finalised Reasoning first, got {other:?}"),
+        }
+        match &app.blocks[1] {
+            TranscriptBlock::Assistant {
+                text, streaming, ..
+            } => {
+                assert_eq!(text, "The answer.");
+                assert!(!*streaming);
+            }
+            other => panic!("expected finalised Assistant second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_without_partials_inserts_before_streaming_answer() {
+        // Non-streaming reasoning (or inline <think> recovery): only the
+        // final Reasoning event fires, while the answer is mid-stream.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::AssistantPartial {
+            text: "Answer".into(),
+        });
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "thought".into(),
+        });
+
+        assert_eq!(app.blocks.len(), 2);
+        assert!(matches!(
+            &app.blocks[0],
+            TranscriptBlock::Reasoning { text, streaming: false } if text == "thought"
+        ));
+        assert!(matches!(
+            &app.blocks[1],
+            TranscriptBlock::Assistant {
+                streaming: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -689,15 +733,23 @@ mod tests {
         app.handle_ui_event(UiEvent::Usage {
             input_tokens: 100,
             output_tokens: 50,
+            cache_hit_tokens: 60,
+            cache_miss_tokens: 40,
         });
         app.handle_ui_event(UiEvent::Usage {
             input_tokens: 30,
             output_tokens: 20,
+            cache_hit_tokens: 10,
+            cache_miss_tokens: 20,
         });
         assert_eq!(app.usage.total_input, 130);
         assert_eq!(app.usage.total_output, 70);
         assert_eq!(app.usage.input_tokens, 30);
         assert_eq!(app.usage.output_tokens, 20);
+        assert_eq!(app.usage.total_cache_hit, 70);
+        assert_eq!(app.usage.total_cache_miss, 60);
+        assert_eq!(app.usage.cache_hit_tokens, 10);
+        assert_eq!(app.usage.cache_miss_tokens, 20);
     }
 
     // ── error event ─────────────────────────────────────────────────
@@ -813,5 +865,19 @@ mod tests {
         app.set_input("hi");
         app.handle_ui_event(UiEvent::TurnFinished);
         assert!(!app.turn.running);
+    }
+
+    #[test]
+    fn turn_started_rearms_spinner_after_finish() {
+        // Simulates a queued turn: the first turn finishes (spinner off),
+        // then the backend starts the queued turn and must re-arm it.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::TurnFinished);
+        assert!(!app.turn.running, "precondition: spinner cleared on finish");
+
+        app.handle_ui_event(UiEvent::TurnStarted);
+        assert!(app.turn.running, "TurnStarted must re-arm the spinner");
+        assert!(app.turn.started_at.is_some(), "spinner timer must reset");
     }
 }

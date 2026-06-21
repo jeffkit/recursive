@@ -30,7 +30,10 @@ use serde_json::Value;
 
 use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
 use super::StructuredRequest;
-use super::{ChatProvider, Completion, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
+use super::{
+    ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
+    ToolSpec,
+};
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
@@ -738,7 +741,7 @@ impl OpenAiProvider {
                         if !delta_content.is_empty() {
                             content.push_str(delta_content);
                             if let Some(tx) = stream_tx {
-                                let _ = tx.send(delta_content.to_string());
+                                let _ = tx.send(StreamChunk::Text(delta_content.to_string()));
                             }
                         }
                     }
@@ -747,6 +750,10 @@ impl OpenAiProvider {
                     {
                         if !delta_reasoning.is_empty() {
                             reasoning_content.push_str(delta_reasoning);
+                            if let Some(tx) = stream_tx {
+                                let _ =
+                                    tx.send(StreamChunk::Reasoning(delta_reasoning.to_string()));
+                            }
                         }
                     }
                     // Accumulate tool_calls deltas
@@ -1449,7 +1456,7 @@ data: [DONE]\n\n";
         assert_eq!(completion.content, "fallback works");
         // Should have received the full content as a single delta
         let delta = rx.recv().await.unwrap();
-        assert_eq!(delta, "fallback works");
+        assert_eq!(delta, StreamChunk::Text("fallback works".to_string()));
     }
 
     #[test]

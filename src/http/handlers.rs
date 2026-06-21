@@ -2090,6 +2090,7 @@ mod tests {
             params: vec![],
             scripts: vec![],
             sections: vec![],
+            globs: None,
         }];
 
         let base_prompt = "You are a helpful agent.";

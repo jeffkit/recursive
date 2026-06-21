@@ -154,8 +154,13 @@ impl ChatProvider for MockProvider {
         // MockProvider: just delegate to complete and emit the full content
         let completion = self.complete(messages, tools).await?;
         if let Some(tx) = stream_tx {
+            if let Some(reasoning) = &completion.reasoning_content {
+                if !reasoning.is_empty() {
+                    let _ = tx.send(super::StreamChunk::Reasoning(reasoning.clone()));
+                }
+            }
             if !completion.content.is_empty() {
-                let _ = tx.send(completion.content.clone());
+                let _ = tx.send(super::StreamChunk::Text(completion.content.clone()));
             }
         }
         Ok(completion)

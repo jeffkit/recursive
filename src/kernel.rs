@@ -176,6 +176,8 @@ pub struct AgentKernel {
     pub(crate) stuck_window: usize,
     /// Error rate threshold within the window to declare stuck. Default 0.8.
     pub(crate) stuck_error_rate: f64,
+    /// Goal-318: Globs-mode skills passed to `SkillInjector` each run.
+    pub(crate) globs_skills: Vec<crate::skills::Skill>,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -260,6 +262,7 @@ impl AgentKernel {
             session_store: self.session_store.clone(),
             stuck_window: self.stuck_window,
             stuck_error_rate: self.stuck_error_rate,
+            globs_skills: self.globs_skills.clone(),
         }
     }
 
@@ -296,6 +299,7 @@ impl AgentKernel {
             stuck_window: self.stuck_window,
             stuck_error_rate: self.stuck_error_rate,
             turn: ctx.turn,
+            globs_skills: self.globs_skills.clone(),
         };
 
         let inner = core.run_inner().await?;
@@ -355,6 +359,8 @@ pub struct AgentKernelBuilder {
     stuck_window: Option<usize>,
     /// Stuck detection error rate threshold (default 0.8).
     stuck_error_rate: Option<f64>,
+    /// Goal-318: Globs-mode skills.
+    globs_skills: Vec<crate::skills::Skill>,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -500,7 +506,14 @@ impl AgentKernelBuilder {
             session_store,
             stuck_window: self.stuck_window.unwrap_or(10),
             stuck_error_rate: self.stuck_error_rate.unwrap_or(0.8),
+            globs_skills: self.globs_skills,
         })
+    }
+
+    /// Goal-318: set the skills list (for Globs-mode injection).
+    pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
+        self.globs_skills = skills;
+        self
     }
 }
 

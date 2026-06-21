@@ -28,7 +28,9 @@ pub mod openai;
 
 // ── Re-exports: chat types ────────────────────────────────────────────────────
 
-pub use chat::{Completion, StreamSender, StructuredRequest, TokenUsage, ToolCall, ToolSpec};
+pub use chat::{
+    Completion, StreamChunk, StreamSender, StructuredRequest, TokenUsage, ToolCall, ToolSpec,
+};
 
 // ── Re-exports: pricing ───────────────────────────────────────────────────────
 
@@ -122,8 +124,13 @@ pub trait ChatProvider: Send + Sync {
     ) -> Result<Completion> {
         let completion = self.complete(messages, tools).await?;
         if let Some(tx) = stream_tx {
+            if let Some(reasoning) = &completion.reasoning_content {
+                if !reasoning.is_empty() {
+                    let _ = tx.send(StreamChunk::Reasoning(reasoning.clone()));
+                }
+            }
             if !completion.content.is_empty() {
-                let _ = tx.send(completion.content.clone());
+                let _ = tx.send(StreamChunk::Text(completion.content.clone()));
             }
         }
         Ok(completion)

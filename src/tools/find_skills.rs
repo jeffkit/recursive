@@ -133,6 +133,7 @@ impl Tool for FindSkills {
                 crate::skills::SkillMode::Always => "always",
                 crate::skills::SkillMode::Trigger => "trigger",
                 crate::skills::SkillMode::Manual => "manual",
+                crate::skills::SkillMode::Globs => "globs",
             };
             // Truncate description to 80 chars to keep the list readable.
             let desc = if skill.description.len() > 80 {
@@ -169,6 +170,7 @@ mod tests {
             params: vec![],
             scripts: vec![],
             sections: vec![],
+            globs: None,
         }
     }
 

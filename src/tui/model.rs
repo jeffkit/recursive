@@ -81,12 +81,14 @@ pub enum TranscriptBlock {
         streaming: bool,
         latency_ms: Option<u64>,
     },
-    /// Reasoning / thinking content for a step. Emitted by
-    /// [`UiEvent::Reasoning`] before the matching assistant text
-    /// block; rendered inline as a `thinking…` header followed by
-    /// the reasoning text in dim grey italics.
+    /// Reasoning / thinking content for a step. Streamed live via
+    /// [`UiEvent::ReasoningPartial`] (while `streaming == true`) and
+    /// finalised by [`UiEvent::Reasoning`]; rendered inline as a
+    /// `thinking…` header followed by the reasoning text in dim grey
+    /// italics, above the matching assistant text block.
     Reasoning {
         text: String,
+        streaming: bool,
     },
     /// Tool call (paired with its result once available).
     ///

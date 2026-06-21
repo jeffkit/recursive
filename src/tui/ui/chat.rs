@@ -63,77 +63,66 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // Messages panel: render the full transcript so the user can scroll
-    // through all history. Logo (recent_display) always anchors at the top.
+    // Messages panel: render the full transcript top-anchored so content
+    // grows downward from the top of the screen (full-screen UX), with the
+    // input box pinned at the bottom. When there is nothing to show yet we
+    // draw a centred startup splash (logo + hints) instead.
     let messages_area = chunks[0];
-    let block_lines =
-        transcript::render_blocks(&app.blocks, &app.usage, app.theme, messages_area.width);
-    let mut lines: Vec<Line<'static>> = app.recent_display.clone();
-    if !block_lines.is_empty() {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
-        lines.extend(block_lines);
-    }
-
-    if app.turn.running {
-        let elapsed = app
-            .turn
-            .started_at
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![Span::styled(
-            spinner::format_line(app.spinner_frame, app.turn.spinner_verb, elapsed),
-            Style::default().fg(Color::Yellow),
-        )]));
-    }
-    // Always keep one blank row between the last content line and the status bar
-    // so the output doesn't visually collide with it.
-    lines.push(Line::raw(""));
-
     let todo_area = chunks[1];
-    // The messages panel no longer wraps in a bordered `Block`, so the
-    // area is the chunk itself — no border rows / columns to subtract.
-    let inner_width = messages_area.width;
-    let visible_rows = messages_area.height;
 
-    // Compute visual (post-wrap) row count as usize to avoid u16 overflow
-    // on long transcripts.
-    let total_rows: usize = if inner_width == 0 {
-        lines.len()
+    if app.blocks.is_empty() && !app.turn.running {
+        render_empty_state(frame, messages_area, app);
     } else {
-        let w = inner_width as usize;
-        lines
-            .iter()
-            .map(|l| {
-                let lw = l.width();
-                if lw == 0 {
-                    1
-                } else {
-                    lw.div_ceil(w)
-                }
-            })
-            .sum()
-    };
-    let visible = visible_rows as usize;
-    let max_scroll = total_rows.saturating_sub(visible);
-    // Cap scroll_offset so scrolling back down always reaches the bottom.
-    let capped = app.scroll_offset.min(max_scroll);
-    let effective_scroll = (max_scroll - capped) as u16;
+        let mut lines: Vec<Line<'static>> =
+            transcript::render_blocks(&app.blocks, &app.usage, app.theme, messages_area.width);
 
-    // Bottom-align when content is shorter than the visible area.
-    if total_rows < visible {
-        let pad = visible - total_rows;
-        let mut padded: Vec<Line<'static>> = (0..pad).map(|_| Line::raw("")).collect();
-        padded.extend(lines);
-        lines = padded;
+        if app.turn.running {
+            let elapsed = app
+                .turn
+                .started_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![Span::styled(
+                spinner::format_line(app.spinner_frame, app.turn.spinner_verb, elapsed),
+                Style::default().fg(Color::Yellow),
+            )]));
+        }
+        // Keep one blank row between the last content line and the status bar
+        // so the output doesn't visually collide with it.
+        lines.push(Line::raw(""));
+
+        // The messages panel no longer wraps in a bordered `Block`, so the
+        // area is the chunk itself — no border rows / columns to subtract.
+        let inner_width = messages_area.width;
+        let visible = messages_area.height as usize;
+
+        // Pre-wrap every logical line into physical rows at the exact panel
+        // width, then window those rows ourselves in `usize`. This replaces
+        // the previous `Paragraph::scroll` + estimated-row-count scheme, whose
+        // char-width row estimate drifted from ratatui's word-aware wrapping
+        // (producing inexact scroll positions and rows that could never be
+        // scrolled into view) and whose `as u16` scroll cast could overflow on
+        // very long transcripts. Exact windowing means both ends are always
+        // reachable.
+        let physical = transcript::wrap_lines_to_width(&lines, inner_width);
+        let total_rows = physical.len();
+        let max_scroll = total_rows.saturating_sub(visible);
+        // `scroll_offset` counts rows from the bottom. Capping it at
+        // `max_scroll` keeps `scroll_offset == 0` stuck to the bottom (newest
+        // content visible) while letting a large offset scroll all the way to
+        // the first row. The transcript is top-anchored, so a short
+        // conversation fills from the top with blank space below.
+        let capped = app.scroll_offset.min(max_scroll);
+        let start = max_scroll - capped;
+        let end = (start + visible).min(total_rows);
+        let window: Vec<Line<'static>> = physical[start..end].to_vec();
+
+        // Rows are already wrapped to `inner_width`, so render without
+        // additional wrapping or scroll offset.
+        let messages_widget = Paragraph::new(window);
+        frame.render_widget(messages_widget, messages_area);
     }
-
-    let messages_widget = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((effective_scroll, 0));
-    frame.render_widget(messages_widget, messages_area);
 
     // Goal-167: task-list panel (only rendered when non-empty).
     if !app.current_todos.is_empty() {
@@ -166,6 +155,52 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.modals.is_empty() {
         modal::render(frame, app);
     }
+}
+
+/// Render the full-screen startup splash shown while the transcript is
+/// empty: a centred wordmark logo, version + model, and a short hint row.
+///
+/// This replaces the old "logo + recent sessions glued above the input box"
+/// banner. Recent sessions now live behind `/resume`, keeping the empty
+/// state clean and the focus on the input.
+fn render_empty_state(frame: &mut Frame, area: Rect, app: &App) {
+    use ratatui::style::Modifier;
+
+    let orange_bold = Style::default()
+        .fg(Color::Rgb(205, 100, 50))
+        .add_modifier(Modifier::BOLD);
+    let orange = Style::default().fg(Color::Rgb(205, 100, 50));
+    let gray = Style::default().fg(Color::Rgb(150, 150, 150));
+    let dim = Style::default().fg(Color::Rgb(110, 110, 110));
+
+    let version = env!("CARGO_PKG_VERSION");
+    let model = app.model_name.clone();
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled("┬─┐┌─┐┌─┐┬ ┬┬─┐┌─┐┬┬  ┬┌─┐", orange_bold)),
+        Line::from(Span::styled("├┬┘├┤ │  │ │├┬┘└─┐│└┐┌┘├┤ ", orange_bold)),
+        Line::from(Span::styled("┴└─└─┘└─┘└─┘┴└─└─┘┴ └┘ └─┘", orange)),
+        Line::raw(""),
+        Line::from(Span::styled(format!("v{version}  ·  {model}"), gray)),
+        Line::raw(""),
+        Line::from(Span::styled("Type a message to start", dim)),
+        Line::from(Span::styled(
+            "/resume to continue a session  ·  /help for commands",
+            dim,
+        )),
+    ];
+
+    // Vertically centre by padding the top with blank rows.
+    let content_h = lines.len() as u16;
+    if area.height > content_h {
+        let pad = (area.height - content_h) / 2;
+        let mut padded: Vec<Line<'static>> = (0..pad).map(|_| Line::raw("")).collect();
+        padded.append(&mut lines);
+        lines = padded;
+    }
+
+    let widget = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(widget, area);
 }
 
 /// Render the compact task-list panel.

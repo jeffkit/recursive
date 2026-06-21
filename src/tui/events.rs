@@ -23,6 +23,10 @@ pub enum UiEvent {
     /// A streamed partial token chunk to append to the in-flight
     /// assistant message.
     AssistantPartial { text: String },
+    /// A streamed partial reasoning / thinking chunk to append to the
+    /// in-flight `thinking…` block. Arrives before [`Self::AssistantPartial`]
+    /// chunks; finalised by [`Self::Reasoning`].
+    ReasoningPartial { text: String },
     /// A completed assistant message (non-streaming providers, or the
     /// final flush after `PartialToken` chunks).
     AssistantMessage { content: String },
@@ -45,6 +49,10 @@ pub enum UiEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        /// Tokens served from the provider's prompt cache.
+        cache_hit_tokens: u64,
+        /// Tokens written to the provider's prompt cache.
+        cache_miss_tokens: u64,
     },
     /// Reasoning / thinking content produced by the model for the
     /// current step (DeepSeek R1, OpenAI o1, …). Carries the full
@@ -56,6 +64,12 @@ pub enum UiEvent {
     Latency { llm_ms: u64 },
     /// Transcript compaction notification.
     Compacted { removed: usize, kept: usize },
+    /// Marks the start of a turn the backend is about to run so the UI can
+    /// (re)arm the spinner. Emitted for every turn, including those drained
+    /// from the type-ahead queue after an earlier turn finished — without it
+    /// a queued turn would run with the spinner stuck off, since the previous
+    /// turn's [`Self::TurnFinished`] already cleared the running state.
+    TurnStarted,
     /// Marks the end of a turn so the UI can stop the spinner.
     TurnFinished,
     /// A non-fatal error worth surfacing to the user.

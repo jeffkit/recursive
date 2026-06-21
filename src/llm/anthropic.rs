@@ -6,11 +6,15 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ChatProvider, Completion, RetryPolicy, StreamSender, TokenUsage, ToolCall, ToolSpec};
+use super::{
+    ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
+    ToolSpec,
+};
 
 /// Beta header required for `tool_reference` block support in the
 /// Anthropic Messages API.
@@ -309,188 +313,74 @@ impl AnthropicProvider {
         resp: reqwest::Response,
         stream_tx: Option<StreamSender>,
     ) -> Result<Completion> {
-        let mut content = String::new();
-        let mut tool_calls: Vec<StreamToolCall> = Vec::new();
-        let mut finish_reason: Option<String> = None;
-        let mut usage: Option<TokenUsage> = None;
-        let mut input_tokens: Option<u32> = None;
-        let mut output_tokens: Option<u32> = None;
-        let mut cache_creation: Option<u32> = None;
-        let mut cache_read: Option<u32> = None;
+        // Process the byte stream incrementally so reasoning/text deltas are
+        // forwarded to `stream_tx` as they arrive — not buffered until the
+        // whole response lands (which would make streaming look fake).
+        //
+        // A raw byte buffer (`incomplete`) carries any partial UTF-8 sequence
+        // split across HTTP chunk boundaries; lossy decoding would corrupt
+        // multi-byte (e.g. Chinese) content mid-stream.
+        let mut acc = SseAccum::default();
+        let mut byte_stream = resp.bytes_stream();
+        let mut incomplete: Vec<u8> = Vec::new();
+        let mut line_buf = String::new();
 
-        // Read the full response body as text and parse line by line
-        let reader = resp.text().await?;
-        let mut current_event: Option<String> = None;
-
-        for line in reader.lines() {
-            if let Some(event_name) = line.strip_prefix("event: ") {
-                current_event = Some(event_name.to_string());
-                continue;
-            }
-
-            if let Some(data) = line.strip_prefix("data: ") {
-                let event_type = current_event.as_deref().unwrap_or("unknown");
-
-                match event_type {
-                    "message_start" => {
-                        // Extract input tokens from the message
-                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
-                            self.make_err(format!(
-                                "SSE parse error (message_start): {e}; data: {data}"
-                            ))
-                        })?;
-                        if let Some(msg) = parsed.get("message") {
-                            if let Some(u) = msg.get("usage") {
-                                input_tokens = u
-                                    .get("input_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                                cache_creation = u
-                                    .get("cache_creation_input_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                                cache_read = u
-                                    .get("cache_read_input_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
-                        }
-                    }
-                    "content_block_start" => {
-                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
-                            self.make_err(format!(
-                                "SSE parse error (content_block_start): {e}; data: {data}"
-                            ))
-                        })?;
-                        if let Some(block) = parsed.get("content_block") {
-                            let block_type =
-                                block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            let index =
-                                parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                            match block_type {
-                                "tool_use" => {
-                                    let id = block
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let name = block
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    // Ensure the vec is large enough
-                                    while tool_calls.len() <= index {
-                                        tool_calls.push(StreamToolCall::default());
-                                    }
-                                    tool_calls[index].id = id;
-                                    tool_calls[index].name = name;
-                                }
-                                "text" => {
-                                    // Initial text content (if any)
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                        if !text.is_empty() {
-                                            content.push_str(text);
-                                            if let Some(ref tx) = stream_tx {
-                                                let _ = tx.send(text.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "content_block_delta" => {
-                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
-                            self.make_err(format!(
-                                "SSE parse error (content_block_delta): {e}; data: {data}"
-                            ))
-                        })?;
-                        if let Some(delta) = parsed.get("delta") {
-                            let delta_type =
-                                delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            match delta_type {
-                                "text_delta" => {
-                                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                        if !text.is_empty() {
-                                            content.push_str(text);
-                                            if let Some(ref tx) = stream_tx {
-                                                let _ = tx.send(text.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(partial) =
-                                        delta.get("partial_json").and_then(|v| v.as_str())
-                                    {
-                                        let index = parsed
-                                            .get("index")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as usize;
-                                        while tool_calls.len() <= index {
-                                            tool_calls.push(StreamToolCall::default());
-                                        }
-                                        tool_calls[index].partial_json.push_str(partial);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "message_delta" => {
-                        let parsed: Value = serde_json::from_str(data).map_err(|e| {
-                            self.make_err(format!(
-                                "SSE parse error (message_delta): {e}; data: {data}"
-                            ))
-                        })?;
-                        if let Some(delta) = parsed.get("delta") {
-                            if let Some(reason) = delta.get("stop_reason").and_then(|v| v.as_str())
-                            {
-                                finish_reason = Some(reason.to_string());
-                            }
-                        }
-                        if let Some(u) = parsed.get("usage") {
-                            output_tokens = u
-                                .get("output_tokens")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                        }
-                    }
-                    "message_stop" => {
-                        // End of stream - nothing to extract
-                    }
-                    "ping" => {
-                        // Anthropic sends periodic pings to keep the connection alive
-                    }
-                    _ => {
-                        tracing::debug!(target: "recursive::llm", event = %event_type, data = %data, "unhandled SSE event");
-                    }
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk.map_err(|e| self.make_err(format!("SSE stream read error: {e}")))?;
+            let combined: Vec<u8> = if incomplete.is_empty() {
+                bytes.to_vec()
+            } else {
+                let mut v = std::mem::take(&mut incomplete);
+                v.extend_from_slice(&bytes);
+                v
+            };
+            let valid_up_to = match std::str::from_utf8(&combined) {
+                Ok(_) => combined.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            incomplete = combined[valid_up_to..].to_vec();
+            // SAFETY: valid_up_to is a valid UTF-8 boundary within `combined`.
+            let text = unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) };
+            for ch in text.chars() {
+                if ch == '\n' {
+                    let line = std::mem::take(&mut line_buf);
+                    self.process_sse_line(&line, &mut acc, &stream_tx)?;
+                } else if ch != '\r' {
+                    line_buf.push(ch);
                 }
-
-                current_event = None;
             }
+        }
+        if !incomplete.is_empty() {
+            tracing::warn!(
+                target: "recursive::llm",
+                bytes = incomplete.len(),
+                "SSE stream ended with incomplete UTF-8 sequence; discarding tail bytes"
+            );
+        }
+        if !line_buf.is_empty() {
+            self.process_sse_line(&line_buf, &mut acc, &stream_tx)?;
         }
 
         // Build final TokenUsage from accumulated fields
-        if input_tokens.is_some() || output_tokens.is_some() {
-            let prompt = input_tokens.unwrap_or(0);
-            let completion = output_tokens.unwrap_or(0);
-            usage = Some(TokenUsage {
+        let usage = if acc.input_tokens.is_some() || acc.output_tokens.is_some() {
+            let prompt = acc.input_tokens.unwrap_or(0);
+            let completion = acc.output_tokens.unwrap_or(0);
+            Some(TokenUsage {
                 reasoning_tokens: 0,
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: prompt.saturating_add(completion),
-                cache_hit_tokens: cache_read.unwrap_or(0),
-                cache_miss_tokens: cache_creation.unwrap_or(0),
+                cache_hit_tokens: acc.cache_read.unwrap_or(0),
+                cache_miss_tokens: acc.cache_creation.unwrap_or(0),
                 // Goal 273: not yet reported by Anthropic. Default 0.
-            });
-        }
+            })
+        } else {
+            None
+        };
 
         // Convert streamed tool calls to final ToolCall objects
-        let final_tool_calls: Vec<ToolCall> = tool_calls
+        let final_tool_calls: Vec<ToolCall> = acc
+            .tool_calls
             .into_iter()
             .filter(|tc| !tc.id.is_empty())
             .map(|tc| {
@@ -509,18 +399,222 @@ impl AnthropicProvider {
             .collect();
 
         Ok(Completion {
-            content,
+            content: acc.content,
             tool_calls: final_tool_calls,
-            finish_reason: finish_reason.map(|r| match r.as_str() {
+            finish_reason: acc.finish_reason.map(|r| match r.as_str() {
                 "end_turn" => "stop".to_string(),
                 "max_tokens" => "length".to_string(),
                 "tool_use" => "tool_calls".to_string(),
                 other => other.to_string(),
             }),
             usage,
-            reasoning_content: None,
+            reasoning_content: if acc.reasoning_content.trim().is_empty() {
+                None
+            } else {
+                Some(acc.reasoning_content)
+            },
         })
     }
+
+    /// Process a single SSE line, mutating `acc` and forwarding any text /
+    /// reasoning delta to `stream_tx` immediately.
+    ///
+    /// Anthropic frames each event as an `event: <name>` line followed by a
+    /// `data: <json>` line; `acc.current_event` carries the name across the
+    /// two calls. Blank lines (event separators) match no prefix and are
+    /// no-ops.
+    fn process_sse_line(
+        &self,
+        line: &str,
+        acc: &mut SseAccum,
+        stream_tx: &Option<StreamSender>,
+    ) -> Result<()> {
+        if let Some(event_name) = line.strip_prefix("event: ") {
+            acc.current_event = Some(event_name.to_string());
+            return Ok(());
+        }
+        let Some(data) = line.strip_prefix("data: ") else {
+            return Ok(());
+        };
+        let event_type = acc.current_event.as_deref().unwrap_or("unknown");
+
+        match event_type {
+            "message_start" => {
+                let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                    self.make_err(format!(
+                        "SSE parse error (message_start): {e}; data: {data}"
+                    ))
+                })?;
+                if let Some(msg) = parsed.get("message") {
+                    if let Some(u) = msg.get("usage") {
+                        acc.input_tokens = u
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                        acc.cache_creation = u
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                        acc.cache_read = u
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                    }
+                }
+            }
+            "content_block_start" => {
+                let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                    self.make_err(format!(
+                        "SSE parse error (content_block_start): {e}; data: {data}"
+                    ))
+                })?;
+                if let Some(block) = parsed.get("content_block") {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    match block_type {
+                        "tool_use" => {
+                            let id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            while acc.tool_calls.len() <= index {
+                                acc.tool_calls.push(StreamToolCall::default());
+                            }
+                            acc.tool_calls[index].id = id;
+                            acc.tool_calls[index].name = name;
+                        }
+                        "text" => {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    acc.content.push_str(text);
+                                    if let Some(tx) = stream_tx {
+                                        let _ = tx.send(StreamChunk::Text(text.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                        // Extended-thinking block (Anthropic, DeepSeek
+                        // `deepseek-v4-flash`, etc.). The opening block may
+                        // carry an initial `thinking` chunk.
+                        "thinking" => {
+                            if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    acc.reasoning_content.push_str(t);
+                                    if let Some(tx) = stream_tx {
+                                        let _ = tx.send(StreamChunk::Reasoning(t.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                    self.make_err(format!(
+                        "SSE parse error (content_block_delta): {e}; data: {data}"
+                    ))
+                })?;
+                if let Some(delta) = parsed.get("delta") {
+                    let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match delta_type {
+                        "text_delta" => {
+                            if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    acc.content.push_str(text);
+                                    if let Some(tx) = stream_tx {
+                                        let _ = tx.send(StreamChunk::Text(text.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(partial) =
+                                delta.get("partial_json").and_then(|v| v.as_str())
+                            {
+                                let index =
+                                    parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                        as usize;
+                                while acc.tool_calls.len() <= index {
+                                    acc.tool_calls.push(StreamToolCall::default());
+                                }
+                                acc.tool_calls[index].partial_json.push_str(partial);
+                            }
+                        }
+                        // Extended-thinking streaming delta. Accumulate into
+                        // `reasoning_content` and forward as a `Reasoning`
+                        // chunk so the UI renders the thinking live, above
+                        // the answer.
+                        "thinking_delta" => {
+                            if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    acc.reasoning_content.push_str(t);
+                                    if let Some(tx) = stream_tx {
+                                        let _ = tx.send(StreamChunk::Reasoning(t.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "message_delta" => {
+                let parsed: Value = serde_json::from_str(data).map_err(|e| {
+                    self.make_err(format!(
+                        "SSE parse error (message_delta): {e}; data: {data}"
+                    ))
+                })?;
+                if let Some(delta) = parsed.get("delta") {
+                    if let Some(reason) = delta.get("stop_reason").and_then(|v| v.as_str()) {
+                        acc.finish_reason = Some(reason.to_string());
+                    }
+                }
+                if let Some(u) = parsed.get("usage") {
+                    acc.output_tokens = u
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
+                }
+            }
+            "message_stop" => {
+                // End of stream - nothing to extract
+            }
+            "ping" => {
+                // Anthropic sends periodic pings to keep the connection alive
+            }
+            _ => {
+                tracing::debug!(target: "recursive::llm", event = %event_type, data = %data, "unhandled SSE event");
+            }
+        }
+
+        acc.current_event = None;
+        Ok(())
+    }
+}
+
+/// Mutable accumulator threaded through [`AnthropicProvider::process_sse_line`]
+/// while consuming a streamed Messages-API response.
+#[derive(Default)]
+struct SseAccum {
+    content: String,
+    reasoning_content: String,
+    tool_calls: Vec<StreamToolCall>,
+    finish_reason: Option<String>,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_creation: Option<u32>,
+    cache_read: Option<u32>,
+    /// Name from the most recent `event:` line, consumed by the next
+    /// `data:` line.
+    current_event: Option<String>,
 }
 
 /// Extract system message if present, return (system_content, remaining_messages).
@@ -727,7 +821,15 @@ enum ContentBlock {
         #[serde(default)]
         input: Value,
     },
-    // Extended thinking blocks (MiniMax-M3, deepseek-v4-flash, etc.) — skip silently.
+    // Extended-thinking block (Anthropic extended thinking, MiniMax-M3,
+    // deepseek-v4-flash, etc.). The chain-of-thought text lives in the
+    // `thinking` field; `redacted_thinking` blocks carry no readable text
+    // and fall through to `Unknown`.
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -773,12 +875,16 @@ struct StreamToolCall {
 
 fn parse_completion(response: AnthropicResponse) -> Completion {
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut tool_calls = Vec::new();
 
     for block in response.content {
         match block {
             ContentBlock::Text { text } => {
                 content.push_str(&text);
+            }
+            ContentBlock::Thinking { thinking } => {
+                reasoning_content.push_str(&thinking);
             }
             ContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
@@ -803,7 +909,11 @@ fn parse_completion(response: AnthropicResponse) -> Completion {
         tool_calls,
         finish_reason,
         usage: response.usage.map(|u| u.to_token_usage()),
-        reasoning_content: None,
+        reasoning_content: if reasoning_content.trim().is_empty() {
+            None
+        } else {
+            Some(reasoning_content)
+        },
     }
 }
 
@@ -912,6 +1022,29 @@ mod tests {
         let c = parse_completion(parsed);
         assert_eq!(c.content, "I'll read that file. ");
         assert_eq!(c.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parses_thinking_block_into_reasoning_content() {
+        // Anthropic extended thinking / DeepSeek deepseek-v4-flash emit a
+        // `thinking` content block. It must land in `reasoning_content`,
+        // not in the visible answer.
+        let raw = r#"{
+            "type": "message",
+            "content": [
+                {"type": "thinking", "thinking": "Let me reason about this.", "signature": "abc"},
+                {"type": "text", "text": "The answer is 42."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed);
+        assert_eq!(c.content, "The answer is 42.");
+        assert_eq!(
+            c.reasoning_content.as_deref(),
+            Some("Let me reason about this.")
+        );
     }
 
     #[test]
@@ -1236,6 +1369,86 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[tokio::test]
+    async fn test_e2_stream_thinking_deltas_populate_reasoning() {
+        // A streaming response with thinking_delta events must accumulate
+        // into reasoning_content while text_delta stays in content.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"deepseek-v4-flash\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Step one. \"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Step two.\"}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Done.\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "deepseek-v4-flash")
+                .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], Some(tx))
+            .await
+            .unwrap();
+
+        assert_eq!(completion.content, "Done.");
+        assert_eq!(
+            completion.reasoning_content.as_deref(),
+            Some("Step one. Step two.")
+        );
+
+        // Both reasoning and answer chunks are forwarded live, reasoning
+        // first (the model thinks before it speaks).
+        let mut chunks = Vec::new();
+        while let Ok(d) = rx.try_recv() {
+            chunks.push(d);
+        }
+        assert_eq!(
+            chunks,
+            vec![
+                StreamChunk::Reasoning("Step one. ".to_string()),
+                StreamChunk::Reasoning("Step two.".to_string()),
+                StreamChunk::Text("Done.".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_f_stream_tool_use_assembles_tool_calls() {
         // Spawn a mock server that sends tool_use blocks via SSE.
         // Assert the returned Completion has the correct tool_calls.
@@ -1344,7 +1557,7 @@ data: {\"type\":\"message_stop\"}
             .unwrap();
         assert_eq!(completion.content, "ABC");
 
-        // Should have received 3 deltas
+        // Should have received 3 text deltas
         let mut deltas = Vec::new();
         while let Some(d) = rx.recv().await {
             deltas.push(d);
@@ -1352,7 +1565,14 @@ data: {\"type\":\"message_stop\"}
                 break;
             }
         }
-        assert_eq!(deltas, vec!["A", "B", "C"]);
+        assert_eq!(
+            deltas,
+            vec![
+                StreamChunk::Text("A".to_string()),
+                StreamChunk::Text("B".to_string()),
+                StreamChunk::Text("C".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

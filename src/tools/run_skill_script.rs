@@ -280,6 +280,7 @@ mod tests {
             hint: String::new(),
             depends_on: vec![],
             sections: vec![],
+            globs: None,
         }]
     }
 
@@ -565,6 +566,7 @@ mod tests {
             hint: String::new(),
             depends_on: vec![],
             sections: vec![],
+            globs: None,
         };
 
         let tool = RunSkillScript::new(

@@ -968,7 +968,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\ndepends_on: base-skill\n---\n\nBody text";
-        let (_, _, _, _, _, depends_on, _) = crate::skills::parse_skill_meta(content, &dir);
+        let (_, _, _, _, _, depends_on, _, _) = crate::skills::parse_skill_meta(content, &dir);
         assert_eq!(depends_on, vec!["base-skill"]);
     }
 
@@ -979,7 +979,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\ndepends_on: base-skill, utils, logging\n---\n\nBody text";
-        let (_, _, _, _, _, depends_on, _) = crate::skills::parse_skill_meta(content, &dir);
+        let (_, _, _, _, _, depends_on, _, _) = crate::skills::parse_skill_meta(content, &dir);
         assert_eq!(depends_on, vec!["base-skill", "utils", "logging"]);
     }
 
@@ -989,7 +989,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\n---\n\nBody text";
-        let (_, _, _, _, _, depends_on, _) = crate::skills::parse_skill_meta(content, &dir);
+        let (_, _, _, _, _, depends_on, _, _) = crate::skills::parse_skill_meta(content, &dir);
         assert!(depends_on.is_empty());
     }
 
@@ -1008,6 +1008,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "no-deps".to_string(),
@@ -1021,6 +1022,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 

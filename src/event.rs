@@ -53,10 +53,22 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u32,
         output_tokens: u32,
+        /// Tokens served from the provider's prompt cache (cache-hit pricing applies).
+        cache_hit_tokens: u32,
+        /// Tokens written to the provider's prompt cache (full input pricing applies).
+        cache_miss_tokens: u32,
         step: usize,
     },
     /// Partial token from streaming response (if streaming enabled).
     PartialToken { text: String, step: usize },
+    /// Partial reasoning / thinking delta from a streaming response.
+    /// Emitted live (before the answer's `PartialToken` deltas) for
+    /// providers that stream an explicit reasoning channel, so UI
+    /// layers can render the chain-of-thought as it is produced. The
+    /// authoritative, fully-joined reasoning string still arrives once
+    /// per step via [`AgentEvent::Reasoning`], which finalises the
+    /// streamed block.
+    PartialReasoning { text: String, step: usize },
     /// Reasoning / thinking content from a model that exposes an
     /// explicit reasoning channel (DeepSeek R1, OpenAI o1, etc.).
     /// Carries the full reasoning text for the current step;
@@ -430,6 +442,8 @@ mod tests {
             AgentEvent::Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cache_hit_tokens: 5,
+                cache_miss_tokens: 15,
                 step: 4,
             },
             AgentEvent::PartialToken {

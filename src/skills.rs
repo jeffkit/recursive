@@ -16,6 +16,10 @@ pub enum SkillMode {
     /// Agent must explicitly call load_skill (current behavior).
     #[default]
     Manual,
+    /// Auto-inject when a tool result references a file path matching one of
+    /// the skill's `globs` patterns (Goal 318). Each skill is injected at most
+    /// once per agent run, tracked by [`SkillInjector`].
+    Globs,
 }
 
 /// A discovered skill with metadata.
@@ -44,6 +48,10 @@ pub struct Skill {
     pub scripts: Vec<SkillScript>,
     /// Named sections within the skill body (parsed from ## headings).
     pub sections: Vec<SkillSection>,
+    /// Glob patterns for `mode: globs` (Goal 318).
+    /// E.g. `["src/tools/**", "src/runtime.rs"]`.
+    /// `None` when mode is not Globs (or globs list is empty/absent).
+    pub globs: Option<Vec<String>>,
 }
 
 /// A named section within a skill's body, delimited by `## Section Name`.
@@ -117,11 +125,16 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                 }
 
                 if let Ok(content) = fs::read_to_string(&skill_file) {
-                    let (name, description, mode, triggers, hint, depends_on, params) =
+                    let (name, description, mode, triggers, hint, depends_on, params, raw_globs) =
                         parse_skill_meta(&content, &dir_path);
                     let refs = discover_refs(&dir_path);
                     let scripts = discover_scripts(&dir_path);
                     let sections = parse_sections(&content);
+                    let globs = if raw_globs.is_empty() {
+                        None
+                    } else {
+                        Some(raw_globs)
+                    };
                     skills.push(Skill {
                         name,
                         description,
@@ -134,6 +147,7 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                         params,
                         scripts,
                         sections,
+                        globs,
                     });
                 }
             }
@@ -309,6 +323,8 @@ fn extract_script_description(path: &Path) -> String {
 /// Returns (name, description, mode, triggers, hint, depends_on, params). If frontmatter is
 /// absent, falls back to using the parent directory name and first non-empty
 /// line, with default mode (Manual), empty triggers, empty hint, and empty depends_on.
+/// Returns `(name, description, mode, triggers, hint, depends_on, params, globs)`.
+#[allow(clippy::type_complexity)]
 pub fn parse_skill_meta(
     content: &str,
     dir_path: &Path,
@@ -320,6 +336,7 @@ pub fn parse_skill_meta(
     String,
     Vec<String>,
     Vec<SkillParam>,
+    Vec<String>,
 ) {
     // Try to extract YAML frontmatter: --- ... ---
     if let Some(frontmatter) = content.strip_prefix("---") {
@@ -335,6 +352,7 @@ pub fn parse_skill_meta(
             let mut hint = String::new();
             let mut params = Vec::new();
             let mut depends_on = Vec::new();
+            let mut globs: Vec<String> = Vec::new();
 
             let lines: Vec<&str> = yaml.lines().collect();
             let mut i = 0;
@@ -351,8 +369,28 @@ pub fn parse_skill_meta(
                     mode = match raw.as_str() {
                         "always" => SkillMode::Always,
                         "trigger" => SkillMode::Trigger,
+                        "globs" => SkillMode::Globs,
                         _ => SkillMode::Manual,
                     };
+                } else if line == "globs:" {
+                    // Parse YAML list: each entry is "  - pattern"
+                    i += 1;
+                    while i < lines.len() {
+                        let entry = lines[i].trim();
+                        if let Some(pat) = entry.strip_prefix("- ") {
+                            let p = pat.trim().trim_matches('"').trim_matches('\'');
+                            if !p.is_empty() {
+                                globs.push(p.to_string());
+                            }
+                            i += 1;
+                        } else if entry.is_empty() {
+                            i += 1;
+                        } else {
+                            // End of list — don't advance, let outer loop re-read
+                            break;
+                        }
+                    }
+                    continue;
                 } else if let Some(stripped) = line.strip_prefix("triggers:") {
                     // Parse comma-separated trigger words
                     triggers = stripped
@@ -438,14 +476,22 @@ pub fn parse_skill_meta(
                 hint = format!("{}: {}", final_name, final_description);
             }
 
+            let final_globs = if globs.is_empty() { None } else { Some(globs) };
+            // Normalise: Globs mode with no patterns → Manual
+            let final_mode = if mode == SkillMode::Globs && final_globs.is_none() {
+                SkillMode::Manual
+            } else {
+                mode
+            };
             return (
                 final_name,
                 final_description,
-                mode,
+                final_mode,
                 triggers,
                 hint,
                 depends_on,
                 params,
+                final_globs.unwrap_or_default(),
             );
         }
     }
@@ -469,6 +515,7 @@ pub fn parse_skill_meta(
         SkillMode::Manual,
         Vec::new(),
         String::new(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -504,8 +551,9 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
                     result.push((skill.name.clone(), skill.hint.clone()));
                 }
             }
-            SkillMode::Manual => {
-                // Never auto-injected; agent must call load_skill
+            SkillMode::Manual | SkillMode::Globs => {
+                // Manual: never auto-injected; agent must call load_skill.
+                // Globs: injected by SkillInjector after matching tool results, not here.
             }
         }
     }
@@ -514,6 +562,10 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
 }
 
 /// Extract the body of a SKILL.md file, stripping YAML frontmatter if present.
+pub fn extract_skill_body(content: &str) -> &str {
+    extract_body(content)
+}
+
 fn extract_body(content: &str) -> &str {
     if let Some(frontmatter) = content.strip_prefix("---") {
         if let Some(end) = frontmatter.find("---") {
@@ -543,6 +595,7 @@ pub fn skill_index(skills: &[Skill]) -> String {
         let mode_tag = match skill.mode {
             SkillMode::Always => "[always]",
             SkillMode::Trigger => "[trigger]",
+            SkillMode::Globs => "[globs]",
             SkillMode::Manual => "",
         };
 
@@ -670,6 +723,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "python-api".to_string(),
@@ -683,6 +737,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 
@@ -778,6 +833,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "no-refs".to_string(),
@@ -791,6 +847,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 
@@ -890,6 +947,7 @@ mod tests {
                 ],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "simple".to_string(),
@@ -903,6 +961,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 
@@ -1015,6 +1074,7 @@ mod tests {
                     },
                 ],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "no-scripts".to_string(),
@@ -1028,6 +1088,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 
@@ -1076,7 +1137,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\nmode: always\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, _depends_on, params) =
+        let (name, desc, mode, triggers, hint, _depends_on, params, _globs) =
             parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
@@ -1093,7 +1154,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust, trait\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, _depends_on, params) =
+        let (name, desc, mode, triggers, hint, _depends_on, params, _globs) =
             parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
@@ -1111,7 +1172,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let content =
             "---\nname: test-skill\ndescription: A test\nmode: trigger\ntriggers: rust\nhint: Rust-related helper\n---\n\nBody text";
-        let (name, desc, mode, triggers, hint, _depends_on, params) =
+        let (name, desc, mode, triggers, hint, _depends_on, params, _globs) =
             parse_skill_meta(content, &dir);
         assert_eq!(name, "test-skill");
         assert_eq!(desc, "A test");
@@ -1127,7 +1188,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "---\nname: test-skill\ndescription: A test\n---\n\nBody text";
-        let (_, _, mode, triggers, hint, _, _) = parse_skill_meta(content, &dir);
+        let (_, _, mode, triggers, hint, _, _, _) = parse_skill_meta(content, &dir);
         assert_eq!(mode, SkillMode::Manual);
         assert!(triggers.is_empty());
         assert!(hint.is_empty());
@@ -1139,7 +1200,7 @@ mod tests {
         let dir = tmp.path().join("test-skill");
         fs::create_dir(&dir).unwrap();
         let content = "Body text";
-        let (_, _, mode, triggers, hint, _, _) = parse_skill_meta(content, &dir);
+        let (_, _, mode, triggers, hint, _, _, _) = parse_skill_meta(content, &dir);
         assert_eq!(mode, SkillMode::Manual);
         assert!(triggers.is_empty());
         assert!(hint.is_empty());
@@ -1215,6 +1276,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_skill_meta_parses_globs_mode() {
+        let content =
+            "---\nname: arch-sync\ndescription: sync docs\nmode: globs\nglobs:\n  - src/tools/**\n  - src/runtime.rs\n---\n\nBody";
+        let dir = std::path::PathBuf::from("/tmp/skills/arch-sync");
+        let (name, _, mode, _, _, _, _, globs) = parse_skill_meta(content, &dir);
+        assert_eq!(name, "arch-sync");
+        assert_eq!(mode, SkillMode::Globs);
+        assert_eq!(globs, vec!["src/tools/**", "src/runtime.rs"]);
+    }
+
+    #[test]
+    fn skills_for_injection_globs_not_injected_at_session_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("arch-sync");
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: arch-sync\ndescription: sync docs\nmode: globs\nglobs:\n  - src/tools/**\n---\n\nBody",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&[tmp.path().to_path_buf()]);
+        // Globs-mode skills must NOT be injected at session start
+        let result = skills_for_injection(&skills, "anything src/tools/fs.rs");
+        assert!(
+            result.is_empty(),
+            "globs skill should not inject at session start"
+        );
+    }
+
+    #[test]
     fn skill_index_shows_mode_tags() {
         let skills = vec![
             Skill {
@@ -1229,6 +1321,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "trigger-skill".to_string(),
@@ -1242,6 +1335,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
             Skill {
                 name: "manual-skill".to_string(),
@@ -1255,6 +1349,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 
@@ -1321,6 +1416,7 @@ mod tests {
                         content: "Specific info".to_string(),
                     },
                 ],
+                globs: None,
             },
             Skill {
                 name: "no-sections".to_string(),
@@ -1334,6 +1430,7 @@ mod tests {
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
+                globs: None,
             },
         ];
 

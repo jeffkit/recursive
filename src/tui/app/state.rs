@@ -62,9 +62,6 @@ impl App {
             active_goal: None,
             workspace_path: workspace,
             theme: &crate::tui::ui::theme::DARK,
-            last_printed_idx: 0,
-            print_queue: Vec::new(),
-            recent_display: Vec::new(),
             modal_scroll: 0,
             active_command_panel: None,
         }
@@ -134,13 +131,6 @@ impl App {
         self.blocks.push(TranscriptBlock::System {
             text: "Conversation cleared.".into(),
         });
-        // Reset the scrollback-pointer so the new System block gets
-        // flushed on the next iteration (without this, last_printed_idx
-        // would remain past blocks.len(), leaving the block invisible).
-        self.last_printed_idx = 0;
-        // Clear any stale in-viewport content from the previous conversation.
-        self.recent_display.clear();
-        self.print_queue.clear();
         self.usage = UsageStats::default();
         self.turn_count = 0;
         self.pending_latency_ms = None;
@@ -340,18 +330,18 @@ mod tests {
     #[test]
     fn estimate_cost_for_known_model() {
         // gpt-4o-mini: $0.15/M in, $0.60/M out
-        // 1000 in = 0.00015, 1000 out = 0.00060 → total 0.00075
-        let c = estimate_cost("gpt-4o-mini", 1000, 1000).unwrap();
+        // 1000 in + 0 cache = 0.00015, 1000 out = 0.00060 → total 0.00075
+        let c = estimate_cost("gpt-4o-mini", 1000, 1000, 0, 0).unwrap();
         assert!((c - 0.00075).abs() < 1e-9);
     }
 
     #[test]
     fn estimate_cost_unknown_model_is_none() {
-        assert!(estimate_cost("foo-9000", 1000, 1000).is_none());
+        assert!(estimate_cost("foo-9000", 1000, 1000, 0, 0).is_none());
     }
 
     #[test]
     fn estimate_cost_minimax_m3_is_known() {
-        assert!(estimate_cost("MiniMax-M3", 1000, 1000).is_some());
+        assert!(estimate_cost("MiniMax-M3", 1000, 1000, 0, 0).is_some());
     }
 }

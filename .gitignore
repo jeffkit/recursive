@@ -33,6 +33,10 @@ Cargo.lock.bak
 .claude/
 .cursor/local/
 
+# Local cargo config (e.g. NO_PROXY for loopback test servers behind a
+# developer's HTTP proxy). Environment-specific, not project policy.
+.cargo/
+
 # Python
 __pycache__/
 *.pyc

@@ -135,24 +135,6 @@ pub struct App {
     /// via `/theme <name>` without restart.
     pub theme: &'static crate::tui::ui::theme::Theme,
 
-    // ── Progressive output ───────────────────────────────────────────────
-    /// Blocks from `self.blocks[0..last_printed_idx]` have already been
-    /// flushed to the terminal's scrollback buffer via
-    /// `terminal.insert_before()`. The inline viewport only renders
-    /// blocks at index `>= last_printed_idx` (in-flight content).
-    pub last_printed_idx: usize,
-    /// Queue of rendered lines waiting to be pushed to the scrollback
-    /// buffer in the next event-loop iteration. Drained by the main
-    /// loop using `terminal.insert_before()`.
-    pub print_queue: Vec<Vec<ratatui::text::Line<'static>>>,
-    /// Rolling buffer of rendered lines from recently-finalised blocks.
-    /// Populated by the main loop whenever blocks are flushed to
-    /// `terminal.insert_before()`.  The messages panel renders these
-    /// above any in-flight content so the viewport always shows context
-    /// instead of blank space, even when no turn is running.
-    /// Capped at 300 lines to bound memory.
-    pub recent_display: Vec<ratatui::text::Line<'static>>,
-
     // ── Modal scroll ─────────────────────────────────────────────────────
     /// Vertical scroll offset (in lines) for the currently-active modal.
     /// Reset to 0 whenever a new modal is pushed. For list-based modals

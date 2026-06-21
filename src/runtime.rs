@@ -636,6 +636,15 @@ impl AgentRuntime {
         self.plan_approval_gate.clone()
     }
 
+    /// Return a shared reference to the plan-mode-request gate (Goal-202).
+    ///
+    /// The TUI backend's `run_turn_select_loop` clones this arc so it can
+    /// forward `ApprovePlanMode` / `RejectPlanMode` user-actions to the gate
+    /// while the runtime is executing inside a spawned task.
+    pub fn plan_mode_request_gate(&self) -> Arc<PlanModeRequestGate> {
+        self.plan_mode_request_gate.clone()
+    }
+
     /// Confirm the pending plan, allowing execution to proceed.
     ///
     /// Wakes `exit_plan_mode`'s blocking wait via the Plan Mode 2.0 gate.
@@ -1028,6 +1037,8 @@ pub struct AgentRuntimeBuilder {
     with_plan_mode_tools: bool,
     /// Goal-291: tail-window size for the goal-evaluator judge. Default 12.
     goal_eval_transcript_tail: usize,
+    /// Goal-318: skills passed through to AgentKernel for Globs-mode injection.
+    skills: Vec<crate::skills::Skill>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -1064,6 +1075,7 @@ impl AgentRuntimeBuilder {
             compactor: None,
             with_plan_mode_tools: false,
             goal_eval_transcript_tail: 12,
+            skills: Vec::new(),
         }
     }
 
@@ -1085,6 +1097,12 @@ impl AgentRuntimeBuilder {
     /// Set the tool registry (optional, defaults to a local empty registry).
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.kernel_builder = self.kernel_builder.tools(tools);
+        self
+    }
+
+    /// Goal-318: set the skills list for Globs-mode automatic injection.
+    pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
+        self.skills = skills;
         self
     }
 
@@ -1184,7 +1202,8 @@ impl AgentRuntimeBuilder {
     ///
     /// Returns an error if the LLM provider is missing.
     pub fn build(self) -> Result<AgentRuntime> {
-        let mut kernel = self.kernel_builder.build()?;
+        let kernel_builder = self.kernel_builder.skills(self.skills);
+        let mut kernel = kernel_builder.build()?;
 
         let mut transcript = Vec::new();
         if let Some(sys) = self.system_prompt {
@@ -2552,6 +2571,113 @@ mod tests {
             4,
             "transcript should have 4 messages (user, assistant, 2× tool), got {}",
             rt.transcript().len()
+        );
+    }
+
+    /// Invariant #8 regression: when stuck detection fires *mid-batch* (the
+    /// error rate threshold is reached while iterating the results of a
+    /// multi-call step), the turn must still push a tool_result for EVERY
+    /// tool_call of the triggering assistant message. The old code returned
+    /// from inside the result loop before pushing the remaining results,
+    /// leaving orphaned `tool_use` blocks in the committed transcript — which
+    /// the provider then rejects on every subsequent turn with HTTP 400
+    /// ("tool_use ids ... were found without tool_result blocks").
+    #[tokio::test]
+    async fn stuck_detection_keeps_tool_calls_paired() {
+        use crate::error::Error;
+
+        struct AlwaysFails;
+
+        #[async_trait]
+        impl Tool for AlwaysFails {
+            fn spec(&self) -> crate::llm::ToolSpec {
+                crate::llm::ToolSpec {
+                    name: "always_fails".into(),
+                    description: "always returns an error".into(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+                Err(Error::Tool {
+                    name: "always_fails".into(),
+                    call_id: None,
+                    message: "boom".into(),
+                })
+            }
+        }
+
+        // One assistant message with three failing tool_calls. With
+        // stuck_window=2 and stuck_error_rate=1.0, the second error trips
+        // the stuck threshold — mid-batch, before the third result is
+        // processed.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "Trying three things at once...".into(),
+            tool_calls: vec![
+                crate::llm::ToolCall {
+                    id: "c1".into(),
+                    name: "always_fails".into(),
+                    arguments: json!({}),
+                },
+                crate::llm::ToolCall {
+                    id: "c2".into(),
+                    name: "always_fails".into(),
+                    arguments: json!({}),
+                },
+                crate::llm::ToolCall {
+                    id: "c3".into(),
+                    name: "always_fails".into(),
+                    arguments: json!({}),
+                },
+            ],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+
+        let tools = ToolRegistry::local().register(Arc::new(AlwaysFails));
+
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .stuck_window(2)
+            .stuck_error_rate(1.0)
+            .build()
+            .unwrap();
+
+        let out = rt.run("go").await.unwrap();
+
+        // The turn ends as Stuck (error rate hit the threshold).
+        assert!(
+            matches!(out.finish_reason, FinishReason::Stuck { .. }),
+            "expected Stuck finish, got {:?}",
+            out.finish_reason
+        );
+
+        // Every one of the assistant's three tool_calls must have a matching
+        // tool_result, even though stuck fired after the second.
+        let assistant = rt
+            .transcript()
+            .iter()
+            .find(|m| m.role == crate::message::Role::Assistant && !m.tool_calls.is_empty())
+            .expect("assistant-with-tool_calls must be in transcript");
+        let tool_results: Vec<&str> = rt
+            .transcript()
+            .iter()
+            .filter(|m| m.role == crate::message::Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        for tc in &assistant.tool_calls {
+            assert!(
+                tool_results.contains(&tc.id.as_str()),
+                "tool_call {} has no matching tool_result (orphaned tool_use); results={tool_results:?}",
+                tc.id
+            );
+        }
+        assert_eq!(
+            tool_results.len(),
+            3,
+            "expected exactly 3 tool_result messages, got {}",
+            tool_results.len()
         );
     }
 

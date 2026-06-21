@@ -35,6 +35,14 @@ impl App {
             return self.handle_command_panel_key(key);
         }
 
+        // ── Fix-E: inline plan-proposal approval ────────────────────────
+        // The plan is shown as a TranscriptBlock::PlanProposal (not a modal),
+        // so the modal-stack check further below never fires for it.
+        // Intercept y/n/e here before keys reach the prompt input.
+        if self.plan_awaiting_approval {
+            return self.handle_inline_plan_review_key(key);
+        }
+
         // ── Goal-202: plan-mode pre-confirmation ──────────────────────
         // When the agent has called `request_plan_mode`, y/Enter approve
         // and n/Esc reject — just like the plan approval banner.
@@ -1032,6 +1040,48 @@ impl App {
                 }
                 self.modals.pop();
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// Fix-E: dispatch a key when `plan_awaiting_approval` is set (inline plan).
+    ///
+    /// The plan is displayed inline as a `TranscriptBlock::PlanProposal`; there
+    /// is no modal on the stack, so this handler must intercept keys before they
+    /// reach the prompt input.
+    ///
+    /// * `y` / `Enter` → optimistically clear `plan_awaiting_approval` and emit
+    ///   `UserAction::ConfirmPlan`.
+    /// * `n` / `Esc` → clear flag and emit `UserAction::RejectPlan("user rejected")`.
+    /// * `e` → copy the plan text from the last `PlanProposal` block into the
+    ///   prompt buffer (so the user can edit and re-send it), clear the flag, and
+    ///   emit `UserAction::RejectPlan("user edited")` to unblock the gate — without
+    ///   this the `exit_plan_mode` tool would block forever.
+    /// * Any other key is consumed, keeping plan-approval focus.
+    fn handle_inline_plan_review_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.plan_awaiting_approval = false;
+                Some(UserAction::ConfirmPlan)
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.plan_awaiting_approval = false;
+                Some(UserAction::RejectPlan("user rejected".into()))
+            }
+            KeyCode::Char('e') => {
+                let plan_text = self.blocks.iter().rev().find_map(|b| {
+                    if let TranscriptBlock::PlanProposal { plan_text, .. } = b {
+                        Some(plan_text.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(text) = plan_text {
+                    self.set_input(text);
+                }
+                self.plan_awaiting_approval = false;
+                Some(UserAction::RejectPlan("user edited".into()))
             }
             _ => None,
         }
@@ -2544,6 +2594,89 @@ mod perm_tests {
                 ..
             }
         )));
+    }
+
+    // ── Inline plan-proposal approval (Fix-E) ─────────────────────────────
+
+    #[test]
+    fn inline_plan_y_dispatches_confirm_and_clears_flag() {
+        use crate::tui::events::UserAction;
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanProposed {
+            plan_text: "do the thing".into(),
+            tool_calls: vec![],
+        });
+        assert!(app.plan_awaiting_approval);
+        let action = app.handle_key(k(KeyCode::Char('y')));
+        assert!(!app.plan_awaiting_approval, "flag should be cleared");
+        assert!(matches!(action, Some(UserAction::ConfirmPlan)));
+        // Key must NOT have fallen through to the input buffer.
+        assert!(app.input().is_empty());
+    }
+
+    #[test]
+    fn inline_plan_enter_dispatches_confirm_and_clears_flag() {
+        use crate::tui::events::UserAction;
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanProposed {
+            plan_text: "do the thing".into(),
+            tool_calls: vec![],
+        });
+        let action = app.handle_key(k(KeyCode::Enter));
+        assert!(!app.plan_awaiting_approval);
+        assert!(matches!(action, Some(UserAction::ConfirmPlan)));
+    }
+
+    #[test]
+    fn inline_plan_n_dispatches_reject_and_clears_flag() {
+        use crate::tui::events::UserAction;
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanProposed {
+            plan_text: "do the thing".into(),
+            tool_calls: vec![],
+        });
+        let action = app.handle_key(k(KeyCode::Char('n')));
+        assert!(!app.plan_awaiting_approval);
+        match action {
+            Some(UserAction::RejectPlan(r)) => assert_eq!(r, "user rejected"),
+            other => panic!("expected RejectPlan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_plan_e_copies_text_to_input_and_emits_reject() {
+        use crate::tui::events::UserAction;
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanProposed {
+            plan_text: "the plan text".into(),
+            tool_calls: vec![],
+        });
+        let action = app.handle_key(k(KeyCode::Char('e')));
+        assert!(!app.plan_awaiting_approval);
+        // 'e' should copy plan text into the input buffer.
+        assert_eq!(app.input(), "the plan text");
+        // And emit a RejectPlan so the gate unblocks.
+        match action {
+            Some(UserAction::RejectPlan(r)) => assert_eq!(r, "user edited"),
+            other => panic!("expected RejectPlan(user edited), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_plan_other_key_consumed_flag_stays() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::PlanProposed {
+            plan_text: "the plan text".into(),
+            tool_calls: vec![],
+        });
+        let action = app.handle_key(k(KeyCode::Char('z')));
+        assert!(
+            app.plan_awaiting_approval,
+            "flag must stay set for other keys"
+        );
+        assert!(action.is_none());
+        // The 'z' must NOT have been typed into the input buffer.
+        assert!(app.input().is_empty());
     }
 
     #[test]

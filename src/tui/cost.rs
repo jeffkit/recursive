@@ -21,6 +21,14 @@ pub struct UsageStats {
     pub total_input: u64,
     /// Cumulative output tokens across all turns.
     pub total_output: u64,
+    /// Most recent per-turn cache-hit tokens.
+    pub cache_hit_tokens: u64,
+    /// Most recent per-turn cache-miss tokens.
+    pub cache_miss_tokens: u64,
+    /// Cumulative cache-hit tokens across all turns.
+    pub total_cache_hit: u64,
+    /// Cumulative cache-miss tokens across all turns.
+    pub total_cache_miss: u64,
     /// Most recent LLM round-trip latency, in milliseconds.
     pub last_latency_ms: u64,
 }
@@ -33,6 +41,23 @@ impl UsageStats {
         self.output_tokens = output_tokens;
         self.total_input = self.total_input.saturating_add(input_tokens);
         self.total_output = self.total_output.saturating_add(output_tokens);
+    }
+
+    /// Fold a `Usage` event including cache fields into the stats.
+    /// Treats incoming numbers as per-turn deltas and accumulates them
+    /// into the running totals.
+    pub fn record_with_cache(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_hit_tokens: u64,
+        cache_miss_tokens: u64,
+    ) {
+        self.record(input_tokens, output_tokens);
+        self.cache_hit_tokens = cache_hit_tokens;
+        self.cache_miss_tokens = cache_miss_tokens;
+        self.total_cache_hit = self.total_cache_hit.saturating_add(cache_hit_tokens);
+        self.total_cache_miss = self.total_cache_miss.saturating_add(cache_miss_tokens);
     }
 }
 
@@ -85,12 +110,25 @@ pub fn detect_model_name() -> String {
         .unwrap_or_else(|_| "gpt-4o-mini".to_string())
 }
 
-/// Compute estimated cost in USD given accumulated tokens.
+/// Compute estimated cost in USD given accumulated tokens and cache stats.
 /// Delegates to `pricing_for()` from the bundled provider catalog.
+/// Uses `ModelPricing::cost_usd()` which applies cache-hit discount rates.
 /// Returns `None` when the model has no pricing entry in `providers.toml`.
-pub fn estimate_cost(model: &str, total_input: u64, total_output: u64) -> Option<f64> {
+pub fn estimate_cost(
+    model: &str,
+    total_input: u64,
+    total_output: u64,
+    cache_hit: u64,
+    cache_miss: u64,
+) -> Option<f64> {
     let pricing = crate::llm::pricing_for(model)?;
-    let in_cost = (total_input as f64) * pricing.input_per_million / 1_000_000.0;
-    let out_cost = (total_output as f64) * pricing.output_per_million / 1_000_000.0;
-    Some(in_cost + out_cost)
+    let usage = crate::llm::TokenUsage {
+        prompt_tokens: total_input as u32,
+        completion_tokens: total_output as u32,
+        total_tokens: 0,
+        cache_hit_tokens: cache_hit as u32,
+        cache_miss_tokens: cache_miss as u32,
+        reasoning_tokens: 0,
+    };
+    Some(pricing.cost_usd(usage))
 }

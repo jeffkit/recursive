@@ -45,6 +45,65 @@ pub fn render_blocks(
     lines
 }
 
+/// Hard-wrap a list of logical lines into physical rows whose visual width is
+/// at most `width` columns, preserving per-span styling.
+///
+/// The chat panel uses this to pre-wrap the whole transcript and then window
+/// the resulting rows itself (in `usize`). This is exact — each returned line
+/// already fits the panel, so the renderer needs no further wrapping — which
+/// avoids two problems with the previous `Paragraph::scroll` approach: the
+/// character-width row *estimate* drifting from ratatui's word-aware wrapping
+/// (inexact scroll positions, unreachable rows) and the `scroll as u16` cast
+/// overflowing on very long transcripts.
+///
+/// Wrapping is grapheme-agnostic and breaks at the column boundary (not on
+/// word boundaries); a single wide character that cannot fit an empty line is
+/// emitted anyway to guarantee forward progress. A `width` of 0 disables
+/// wrapping and returns the input unchanged.
+pub fn wrap_lines_to_width(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar as _;
+
+    if width == 0 {
+        return lines.to_vec();
+    }
+    let w = width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    for line in lines {
+        let mut cur: Vec<Span<'static>> = Vec::new();
+        let mut cur_w = 0usize;
+
+        for span in &line.spans {
+            let style = span.style;
+            let mut buf = String::new();
+            for ch in span.content.chars() {
+                let cw = ch.width().unwrap_or(0);
+                // Break before this char when it would overflow the row, but
+                // only if the row already has content (otherwise an oversized
+                // glyph on an empty row would loop forever).
+                if cur_w + cw > w && cur_w > 0 {
+                    if !buf.is_empty() {
+                        cur.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    out.push(Line::from(std::mem::take(&mut cur)));
+                    cur_w = 0;
+                }
+                buf.push(ch);
+                cur_w += cw;
+            }
+            if !buf.is_empty() {
+                cur.push(Span::styled(buf, style));
+            }
+        }
+
+        // Always emit the trailing row, even when empty, so blank logical
+        // lines (paragraph spacing) are preserved one-for-one.
+        out.push(Line::from(cur));
+    }
+
+    out
+}
+
 /// Render a single block. Exposed for unit tests.
 ///
 /// `width` is the available render width in columns (0 = no limit).
@@ -56,7 +115,7 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme, width: u16) -> Vec<Line
             streaming,
             latency_ms,
         } => render_assistant(text, *streaming, *latency_ms, th, width),
-        TranscriptBlock::Reasoning { text } => render_reasoning(text),
+        TranscriptBlock::Reasoning { text, .. } => render_reasoning(text),
         TranscriptBlock::ToolCall {
             name,
             args_preview,
@@ -739,6 +798,7 @@ mod tests {
         let lines = render_block(
             &TranscriptBlock::Reasoning {
                 text: "let me think about this\nmaybe this way".into(),
+                streaming: false,
             },
             &theme::DARK,
             0,
@@ -764,6 +824,7 @@ mod tests {
         let lines = render_block(
             &TranscriptBlock::Reasoning {
                 text: String::new(),
+                streaming: false,
             },
             &theme::DARK,
             0,
@@ -940,6 +1001,66 @@ mod tests {
         };
         let lines = render_block(&block, &theme::DARK, 0);
         assert!(lines.iter().any(|l| line_text(l).contains("Updated")));
+    }
+
+    // ── wrap_lines_to_width ─────────────────────────────────────────
+
+    #[test]
+    fn wrap_splits_long_line_into_width_bounded_rows() {
+        let line = Line::from("abcdefghij".to_string()); // 10 cols
+        let rows = wrap_lines_to_width(&[line], 4);
+        // 10 chars at width 4 → "abcd" / "efgh" / "ij"
+        assert_eq!(rows.len(), 3);
+        assert_eq!(line_text(&rows[0]), "abcd");
+        assert_eq!(line_text(&rows[1]), "efgh");
+        assert_eq!(line_text(&rows[2]), "ij");
+    }
+
+    #[test]
+    fn wrap_preserves_blank_lines_one_for_one() {
+        let lines = vec![Line::raw(""), Line::from("hi".to_string()), Line::raw("")];
+        let rows = wrap_lines_to_width(&lines, 80);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(line_text(&rows[0]), "");
+        assert_eq!(line_text(&rows[1]), "hi");
+        assert_eq!(line_text(&rows[2]), "");
+    }
+
+    #[test]
+    fn wrap_width_zero_is_noop() {
+        let lines = vec![Line::from("anything at all".to_string())];
+        let rows = wrap_lines_to_width(&lines, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(line_text(&rows[0]), "anything at all");
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles_across_break() {
+        let styled = Line::from(vec![
+            Span::styled("redred", Style::default().fg(Color::Red)),
+            Span::styled("bluebl", Style::default().fg(Color::Blue)),
+        ]);
+        // total 12 cols, width 5 → rows of ≤5 cols, styles intact.
+        let rows = wrap_lines_to_width(&[styled], 5);
+        assert_eq!(full_text(&rows), "redre\ndblue\nbl");
+        // Every span on the first row must still be red.
+        assert!(rows[0].spans.iter().all(|s| s.style.fg == Some(Color::Red)));
+        // The last row's only content came from the blue span.
+        assert!(rows[2]
+            .spans
+            .iter()
+            .all(|s| s.style.fg == Some(Color::Blue)));
+    }
+
+    #[test]
+    fn wrap_handles_wide_chars_without_exceeding_width() {
+        // CJK chars are width 2. At width 3, only one fits per row.
+        let line = Line::from("中文字".to_string());
+        let rows = wrap_lines_to_width(&[line], 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(line_text(&rows[0]), "中");
+        assert_eq!(line_text(&rows[1]), "文");
+        assert_eq!(line_text(&rows[2]), "字");
     }
 
     #[test]

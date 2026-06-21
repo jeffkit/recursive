@@ -48,6 +48,19 @@ pub fn build_line(app: &App) -> Line<'static> {
         Style::default().fg(Color::Cyan).bg(Color::DarkGray),
     ));
 
+    // [version + workspace] — the identity info that used to live in the
+    // startup banner header now lives here, in the always-visible status bar.
+    spans.push(separator());
+    spans.push(Span::styled(
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(Color::Gray).bg(Color::DarkGray),
+    ));
+    spans.push(separator());
+    spans.push(Span::styled(
+        abbreviate_workspace(&app.workspace_path),
+        Style::default().fg(Color::Gray).bg(Color::DarkGray),
+    ));
+
     // [tokens + cost]
     spans.push(separator());
     spans.push(Span::styled(
@@ -62,11 +75,23 @@ pub fn build_line(app: &App) -> Line<'static> {
         &app.model_name,
         app.usage.total_input,
         app.usage.total_output,
+        app.usage.total_cache_hit,
+        app.usage.total_cache_miss,
     ) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("${cost:.4}"),
             Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+        ));
+    }
+
+    // [cache hit rate] — only when there's cache data to show
+    if app.usage.total_cache_hit > 0 {
+        let pct = (app.usage.total_cache_hit as f64 / app.usage.total_input as f64) * 100.0;
+        spans.push(separator());
+        spans.push(Span::styled(
+            format!("📦{:.0}%", pct),
+            Style::default().fg(Color::Green).bg(Color::DarkGray),
         ));
     }
 
@@ -100,6 +125,19 @@ pub fn build_line(app: &App) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+/// Abbreviate an absolute workspace path for the status bar, replacing the
+/// home-directory prefix with `~`.
+fn abbreviate_workspace(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Some(home) = dirs::home_dir() {
+        let h = home.display().to_string();
+        if !h.is_empty() && s.starts_with(&h) {
+            return format!("~{}", &s[h.len()..]);
+        }
+    }
+    s
 }
 
 fn separator() -> Span<'static> {
@@ -179,6 +217,36 @@ mod tests {
         app.turn.start();
         let with_turn = line_text(&build_line(&app));
         assert!(with_turn.contains("⏱"));
+    }
+
+    #[test]
+    fn status_bar_includes_version_and_workspace() {
+        let mut app = App::new();
+        app.workspace_path = std::path::PathBuf::from("/tmp/some-workspace");
+        let text = line_text(&build_line(&app));
+        // Version is the crate version, prefixed with `v`.
+        assert!(
+            text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "status bar should show version: {text:?}"
+        );
+        // Workspace tail should appear (path not under $HOME → shown verbatim).
+        assert!(
+            text.contains("some-workspace"),
+            "status bar should show workspace: {text:?}"
+        );
+    }
+
+    #[test]
+    fn abbreviate_workspace_replaces_home_prefix() {
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join("projects/Recursive");
+            let abbreviated = abbreviate_workspace(&p);
+            assert!(
+                abbreviated.starts_with("~/"),
+                "expected ~-prefixed path, got {abbreviated:?}"
+            );
+            assert!(abbreviated.ends_with("projects/Recursive"));
+        }
     }
 
     #[test]

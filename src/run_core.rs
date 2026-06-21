@@ -28,7 +28,7 @@ pub(crate) const DENIAL_LIMIT_SENTINEL: &str = "ERROR_DENIAL_LIMIT:";
 use crate::compact::Compactor;
 use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
-use crate::llm::{ChatProvider, Completion, StreamSender, TokenUsage, ToolCall};
+use crate::llm::{ChatProvider, Completion, StreamChunk, StreamSender, TokenUsage, ToolCall};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
@@ -36,6 +36,8 @@ use crate::tools::ToolRegistry;
 
 use crate::agent::{FinishReason, PermissionDecision};
 use crate::event::AgentEvent;
+use crate::skills::Skill;
+use crate::skills_injector::SkillInjector;
 use crate::tools::PermissionHook;
 
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
@@ -106,6 +108,9 @@ pub(crate) struct RunCore<'a> {
     /// Turn index (0-based), scopes [`crate::tools::AuditKey`] prefixes so
     /// that cross-turn tool_call_id reuse cannot corrupt audit metadata.
     pub(crate) turn: u32,
+    /// Goal-318: `Globs`-mode skills for path-triggered injection.
+    /// Injected as system messages after tool calls match a skill's glob patterns.
+    pub(crate) globs_skills: Vec<Skill>,
 }
 
 impl<'a> RunCore<'a> {
@@ -487,6 +492,8 @@ impl<'a> RunCore<'a> {
         let mut recent_errors: std::collections::VecDeque<(bool, String)> =
             std::collections::VecDeque::with_capacity(self.stuck_window);
         let mut total_usage = TokenUsage::default();
+        // Goal-318: one injector per run; tracks already-fired globs skills.
+        let mut skill_injector = SkillInjector::new(&self.globs_skills);
         // Goal-153: audit metadata for tool calls, keyed by (turn, tool_call_id).
         let mut tool_audits: std::collections::HashMap<
             crate::tools::AuditKey,
@@ -591,21 +598,46 @@ impl<'a> RunCore<'a> {
             // ---- LLM call (with retry) --------------------------------------------
             debug!(target: "recursive::agent", step, "calling llm");
             let start = std::time::Instant::now();
+            let mut forward_handle = None;
             let stream_tx: Option<StreamSender> = if self.streaming {
-                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamChunk>();
                 let events_tx = self.events.clone();
-                tokio::spawn(async move {
-                    while let Some(text) = delta_rx.recv().await {
+                forward_handle = Some(tokio::spawn(async move {
+                    while let Some(chunk) = delta_rx.recv().await {
                         if let Some(ref tx) = events_tx {
-                            let _ = tx.send(AgentEvent::PartialToken { text, step });
+                            let event = match chunk {
+                                StreamChunk::Text(text) => AgentEvent::PartialToken { text, step },
+                                StreamChunk::Reasoning(text) => {
+                                    AgentEvent::PartialReasoning { text, step }
+                                }
+                            };
+                            let _ = tx.send(event);
                         }
                     }
-                });
+                }));
                 Some(delta_tx)
             } else {
                 None
             };
-            let completion: Completion = self.call_llm(&specs, stream_tx).await?;
+            let mut completion: Completion = self.call_llm(&specs, stream_tx).await?;
+            // Drain the partial-token forwarder before emitting any further
+            // events. `call_llm` drops `stream_tx` on return, which closes
+            // `delta_rx` and lets the spawned task finish; awaiting it
+            // guarantees every `PartialToken` has been pushed to the event
+            // sink *before* the finalising `AssistantText`. Without this the
+            // two tasks race on the shared sink and a late token can arrive
+            // after the assistant block was finalised, spawning a duplicate
+            // streaming block in the UI.
+            if let Some(handle) = forward_handle.take() {
+                let _ = handle.await;
+            }
+            // Normalise chain-of-thought that the model emitted inline as
+            // `<think>…</think>` in `content` (common for OpenAI-compatible
+            // DeepSeek-R1 deployments that don't use the dedicated
+            // `reasoning_content` SSE field) into the reasoning channel, so
+            // the thinking block renders instead of being dropped by the
+            // markdown HTML-block parser.
+            completion.extract_inline_reasoning();
             let llm_ms = start.elapsed().as_millis() as u64;
             self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
             self.emit(AgentEvent::Latency { step, llm_ms });
@@ -615,6 +647,8 @@ impl<'a> RunCore<'a> {
                 self.emit(AgentEvent::Usage {
                     input_tokens: u.prompt_tokens,
                     output_tokens: u.completion_tokens,
+                    cache_hit_tokens: u.cache_hit_tokens,
+                    cache_miss_tokens: u.cache_miss_tokens,
                     step,
                 });
             }
@@ -736,6 +770,16 @@ impl<'a> RunCore<'a> {
                 });
             }
 
+            // Stuck detection may fire while iterating the results of a
+            // multi-call step. Returning mid-loop (as this code used to do)
+            // left the assistant message's remaining tool_calls without
+            // matching tool_result messages — orphaned `tool_use` blocks that
+            // the provider rejects on the *next* turn with HTTP 400
+            // ("tool_use ids ... were found without tool_result blocks").
+            // Invariant #8 requires every tool_call be paired before the turn
+            // ends, so we record the stuck verdict here but defer the actual
+            // return until the loop has pushed a tool_result for every call.
+            let mut stuck_finish: Option<FinishReason> = None;
             for ToolCallOutcome {
                 id,
                 name,
@@ -756,6 +800,11 @@ impl<'a> RunCore<'a> {
                     tool_audits.insert((self.turn, id.clone()), a.clone());
                 }
 
+                // Push the tool_result before any (deferred) early
+                // termination so the tool_call ↔ tool_result pairing stays
+                // intact for the whole batch.
+                self.push_message(Message::tool_result(id.clone(), result.clone()));
+
                 // Sliding-window stuck detection: track whether each tool call
                 // was an error. Triggers when the error rate in the last
                 // stuck_window steps exceeds stuck_error_rate, catching loops
@@ -765,7 +814,7 @@ impl<'a> RunCore<'a> {
                 }
                 recent_errors.push_back((is_error, name.clone()));
 
-                if recent_errors.len() == self.stuck_window {
+                if stuck_finish.is_none() && recent_errors.len() == self.stuck_window {
                     let error_entries: Vec<&str> = recent_errors
                         .iter()
                         .filter(|(is_err, _)| *is_err)
@@ -785,28 +834,40 @@ impl<'a> RunCore<'a> {
                             .max_by_key(|&(_, c)| c)
                             .map(|(n, _)| n)
                             .unwrap_or(name.as_str());
-                        let finish = FinishReason::Stuck {
+                        stuck_finish = Some(FinishReason::Stuck {
                             repeated_call: top_tool.to_string(),
                             repeats: error_count,
-                        };
-                        self.emit(AgentEvent::TurnFinished {
-                            reason: finish_reason_str(&finish),
-                            steps: step,
                         });
-                        let outcome = RunInnerOutcome {
-                            messages: self.messages,
-                            final_message,
-                            finish_reason: finish,
-                            total_usage,
-                            total_llm_latency_ms: self.total_llm_latency_ms,
-                            steps: step,
-                            tool_audits,
-                        };
-                        return Ok(outcome);
                     }
                 }
+            }
 
-                self.push_message(Message::tool_result(id.clone(), result.clone()));
+            // Deferred stuck termination: every tool_call now has its matching
+            // tool_result in the transcript, so ending the turn here cannot
+            // leave orphaned `tool_use` blocks behind.
+            if let Some(finish) = stuck_finish {
+                self.emit(AgentEvent::TurnFinished {
+                    reason: finish_reason_str(&finish),
+                    steps: step,
+                });
+                return Ok(RunInnerOutcome {
+                    messages: self.messages,
+                    final_message,
+                    finish_reason: finish,
+                    total_usage,
+                    total_llm_latency_ms: self.total_llm_latency_ms,
+                    steps: step,
+                    tool_audits,
+                });
+            }
+
+            // Goal-318: after every tool-result batch, check whether any result
+            // references a path matching a Globs-mode skill.  Inject once per skill.
+            let result_strings: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
+            for (skill_name, skill_body) in skill_injector.check(&result_strings) {
+                self.push_message(Message::system(format!(
+                    "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
+                )));
             }
         }
 
