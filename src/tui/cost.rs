@@ -29,6 +29,16 @@ pub struct UsageStats {
     pub total_cache_hit: u64,
     /// Cumulative cache-miss tokens across all turns.
     pub total_cache_miss: u64,
+    /// Cache-hit tokens summed over the in-progress / most recent turn.
+    ///
+    /// Reset to zero at the start of each turn via [`UsageStats::begin_turn`].
+    /// The status bar uses this (not the cumulative totals) for the cache-hit
+    /// rate, because the session totals trend toward ~100% as the cached
+    /// prompt prefix is re-read on every step, drowning out the cold-start
+    /// misses and making the figure useless.
+    pub turn_cache_hit: u64,
+    /// Cache-miss tokens summed over the in-progress / most recent turn.
+    pub turn_cache_miss: u64,
     /// Most recent LLM round-trip latency, in milliseconds.
     pub last_latency_ms: u64,
 }
@@ -58,6 +68,16 @@ impl UsageStats {
         self.cache_miss_tokens = cache_miss_tokens;
         self.total_cache_hit = self.total_cache_hit.saturating_add(cache_hit_tokens);
         self.total_cache_miss = self.total_cache_miss.saturating_add(cache_miss_tokens);
+        self.turn_cache_hit = self.turn_cache_hit.saturating_add(cache_hit_tokens);
+        self.turn_cache_miss = self.turn_cache_miss.saturating_add(cache_miss_tokens);
+    }
+
+    /// Reset the per-turn cache counters. Called when a new turn starts so the
+    /// status bar reports the cache-hit rate for the current turn rather than
+    /// the whole session.
+    pub fn begin_turn(&mut self) {
+        self.turn_cache_hit = 0;
+        self.turn_cache_miss = 0;
     }
 }
 

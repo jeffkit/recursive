@@ -136,3 +136,54 @@ test('E2E 项目自定义门：.flowcast/gates.json 声明的门红灯 → rolle
 
   rmSync(root, { recursive: true, force: true })
 })
+
+test('E2E clippy 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () => {
+  // CARGO_FAIL=clippy 让假 cargo clippy 以非零退出，触发 clippy 质量门失败路径。
+  const { root, repo, binDir } = setup()
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  const runId = 'e2e-clippy-fail'
+
+  const r = runFlow({ repo, binDir, runId, cargoFail: 'clippy' })
+  assert.equal(r.status, 0, `flow 应正常退出（clippy 失败不是 crash）:\n${r.stdout}\n${r.stderr}`)
+
+  // clippy 门失败 → 回滚：HEAD 不变
+  assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, 'clippy 红灯后 HEAD 应回到 baseline')
+
+  const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
+  assert.equal(state.summary.verdict, 'rolled-back', `verdict 应为 rolled-back，实际: ${state.summary.verdict}`)
+
+  // 回滚原因必须来自 clippy 门
+  assert.match(
+    state.summary.detail ?? '',
+    /clippy/i,
+    `回滚原因应来自 clippy 门，实际 detail: ${state.summary.detail}`,
+  )
+
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('E2E fmt 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () => {
+  // CARGO_FAIL=fmt 让假 cargo fmt 以非零退出，触发 fmt 质量门失败路径。
+  // fmt 门的 cmd 是 `cargo fmt --all -- --check`，$1 = "fmt"，CARGO_FAIL=fmt 即可触发。
+  const { root, repo, binDir } = setup()
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  const runId = 'e2e-fmt-fail'
+
+  const r = runFlow({ repo, binDir, runId, cargoFail: 'fmt' })
+  assert.equal(r.status, 0, `flow 应正常退出（fmt 失败不是 crash）:\n${r.stdout}\n${r.stderr}`)
+
+  // fmt 门失败 → 回滚：HEAD 不变
+  assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, 'fmt 红灯后 HEAD 应回到 baseline')
+
+  const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
+  assert.equal(state.summary.verdict, 'rolled-back', `verdict 应为 rolled-back，实际: ${state.summary.verdict}`)
+
+  // 回滚原因必须来自 fmt 门
+  assert.match(
+    state.summary.detail ?? '',
+    /fmt/i,
+    `回滚原因应来自 fmt 门，实际 detail: ${state.summary.detail}`,
+  )
+
+  rmSync(root, { recursive: true, force: true })
+})

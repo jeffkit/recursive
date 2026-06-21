@@ -160,6 +160,9 @@ impl App {
                 // armed it on submit); essential for queued turns, whose
                 // predecessor's TurnFinished cleared the running state.
                 self.turn.start();
+                // Reset per-turn cache counters so the status bar shows the
+                // cache-hit rate for this turn, not the whole session.
+                self.usage.begin_turn();
             }
             UiEvent::TurnFinished => {
                 // Make sure the last streaming assistant block is
@@ -750,6 +753,44 @@ mod tests {
         assert_eq!(app.usage.total_cache_miss, 60);
         assert_eq!(app.usage.cache_hit_tokens, 10);
         assert_eq!(app.usage.cache_miss_tokens, 20);
+    }
+
+    #[test]
+    fn turn_started_resets_per_turn_cache_but_keeps_totals() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        // First turn: a cold miss followed by a warm hit.
+        app.handle_ui_event(UiEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 100,
+        });
+        app.handle_ui_event(UiEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_hit_tokens: 100,
+            cache_miss_tokens: 10,
+        });
+        assert_eq!(app.usage.turn_cache_hit, 100);
+        assert_eq!(app.usage.turn_cache_miss, 110);
+
+        // A new turn begins: per-turn counters reset, session totals persist.
+        app.handle_ui_event(UiEvent::TurnStarted);
+        assert_eq!(app.usage.turn_cache_hit, 0);
+        assert_eq!(app.usage.turn_cache_miss, 0);
+        assert_eq!(app.usage.total_cache_hit, 100);
+        assert_eq!(app.usage.total_cache_miss, 110);
+
+        // The new turn accumulates independently.
+        app.handle_ui_event(UiEvent::Usage {
+            input_tokens: 5,
+            output_tokens: 5,
+            cache_hit_tokens: 200,
+            cache_miss_tokens: 5,
+        });
+        assert_eq!(app.usage.turn_cache_hit, 200);
+        assert_eq!(app.usage.turn_cache_miss, 5);
     }
 
     // ── error event ─────────────────────────────────────────────────

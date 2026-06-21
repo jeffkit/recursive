@@ -371,7 +371,13 @@ impl AnthropicProvider {
                 completion_tokens: completion,
                 total_tokens: prompt.saturating_add(completion),
                 cache_hit_tokens: acc.cache_read.unwrap_or(0),
-                cache_miss_tokens: acc.cache_creation.unwrap_or(0),
+                // Anthropic reports `input_tokens` (fresh, non-cached) and
+                // `cache_creation_input_tokens` separately from the cache
+                // read. Both are "misses" for hit-rate purposes (processed
+                // fresh, not served from cache), so fold them together to keep
+                // the invariant `hit + miss == total input` consistent with
+                // DeepSeek. See `TokenUsage` docs.
+                cache_miss_tokens: prompt.saturating_add(acc.cache_creation.unwrap_or(0)),
                 // Goal 273: not yet reported by Anthropic. Default 0.
             })
         } else {
@@ -848,16 +854,17 @@ struct AnthropicUsage {
 
 impl AnthropicUsage {
     fn to_token_usage(&self) -> TokenUsage {
+        let prompt = self.input_tokens.unwrap_or(0);
         TokenUsage {
             reasoning_tokens: 0,
-            prompt_tokens: self.input_tokens.unwrap_or(0),
+            prompt_tokens: prompt,
             completion_tokens: self.output_tokens.unwrap_or(0),
-            total_tokens: self
-                .input_tokens
-                .unwrap_or(0)
-                .saturating_add(self.output_tokens.unwrap_or(0)),
+            total_tokens: prompt.saturating_add(self.output_tokens.unwrap_or(0)),
             cache_hit_tokens: self.cache_read_input_tokens.unwrap_or(0),
-            cache_miss_tokens: self.cache_creation_input_tokens.unwrap_or(0),
+            // Fold fresh input + cache-creation into "miss" so that
+            // `hit + miss == total input`, matching DeepSeek's reporting.
+            // See `TokenUsage` docs.
+            cache_miss_tokens: prompt.saturating_add(self.cache_creation_input_tokens.unwrap_or(0)),
             // Goal 273: Anthropic extended-thinking emits a separate
             // `thinking_tokens` field. Default 0 — the field may be
             // added once Anthropic's response shape is finalised.
@@ -1065,8 +1072,16 @@ mod tests {
         let u = c.usage.unwrap();
         assert_eq!(u.prompt_tokens, 100);
         assert_eq!(u.completion_tokens, 50);
+        // cache_read → hit.
         assert_eq!(u.cache_hit_tokens, 30);
-        assert_eq!(u.cache_miss_tokens, 20);
+        // Fresh input (100) + cache_creation (20) are folded into miss so
+        // that hit + miss == total input tokens (30 + 130 == 100+30+20).
+        assert_eq!(u.cache_miss_tokens, 120);
+        assert_eq!(
+            u.cache_hit_tokens + u.cache_miss_tokens,
+            100 + 30 + 20,
+            "hit + miss must equal total input tokens"
+        );
     }
 
     #[test]

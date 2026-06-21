@@ -34,6 +34,18 @@ pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Input tokens served from the provider's prompt cache.
+    ///
+    /// Invariant (normalised across providers):
+    /// `cache_hit_tokens + cache_miss_tokens == total input tokens`.
+    /// A "hit" is a token read from cache; everything else processed for the
+    /// prompt (fresh input *and* tokens written to cache) counts as a "miss".
+    /// This lets consumers compute a cache-hit rate as
+    /// `cache_hit / (cache_hit + cache_miss)` uniformly, regardless of which
+    /// provider reported the usage. DeepSeek already reports the split this
+    /// way (`prompt_tokens = hit + miss`); Anthropic reports `input_tokens`,
+    /// `cache_read_input_tokens` and `cache_creation_input_tokens` separately,
+    /// so its parser folds `input + creation` into `cache_miss_tokens`.
     pub cache_hit_tokens: u32,
     pub cache_miss_tokens: u32,
     /// Reasoning / thinking tokens emitted by models that support
