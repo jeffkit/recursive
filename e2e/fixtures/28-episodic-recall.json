@@ -1,0 +1,39 @@
+{
+  "_comment": "Fixtures for 28-episodic-recall.yaml — agent searches past session transcripts. Match key is 'episodic-search-task' (unique across all fixtures to avoid collisions).",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent calls episodic_recall to search past sessions",
+      "match": { "userMessage": "episodic-search-task", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "episodic_recall",
+            "arguments": { "query": "write_file", "limit": 3 }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after recall result, agent writes summary of what was found",
+      "match": { "userMessage": "episodic-search-task", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "episodic-result.txt",
+              "contents": "episodic-search-completed"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent confirms done",
+      "match": { "userMessage": "episodic-search-task", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "content": "Done! Used episodic_recall to search past sessions and wrote the result to episodic-result.txt."
+      }
+    }
+  ]
+}

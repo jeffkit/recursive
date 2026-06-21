@@ -1,0 +1,149 @@
+name: "HTTP API Authentication (RECURSIVE_HTTP_AUTH_KEYS)"
+description: |
+  Verify the HTTP server's inbound API-key authentication (src/http/auth.rs).
+  Uses the same in-container curl pattern as 08-http-api.yaml because the
+  server is started inside the container and is only reachable from within.
+
+    - When RECURSIVE_HTTP_AUTH_KEYS is set, requests without X-API-Key return 401.
+    - Requests with the correct key are accepted (200).
+    - Requests with a wrong key are rejected (401).
+    - /health and /metrics bypass auth (liveness probes must work unauthenticated).
+sequential: true
+
+setup:
+  - name: "Kill any leftover server on port 9097"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9097' 2>/dev/null || true
+        sleep 0.5
+        echo cleaned
+
+  - name: "Start HTTP server on 9097 with auth key 'test-secret-key'"
+    exec:
+      container: recursive-e2e
+      command: |
+        nohup sh -c 'RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
+          recursive \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            http --addr 0.0.0.0:9097' \
+          > /tmp/http-9097.log 2>&1 &
+        for i in $(seq 1 20); do
+          curl -sf http://localhost:9097/health > /dev/null 2>&1 && echo "server-ready" && break
+          sleep 0.5
+        done
+
+cases:
+  # ── /health and /metrics bypass auth ─────────────────────────────────────────
+  - name: "GET /health without key returns 200 (auth-exempt endpoint)"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:9097/health
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=200"
+
+  - name: "GET /metrics without key returns 200 (auth-exempt endpoint)"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:9097/metrics
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=200"
+
+  # ── Auth-protected endpoints without key ─────────────────────────────────────
+  - name: "GET /sessions without X-API-Key returns 401"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:9097/sessions
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=401"
+
+  - name: "POST /sessions without key returns 401"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9097/sessions
+        -H 'Content-Type: application/json'
+        -d '{}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=401"
+
+  - name: "POST /run without key returns 401"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:9097/run
+        -H 'Content-Type: application/json'
+        -d '{"goal":"test"}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=401"
+
+  # ── Wrong key ────────────────────────────────────────────────────────────────
+  - name: "GET /sessions with wrong X-API-Key returns 401"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -H 'X-API-Key: wrong-key'
+        http://localhost:9097/sessions
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=401"
+
+  # ── Correct key grants access ─────────────────────────────────────────────────
+  - name: "GET /sessions with correct X-API-Key returns 200"
+    exec:
+      container: recursive-e2e
+      command: >
+        curl -s -o /dev/null -w 'status=%{http_code}'
+        -H 'X-API-Key: test-secret-key'
+        http://localhost:9097/sessions
+    expect:
+      exitCode: 0
+      output:
+        contains: "status=200"
+
+  - name: "POST /sessions with correct key creates a session (200 or 201)"
+    exec:
+      container: recursive-e2e
+      command: |
+        OUT=$(curl -sf \
+          -H 'X-API-Key: test-secret-key' \
+          -X POST http://localhost:9097/sessions \
+          -H 'Content-Type: application/json' \
+          -d '{"system_prompt":"auth test"}')
+        echo "$OUT" | grep -q '"id"' && echo "has-id" || echo "no-id"
+    expect:
+      exitCode: 0
+      output:
+        contains: "has-id"
+
+teardown:
+  - name: "Stop HTTP server on 9097"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        pkill -f 'http --addr 0.0.0.0:9097' 2>/dev/null || true
+        rm -f /tmp/http-9097.log
+        echo stopped

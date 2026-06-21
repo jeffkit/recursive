@@ -1,0 +1,111 @@
+name: "Bash Tool (run_shell)"
+description: |
+  Verify the Bash tool (run_shell) executes shell commands correctly:
+    A. Basic command execution — agent runs `echo` and creates a file.
+    B. cwd parameter — agent runs a command inside a workspace subdirectory.
+    C. Sandbox cwd rejection — cwd pointing outside the workspace is rejected
+       with an error mentioning "escapes workspace root" (Invariant #3).
+    D. env parameter — extra env vars are injected and visible in the command.
+
+  Scenarios A and B use the mock LLM fixture; C and D use MCP stdio
+  to invoke the Bash tool directly without a full agent loop.
+sequential: true
+
+setup:
+  - name: "Prepare workspaces and isolated RECURSIVE_HOME directories"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-bash /workspace/test-bash-cwd /workspace/test-bash-mcp
+        rm -rf /tmp/rh-bash /tmp/rh-bash-cwd /tmp/sessions-bash /tmp/sessions-bash-cwd
+        mkdir -p /workspace/test-bash /workspace/test-bash-cwd/subdir /workspace/test-bash-mcp
+        mkdir -p /tmp/rh-bash /tmp/rh-bash-cwd
+        echo prepared
+
+  - name: "Scenario A (act): agent runs basic Bash command"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-bash \
+        recursive --workspace /workspace/test-bash \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 5 \
+          run "Run a Bash command to create bash-output.txt with content 'bash-ok'."
+        SESSION_DIR=$(find /tmp/rh-bash -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-bash
+          cp -r "$SESSION_DIR/." /tmp/sessions-bash/
+        fi
+
+  - name: "Scenario B (act): agent uses Bash with cwd parameter"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-bash-cwd \
+        recursive --workspace /workspace/test-bash-cwd \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 5 \
+          run "Create file bash-cwd.txt inside the subdir folder using Bash with cwd=subdir."
+        SESSION_DIR=$(find /tmp/rh-bash-cwd -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-bash-cwd
+          cp -r "$SESSION_DIR/." /tmp/sessions-bash-cwd/
+        fi
+
+cases:
+  # ── Scenario A: basic execution ──────────────────────────────────────────────
+  - name: "A: bash-output.txt was created by Bash command"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-bash/bash-output.txt
+      exists: true
+      contains: "bash-ok"
+
+  - name: "A: session recorded Bash tool call"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-bash
+      status: ["completed", "success"]
+      hasToolCalls: ["Bash"]
+      minMessages: 3
+
+  # ── Scenario B: cwd parameter ─────────────────────────────────────────────────
+  - name: "B: bash-cwd.txt was created inside subdir (cwd parameter honoured)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-bash-cwd/subdir/bash-cwd.txt
+      exists: true
+      contains: "cwd-ok"
+
+  # ── Scenario C: sandbox cwd escape rejection (via MCP) ───────────────────────
+  - name: "C: Bash with cwd='../../' is rejected — error mentions workspace escape"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"echo hi","cwd":"../../"}}}\n'
+        | recursive serve --workspace /workspace/test-bash-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "escapes workspace"
+
+  # ── Scenario D: env parameter — injected env var visible in command ────────────
+  - name: "D: Bash env parameter — MY_VAR is visible inside the command"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"echo $MY_VAR","env":{"MY_VAR":"injected-value"}}}}\n'
+        | recursive serve --workspace /workspace/test-bash-mcp 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "injected-value"
+
+teardown:
+  - name: "Clean workspaces and RECURSIVE_HOME directories"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-bash /workspace/test-bash-cwd /workspace/test-bash-mcp
+        rm -rf /tmp/rh-bash /tmp/rh-bash-cwd /tmp/sessions-bash /tmp/sessions-bash-cwd

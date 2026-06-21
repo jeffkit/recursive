@@ -37,14 +37,16 @@ setup:
       container: recursive-e2e
       command: |
         [ -z "${DEEPSEEK_API_KEY:-}" ] && echo "SKIP: no key" && exit 0
-        recursive \
-          --workspace /workspace/test-23-anthropic \
-          --api-base "https://api.deepseek.com/anthropic" \
-          --provider anthropic \
-          --api-key "$DEEPSEEK_API_KEY" \
-          -m "deepseek-v4-flash" \
-          --max-steps 8 \
-          run "Use the web_fetch tool to fetch https://example.com and tell me the page title."
+        rm -rf /tmp/rh-23-a
+        RECURSIVE_HOME=/tmp/rh-23-a \
+          recursive \
+            --workspace /workspace/test-23-anthropic \
+            --api-base "https://api.deepseek.com/anthropic" \
+            --provider anthropic \
+            --api-key "$DEEPSEEK_API_KEY" \
+            -m "deepseek-v4-flash" \
+            --max-steps 8 \
+            run "Use the web_fetch tool to fetch https://example.com and tell me the page title."
     expect:
       exitCode: 0
 
@@ -54,14 +56,16 @@ setup:
       container: recursive-e2e
       command: |
         [ -z "${DEEPSEEK_API_KEY:-}" ] && echo "SKIP: no key" && exit 0
-        recursive \
-          --workspace /workspace/test-23-openai \
-          --api-base "https://api.deepseek.com/v1" \
-          --provider openai \
-          --api-key "$DEEPSEEK_API_KEY" \
-          -m "deepseek-v4-flash" \
-          --max-steps 8 \
-          run "Use the web_fetch tool to fetch https://example.com and tell me the page title."
+        rm -rf /tmp/rh-23-b
+        RECURSIVE_HOME=/tmp/rh-23-b \
+          recursive \
+            --workspace /workspace/test-23-openai \
+            --api-base "https://api.deepseek.com/v1" \
+            --provider openai \
+            --api-key "$DEEPSEEK_API_KEY" \
+            -m "deepseek-v4-flash" \
+            --max-steps 8 \
+            run "Use the web_fetch tool to fetch https://example.com and tell me the page title."
     expect:
       exitCode: 0
 
@@ -71,7 +75,7 @@ cases:
   - name: "A — ToolSearchTool called before WebFetch"
     deferred-tool-order:
       container: recursive-e2e
-      input: /workspace/workspaces
+      input: /tmp/rh-23-a/workspaces
       slug: workspace-test-23-anthropic
       before: ToolSearchTool
       after: WebFetch
@@ -79,7 +83,7 @@ cases:
   - name: "A — Session contains ToolSearchTool call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/workspaces
+      input: /tmp/rh-23-a/workspaces
       slug: workspace-test-23-anthropic
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
@@ -89,7 +93,7 @@ cases:
   - name: "A — LLM Judge: model used deferred-loading flow correctly"
     llm-judge:
       container: recursive-e2e
-      input: /workspace/workspaces
+      input: /tmp/rh-23-a/workspaces
       goal: |
         The agent was given a task requiring the web_fetch tool, but web_fetch was
         deferred (not sent in the initial tools array). The agent must have called
@@ -104,14 +108,14 @@ cases:
   - name: "B — ToolSearchTool absent (eager mode, not registered)"
     deferred-tool-absent:
       container: recursive-e2e
-      input: /workspace/workspaces
+      input: /tmp/rh-23-b/workspaces
       slug: workspace-test-23-openai
       tool: ToolSearchTool
 
   - name: "B — Session valid, WebFetch called directly without ToolSearch"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/workspaces
+      input: /tmp/rh-23-b/workspaces
       slug: workspace-test-23-openai
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
@@ -119,8 +123,10 @@ cases:
       finalized: true
 
 teardown:
-  - name: "Clean workspaces"
+  - name: "Clean workspaces and RECURSIVE_HOMEs"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-23-anthropic /workspace/test-23-openai
+      command: |
+        rm -rf /workspace/test-23-anthropic /workspace/test-23-openai
+        rm -rf /tmp/rh-23-a /tmp/rh-23-b

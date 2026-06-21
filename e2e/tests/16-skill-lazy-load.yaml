@@ -33,18 +33,26 @@ setup:
   - name: "Run agent (act): format file using formatter skill"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-skill-load
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        --max-steps 8
-        run "Format format-me.py using the formatter skill."
+      command: |
+        rm -rf /tmp/rh-skill /tmp/sessions-skill
+        mkdir -p /tmp/rh-skill /tmp/sessions-skill
+        RECURSIVE_HOME=/tmp/rh-skill \
+          recursive --workspace /workspace/test-skill-load \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            --max-steps 8 \
+            run "Format format-me.py using the formatter skill."
+        SESSION_DIR=$(find /tmp/rh-skill -name "transcript.jsonl" -exec dirname {} \; 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          cp -r "$SESSION_DIR"/. /tmp/sessions-skill/
+          echo "session copied"
+        fi
 
 cases:
   - name: "Session called load_skill (lazy loading verified)"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-skill-load/.recursive/sessions
+      input: /tmp/sessions-skill
       status: ["completed", "success"]
       hasToolCalls: ["load_skill"]
       minMessages: 4
@@ -61,4 +69,5 @@ teardown:
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-skill-load
+      command: |
+        rm -rf /workspace/test-skill-load /tmp/rh-skill /tmp/sessions-skill

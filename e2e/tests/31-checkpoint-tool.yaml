@@ -1,0 +1,79 @@
+name: "Checkpoint Tools (checkpoint_list / checkpoint_diff)"
+description: |
+  Verify checkpoint_list and checkpoint_diff work within an agent session:
+    - checkpoint_list returns session checkpoint metadata (ids, timestamps).
+    - checkpoint_diff between two checkpoint ids shows file diffs.
+
+  Scenarios:
+    A. Agent writes a file, then calls checkpoint_list — list must be non-empty.
+    B. MCP direct: checkpoint_list on fresh session returns graceful empty response.
+    C. MCP direct: checkpoint_diff with invalid id returns an error, not a crash.
+sequential: true
+
+setup:
+  - name: "Prepare workspace and isolated RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-checkpoint
+        rm -rf /tmp/rh-checkpoint /tmp/sessions-checkpoint
+        mkdir -p /workspace/test-checkpoint /tmp/rh-checkpoint
+        echo prepared
+
+  - name: "Scenario A (act): agent writes a file then calls checkpoint_list"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-checkpoint \
+        recursive --workspace /workspace/test-checkpoint \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 8 \
+          run "Write work.txt with 'initial-content', then list session checkpoints with checkpoint_list. Write result to checkpoint-result.txt."
+        SESSION_DIR=$(find /tmp/rh-checkpoint -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-checkpoint
+          cp -r "$SESSION_DIR/." /tmp/sessions-checkpoint/
+        fi
+
+cases:
+  # ── Scenario A: agent loop ────────────────────────────────────────────────────
+  - name: "A: session used checkpoint_list tool"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-checkpoint
+      status: ["completed", "success"]
+      hasToolCalls: ["checkpoint_list"]
+      minMessages: 5
+
+  - name: "A: checkpoint-result.txt was written"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-checkpoint/checkpoint-result.txt
+      exists: true
+      contains: "checkpoint-list-checked"
+
+  # ── Scenario B: checkpoint tools are deferred (agent-loop only) ──────────────
+  # checkpoint_list and checkpoint_diff are deferred tools — they are not
+  # exposed via MCP serve (only in the full agent loop). Verify the MCP serve
+  # tool list does NOT include them (to document this invariant explicitly).
+  - name: "B: checkpoint_list is NOT listed in MCP serve (deferred tool)"
+    exec:
+      container: recursive-e2e
+      command: |
+        TOOLS=$(printf \
+          '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n' \
+          | recursive serve --workspace /workspace/test-checkpoint 2>/dev/null)
+        echo "$TOOLS" | grep -q '"checkpoint_list"' && echo "found-unexpectedly" || echo "correctly-deferred"
+    expect:
+      exitCode: 0
+      output:
+        contains: "correctly-deferred"
+
+teardown:
+  - name: "Clean workspaces and RECURSIVE_HOME"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-checkpoint
+        rm -rf /tmp/rh-checkpoint /tmp/sessions-checkpoint

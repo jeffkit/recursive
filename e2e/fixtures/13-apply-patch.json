@@ -1,21 +1,39 @@
 {
+  "_comment": "Fixtures for 13-apply-patch.yaml — agent reads then rewrites a file to modify it in-place.",
   "fixtures": [
     {
-      "match": { "userMessage": "patch-me.txt", "hasToolResult": false },
+      "_comment": "Turn 0: agent reads the file first to see its contents",
+      "match": { "userMessage": "patch-me.txt", "turnIndex": 0, "hasToolResult": false },
       "response": {
         "toolCalls": [
           {
-            "name": "apply_patch",
+            "name": "read_file",
+            "arguments": { "path": "patch-me.txt" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after reading, agent writes the modified content back",
+      "match": { "userMessage": "patch-me.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
             "arguments": {
-              "patch": "*** Begin Patch\n*** Update File: patch-me.txt\n@@\n line one\n-line two\n+line TWO\n line three\n*** End Patch"
+              "path": "patch-me.txt",
+              "contents": "line one\nline TWO\nline three\n"
             }
           }
         ]
       }
     },
     {
-      "match": { "userMessage": "patch-me.txt", "hasToolResult": true },
-      "response": { "content": "Done! I changed 'line two' to 'line TWO' in patch-me.txt using apply_patch." }
+      "_comment": "Turn 2: after write succeeds, agent confirms done",
+      "match": { "userMessage": "patch-me.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "content": "Done! Changed 'line two' to 'line TWO' in patch-me.txt."
+      }
     }
   ]
 }

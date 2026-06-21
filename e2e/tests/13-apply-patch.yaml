@@ -1,15 +1,24 @@
-name: "apply_patch Tool"
+name: "In-place file modification (read then write)"
 description: >
-  Verify agent uses apply_patch to modify an existing file in-place.
-  Tests the primary edit tool tracked by the self-improve loop (apply_patch:write_file ratio).
+  Verify agent can modify an existing file in-place using read_file + write_file.
+  apply_patch was removed from the binary; this test covers the read-modify-write
+  workflow that achieves the same outcome.
 sequential: true
 
-cases:
-  - name: "Create base file for patching"
+setup:
+  - name: "Prepare workspace"
     exec:
       container: recursive-e2e
       command: |
-        mkdir -p /workspace/test-patch
+        rm -rf /workspace/test-patch /tmp/rh-patch /tmp/sessions-patch
+        mkdir -p /workspace/test-patch /tmp/rh-patch /tmp/sessions-patch
+        echo prepared
+
+cases:
+  - name: "Create base file for editing"
+    exec:
+      container: recursive-e2e
+      command: |
         printf 'line one\nline two\nline three\n' > /workspace/test-patch/patch-me.txt
         echo created
     expect:
@@ -17,27 +26,35 @@ cases:
       output:
         contains: "created"
 
-  - name: "Agent modifies file using apply_patch"
+  - name: "Agent modifies file using Read then Edit"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-patch
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 5
-        run "Modify file patch-me.txt: change 'line two' to 'line TWO' using apply_patch"
+      command: |
+        RECURSIVE_HOME=/tmp/rh-patch \
+          recursive --workspace /workspace/test-patch \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key \
+            -m mock-chat \
+            --max-steps 5 \
+            run "Modify patch-me.txt: change line two to line TWO and save it"
+        SESSION_DIR=$(find /tmp/rh-patch -name "transcript.jsonl" -exec dirname {} \; 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          cp -r "$SESSION_DIR"/. /tmp/sessions-patch/
+          echo "session copied"
+        else
+          echo "WARNING: no session found"
+        fi
     expect:
       exitCode: 0
 
-  - name: "patch-me.txt contains the patched content"
+  - name: "patch-me.txt contains the edited content"
     file:
       container: recursive-e2e
       path: /workspace/test-patch/patch-me.txt
       exists: true
       contains: "line TWO"
 
-  - name: "Original lines not in the patch are preserved"
+  - name: "Original lines not in the edit are preserved"
     exec:
       container: recursive-e2e
       command: >
@@ -46,10 +63,18 @@ cases:
     expect:
       exitCode: 0
 
-  - name: "Session records apply_patch tool call"
+  - name: "Session records read_file and write_file tool calls"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-patch/.recursive/sessions
+      input: /tmp/sessions-patch
       status: ["completed", "success"]
-      hasToolCalls: ["apply_patch"]
+      hasToolCalls: ["read_file", "write_file"]
       minMessages: 3
+
+teardown:
+  - name: "Clean workspace"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-patch /tmp/rh-patch /tmp/sessions-patch

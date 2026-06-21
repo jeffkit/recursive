@@ -1,0 +1,24 @@
+{
+  "_comment": "Fixtures for 24-bash-tool.yaml — agent uses Bash tool to run shell commands.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent runs a basic echo command to create output",
+      "match": { "userMessage": "bash-output.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Bash",
+            "arguments": { "command": "echo 'bash-ok' > bash-output.txt && echo done" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: agent confirms the command succeeded",
+      "match": { "userMessage": "bash-output.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "content": "Done! Ran the Bash command and created bash-output.txt."
+      }
+    }
+  ]
+}

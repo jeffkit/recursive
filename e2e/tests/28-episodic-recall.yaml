@@ -1,0 +1,87 @@
+name: "Episodic Recall Tool (cross-session transcript search)"
+description: |
+  Verify episodic_recall searches past session JSONL transcripts and returns
+  matching messages with surrounding context.
+
+  Setup deliberately creates a prior session containing "hello.txt" in its
+  transcript (by running the 01-basic-tools scenario first). Then in the
+  main run, the agent calls episodic_recall and the test verifies:
+    - episodic_recall tool was called (not skipped)
+    - The tool returned a result (even if no matches, it should not error)
+    - episodic-result.txt was written as expected
+
+  Also tests the MCP interface directly: query with no matches returns
+  an empty result, not an error.
+sequential: true
+
+setup:
+  - name: "Prepare workspace and isolated RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-episodic
+        rm -rf /tmp/rh-episodic-pre /tmp/rh-episodic /tmp/sessions-episodic
+        mkdir -p /workspace/test-episodic /tmp/rh-episodic-pre /tmp/rh-episodic
+        echo prepared
+
+  - name: "Pre-run: create a prior session with 'hello.txt' in transcript"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-episodic-pre \
+        recursive --workspace /workspace/test-episodic \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 3 \
+          run "Create hello.txt with content 'world'."
+
+  - name: "Main run (act): agent calls episodic_recall to search past sessions"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-episodic \
+        recursive --workspace /workspace/test-episodic \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 8 \
+          run "episodic-search-task: call episodic_recall to search past sessions, then write episodic-result.txt."
+        SESSION_DIR=$(find /tmp/rh-episodic -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-episodic
+          cp -r "$SESSION_DIR/." /tmp/sessions-episodic/
+        fi
+
+cases:
+  - name: "Session used episodic_recall tool"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-episodic
+      status: ["completed", "success"]
+      hasToolCalls: ["episodic_recall"]
+      minMessages: 4
+
+  - name: "episodic-result.txt was written"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-episodic/episodic-result.txt
+      exists: true
+      contains: "episodic-search-completed"
+
+  - name: "MCP direct: episodic_recall with no-match query returns valid response (not error)"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"episodic_recall","arguments":{"query":"zzz-no-such-term-xyzzy","limit":2}}}\n'
+        | recursive serve --workspace /workspace/test-episodic 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "result"
+
+teardown:
+  - name: "Clean workspace and RECURSIVE_HOME directories"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-episodic
+        rm -rf /tmp/rh-episodic-pre /tmp/rh-episodic /tmp/sessions-episodic

@@ -1,0 +1,106 @@
+name: "Utility Tools (estimate_tokens / count_lines)"
+description: |
+  Verify the two budget-planning utility tools work end-to-end:
+    - estimate_tokens returns a numeric token estimate for a file.
+    - count_lines returns the line count for a file.
+  Both tools must handle large files without error and sandbox their paths.
+
+  Scenarios:
+    A. Agent uses both tools sequentially on the same file.
+    B. MCP direct: both tools on a known file return numeric results.
+    C. MCP direct: both tools on a missing file return an error (not a crash).
+sequential: true
+
+setup:
+  - name: "Prepare workspace with a file of known line count"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-utility
+        rm -rf /tmp/rh-utility /tmp/sessions-utility
+        mkdir -p /workspace/test-utility /tmp/rh-utility
+        seq 1 50 | awk '{print "line " $1 ": some content to estimate tokens"}' \
+          > /workspace/test-utility/large-file.txt
+        echo prepared
+
+  - name: "Scenario A (act): agent calls estimate_tokens then count_lines"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-utility \
+        recursive --workspace /workspace/test-utility \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 10 \
+          run "Estimate tokens for large-file.txt using estimate_tokens, then count its lines with count_lines. Write the results to utility-result.txt."
+        SESSION_DIR=$(find /tmp/rh-utility -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-utility
+          cp -r "$SESSION_DIR/." /tmp/sessions-utility/
+        fi
+
+cases:
+  # ── Scenario A: agent loop ────────────────────────────────────────────────────
+  - name: "A: session used estimate_tokens and count_lines tools"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-utility
+      status: ["completed", "success"]
+      hasToolCalls: ["estimate_tokens", "count_lines"]
+      minMessages: 5
+
+  - name: "A: utility-result.txt was written"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-utility/utility-result.txt
+      exists: true
+      contains: "estimate-and-count-done"
+
+  # ── Scenario B: estimate_tokens is available via MCP serve ───────────────────
+  # estimate_tokens is registered in tools/registry.rs (shared with MCP serve).
+  # count_lines is agent-loop-only (registered only in cli/builder.rs), so it
+  # is not accessible via MCP serve; we document that invariant below.
+  - name: "B: estimate_tokens via MCP serve returns a positive token count"
+    exec:
+      container: recursive-e2e
+      command: |
+        OUT=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"estimate_tokens","arguments":{"path":"large-file.txt"}}}\n' \
+          | recursive serve --workspace /workspace/test-utility 2>/dev/null)
+        echo "$OUT" | grep -o '[0-9][0-9]*' | awk 'NR==1 && $1>0{print "tokens="$1}'
+    expect:
+      exitCode: 0
+      output:
+        contains: "tokens="
+
+  - name: "B: count_lines is NOT in MCP serve tool list (agent-loop-only tool)"
+    exec:
+      container: recursive-e2e
+      command: |
+        TOOLS=$(printf \
+          '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n' \
+          | recursive serve --workspace /workspace/test-utility 2>/dev/null)
+        echo "$TOOLS" | grep -q '"count_lines"' && echo "found-unexpectedly" || echo "correctly-agent-only"
+    expect:
+      exitCode: 0
+      output:
+        contains: "correctly-agent-only"
+
+  # ── Scenario C: estimate_tokens handles missing file gracefully ───────────────
+  - name: "C: estimate_tokens on non-existent file returns error without crash"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"estimate_tokens","arguments":{"path":"no-such-file.txt"}}}\n'
+        | recursive serve --workspace /workspace/test-utility 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "result"
+
+teardown:
+  - name: "Clean workspace and RECURSIVE_HOME"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-utility
+        rm -rf /tmp/rh-utility /tmp/sessions-utility

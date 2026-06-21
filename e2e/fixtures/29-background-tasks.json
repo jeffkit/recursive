@@ -1,0 +1,63 @@
+{
+  "_comment": "Fixtures for 29-background-tasks.yaml — agent uses run_background then check_background. Since each test starts with a fresh session, the first background job is always 'bg-1'.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent spawns a background job",
+      "match": { "userMessage": "bg-result.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "run_background",
+            "arguments": {
+              "command": "sleep 0.5 && echo bg-ok > bg-result.txt",
+              "timeout_secs": 10
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after run_background returns job_id, wait briefly then check. Job is always bg-1 on a fresh session.",
+      "match": { "userMessage": "bg-result.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Bash",
+            "arguments": { "command": "sleep 1.5" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: after waiting, check the background job status",
+      "match": { "userMessage": "bg-result.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "check_background",
+            "arguments": { "job_id": "bg-1" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 3: after check_background, write a summary file confirming the job completed",
+      "match": { "userMessage": "bg-result.txt", "turnIndex": 3, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "bg-check-result.txt", "contents": "bg-check-completed" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 4: agent confirms done",
+      "match": { "userMessage": "bg-result.txt", "turnIndex": 4, "hasToolResult": true },
+      "response": {
+        "content": "Done! Background job bg-1 completed. bg-result.txt and bg-check-result.txt were written."
+      }
+    }
+  ]
+}

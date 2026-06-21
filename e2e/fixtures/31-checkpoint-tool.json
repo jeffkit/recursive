@@ -1,0 +1,51 @@
+{
+  "_comment": "Fixtures for 31-checkpoint-tool.yaml — agent uses checkpoint_list and checkpoint_diff.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent first writes a file so there are changes to checkpoint",
+      "match": { "userMessage": "checkpoint-result.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": { "path": "work.txt", "contents": "initial-content" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after write, agent calls checkpoint_list to inspect session checkpoints",
+      "match": { "userMessage": "checkpoint-result.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "checkpoint_list",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent writes a summary of the checkpoint list",
+      "match": { "userMessage": "checkpoint-result.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "checkpoint-result.txt",
+              "contents": "checkpoint-list-checked"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 3: agent confirms done",
+      "match": { "userMessage": "checkpoint-result.txt", "turnIndex": 3, "hasToolResult": true },
+      "response": {
+        "content": "Done! Created work.txt, listed checkpoints, and wrote checkpoint-result.txt."
+      }
+    }
+  ]
+}

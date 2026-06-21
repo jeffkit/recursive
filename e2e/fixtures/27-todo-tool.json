@@ -1,0 +1,63 @@
+{
+  "_comment": "Fixtures for 27-todo-tool.yaml — agent uses TodoWrite to manage a task list.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent creates a todo list with 3 tasks",
+      "match": { "userMessage": "todo-complete.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "TodoWrite",
+            "arguments": {
+              "todos": [
+                { "content": "Read the input file", "status": "in_progress" },
+                { "content": "Transform its content", "status": "pending" },
+                { "content": "Write the output file", "status": "pending" }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after creating todo list, agent writes the output file",
+      "match": { "userMessage": "todo-complete.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "todo-complete.txt",
+              "contents": "task-done"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent marks all tasks completed in the todo list",
+      "match": { "userMessage": "todo-complete.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "TodoWrite",
+            "arguments": {
+              "todos": [
+                { "content": "Read the input file", "status": "completed" },
+                { "content": "Transform its content", "status": "completed" },
+                { "content": "Write the output file", "status": "completed" }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 3: agent confirms all done",
+      "match": { "userMessage": "todo-complete.txt", "turnIndex": 3, "hasToolResult": true },
+      "response": {
+        "content": "All tasks completed. todo-complete.txt has been written."
+      }
+    }
+  ]
+}

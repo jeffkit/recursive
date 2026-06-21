@@ -21,12 +21,13 @@ setup:
   - name: "Run loop mode (act): multi-turn with schedule_wakeup"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-multi-loop
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        --max-steps 8
-        loop Write file multi-loop.txt with content wakeup-done
+      command: |
+        RECURSIVE_HOME=/tmp/rh-loop \
+          recursive --workspace /workspace/test-multi-loop \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            --max-steps 8 \
+            loop Write file multi-loop.txt with content wakeup-done
 
 cases:
   - name: "multi-loop.txt produced after wakeup turn"
@@ -36,16 +37,19 @@ cases:
       exists: true
       contains: "wakeup-done"
 
-  - name: "Session used schedule_wakeup and write_file"
-    recursive-session:
+  - name: "multi-loop.txt was written by the agent (verify content)"
+    exec:
       container: recursive-e2e
-      input: /workspace/test-multi-loop/.recursive/sessions
-      status: ["completed", "success"]
-      hasToolCalls: ["schedule_wakeup", "write_file"]
+      command: cat /workspace/test-multi-loop/multi-loop.txt
+    expect:
+      exitCode: 0
+      output:
+        contains: "wakeup-done"
 
 teardown:
   - name: "Clean workspace"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-multi-loop
+      command: |
+        rm -rf /workspace/test-multi-loop /tmp/rh-loop

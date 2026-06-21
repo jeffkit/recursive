@@ -1,0 +1,86 @@
+name: "Background Tasks (run_background / check_background)"
+description: |
+  Verify run_background spawns a shell command asynchronously and
+  check_background can poll for its completion within the same agent session.
+
+  Key design note: run_background uses an in-memory job manager that does not
+  persist across recursive serve sessions. Tests must therefore use an agent
+  loop fixture rather than two separate MCP stdio sessions. Because each test
+  starts with a fresh workspace, the first job is always assigned id 'bg-1',
+  making the fixture deterministic.
+
+  Scenarios:
+    A. Agent loop: run_background → sleep (wait) → check_background → file written.
+    B. MCP direct: check_background with an unknown job_id returns a structured
+       error (not a crash).
+sequential: true
+
+setup:
+  - name: "Prepare workspace and isolated RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-bg
+        rm -rf /tmp/rh-bg /tmp/sessions-bg
+        mkdir -p /workspace/test-bg /tmp/rh-bg
+        echo prepared
+
+  - name: "Scenario A (act): agent runs background job and checks completion"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-bg \
+        recursive --workspace /workspace/test-bg \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 12 \
+          run "Run background job 'sleep 0.5 && echo bg-ok > bg-result.txt', wait, then check its status with check_background. Write result to bg-check-result.txt."
+        SESSION_DIR=$(find /tmp/rh-bg -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-bg
+          cp -r "$SESSION_DIR/." /tmp/sessions-bg/
+        fi
+
+cases:
+  # ── Scenario A: agent loop orchestrates run + check ──────────────────────────
+  - name: "A: session used run_background and check_background tools"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-bg
+      status: ["completed", "success"]
+      hasToolCalls: ["run_background", "check_background"]
+      minMessages: 6
+
+  - name: "A: bg-result.txt was written by the background command"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-bg/bg-result.txt
+      exists: true
+      contains: "bg-ok"
+
+  - name: "A: bg-check-result.txt confirms agent received check_background result"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-bg/bg-check-result.txt
+      exists: true
+      contains: "bg-check-completed"
+
+  # ── Scenario B: unknown job_id returns structured error, not crash ────────────
+  - name: "B: check_background with unknown job_id returns non-crash response"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"check_background","arguments":{"job_id":"no-such-job-xyz"}}}\n'
+        | recursive serve --workspace /workspace/test-bg 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "no-such-job-xyz"
+
+teardown:
+  - name: "Clean workspace and RECURSIVE_HOME"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-bg
+        rm -rf /tmp/rh-bg /tmp/sessions-bg

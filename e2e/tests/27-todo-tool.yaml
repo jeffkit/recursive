@@ -1,0 +1,57 @@
+name: "TodoWrite Tool (agent task list management)"
+description: |
+  Verify TodoWrite allows the agent to manage a structured task checklist:
+    - Agent creates a todo list with pending/in_progress tasks.
+    - Agent later marks tasks as completed.
+    - The output file proves side effects ran after the todo list was set up.
+sequential: true
+
+setup:
+  - name: "Prepare workspace and isolated RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-todo
+        rm -rf /tmp/rh-todo /tmp/sessions-todo
+        mkdir -p /workspace/test-todo /tmp/rh-todo
+        echo prepared
+
+  - name: "Run agent (act): create and complete a todo list"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-todo \
+        recursive --workspace /workspace/test-todo \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 10 \
+          run "Create a 3-task todo list using TodoWrite (read, transform, write), then write todo-complete.txt with 'task-done', then mark all tasks completed."
+        SESSION_DIR=$(find /tmp/rh-todo -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-todo
+          cp -r "$SESSION_DIR/." /tmp/sessions-todo/
+        fi
+
+cases:
+  - name: "Session used TodoWrite tool"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-todo
+      status: ["completed", "success"]
+      hasToolCalls: ["TodoWrite"]
+      minMessages: 5
+
+  - name: "todo-complete.txt was written (agent executed side effect after creating todo)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-todo/todo-complete.txt
+      exists: true
+      contains: "task-done"
+
+teardown:
+  - name: "Clean workspace and RECURSIVE_HOME"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-todo
+        rm -rf /tmp/rh-todo /tmp/sessions-todo

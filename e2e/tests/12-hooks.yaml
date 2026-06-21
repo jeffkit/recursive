@@ -11,20 +11,28 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        rm -rf /workspace/test-hooks
-        mkdir -p /workspace/test-hooks
+        rm -rf /workspace/test-hooks /tmp/rh-hooks /tmp/sessions-hooks
+        mkdir -p /workspace/test-hooks /tmp/rh-hooks /tmp/sessions-hooks
         echo prepared
 
   - name: "Run agent with --hook-timing (act)"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-hooks
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        --max-steps 5
-        --hook-timing
-        run "Write file hook-test.txt with content hook-ok"
+      command: |
+        RECURSIVE_HOME=/tmp/rh-hooks \
+          recursive --workspace /workspace/test-hooks \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            --max-steps 5 \
+            --hook-timing \
+            run "Write file hook-test.txt with content hook-ok"
+        SESSION_DIR=$(find /tmp/rh-hooks -name "transcript.jsonl" -exec dirname {} \; 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          cp -r "$SESSION_DIR"/. /tmp/sessions-hooks/
+          echo "session copied from $SESSION_DIR"
+        else
+          echo "WARNING: no session found under /tmp/rh-hooks"
+        fi
 
 cases:
   - name: "hook-test.txt was created (hook did not block tool execution)"
@@ -37,7 +45,7 @@ cases:
   - name: "Session recorded write_file tool call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-hooks/.recursive/sessions
+      input: /tmp/sessions-hooks
       status: ["completed", "success"]
       hasToolCalls: ["write_file"]
       minMessages: 2
@@ -47,4 +55,5 @@ teardown:
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-hooks
+      command: |
+        rm -rf /workspace/test-hooks /tmp/rh-hooks /tmp/sessions-hooks

@@ -148,3 +148,53 @@ tests:
     - name: "Deferred Tool Loading (Real LLM)"
       id: deferred-tool-loading
       file: tests/23-deferred-tool-loading.yaml
+
+    # ── P0: Critical gaps ──────────────────────────────────────────────────────
+    - name: "Bash Tool (run_shell)"
+      id: bash-tool
+      file: tests/24-bash-tool.yaml
+
+    - name: "Glob Tool (file pattern matching)"
+      id: glob-tool
+      file: tests/25-glob-tool.yaml
+
+    # ── P1: High-priority gaps ──────────────────────────────────────────────────
+    - name: "Semantic Facts Memory (remember / recall)"
+      id: facts-memory
+      file: tests/26-facts-memory.yaml
+
+    - name: "TodoWrite Tool (agent task list)"
+      id: todo-tool
+      file: tests/27-todo-tool.yaml
+
+    - name: "Episodic Recall (cross-session search)"
+      id: episodic-recall
+      file: tests/28-episodic-recall.yaml
+
+    - name: "Background Tasks (run_background / check_background)"
+      id: background-tasks
+      file: tests/29-background-tasks.yaml
+
+    - name: "Checkpoint Tools (checkpoint_list / checkpoint_diff)"
+      id: checkpoint-tool
+      file: tests/31-checkpoint-tool.yaml
+
+    - name: "Utility Tools (estimate_tokens / count_lines)"
+      id: utility-tools
+      file: tests/33-utility-tools.yaml
+
+    - name: "Sandbox Path Escape Rejection (Invariant #3)"
+      id: sandbox-security
+      file: tests/34-sandbox-security.yaml
+
+    - name: "Permission System — deny/allow Rules"
+      id: permissions
+      file: tests/35-permissions.yaml
+
+    - name: "Session Rewind (sessions rewind CLI)"
+      id: session-rewind
+      file: tests/36-session-rewind.yaml
+
+    - name: "HTTP API Authentication (RECURSIVE_HTTP_AUTH_KEYS)"
+      id: http-auth
+      file: tests/39-http-auth.yaml

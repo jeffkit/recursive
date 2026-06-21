@@ -1,34 +1,23 @@
 {
   "fixtures": [
     {
-      "match": { "userMessage": "resume-task", "hasToolResult": false },
+      "_comment": "Turn 0: first run — max-steps 1, so session stops after this tool call",
+      "match": { "userMessage": "resume-step1.txt", "turnIndex": 0, "hasToolResult": false },
       "response": {
         "toolCalls": [
           {
             "name": "write_file",
-            "arguments": { "path": "step1.txt", "contents": "step1" }
+            "arguments": { "path": "resume-step1.txt", "contents": "step1-done" }
           }
         ]
       }
     },
     {
-      "match": { "userMessage": "resume-task", "hasToolResult": true },
-      "response": { "content": "Created step1.txt." }
-    },
-    {
-      "match": { "userMessage": "resume-continuation", "hasToolResult": false },
+      "_comment": "Turn 1: resume continues here — max-steps 1 was exhausted after turn 0",
+      "match": { "userMessage": "resume-step1.txt", "turnIndex": 1, "hasToolResult": true },
       "response": {
-        "toolCalls": [
-          {
-            "name": "write_file",
-            "arguments": { "path": "step2.txt", "contents": "step2" }
-          }
-        ]
+        "content": "Done! resume-step1.txt has been created with content step1-done."
       }
-    },
-    {
-      "match": { "userMessage": "resume-continuation", "hasToolResult": true },
-      "response": { "content": "Created step2.txt. All done!" }
     }
   ]
 }

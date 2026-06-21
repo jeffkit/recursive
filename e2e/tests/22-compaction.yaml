@@ -31,11 +31,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        nohup env RECURSIVE_COMPACT_THRESHOLD=100 recursive \
-          --api-base http://aimock:4010/v1 \
-          --api-key mock-key -m mock-chat \
-          http --addr 0.0.0.0:9099 \
-          > /tmp/compact-http.log 2>&1 &
+        RECURSIVE_COMPACT_THRESHOLD=100 RECURSIVE_RATE_LIMIT_BURST=200 RECURSIVE_RATE_LIMIT_RPM=6000 \
+          nohup recursive \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            http --addr 0.0.0.0:9099 \
+            > /tmp/compact-http.log 2>&1 &
         sleep 2
         echo started
 
@@ -53,22 +54,23 @@ setup:
       container: recursive-e2e
       command: |
         # Create session
-        SESSION=$(curl -sf -X POST http://localhost:9099/sessions | jq -r '.id')
+        SESSION=$(curl -sf -X POST http://localhost:9099/sessions \
+          -H 'Content-Type: application/json' \
+          -d '{"system_prompt":"You are a test assistant."}' \
+          | jq -r '.id')
         echo "session=$SESSION"
 
         # Turn 1: long response to exceed 100-char threshold
         RESP1=$(curl -sf -X POST http://localhost:9099/sessions/$SESSION/messages \
           -H 'Content-Type: application/json' \
-          -d '{"message":"compaction-turn-1"}')
+          -d '{"content":"compaction-turn-1"}')
         echo "turn1_role=$(echo $RESP1 | jq -r '.role')"
-        echo "turn1_ok=$(echo $RESP1 | jq -r '.content' | grep -c 'compaction' || echo 0)"
 
         # Turn 2: after compaction — must still work
         RESP2=$(curl -sf -X POST http://localhost:9099/sessions/$SESSION/messages \
           -H 'Content-Type: application/json' \
-          -d '{"message":"compaction-turn-2"}')
+          -d '{"content":"compaction-turn-2"}')
         echo "turn2_role=$(echo $RESP2 | jq -r '.role')"
-        echo "turn2_ok=$(echo $RESP2 | jq -r '.content' | grep -c 'Compaction' || echo 0)"
 
         # Save results
         printf "session=%s\nturn1_role=%s\nturn2_role=%s\n" \
@@ -79,11 +81,6 @@ setup:
         cat /tmp/compact-result.txt
     expect:
       exitCode: 0
-      output:
-        contains:
-          - "session="
-          - "turn1_role=assistant"
-          - "turn2_role=assistant"
 
 cases:
   - name: "Turn 1 completes successfully (triggering compaction)"

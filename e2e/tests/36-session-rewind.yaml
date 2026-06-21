@@ -1,0 +1,106 @@
+name: "Session Rewind CLI"
+description: |
+  Verify the `recursive sessions rewind` CLI behaves correctly in the E2E
+  container environment.
+
+  Important constraint: the E2E container does not have git installed, so
+  shadow-git checkpointing is disabled. Sessions created inside the container
+  will not have checkpoints.jsonl. This test suite covers:
+
+    A. --help shows expected options (usage/contract test).
+    B. Rewinding a session without checkpoints.jsonl produces a clear, structured
+       error — not a crash.
+    C. Rewinding with a non-existent session path produces a clear error.
+    D. sessions list shows the session created by setup.
+
+  Full rewind (write-file restoration) requires a containerimage with git.
+  That capability is tested separately in CI environments that include git.
+sequential: true
+
+setup:
+  - name: "Prepare workspace and create a session to list"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-rewind /tmp/rh-rewind
+        mkdir -p /workspace/test-rewind /tmp/rh-rewind
+        RECURSIVE_HOME=/tmp/rh-rewind \
+        recursive --workspace /workspace/test-rewind \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 5 \
+          run "Write rewind-probe.txt with content probe." 2>&1
+        SESSION_PATH=$(find /tmp/rh-rewind -name ".meta.json" -printf "%h\n" 2>/dev/null | head -1)
+        echo "session_path=$SESSION_PATH" > /tmp/rw-session.txt
+        echo "$SESSION_PATH"
+        echo "prepared"
+
+cases:
+  # ── A: --help contract test ────────────────────────────────────────────────────
+  - name: "A: sessions rewind --help lists expected options"
+    exec:
+      container: recursive-e2e
+      command: recursive sessions rewind --help
+    expect:
+      exitCode: 0
+      output:
+        contains: "--dry-run"
+
+  # ── B: no checkpoints → structured error, not crash ──────────────────────────
+  - name: "B: rewind on checkpoint-less session prints clear error (non-zero exit)"
+    exec:
+      container: recursive-e2e
+      command: |
+        SESSION_PATH=$(grep 'session_path=' /tmp/rw-session.txt | cut -d'=' -f2-)
+        recursive sessions rewind "$SESSION_PATH" --to-turn 0 2>&1 || true
+    expect:
+      exitCode: 0
+      output:
+        contains: "checkpoints"
+
+  - name: "B: no crash — exit code from rewind was not 101+ (signal/panic)"
+    exec:
+      container: recursive-e2e
+      command: |
+        SESSION_PATH=$(grep 'session_path=' /tmp/rw-session.txt | cut -d'=' -f2-)
+        recursive sessions rewind "$SESSION_PATH" --to-turn 0 2>&1
+        CODE=$?
+        [ $CODE -lt 100 ] && echo "graceful-exit=true" || echo "graceful-exit=false"
+    expect:
+      exitCode: 0
+      output:
+        contains: "graceful-exit=true"
+
+  # ── C: non-existent session path → clear error ───────────────────────────────
+  - name: "C: rewind of non-existent session path returns error with path in message"
+    exec:
+      container: recursive-e2e
+      command: |
+        recursive sessions rewind /tmp/does-not-exist-session --to-turn 0 2>&1 || true
+    expect:
+      exitCode: 0
+      output:
+        anyOf:
+          - contains: "not found"
+          - contains: "No such"
+          - contains: "does-not-exist"
+
+  # ── D: sessions list shows the session created in setup ──────────────────────
+  - name: "D: recursive sessions list returns the session created in setup"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-rewind \
+          recursive --workspace /workspace/test-rewind \
+            sessions list 2>&1
+    expect:
+      exitCode: 0
+      output:
+        contains: "workspace-test-rewind"
+
+teardown:
+  - name: "Clean workspace and RECURSIVE_HOME"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-rewind /tmp/rh-rewind /tmp/rw-session.txt

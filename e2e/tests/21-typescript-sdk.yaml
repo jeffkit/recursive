@@ -12,12 +12,12 @@ description: |
 sequential: true
 
 setup:
-  - name: "Kill any leftover server on port 9097"
+  - name: "Kill any leftover server on port 9096"
     ignoreError: true
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9097' 2>/dev/null || true
+        pkill -f 'http --addr 0.0.0.0:9096' 2>/dev/null || true
         sleep 1
         echo cleaned
 
@@ -27,22 +27,23 @@ setup:
       container: recursive-e2e
       command: rm -f /tmp/ts-sdk-result.txt /tmp/ts-sdk-http.log && echo reset
 
-  - name: "Start HTTP server on port 9097"
+  - name: "Start HTTP server on port 9096"
     exec:
       container: recursive-e2e
       command: |
-        nohup recursive \
-          --api-base http://aimock:4010/v1 \
-          --api-key mock-key -m mock-chat \
-          http --addr 0.0.0.0:9097 \
-          > /tmp/ts-sdk-http.log 2>&1 &
+        RECURSIVE_RATE_LIMIT_BURST=200 RECURSIVE_RATE_LIMIT_RPM=6000 \
+          nohup recursive \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            http --addr 0.0.0.0:9096 \
+            > /tmp/ts-sdk-http.log 2>&1 &
         sleep 2
         echo started
 
   - name: "Sanity: GET /health returns ok"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9097/health
+      command: curl -sf http://localhost:9096/health
     expect:
       exitCode: 0
       output:
@@ -52,11 +53,11 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        node - <<'JSEOF' > /tmp/ts-sdk-result.txt
+        node - <<'JSEOF' > /tmp/ts-sdk-result.txt 2>&1
         const { Agent } = require('/sdk/typescript/dist/index.js');
 
         async function main() {
-          const agent = await Agent.create({ baseUrl: 'http://localhost:9097', apiKey: 'test' });
+          const agent = await Agent.create({ baseUrl: 'http://127.0.0.1:9096', apiKey: 'test' });
           try {
             const run = await agent.send('sdk-typescript-hello');
             const result = await run.wait();
@@ -109,11 +110,11 @@ cases:
       contains: "has_duration=true"
 
 teardown:
-  - name: "Stop HTTP server on 9097 and clean up"
+  - name: "Stop HTTP server on 9096 and clean up"
     ignoreError: true
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9097' 2>/dev/null || true
+        pkill -f 'http --addr 0.0.0.0:9096' 2>/dev/null || true
         rm -f /tmp/ts-sdk-result.txt /tmp/ts-sdk-http.log
         echo stopped

@@ -1,0 +1,55 @@
+{
+  "_comment": "Fixtures for 26-facts-memory.yaml — agent stores and retrieves semantic facts.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent calls remember to persist a fact",
+      "match": { "userMessage": "facts-result.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "remember",
+            "arguments": {
+              "text": "The project uses Rust as its primary language",
+              "tags": ["project", "language"],
+              "source": "agent"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after storing, agent recalls the fact to verify persistence",
+      "match": { "userMessage": "facts-result.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "recall",
+            "arguments": { "query": "primary language", "limit": 5 }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent writes the recall results to a file for assertion",
+      "match": { "userMessage": "facts-result.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "facts-result.txt",
+              "contents": "Recalled: The project uses Rust as its primary language"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 3: agent confirms done",
+      "match": { "userMessage": "facts-result.txt", "turnIndex": 3, "hasToolResult": true },
+      "response": {
+        "content": "Done! Stored fact about Rust and recalled it successfully."
+      }
+    }
+  ]
+}

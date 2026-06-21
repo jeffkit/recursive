@@ -1,0 +1,70 @@
+name: "Semantic Facts Memory (remember / recall)"
+description: |
+  Verify the Semantic Facts system (src/tools/facts.rs) works end-to-end:
+    - `remember` persists a fact to facts.jsonl
+    - `recall` retrieves it by full-text query
+    - The facts.jsonl file on disk is well-formed
+    - A second `remember` call with overlapping content deduplicates
+      (does not create a duplicate entry)
+
+  Distinct from 03-memory-scratchpad: scratchpad uses key/value pairs;
+  facts uses text+tags+dedup and is persisted separately in memory/facts.jsonl.
+sequential: true
+
+setup:
+  - name: "Prepare workspace + isolated RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-facts
+        rm -rf /tmp/recursive-home-facts /tmp/sessions-facts
+        mkdir -p /workspace/test-facts
+        mkdir -p /tmp/recursive-home-facts
+        echo prepared
+
+  - name: "Run agent (act): remember a fact then recall it"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/recursive-home-facts \
+        recursive --workspace /workspace/test-facts \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 10 \
+          run "Store the fact 'The project uses Rust as its primary language' using remember tool with tags=['project','language']. Then recall using query 'primary language'. Write the recall result to facts-result.txt."
+        SESSION_DIR=$(find /tmp/recursive-home-facts -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-facts
+          cp -r "$SESSION_DIR/." /tmp/sessions-facts/
+        fi
+
+cases:
+  - name: "Session used remember and recall tools"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-facts
+      status: ["completed", "success"]
+      hasToolCalls: ["remember", "recall"]
+      minMessages: 5
+
+  - name: "facts-result.txt contains the recalled fact"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-facts/facts-result.txt
+      exists: true
+      contains: "Rust"
+
+  - name: "facts.jsonl exists in workspace and contains the stored fact"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-facts/.recursive/memory/facts.jsonl
+      exists: true
+      contains: "Rust"
+
+teardown:
+  - name: "Clean workspace + RECURSIVE_HOME + sessions"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-facts
+        rm -rf /tmp/recursive-home-facts /tmp/sessions-facts

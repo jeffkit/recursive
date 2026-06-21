@@ -21,20 +21,28 @@ setup:
   - name: "Run write_file scenario (smoke-01)"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/smoke-01
-        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
-        --max-steps 5
-        run "Create a file called smoke.txt with content 'ok'"
+      command: |
+        RECURSIVE_HOME=/tmp/rh-smoke-01 \
+          recursive --workspace /workspace/smoke-01 \
+            --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+            --max-steps 5 \
+            run "Create a file called smoke.txt with content 'ok'"
+        SESSION=$(find /tmp/rh-smoke-01 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        [ -n "$SESSION" ] && mkdir -p /tmp/sessions-smoke-01 && cp -r "$SESSION/." /tmp/sessions-smoke-01/
+        echo done
 
   - name: "Run read_file scenario (smoke-02)"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/smoke-02
-        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
-        --max-steps 5
-        run "Read the file input.txt and tell me what it contains"
+      command: |
+        RECURSIVE_HOME=/tmp/rh-smoke-02 \
+          recursive --workspace /workspace/smoke-02 \
+            --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+            --max-steps 5 \
+            run "Read the file input.txt and tell me what it contains"
+        SESSION=$(find /tmp/rh-smoke-02 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        [ -n "$SESSION" ] && mkdir -p /tmp/sessions-smoke-02 && cp -r "$SESSION/." /tmp/sessions-smoke-02/
+        echo done
 
 cases:
   - name: "smoke-01: write_file produced smoke.txt with 'ok'"
@@ -47,7 +55,7 @@ cases:
   - name: "smoke-01: session recorded write_file tool call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/sessions
+      input: /tmp/sessions-smoke-01
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
       hasToolCalls: ["write_file"]
@@ -56,13 +64,16 @@ cases:
   - name: "smoke-02: session recorded read_file tool call"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/sessions
+      input: /tmp/sessions-smoke-02
       status: ["completed", "success"]
       hasToolCalls: ["read_file"]
 
 teardown:
-  - name: "Clean smoke workspaces"
+  - name: "Clean smoke workspaces and RECURSIVE_HOME dirs"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/smoke-01 /workspace/smoke-02
+      command: |
+        rm -rf /workspace/smoke-01 /workspace/smoke-02
+        rm -rf /tmp/rh-smoke-01 /tmp/rh-smoke-02
+        rm -rf /tmp/sessions-smoke-01 /tmp/sessions-smoke-02

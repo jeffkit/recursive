@@ -1,0 +1,51 @@
+{
+  "_comment": "Fixtures for 33-utility-tools.yaml — agent uses estimate_tokens and count_lines.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent calls estimate_tokens to estimate token cost before reading a large file",
+      "match": { "userMessage": "utility-result.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "estimate_tokens",
+            "arguments": { "path": "large-file.txt" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after token estimate, agent calls count_lines on the same file",
+      "match": { "userMessage": "utility-result.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "count_lines",
+            "arguments": { "path": "large-file.txt" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent writes summary of both results",
+      "match": { "userMessage": "utility-result.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "utility-result.txt",
+              "contents": "estimate-and-count-done"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 3: agent confirms",
+      "match": { "userMessage": "utility-result.txt", "turnIndex": 3, "hasToolResult": true },
+      "response": {
+        "content": "Done! Estimated tokens and counted lines for large-file.txt. Results written to utility-result.txt."
+      }
+    }
+  ]
+}

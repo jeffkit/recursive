@@ -16,13 +16,17 @@ setup:
   - name: "Run agent (act): produce greet.py + README.md"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-judge
-        --api-base http://aimock:4010/v1
-        --api-key mock-key
-        -m mock-chat
-        --max-steps 15
-        run "Create a Python script called greet.py that defines a function greet(name) returning 'Hello, {name}!', has a main block calling greet('World'), then create a README.md describing it."
+      command: |
+        RECURSIVE_HOME=/tmp/rh-judge \
+          recursive --workspace /workspace/test-judge \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key \
+            -m mock-chat \
+            --max-steps 15 \
+            run "Create a Python script called greet.py that defines a function greet(name) returning 'Hello, {name}!', has a main block calling greet('World'), then create a README.md describing it."
+        SESSION=$(find /tmp/rh-judge -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        [ -n "$SESSION" ] && mkdir -p /tmp/sessions-judge && cp -r "$SESSION/." /tmp/sessions-judge/
+        echo done
 
 cases:
   - name: "greet.py exists with greet function"
@@ -41,7 +45,7 @@ cases:
   - name: "Session is complete with write_file tool calls"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-judge/.recursive/sessions
+      input: /tmp/sessions-judge
       status: ["completed", "success"]
       hasToolCalls: ["write_file"]
       minMessages: 4
@@ -49,13 +53,15 @@ cases:
   - name: "LLM Judge approves (semantic)"
     llm-judge:
       container: recursive-e2e
-      input: /workspace/test-judge/.recursive/sessions
+      input: /tmp/sessions-judge
       goal: "Create greet.py with greet(name) function + main block, then README.md"
       minScore: 3
 
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace and RECURSIVE_HOME"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-judge
+      command: |
+        rm -rf /workspace/test-judge
+        rm -rf /tmp/rh-judge /tmp/sessions-judge

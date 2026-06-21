@@ -1,78 +1,87 @@
 name: "Session Resume (continue interrupted runs)"
 description: |
   Verify `recursive resume` can continue a run that was interrupted due to
-  max-steps budget. Uses --session-out to capture state in /tmp.
+  max-steps budget.
 
-  /tmp/resume-session.json is the cross-case fixture: it's produced in
-  setup (the "first run") and consumed by the "resume" act. We can't lift
-  it into ArgusAI variables because `save:` does not capture exec stdout —
-  this is a known engine limitation, not a test smell.
+  The first run (max-steps 1) exhausts its budget after one LLM call, leaving
+  the session in "active" (incomplete) state. The resume command continues
+  from where it left off in the same session directory, completing the task.
+
+  Both runs use the same RECURSIVE_HOME so the session directory is stable.
+  After resume, the session should reach "completed" status.
 sequential: true
 
 setup:
-  - name: "Prepare workspace + clear stale session file"
+  - name: "Prepare workspace + clean RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-resume
-        rm -f /tmp/resume-session.json
-        mkdir -p /workspace/test-resume
+        rm -rf /tmp/rh-resume /tmp/sessions-resume
+        mkdir -p /workspace/test-resume /tmp/rh-resume
         echo prepared
 
-  - name: "First run with max-steps 1 (act-fixture): writes /tmp/resume-session.json"
+  - name: "First run with max-steps 1: creates incomplete session"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-resume
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        --max-steps 1
-        --session-out /tmp/resume-session.json
-        run "Write file resume-task with content: step1 done. Then write resume-continuation."
-        ; echo exit=$?
+      command: |
+        RECURSIVE_HOME=/tmp/rh-resume \
+          recursive --workspace /workspace/test-resume \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            --max-steps 1 \
+            run "Write file resume-step1.txt with content step1-done."
+        echo exit=$?
 
-  - name: "Sanity: session fixture file exists with transcript"
-    file:
-      container: recursive-e2e
-      path: /tmp/resume-session.json
-      exists: true
-      contains: "transcript"
-
-  - name: "Clear workspace .recursive/sessions before resume"
-    # The first-run also wrote an "incomplete" session to
-    # /workspace/test-resume/.recursive/sessions/. Without this step, the
-    # plugin's findSessionDir() (which returns the first directory it finds
-    # via readdirSync alphabetical order) would pick the older incomplete
-    # session and fail status=[completed,success] even though the resume
-    # itself succeeded. Removing the directory ensures only the resume's
-    # session ends up there.
+  - name: "Capture first-run session path"
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-resume/.recursive/sessions && echo cleared
+      command: |
+        SESSION=$(find /tmp/rh-resume -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -z "$SESSION" ]; then
+          echo "ERROR: no session found after first run"
+          exit 1
+        fi
+        echo "$SESSION" > /tmp/resume-session-path.txt
+        echo "session: $SESSION"
 
-  - name: "Resume from session file (act)"
+  - name: "Resume from session path (act)"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-resume
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        --max-steps 5
-        resume /tmp/resume-session.json
+      command: |
+        SESSION=$(cat /tmp/resume-session-path.txt)
+        RECURSIVE_HOME=/tmp/rh-resume \
+          recursive --workspace /workspace/test-resume \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            --max-steps 5 \
+            resume "$SESSION"
+        # Copy the (now completed) session to a predictable assertions path
+        mkdir -p /tmp/sessions-resume
+        cp -r "$SESSION/." /tmp/sessions-resume/
+        echo done
 
 cases:
   - name: "Resumed run produced a valid completed session"
     recursive-session:
       container: recursive-e2e
-      input: /workspace/test-resume/.recursive/sessions
+      input: /tmp/sessions-resume
       status: ["completed", "success"]
       minMessages: 2
 
+  - name: "resume-step1.txt was written by the first run (side-effect persists across resume)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-resume/resume-step1.txt
+      exists: true
+      contains: "step1-done"
+
 teardown:
-  - name: "Clean workspace + remove fixture session file"
+  - name: "Clean workspace + RECURSIVE_HOME + temp files"
     ignoreError: true
     exec:
       container: recursive-e2e
       command: |
         rm -rf /workspace/test-resume
-        rm -f /tmp/resume-session.json
+        rm -rf /tmp/rh-resume /tmp/sessions-resume
+        rm -f /tmp/resume-session-path.txt

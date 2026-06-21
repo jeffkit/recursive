@@ -1,0 +1,27 @@
+{
+  "_comment": "Fixtures for 24-bash-tool.yaml — cwd scenario: agent uses Bash with explicit cwd subdir.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent runs a command in a subdirectory using cwd parameter",
+      "match": { "userMessage": "bash-cwd.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Bash",
+            "arguments": {
+              "command": "echo 'cwd-ok' > bash-cwd.txt",
+              "cwd": "subdir"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: agent confirms cwd command succeeded",
+      "match": { "userMessage": "bash-cwd.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "content": "Done! Ran Bash with cwd=subdir and created bash-cwd.txt inside it."
+      }
+    }
+  ]
+}

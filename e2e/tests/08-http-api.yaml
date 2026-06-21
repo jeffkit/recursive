@@ -58,14 +58,14 @@ setup:
 
 cases:
   # ── Discovery endpoints ──
-  - name: "GET /tools returns read_file in JSON array"
+  - name: "GET /tools returns Read in JSON array"
     exec:
       container: recursive-e2e
       command: curl -sf http://localhost:9090/tools
     expect:
       exitCode: 0
       output:
-        contains: "read_file"
+        contains: "\"name\":\"Read\""
 
   - name: "GET /openapi.json returns OpenAPI spec"
     exec:

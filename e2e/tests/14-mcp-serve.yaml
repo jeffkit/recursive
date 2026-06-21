@@ -30,7 +30,7 @@ cases:
           - "recursive-agent"
           - "protocolVersion"
 
-  - name: "tools/list returns write_file, apply_patch, read_file"
+  - name: "tools/list returns Write and Read tools"
     exec:
       container: recursive-e2e
       command: >
@@ -40,15 +40,14 @@ cases:
       exitCode: 0
       output:
         contains:
-          - "write_file"
-          - "apply_patch"
-          - "read_file"
+          - "\"Write\""
+          - "\"Read\""
 
-  - name: "tools/call write_file (act): RPC response acknowledges path"
+  - name: "tools/call Write (act): RPC response acknowledges path"
     exec:
       container: recursive-e2e
       command: >
-        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"mcp-test.txt","contents":"mcp-ok"}}}\n'
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Write","arguments":{"path":"mcp-test.txt","contents":"mcp-ok"}}}\n'
         | recursive serve --workspace /workspace/test-mcp 2>/dev/null
     expect:
       exitCode: 0

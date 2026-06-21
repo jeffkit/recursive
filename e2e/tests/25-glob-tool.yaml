@@ -1,0 +1,102 @@
+name: "Glob Tool (file pattern matching)"
+description: |
+  Verify the Glob tool finds files matching patterns across the workspace.
+  Also exercises scoped search via the `path` parameter and verifies that
+  non-matching patterns return an empty result (not an error).
+
+  Scenarios:
+    A. Agent uses Glob(**/*.rs) to find Rust files, writes summary.
+    B. MCP direct call: scoped glob returns only matching subset.
+    C. MCP direct call: pattern with no matches returns empty (not error).
+sequential: true
+
+setup:
+  - name: "Prepare workspace with Rust and Python source files"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-glob
+        rm -rf /tmp/rh-glob /tmp/sessions-glob
+        mkdir -p /workspace/test-glob/src /tmp/rh-glob
+        printf 'fn main() {}\n' > /workspace/test-glob/src/main.rs
+        printf 'pub fn lib() {}\n' > /workspace/test-glob/src/lib.rs
+        printf 'def hello(): pass\n' > /workspace/test-glob/script.py
+        printf 'config: true\n' > /workspace/test-glob/config.yaml
+        echo prepared
+
+  - name: "Scenario A (act): agent globs for .rs files and writes summary"
+    exec:
+      container: recursive-e2e
+      command: |
+        RECURSIVE_HOME=/tmp/rh-glob \
+        recursive --workspace /workspace/test-glob \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 8 \
+          run "Glob all .rs files in the workspace and save the list to glob-result.txt."
+        SESSION_DIR=$(find /tmp/rh-glob -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-glob
+          cp -r "$SESSION_DIR/." /tmp/sessions-glob/
+        fi
+
+cases:
+  # ── Scenario A: agent glob ────────────────────────────────────────────────────
+  - name: "A: session used Glob tool"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-glob
+      status: ["completed", "success"]
+      hasToolCalls: ["Glob"]
+      minMessages: 4
+
+  - name: "A: glob-result.txt was produced"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-glob/glob-result.txt
+      exists: true
+      contains: ".rs"
+
+  # ── Scenario B: scoped glob via MCP ──────────────────────────────────────────
+  - name: "B: Glob(**/*.rs, path=src) returns only .rs files under src/"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Glob","arguments":{"pattern":"**/*.rs","path":"src"}}}\n'
+        | recursive serve --workspace /workspace/test-glob 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "main.rs"
+
+  - name: "B: scoped glob result does not include the Python file"
+    exec:
+      container: recursive-e2e
+      command: |
+        OUT=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Glob","arguments":{"pattern":"**/*.rs","path":"src"}}}\n' \
+          | recursive serve --workspace /workspace/test-glob 2>/dev/null)
+        echo "$OUT" | grep -q 'script.py' && echo "python-present" || echo "python-absent"
+    expect:
+      exitCode: 0
+      output:
+        contains: "python-absent"
+
+  # ── Scenario C: no-match pattern returns empty not error ─────────────────────
+  - name: "C: Glob(*.nonexistent) returns a valid (empty) result without error"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Glob","arguments":{"pattern":"*.nonexistent"}}}\n'
+        | recursive serve --workspace /workspace/test-glob 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "result"
+
+teardown:
+  - name: "Clean workspace and RECURSIVE_HOME"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-glob
+        rm -rf /tmp/rh-glob /tmp/sessions-glob

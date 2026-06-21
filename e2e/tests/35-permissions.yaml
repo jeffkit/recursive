@@ -1,0 +1,113 @@
+name: "Permission System — deny/allow Rules"
+description: |
+  Verify the layered permission system (src/permissions/) is enforced end-to-end.
+
+  Scenarios:
+    A. deny=["Bash"] in config.toml — Bash tool call via MCP returns a permission
+       error; write_file (not in deny list) still works.
+    B. deny=["write_file"] in config.toml — write_file is rejected; Bash still works.
+
+  Uses RECURSIVE_HOME to point the binary at a custom config.toml with deny rules.
+  MCP stdio invocation keeps the test deterministic — no LLM fixture needed.
+sequential: true
+
+setup:
+  - name: "Prepare workspaces"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-perms-a /workspace/test-perms-b
+        rm -rf /tmp/perm-home-a /tmp/perm-home-b
+        mkdir -p /workspace/test-perms-a /workspace/test-perms-b
+        mkdir -p /tmp/perm-home-a/.recursive /tmp/perm-home-b/.recursive
+        echo prepared
+
+  - name: "Write config.toml for Scenario A: deny Bash"
+    exec:
+      container: recursive-e2e
+      command: |
+        cat > /tmp/perm-home-a/.recursive/config.toml << 'EOF'
+        [permissions]
+        deny = ["Bash"]
+        EOF
+        echo written
+
+  - name: "Write config.toml for Scenario B: deny write_file"
+    exec:
+      container: recursive-e2e
+      command: |
+        cat > /tmp/perm-home-b/.recursive/config.toml << 'EOF'
+        [permissions]
+        deny = ["write_file"]
+        EOF
+        echo written
+
+cases:
+  # ── Scenario A: Bash denied ───────────────────────────────────────────────────
+  - name: "A: Bash tool call is rejected when deny=[Bash] in config.toml"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"echo hi"}}}\n'
+        | RECURSIVE_HOME=/tmp/perm-home-a recursive serve --workspace /workspace/test-perms-a 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains:
+          - "denied"
+
+  - name: "A: write_file still works when only Bash is denied"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"allowed.txt","contents":"yes"}}}\n'
+        | RECURSIVE_HOME=/tmp/perm-home-a recursive serve --workspace /workspace/test-perms-a 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "allowed.txt"
+
+  - name: "A: allowed.txt was actually written to disk (not just acknowledged)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-perms-a/allowed.txt
+      exists: true
+      contains: "yes"
+
+  # ── Scenario B: write_file denied ─────────────────────────────────────────────
+  - name: "B: write_file is rejected when deny=[write_file] in config.toml"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"blocked.txt","contents":"should-not-exist"}}}\n'
+        | RECURSIVE_HOME=/tmp/perm-home-b recursive serve --workspace /workspace/test-perms-b 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "denied"
+
+  - name: "B: blocked.txt was NOT created (denial actually prevented the write)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-perms-b/blocked.txt
+      exists: false
+
+  - name: "B: Bash still works when only write_file is denied"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"echo bash-allowed"}}}\n'
+        | RECURSIVE_HOME=/tmp/perm-home-b recursive serve --workspace /workspace/test-perms-b 2>/dev/null
+    expect:
+      exitCode: 0
+      output:
+        contains: "bash-allowed"
+
+teardown:
+  - name: "Clean workspaces and homes"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-perms-a /workspace/test-perms-b
+        rm -rf /tmp/perm-home-a /tmp/perm-home-b

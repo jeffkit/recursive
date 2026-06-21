@@ -1,0 +1,39 @@
+{
+  "_comment": "Fixtures for 25-glob-tool.yaml — agent uses Glob to find files matching a pattern.",
+  "fixtures": [
+    {
+      "_comment": "Turn 0: agent globs for all .rs files in the workspace",
+      "match": { "userMessage": "glob-result.txt", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Glob",
+            "arguments": { "pattern": "**/*.rs" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 1: after receiving glob results, agent writes a summary file",
+      "match": { "userMessage": "glob-result.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "glob-result.txt",
+              "contents": "Found Rust files: src/main.rs, src/lib.rs"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Turn 2: agent confirms done",
+      "match": { "userMessage": "glob-result.txt", "turnIndex": 2, "hasToolResult": true },
+      "response": {
+        "content": "Done! Found 2 Rust files using Glob and saved the result to glob-result.txt."
+      }
+    }
+  ]
+}

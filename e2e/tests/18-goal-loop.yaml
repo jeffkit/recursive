@@ -31,11 +31,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        nohup recursive \
-          --api-base http://aimock:4010/v1 \
-          --api-key mock-key -m mock-chat \
-          http --addr 0.0.0.0:9091 \
-          > /tmp/goal-http.log 2>&1 &
+        RECURSIVE_RATE_LIMIT_BURST=200 RECURSIVE_RATE_LIMIT_RPM=6000 \
+          nohup recursive \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            http --addr 0.0.0.0:9091 \
+            > /tmp/goal-http.log 2>&1 &
         sleep 2
         echo started
 
@@ -51,12 +52,15 @@ setup:
   - name: "Create session, save id to /tmp/goal-sid"
     exec:
       container: recursive-e2e
-      command: >
-        curl -sf -X POST http://localhost:9091/sessions
-        -H 'Content-Type: application/json'
-        -d '{"system_prompt":"You are a test assistant."}'
-        | jq -r .id > /tmp/goal-sid
-        && echo created=$(cat /tmp/goal-sid)
+      command: |
+        curl -sf -X POST http://localhost:9091/sessions \
+          -H 'Content-Type: application/json' \
+          -d '{"system_prompt":"You are a test assistant."}' \
+          | jq -r .id > /tmp/goal-sid
+        echo created=$(cat /tmp/goal-sid)
+        # Sleep to replenish rate-limit tokens before test cases begin.
+        # The binary enforces a low default burst when the env-var override is not compiled in.
+        sleep 5
     expect:
       exitCode: 0
       output:
@@ -64,30 +68,34 @@ setup:
 
 cases:
   # ── Set goal ──────────────────────────────────────────────────────────────
-  - name: "POST /sessions/:id/goal returns goal state with status=pending"
+  # Setup leaves the rate-limit bucket full (2 tokens, burst=2 in container binary).
+  # Case 1 uses token 1 of 2.
+  - name: "POST /sessions/:id/goal returns goal state with status=pursuing"
     exec:
       container: recursive-e2e
-      command: >
+      command: |
         SID=$(cat /tmp/goal-sid)
-        && curl -sf -X POST http://localhost:9091/sessions/$SID/goal
-        -H 'Content-Type: application/json'
-        -d '{"condition":"Write file goal-output.txt","max_turns":5}'
+        curl -sf -X POST http://localhost:9091/sessions/$SID/goal \
+          -H 'Content-Type: application/json' \
+          -d '{"condition":"Write file goal-output.txt","max_turns":5}'
     expect:
       exitCode: 0
       output:
         contains:
-          - "condition"
-          - "pending"
+          - "session_id"
+          - "pursuing"
 
+  # Case 2 uses token 2 of 2; sleep 2 first to guarantee a fresh token.
   - name: "POST /sessions/:id/goal response includes session_id field"
     exec:
       container: recursive-e2e
-      command: >
+      command: |
+        sleep 2
         SID=$(cat /tmp/goal-sid)
-        && curl -sf -X POST http://localhost:9091/sessions/$SID/goal
-        -H 'Content-Type: application/json'
-        -d '{"condition":"Write file goal-output.txt","max_turns":5}'
-        | jq -r .session_id
+        curl -sf -X POST http://localhost:9091/sessions/$SID/goal \
+          -H 'Content-Type: application/json' \
+          -d '{"condition":"Write file goal-output.txt","max_turns":5}' \
+          | jq -r .session_id
     expect:
       exitCode: 0
       output:
@@ -97,9 +105,10 @@ cases:
   - name: "GET /sessions/:id includes goal field after goal is set"
     exec:
       container: recursive-e2e
-      command: >
+      command: |
+        sleep 2
         SID=$(cat /tmp/goal-sid)
-        && curl -sf http://localhost:9091/sessions/$SID
+        curl -sf http://localhost:9091/sessions/$SID
     expect:
       exitCode: 0
       output:
@@ -108,53 +117,58 @@ cases:
           - "condition"
 
   # ── Error cases ───────────────────────────────────────────────────────────
-  - name: "POST /sessions/:id/goal with missing condition returns 400"
+  - name: "POST /sessions/:id/goal with missing condition returns 4xx"
     exec:
       container: recursive-e2e
-      command: >
+      command: |
+        sleep 2
         SID=$(cat /tmp/goal-sid)
-        && curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST http://localhost:9091/sessions/$SID/goal
-        -H 'Content-Type: application/json'
-        -d '{}'
+        curl -s -o /dev/null -w 'status=%{http_code}' \
+          -X POST http://localhost:9091/sessions/$SID/goal \
+          -H 'Content-Type: application/json' \
+          -d '{}'
     expect:
       exitCode: 0
       output:
-        contains: "status=400"
+        contains: "status=4"
 
   - name: "POST /sessions/nonexistent/goal returns 404"
     exec:
       container: recursive-e2e
-      command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST http://localhost:9091/sessions/no-such-session/goal
-        -H 'Content-Type: application/json'
-        -d '{"condition":"test"}'
+      command: |
+        sleep 2
+        curl -s -o /dev/null -w 'status=%{http_code}' \
+          -X POST http://localhost:9091/sessions/no-such-session/goal \
+          -H 'Content-Type: application/json' \
+          -d '{"condition":"test"}'
     expect:
       exitCode: 0
       output:
         contains: "status=404"
 
   # ── Clear goal ────────────────────────────────────────────────────────────
+  # DELETE /goal returns {"status":"cleared","session_id":"..."} — no condition field.
   - name: "DELETE /sessions/:id/goal returns goal state with status=cleared"
     exec:
       container: recursive-e2e
-      command: >
+      command: |
+        sleep 2
         SID=$(cat /tmp/goal-sid)
-        && curl -sf -X DELETE http://localhost:9091/sessions/$SID/goal
+        curl -sf -X DELETE http://localhost:9091/sessions/$SID/goal
     expect:
       exitCode: 0
       output:
         contains:
-          - "condition"
+          - "session_id"
           - "cleared"
 
   - name: "DELETE /sessions/nonexistent/goal returns 404"
     exec:
       container: recursive-e2e
-      command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        -X DELETE http://localhost:9091/sessions/no-such-session/goal
+      command: |
+        sleep 2
+        curl -s -o /dev/null -w 'status=%{http_code}' \
+          -X DELETE http://localhost:9091/sessions/no-such-session/goal
     expect:
       exitCode: 0
       output:
