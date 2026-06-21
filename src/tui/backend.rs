@@ -332,6 +332,8 @@ async fn worker_loop(
             tx: perm_tx,
             enabled: permission_enabled,
         }));
+        // Signal the UI that the runtime is ready — drives App::connected = true.
+        let _ = event_tx.send(UiEvent::RuntimeReady);
     }
 
     let bash_registry = build_bash_registry(&resolve_workspace_root());

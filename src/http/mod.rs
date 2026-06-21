@@ -427,7 +427,6 @@ impl ApiError {
     }
 
     /// 400 Bad Request with a message.
-    #[allow(dead_code)] // not used by any current handler; reserved for future use
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }

@@ -7,8 +7,9 @@
 //!   (messages, tools, config, event sink).
 //! * [`TurnOutcome`] — the result of executing one turn (new messages,
 //!   usage, finish reason, side effects).
-//! * [`AgentKernel`] — the stateless single-turn executor (struct + builder
-//!   only; `run()` is not yet implemented).
+//! * [`AgentKernel`] — the stateless single-turn executor. Its `run()`
+//!   method delegates to [`crate::run_core::RunCore`] which owns the
+//!   ReAct step loop.
 //!
 //! # Design
 //!
@@ -17,8 +18,8 @@
 //! `TurnContext` from its transcript, calls the kernel, and then
 //! incorporates the `TurnOutcome` back into its state.
 //!
-//! As of Goal 219 Commit 1, the kernel passes the caller's
-//! `AgentEvent` channel directly to `RunCore` — no internal bridge.
+//! The kernel passes the caller's `AgentEvent` channel directly to
+//! `RunCore` — no internal bridge (introduced in Goal 219).
 
 use crate::agent::FinishReason;
 use crate::compact::Compactor;
@@ -293,7 +294,6 @@ impl AgentKernel {
             hooks: &self.hooks,
             total_llm_latency_ms: 0,
             exploring_plan_mode: ctx.exploring_plan_mode,
-            permission_mode: ctx.permission_mode,
             shutdown_token: self.shutdown_token.clone(),
             mailbox: ctx.mailbox,
             stuck_window: self.stuck_window,

@@ -31,12 +31,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 pub fn build_line(app: &App) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // [connection]
+    // [connection] — "local" once the runtime is ready, "starting…" before that.
     spans.push(Span::raw(" "));
+    let (conn_label, conn_color) = if app.connected {
+        ("local", Color::Green)
+    } else {
+        ("starting\u{2026}", Color::Yellow)
+    };
     spans.push(Span::styled(
-        "local".to_string(),
+        conn_label.to_string(),
         Style::default()
-            .fg(Color::Green)
+            .fg(conn_color)
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     ));
@@ -186,9 +191,17 @@ mod tests {
         app.model_name = "deepseek-chat".to_string();
         app.usage.total_input = 1234;
         app.usage.total_output = 342;
+
+        // Before runtime is ready: shows "starting…".
+        let text = line_text(&build_line(&app));
+        assert!(text.contains("starting"), "expected 'starting' before RuntimeReady; got: {text}");
+        assert!(text.contains("deepseek-chat"));
+
+        // After RuntimeReady: shows "local".
+        app.connected = true;
         let line = build_line(&app);
         let text = line_text(&line);
-        assert!(text.contains("local"));
+        assert!(text.contains("local"), "expected 'local' after RuntimeReady; got: {text}");
         assert!(text.contains("deepseek-chat"));
         assert!(text.contains("↑1.2k"));
         assert!(text.contains("↓342"));

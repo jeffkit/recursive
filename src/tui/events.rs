@@ -64,6 +64,10 @@ pub enum UiEvent {
     Latency { llm_ms: u64 },
     /// Transcript compaction notification.
     Compacted { removed: usize, kept: usize },
+    /// The backend worker finished building the runtime and is ready to accept
+    /// user messages. Drives `App::connected = true` in the event loop so the
+    /// status bar can show an accurate connection label instead of "starting…".
+    RuntimeReady,
     /// Marks the start of a turn the backend is about to run so the UI can
     /// (re)arm the spinner. Emitted for every turn, including those drained
     /// from the type-ahead queue after an earlier turn finished — without it

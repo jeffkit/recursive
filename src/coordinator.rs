@@ -51,11 +51,10 @@ pub fn is_coordinator_mode() -> bool {
 /// enforcement, layer in a `PermissionHook` later.
 pub fn coordinator_tool_set() -> &'static [&'static str] {
     &[
-        // --- Read-only introspection ---
-        "list_files",
-        "read_file",
-        "grep",
-        "glob",
+        // --- Read-only introspection (PascalCase matches Tool::spec().name) ---
+        "Read",
+        "Grep",
+        "Glob",
         "shared_memory_read",
         "list_workers",
         // --- Team / task meta-tools ---
@@ -69,12 +68,12 @@ pub fn coordinator_tool_set() -> &'static [&'static str] {
         "task_stop",
         "task_update",
         // --- Local context helpers (read-only / non-shell) ---
-        "todo_write",
-        "web_fetch",
-        "web_search",
+        "TodoWrite",
+        "WebFetch",
+        "WebSearch",
         // --- The agent tool itself (so the coordinator can dispatch) ---
         "agent",
-        // --- Plan mode (read-only) ---
+        // --- Plan mode ---
         "enter_plan_mode",
         "exit_plan_mode",
         "request_plan_mode",
@@ -98,12 +97,10 @@ pub fn is_coordinator_tool(tool_name: &str) -> bool {
 /// Currently mirrors the spec's "Edit / Write / Bash" prohibition.
 pub fn coordinator_deny_list() -> &'static [&'static str] {
     &[
-        "edit",
-        "write",
-        "bash",
-        "shell",
-        "multi_edit",
-        "notebook_edit",
+        // PascalCase matches actual Tool::spec().name values.
+        "Edit",
+        "Write",
+        "Bash",
     ]
 }
 
@@ -143,7 +140,8 @@ mod tests {
     #[test]
     fn allow_list_excludes_mutating_tools() {
         // The whole point of coordinator mode: no direct mutation.
-        for forbidden in ["edit", "write", "bash"] {
+        // Tool names are PascalCase (matching Tool::spec().name).
+        for forbidden in ["Edit", "Write", "Bash"] {
             assert!(
                 !is_allowed_in_coordinator_mode(forbidden),
                 "coordinator mode must forbid `{forbidden}`"
@@ -175,23 +173,26 @@ mod tests {
     fn allow_list_includes_agent_and_read_only_introspection() {
         for required in [
             "agent",
-            "list_files",
-            "read_file",
-            "grep",
+            "Read",
+            "Grep",
+            "Glob",
             "shared_memory_read",
         ] {
-            assert!(is_allowed_in_coordinator_mode(required));
+            assert!(
+                is_allowed_in_coordinator_mode(required),
+                "coordinator mode must allow `{required}`"
+            );
         }
     }
 
     #[test]
     fn deny_list_blocks_even_if_allowlist_grows() {
         // The deny list is the safety net.  Even if a future change
-        // adds "edit" to the allow list (which it shouldn't), the
-        // deny list still excludes it.
-        assert!(coordinator_deny_list().contains(&"edit"));
-        assert!(coordinator_deny_list().contains(&"write"));
-        assert!(coordinator_deny_list().contains(&"bash"));
+        // adds "Edit" to the allow list (which it shouldn't), the
+        // deny list still excludes it. Tool names are PascalCase.
+        assert!(coordinator_deny_list().contains(&"Edit"));
+        assert!(coordinator_deny_list().contains(&"Write"));
+        assert!(coordinator_deny_list().contains(&"Bash"));
     }
 
     #[test]

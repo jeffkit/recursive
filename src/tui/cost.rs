@@ -130,6 +130,15 @@ pub fn detect_model_name() -> String {
         .unwrap_or_else(|_| "gpt-4o-mini".to_string())
 }
 
+/// Saturating cast from u64 to u32: returns `u32::MAX` instead of wrapping.
+///
+/// `TokenUsage` fields are `u32` but session totals accumulate as `u64`.
+/// Very long sessions (>4 billion tokens) are extremely rare in practice,
+/// but saturating is safer than silent modular truncation.
+fn saturating_u32(v: u64) -> u32 {
+    v.min(u32::MAX as u64) as u32
+}
+
 /// Compute estimated cost in USD given accumulated tokens and cache stats.
 /// Delegates to `pricing_for()` from the bundled provider catalog.
 /// Uses `ModelPricing::cost_usd()` which applies cache-hit discount rates.
@@ -143,11 +152,11 @@ pub fn estimate_cost(
 ) -> Option<f64> {
     let pricing = crate::llm::pricing_for(model)?;
     let usage = crate::llm::TokenUsage {
-        prompt_tokens: total_input as u32,
-        completion_tokens: total_output as u32,
+        prompt_tokens: saturating_u32(total_input),
+        completion_tokens: saturating_u32(total_output),
         total_tokens: 0,
-        cache_hit_tokens: cache_hit as u32,
-        cache_miss_tokens: cache_miss as u32,
+        cache_hit_tokens: saturating_u32(cache_hit),
+        cache_miss_tokens: saturating_u32(cache_miss),
         reasoning_tokens: 0,
     };
     Some(pricing.cost_usd(usage))

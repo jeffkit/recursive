@@ -81,7 +81,6 @@ pub struct AutoClassifier {
 #[derive(serde::Deserialize)]
 struct ClassifierResponse {
     block: bool,
-    #[allow(dead_code)]
     reason: String,
 }
 

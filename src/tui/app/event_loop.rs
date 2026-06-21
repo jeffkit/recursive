@@ -9,6 +9,9 @@ impl App {
     /// Apply an event coming from the backend worker.
     pub fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
+            UiEvent::RuntimeReady => {
+                self.connected = true;
+            }
             UiEvent::AssistantPartial { text } => {
                 self.append_streaming_assistant(&text);
             }

@@ -32,14 +32,11 @@ pub struct AnthropicProvider {
     temperature: f64,
     max_tokens: u32,
     retry: RetryPolicy,
-    /// Cap on `ToolSearchTool` round-trips per `complete_with_search` /
-    /// `stream_with_search` call, mirroring the OpenAI provider. Anthropic
-    /// itself does not yet drive a server-side tool-search loop, so this
-    /// field is configured (and surfaced via `with_max_search_rounds`) for
-    /// API parity with `OpenAiProvider` but is currently unused at
-    /// runtime. Wire it up when Anthropic gets its own deferred-tool
-    /// search loop.
-    #[allow(dead_code)]
+    /// Cap on `ToolSearchTool` round-trips. Set via `with_max_search_rounds()`
+    /// for API parity with `OpenAiProvider`. Not yet consumed because Anthropic
+    /// does not currently have a server-side deferred search loop. Wire it up
+    /// once that becomes available.
+    #[allow(dead_code, reason = "API parity placeholder; used once Anthropic adds deferred search")]
     max_search_rounds: usize,
 }
 
@@ -90,10 +87,8 @@ impl AnthropicProvider {
         self
     }
 
-    /// Cap on `ToolSearchTool` round-trips per `complete_with_search` /
-    /// `stream_with_search` call. Mirrors `OpenAiProvider`; the value is
-    /// stored but not yet consumed by the Anthropic code path (see the
-    /// field doc for context).
+    /// Cap on `ToolSearchTool` round-trips per call. Stored for API parity
+    /// with `OpenAiProvider`; wired up once Anthropic supports deferred search.
     pub fn with_max_search_rounds(mut self, n: usize) -> Self {
         self.max_search_rounds = n;
         self

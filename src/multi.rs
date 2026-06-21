@@ -287,18 +287,15 @@ pub type AgentManifest = HashMap<String, WorkerManifestEntry>;
 pub struct AgentPool {
     roles: HashMap<String, AgentRole>,
     provider: Arc<dyn ChatProvider>,
-    #[allow(dead_code)]
-    config: Config,
     memory: SharedMemory,
     bus: MessageBus,
 }
 
 impl AgentPool {
-    pub fn new(provider: Arc<dyn ChatProvider>, config: Config) -> Self {
+    pub fn new(provider: Arc<dyn ChatProvider>, _config: Config) -> Self {
         Self {
             roles: HashMap::new(),
             provider,
-            config,
             memory: SharedMemory::new(),
             bus: MessageBus::new(),
         }

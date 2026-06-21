@@ -87,7 +87,7 @@ impl RateLimiter {
     }
 
     /// Return the number of client buckets currently stored.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) async fn bucket_count(&self) -> usize {
         self.buckets.lock().await.len()
     }
