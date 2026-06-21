@@ -194,14 +194,20 @@ mod tests {
 
         // Before runtime is ready: shows "starting…".
         let text = line_text(&build_line(&app));
-        assert!(text.contains("starting"), "expected 'starting' before RuntimeReady; got: {text}");
+        assert!(
+            text.contains("starting"),
+            "expected 'starting' before RuntimeReady; got: {text}"
+        );
         assert!(text.contains("deepseek-chat"));
 
         // After RuntimeReady: shows "local".
         app.connected = true;
         let line = build_line(&app);
         let text = line_text(&line);
-        assert!(text.contains("local"), "expected 'local' after RuntimeReady; got: {text}");
+        assert!(
+            text.contains("local"),
+            "expected 'local' after RuntimeReady; got: {text}"
+        );
         assert!(text.contains("deepseek-chat"));
         assert!(text.contains("↑1.2k"));
         assert!(text.contains("↓342"));

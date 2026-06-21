@@ -36,7 +36,10 @@ pub struct AnthropicProvider {
     /// for API parity with `OpenAiProvider`. Not yet consumed because Anthropic
     /// does not currently have a server-side deferred search loop. Wire it up
     /// once that becomes available.
-    #[allow(dead_code, reason = "API parity placeholder; used once Anthropic adds deferred search")]
+    #[allow(
+        dead_code,
+        reason = "API parity placeholder; used once Anthropic adds deferred search"
+    )]
     max_search_rounds: usize,
 }
 
@@ -526,43 +529,15 @@ impl AnthropicProvider {
                 if let Some(delta) = parsed.get("delta") {
                     let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     match delta_type {
-                        "text_delta" => {
-                            if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
-                                    acc.content.push_str(text);
-                                    if let Some(tx) = stream_tx {
-                                        let _ = tx.send(StreamChunk::Text(text.to_string()));
-                                    }
-                                }
-                            }
-                        }
+                        "text_delta" => Self::handle_text_delta(acc, delta, stream_tx),
                         "input_json_delta" => {
-                            if let Some(partial) =
-                                delta.get("partial_json").and_then(|v| v.as_str())
-                            {
-                                let index =
-                                    parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
-                                        as usize;
-                                while acc.tool_calls.len() <= index {
-                                    acc.tool_calls.push(StreamToolCall::default());
-                                }
-                                acc.tool_calls[index].partial_json.push_str(partial);
-                            }
+                            Self::handle_input_json_delta(acc, delta, &parsed);
                         }
                         // Extended-thinking streaming delta. Accumulate into
                         // `reasoning_content` and forward as a `Reasoning`
                         // chunk so the UI renders the thinking live, above
                         // the answer.
-                        "thinking_delta" => {
-                            if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
-                                if !t.is_empty() {
-                                    acc.reasoning_content.push_str(t);
-                                    if let Some(tx) = stream_tx {
-                                        let _ = tx.send(StreamChunk::Reasoning(t.to_string()));
-                                    }
-                                }
-                            }
-                        }
+                        "thinking_delta" => Self::handle_thinking_delta(acc, delta, stream_tx),
                         _ => {}
                     }
                 }
@@ -598,6 +573,42 @@ impl AnthropicProvider {
 
         acc.current_event = None;
         Ok(())
+    }
+
+    /// Append a `text_delta` chunk to the content buffer and optionally
+    /// forward it to the live-streaming channel.
+    fn handle_text_delta(acc: &mut SseAccum, delta: &Value, stream_tx: &Option<StreamSender>) {
+        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                acc.content.push_str(text);
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(StreamChunk::Text(text.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Append a partial JSON fragment for the tool call at `parsed["index"]`.
+    fn handle_input_json_delta(acc: &mut SseAccum, delta: &Value, parsed: &Value) {
+        if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
+            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            while acc.tool_calls.len() <= index {
+                acc.tool_calls.push(StreamToolCall::default());
+            }
+            acc.tool_calls[index].partial_json.push_str(partial);
+        }
+    }
+
+    /// Append an extended-thinking chunk and optionally stream it live.
+    fn handle_thinking_delta(acc: &mut SseAccum, delta: &Value, stream_tx: &Option<StreamSender>) {
+        if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+            if !t.is_empty() {
+                acc.reasoning_content.push_str(t);
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(StreamChunk::Reasoning(t.to_string()));
+                }
+            }
+        }
     }
 }
 
@@ -1783,5 +1794,47 @@ data: {\"type\":\"message_stop\"}
 
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "Read");
+    }
+
+    #[test]
+    fn handle_text_delta_appends_content_and_skips_empty() {
+        let mut acc = SseAccum::default();
+        let delta = json!({ "type": "text_delta", "text": "hello" });
+        AnthropicProvider::handle_text_delta(&mut acc, &delta, &None);
+        assert_eq!(acc.content, "hello");
+
+        let empty_delta = json!({ "type": "text_delta", "text": "" });
+        AnthropicProvider::handle_text_delta(&mut acc, &empty_delta, &None);
+        assert_eq!(acc.content, "hello", "empty text must not change content");
+    }
+
+    #[test]
+    fn handle_input_json_delta_fills_tool_call_slot() {
+        let mut acc = SseAccum::default();
+        let delta = json!({ "type": "input_json_delta", "partial_json": r#"{"pa"# });
+        let parsed = json!({ "index": 0, "delta": delta });
+        AnthropicProvider::handle_input_json_delta(&mut acc, &delta, &parsed);
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert_eq!(acc.tool_calls[0].partial_json, r#"{"pa"#);
+
+        let delta2 = json!({ "type": "input_json_delta", "partial_json": r#"th":"x"}"# });
+        let parsed2 = json!({ "index": 0, "delta": delta2 });
+        AnthropicProvider::handle_input_json_delta(&mut acc, &delta2, &parsed2);
+        assert_eq!(acc.tool_calls[0].partial_json, r#"{"path":"x"}"#);
+    }
+
+    #[test]
+    fn handle_thinking_delta_appends_reasoning_and_skips_empty() {
+        let mut acc = SseAccum::default();
+        let delta = json!({ "type": "thinking_delta", "thinking": "step 1" });
+        AnthropicProvider::handle_thinking_delta(&mut acc, &delta, &None);
+        assert_eq!(acc.reasoning_content, "step 1");
+
+        let empty = json!({ "type": "thinking_delta", "thinking": "" });
+        AnthropicProvider::handle_thinking_delta(&mut acc, &empty, &None);
+        assert_eq!(
+            acc.reasoning_content, "step 1",
+            "empty thinking must not change reasoning"
+        );
     }
 }

@@ -98,9 +98,7 @@ pub fn is_coordinator_tool(tool_name: &str) -> bool {
 pub fn coordinator_deny_list() -> &'static [&'static str] {
     &[
         // PascalCase matches actual Tool::spec().name values.
-        "Edit",
-        "Write",
-        "Bash",
+        "Edit", "Write", "Bash",
     ]
 }
 
@@ -171,13 +169,7 @@ mod tests {
 
     #[test]
     fn allow_list_includes_agent_and_read_only_introspection() {
-        for required in [
-            "agent",
-            "Read",
-            "Grep",
-            "Glob",
-            "shared_memory_read",
-        ] {
+        for required in ["agent", "Read", "Grep", "Glob", "shared_memory_read"] {
             assert!(
                 is_allowed_in_coordinator_mode(required),
                 "coordinator mode must allow `{required}`"

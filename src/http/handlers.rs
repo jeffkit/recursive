@@ -1249,10 +1249,80 @@ impl AguiConverter {
                 // Actual RunFinished is emitted by the caller (it knows
                 // the thread/run ids); we just flush state here.
             }
-            // TODO(g141, g140): map permission_request / checkpoint_post /
-            // heartbeat / file_artifact onto Custom events here.
+            // Hook lifecycle events: forward as Custom so AG-UI clients can
+            // render hook progress and system messages in real time.
+            AgentEvent::HookStarted {
+                hook_event,
+                hook_name,
+                status_message,
+                ..
+            } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/hook_started".into(),
+                    value: serde_json::json!({
+                        "hookEvent": hook_event,
+                        "hookName": hook_name,
+                        "statusMessage": status_message,
+                    }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::HookProgress {
+                hook_event,
+                hook_name,
+                last_line,
+                ..
+            } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/hook_progress".into(),
+                    value: serde_json::json!({
+                        "hookEvent": hook_event,
+                        "hookName": hook_name,
+                        "lastLine": last_line,
+                    }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::HookFinished {
+                hook_event,
+                hook_name,
+                outcome,
+                duration_ms,
+                ..
+            } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/hook_finished".into(),
+                    value: serde_json::json!({
+                        "hookEvent": hook_event,
+                        "hookName": hook_name,
+                        "outcome": outcome,
+                        "durationMs": duration_ms,
+                    }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::HookSystemMessage { text, .. } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/hook_system_message".into(),
+                    value: serde_json::json!({ "text": text }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            // Task checklist updates: forward so clients can render live todo state.
+            AgentEvent::TodoUpdated { todos, .. } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/todo_updated".into(),
+                    value: serde_json::json!({ "todos": todos }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            // checkpoint_post is emitted directly by the driver task (not via
+            // AguiConverter) after RunFinished so it lands last.
+            // heartbeat is emitted as an SSE comment at the HTTP layer.
+            // permission_request and file_artifact require new AgentEvent variants
+            // (tracked as g141/g140) before they can be mapped here.
             // Other variants (Latency, Usage, Compacted, PlanProposed,
-            // PlanConfirmed, PlanRejected) have no AG-UI standard
+            // PlanConfirmed, PlanRejected, etc.) have no AG-UI standard
             // equivalent and are intentionally dropped.
             _ => {}
         }

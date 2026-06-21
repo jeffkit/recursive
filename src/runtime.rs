@@ -412,7 +412,7 @@ impl AgentRuntime {
     /// (or `MessageAppendedWithAudit`) for each, then flush the deferred
     /// `TurnFinished` event.
     async fn emit_turn_messages(&mut self, outcome: &crate::kernel::TurnOutcome) {
-        let new_messages = outcome.new_messages.clone();
+        let new_messages = &outcome.new_messages;
         let turn_usage = crate::session::UsageMeta::from_token_usage(&outcome.usage);
         let mut tool_audits = outcome.tool_audits.clone();
         // Token usage belongs only on the last assistant message of the turn —
