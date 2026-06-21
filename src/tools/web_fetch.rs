@@ -326,12 +326,11 @@ impl Tool for WebFetch {
 
         let total_bytes = body.len();
         let truncated = if total_bytes > max_bytes {
-            let truncated_body = &body[..max_bytes];
-            let msg = format!(
+            let truncated_body = crate::truncate_str(&body, max_bytes);
+            format!(
                 "{}\n\n[…truncated at {} bytes; total body was {} bytes]",
                 truncated_body, max_bytes, total_bytes
-            );
-            msg
+            )
         } else {
             body
         };
@@ -638,5 +637,21 @@ mod tests {
         let md = WebFetch::html_to_markdown(html);
         assert!(md.contains("# Title"));
         assert!(md.contains("Link"));
+    }
+
+    #[test]
+    fn truncate_multibyte_body_does_not_panic() {
+        // "你好世界" = 4 chars × 3 bytes each = 12 bytes per repeat.
+        // 100 repeats = 1200 bytes total.
+        let chinese_body = "你好世界".repeat(100);
+        // max_bytes=100 would cut through a 3-byte sequence with naive byte indexing.
+        // crate::truncate_str must return a valid &str without panicking.
+        let truncated = crate::truncate_str(&chinese_body, 100);
+        assert!(
+            truncated.len() <= 100,
+            "truncated len must not exceed max_bytes"
+        );
+        // The result must be valid UTF-8 (would panic at assert if not, catching any regression).
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 }

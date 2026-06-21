@@ -643,6 +643,7 @@ impl OpenAiProvider {
                     let line = std::mem::take(&mut line_buf);
                     Self::process_sse_line(
                         &line,
+                        &self.model,
                         &mut content,
                         &mut reasoning_content,
                         &mut tool_call_builders,
@@ -667,6 +668,7 @@ impl OpenAiProvider {
         if !line_buf.is_empty() {
             Self::process_sse_line(
                 &line_buf,
+                &self.model,
                 &mut content,
                 &mut reasoning_content,
                 &mut tool_call_builders,
@@ -712,8 +714,12 @@ impl OpenAiProvider {
         })
     }
 
+    // provider is needed to produce accurate error messages when the OpenAI adapter
+    // is used by non-OpenAI backends (DeepSeek, GLM, Moonshot, …).
+    #[allow(clippy::too_many_arguments)]
     fn process_sse_line(
         line: &str,
+        provider: &str,
         content: &mut String,
         reasoning_content: &mut String,
         tool_call_builders: &mut HashMap<usize, (String, String, String)>,
@@ -730,7 +736,7 @@ impl OpenAiProvider {
         }
 
         let chunk: Value = serde_json::from_str(data).map_err(|e| Error::Llm {
-            provider: "openai".into(),
+            provider: provider.to_string(),
             message: format!("SSE parse error: {e}; data: {data}"),
         })?;
 

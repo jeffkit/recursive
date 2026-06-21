@@ -1248,25 +1248,27 @@ api_key = "sk-from-file"
         }
     }
 
+    // ── Stuck-detection env-var overrides ───────────────────────────────
+    //
+    // Consolidated per .dev/AGENTS.md §5: set_var/remove_var are
+    // process-global, so we hold env_lock for the whole test body and
+    // exercise both fields in a single test.
     #[test]
-    fn stuck_window_env_override() {
-        std::env::set_var("RECURSIVE_STUCK_WINDOW", "5");
-        let window = std::env::var("RECURSIVE_STUCK_WINDOW")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(10);
-        assert_eq!(window, 5);
-        std::env::remove_var("RECURSIVE_STUCK_WINDOW");
-    }
+    fn stuck_window_and_error_rate_env_override() {
+        let _env_lock = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
 
-    #[test]
-    fn stuck_error_rate_env_override() {
+        // Override stuck_window: env=5 → Config reports 5.
+        std::env::set_var("RECURSIVE_STUCK_WINDOW", "5");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.stuck_window, 5);
+        std::env::remove_var("RECURSIVE_STUCK_WINDOW");
+
+        // Override stuck_error_rate: env=0.5 → Config reports 0.5.
         std::env::set_var("RECURSIVE_STUCK_ERROR_RATE", "0.5");
-        let rate = std::env::var("RECURSIVE_STUCK_ERROR_RATE")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.8);
-        assert!((rate - 0.5).abs() < 1e-9);
+        let config = Config::from_env().unwrap();
+        assert!((config.stuck_error_rate - 0.5).abs() < 1e-9);
         std::env::remove_var("RECURSIVE_STUCK_ERROR_RATE");
     }
 
