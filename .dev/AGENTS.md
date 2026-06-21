@@ -199,6 +199,30 @@ tests/
    non-interactive subprocesses. Only set `RECURSIVE_SMOKE_TEST=0`
    if Docker is genuinely unavailable in the run environment.
 
+   **E2E test authoring rules (applies when a goal touches `e2e/`).**
+   The container binary (`recursive-e2e`) may lag the source tree. Before
+   writing E2E assertions, verify the actual tool names and env-var support:
+   ```bash
+   docker exec recursive-e2e sh -c \
+     'echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}" \
+      | recursive mcp' | jq '[.result.tools[].name]'
+   ```
+   Key invariants:
+   - Tool names are PascalCase (`Read`, `Write`, `Bash`, `Glob`). Don't assert
+     `read_file` / `write_file` — those are backward-compat aliases that may
+     disappear.
+   - `RECURSIVE_SESSIONS_DIR` is ignored by older binaries. For any suite
+     that uses `recursive-session:` assertions, isolate with
+     `RECURSIVE_HOME=/tmp/rh-{unique}` and dynamically `find transcript.jsonl`
+     to copy it to a predictable path. Never hardcode a sessions path.
+   - `POST /sessions` requires `Content-Type: application/json`. The messages
+     endpoint field is `content`, not `message`.
+   - Node.js scripts: use `http://127.0.0.1:PORT`, not `http://localhost:PORT`
+     (Node 18 resolves localhost → ::1 IPv6; server binds IPv4 only).
+   - `recursive loop` does not produce `transcript.jsonl`; only use `file:`
+     assertions for loop-mode tests.
+   Full details: `CLAUDE.md` → "E2E testing rules" section.
+
    **Verify behavior through `cargo test`, never through `cargo run | jq`.**
    On a fresh worktree, `cargo run` first does a full `cargo build`, whose
    "Compiling …" / "Finished …" lines spill onto stderr *and sometimes

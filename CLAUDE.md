@@ -90,6 +90,94 @@ work safe, and prevents in-flight changes from colliding with the
 stable branch. A worktree is a full working tree on a different branch,
 so editing one does not touch the other.
 
+## E2E testing rules
+
+E2E tests live in `e2e/` and run via `argusai -c e2e.yaml`. Before writing
+or modifying any E2E test, internalize these hard-won rules:
+
+### Before writing a new suite
+
+1. **Confirm the container binary first.** The binary inside `recursive-e2e`
+   may lag the source tree. Always check before writing assertions:
+   ```bash
+   docker exec recursive-e2e recursive --version
+   docker exec recursive-e2e sh -c 'echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}" | recursive mcp' | jq '[.result.tools[].name]'
+   ```
+   Tool names are **PascalCase** (`Read`, `Write`, `Bash`, `Glob`). If you
+   assert snake_case (`read_file`, `write_file`) the test will silently lie.
+
+2. **Port registry — every HTTP suite picks a unique port:**
+
+   | Port | Suite |
+   |------|-------|
+   | 9090 | 08-http-api |
+   | 9091 | 08b-http-rate-limit |
+   | 9092 | 18-goal-loop |
+   | 9093 | 19-http-interrupt |
+   | 9096 | 21-typescript-sdk |
+   | 9097 | 39-http-auth |
+   | 9098 | (reserved) |
+   | 9099 | 22-compaction |
+
+   Add new HTTP suites to this table. Shared ports cause 401/ECONNREFUSED ghosts.
+
+### Session path isolation (mandatory for `recursive-session:` assertions)
+
+The container binary ignores `RECURSIVE_SESSIONS_DIR`. Sessions land at
+`RECURSIVE_HOME/workspaces/{SHA256_HASH}/sessions/`. **Never hardcode this path.**
+
+Required pattern for every agent `run` that needs a `recursive-session:` assertion:
+
+```bash
+# 1. Isolate with a unique RECURSIVE_HOME
+RECURSIVE_HOME=/tmp/rh-mytest recursive run --max-steps 3 ...
+
+# 2. Dynamically locate the transcript
+SESSION_DIR=$(find /tmp/rh-mytest -name "transcript.jsonl" 2>/dev/null \
+  | head -1 | xargs dirname)
+mkdir -p /tmp/sessions-mytest
+cp -r "$SESSION_DIR/." /tmp/sessions-mytest/
+
+# 3. Assert on the predictable path
+assert:
+  recursive-session:
+    input: /tmp/sessions-mytest
+```
+
+Always clean up in teardown:
+```bash
+rm -rf /tmp/rh-mytest /tmp/sessions-mytest
+```
+
+### aimock fixtures: use `turnIndex`, not fragile text matching
+
+Multi-turn fixtures **must** use `turnIndex` + `hasToolResult`:
+```json
+[
+  { "turnIndex": 0, "response": { "tool_calls": [{ "name": "Read", ... }] } },
+  { "turnIndex": 1, "hasToolResult": true, "response": { "tool_calls": [{ "name": "Write", ... }] } },
+  { "turnIndex": 2, "hasToolResult": true, "response": { "content": "Done." } }
+]
+```
+
+### HTTP API calls inside the container
+
+- Always include `-H 'Content-Type: application/json'`
+- `POST /sessions` body: `{"system_prompt": "..."}` (can be empty `{}`)
+- `POST /sessions/:id/messages` field is **`content`**, not `message`
+- Node.js scripts: use `http://127.0.0.1:PORT`, never `http://localhost:PORT`
+  (Node 18 `fetch` resolves `localhost` → `::1` IPv6; the server binds IPv4 only)
+
+### What `recursive loop` cannot assert
+
+`recursive loop` does **not** produce `transcript.jsonl`. Never use
+`recursive-session:` assertions for loop-mode tests. Use `file:` assertions only.
+
+### `argusAI save:` cannot capture exec stdout
+
+ArgusAI cannot capture `exec:` stdout into variables via `save:`. Pass
+runtime state between cases through temp files (`echo "$ID" > /tmp/my-sid`).
+
 ## Skills available in this project
 
 - `/recursive-loop` — act as the loop orchestrator: read roadmap, pick goals,
