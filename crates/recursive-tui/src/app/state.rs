@@ -12,15 +12,14 @@ use super::{
 impl App {
     pub fn new() -> Self {
         // Goal-169: load workspace skill commands at startup.
-        let workspace = crate::config::Config::from_env()
+        let workspace = recursive::config::Config::from_env()
             .map(|c| c.workspace)
             .unwrap_or_else(|e| {
                 tracing::warn!("config error at TUI startup, using '.': {e}");
                 std::path::PathBuf::from(".")
             });
-        let skills = crate::tui::skill_commands::SkillCommandLoader::load(&workspace);
-        let commands =
-            crate::tui::commands::CommandRegistry::default_set().with_skill_commands(skills);
+        let skills = crate::skill_commands::SkillCommandLoader::load(&workspace);
+        let commands = crate::commands::CommandRegistry::default_set().with_skill_commands(skills);
         Self {
             prompt: PromptInputState::new(),
             // Empty transcript — the bordered "Messages" panel and the
@@ -61,14 +60,14 @@ impl App {
             current_todos: Vec::new(),
             active_goal: None,
             workspace_path: workspace,
-            theme: &crate::tui::ui::theme::DARK,
+            theme: &crate::ui::theme::DARK,
             modal_scroll: 0,
             active_command_panel: None,
         }
     }
 
     /// Push a modal onto the stack and reset the modal scroll to the top.
-    pub fn push_modal(&mut self, modal: crate::tui::ui::modal::Modal) {
+    pub fn push_modal(&mut self, modal: crate::ui::modal::Modal) {
         self.modal_scroll = 0;
         self.modals.push(modal);
     }
@@ -110,7 +109,7 @@ impl App {
 
     /// Open an interactive command panel below the input box and switch
     /// the input mode to [`InputMode::CommandInteract`].
-    pub fn open_command_panel(&mut self, panel: crate::tui::app::CommandPanelState) {
+    pub fn open_command_panel(&mut self, panel: crate::app::CommandPanelState) {
         self.active_command_panel = Some(panel);
         self.prompt.mode = InputMode::CommandInteract;
         self.prompt.buffer.clear();
@@ -140,7 +139,7 @@ impl App {
     /// Receive a pending permission request from the backend side-channel.
     /// Auto-allow if the tool is in the `auto_allowed_tools` set;
     /// otherwise store it so the UI can display the modal on the next render.
-    pub fn set_pending_permission(&mut self, req: crate::tui::events::PermissionRequest) {
+    pub fn set_pending_permission(&mut self, req: crate::events::PermissionRequest) {
         if self.auto_allowed_tools.contains(&req.tool_name) {
             // Auto-allow: resolve immediately without showing the modal.
             let _ = req.reply.send(true);
@@ -161,9 +160,9 @@ impl App {
 
     /// Goal-230: receive a skill-install search request from the tool
     /// side-channel and push the Results modal.
-    pub fn handle_skill_search_request(&mut self, req: crate::tui::events::SkillSearchRequest) {
-        use crate::tui::app::PendingSkillInstall;
-        use crate::tui::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
+    pub fn handle_skill_search_request(&mut self, req: crate::events::SkillSearchRequest) {
+        use crate::app::PendingSkillInstall;
+        use crate::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
 
         // Deny any lingering install reply so the previous tool call unblocks.
         if let Some(old) = self.pending_skill_install.take() {
@@ -190,9 +189,9 @@ impl App {
 
     /// Goal-230: receive a skill-install files request from the tool
     /// side-channel and advance the open modal to the Files page.
-    pub fn handle_skill_files_request(&mut self, req: crate::tui::events::SkillFilesRequest) {
-        use crate::tui::app::PendingSkillInstall;
-        use crate::tui::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
+    pub fn handle_skill_files_request(&mut self, req: crate::events::SkillFilesRequest) {
+        use crate::app::PendingSkillInstall;
+        use crate::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
 
         // Update or push the modal with file data.
         if let Some(Modal::SkillInstall(state)) = self.modals.last_mut() {
@@ -231,8 +230,8 @@ impl Default for App {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::app::{App, AppScreen};
-    use crate::tui::cost::{detect_model_name, estimate_cost};
+    use crate::app::{App, AppScreen};
+    use crate::cost::{detect_model_name, estimate_cost};
 
     // ── construction ────────────────────────────────────────────────
 
@@ -281,7 +280,7 @@ mod tests {
     #[test]
     fn detect_model_name_falls_back_to_config_file() {
         let home = tempfile::tempdir().expect("tempdir");
-        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
 
         // Snapshot env so we can clear / restore.
         let prev_recursive_model = std::env::var("RECURSIVE_MODEL").ok();

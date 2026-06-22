@@ -12,7 +12,7 @@
 ///
 /// Goal 147 removed the `PlanReview` variant — the plan-mode
 /// confirmation now lives on the modal stack as
-/// [`crate::tui::ui::modal::Modal::PlanReview`], so we are down to one
+/// [`crate::ui::modal::Modal::PlanReview`], so we are down to one
 /// screen: the chat surface. The splash screen was replaced by a
 /// startup banner printed to stdout before the inline TUI starts.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,7 +70,7 @@ pub struct ToolResultData {
 ///
 /// The chat screen renders a `Vec<TranscriptBlock>` in order, with one
 /// blank line between adjacent blocks. Each variant has a corresponding
-/// renderer in [`crate::tui::ui::transcript`].
+/// renderer in [`crate::ui::transcript`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptBlock {
     User {

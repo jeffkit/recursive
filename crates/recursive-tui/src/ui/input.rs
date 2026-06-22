@@ -17,7 +17,7 @@ use ratatui::layout::Position;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::tui::app::{App, InputMode};
+use crate::app::{App, InputMode};
 
 /// Maximum visible input rows (after which the box scrolls
 /// internally). The +2 below accounts for the box's borders.
@@ -189,7 +189,7 @@ pub fn footer_hint(mode: InputMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::AppScreen;
+    use crate::app::AppScreen;
 
     #[test]
     fn renders_correct_indicator_per_mode() {

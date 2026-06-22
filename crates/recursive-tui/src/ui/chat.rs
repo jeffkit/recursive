@@ -1,13 +1,13 @@
 //! Chat screen renderer (block-aware).
 //!
 //! Goal-144 redraws the messages panel using
-//! [`crate::tui::ui::transcript::render_blocks`] (one block per logical
+//! [`crate::ui::transcript::render_blocks`] (one block per logical
 //! transcript entry, separated by blank lines) and replaces the old
 //! single-line status bar with the rich
-//! [`crate::tui::ui::status::render`] formatter.
+//! [`crate::ui::status::render`] formatter.
 //!
 //! Goal-145 swaps the single-line input footer for the multi-mode
-//! [`crate::tui::ui::input`] renderer (input box + dynamic height + footer
+//! [`crate::ui::input`] renderer (input box + dynamic height + footer
 //! hint) and lets the terminal native cursor land on the actual edit
 //! position.
 //!
@@ -15,15 +15,15 @@
 //! the status bar when `current_todos` is non-empty.
 //!
 //! While a turn is running the spinner from
-//! [`crate::tui::ui::spinner::format_line`] is appended after the last
+//! [`crate::ui::spinner::format_line`] is appended after the last
 //! block.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::tools::todo::TodoStatus;
-use crate::tui::app::App;
-use crate::tui::ui::{command_menu, input, modal, spinner, status, transcript};
+use crate::app::App;
+use crate::ui::{command_menu, input, modal, spinner, status, transcript};
+use recursive::tools::todo::TodoStatus;
 
 /// Height of the todo panel (border + one row per item, capped at 6 items).
 fn todo_panel_height(app: &App) -> u16 {

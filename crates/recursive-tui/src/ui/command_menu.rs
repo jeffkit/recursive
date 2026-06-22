@@ -1,12 +1,12 @@
 //! Command-completion popup (Goal 146).
 //!
-//! When the prompt input is in [`crate::tui::app::InputMode::Command`],
+//! When the prompt input is in [`crate::app::InputMode::Command`],
 //! the chat renderer overlays a small popup just above the input box
 //! that lists the candidate commands matching the current buffer.
 //!
 //! The popup is purely visual — keyboard navigation lives in
-//! [`crate::tui::app::App::handle_command_menu_key`], which is called
-//! from [`crate::tui::app::App::handle_key`] before falling through to
+//! [`crate::app::App::handle_command_menu_key`], which is called
+//! from [`crate::app::App::handle_key`] before falling through to
 //! the generic chat key path.
 
 use ratatui::layout::Rect;
@@ -15,8 +15,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::tui::app::App;
-use crate::tui::commands::CommandSpec;
+use crate::app::App;
+use crate::commands::CommandSpec;
 
 /// Maximum number of candidate rows to display in the popup.
 pub const MAX_VISIBLE: usize = 8;
@@ -86,8 +86,8 @@ pub fn popup_rect(input_area: Rect, candidate_count: usize, frame_area: Rect) ->
 /// A single entry in the combined command-menu popup — either a built-in
 /// command or a Goal-169 skill-backed command.
 enum MenuEntry<'a> {
-    Builtin(&'a crate::tui::commands::CommandSpec),
-    Skill(&'a crate::tui::skill_commands::SkillCommand),
+    Builtin(&'a crate::commands::CommandSpec),
+    Skill(&'a crate::skill_commands::SkillCommand),
 }
 
 impl<'a> MenuEntry<'a> {
@@ -115,7 +115,7 @@ impl<'a> MenuEntry<'a> {
 /// (skills are suffixed with `[skill]` in a dim colour so the user can
 /// distinguish them at a glance).
 pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
-    if app.prompt.mode != crate::tui::app::InputMode::Command {
+    if app.prompt.mode != crate::app::InputMode::Command {
         return;
     }
     let builtin_matches = app.commands.search(&app.prompt.buffer);
@@ -177,7 +177,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
 /// Render the @file completion popup (Goal 158). No-op when not in
 /// AtFile mode or when the suggestion list is empty.
 pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
-    if app.prompt.mode != crate::tui::app::InputMode::AtFile {
+    if app.prompt.mode != crate::app::InputMode::AtFile {
         return;
     }
     let suggestions = &app.atfile_suggestions;
@@ -222,7 +222,7 @@ pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
 /// Render the Ctrl+R history-search popup (Goal 160). No-op when not in
 /// HistorySearch mode or when there are no matches to show.
 pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
-    if app.prompt.mode != crate::tui::app::InputMode::HistorySearch {
+    if app.prompt.mode != crate::app::InputMode::HistorySearch {
         return;
     }
     // Always show the popup (even when matches is empty) so the user
@@ -287,7 +287,7 @@ pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
 /// @file-completion, or history-search mode is active, this returns the
 /// number of rows required; otherwise returns 0 so the slot collapses.
 pub fn panel_height(app: &App) -> u16 {
-    use crate::tui::app::InputMode;
+    use crate::app::InputMode;
     match app.prompt.mode {
         InputMode::Command => {
             let n = app.commands.search(&app.prompt.buffer).len()
@@ -330,7 +330,7 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    use crate::tui::app::InputMode;
+    use crate::app::InputMode;
     match app.prompt.mode {
         InputMode::Command => render_command_panel(frame, area, app),
         InputMode::AtFile => render_atfile_panel(frame, area, app),
@@ -630,7 +630,7 @@ pub fn render_permission_modal(frame: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{App, AppScreen, InputMode};
+    use crate::app::{App, AppScreen, InputMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn tab_completes_unique_prefix() {
-        let r = crate::tui::commands::CommandRegistry::default_set();
+        let r = crate::commands::CommandRegistry::default_set();
         // "he" → only /help; should complete to "help".
         let matches = r.search("he");
         let target = tab_completion_target("he", &matches);
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn tab_extends_to_common_prefix_with_multiple_matches() {
-        let r = crate::tui::commands::CommandRegistry::default_set();
+        let r = crate::commands::CommandRegistry::default_set();
         // "co" matches /compact and /cost → common prefix "co"; not a
         // strict extension of "co", so target is None.
         let matches = r.search("co");
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn tab_with_no_matches_returns_none() {
-        let r = crate::tui::commands::CommandRegistry::default_set();
+        let r = crate::commands::CommandRegistry::default_set();
         let matches = r.search("zz");
         assert!(tab_completion_target("zz", &matches).is_none());
     }
@@ -711,7 +711,7 @@ mod tests {
         // /clear resets the transcript to a single "cleared" block.
         assert_eq!(app.blocks.len(), 1);
         match &app.blocks[0] {
-            crate::tui::app::TranscriptBlock::System { text } => {
+            crate::app::TranscriptBlock::System { text } => {
                 assert!(text.contains("cleared"), "got {text:?}")
             }
             other => panic!("expected System, got {other:?}"),

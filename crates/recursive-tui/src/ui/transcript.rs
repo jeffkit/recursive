@@ -7,9 +7,9 @@
 
 use ratatui::prelude::*;
 
-use crate::tui::app::{ToolResultData, TranscriptBlock, UsageStats};
-use crate::tui::ui::theme::Theme;
-use crate::tui::ui::{diff, markdown};
+use crate::app::{ToolResultData, TranscriptBlock, UsageStats};
+use crate::ui::theme::Theme;
+use crate::ui::{diff, markdown};
 
 /// Convert the entire transcript into a flat `Vec<Line>` with one
 /// blank line between adjacent blocks. Folded ToolResult blocks
@@ -428,7 +428,7 @@ fn format_size(bytes: usize) -> String {
 
 // ── Diff ──────────────────────────────────────────────────────────────
 
-fn render_diff(path: &str, hunks: &[crate::tui::app::DiffHunk]) -> Vec<Line<'static>> {
+fn render_diff(path: &str, hunks: &[crate::app::DiffHunk]) -> Vec<Line<'static>> {
     let mut out = vec![diff::header_line(path)];
     if hunks.is_empty() {
         out.push(diff::empty_stub_line(path));
@@ -739,8 +739,8 @@ fn render_plan_mode_request(reason: &str, approved: Option<bool>) -> Vec<Line<'s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock};
-    use crate::tui::ui::theme;
+    use crate::app::{DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock};
+    use crate::ui::theme;
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

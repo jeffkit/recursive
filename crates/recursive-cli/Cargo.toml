@@ -1,0 +1,32 @@
+[package]
+name = "recursive-cli"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Command-line interface for the Recursive agent"
+license = "MIT"
+
+[[bin]]
+name = "recursive"
+path = "src/main.rs"
+
+[dependencies]
+recursive = { package = "recursive-agent", path = "../..", default-features = false, features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml = "0.8"
+
+[features]
+default = []
+weixin = ["recursive/weixin"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,9 +1,9 @@
 //! UI-facing event and action types.
 //!
 //! [`UiEvent`] flows from the agent backend → UI thread; the UI applies
-//! them to [`crate::tui::app::App`] state. [`UserAction`] flows the other way
+//! them to [`crate::app::App`] state. [`UserAction`] flows the other way
 //! — the UI thread captures key events and the
-//! [`crate::tui::backend::Backend`] worker dispatches them onto the
+//! [`crate::backend::Backend`] worker dispatches them onto the
 //! `AgentRuntime`.
 //!
 //! Goal-144 widens this surface from goal-143's four variants to
@@ -106,7 +106,7 @@ pub enum UiEvent {
     /// Goal-167: the agent updated its task list via `todo_write`. Carries
     /// the complete replacement list so the UI can re-render without a diff.
     TodoUpdated {
-        todos: Vec<crate::tools::todo::TodoItem>,
+        todos: Vec<recursive::tools::todo::TodoItem>,
     },
 
     // ── Goal-168: goal-loop status events ────────────────────────────────────
@@ -134,7 +134,7 @@ pub enum UiEvent {
     // ── Goal-173: MCP server list ────────────────────────────────────────────
     /// MCP server list loaded from the workspace config.
     McpServersLoaded {
-        entries: Vec<crate::tui::ui::modal::McpEntry>,
+        entries: Vec<crate::ui::modal::McpEntry>,
     },
 
     // ── Goal-210: hook progress display ─────────────────────────────────────
@@ -265,7 +265,7 @@ pub enum UserAction {
 // (install_skill.rs is part of the core crate, not the tui crate).
 
 #[cfg(feature = "skill-hub")]
-pub use crate::tools::install_skill::{
+pub use recursive::tools::install_skill::{
     SkillFilesRequest, SkillInstallEvent, SkillSearchRequest, SkillSearchResult, SkillZipFile,
 };
 

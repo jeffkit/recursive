@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
-use crate::runtime::GoalState;
+use recursive::runtime::GoalState;
 
 pub mod commands;
 pub mod event_loop;
@@ -23,17 +23,17 @@ pub mod render;
 pub mod state;
 
 // Re-export from sub-modules so the rest of the codebase can still do
-// `use crate::tui::app::Foo` without any changes.
-pub use crate::tui::completion::{
+// `use crate::app::Foo` without any changes.
+pub use crate::completion::{
     collect_files, default_offline_tool_catalog, glob_workspace_files, search_history,
     MAX_ATFILE_SUGGESTIONS, MAX_HSEARCH_RESULTS,
 };
-pub use crate::tui::cost::{detect_model_name, estimate_cost, TurnState, UsageStats};
-pub use crate::tui::input_state::{
+pub use crate::cost::{detect_model_name, estimate_cost, TurnState, UsageStats};
+pub use crate::input_state::{
     double_press_window, strip_history_prefix, DoublePressTracker, InputMode, PromptInputState,
     DOUBLE_PRESS_WINDOW, HISTORY_CAPACITY,
 };
-pub use crate::tui::model::{
+pub use crate::model::{
     AppScreen, DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock,
 };
 pub use render::{parse_v4a_patch, preview_args, verb_for_tool};
@@ -61,10 +61,10 @@ pub struct App {
     pub spinner_frame: usize,
     /// Goal-146: stack of overlay modals. The topmost (last) modal
     /// receives keys; an empty stack means chat keys are active.
-    pub modals: Vec<crate::tui::ui::modal::Modal>,
+    pub modals: Vec<crate::ui::modal::Modal>,
     /// Goal-146: registry of `/`-prefixed slash commands. Lazily
     /// initialised in [`App::new`] with [`CommandRegistry::default_set`].
-    pub commands: crate::tui::commands::CommandRegistry,
+    pub commands: crate::commands::CommandRegistry,
     /// Goal-146: list of tools the runtime has registered. Populated
     /// by `main.rs` from `Backend::tool_specs()` after the worker
     /// boots, and read by the `/tools` command. Defaults to a static
@@ -126,14 +126,14 @@ pub struct App {
     pub pending_skill_install: Option<PendingSkillInstall>,
     /// Goal-167: current task list maintained by `todo_write` calls.
     /// Empty when no task list has been set this session.
-    pub current_todos: Vec<crate::tools::todo::TodoItem>,
+    pub current_todos: Vec<recursive::tools::todo::TodoItem>,
     /// Goal-168: mirrored goal state, updated by `UiEvent::Goal*` events.
     pub active_goal: Option<GoalState>,
     /// Goal-171: workspace root path, used by /resume to list sessions.
     pub workspace_path: std::path::PathBuf,
     /// Goal-174: active colour palette. Defaults to [`DARK`]; switchable
     /// via `/theme <name>` without restart.
-    pub theme: &'static crate::tui::ui::theme::Theme,
+    pub theme: &'static crate::ui::theme::Theme,
 
     // ── Modal scroll ─────────────────────────────────────────────────────
     /// Vertical scroll offset (in lines) for the currently-active modal.
@@ -155,7 +155,7 @@ pub struct App {
 /// State for the interactive panel that expands below the input box when a
 /// slash-command requires user interaction (a form, picker, confirmation, …).
 ///
-/// Commands open a panel by returning [`crate::tui::commands::CommandOutcome::OpenPanel`]
+/// Commands open a panel by returning [`crate::commands::CommandOutcome::OpenPanel`]
 /// from their handler. The panel closes when the user presses Esc or the
 /// command resolves (confirmed / cancelled).
 #[derive(Debug, Clone)]

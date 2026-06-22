@@ -151,7 +151,7 @@ pub(crate) fn extract_write_file_path_from_result(output: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::DiffLineKind;
+    use crate::app::DiffLineKind;
 
     #[test]
     fn tool_call_args_preview_extracts_path() {

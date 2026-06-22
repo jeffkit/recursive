@@ -18,10 +18,10 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::app::{App as AppState, CommandPanelState};
-use crate::tui::events::UserAction;
-use crate::tui::skill_commands::SkillCommand;
-use crate::tui::ui::modal::Modal;
+use crate::app::{App as AppState, CommandPanelState};
+use crate::events::UserAction;
+use crate::skill_commands::SkillCommand;
+use crate::ui::modal::Modal;
 
 /// One registered slash command.
 #[derive(Clone)]
@@ -69,7 +69,7 @@ pub enum CommandOutcome {
     OpenModal(Modal),
     /// Open an interactive panel below the input box. The panel owns
     /// key events until the user confirms (Enter) or cancels (Esc).
-    OpenPanel(crate::tui::app::CommandPanelState),
+    OpenPanel(crate::app::CommandPanelState),
 }
 
 /// Vec-backed slash-command registry.
@@ -349,7 +349,7 @@ fn cmd_plan(app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
 }
 
 fn cmd_journal(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
-    let entries = crate::tui::ui::modal::load_recent_journal_entries(5);
+    let entries = crate::ui::modal::load_recent_journal_entries(5);
     let item_count = entries.len();
     let lines = build_journal_lines(&entries, 0);
     let ctx = serde_journal_context(&entries);
@@ -468,7 +468,7 @@ fn parse_goal_args(raw: &str) -> (String, u32) {
 // ──────────────────────────────────────────────────────────────────────
 
 fn cmd_resume(app: &mut AppState, _args: &[String]) -> CommandOutcome {
-    use crate::tui::ui::modal::load_recent_sessions;
+    use crate::ui::modal::load_recent_sessions;
     let workspace = app.workspace_path.clone();
     let entries = load_recent_sessions(&workspace, 20);
     if entries.is_empty() {
@@ -491,7 +491,7 @@ fn cmd_mcp(_app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
 }
 
 fn cmd_theme(app: &mut AppState, args: &[String]) -> CommandOutcome {
-    use crate::tui::ui::theme::ALL_THEMES;
+    use crate::ui::theme::ALL_THEMES;
     if args.is_empty() {
         // Open the interactive theme picker panel.
         let current = app.theme.name;
@@ -515,7 +515,7 @@ fn cmd_theme(app: &mut AppState, args: &[String]) -> CommandOutcome {
         );
     }
     let requested = args[0].to_lowercase();
-    let found = crate::tui::ui::theme::find_theme(&requested);
+    let found = crate::ui::theme::find_theme(&requested);
     if found.name == requested {
         app.theme = found;
         app.push_system(format!("Theme switched to '{}'.", found.name));
@@ -534,7 +534,7 @@ fn cmd_theme(app: &mut AppState, args: &[String]) -> CommandOutcome {
 // Line builder helpers (called by command handlers above)
 // ──────────────────────────────────────────────────────────────────────
 
-pub fn build_help_lines(registry: &crate::tui::commands::CommandRegistry) -> Vec<Line<'static>> {
+pub fn build_help_lines(registry: &crate::commands::CommandRegistry) -> Vec<Line<'static>> {
     let header = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -596,8 +596,8 @@ pub fn build_help_lines(registry: &crate::tui::commands::CommandRegistry) -> Vec
     out
 }
 
-pub fn build_cost_lines(usage: &crate::tui::app::UsageStats, model: &str) -> Vec<Line<'static>> {
-    let pricing = crate::llm::pricing_for(model);
+pub fn build_cost_lines(usage: &crate::app::UsageStats, model: &str) -> Vec<Line<'static>> {
+    let pricing = recursive::llm::pricing_for(model);
     let cost_in = pricing.map(|p| (usage.total_input as f64) * p.input_per_million / 1_000_000.0);
     let cost_out =
         pricing.map(|p| (usage.total_output as f64) * p.output_per_million / 1_000_000.0);
@@ -657,7 +657,7 @@ pub fn build_cost_lines(usage: &crate::tui::app::UsageStats, model: &str) -> Vec
 }
 
 pub fn build_model_lines() -> Vec<Line<'static>> {
-    let cfg = crate::config::Config::from_env().ok();
+    let cfg = recursive::config::Config::from_env().ok();
     let api_base = cfg
         .as_ref()
         .map(|c| c.api_base.clone())
@@ -665,7 +665,9 @@ pub fn build_model_lines() -> Vec<Line<'static>> {
     let provider = cfg
         .as_ref()
         .and_then(|c| c.preset.clone())
-        .or_else(|| crate::providers::find_preset_by_api_base(&api_base).map(|p| p.id.to_string()))
+        .or_else(|| {
+            recursive::providers::find_preset_by_api_base(&api_base).map(|p| p.id.to_string())
+        })
         .unwrap_or_else(|| "custom".to_string());
     let model = cfg
         .as_ref()
@@ -729,7 +731,7 @@ pub fn build_tool_lines(entries: &[(String, String)]) -> Vec<Line<'static>> {
 }
 
 pub fn build_journal_lines(
-    entries: &[crate::tui::ui::modal::JournalEntry],
+    entries: &[crate::ui::modal::JournalEntry],
     selected: usize,
 ) -> Vec<Line<'static>> {
     let header = Style::default()
@@ -784,7 +786,7 @@ pub fn build_journal_lines(
 
 /// Serialise journal entry names into the panel context so
 /// `handle_command_panel_key` can reload them on selection change.
-pub fn serde_journal_context(entries: &[crate::tui::ui::modal::JournalEntry]) -> String {
+pub fn serde_journal_context(entries: &[crate::ui::modal::JournalEntry]) -> String {
     entries
         .iter()
         .map(|e| e.name.as_str())
@@ -793,7 +795,7 @@ pub fn serde_journal_context(entries: &[crate::tui::ui::modal::JournalEntry]) ->
 }
 
 pub fn build_resume_lines(
-    entries: &[crate::tui::ui::modal::ResumeEntry],
+    entries: &[crate::ui::modal::ResumeEntry],
     selected: usize,
 ) -> Vec<Line<'static>> {
     let header = Style::default()
@@ -830,7 +832,7 @@ pub fn build_resume_lines(
 
 /// Serialise session_dir paths (one per line) into the context so
 /// `handle_command_panel_key` can reconstruct `UserAction::ResumeSession`.
-pub fn serde_resume_context(entries: &[crate::tui::ui::modal::ResumeEntry]) -> String {
+pub fn serde_resume_context(entries: &[crate::ui::modal::ResumeEntry]) -> String {
     entries
         .iter()
         .map(|e| e.session_dir.to_string_lossy().into_owned())
@@ -839,7 +841,7 @@ pub fn serde_resume_context(entries: &[crate::tui::ui::modal::ResumeEntry]) -> S
 }
 
 pub fn build_theme_picker_lines(current: &str, selected: usize) -> Vec<Line<'static>> {
-    use crate::tui::ui::theme::ALL_THEMES;
+    use crate::ui::theme::ALL_THEMES;
     let header = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -868,7 +870,7 @@ pub fn build_theme_picker_lines(current: &str, selected: usize) -> Vec<Line<'sta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{App, TranscriptBlock};
+    use crate::app::{App, TranscriptBlock};
 
     fn invoke(app: &mut App, line: &str) -> InvokeResult {
         let mut parts = line.split_whitespace();

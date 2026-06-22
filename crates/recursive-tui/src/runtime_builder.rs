@@ -1,16 +1,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::Config;
-use crate::llm::RetryPolicy;
-use crate::{AgentRuntime, AgentRuntimeBuilder, ChatProvider};
+use recursive::config::Config;
+use recursive::llm::RetryPolicy;
+use recursive::{AgentRuntime, AgentRuntimeBuilder, ChatProvider};
 
 pub enum RuntimeBuild {
     Ready(Option<Box<AgentRuntime>>),
     Offline { reason: String },
 }
 
-fn build_provider(config: &Config, api_key: String) -> crate::error::Result<Arc<dyn ChatProvider>> {
+fn build_provider(
+    config: &Config,
+    api_key: String,
+) -> recursive::error::Result<Arc<dyn ChatProvider>> {
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
@@ -18,12 +21,12 @@ fn build_provider(config: &Config, api_key: String) -> crate::error::Result<Arc<
     };
     let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
         "anthropic" => Arc::new(
-            crate::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)?
+            recursive::llm::AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
                 .with_retry_policy(retry),
         ),
         _ => Arc::new(
-            crate::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)?
+            recursive::llm::OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
                 .with_retry_policy(retry)
                 .with_max_search_rounds(config.max_search_rounds),
@@ -65,7 +68,7 @@ pub fn build_runtime() -> RuntimeBuild {
     };
 
     let tools =
-        crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
+        recursive::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
 
     match AgentRuntimeBuilder::new()
         .llm(provider)
@@ -96,9 +99,9 @@ pub fn build_runtime() -> RuntimeBuild {
 #[cfg(feature = "skill-hub")]
 pub fn build_runtime_for_tui() -> (
     RuntimeBuild,
-    tokio::sync::mpsc::UnboundedReceiver<crate::tui::events::SkillInstallEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::events::SkillInstallEvent>,
 ) {
-    use crate::tui::events::SkillInstallEvent;
+    use crate::events::SkillInstallEvent;
     use tokio::sync::mpsc;
 
     let (skill_tx, skill_rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
@@ -110,7 +113,7 @@ pub fn build_runtime_for_tui() -> (
 /// Inner helper: build a runtime with optional skill-hub tool injection.
 #[cfg(feature = "skill-hub")]
 fn build_runtime_with_skill_tx(
-    skill_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::events::SkillInstallEvent>>,
+    skill_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::events::SkillInstallEvent>>,
 ) -> RuntimeBuild {
     let config = match Config::from_env() {
         Ok(c) => c,
@@ -144,11 +147,11 @@ fn build_runtime_with_skill_tx(
     };
 
     let mut tools =
-        crate::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
+        recursive::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
 
     // Register skill-hub tools: find_skills (always) and install_skill (TUI only).
-    tools = tools.register(Arc::new(crate::tools::FindSkills::new(vec![])));
-    tools = tools.register(Arc::new(crate::tools::InstallSkill::new(skill_tx)));
+    tools = tools.register(Arc::new(recursive::tools::FindSkills::new(vec![])));
+    tools = tools.register(Arc::new(recursive::tools::InstallSkill::new(skill_tx)));
 
     match AgentRuntimeBuilder::new()
         .llm(provider)
@@ -174,9 +177,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::tui::backend::Backend;
-    use crate::tui::events::UiEvent;
-    use crate::tui::events::UserAction;
+    use crate::backend::Backend;
+    use crate::events::UiEvent;
+    use crate::events::UserAction;
 
     /// RAII guard that clears API key env vars for the duration of a test
     /// and restores them on drop (including on panic).
@@ -222,7 +225,7 @@ mod tests {
         // and does not respond to runtime USERPROFILE / HOME changes.
         // PinnedRecursiveHome also acquires env_lock(), serialising this test
         // against all other env-mutating tests.
-        let _pin = crate::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
 
         // ApiKeyGuard clears the API key vars and restores them on drop,
         // ensuring cleanup even if an assertion panics.

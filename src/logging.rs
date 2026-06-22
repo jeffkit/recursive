@@ -34,6 +34,7 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "cli")]
 use tracing_subscriber::fmt::MakeWriter;
 
 static TUI_QUIET: AtomicBool = AtomicBool::new(false);
@@ -100,6 +101,7 @@ impl io::Write for StderrOrNull {
 #[derive(Clone, Debug)]
 pub struct StderrOrNullMaker;
 
+#[cfg(feature = "cli")]
 impl<'a> MakeWriter<'a> for StderrOrNullMaker {
     type Writer = StderrOrNull;
     fn make_writer(&'a self) -> Self::Writer {

@@ -569,20 +569,6 @@ async fn main() -> anyhow::Result<()> {
             } else if let Some(prompt) = cli.prompt {
                 Cmd::Run { goal: vec![prompt] }
             } else {
-                #[cfg(all(feature = "tui", feature = "weixin"))]
-                if cli.weixin {
-                    return run_tui_with_weixin(
-                        cli.weixin_base_url.clone(),
-                        cli.weixin_cred_path.clone(),
-                        config.workspace.clone(),
-                    )
-                    .await;
-                }
-                #[cfg(feature = "tui")]
-                {
-                    return recursive::tui::run().await.map_err(Into::into);
-                }
-                #[cfg(not(feature = "tui"))]
                 Cmd::Repl
             }
         }
@@ -671,37 +657,6 @@ async fn main() -> anyhow::Result<()> {
                         Arc::new(openai)
                     }
                 };
-            // Goal-169: build the slash command list from built-in TUI commands +
-            // workspace skill files. Guarded by the `tui` feature since
-            // CommandRegistry lives in the tui module.
-            #[cfg(feature = "tui")]
-            let slash_commands: Vec<recursive::http::SlashCommandInfo> = {
-                let registry = recursive::tui::commands::CommandRegistry::default_set();
-                let mut cmds: Vec<recursive::http::SlashCommandInfo> = registry
-                    .commands()
-                    .iter()
-                    .map(|c| recursive::http::SlashCommandInfo {
-                        name: c.name.to_string(),
-                        description: c.summary.to_string(),
-                        source: "builtin".to_string(),
-                        aliases: c.aliases.iter().map(|a| a.to_string()).collect(),
-                        argument_hint: String::new(),
-                    })
-                    .collect();
-                let workspace = std::env::current_dir().unwrap_or_default();
-                let skills = recursive::tui::skill_commands::SkillCommandLoader::load(&workspace);
-                for skill in skills {
-                    cmds.push(recursive::http::SlashCommandInfo {
-                        name: skill.name.clone(),
-                        description: skill.description.clone(),
-                        source: "skill".to_string(),
-                        aliases: skill.aliases.clone(),
-                        argument_hint: skill.argument_hint.clone(),
-                    });
-                }
-                cmds
-            };
-            #[cfg(not(feature = "tui"))]
             let slash_commands: Vec<recursive::http::SlashCommandInfo> = Vec::new();
             // Goal-312: discover skills for skill_index injection into
             // the system prompt of every HTTP API run.
@@ -1466,7 +1421,7 @@ async fn cmd_update() -> anyhow::Result<()> {
                     println!("Release page: {}", release.html_url);
                     println!();
                     println!("To upgrade, rebuild from source:");
-                    println!("  cargo install --path . --features tui");
+                    println!("  cargo install recursive-cli");
                 }
             } else {
                 println!("Could not parse release info.");
@@ -2150,51 +2105,6 @@ async fn dispatch_request_via_registry(
 }
 
 // ── WeChat helpers ────────────────────────────────────────────────────────────
-
-/// Run TUI with a WeChat iLink daemon running in the background.
-///
-/// Starts the WeChat daemon, connects its request channel to the TUI backend,
-/// then runs the TUI event loop as normal.
-#[cfg(all(feature = "tui", feature = "weixin"))]
-async fn run_tui_with_weixin(
-    base_url: Option<String>,
-    cred_path: Option<PathBuf>,
-    workspace: PathBuf,
-) -> anyhow::Result<()> {
-    use recursive::tui::backend::Backend;
-    use recursive::weixin::{WeixinDaemon, WeixinDaemonOptions};
-
-    let mut opts = WeixinDaemonOptions::new(&workspace);
-    opts.base_url = base_url;
-    opts.cred_path = cred_path;
-
-    let daemon = WeixinDaemon::new(opts);
-    daemon.login(false).await?;
-
-    let (_polling_handle, mut weixin_req_rx) = daemon.start();
-
-    // Spawn bridge: forward WeixinRequests to the TUI backend.
-    let backend = Backend::spawn();
-    let weixin_tx = backend.weixin_tx.clone();
-    tokio::spawn(async move {
-        use recursive::tui::events::WeixinBackendRequest;
-        while let Some(req) = weixin_req_rx.recv().await {
-            let backend_req = WeixinBackendRequest {
-                user_id: req.user_id,
-                text: req.text,
-                reply_tx: req.reply_tx,
-            };
-            if weixin_tx.send(backend_req).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Run TUI with the already-spawned backend.
-    recursive::tui::run_with_backend(backend)
-        .await
-        .map_err(anyhow::Error::from)
-}
 
 /// Run as a headless WeChat-only daemon (no TUI).
 ///

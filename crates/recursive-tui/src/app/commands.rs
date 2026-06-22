@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::tui::events::UserAction;
+use crate::events::UserAction;
 
 use super::{
     double_press_window, glob_workspace_files, search_history, App, InputMode, TranscriptBlock,
@@ -484,7 +484,7 @@ impl App {
     /// it up in [`App::commands`], and run the handler. Returns an
     /// optional [`UserAction`] for the dispatcher.
     fn dispatch_slash_command(&mut self, body: &str) -> Option<UserAction> {
-        use crate::tui::commands::{CommandHandler, CommandOutcome};
+        use crate::commands::{CommandHandler, CommandOutcome};
 
         let mut parts = body.split_whitespace();
         let name = parts.next().unwrap_or("");
@@ -544,7 +544,7 @@ impl App {
     /// consumed; the outer `None` means "fall through to the regular
     /// chat key path".
     pub fn handle_command_menu_key(&mut self, key: KeyEvent) -> Option<Option<UserAction>> {
-        use crate::tui::ui::command_menu;
+        use crate::ui::command_menu;
         let matches_count = self.commands.search(&self.prompt.buffer).len();
 
         match key.code {
@@ -877,19 +877,17 @@ impl App {
         new_sel: usize,
         _ctx: Option<&str>,
     ) {
-        use crate::tui::commands::{
-            build_journal_lines, build_resume_lines, build_theme_picker_lines,
-        };
+        use crate::commands::{build_journal_lines, build_resume_lines, build_theme_picker_lines};
         match command_name {
             "journal" => {
-                let entries = crate::tui::ui::modal::load_recent_journal_entries(5);
+                let entries = crate::ui::modal::load_recent_journal_entries(5);
                 if let Some(p) = &mut self.active_command_panel {
                     p.lines = build_journal_lines(&entries, new_sel);
                 }
             }
             "resume" => {
                 let workspace = self.workspace_path.clone();
-                let entries = crate::tui::ui::modal::load_recent_sessions(&workspace, 20);
+                let entries = crate::ui::modal::load_recent_sessions(&workspace, 20);
                 if let Some(p) = &mut self.active_command_panel {
                     p.lines = build_resume_lines(&entries, new_sel);
                 }
@@ -928,7 +926,7 @@ impl App {
                 None
             }
             "theme" => {
-                use crate::tui::ui::theme::ALL_THEMES;
+                use crate::ui::theme::ALL_THEMES;
                 if let Some(idx) = sel {
                     if let Some(theme) = ALL_THEMES.get(idx) {
                         self.theme = theme;
@@ -975,7 +973,7 @@ impl App {
     /// modal does this). The outer key dispatcher should not also
     /// process this key against the chat layer.
     pub fn handle_modal_key_action(&mut self, key: KeyEvent) -> Option<UserAction> {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
 
         // Goal-147: PlanReview modal owns y / n / e / Enter / Esc and
         // *bypasses* the generic confirm logic.
@@ -1020,7 +1018,7 @@ impl App {
     /// * Any other key is consumed but ignored, keeping plan-mode
     ///   focus.
     fn handle_plan_review_key(&mut self, key: KeyEvent) -> Option<UserAction> {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
 
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
@@ -1110,7 +1108,7 @@ impl App {
 
     /// Goal-171: dispatch a key against an active `Modal::ResumePicker`.
     fn handle_resume_picker_key(&mut self, key: KeyEvent) -> Option<UserAction> {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.modals.pop();
@@ -1159,7 +1157,7 @@ impl App {
 
     /// Goal-173: dispatch a key against an active `Modal::McpServers`.
     fn handle_mcp_servers_key(&mut self, key: KeyEvent) -> Option<UserAction> {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.modals.pop();
@@ -1204,8 +1202,8 @@ impl App {
     /// - `Preview` page: `↑/↓/PgUp/PgDn` scroll, `Esc` returns to Files.
     #[cfg(feature = "skill-hub")]
     fn handle_skill_install_key(&mut self, key: KeyEvent) {
-        use crate::tui::app::PendingSkillInstall;
-        use crate::tui::ui::modal::{Modal, SkillInstallPage};
+        use crate::app::PendingSkillInstall;
+        use crate::ui::modal::{Modal, SkillInstallPage};
 
         let page = if let Some(Modal::SkillInstall(s)) = self.modals.last() {
             s.page.clone()
@@ -1359,7 +1357,7 @@ impl App {
     /// Returns `true` if the key was consumed by the modal layer
     /// (so the caller should skip the chat key path).
     pub fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
-        use crate::tui::ui::modal::{ConfirmAction, Modal};
+        use crate::ui::modal::{ConfirmAction, Modal};
         if self.modals.is_empty() {
             return false;
         }
@@ -1463,8 +1461,8 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::tui::app::{App, AppScreen, InputMode, ToolResultData, TranscriptBlock};
-    use crate::tui::events::{UiEvent, UserAction};
+    use crate::app::{App, AppScreen, InputMode, ToolResultData, TranscriptBlock};
+    use crate::events::{UiEvent, UserAction};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1653,7 +1651,7 @@ mod tests {
 
     #[test]
     fn plan_review_y_dispatches_confirm_plan_action() {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -1669,7 +1667,7 @@ mod tests {
 
     #[test]
     fn plan_review_n_dispatches_reject_plan_action() {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -1687,7 +1685,7 @@ mod tests {
 
     #[test]
     fn plan_review_e_copies_text_to_input_and_closes_modal() {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -1705,7 +1703,7 @@ mod tests {
     /// Goal §5: Esc closes the topmost modal rather than quitting.
     #[test]
     fn esc_first_press_closes_modal_not_quits() {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::Help);
@@ -1804,8 +1802,8 @@ mod tests {
 mod prompt_input_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::tui::app::{App, AppScreen, InputMode, HISTORY_CAPACITY};
-    use crate::tui::input_state::strip_history_prefix;
+    use crate::app::{App, AppScreen, InputMode, HISTORY_CAPACITY};
+    use crate::input_state::strip_history_prefix;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2021,7 +2019,7 @@ mod prompt_input_tests {
 
     #[test]
     fn submit_in_bash_mode_dispatches_run_shell() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = fresh_app();
         let _ = app.handle_key(k(KeyCode::Char('!')));
         for c in "ls".chars() {
@@ -2037,7 +2035,7 @@ mod prompt_input_tests {
 
     #[test]
     fn submit_in_note_mode_appends_system_block() {
-        use crate::tui::app::TranscriptBlock;
+        use crate::app::TranscriptBlock;
         let mut app = fresh_app();
         let _ = app.handle_key(k(KeyCode::Char('#')));
         for c in "remember this".chars() {
@@ -2104,8 +2102,8 @@ mod prompt_input_tests {
 
     #[test]
     fn ctrl_e_with_empty_buffer_toggles_tool_result() {
-        use crate::tui::app::{ToolResultData, TranscriptBlock};
-        use crate::tui::events::UiEvent;
+        use crate::app::{ToolResultData, TranscriptBlock};
+        use crate::events::UiEvent;
         let mut app = fresh_app();
         app.handle_ui_event(UiEvent::ToolResult {
             id: "1".into(),
@@ -2168,8 +2166,8 @@ mod prompt_input_tests {
 mod atfile_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::tui::app::{App, InputMode, MAX_ATFILE_SUGGESTIONS};
-    use crate::tui::completion::glob_workspace_files;
+    use crate::app::{App, InputMode, MAX_ATFILE_SUGGESTIONS};
+    use crate::completion::glob_workspace_files;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2311,8 +2309,8 @@ mod atfile_tests {
 mod hsearch_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::tui::app::{App, InputMode, MAX_HSEARCH_RESULTS};
-    use crate::tui::completion::search_history;
+    use crate::app::{App, InputMode, MAX_HSEARCH_RESULTS};
+    use crate::completion::search_history;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2432,13 +2430,13 @@ mod hsearch_tests {
 mod perm_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::tui::app::{App, PendingPermission};
-    use crate::tui::events::UiEvent;
+    use crate::app::{App, PendingPermission};
+    use crate::events::UiEvent;
 
     fn make_perm(tool: &str, args: &str) -> (App, tokio::sync::oneshot::Receiver<bool>) {
         let mut app = App::new();
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        let req = crate::tui::events::PermissionRequest {
+        let req = crate::events::PermissionRequest {
             tool_name: tool.to_string(),
             args_preview: args.to_string(),
             reply: tx,
@@ -2506,7 +2504,7 @@ mod perm_tests {
         let mut app = App::new();
         app.auto_allowed_tools.insert("Bash".to_string());
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        let req = crate::tui::events::PermissionRequest {
+        let req = crate::events::PermissionRequest {
             tool_name: "Bash".to_string(),
             args_preview: "cargo build".to_string(),
             reply: tx,
@@ -2522,7 +2520,7 @@ mod perm_tests {
         // When pending_permission is set, handle_key routes to permission handler.
         let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
         let mut app = App::new();
-        let req = crate::tui::events::PermissionRequest {
+        let req = crate::events::PermissionRequest {
             tool_name: "Write".to_string(),
             args_preview: "path=foo.rs".to_string(),
             reply: tx,
@@ -2542,7 +2540,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_requested_event_sets_pending_flag() {
-        use crate::tui::app::TranscriptBlock;
+        use crate::app::TranscriptBlock;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "This task is complex".into(),
@@ -2555,7 +2553,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_request_y_dispatches_approve_action() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "need to plan".into(),
@@ -2568,7 +2566,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_request_n_dispatches_reject_action() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "need to plan".into(),
@@ -2580,7 +2578,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_approved_event_marks_block() {
-        use crate::tui::app::TranscriptBlock;
+        use crate::app::TranscriptBlock;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "complex".into(),
@@ -2600,7 +2598,7 @@ mod perm_tests {
 
     #[test]
     fn inline_plan_y_dispatches_confirm_and_clears_flag() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanProposed {
             plan_text: "do the thing".into(),
@@ -2616,7 +2614,7 @@ mod perm_tests {
 
     #[test]
     fn inline_plan_enter_dispatches_confirm_and_clears_flag() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanProposed {
             plan_text: "do the thing".into(),
@@ -2629,7 +2627,7 @@ mod perm_tests {
 
     #[test]
     fn inline_plan_n_dispatches_reject_and_clears_flag() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanProposed {
             plan_text: "do the thing".into(),
@@ -2645,7 +2643,7 @@ mod perm_tests {
 
     #[test]
     fn inline_plan_e_copies_text_to_input_and_emits_reject() {
-        use crate::tui::events::UserAction;
+        use crate::events::UserAction;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanProposed {
             plan_text: "the plan text".into(),
@@ -2681,7 +2679,7 @@ mod perm_tests {
 
     #[test]
     fn plan_mode_rejected_event_marks_block() {
-        use crate::tui::app::TranscriptBlock;
+        use crate::app::TranscriptBlock;
         let mut app = App::new();
         app.handle_ui_event(UiEvent::PlanModeRequested {
             reason: "complex".into(),

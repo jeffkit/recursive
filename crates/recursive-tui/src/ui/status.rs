@@ -17,7 +17,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::tui::app::App;
+use crate::app::App;
 
 /// Build the styled status-bar paragraph for the given [`App`].
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -76,7 +76,7 @@ pub fn build_line(app: &App) -> Line<'static> {
         ),
         Style::default().fg(Color::White).bg(Color::DarkGray),
     ));
-    if let Some(cost) = crate::tui::app::estimate_cost(
+    if let Some(cost) = crate::app::estimate_cost(
         &app.model_name,
         app.usage.total_input,
         app.usage.total_output,

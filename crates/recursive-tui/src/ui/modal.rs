@@ -1,7 +1,7 @@
 //! Modal stack (Goal 146).
 //!
 //! A modal is a transient overlay drawn on top of the chat screen.
-//! [`crate::tui::app::App`] owns a `Vec<Modal>`; the topmost element (the
+//! [`crate::app::App`] owns a `Vec<Modal>`; the topmost element (the
 //! "active" modal) is rendered as a full-width left-accent panel (inspired
 //! by Claude Code's `/mcp` panel style) that covers the conversation area
 //! and consumes all key events until popped.
@@ -10,7 +10,7 @@
 //! read-only views over [`App`]. Side-effects (clear / exit /
 //! compact) are routed through the command system in
 //! [`crate::commands`] and the input dispatcher in
-//! [`crate::tui::app::App`].
+//! [`crate::app::App`].
 
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
@@ -18,8 +18,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::tui::app::{App, UsageStats};
-use crate::tui::commands::CommandRegistry;
+use crate::app::{App, UsageStats};
+use crate::commands::CommandRegistry;
 
 /// A simple read-only journal entry: filename + its first 30 lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +109,7 @@ pub enum Modal {
     /// Goal-230: skill-hub installation flow. Three-stage interactive modal:
     /// Results (search results) → Files (zip contents) → Preview (file viewer).
     #[cfg(feature = "skill-hub")]
-    SkillInstall(crate::tui::ui::modal::SkillInstallState),
+    SkillInstall(crate::ui::modal::SkillInstallState),
 }
 
 // ── Goal-230: SkillInstall modal state ───────────────────────────────────────
@@ -132,10 +132,10 @@ pub enum SkillInstallPage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillInstallState {
     pub query: String,
-    pub results: Vec<crate::tui::events::SkillSearchResult>,
+    pub results: Vec<crate::events::SkillSearchResult>,
     /// Populated after the user selects a result and the tool downloads the zip.
     pub slug: Option<String>,
-    pub files: Vec<crate::tui::events::SkillZipFile>,
+    pub files: Vec<crate::events::SkillZipFile>,
     pub page: SkillInstallPage,
 }
 
@@ -300,7 +300,7 @@ fn render_help_body(registry: &CommandRegistry) -> Vec<Line<'static>> {
 }
 
 fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
-    let pricing = crate::llm::pricing_for(model);
+    let pricing = recursive::llm::pricing_for(model);
     let cost_in = pricing.map(|p| (usage.total_input as f64) * p.input_per_million / 1_000_000.0);
     let cost_out =
         pricing.map(|p| (usage.total_output as f64) * p.output_per_million / 1_000_000.0);
@@ -373,7 +373,7 @@ fn render_model_body(model: &str) -> Vec<Line<'static>> {
     // read RECURSIVE_API_BASE directly and used a `model.starts_with(...)`
     // heuristic — both bypassed preset resolution and displayed wrong
     // values when the user set `provider.preset = "deepseek"`.
-    let cfg = crate::config::Config::from_env().ok();
+    let cfg = recursive::config::Config::from_env().ok();
     let api_base = cfg
         .as_ref()
         .map(|c| c.api_base.clone())
@@ -381,7 +381,9 @@ fn render_model_body(model: &str) -> Vec<Line<'static>> {
     let provider = cfg
         .as_ref()
         .and_then(|c| c.preset.clone())
-        .or_else(|| crate::providers::find_preset_by_api_base(&api_base).map(|p| p.id.to_string()))
+        .or_else(|| {
+            recursive::providers::find_preset_by_api_base(&api_base).map(|p| p.id.to_string())
+        })
         .unwrap_or_else(|| "custom".to_string());
 
     let header = Style::default()
@@ -793,10 +795,11 @@ pub fn load_journal_from(
 /// Load up to `limit` recent sessions from `workspace`, sorted by
 /// `updated_at` descending. Silently skips dirs with missing/corrupt metadata.
 pub fn load_recent_sessions(workspace: &std::path::Path, limit: usize) -> Vec<ResumeEntry> {
-    let pairs = match crate::session::SessionReader::list_sessions_sorted_by_updated_at(workspace) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+    let pairs =
+        match recursive::session::SessionReader::list_sessions_sorted_by_updated_at(workspace) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
 
     pairs
         .into_iter()
@@ -966,7 +969,7 @@ fn render_skill_install(state: &SkillInstallState) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::App;
+    use crate::app::App;
 
     #[test]
     fn esc_pops_top_modal() {
@@ -1117,7 +1120,7 @@ mod tests {
 
     #[test]
     fn render_help_lists_skill_commands_when_present() {
-        use crate::tui::skill_commands::SkillCommand;
+        use crate::skill_commands::SkillCommand;
         use std::path::PathBuf;
         let skill = SkillCommand {
             name: "my-skill".to_string(),

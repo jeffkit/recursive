@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::tools::{LocalTransport, RunShell, ToolTransport};
-use crate::ToolRegistry;
+use recursive::tools::{LocalTransport, RunShell, ToolTransport};
+use recursive::ToolRegistry;
 use serde_json::json;
 
-use crate::tui::events::UiEvent;
+use crate::events::UiEvent;
 
 pub fn build_bash_registry(root: &std::path::Path) -> ToolRegistry {
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);

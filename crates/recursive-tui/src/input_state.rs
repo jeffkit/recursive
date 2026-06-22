@@ -132,7 +132,7 @@ pub const HISTORY_CAPACITY: usize = 200;
 ///
 /// Owns the editing buffer, byte-cursor, in-session history, and a
 /// stash slot for the user's draft when they walk back through
-/// history. Rendering is in [`crate::tui::ui::input`].
+/// history. Rendering is in [`crate::ui::input`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptInputState {
     pub mode: InputMode,

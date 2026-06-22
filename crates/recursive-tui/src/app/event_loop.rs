@@ -1,6 +1,6 @@
 //! Event-loop reducers: `handle_ui_event` and streaming helpers.
 
-use crate::tui::events::UiEvent;
+use crate::events::UiEvent;
 
 use super::render::extract_write_file_path_from_result;
 use super::{preview_args, verb_for_tool, App, ToolResultData, TranscriptBlock};
@@ -283,7 +283,7 @@ impl App {
                 self.plan_awaiting_approval = false;
             }
             UiEvent::McpServersLoaded { entries } => {
-                self.push_modal(crate::tui::ui::modal::Modal::McpServers {
+                self.push_modal(crate::ui::modal::Modal::McpServers {
                     entries,
                     selected: 0,
                 });
@@ -374,7 +374,7 @@ impl App {
     fn close_plan_review_modal(&mut self) {
         if matches!(
             self.modals.last(),
-            Some(crate::tui::ui::modal::Modal::PlanReview { .. })
+            Some(crate::ui::modal::Modal::PlanReview { .. })
         ) {
             self.modals.pop();
         }
@@ -506,8 +506,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::app::{App, AppScreen, TranscriptBlock};
-    use crate::tui::events::UiEvent;
+    use crate::app::{App, AppScreen, TranscriptBlock};
+    use crate::events::UiEvent;
 
     // ── streaming assistant ────────────────────────────────────────
 
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn plan_confirmed_closes_modal_and_pushes_system_block() {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn plan_rejected_pushes_system_block_with_reason() {
-        use crate::tui::ui::modal::Modal;
+        use crate::ui::modal::Modal;
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.modals.push(Modal::PlanReview {

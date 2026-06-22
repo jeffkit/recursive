@@ -125,7 +125,7 @@ impl TurnState {
 /// `provider.preset = "deepseek"` would see "claude-sonnet-4-6" in the
 /// status bar while the agent talked to DeepSeek.
 pub fn detect_model_name() -> String {
-    crate::config::Config::from_env()
+    recursive::config::Config::from_env()
         .map(|c| c.model)
         .unwrap_or_else(|_| "gpt-4o-mini".to_string())
 }
@@ -150,8 +150,8 @@ pub fn estimate_cost(
     cache_hit: u64,
     cache_miss: u64,
 ) -> Option<f64> {
-    let pricing = crate::llm::pricing_for(model)?;
-    let usage = crate::llm::TokenUsage {
+    let pricing = recursive::llm::pricing_for(model)?;
+    let usage = recursive::llm::TokenUsage {
         prompt_tokens: saturating_u32(total_input),
         completion_tokens: saturating_u32(total_output),
         total_tokens: 0,

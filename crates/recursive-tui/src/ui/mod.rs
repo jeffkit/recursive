@@ -4,11 +4,11 @@
 //! The TUI runs full-screen on the alternate screen; when the transcript
 //! is empty the chat renderer draws a centred startup splash (logo + hints)
 //! instead of a separate splash screen — see
-//! [`crate::tui::ui::chat::render`].
+//! [`crate::ui::chat::render`].
 
 use ratatui::Frame;
 
-use crate::tui::app::App;
+use crate::app::App;
 
 pub mod chat;
 pub mod command_menu;

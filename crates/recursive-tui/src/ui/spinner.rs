@@ -1,9 +1,9 @@
 //! Braille spinner used while a turn is in flight.
 //!
 //! Goal-144 introduces a single-line spinner rendered transiently
-//! at the bottom of the transcript while [`crate::tui::app::TurnState::running`]
+//! at the bottom of the transcript while [`crate::app::TurnState::running`]
 //! is true. The animation frame is driven by a counter in
-//! [`crate::tui::app::App::spinner_frame`] that the main loop ticks every
+//! [`crate::app::App::spinner_frame`] that the main loop ticks every
 //! draw cycle.
 
 /// 10-frame braille spinner sequence (≈100ms per frame at 50ms ticks).

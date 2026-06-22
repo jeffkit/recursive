@@ -3136,16 +3136,13 @@ dependencies = [
  "bollard",
  "chrono",
  "clap",
- "crossterm",
  "deadpool-redis",
  "dirs",
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
  "mockito",
- "pulldown-cmark",
  "qrcode",
- "ratatui",
  "recursive-agent",
  "redis",
  "regex",
@@ -3155,7 +3152,6 @@ dependencies = [
  "serde_json",
  "serde_yml",
  "shell-words",
- "syntect",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3167,7 +3163,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
- "unicode-width 0.2.0",
  "url",
  "uuid",
  "walkdir",
@@ -3176,10 +3171,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "recursive-tui"
-version = "0.6.0"
+name = "recursive-cli"
+version = "0.7.0"
 dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
  "recursive-agent",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "recursive-tui"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "crossterm",
+ "dirs",
+ "futures-util",
+ "pulldown-cmark",
+ "ratatui",
+ "recursive-agent",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -10,19 +10,19 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::event::CompositeSink;
-use crate::session::{SessionPersistenceSink, SessionWriter};
-use crate::tools::PermissionHook;
-use crate::{AgentEvent, AgentRuntime, EventSink, SessionStatus};
 use async_trait::async_trait;
+use recursive::event::CompositeSink;
+use recursive::session::{SessionPersistenceSink, SessionWriter};
+use recursive::tools::PermissionHook;
+use recursive::{AgentEvent, AgentRuntime, EventSink, SessionStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::tui::bash::{build_bash_registry, resolve_workspace_root, run_bash_command};
+use crate::bash::{build_bash_registry, resolve_workspace_root, run_bash_command};
 #[cfg(feature = "weixin")]
-use crate::tui::events::WeixinBackendRequest;
-use crate::tui::events::{PermissionRequest, SkillInstallEvent, UiEvent, UserAction};
-use crate::tui::runtime_builder::RuntimeBuild;
+use crate::events::WeixinBackendRequest;
+use crate::events::{PermissionRequest, SkillInstallEvent, UiEvent, UserAction};
+use crate::runtime_builder::RuntimeBuild;
 
 /// Local helper to fan-out from two channels in the worker loop.
 enum Either<L, R> {
@@ -60,7 +60,7 @@ impl Backend {
     pub fn spawn() -> Self {
         #[cfg(feature = "skill-hub")]
         {
-            let (state, skill_install_rx) = crate::tui::runtime_builder::build_runtime_for_tui();
+            let (state, skill_install_rx) = crate::runtime_builder::build_runtime_for_tui();
             Self::spawn_with_state_and_skill_rx(state, skill_install_rx)
         }
         #[cfg(not(feature = "skill-hub"))]
@@ -285,12 +285,12 @@ impl PermissionHook for TuiPermissionHook {
         &self,
         tool_name: &str,
         args: &serde_json::Value,
-    ) -> crate::agent::PermissionDecision {
-        use crate::agent::PermissionDecision;
+    ) -> recursive::agent::PermissionDecision {
+        use recursive::agent::PermissionDecision;
         if !self.enabled.load(Ordering::Relaxed) {
             return PermissionDecision::Allow;
         }
-        let args_preview = crate::tools::args_preview_for_permission(args);
+        let args_preview = recursive::tools::args_preview_for_permission(args);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<bool>();
         let req = PermissionRequest {
             tool_name: tool_name.to_string(),
@@ -457,7 +457,7 @@ async fn worker_loop(
                     if session_writer.is_none() {
                         let ws = resolve_workspace_root();
                         let goal: String = text.chars().take(200).collect();
-                        let model = crate::tui::cost::detect_model_name();
+                        let model = crate::cost::detect_model_name();
                         if let Ok(sw) = SessionWriter::create(&ws, &goal, &model, "tui") {
                             let sw_arc = Arc::new(std::sync::Mutex::new(sw));
                             // Build a composite sink: TUI display + session persistence.
@@ -729,7 +729,7 @@ async fn worker_loop(
                         tracing::warn!("backend: runtime not available in ResumeSession");
                         continue;
                     };
-                    match crate::session::SessionReader::load_messages(&session_dir) {
+                    match recursive::session::SessionReader::load_messages(&session_dir) {
                         Ok(messages) => {
                             let turn_count = messages.len();
                             rt.set_transcript(messages);
@@ -757,10 +757,10 @@ async fn worker_loop(
                 let workspace = resolve_workspace_root();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    let servers = crate::mcp::discover_mcp_servers(&workspace)
+                    let servers = recursive::mcp::discover_mcp_servers(&workspace)
                         .await
                         .unwrap_or_default();
-                    let entries: Vec<crate::tui::ui::modal::McpEntry> = servers
+                    let entries: Vec<crate::ui::modal::McpEntry> = servers
                         .iter()
                         .map(|s| {
                             let transport = if s.url.is_some() {
@@ -770,7 +770,7 @@ async fn worker_loop(
                             } else {
                                 "unknown".to_string()
                             };
-                            crate::tui::ui::modal::McpEntry {
+                            crate::ui::modal::McpEntry {
                                 name: s.name.clone(),
                                 transport,
                                 enabled: true,
@@ -806,7 +806,7 @@ async fn worker_loop(
                     let aborted = tokio::select! {
                         res = &mut handle => {
                             if let Err(e) = res
-                                .map_err(|e| crate::Error::Internal {
+                                .map_err(|e| recursive::Error::Internal {
                                     context: "tui::task_join".to_string(),
                                     message: e.to_string(),
                                 })
@@ -872,14 +872,14 @@ pub async fn wait_for_cancel(flag: Arc<AtomicBool>, notify: Arc<tokio::sync::Not
 /// (they cannot be acted on without the runtime, which is inside the task).
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_select_loop(
-    handle: &mut tokio::task::JoinHandle<Result<(), crate::Error>>,
+    handle: &mut tokio::task::JoinHandle<Result<(), recursive::Error>>,
     action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UserAction>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
     cancel_flag: &Arc<AtomicBool>,
     cancel_clone: Arc<AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
-    gate: &Arc<crate::tools::plan_mode::PlanApprovalGate>,
-    plan_mode_request_gate: &Arc<crate::tools::plan_mode::PlanModeRequestGate>,
+    gate: &Arc<recursive::tools::plan_mode::PlanApprovalGate>,
+    plan_mode_request_gate: &Arc<recursive::tools::plan_mode::PlanModeRequestGate>,
     queued: &mut std::collections::VecDeque<String>,
 ) -> bool {
     loop {
@@ -887,7 +887,7 @@ async fn run_turn_select_loop(
             biased;
             res = &mut *handle => {
                 if let Err(e) = res
-                    .map_err(|e| crate::Error::Internal {
+                    .map_err(|e| recursive::Error::Internal {
                         context: "tui::task_join".to_string(),
                         message: e.to_string(),
                     })
@@ -944,7 +944,7 @@ async fn run_turn_select_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::bash::build_bash_registry;
+    use crate::bash::build_bash_registry;
 
     #[test]
     fn map_partial_token_to_assistant_partial() {
