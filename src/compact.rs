@@ -184,7 +184,10 @@ impl Compactor {
     /// non-Tool boundary, preserving tool-call / tool-result pairs.
     pub fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
         let mut split = transcript.len().saturating_sub(keep_n);
-        while split > 0 && matches!(transcript[split].role, crate::message::Role::Tool) {
+        while split > 0
+            && split < transcript.len()
+            && matches!(transcript[split].role, crate::message::Role::Tool)
+        {
             split -= 1;
         }
         split
@@ -283,7 +286,6 @@ impl Compactor {
             }
         };
 
-        let _older_chars: usize = older.iter().map(|m| m.content.len()).sum();
         let summary_chars = summary.len();
 
         let header = format!(
@@ -530,5 +532,25 @@ mod tests {
         assert!(summary_msg
             .content
             .contains("Fallback after invalid structured response."));
+    }
+
+    #[test]
+    fn safe_split_point_keep_n_zero_does_not_panic() {
+        // keep_n=0 means split = transcript.len(); the while loop must not
+        // index transcript[transcript.len()] — that would be out of bounds.
+        let msgs = vec![
+            Message::user("a".to_string()),
+            Message::assistant("b".to_string()),
+        ];
+        let split = Compactor::safe_split_point(&msgs, 0);
+        assert_eq!(split, msgs.len(), "keep_n=0 should return full length");
+    }
+
+    #[test]
+    fn safe_split_point_empty_transcript_does_not_panic() {
+        let split = Compactor::safe_split_point(&[], 0);
+        assert_eq!(split, 0);
+        let split = Compactor::safe_split_point(&[], 5);
+        assert_eq!(split, 0);
     }
 }

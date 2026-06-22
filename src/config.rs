@@ -1270,6 +1270,10 @@ api_key = "sk-from-file"
         let config = Config::from_env().unwrap();
         assert!((config.stuck_error_rate - 0.5).abs() < 1e-9);
         std::env::remove_var("RECURSIVE_STUCK_ERROR_RATE");
+
+        // Clean up the required vars set at the top of this test.
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
     }
 
     // ── Goal-291: goal_eval_transcript_tail env var override ────────────

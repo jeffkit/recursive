@@ -52,6 +52,9 @@ impl MockServer {
         std::thread::spawn(move || {
             for body in responses {
                 let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
 
                 // Read the full HTTP request (headers + body).
                 let mut buf = vec![0u8; 65536];

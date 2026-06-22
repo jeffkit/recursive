@@ -66,6 +66,9 @@ async fn anthropic_full_runtime_loop_with_mock_provider() {
         // Accept two connections (one per LLM call)
         for _ in 0..2 {
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
             use std::io::{Read, Write};
             let mut buf = [0u8; 8192];
             let _ = stream.read(&mut buf);
