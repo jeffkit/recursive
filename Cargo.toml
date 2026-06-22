@@ -1,9 +1,12 @@
 [workspace]
 members = [
+    ".",
     "crates/agui-protocol",
     "crates/agui-client",
     "crates/agui-tui",
+    "crates/recursive-tui",
 ]
+resolver = "2"
 
 [package]
 name = "recursive-agent"

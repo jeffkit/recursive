@@ -261,56 +261,18 @@ pub enum UserAction {
 }
 
 // ── Goal-230: Skill-hub install side-channel ─────────────────────────────────
+// These types live in tools::install_skill to avoid a circular dependency
+// (install_skill.rs is part of the core crate, not the tui crate).
 
-/// One search result returned by `skillhub.cn`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillSearchResult {
-    pub slug: String,
-    pub name: String,
-    pub description: String,
-    pub downloads: u64,
-    pub stars: u32,
-    pub version: String,
-}
+#[cfg(feature = "skill-hub")]
+pub use crate::tools::install_skill::{
+    SkillFilesRequest, SkillInstallEvent, SkillSearchRequest, SkillSearchResult, SkillZipFile,
+};
 
-/// A single file from inside a skill zip archive.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillZipFile {
-    /// Relative path inside the archive, e.g. `"pdf/SKILL.md"`.
-    pub path: String,
-    /// UTF-8 text content; binary files are represented as `"<binary>"`.
-    pub content: String,
-    /// Original file size in bytes (0 for directories).
-    pub size: usize,
-}
-
-/// Phase 1: tool → TUI. User selects a slug or cancels.
-///
-/// `reply` carries `Some(slug)` if the user confirmed a choice, or `None`
-/// to cancel. Not `PartialEq` because `oneshot::Sender` is not `PartialEq`.
-pub struct SkillSearchRequest {
-    pub query: String,
-    pub results: Vec<SkillSearchResult>,
-    pub reply: tokio::sync::oneshot::Sender<Option<String>>,
-}
-
-/// Phase 2: tool → TUI. User reviews files and confirms installation.
-///
-/// `reply` carries `true` to install, `false` to cancel.
-pub struct SkillFilesRequest {
-    pub slug: String,
-    pub files: Vec<SkillZipFile>,
-    pub reply: tokio::sync::oneshot::Sender<bool>,
-}
-
-/// Events from the `install_skill` tool to the TUI side-channel.
-/// Carried on a dedicated `mpsc::UnboundedReceiver<SkillInstallEvent>` in
-/// [`crate::tui::backend::Backend`], separate from `event_rx`, because the
-/// payloads contain `oneshot::Sender` values which are not `PartialEq`.
-pub enum SkillInstallEvent {
-    Search(SkillSearchRequest),
-    Files(SkillFilesRequest),
-}
+/// Stub used when the `skill-hub` feature is disabled: the channel
+/// still needs a concrete type but will never send any messages.
+#[cfg(not(feature = "skill-hub"))]
+pub enum SkillInstallEvent {}
 
 // ── WeChat side-channel ───────────────────────────────────────────────────────
 

@@ -1,0 +1,14 @@
+[package]
+name = "recursive-tui"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Terminal UI for the Recursive agent (standalone re-export crate)"
+license = "MIT"
+
+[dependencies]
+recursive = { package = "recursive-agent", path = "../..", features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub", "tui"] }
+
+[features]
+default = []
+weixin = ["recursive/weixin"]
