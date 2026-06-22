@@ -595,6 +595,7 @@ impl ExportedTranscript {
     pub fn from_session_dir(session_dir: &Path) -> std::io::Result<Self> {
         let meta = SessionReader::load_meta(session_dir)?;
         let entries = SessionReader::load_transcript(session_dir)?;
+        let message_count = entries.len() as u64;
         Ok(Self {
             version: 1,
             session_id: meta.session_id,
@@ -602,8 +603,8 @@ impl ExportedTranscript {
             goal: meta.goal,
             created_at: meta.created_at,
             status: meta.status,
-            messages: entries.clone(),
-            message_count: entries.len() as u64,
+            messages: entries,
+            message_count,
         })
     }
 }

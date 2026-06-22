@@ -1502,7 +1502,7 @@ pub(super) async fn agui_run(
     let metrics = state.metrics.clone();
     let drv_thread = thread_id.clone();
     let drv_run = run_id.clone();
-    tokio::spawn(async move {
+    let driver_handle = tokio::spawn(async move {
         let outcome = runtime.run(&goal).await;
         // Replace the sink so the converter task's recv() sees a closed
         // channel and exits cleanly.
@@ -1544,6 +1544,14 @@ pub(super) async fn agui_run(
             result: None,
             base: ag::BaseEvent::default(),
         }));
+    });
+
+    // Monitor the driver task so panics are surfaced in logs rather than
+    // silently swallowed by the dropped JoinHandle.
+    tokio::spawn(async move {
+        if let Err(e) = driver_handle.await {
+            tracing::error!("agui: driver task panicked: {e}");
+        }
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx).map(|ev| {

@@ -178,18 +178,55 @@ mod tests {
     use crate::tui::events::UiEvent;
     use crate::tui::events::UserAction;
 
+    /// RAII guard that clears API key env vars for the duration of a test
+    /// and restores them on drop (including on panic).
+    ///
+    /// Assumes the caller already holds `env_lock()` (e.g. via
+    /// `PinnedRecursiveHome`), so this guard itself does not re-acquire it.
+    struct ApiKeyGuard {
+        prev_recursive: Option<String>,
+        prev_openai: Option<String>,
+    }
+
+    impl ApiKeyGuard {
+        fn clear() -> Self {
+            let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
+            let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+            std::env::remove_var("RECURSIVE_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            Self {
+                prev_recursive,
+                prev_openai,
+            }
+        }
+    }
+
+    impl Drop for ApiKeyGuard {
+        fn drop(&mut self) {
+            match self.prev_recursive.take() {
+                Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+                None => std::env::remove_var("RECURSIVE_API_KEY"),
+            }
+            match self.prev_openai.take() {
+                Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                None => std::env::remove_var("OPENAI_API_KEY"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn offline_mode_and_config_file_resolution() {
         let empty_home = tempfile::tempdir().expect("tempdir");
         // Use PinnedRecursiveHome (sets RECURSIVE_HOME) rather than PinnedHome
         // because on Windows dirs::home_dir() resolves via SHGetKnownFolderPath
         // and does not respond to runtime USERPROFILE / HOME changes.
+        // PinnedRecursiveHome also acquires env_lock(), serialising this test
+        // against all other env-mutating tests.
         let _pin = crate::test_util::PinnedRecursiveHome::new(empty_home.path());
 
-        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
-        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("RECURSIVE_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        // ApiKeyGuard clears the API key vars and restores them on drop,
+        // ensuring cleanup even if an assertion panics.
+        let _keys = ApiKeyGuard::clear();
 
         let mut backend = Backend::spawn();
         backend
@@ -243,12 +280,6 @@ type = "openai"
                 panic!("expected Ready when config.toml has api_key, got Offline: {reason}");
             }
         }
-
-        if let Some(v) = prev_recursive {
-            std::env::set_var("RECURSIVE_API_KEY", v);
-        }
-        if let Some(v) = prev_openai {
-            std::env::set_var("OPENAI_API_KEY", v);
-        }
+        // _keys guard restores API key env vars on drop here.
     }
 }
