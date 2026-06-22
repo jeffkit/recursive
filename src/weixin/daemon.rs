@@ -162,11 +162,8 @@ impl WeixinDaemon {
         let req_tx_proc = req_tx.clone();
         tokio::spawn(async move {
             while let Some(incoming) = raw_rx.recv().await {
-                debug!(
-                    "WeChat message from {}: {}",
-                    incoming.user_id,
-                    &incoming.text[..incoming.text.len().min(80)]
-                );
+                let preview: String = incoming.text.chars().take(80).collect();
+                debug!("WeChat message from {}: {}", incoming.user_id, preview);
 
                 if let Some(cmd) = parse_command(&incoming.text) {
                     handle_command(cmd, &bot_proc, &incoming, &workspace, &req_tx_proc).await;

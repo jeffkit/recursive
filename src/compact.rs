@@ -179,16 +179,31 @@ impl Compactor {
     /// Compute the safe split point for compaction: the index at which to
     /// divide "older messages to summarize" from "recent messages to keep".
     ///
-    /// Never splits in the middle of a Tool role message — if the natural
-    /// split point lands on a Tool message, it backs up until it finds a
-    /// non-Tool boundary, preserving tool-call / tool-result pairs.
+    /// The retained ("kept") segment must start with a User (or System)
+    /// message, because OpenAI/Anthropic require that the first non-System
+    /// message after the compaction summary is a User message.  Two cases
+    /// can violate this invariant:
+    ///
+    /// 1. The split point lands on a `Tool` result message — backing up
+    ///    preserves tool-call / tool-result pairs.
+    /// 2. The split point lands on an `Assistant` message that carries
+    ///    `tool_calls` — backing up avoids starting the kept segment with
+    ///    an Assistant-with-tool-calls, which would produce an invalid
+    ///    `[System(summary), Assistant(tool_calls), Tool, …]` sequence.
     pub fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
         let mut split = transcript.len().saturating_sub(keep_n);
-        while split > 0
-            && split < transcript.len()
-            && matches!(transcript[split].role, crate::message::Role::Tool)
-        {
-            split -= 1;
+        loop {
+            if split == 0 || split >= transcript.len() {
+                break;
+            }
+            let msg = &transcript[split];
+            let should_back_up = msg.role == crate::message::Role::Tool
+                || (msg.role == crate::message::Role::Assistant && !msg.tool_calls.is_empty());
+            if should_back_up {
+                split -= 1;
+            } else {
+                break;
+            }
         }
         split
     }

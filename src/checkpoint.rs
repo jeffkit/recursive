@@ -698,10 +698,11 @@ fn session_ref(sid: &str) -> String {
 /// Encode a session id into a git refname-safe segment. Git refnames
 /// disallow consecutive dots (`..`), leading/trailing dots, `.lock`
 /// suffixes, and a few control characters. For our purposes (we
-/// already pre-validate via [`validate_session_id`]) we just collapse
-/// any `.` into `-`, which is always safe and deterministic.
+/// already pre-validate via [`validate_session_id`]) we encode `.`
+/// as `_dot_` and `-` as `_dash_` so that distinct session IDs
+/// (e.g. `sess.1` vs `sess-1`) never collide on the same git ref.
 fn sanitize_for_refname(sid: &str) -> String {
-    sid.replace('.', "-")
+    sid.replace('.', "_dot_").replace('-', "_dash_")
 }
 
 fn validate_session_id(sid: &str) -> Result<()> {
@@ -794,8 +795,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_for_refname_collapses_dots() {
-        assert_eq!(sanitize_for_refname("a.b.c"), "a-b-c");
+    fn sanitize_for_refname_no_collision() {
+        // `.` and `-` must produce distinct encodings so that `sess.1` and
+        // `sess-1` never map to the same git ref.
+        let dot_encoded = sanitize_for_refname("sess.1");
+        let dash_encoded = sanitize_for_refname("sess-1");
+        assert_ne!(dot_encoded, dash_encoded);
+        assert_eq!(sanitize_for_refname("a.b.c"), "a_dot_b_dot_c");
+        assert_eq!(sanitize_for_refname("a-b-c"), "a_dash_b_dash_c");
         assert_eq!(sanitize_for_refname("plain"), "plain");
     }
 

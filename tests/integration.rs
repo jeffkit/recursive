@@ -92,6 +92,14 @@ async fn hooks_and_compaction() {
     std::fs::write(root.join("data.txt"), b"hello world").unwrap();
 
     // Script: 3 tool calls (to build up transcript) then a final stop.
+    //
+    // With the corrected safe_split_point (which backs up past Asst+tool_calls
+    // messages to ensure the kept segment starts at a User message), the
+    // in-kernel compaction at step 3 only removes the System prompt (split=1).
+    // That means the runtime transcript is still above the threshold after the
+    // turn, triggering a second cross-turn compaction pass.  We therefore need
+    // 6 completions: 3 tool calls + 1 in-kernel summary + 1 final stop +
+    // 1 cross-turn summary.
     let script = vec![
         Completion {
             content: "reading file".into(),
@@ -126,7 +134,7 @@ async fn hooks_and_compaction() {
             usage: None,
             reasoning_content: None,
         },
-        // This completion is consumed by the compactor
+        // Consumed by the in-kernel compactor (fires before the 4th LLM call).
         Completion {
             content: "Summary: read file, glob files, tests pass.".into(),
             tool_calls: vec![],
@@ -134,9 +142,18 @@ async fn hooks_and_compaction() {
             usage: None,
             reasoning_content: None,
         },
-        // Final completion after compaction
+        // Final completion after in-kernel compaction.
         Completion {
             content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        // Consumed by the cross-turn compactor (fires after the turn because
+        // the transcript is still above the threshold).
+        Completion {
+            content: "Cross-turn summary.".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
@@ -155,9 +172,11 @@ async fn hooks_and_compaction() {
     hooks.register(hook.clone() as Arc<dyn Hook>);
 
     // Threshold calibrated to trigger after all 3 tool calls have completed.
-    // estimate_chars now includes tool_call arguments (~54 chars each), so the
-    // old threshold of 100 would fire too early (after step 2). After all 3
-    // steps the transcript is ~264 chars, so 250 fires at the right moment.
+    // estimate_chars includes tool_call arguments (~54 chars each).  After all
+    // 3 steps the transcript is ~315 chars (with system prompt), so 250 fires
+    // at the right moment.  The corrected safe_split_point only removes the
+    // system prompt (split=1), so the transcript remains above 250 after the
+    // in-kernel compact, triggering a second cross-turn compact pass.
     let compactor = Compactor::new(250).keep_recent_n(2);
 
     let mut runtime = AgentRuntime::builder()
