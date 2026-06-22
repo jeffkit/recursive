@@ -128,6 +128,23 @@ impl PlanApprovalGate {
         }
         self.notify.notify_one();
     }
+
+    /// Set the pending plan text and clear any stale approval/rejection
+    /// from a previous cycle.
+    ///
+    /// Must be called instead of writing `pending_plan` directly so that
+    /// a ghost `response` left over from a duplicate concurrent HTTP request
+    /// (TOCTOU race) cannot bypass the human-approval gate on the next round.
+    pub fn begin_approval(&self, plan_text: String) {
+        if let Ok(mut w) = self.pending_plan.write() {
+            *w = Some(plan_text);
+        }
+        // Clear any stale response from a previous (or concurrent duplicate)
+        // approval so the next wait_for_approval() call blocks correctly.
+        if let Ok(mut w) = self.response.write() {
+            *w = None;
+        }
+    }
 }
 
 impl Default for PlanApprovalGate {
@@ -300,10 +317,9 @@ impl Tool for ExitPlanModeTool {
             .exploring_plan_mode
             .store(false, Ordering::Relaxed);
 
-        // Store the plan text so external callers can read it.
-        if let Ok(mut w) = self.gate.pending_plan.write() {
-            *w = Some(plan_text.clone());
-        }
+        // Store the plan text so external callers can read it, and atomically
+        // clear any stale response from a previous cycle (prevents ghost approvals).
+        self.gate.begin_approval(plan_text.clone());
 
         // Emit PlanProposed so TUI / HTTP can render the review modal.
         // Plan Mode 2.0 has no pending tool_calls — the plan is prose only.

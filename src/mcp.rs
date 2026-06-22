@@ -902,7 +902,10 @@ impl McpClient {
                 Err(_) => {
                     return Err(Error::Mcp {
                         server: server_name.to_string(),
-                        message: "server timed out (no response within 10s)".into(),
+                        message: format!(
+                            "server timed out (no response within {}s)",
+                            read_timeout.as_secs()
+                        ),
                     });
                 }
             }

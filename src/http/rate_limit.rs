@@ -106,6 +106,12 @@ pub fn rate_limiter_from_env() -> RateLimiter {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(10);
+    if rpm <= 0.0 {
+        tracing::warn!("RECURSIVE_RATE_LIMIT_RPM=0: token bucket never refills, clients will be permanently blocked after burst");
+    }
+    if burst == 0 {
+        tracing::warn!("RECURSIVE_RATE_LIMIT_BURST=0: all requests will be rejected immediately");
+    }
     // Convert RPM to per-second refill rate
     let refill_rate = rpm / 60.0;
     RateLimiter::new(burst, refill_rate)
