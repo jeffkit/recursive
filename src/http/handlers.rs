@@ -265,7 +265,7 @@ pub(super) async fn create_session(
         .metrics
         .sessions_active
         .fetch_add(1, Ordering::Relaxed);
-
+    tracing::info!(session_id = %id, "session created");
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse { id, created_at }),
@@ -436,6 +436,7 @@ pub(super) async fn delete_session(
             .fetch_sub(1, Ordering::Relaxed);
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
+        tracing::info!(session_id = %id, "session deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("session not found"))
@@ -803,6 +804,10 @@ pub(super) async fn send_session_message(
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, ApiError> {
+    if body.content.trim().is_empty() {
+        return Err(ApiError::bad_request("missing or empty 'content' field"));
+    }
+    tracing::debug!(session_id = %id, content_len = body.content.len(), "session message received");
     // Get the session's runtime, interrupt token, message counter, last_active,
     // and token usage counters.
     let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = {

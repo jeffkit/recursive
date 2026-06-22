@@ -752,7 +752,13 @@ async fn main() -> anyhow::Result<()> {
             // Clone the state before consuming it for the router (both share the
             // same Arc-wrapped inner fields, so no actual data is duplicated).
             let reaper_state = std::sync::Arc::new(state.clone());
-            recursive::http::spawn_session_reaper(reaper_state, Duration::from_secs(60));
+            let reaper_handle =
+                recursive::http::spawn_session_reaper(reaper_state, Duration::from_secs(60));
+            tokio::spawn(async move {
+                if let Err(e) = reaper_handle.await {
+                    tracing::error!("session reaper panicked: {e}");
+                }
+            });
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
@@ -1528,12 +1534,21 @@ fn shutdown_signal() -> tokio_util::sync::CancellationToken {
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        #[cfg(unix)]
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = sigterm.recv() => {},
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to register SIGTERM handler: {e}; only Ctrl+C will trigger shutdown"
+                );
+                if let Err(e) = ctrl_c.await {
+                    tracing::error!("ctrl_c signal error: {e}");
+                }
+            }
         }
         #[cfg(not(unix))]
         if let Err(e) = ctrl_c.await {

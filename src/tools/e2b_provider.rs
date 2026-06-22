@@ -106,6 +106,10 @@ impl E2bSandbox {
             .map_err(|e| Error::Storage {
                 message: format!("e2b create sandbox: {e}"),
             })?
+            .error_for_status()
+            .map_err(|e| Error::Storage {
+                message: format!("e2b create sandbox HTTP error: {e}"),
+            })?
             .json()
             .await
             .map_err(|e| Error::Storage {
@@ -178,7 +182,8 @@ impl E2bSandbox {
     /// Sends the raw bytes as the request body with the path encoded as a
     /// query parameter (compatible with E2B's file upload endpoint).
     pub async fn upload_file(&self, path: &str, content: &[u8]) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .post(format!(
                 "{}/sandboxes/{}/files",
                 self.config.api_base, self.sandbox_id
@@ -191,12 +196,19 @@ impl E2bSandbox {
             .map_err(|e| Error::Storage {
                 message: format!("e2b upload_file: {e}"),
             })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(Error::Storage {
+                message: format!("e2b upload_file HTTP {status}: {err_body}"),
+            });
+        }
         Ok(())
     }
 
     /// Download a file from the sandbox (GET /sandboxes/{id}/files?path=...).
     pub async fn download_file(&self, path: &str) -> Result<Vec<u8>> {
-        let bytes = self
+        let response = self
             .client
             .get(format!(
                 "{}/sandboxes/{}/files",
@@ -208,18 +220,24 @@ impl E2bSandbox {
             .await
             .map_err(|e| Error::Storage {
                 message: format!("e2b download_file: {e}"),
-            })?
-            .bytes()
-            .await
-            .map_err(|e| Error::Storage {
-                message: format!("e2b download_file bytes: {e}"),
             })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_body = response.text().await.unwrap_or_default();
+            return Err(Error::Storage {
+                message: format!("e2b download_file HTTP {status}: {err_body}"),
+            });
+        }
+        let bytes = response.bytes().await.map_err(|e| Error::Storage {
+            message: format!("e2b download_file bytes: {e}"),
+        })?;
         Ok(bytes.to_vec())
     }
 
     /// Extend the sandbox TTL (PATCH /sandboxes/{id}).
     pub async fn refresh_timeout(&self) -> Result<()> {
-        self.client
+        let resp = self
+            .client
             .patch(format!(
                 "{}/sandboxes/{}",
                 self.config.api_base, self.sandbox_id
@@ -231,6 +249,13 @@ impl E2bSandbox {
             .map_err(|e| Error::Storage {
                 message: format!("e2b refresh_timeout: {e}"),
             })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(Error::Storage {
+                message: format!("e2b refresh_timeout HTTP {status}: {err_body}"),
+            });
+        }
         Ok(())
     }
 }
