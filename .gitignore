@@ -33,9 +33,11 @@ Cargo.lock.bak
 .claude/
 .cursor/local/
 
-# Local cargo config (e.g. NO_PROXY for loopback test servers behind a
-# developer's HTTP proxy). Environment-specific, not project policy.
-.cargo/
+# Cargo config: ignore per-user overrides but track the shared config.toml
+# which contains project-level aliases (cargo tui, cargo cli) and NO_PROXY
+# settings that apply to all contributors.
+.cargo/*
+!.cargo/config.toml
 
 # Python
 __pycache__/

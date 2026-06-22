@@ -1,0 +1,20 @@
+# Make loopback traffic bypass any developer/CI HTTP proxy when running
+# `cargo test` / `cargo run` in this repo.
+#
+# Many tests spin up local mock HTTP servers on 127.0.0.1. reqwest honors
+# the standard proxy env vars (HTTP_PROXY/HTTPS_PROXY), and if a developer
+# has a system proxy configured, requests to those loopback mock servers get
+# routed through it and fail with `502 Bad Gateway`. Expressing the bypass via
+# the standard NO_PROXY mechanism keeps the product code free of any proxy
+# special-casing. This only affects cargo-invoked processes; it is NOT baked
+# into released binaries, so production keeps the standard proxy behavior.
+#
+# Note: by default these do not override a NO_PROXY already set in the
+# environment, so a developer who sets their own NO_PROXY stays in control.
+[env]
+NO_PROXY = "127.0.0.1,localhost,::1"
+no_proxy = "127.0.0.1,localhost,::1"
+
+[alias]
+tui = "run -p recursive-tui"
+cli = "run -p recursive-cli"
