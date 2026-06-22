@@ -568,4 +568,84 @@ mod tests {
         let split = Compactor::safe_split_point(&[], 5);
         assert_eq!(split, 0);
     }
+
+    #[test]
+    fn safe_split_backs_up_past_tool_and_assistant_with_tool_calls() {
+        // Sequence: [user, asst+tc, tool_result, user, asst]  (indices 0..4)
+        // keep_n=3: initial split = 5-3 = 2 (Tool message)
+        //   → backs up to 1 (Assistant+tool_calls)
+        //   → backs up to 0 (loop breaks: split==0)
+        use crate::llm::ToolCall;
+        let asst_with_calls = Message::assistant_with_tool_calls(
+            "thinking".to_string(),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "Read".into(),
+                arguments: serde_json::json!("{}"),
+            }],
+        );
+        let msgs = vec![
+            Message::user("start".to_string()),
+            asst_with_calls,
+            Message::tool_result("call_1", "file contents"),
+            Message::user("continue".to_string()),
+            Message::assistant("done".to_string()),
+        ];
+        let split = Compactor::safe_split_point(&msgs, 3);
+        assert_eq!(
+            split, 0,
+            "should back up past both Tool and Assistant-with-tool-calls to index 0"
+        );
+    }
+
+    #[test]
+    fn safe_split_backs_up_when_landing_directly_on_assistant_with_tool_calls() {
+        // Sequence: [user, asst+tc, user, asst]  (indices 0..3)
+        // keep_n=3: initial split = 4-3 = 1 (Assistant+tool_calls)
+        //   → backs up to 0 (loop breaks: split==0)
+        use crate::llm::ToolCall;
+        let asst_with_calls = Message::assistant_with_tool_calls(
+            "planning".to_string(),
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "Glob".into(),
+                arguments: serde_json::json!("{}"),
+            }],
+        );
+        let msgs = vec![
+            Message::user("first question".to_string()),
+            asst_with_calls,
+            Message::user("follow-up".to_string()),
+            Message::assistant("answer".to_string()),
+        ];
+        let split = Compactor::safe_split_point(&msgs, 3);
+        assert_eq!(
+            split, 0,
+            "split landing directly on Assistant+tool_calls should retreat to 0"
+        );
+    }
+
+    #[test]
+    fn safe_split_no_backup_when_split_is_already_valid() {
+        // Sequence: [user, asst+tc, tool_result, user, asst]  (indices 0..4)
+        // keep_n=2: initial split = 5-2 = 3 (User message) → no backup needed
+        use crate::llm::ToolCall;
+        let asst_with_calls = Message::assistant_with_tool_calls(
+            "".to_string(),
+            vec![ToolCall {
+                id: "x".into(),
+                name: "Write".into(),
+                arguments: serde_json::json!("{}"),
+            }],
+        );
+        let msgs = vec![
+            Message::user("start".to_string()),
+            asst_with_calls,
+            Message::tool_result("x", "ok"),
+            Message::user("continue".to_string()),
+            Message::assistant("done".to_string()),
+        ];
+        let split = Compactor::safe_split_point(&msgs, 2);
+        assert_eq!(split, 3, "split at a User message should not retreat");
+    }
 }

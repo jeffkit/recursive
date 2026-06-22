@@ -904,7 +904,8 @@ fn effective_step_limit(max_steps: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_step_limit;
+    use super::{effective_step_limit, RunCore};
+    use crate::message::Message;
 
     #[test]
     fn effective_step_limit_zero_means_unbounded() {
@@ -1047,6 +1048,79 @@ mod tests {
         assert_eq!(
             top_tool, "tool_a",
             "most repeated tool should be tool_a (2 errors), not tool_b (1 error)"
+        );
+    }
+
+    // Helper: build a minimal RunCore suitable for testing methods that only
+    // touch `messages` (e.g. `attach_reasoning_content`).
+    fn make_test_core<'a>(
+        messages: Vec<Message>,
+        hooks: &'a crate::hooks::HookRegistry,
+    ) -> RunCore<'a> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        RunCore {
+            messages: Arc::new(messages),
+            llm: Arc::new(crate::llm::MockProvider::new(vec![])),
+            tools: Arc::new(crate::tools::ToolRegistry::default()),
+            max_steps: 1,
+            max_transcript_chars: None,
+            events: None,
+            streaming: false,
+            compactor: None,
+            permission_hook: None,
+            hooks,
+            total_llm_latency_ms: 0,
+            exploring_plan_mode: Arc::new(AtomicBool::new(false)),
+            shutdown_token: None,
+            mailbox: None,
+            stuck_window: 3,
+            stuck_error_rate: 1.0,
+            turn: 0,
+            globs_skills: vec![],
+        }
+    }
+
+    #[test]
+    fn attach_reasoning_content_sets_last_message_when_some() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::assistant("response".to_string())], &hooks);
+
+        core.attach_reasoning_content(Some("I thought carefully about this.".to_string()));
+
+        assert_eq!(
+            core.messages.last().unwrap().reasoning_content.as_deref(),
+            Some("I thought carefully about this."),
+            "reasoning_content should be set on the last message"
+        );
+    }
+
+    #[test]
+    fn attach_reasoning_content_does_not_modify_when_none() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::assistant("response".to_string())], &hooks);
+
+        core.attach_reasoning_content(None);
+
+        assert!(
+            core.messages.last().unwrap().reasoning_content.is_none(),
+            "reasoning_content should remain None when called with None"
+        );
+    }
+
+    #[test]
+    fn attach_reasoning_content_preserves_existing_content_when_none() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut msg = Message::assistant("response".to_string());
+        msg.reasoning_content = Some("prior thinking".to_string());
+        let mut core = make_test_core(vec![msg], &hooks);
+
+        core.attach_reasoning_content(None);
+
+        assert_eq!(
+            core.messages.last().unwrap().reasoning_content.as_deref(),
+            Some("prior thinking"),
+            "calling with None should not overwrite existing reasoning_content"
         );
     }
 }

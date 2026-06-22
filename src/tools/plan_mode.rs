@@ -736,4 +736,48 @@ mod tests {
         assert_eq!(parsed["approved"], false);
         assert_eq!(parsed["reason"], "not needed");
     }
+
+    // -- PlanApprovalGate::begin_approval -----------------------------------
+
+    #[test]
+    fn begin_approval_sets_plan_and_clears_stale_response() {
+        let gate = PlanApprovalGate::new();
+
+        // Simulate a stale response left over from a previous cycle.
+        *gate.response.write().unwrap() = Some(PlanApprovalResult::Approved);
+
+        gate.begin_approval("new plan text".to_string());
+
+        assert!(
+            gate.response.read().unwrap().is_none(),
+            "begin_approval must clear stale response to prevent TOCTOU bypass"
+        );
+        assert_eq!(
+            gate.pending_plan.read().unwrap().as_deref(),
+            Some("new plan text"),
+            "begin_approval must store the new plan text"
+        );
+    }
+
+    #[test]
+    fn begin_approval_called_twice_no_ghost_approval() {
+        let gate = PlanApprovalGate::new();
+
+        // First cycle: begin, then approve.
+        gate.begin_approval("plan v1".to_string());
+        *gate.response.write().unwrap() = Some(PlanApprovalResult::Approved);
+
+        // Second cycle: begin_approval should wipe the approval from cycle 1.
+        gate.begin_approval("plan v2".to_string());
+
+        assert!(
+            gate.response.read().unwrap().is_none(),
+            "second begin_approval must clear the cycle-1 approval (ghost-approval prevention)"
+        );
+        assert_eq!(
+            gate.pending_plan.read().unwrap().as_deref(),
+            Some("plan v2"),
+            "pending_plan should reflect the latest plan text"
+        );
+    }
 }

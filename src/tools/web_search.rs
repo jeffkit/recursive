@@ -62,8 +62,13 @@ pub struct WebSearch {
     test_base_url: Option<String>,
 }
 
+impl Default for WebSearch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebSearch {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))

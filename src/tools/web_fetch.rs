@@ -21,8 +21,13 @@ pub struct WebFetch {
     client: Client,
 }
 
+impl Default for WebFetch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebFetch {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
