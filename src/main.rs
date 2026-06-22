@@ -1536,7 +1536,9 @@ fn shutdown_signal() -> tokio_util::sync::CancellationToken {
             _ = sigterm.recv() => {},
         }
         #[cfg(not(unix))]
-        ctrl_c.await.unwrap();
+        if let Err(e) = ctrl_c.await {
+            tracing::error!("ctrl_c signal error: {e}");
+        }
         t.cancel();
     });
     token

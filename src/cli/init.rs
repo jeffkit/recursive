@@ -82,25 +82,6 @@ fn detect_current_preset(config_path: &Path) -> Option<String> {
     ))
 }
 
-/// Look up the default model for a preset id from the bundled catalog.
-/// Returns an empty string if the preset is not in the catalog.
-///
-/// Centralizing this lookup makes the "wizard defaults follow the catalog"
-/// invariant testable, and stops any future code from re-introducing
-/// hardcoded `match preset.id.as_str() { "anthropic" => "…", … }` style
-/// fallbacks that drift from `providers.toml`.
-// Allow dead_code: this helper exists as a defensive catalog lookup
-// for the auto-detect / prefill path and is exercised by tests in this
-// file. If a hardcoded preset-id -> model match ever re-appears in
-// run_init, route it through this helper instead of re-introducing the
-// catalog-vs-init drift.
-#[allow(dead_code)]
-fn default_model_for_preset(preset_id: &str) -> String {
-    recursive::find_preset(preset_id)
-        .map(|p| p.default_model.clone())
-        .unwrap_or_default()
-}
-
 /// Look up the default model for a manually-typed API base URL by matching
 /// it against the bundled catalog. Replaces a previous string-contains
 /// heuristic that guessed at models from URL substrings (deepseek,
@@ -462,23 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn init_default_model_uses_catalog_for_anthropic() {
-        // The helper must return the catalog's default_model, not a
-        // hardcoded fallback. Asserts both equality and non-emptiness so
-        // a future drift to empty string would also be caught.
-        let from_helper = default_model_for_preset("anthropic");
-        let from_catalog = recursive::find_preset("anthropic")
-            .unwrap()
-            .default_model
-            .clone();
-        assert_eq!(from_helper, from_catalog);
-        assert!(
-            !from_helper.is_empty(),
-            "anthropic catalog default_model is empty"
-        );
-    }
-
-    #[test]
     fn init_default_model_detect_from_api_base_deepseek() {
         // Previously the heuristic returned the hardcoded "deepseek-chat";
         // the catalog now lists "deepseek-v4-flash". The helper must
@@ -511,10 +475,5 @@ mod tests {
         // No catalog match → empty string. The wizard's prompt handles
         // empty defaults by asking the user.
         assert_eq!(detect_model_from_api_base("https://example.com/v1"), "");
-    }
-
-    #[test]
-    fn init_default_model_uses_catalog_for_unknown_preset_is_empty() {
-        assert_eq!(default_model_for_preset("not-a-real-preset"), "");
     }
 }

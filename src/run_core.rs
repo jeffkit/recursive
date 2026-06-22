@@ -43,6 +43,9 @@ use crate::tools::PermissionHook;
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
 pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
+/// Minimum tool-result size (bytes) worth trimming; shorter results are kept verbatim.
+const MIN_TRIM_LENGTH: usize = 200;
+
 /// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
 ///
 /// Delegates to the `Display` implementation on `FinishReason` to ensure
@@ -120,6 +123,18 @@ impl<'a> RunCore<'a> {
         Arc::make_mut(&mut self.messages).push(msg);
     }
 
+    /// Attach `reasoning_content` to the last message in the transcript, if present.
+    ///
+    /// Called immediately after `push_message` on any path that produces reasoning
+    /// tokens (both the no-tool-calls path and the tool-calls path share this logic).
+    fn attach_reasoning_content(&mut self, reasoning: Option<String>) {
+        if reasoning.is_some() {
+            if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
+                msg.reasoning_content = reasoning;
+            }
+        }
+    }
+
     /// Call the LLM once, delegating retry handling to the provider's
     /// internal `RetryPolicy`. Goal-288 removed the outer retry loop so
     /// there is exactly one retry layer.
@@ -186,7 +201,7 @@ impl<'a> RunCore<'a> {
         let placeholder_len = TRIM_PLACEHOLDER.len();
 
         for msg in Arc::make_mut(&mut self.messages).iter_mut().skip(1) {
-            if msg.role == crate::message::Role::Tool && msg.content.len() > 200 {
+            if msg.role == crate::message::Role::Tool && msg.content.len() > MIN_TRIM_LENGTH {
                 let old_len = msg.content.len();
                 msg.content = TRIM_PLACEHOLDER.to_string();
                 trimmed_count += 1;
@@ -386,7 +401,7 @@ impl<'a> RunCore<'a> {
                     let tools = Arc::clone(&self.tools);
                     join_set.spawn(async move {
                         let tool_start = std::time::Instant::now();
-                        let dispatch = tools.invoke_with_audit(&name, args.clone()).await;
+                        let dispatch = tools.invoke_with_audit(&name, args).await;
                         let result = match dispatch.result {
                             Ok(output) => output,
                             Err(crate::error::Error::PermissionDeniedLimit { .. }) => {
@@ -405,7 +420,7 @@ impl<'a> RunCore<'a> {
                 // calls complete in arbitrary order (linear find would always
                 // hit the first matching id, causing silent audit mis-attribution).
                 let mut batch_map: std::collections::HashMap<String, BatchRow> =
-                    std::collections::HashMap::new();
+                    std::collections::HashMap::with_capacity(batch.len());
                 while let Some(res) = join_set.join_next().await {
                     match res {
                         Ok(row) => {
@@ -680,11 +695,7 @@ impl<'a> RunCore<'a> {
             // ---- no tool calls → finish -------------------------------------------
             if completion.tool_calls.is_empty() {
                 self.push_message(Message::assistant(completion.content.clone()));
-                if completion.reasoning_content.is_some() {
-                    if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
-                        msg.reasoning_content = completion.reasoning_content.clone();
-                    }
-                }
+                self.attach_reasoning_content(completion.reasoning_content.clone());
                 let finish = match completion.finish_reason {
                     Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
                     _ => FinishReason::NoMoreToolCalls,
@@ -709,11 +720,7 @@ impl<'a> RunCore<'a> {
                 completion.content.clone(),
                 completion.tool_calls.clone(),
             ));
-            if completion.reasoning_content.is_some() {
-                if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
-                    msg.reasoning_content = completion.reasoning_content.clone();
-                }
-            }
+            self.attach_reasoning_content(completion.reasoning_content.clone());
 
             for call in &completion.tool_calls {
                 self.emit(AgentEvent::ToolCall {

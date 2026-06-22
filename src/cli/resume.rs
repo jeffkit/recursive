@@ -334,10 +334,9 @@ pub(crate) async fn run_resumed(
 
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> =
         if let Some(w) = existing_writer {
-            eprintln!(
-                "session: appending to {}",
-                w.lock().unwrap().session_dir().display()
-            );
+            #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
+            let display_path = w.lock().unwrap().session_dir().display().to_string();
+            eprintln!("session: appending to {display_path}");
             Some(w)
         } else if session {
             match SessionWriter::create_with_tools(
@@ -363,6 +362,7 @@ pub(crate) async fn run_resumed(
 
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
         session_writer.as_ref().map(|w| {
+            #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
             let session_dir = w.lock().unwrap().session_dir().to_path_buf();
             std::sync::Mutex::new(recursive::cost::CostTracker::new(
                 session_dir,
@@ -401,7 +401,9 @@ pub(crate) async fn run_resumed(
     if let Some(ref sw) = session_writer {
         match recursive::ShadowRepo::open(&config.workspace) {
             Ok(repo) => {
+                #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
                 let session_id = sw.lock().unwrap().session_id().to_string();
+                #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
                 let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
                 let log_path = session_dir.join("checkpoints.jsonl");
                 let touched = runtime.kernel().tools().touched_files();

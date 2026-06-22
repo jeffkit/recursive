@@ -130,7 +130,6 @@ impl E2bSandbox {
         struct ExecResp {
             stdout: String,
             stderr: String,
-            #[allow(dead_code)]
             exit_code: i32,
         }
 
@@ -156,6 +155,16 @@ impl E2bSandbox {
                 message: format!("e2b exec parse: {e}"),
             })?;
 
+        if resp.exit_code != 0 {
+            return Err(Error::Tool {
+                name: "Bash".into(),
+                call_id: None,
+                message: format!(
+                    "command exited with code {}: {}",
+                    resp.exit_code, resp.stderr
+                ),
+            });
+        }
         let output = if resp.stderr.is_empty() {
             resp.stdout
         } else {

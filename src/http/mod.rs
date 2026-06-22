@@ -441,13 +441,6 @@ impl ApiError {
         self.retry_after_secs = Some(secs);
         self
     }
-
-    /// Borrow the HTTP status code (used by handlers that need to vary
-    /// behaviour on the status without dropping the message).
-    #[allow(dead_code)]
-    pub(super) fn status(&self) -> StatusCode {
-        self.status
-    }
 }
 
 impl IntoResponse for ApiError {
