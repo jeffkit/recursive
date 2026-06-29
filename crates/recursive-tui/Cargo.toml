@@ -28,6 +28,10 @@ dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"
+# Enables the kernel's test-utils (MockProvider etc.) for the TUI's own
+# test suite so `cargo test -p recursive-tui` is self-contained — no
+# `--features recursive/test-utils` CLI flag needed. Required by the
+# in-process harness workflow (see src/harness.rs).
 recursive = { package = "recursive-agent", path = "../..", features = ["test-utils"] }
 
 [features]

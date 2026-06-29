@@ -20,6 +20,14 @@ pub mod runtime_builder;
 pub mod skill_commands;
 pub mod ui;
 
+/// In-process test harness — the AI's "eyes" for TUI testing.
+///
+/// Test-only: drives `App` + keymap + `handle_ui_event` and renders to an
+/// offscreen `ratatui::Buffer` via `TestBackend`. See the module docs for
+/// the observation / effectiveness loops it enables.
+#[cfg(test)]
+pub mod harness;
+
 // Re-export types used by embedders and by the binary entry point.
 pub use cost::UsageStats;
 pub use input_state::{InputMode, PromptInputState};
