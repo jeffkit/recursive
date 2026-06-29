@@ -575,7 +575,7 @@ fn extract_body(content: &str) -> &str {
     content.trim()
 }
 
-/// Default character budget for `skill_index` rendering.
+/// Default byte budget for `skill_index` rendering.
 ///
 /// Overridden by `RECURSIVE_SKILL_INDEX_BUDGET` env var. Reads on every
 /// call so test setups that toggle the env var take effect immediately.
@@ -594,7 +594,7 @@ const SKILL_INDEX_PER_ENTRY_DESC_BYTES: usize = 250;
 
 /// Render a compact "available skills" block for the system prompt.
 ///
-/// Returns empty string if no skills found. Honors a character budget —
+/// Returns empty string if no skills found. Honors a byte budget —
 /// when the full rendering exceeds the budget, per-entry descriptions
 /// are truncated; if still too long, descriptions are dropped entirely
 /// and only the mode tag + name remain. The budget is read from
@@ -603,21 +603,25 @@ pub fn skill_index(skills: &[Skill]) -> String {
     skill_index_with_budget(skills, default_skill_index_budget())
 }
 
-/// Render `skill_index` constrained to `char_budget` characters total.
+/// Render `skill_index` constrained to `byte_budget` bytes total.
 ///
 /// When the total rendered length fits, the output is identical to the
 /// unconstrained format. When it overflows, descriptions are progressively
 /// truncated (char-boundary-safe via [`crate::truncate_str`]) and finally
 /// dropped, preserving the mode tag and any structural suffixes
-/// (refs/params/sections/depends_on/scripts).
-pub fn skill_index_with_budget(skills: &[Skill], char_budget: usize) -> String {
+/// (refs/params/sections/depends_on/scripts). The budget is measured in
+/// bytes (`str::len`), matching the per-entry truncation cap
+/// [`SKILL_INDEX_PER_ENTRY_DESC_BYTES`]; this is a conservative proxy for
+/// prompt-token cost (multi-byte/CJK content counts toward the budget
+/// faster, so it is truncated sooner).
+pub fn skill_index_with_budget(skills: &[Skill], byte_budget: usize) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
     // Phase 1: full render — preserves the prior behavior when under budget.
     let full = render_skill_index(skills, |s| s.description.clone());
-    if full.len() <= char_budget {
+    if full.len() <= byte_budget {
         return full;
     }
 
@@ -633,7 +637,7 @@ pub fn skill_index_with_budget(skills: &[Skill], char_budget: usize) -> String {
             s.description.clone()
         }
     });
-    if truncated.len() <= char_budget {
+    if truncated.len() <= byte_budget {
         return truncated;
     }
 

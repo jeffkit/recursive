@@ -323,15 +323,64 @@ impl Tool for LoadSkill {
 /// Trailing slashes are not added — authors write the slash after the
 /// placeholder (e.g. `${SKILL_DIR}/scripts/lint.sh`) so the resulting
 /// path is well-formed. If `skill.path` has no parent (degenerate case),
-/// the content is returned unchanged (no panic).
+/// the placeholders are left as-is (no panic).
+///
+/// To include a literal `${SKILL_DIR}` in the body (e.g. when a skill
+/// documents the feature itself), prefix it with a backslash:
+/// `\${SKILL_DIR}` renders as the literal text `${SKILL_DIR}`. A lone
+/// backslash that is not followed by one of the two placeholders is
+/// preserved unchanged.
 fn substitute_skill_dir(content: &str, skill: &Skill) -> String {
-    let Some(skill_dir) = skill.path.parent() else {
-        return content.to_string();
-    };
-    let dir = skill_dir.to_string_lossy().to_string();
-    content
-        .replace("${SKILL_DIR}", &dir)
-        .replace("${RECURSIVE_SKILL_DIR}", &dir)
+    const SKILL_DIR: &str = "${SKILL_DIR}";
+    const RECURSIVE_SKILL_DIR: &str = "${RECURSIVE_SKILL_DIR}";
+
+    let dir: Option<String> = skill.path.parent().map(|p| p.to_string_lossy().to_string());
+
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while i < content.len() {
+        let rest = &content[i..];
+        // Escaped placeholder: `\${SKILL_DIR}` / `\${RECURSIVE_SKILL_DIR}`
+        // renders as the literal placeholder, regardless of whether a dir
+        // is available.
+        if let Some(after) = rest.strip_prefix('\\') {
+            if after.starts_with(SKILL_DIR) {
+                out.push_str(SKILL_DIR);
+                i += 1 + SKILL_DIR.len();
+                continue;
+            }
+            if after.starts_with(RECURSIVE_SKILL_DIR) {
+                out.push_str(RECURSIVE_SKILL_DIR);
+                i += 1 + RECURSIVE_SKILL_DIR.len();
+                continue;
+            }
+            // Lone backslash — keep it and let the normal char copy below
+            // handle it, so we don't mis-handle `\` at EOF or before a
+            // multi-byte char.
+        }
+        if let Some(d) = &dir {
+            if rest.starts_with(SKILL_DIR) {
+                out.push_str(d);
+                i += SKILL_DIR.len();
+                continue;
+            }
+            if rest.starts_with(RECURSIVE_SKILL_DIR) {
+                out.push_str(d);
+                i += RECURSIVE_SKILL_DIR.len();
+                continue;
+            }
+        }
+        // Copy one char (advancing to the next char boundary so multi-byte
+        // sequences are preserved intact).
+        let next = i + 1;
+        let mut end = next;
+        while end < content.len() && !content.is_char_boundary(end) {
+            end += 1;
+        }
+        out.push_str(&content[i..end]);
+        i = end;
+    }
+    out
 }
 
 /// Resolve parameter values: use provided values, fall back to defaults,
@@ -1046,6 +1095,101 @@ mod tests {
         assert!(result.is_ok(), "should not panic: {result:?}");
         // No parent → no substitution; content unchanged
         assert_eq!(result.unwrap(), "Run bash ${SKILL_DIR}/scripts/lint.sh");
+    }
+
+    #[test]
+    fn load_skill_escape_preserves_literal_skill_dir() {
+        // A backslash before the placeholder escapes substitution, so a
+        // skill that documents the feature can include literal `${SKILL_DIR}`
+        // text in its body without it being replaced by the path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: documents the placeholder\n---\n\n\
+             Use \\${SKILL_DIR} to reference this skill's directory.\n\
+             Run `bash ${SKILL_DIR}/scripts/lint.sh`.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let expected_dir = skills[0]
+            .path
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill"})));
+
+        let expected = format!(
+            "Use ${{SKILL_DIR}} to reference this skill's directory.\n\
+             Run `bash {expected_dir}/scripts/lint.sh`."
+        );
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn load_skill_escape_preserves_literal_recursive_skill_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: documents the alias\n---\n\n\
+             Alias form: \\${RECURSIVE_SKILL_DIR} stays literal.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill"})));
+
+        assert_eq!(
+            result.unwrap(),
+            "Alias form: ${RECURSIVE_SKILL_DIR} stays literal."
+        );
+    }
+
+    #[test]
+    fn load_skill_lone_backslash_preserved() {
+        // A backslash not followed by a known placeholder must pass through
+        // unchanged (no over-eager escaping of unrelated content, and no
+        // panic on a trailing backslash).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: backslash handling\n---\n\n\
+             Path C:\\Users\\foo and a trailing slash \\",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill"})));
+
+        assert_eq!(
+            result.unwrap(),
+            "Path C:\\Users\\foo and a trailing slash \\"
+        );
     }
 
     // --- Dependency resolution tests ---

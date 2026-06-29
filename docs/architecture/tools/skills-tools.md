@@ -84,6 +84,15 @@ path). Substitution happens after `{{key}}` parameter substitution.
 Dependency bodies inlined by a `Skill` call are not recursed into; each
 dependency is substituted when it is loaded by its own `Skill` call.
 
+### Escaping a literal placeholder
+
+To include a literal `${SKILL_DIR}` (or `${RECURSIVE_SKILL_DIR}`) in the
+body — e.g. when a skill documents the feature itself — prefix it with a
+backslash: `\${SKILL_DIR}` renders as the literal text `${SKILL_DIR}`
+and is **not** substituted. A backslash that is not followed by one of
+the two placeholders is preserved unchanged. (Refs don't need this:
+they're returned verbatim regardless.)
+
 ## Related Concepts
 
 - [Skills System](../skills.md) — discovery, injection modes, full format
