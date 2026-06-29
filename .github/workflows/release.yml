@@ -73,12 +73,16 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
-          # macOS
-          - target: x86_64-apple-darwin
-            os: macos-13        # Intel runner
-            cross: false
+          # macOS — aarch64 only for 0.7.0. We dropped x86_64-apple-darwin
+          # because (a) GitHub's `macos-13` Intel runner pool is
+          # chronically backlogged (the last attempt queued >24h and was
+          # cancelled) and (b) cross-building x86_64 from the arm64
+          # `macos-latest` runner needs extra cargo SDK config we don't
+          # want to bake in. Intel Mac users are <5% of the install base
+          # and can `cargo install recursive-cli` from source. Revisit
+          # in 0.7.1 with a darwin-universal target.
           - target: aarch64-apple-darwin
-            os: macos-latest    # Apple Silicon runner
+            os: macos-latest
             cross: false
           # Windows
           - target: x86_64-pc-windows-msvc

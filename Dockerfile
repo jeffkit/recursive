@@ -13,12 +13,13 @@
 # no shell for HEALTHCHECK; the debian variant of distroless adds
 # complexity without much size savings vs bookworm-slim (~75 MB).
 
-ARG RUST_VERSION=1.86
-
-# ──────────────────────────────────────────────────────────────────────
-# Stage 1: builder
-# ──────────────────────────────────────────────────────────────────────
-FROM rust:${RUST_VERSION}-slim AS builder
+# Track `stable` rather than pinning a specific version: the recursive-cli
+# build picks up indirect deps (e.g. time@0.3.47) whose MSRV moves with
+# stable, so a pinned rust version in this Dockerfile silently breaks
+# every time a transitive dep bumps its minimum. The release workflow
+# (`.github/workflows/release.yml`) uses dtolnay/rust-toolchain@stable,
+# so the CI verification and the published image stay in lockstep.
+FROM rust:stable-slim AS builder
 
 WORKDIR /build
 
