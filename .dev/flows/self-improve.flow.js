@@ -140,9 +140,12 @@ async function main() {
   console.log(`  baseline: ${baseline}`)
 
   // ── 预编译最新二进制（确保 agent 用到的是最新代码编译出的版本）────
+  // 裸 `cargo build --release` 在 workspace 根只构建根包 (recursive-agent lib)，
+  // 不构建 recursive-cli 的 `recursive` bin —— flow 下游 spawn 的正是该 bin。
+  // 用 -p recursive-cli 显式构建执行器二进制及其依赖。
   await cp.step('preflight.build', () => {
-    console.log('  [preflight.build] cargo build --release ...')
-    execFileSync('cargo', ['build', '--release'], { cwd: repo, stdio: 'inherit' })
+    console.log('  [preflight.build] cargo build --release -p recursive-cli ...')
+    execFileSync('cargo', ['build', '--release', '-p', 'recursive-cli'], { cwd: repo, stdio: 'inherit' })
     console.log('  [preflight.build] ✓ done')
   })
 
