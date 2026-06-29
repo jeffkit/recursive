@@ -380,47 +380,49 @@ set +e
 AGENT_STATUS=${PIPESTATUS[0]}
 set -e
 
+# Session directory the run recorded (emitted on stderr as
+# "session: recording to <dir>"). Used by the auto-resume / resume-fix
+# paths to resume via native `recursive resume --from-file <dir>` —
+# the orthodox session-id resume — instead of replaying the
+# transcript file with --resume-from.
+SESSION_DIR="$(rg -o 'session: recording to .*' "$LOG" 2>/dev/null | head -1 | cut -d' ' -f4)"
+
 # ---- Auto-resume on BudgetExceeded -----------------------------------------
 # If the first attempt hit the step ceiling, re-seed a fresh run with the
 # saved transcript and let it continue from where it left off. One resume
 # only — repeated resumes hit diminishing returns and stack cost.
 if [[ "$AGENT_STATUS" -ne 0 ]] \
    && [[ "$RECURSIVE_AUTO_RESUME" == "1" ]] \
-   && [[ -f "$TRANSCRIPT_OUT" ]] \
-   && rg -q 'reason: BudgetExceeded' "$LOG" 2>/dev/null \
-   && command -v jq >/dev/null 2>&1; then
-  RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
-  if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
-    RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-resumed.json"
-    {
-      echo ""
-      echo "--- AUTO-RESUME: budget exceeded after ${RESUME_FROM} messages;"
-      echo "    replaying with --resume-from ${RESUME_FROM} (one chance) ---"
-      echo ""
-    } | tee -a "$LOG"
+   && [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]] \
+   && rg -q 'reason: BudgetExceeded' "$LOG" 2>/dev/null; then
+  RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-resumed.json"
+  {
+    echo ""
+    echo "--- AUTO-RESUME: budget exceeded; resuming session ${SESSION_DIR}"
+    echo "    via native recursive resume (synthetic continue, one chance) ---"
+    echo ""
+  } | tee -a "$LOG"
 
-    set +e
-    "$BIN" --workspace . \
-      --system-prompt-file "$SYSPROMPT_FILE" \
-      --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
-      $PRICING_FLAG \
-      --log warn \
-      replay "$TRANSCRIPT_OUT" \
-      --resume-from "$RESUME_FROM" "$GOAL_BODY" 2>&1 | redact_secrets | tee -a "$LOG"
-    AGENT_STATUS=${PIPESTATUS[0]}
-    set -e
+  set +e
+  "$BIN" --workspace . \
+    --system-prompt-file "$SYSPROMPT_FILE" \
+    --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+    $PRICING_FLAG \
+    --log warn \
+    resume --from-file "$SESSION_DIR" 2>&1 | redact_secrets | tee -a "$LOG"
+  AGENT_STATUS=${PIPESTATUS[0]}
+  set -e
 
-    # After auto-resume: if cargo test passes AND there are src changes,
-    # treat as success regardless of agent exit code. The agent may exit
-    # non-zero (BudgetExceeded again, or ProviderStop) but the code it
-    # produced before that is still valuable.
-    if [[ "$AGENT_STATUS" -ne 0 ]] && git diff --quiet HEAD -- src/ 2>/dev/null; then
-      : # No src changes — nothing to save, let normal failure path handle it
-    elif [[ "$AGENT_STATUS" -ne 0 ]] && cargo test --quiet >/dev/null 2>&1; then
-      echo ""
-      echo "--- AUTO-RESUME: agent exited non-zero but cargo test passes; treating as success ---"
-      AGENT_STATUS=0
-    fi
+  # After auto-resume: if cargo test passes AND there are src changes,
+  # treat as success regardless of agent exit code. The agent may exit
+  # non-zero (BudgetExceeded again, or ProviderStop) but the code it
+  # produced before that is still valuable.
+  if [[ "$AGENT_STATUS" -ne 0 ]] && git diff --quiet HEAD -- src/ 2>/dev/null; then
+    : # No src changes — nothing to save, let normal failure path handle it
+  elif [[ "$AGENT_STATUS" -ne 0 ]] && cargo test --quiet >/dev/null 2>&1; then
+    echo ""
+    echo "--- AUTO-RESUME: agent exited non-zero but cargo test passes; treating as success ---"
+    AGENT_STATUS=0
   fi
 fi
 
@@ -730,15 +732,12 @@ if ! cargo test --quiet 2>/tmp/cargo-test-errors.log; then
   # This is more effective than starting fresh because the agent retains its
   # full understanding of the codebase changes it made.
   if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
-     && [[ -f "$TRANSCRIPT_OUT" ]] \
-     && [[ -z "${_RECURSIVE_RESUME_ATTEMPTED:-}" ]] \
-     && command -v jq >/dev/null 2>&1; then
+     && [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]] \
+     && [[ -z "${_RECURSIVE_RESUME_ATTEMPTED:-}" ]]; then
     export _RECURSIVE_RESUME_ATTEMPTED=1
-    RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
-    if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
-      # Build the fix prompt with actual error output
-      TEST_ERRORS="$(tail -40 /tmp/cargo-test-errors.log)"
-      FIX_PROMPT="Your code changes caused cargo test to FAIL. Here are the errors:
+    # Build the fix prompt with actual error output
+    TEST_ERRORS="$(tail -40 /tmp/cargo-test-errors.log)"
+    FIX_PROMPT="Your code changes caused cargo test to FAIL. Here are the errors:
 
 \`\`\`
 ${TEST_ERRORS}
@@ -746,34 +745,30 @@ ${TEST_ERRORS}
 
 Please fix the compilation/test errors. Do NOT start over — fix the specific issues above."
 
-      RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-fix.json"
-      {
-        echo ""
-        echo "--- RESUME-FIX: cargo test failed, resuming agent to fix errors ---"
-        echo ""
-      } | tee -a "$LOG"
+    RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-fix.json"
+    {
+      echo ""
+      echo "--- RESUME-FIX: cargo test failed, resuming agent to fix errors ---"
+      echo ""
+    } | tee -a "$LOG"
 
-      set +e
-      "$BIN" --workspace . \
-        --system-prompt-file "$SYSPROMPT_FILE" \
-        --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
-        $PRICING_FLAG \
-        --log warn \
-        replay "$TRANSCRIPT_OUT" \
-        --resume-from "$RESUME_FROM" "$FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
-      FIX_STATUS=${PIPESTATUS[0]}
-      set -e
+    set +e
+    "$BIN" --workspace . \
+      --system-prompt-file "$SYSPROMPT_FILE" \
+      --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+      $PRICING_FLAG \
+      --log warn \
+      resume --from-file "$SESSION_DIR" -p "$FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
+    FIX_STATUS=${PIPESTATUS[0]}
+    set -e
 
-      # Re-check cargo test after the fix attempt
-      if [[ "$FIX_STATUS" -eq 0 ]] && cargo test --quiet >/dev/null 2>&1; then
-        echo "[self-improve] RESUME-FIX: tests pass after fix ✓"
-        # Continue to smoke gate / review as normal
-      else
-        echo "[self-improve] RESUME-FIX: still failing after fix attempt"
-        verdict_and_exit "rolled-back" "post-agent cargo test failed (resume-fix also failed)"
-      fi
+    # Re-check cargo test after the fix attempt
+    if [[ "$FIX_STATUS" -eq 0 ]] && cargo test --quiet >/dev/null 2>&1; then
+      echo "[self-improve] RESUME-FIX: tests pass after fix ✓"
+      # Continue to smoke gate / review as normal
     else
-      verdict_and_exit "rolled-back" "post-agent cargo test failed"
+      echo "[self-improve] RESUME-FIX: still failing after fix attempt"
+      verdict_and_exit "rolled-back" "post-agent cargo test failed (resume-fix also failed)"
     fi
   else
     verdict_and_exit "rolled-back" "post-agent cargo test failed"
@@ -826,14 +821,11 @@ if [[ "${RECURSIVE_CLIPPY_CHECK:-1}" == "1" ]] \
   # are usually a one-line fix; unused imports the agent can drop without
   # needing a follow-up compile cycle.
   if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
-     && [[ -f "$TRANSCRIPT_OUT" ]] \
-     && [[ -z "${_RECURSIVE_CLIPPY_RESUME_ATTEMPTED:-}" ]] \
-     && command -v jq >/dev/null 2>&1; then
+     && [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]] \
+     && [[ -z "${_RECURSIVE_CLIPPY_RESUME_ATTEMPTED:-}" ]]; then
     export _RECURSIVE_CLIPPY_RESUME_ATTEMPTED=1
-    RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
-    if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
-      CLIPPY_ERRORS="$(tail -60 /tmp/cargo-clippy-errors.log)"
-      CLIPPY_FIX_PROMPT="Your code changes caused \`cargo clippy --all-targets --all-features -- -D warnings\` to FAIL. Lint warnings are errors under \`-D warnings\`. Errors:
+    CLIPPY_ERRORS="$(tail -60 /tmp/cargo-clippy-errors.log)"
+    CLIPPY_FIX_PROMPT="Your code changes caused \`cargo clippy --all-targets --all-features -- -D warnings\` to FAIL. Lint warnings are errors under \`-D warnings\`. Errors:
 
 \`\`\`
 ${CLIPPY_ERRORS}
@@ -841,40 +833,36 @@ ${CLIPPY_ERRORS}
 
 Please fix the lint warnings. Mechanical fixes (needless_borrow, redundant_clone, unused_imports) are usually a one-line change. Do NOT start over — fix the specific issues above."
 
-      RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-clippy-fix.json"
-      {
-        echo ""
-        echo "--- CLIPPY-FIX: cargo clippy failed, resuming agent to fix warnings ---"
-        echo ""
-      } | tee -a "$LOG"
+    RESUMED_TRANSCRIPT_OUT="${TRANSCRIPT_OUT%.json}-clippy-fix.json"
+    {
+      echo ""
+      echo "--- CLIPPY-FIX: cargo clippy failed, resuming agent to fix warnings ---"
+      echo ""
+    } | tee -a "$LOG"
 
-      set +e
-      "$BIN" --workspace . \
-        --system-prompt-file "$SYSPROMPT_FILE" \
-        --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
-        $PRICING_FLAG \
-        --log warn \
-        replay "$TRANSCRIPT_OUT" \
-        --resume-from "$RESUME_FROM" "$CLIPPY_FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
-      CLIPPY_FIX_STATUS=${PIPESTATUS[0]}
-      set -e
+    set +e
+    "$BIN" --workspace . \
+      --system-prompt-file "$SYSPROMPT_FILE" \
+      --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
+      $PRICING_FLAG \
+      --log warn \
+      resume --from-file "$SESSION_DIR" -p "$CLIPPY_FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
+    CLIPPY_FIX_STATUS=${PIPESTATUS[0]}
+    set -e
 
-      # Re-check clippy after the fix attempt
-      if [[ "$CLIPPY_FIX_STATUS" -eq 0 ]] \
-         && cargo clippy --all-targets --all-features -- -D warnings \
-              >/dev/null 2>&1; then
-        echo "[self-improve] CLIPPY-FIX: clippy clean after fix ✓" | tee -a "$LOG"
-        # Re-commit any agent edits made during the clippy-fix replay.
-        if [[ -n "$(git status --porcelain)" ]]; then
-          git add -A
-          git commit --quiet -m "self-improve(${GOAL_TAG}): clippy-fix round"
-        fi
-      else
-        echo "[self-improve] CLIPPY-FIX: still failing after fix attempt" | tee -a "$LOG"
-        verdict_and_exit "rolled-back" "post-agent cargo clippy failed (clippy-fix also failed)"
+    # Re-check clippy after the fix attempt
+    if [[ "$CLIPPY_FIX_STATUS" -eq 0 ]] \
+       && cargo clippy --all-targets --all-features -- -D warnings \
+            >/dev/null 2>&1; then
+      echo "[self-improve] CLIPPY-FIX: clippy clean after fix ✓" | tee -a "$LOG"
+      # Re-commit any agent edits made during the clippy-fix resume.
+      if [[ -n "$(git status --porcelain)" ]]; then
+        git add -A
+        git commit --quiet -m "self-improve(${GOAL_TAG}): clippy-fix round"
       fi
     else
-      verdict_and_exit "rolled-back" "post-agent cargo clippy failed"
+      echo "[self-improve] CLIPPY-FIX: still failing after fix attempt" | tee -a "$LOG"
+      verdict_and_exit "rolled-back" "post-agent cargo clippy failed (clippy-fix also failed)"
     fi
   else
     verdict_and_exit "rolled-back" "post-agent cargo clippy failed"
@@ -1037,12 +1025,9 @@ if [[ "${RECURSIVE_SMOKE_TEST:-1}" == "1" ]] \
 
     # Give the agent one chance to fix the regression before rolling back.
     if [[ "${RECURSIVE_RESUME_ON_FAILURE:-1}" == "1" ]] \
-       && [[ -f "$TRANSCRIPT_OUT" ]] \
-       && [[ -z "${_RECURSIVE_SMOKE_RESUME_ATTEMPTED:-}" ]] \
-       && command -v jq >/dev/null 2>&1; then
+       && [[ -z "${_RECURSIVE_SMOKE_RESUME_ATTEMPTED:-}" ]]; then
       export _RECURSIVE_SMOKE_RESUME_ATTEMPTED=1
-      RESUME_FROM="$(jq '.messages | length' "$TRANSCRIPT_OUT" 2>/dev/null || echo 0)"
-      if [[ "$RESUME_FROM" =~ ^[0-9]+$ ]] && [[ "$RESUME_FROM" -gt 0 ]]; then
+      if [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]]; then
         SMOKE_PROMPT="The E2E smoke suite failed after your changes. Output:
 
 \`\`\`
@@ -1059,8 +1044,7 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
           --transcript-out "$SMOKE_TRANSCRIPT_OUT" \
           $PRICING_FLAG \
           --log warn \
-          replay "$TRANSCRIPT_OUT" \
-          --resume-from "$RESUME_FROM" "$SMOKE_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
+          resume --from-file "$SESSION_DIR" -p "$SMOKE_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
         SMOKE_FIX_STATUS=${PIPESTATUS[0]}
         set -e
 

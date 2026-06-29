@@ -5,8 +5,9 @@ COPY Cargo.toml Cargo.lock providers.toml ./
 COPY src/ src/
 COPY crates/ crates/
 
-# Build release binary
-RUN cargo build --release -p recursive-agent 2>&1 | tail -5
+# Build release binary. The `recursive` binary is the `recursive-cli` crate's
+# bin target (the root `recursive-agent` crate is a lib only, post split).
+RUN cargo build --release -p recursive-cli 2>&1 | tail -5
 
 FROM debian:bookworm-slim
 
