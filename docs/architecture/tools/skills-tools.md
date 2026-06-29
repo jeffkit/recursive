@@ -48,6 +48,31 @@ All Recursive project skills are OKF-conformant. See [Skills System](../skills.m
 `load_skill name=my-skill section="Recovery patterns"` loads only the named
 `## Recovery patterns` section — useful for token budget management.
 
+## `${SKILL_DIR}` Placeholder Substitution
+
+When the `Skill` tool returns a skill's **body** or a **named section**,
+every occurrence of `${SKILL_DIR}` (and the alias
+`${RECURSIVE_SKILL_DIR}`) is replaced with the absolute path of the
+directory containing that skill's `SKILL.md`. This lets skill authors
+reference bundled scripts and refs with portable, ready-to-run paths
+the agent can hand to the `Bash` tool. Ref documents are returned
+verbatim and never receive this substitution — they may legitimately
+contain literal `${...}` text.
+
+Example skill body:
+
+```markdown
+Run the linter with: `bash ${SKILL_DIR}/scripts/lint.sh`
+Read the spec from `${SKILL_DIR}/refs/api-spec.md`.
+```
+
+After `load_skill` returns, the placeholders are resolved to absolute
+paths (no trailing slash is added — write the slash after the
+placeholder so `${SKILL_DIR}/scripts/foo.sh` resolves to a well-formed
+path). Substitution happens after `{{key}}` parameter substitution.
+Dependency bodies inlined by a `Skill` call are not recursed into; each
+dependency is substituted when it is loaded by its own `Skill` call.
+
 ## Related Concepts
 
 - [Skills System](../skills.md) — discovery, injection modes, full format

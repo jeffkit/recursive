@@ -254,6 +254,13 @@ impl Tool for LoadSkill {
                 result
             };
 
+            // Substitute ${SKILL_DIR} / ${RECURSIVE_SKILL_DIR} placeholders
+            // so skill authors can reference bundled scripts and refs
+            // (e.g. `bash ${SKILL_DIR}/scripts/lint.sh`). Ref documents
+            // are returned as-is and never receive this substitution —
+            // they may legitimately contain literal `${...}` text.
+            let rendered = substitute_skill_dir(&rendered, skill);
+
             return Ok(rendered);
         }
 
@@ -285,6 +292,12 @@ impl Tool for LoadSkill {
             result
         };
 
+        // Substitute ${SKILL_DIR} / ${RECURSIVE_SKILL_DIR} placeholders
+        // for the requested skill's body only. Dependency bodies are not
+        // recursed into here — they will get their own substitution when
+        // they are loaded by a future `Skill` call (do not recurse).
+        let rendered = substitute_skill_dir(&rendered, skill);
+
         // Resolve dependencies (if any)
         let mut visited = HashSet::new();
         visited.insert(skill.name.to_lowercase());
@@ -303,6 +316,22 @@ impl Tool for LoadSkill {
 
         Ok(output)
     }
+}
+
+/// Substitute `${SKILL_DIR}` and `${RECURSIVE_SKILL_DIR}` with the
+/// absolute path of the directory containing the skill's SKILL.md.
+/// Trailing slashes are not added — authors write the slash after the
+/// placeholder (e.g. `${SKILL_DIR}/scripts/lint.sh`) so the resulting
+/// path is well-formed. If `skill.path` has no parent (degenerate case),
+/// the content is returned unchanged (no panic).
+fn substitute_skill_dir(content: &str, skill: &Skill) -> String {
+    let Some(skill_dir) = skill.path.parent() else {
+        return content.to_string();
+    };
+    let dir = skill_dir.to_string_lossy().to_string();
+    content
+        .replace("${SKILL_DIR}", &dir)
+        .replace("${RECURSIVE_SKILL_DIR}", &dir)
 }
 
 /// Resolve parameter values: use provided values, fall back to defaults,
@@ -360,7 +389,7 @@ fn resolve_params(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::SkillMode;
+    use crate::skills::{SkillMode, SkillSection};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -837,6 +866,186 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Review python code.");
+    }
+
+    // --- ${SKILL_DIR} substitution tests (Goal 320) ---
+
+    #[test]
+    fn load_skill_substitutes_skill_dir_in_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A skill that runs a script\n---\n\n\
+             Run the linter with: `bash ${SKILL_DIR}/scripts/lint.sh`",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let expected_dir = skills[0]
+            .path
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill"})));
+
+        assert!(result.is_ok());
+        let expected = format!("Run the linter with: `bash {expected_dir}/scripts/lint.sh`");
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn load_skill_substitutes_recursive_skill_dir_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A skill that runs a script\n---\n\n\
+             Run with `${RECURSIVE_SKILL_DIR}/scripts/lint.sh`.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let expected_dir = skills[0]
+            .path
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill"})));
+
+        assert!(result.is_ok());
+        let expected = format!("Run with `{expected_dir}/scripts/lint.sh`.");
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn load_skill_substitutes_skill_dir_in_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: Has a script-running section\n---\n\n\
+             ## Overview\n\n\
+             Intro without placeholders.\n\n\
+             ## Run\n\n\
+             Execute `${SKILL_DIR}/scripts/run.sh` to start.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let expected_dir = skills[0]
+            .path
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill", "section": "Run"})));
+
+        assert!(result.is_ok());
+        let expected = format!("Execute `{expected_dir}/scripts/run.sh` to start.");
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn load_skill_does_not_substitute_skill_dir_in_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a skill with a ref that contains literal ${SKILL_DIR} text.
+        // Refs are arbitrary documents and must NOT have ${SKILL_DIR}
+        // substituted on them.
+        let skill_dir = base.join("my-skill");
+        fs::create_dir(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A skill with a literal-ref\n---\n\nBody",
+        )
+        .unwrap();
+
+        let refs_dir = skill_dir.join("refs");
+        fs::create_dir(&refs_dir).unwrap();
+        fs::write(
+            refs_dir.join("literal.md"),
+            "The literal text `${SKILL_DIR}` and `${RECURSIVE_SKILL_DIR}` must pass through.",
+        )
+        .unwrap();
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "my-skill", "ref": "literal"})));
+
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(
+            body.contains("${SKILL_DIR}"),
+            "ref should preserve literal ${{SKILL_DIR}} text: {body}"
+        );
+        assert!(
+            body.contains("${RECURSIVE_SKILL_DIR}"),
+            "ref should preserve literal ${{RECURSIVE_SKILL_DIR}} text: {body}"
+        );
+    }
+
+    #[test]
+    fn load_skill_no_skill_dir_when_path_has_no_parent() {
+        // Degenerate case: a Skill whose `path` has no parent (e.g. the
+        // filesystem root "/"). The substitution helper must return content
+        // unchanged rather than panic. We exercise the section-return path
+        // because it doesn't read `skill.path` from disk (so we can use a
+        // non-existent root path safely).
+        let skill = Skill {
+            name: "weird-skill".to_string(),
+            description: "Skill with no parent path".to_string(),
+            path: PathBuf::from("/"),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![SkillSection {
+                name: "Overview".to_string(),
+                content: "Run bash ${SKILL_DIR}/scripts/lint.sh".to_string(),
+            }],
+            globs: None,
+        };
+
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "weird-skill", "section": "Overview"})));
+
+        assert!(result.is_ok(), "should not panic: {result:?}");
+        // No parent → no substitution; content unchanged
+        assert_eq!(result.unwrap(), "Run bash ${SKILL_DIR}/scripts/lint.sh");
     }
 
     // --- Dependency resolution tests ---
