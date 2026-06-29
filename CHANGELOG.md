@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.7.0
+
+The "workspace split" release — 805 commits since 0.6.0. Highlights:
+
+### Breaking
+- **Workspace restructure**: TUI and CLI physically migrated into separate
+  workspace crates (`recursive-cli`, `recursive-tui`, `recursive-agent`).
+  The published `recursive` binary now lives in `recursive-cli`; the root
+  crate is the library. Embedders depending on the old in-tree layout
+  must update path deps.
+- **Deleted deprecated types**: `Agent`, `StepEvent`, `AgentOutcome`
+  removed (use `RunCore` / `AgentEvent`).
+- **HTTP server security**: refuses 503 when no auth is configured
+  (`RECURSIVE_HTTP_AUTH_KEYS` / `RECURSIVE_HTTP_AUTH_JWT_SECRET`).
+  `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` for local dev only.
+- **`run_skill_script`** no longer wraps in `sh -c`; args are parsed with
+  `shell-words` and exec'd directly (no shell injection).
+
+### Providers & pricing
+- Remote provider catalog with 7-day TTL cache
+  (`recursive providers update|list|status`, `RECURSIVE_PROVIDERS_URL`,
+  `RECURSIVE_PROVIDERS_AUTO_REFRESH`). `pricing_for` now resolves from
+  the effective catalog (remote cache > bundled > `providers.d`).
+- Dual-protocol `anthropic_api_base` in presets (OpenAI + Anthropic on
+  one provider).
+
+### LLM
+- Anthropic `stream_with_search`: multi-round tool search across
+  streaming calls.
+- OpenAI provider software-layer ToolSearch fallback.
+- Live reasoning streaming; reasoning tokens counted in cost total.
+
+### Tools & skills
+- `WebSearch` tool with multi-provider support + Jina zero-config fallback.
+- `Glob`; tool names aligned with fake-cc conventions.
+- Skill-hub: `find_skills` / `install_skill` tools.
+- Partial-read guard for `StrReplace` (goal 261).
+
+### HTTP API & sessions
+- `recursive http` subcommand with graceful shutdown.
+- Route-level auth bypass; HTTP session TTL reaper +
+  `Config.subagent_max_depth`.
+- Type-safe `SessionStatus` enum; `schema_version` on `SessionMeta`;
+  auto-fill session `name` from first prompt.
+- Native session-id resume (`recursive resume <id>` / `--from-file`)
+  replaces transcript-replay resume.
+
+### Multi-agent
+- Coordinator mode + team/task tools; inter-worker messaging; parallel
+  dispatch; `role_name` in `spawn_worker`.
+
+### TUI
+- Bottom-panel API + `CommandInteract` mode (in-layout slot replaces
+  overlay popups); per-turn cache-hit rate; Claude-Code-style startup
+  banner.
+
+### Self-improve loop
+- `--reviewer-agent` (claude support); `--allow-tools` flag; multi-round
+  revision loop; reviewer with Read/Glob access.
+
+### Internals
+- Architecture review fixes (P0–P3); `session.rs` / `tools/mod.rs` split;
+  unified `atomic_write`; configurable stuck-detection window/threshold.
+
 ## 0.2.0 (unreleased)
 
 - **BREAKING (security)**: HTTP server now refuses requests with 503 when

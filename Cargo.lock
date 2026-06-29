@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "agui-client",
  "agui-protocol",
