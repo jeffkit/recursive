@@ -75,20 +75,41 @@ impl Screen {
         self.buf[(x, y)].style()
     }
 
+    /// The background colour at `(x, y)`, or `None` if unset / `Reset`.
+    /// Use this (rather than [`Screen::has_bg`]) when you need to tell a
+    /// highlight bar apart from a panel block's uniform base fill.
+    pub fn bg(&self, x: u16, y: u16) -> Option<Color> {
+        match self.buf[(x, y)].style().bg {
+            Some(Color::Reset) | None => None,
+            Some(c) => Some(c),
+        }
+    }
+
+    /// `true` if any cell on row `y` carries the specific background `color`.
+    pub fn row_has_bg_color(&self, y: u16, color: Color) -> bool {
+        (0..self.width).any(|x| self.bg(x, y) == Some(color))
+    }
+
+    /// `true` if any cell on row `y` has a background fill other than `base`.
+    /// Pass a panel's base colour to filter out its uniform block background.
+    pub fn row_has_bg_other_than(&self, y: u16, base: Color) -> bool {
+        (0..self.width).any(|x| matches!(self.bg(x, y), Some(c) if c != base))
+    }
+
     /// `true` if the cell has any non-default background (a coloured or
-    /// reversed fill). Used to detect the command-panel highlight bar
-    /// independently of the `▶` marker text.
+    /// reversed fill). Coarse — does not distinguish a highlight from a
+    /// block's base fill; prefer [`Screen::bg`] / [`Screen::row_has_bg_color`]
+    /// for highlight-bar detection.
     pub fn has_bg(&self, x: u16, y: u16) -> bool {
-        !matches!(self.buf[(x, y)].style().bg, Some(Color::Reset) | None)
+        self.bg(x, y).is_some()
             || self.buf[(x, y)]
                 .style()
                 .add_modifier
                 .intersects(Modifier::REVERSED)
     }
 
-    /// `true` if any cell on row `y` carries a background fill. Cheaper
-    /// than scanning for a specific column when you only need "which row
-    /// is highlighted".
+    /// `true` if any cell on row `y` carries a background fill. Coarse;
+    /// see [`Screen::has_bg`].
     pub fn row_has_bg(&self, y: u16) -> bool {
         (0..self.width).any(|x| self.has_bg(x, y))
     }
@@ -392,5 +413,133 @@ mod tests {
         let drained = h.drain_actions();
         assert_eq!(drained.len(), 1);
         assert!(h.actions().is_empty(), "drain_actions must clear the queue");
+    }
+
+    // ── Stage 2: real visual acceptance tests ───────────────────────────
+    //
+    // These exercise the two `/resume`-area bugs fixed in b202dc8 at the
+    // *rendered* layer, not just the structural layer. The structural test
+    // `theme_panel_list_offset_aligns_highlight_with_marker` (in commands.rs)
+    // compares `lines` indices; the tests below compare what actually lands
+    // on screen — catching the visual misalignment the user originally saw.
+
+    use crate::app::InputMode;
+    use crate::commands::{CommandHandler, CommandOutcome};
+    use ratatui::style::Color;
+
+    /// The interact-panel highlight colour (must match
+    /// `render_command_interact_panel`'s `selected_style`).
+    const HIGHLIGHT: Color = Color::Rgb(205, 100, 50);
+
+    /// Invoke a sync slash-command that opens a panel and return the panel.
+    fn open_panel(app: &mut App, name: &str, args: &[String]) -> crate::app::CommandPanelState {
+        let registry = app.commands.clone();
+        let spec = registry
+            .lookup(name)
+            .unwrap_or_else(|| panic!("/{name} registered"));
+        match &spec.handler {
+            CommandHandler::Sync(f) => match f(app, args) {
+                CommandOutcome::OpenPanel(panel) => panel,
+                other => panic!("/{name} expected OpenPanel, got {other:?}"),
+            },
+            _ => panic!("/{name} is not a sync command"),
+        }
+    }
+
+    #[test]
+    fn theme_panel_marker_row_carries_highlight_bg() {
+        // Regression: the highlight bar must land on the same screen row as
+        // the `▶` marker. Before the list_offset fix the bar sat on the
+        // header row and the `▶` row had only the panel's base (Black) fill.
+        let mut h = Harness::new();
+        let panel = open_panel(h.app_mut(), "theme", &[]);
+        h.app_mut().active_command_panel = Some(panel);
+        h.app_mut().prompt.mode = InputMode::CommandInteract;
+
+        let screen = h.render();
+        let marker_row = screen
+            .find_row("▶")
+            .expect("a ▶ marker should be rendered on screen");
+        assert!(
+            screen.row_has_bg_color(marker_row, HIGHLIGHT),
+            "the ▶ marker row must carry the highlight bar (visual alignment)\n{}",
+            screen.numbered()
+        );
+    }
+
+    #[test]
+    fn theme_panel_header_row_is_not_highlighted() {
+        // Companion guard: the header row ("Choose theme …") must NOT carry
+        // the highlight colour. This is the row the buggy config
+        // (list_offset = 0) would have highlighted instead of the item.
+        let mut h = Harness::new();
+        let panel = open_panel(h.app_mut(), "theme", &[]);
+        h.app_mut().active_command_panel = Some(panel);
+        h.app_mut().prompt.mode = InputMode::CommandInteract;
+
+        let screen = h.render();
+        let header_row = screen
+            .find_row("Choose theme")
+            .expect("the panel header should be rendered");
+        assert!(
+            !screen.row_has_bg_color(header_row, HIGHLIGHT),
+            "the header row must not carry the highlight — the bar belongs on the item row\n{}",
+            screen.numbered()
+        );
+    }
+
+    #[test]
+    fn session_resumed_replaces_visible_transcript() {
+        // Regression: `/resume` must REPLACE the visible conversation, not
+        // append to it. Pump some old content, then a SessionResumed event
+        // carrying a fresh transcript; the old content must vanish from the
+        // screen and the resumed dialogue must appear.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "OLD-TURN-MUST-VANISH".into(),
+        });
+
+        h.pump(UiEvent::SessionResumed {
+            session_id: "s1".into(),
+            turn_count: 3,
+            blocks: vec![
+                TranscriptBlock::User {
+                    text: "resumed question".into(),
+                },
+                TranscriptBlock::Assistant {
+                    text: "resumed answer".into(),
+                    streaming: false,
+                    latency_ms: None,
+                },
+            ],
+        });
+
+        let text = h.screen_text();
+        assert!(
+            text.contains("resumed question") && text.contains("resumed answer"),
+            "resumed transcript should be visible:\n{}",
+            h.screen_numbered()
+        );
+        assert!(
+            !text.contains("OLD-TURN-MUST-VANISH"),
+            "old transcript must be replaced, not appended:\n{}",
+            h.screen_numbered()
+        );
+    }
+
+    #[test]
+    fn session_resumed_appends_resume_note() {
+        let mut h = Harness::new();
+        h.pump(UiEvent::SessionResumed {
+            session_id: "abc123".into(),
+            turn_count: 9,
+            blocks: vec![TranscriptBlock::User { text: "q".into() }],
+        });
+        let text = h.screen_text();
+        assert!(
+            text.contains("Resumed session abc123") && text.contains("9 messages"),
+            "a resume note should be appended after the resumed transcript:\n{}",
+            h.screen_numbered()
+        );
     }
 }
