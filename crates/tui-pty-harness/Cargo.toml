@@ -1,0 +1,28 @@
+[package]
+name = "tui-pty-harness"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "PTY harness that runs a TUI binary and snapshots its screen — the integration-layer 'eyes' for AI-driven TUI testing"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "tui-pty"
+path = "src/main.rs"
+
+[dependencies]
+# portable-pty: cross-platform PTY (wezterm's crate). Implementing PTY
+# allocation by hand is infeasible across macOS/Linux/Windows; this is the
+# de-facto choice and keeps the harness off the product crates' dep graphs.
+portable-pty = "0.8"
+# vt100: a correct VT100/ANSI terminal state model with a readable Screen
+# grid. Reimplements the terminal escape handling the real TUI targets, so
+# the snapshot reflects what a user's terminal would show — not a guess.
+vt100 = "0.15"
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+# Used by the self-test that spawns a trivial command under a PTY and
+# asserts the snapshot captures its output.
