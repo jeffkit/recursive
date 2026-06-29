@@ -493,6 +493,24 @@ pub fn build_router(state: AppState) -> Router {
     build_router_with_auth(state, auth_config_from_env())
 }
 
+/// Run a `Router` on an already-bound [`tokio::net::TcpListener`] until
+/// `shutdown` resolves, then stop gracefully.
+///
+/// This encapsulates the `axum::serve` call so callers — notably the
+/// `recursive http` CLI subcommand — can serve the API without taking a
+/// direct `axum` dependency. `shutdown` is any future that completes when
+/// the server should stop (e.g. `CancellationToken::cancelled()` wrapped in
+/// an `async move` block fired on SIGINT/SIGTERM).
+pub async fn serve_with_graceful_shutdown(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
 /// Build the HTTP router with an explicit `AuthConfig`.
 ///
 /// Tests use this to inject a known auth state without touching

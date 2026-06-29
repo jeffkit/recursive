@@ -669,7 +669,7 @@ async fn main() -> anyhow::Result<()> {
                 ];
                 if let Some(home) = std::env::var_os("HOME") {
                     paths.push(
-                        std::path::PathBuf::from(home)
+                        std::path::PathBuf::from(home.clone())
                             .join(".recursive")
                             .join("skills"),
                     );
@@ -738,9 +738,10 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let shutdown = shutdown_signal();
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move { shutdown.cancelled().await })
-                .await?;
+            recursive::http::serve_with_graceful_shutdown(listener, router, async move {
+                shutdown.cancelled().await
+            })
+            .await?;
             eprintln!("shutdown: HTTP server stopped gracefully");
             Ok(())
         }
