@@ -289,6 +289,8 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_cost_usd() {
+        let _home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(_home.path());
         let dir = tempfile::tempdir().unwrap();
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
@@ -353,6 +355,8 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_finish_writes_files() {
+        let _home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(_home.path());
         let dir = tempfile::tempdir().unwrap();
 
         // Create a minimal .meta.json to test update_meta_with_cost
@@ -500,6 +504,8 @@ mod tests {
 
     #[test]
     fn test_cost_tracker_cache_hit_discount() {
+        let _home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(_home.path());
         let dir = tempfile::tempdir().unwrap();
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 
@@ -526,6 +532,8 @@ mod tests {
     /// output rate.
     #[test]
     fn cost_includes_reasoning_in_output_bill() {
+        let _home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(_home.path());
         let dir = tempfile::tempdir().unwrap();
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
 

@@ -206,14 +206,16 @@ fn compute_effective_presets() -> Vec<ProviderPreset> {
 /// All presets: remote cache + bundled + `providers.d/`. Returns an owned
 /// `Vec` because the cache and user overrides are loaded at runtime. Use
 /// [`find_preset_effective`] / [`find_model_pricing_effective`] when you
-/// only need to look one up. The merged vec is computed once per process
-/// (the cache file is read at first use and memoised) — CLI processes are
-/// short-lived, so a stale in-process cache across a long-running server
-/// is an acceptable trade-off documented here for future callers.
+/// only need to look one up.
+///
+/// Recomputed on every call (no process-wide memoisation). The cache file
+/// is a small JSON read, so the per-call cost is negligible, and avoiding
+/// a `OnceLock` here keeps the effective catalog correct for long-running
+/// processes (HTTP server, loop mode) and deterministic for unit tests
+/// that pin `RECURSIVE_HOME` — a memoised vec would be poisoned by the
+/// first caller's environment and leak across tests.
 pub fn all_presets_effective() -> Vec<ProviderPreset> {
-    use std::sync::OnceLock;
-    static EFFECTIVE: OnceLock<Vec<ProviderPreset>> = OnceLock::new();
-    EFFECTIVE.get_or_init(compute_effective_presets).clone()
+    compute_effective_presets()
 }
 
 /// Look up a preset by id in the **effective** catalog (remote cache +

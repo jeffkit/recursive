@@ -325,6 +325,12 @@ mod tests {
 
     #[test]
     fn pricing_for_known_models() {
+        // Pin RECURSIVE_HOME so the effective catalog (remote cache +
+        // bundled) collapses to bundled pricing — a stray
+        // ~/.recursive/providers_cache.json on the developer's machine
+        // must not change the asserted bundled prices.
+        let _home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(_home.path());
         let p1 = pricing_for("MiniMax-M3");
         assert!(p1.is_some());
         assert!((p1.unwrap().input_per_million - 0.30).abs() < 1e-9);
@@ -408,6 +414,8 @@ mod tests {
 
     #[test]
     fn pricing_for_deepseek_has_cache_discount() {
+        let _home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(_home.path());
         let pricing = pricing_for("deepseek-chat").expect("deepseek-chat should be known");
         assert!((pricing.input_per_million - 0.14).abs() < 1e-9);
         assert!((pricing.cache_hit_input_per_million - 0.0028).abs() < 1e-9);
