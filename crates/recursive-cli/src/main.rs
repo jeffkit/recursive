@@ -332,6 +332,26 @@ enum Cmd {
     /// List active agent sessions (sessions in the current workspace
     /// whose status is "active" or whose lock file is live).
     Agents,
+    /// Manage the remote provider preset catalog (download, list, status).
+    Providers {
+        #[command(subcommand)]
+        cmd: ProvidersCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvidersCmd {
+    /// Download the upstream provider catalog and refresh the local cache.
+    Update {
+        /// Override the upstream URL for this fetch. Defaults to
+        /// `RECURSIVE_PROVIDERS_URL` or the built-in catalog.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// Print the effective preset list (remote cache + bundled + providers.d).
+    List,
+    /// Show cache file path, age, and whether a refresh is due.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -591,6 +611,12 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("hint:    run `recursive migrate` to move it under ~/.recursive");
         }
     }
+
+    // Best-effort remote provider-catalog refresh. No-op unless
+    // RECURSIVE_PROVIDERS_AUTO_REFRESH=1 AND the cache is stale, so the
+    // default startup behaviour is unchanged. One-shot commands exit
+    // before the spawned task completes; long-running commands benefit.
+    recursive::providers_cache::spawn_background_refresh();
 
     match effective_cmd {
         #[cfg(feature = "weixin")]
@@ -1174,6 +1200,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Mcp { cmd } => cmd_mcp(cmd, &config.workspace).await,
         Cmd::Update | Cmd::Upgrade => cmd_update().await,
         Cmd::Agents => cmd_agents(&config.workspace),
+        Cmd::Providers { cmd } => cmd_providers(cmd).await,
     }
 }
 
@@ -1491,6 +1518,72 @@ fn cmd_agents(workspace: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+// ─── providers ───────────────────────────────────────────────────────────────
+
+/// Implement `recursive providers update|list|status` — manage the remote
+/// provider preset catalog cache.
+async fn cmd_providers(cmd: ProvidersCmd) -> anyhow::Result<()> {
+    match cmd {
+        ProvidersCmd::Update { url } => {
+            let target = url.unwrap_or_else(recursive::providers_cache::configured_url);
+            println!("Fetching provider catalog from {target}");
+            let cache = recursive::providers_cache::fetch_and_save(&target)
+                .await
+                .map_err(|e| anyhow::anyhow!("providers update failed: {e}"))?;
+            let path = recursive::providers_cache::cache_path();
+            println!(
+                "Updated {} preset(s) from {}",
+                cache.providers.len(),
+                cache.source_url
+            );
+            println!("Cache written to {}", path.display());
+            Ok(())
+        }
+        ProvidersCmd::List => {
+            let presets = recursive::all_presets_effective();
+            if presets.is_empty() {
+                println!("(no presets)");
+                return Ok(());
+            }
+            println!(
+                "{:<18} {:<14} {:<24} {}",
+                "ID", "TYPE", "DEFAULT_MODEL", "API_BASE"
+            );
+            for p in presets {
+                println!(
+                    "{:<18} {:<14} {:<24} {}",
+                    p.id, p.provider_type, p.default_model, p.api_base
+                );
+            }
+            Ok(())
+        }
+        ProvidersCmd::Status => {
+            let path = recursive::providers_cache::cache_path();
+            println!("Cache file: {}", path.display());
+            if !path.exists() {
+                println!("Status: no cache — run `recursive providers update`");
+                println!("Upstream: {}", recursive::providers_cache::configured_url());
+                return Ok(());
+            }
+            let age = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok());
+            match age {
+                Some(d) => println!("Age: {:.1} hours", d.as_secs_f64() / 3600.0),
+                None => println!("Age: unknown"),
+            }
+            let stale = recursive::providers_cache::needs_update();
+            println!(
+                "Refresh due: {}",
+                if stale { "yes (>7 days)" } else { "no" }
+            );
+            println!("Upstream: {}", recursive::providers_cache::configured_url());
+            Ok(())
+        }
+    }
 }
 
 /// Returns a [`CancellationToken`] that fires on SIGINT (Ctrl+C) or SIGTERM.
