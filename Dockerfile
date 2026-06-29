@@ -38,7 +38,7 @@ COPY src/ src/
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --features http --bin recursive && \
+    cargo build --release -p recursive-cli --features http --bin recursive && \
     cp target/release/recursive /tmp/recursive
 
 # ──────────────────────────────────────────────────────────────────────

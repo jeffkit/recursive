@@ -109,11 +109,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --bin recursive
+        run: cross build --release --target ${{ matrix.target }} -p recursive-cli --bin recursive
 
       - name: Build (native)
         if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }} --bin recursive
+        run: cargo build --release --target ${{ matrix.target }} -p recursive-cli --bin recursive
 
       # Package into .tar.gz (Unix) or .zip (Windows)
       - name: Package (Unix)
