@@ -25,7 +25,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 toml = "0.8"
 
 [features]
-default = []
+default = ["web_search", "http"]
+# Forwarding features: the `[dependencies]` line unconditionally enables
+# `recursive/web_search` and `recursive/http`, so these features are always-on
+# in the CLI binary. Declaring them here (a) satisfies `unexpected_cfgs` for
+# the `#[cfg(feature = "web_search")]` / `#[cfg(feature = "http")]` gates in
+# `cli/builder.rs` and `main.rs`, and (b) makes those gates evaluate to true
+# so `WebSearch` registration and the `recursive http` subcommand are actually
+# compiled in. To make either optional later, remove it from `default` and
+# move the corresponding entry out of the `[dependencies]` `features` list.
+web_search = ["recursive/web_search"]
+http = ["recursive/http"]
 weixin = ["recursive/weixin"]
 
 [dev-dependencies]
