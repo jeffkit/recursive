@@ -24,6 +24,26 @@
 //! not run the real binary, real keystroke raw-mode handling, or ANSI
 //! round-trip. That integration layer is covered by the separate
 //! `tui-pty` harness (stage 4).
+//!
+//! # Effectiveness loop — "改某文件 → 杀该文件变异点"
+//!
+//! A harness test that passes can still be useless (a tautology, or it
+//! asserts on the wrong thing). The effectiveness check is mutation
+//! testing via `cargo-mutants`: mutate the source the AI just touched and
+//! re-run the tests. A mutant that *survives* (tests still green) marks a
+//! real coverage gap — strengthen or add the test, then re-run until the
+//! touched file's mutants are all killed.
+//!
+//! Keep runs fast by scoping to the touched files only:
+//!
+//! ```text
+//! .dev/scripts/tui-mutants.sh                       # auto-detect changed files vs main
+//! .dev/scripts/tui-mutants.sh crates/recursive-tui/src/app/render.rs
+//! .dev/scripts/tui-mutants.sh --dir crates/recursive-tui/src/app
+//! ```
+//!
+//! Exit code is non-zero if any mutant survives, so the script can gate a
+//! commit. Stage 5 wires this into the self-improve acceptance flow.
 
 use std::collections::VecDeque;
 
