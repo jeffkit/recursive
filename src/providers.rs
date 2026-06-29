@@ -1,9 +1,9 @@
 //! Static vendor preset catalog, embedded at compile time.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-million-token pricing embedded in a provider preset model entry. USD.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct ModelPricingSpec {
     pub input_per_million: f64,
     pub output_per_million: f64,
@@ -12,7 +12,7 @@ pub struct ModelPricingSpec {
 }
 
 /// A single model entry within a provider preset.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelSpec {
     pub name: String,
     /// Maximum input context window in tokens for this model.
@@ -21,7 +21,7 @@ pub struct ModelSpec {
     pub pricing: Option<ModelPricingSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderPreset {
     pub id: String,
     pub name: String,
@@ -170,6 +170,74 @@ pub fn all_presets_dynamic() -> Vec<ProviderPreset> {
 /// (e.g. `Config::from_env` rejecting unknown preset ids at startup).
 pub fn find_preset_extended(id: &str) -> Option<ProviderPreset> {
     all_presets_dynamic().into_iter().find(|p| p.id == id)
+}
+
+/// Compute the effective preset list: remote cache (overriding bundled by
+/// `id`) → bundled presets absent from the cache → user overrides from
+/// `providers.d/` absent from both. First-match wins, so the precedence is
+/// **remote-cache > bundled > providers.d**.
+///
+/// This is the source of truth for pricing/model lookups that must reflect
+/// upstream catalog refreshes (see [`find_model_pricing_effective`]). It is
+/// kept separate from the strict [`find_preset`] / [`all_presets`] so that
+/// startup validation in `Config::from_env` still rejects unknown preset
+/// ids against the compile-time catalog only.
+///
+/// No network: reads the local `providers_cache.json` written by
+/// `recursive providers update` (or a stale background refresh). If the
+/// cache is absent or unreadable, falls back to [`all_presets_dynamic`].
+fn compute_effective_presets() -> Vec<ProviderPreset> {
+    let bundled = bundled_presets().to_vec();
+    let with_cache = match crate::providers_cache::load_cache() {
+        Some(cache) => crate::providers_cache::merge_over_bundled(&bundled, &cache.providers),
+        None => bundled,
+    };
+    // Layer providers.d overrides additively (main's existing semantics:
+    // providers.d adds new presets; it does not override bundled ids).
+    let mut result = with_cache;
+    for p in additional_presets() {
+        if !result.iter().any(|r| r.id == p.id) {
+            result.push(p);
+        }
+    }
+    result
+}
+
+/// All presets: remote cache + bundled + `providers.d/`. Returns an owned
+/// `Vec` because the cache and user overrides are loaded at runtime. Use
+/// [`find_preset_effective`] / [`find_model_pricing_effective`] when you
+/// only need to look one up. The merged vec is computed once per process
+/// (the cache file is read at first use and memoised) — CLI processes are
+/// short-lived, so a stale in-process cache across a long-running server
+/// is an acceptable trade-off documented here for future callers.
+pub fn all_presets_effective() -> Vec<ProviderPreset> {
+    use std::sync::OnceLock;
+    static EFFECTIVE: OnceLock<Vec<ProviderPreset>> = OnceLock::new();
+    EFFECTIVE.get_or_init(compute_effective_presets).clone()
+}
+
+/// Look up a preset by id in the **effective** catalog (remote cache +
+/// bundled + `providers.d/`). Owned result, since the effective catalog is
+/// a runtime-merged `Vec`.
+pub fn find_preset_effective(id: &str) -> Option<ProviderPreset> {
+    all_presets_effective().into_iter().find(|p| p.id == id)
+}
+
+/// Look up pricing for a model name across the **effective** catalog
+/// (remote cache + bundled + `providers.d/`). This is the path used by
+/// `pricing_for` so per-token cost reflects upstream catalog refreshes,
+/// not just the compile-time `providers.toml`. Owned result.
+pub fn find_model_pricing_effective(model: &str) -> Option<ModelPricingSpec> {
+    for preset in all_presets_effective() {
+        for spec in &preset.models {
+            if spec.name == model {
+                if let Some(pricing) = spec.pricing {
+                    return Some(pricing);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Look up pricing for a model name across all presets.
