@@ -19,7 +19,11 @@
 # every time a transitive dep bumps its minimum. The release workflow
 # (`.github/workflows/release.yml`) uses dtolnay/rust-toolchain@stable,
 # so the CI verification and the published image stay in lockstep.
-FROM rust:stable-slim AS builder
+#
+# Note: Docker Hub's `rust:stable-slim` tag does NOT exist (the official
+# image only ships `slim-bookworm` → `latest`, plus `1.x-slim` and `1-slim`
+# that track stable). `1-slim` is the right tag for "always stable".
+FROM rust:1-slim AS builder
 
 WORKDIR /build
 
