@@ -88,5 +88,5 @@ are large.
 ## Related Concepts
 
 - [Layer 0 Injection](layer0-injection.md) — where skill_index() is injected
-- [Skills Tools](tools/skills-tools.md) — load_skill, find_skills, install_skill
+- [Skills Tools](tools/skills-tools.md) — load_skill, install_skill
 - [Memory Overview](memory/index.md)

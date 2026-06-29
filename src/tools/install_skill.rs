@@ -367,7 +367,9 @@ impl Tool for InstallSkill {
             Some(tx) => Arc::clone(tx),
             None => {
                 return Ok("Error: install_skill is only available in TUI mode.\n\
-                     To discover locally installed skills use find_skills.\n\
+                     The skill catalog is listed in the system prompt \
+                     (search for \"Available skills\"); call `load_skill` to \
+                     activate one.\n\
                      To install manually: skillhub install <slug>"
                     .to_string());
             }

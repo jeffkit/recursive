@@ -1,7 +1,7 @@
 ---
 type: Architecture
-title: Skills Tools — load_skill, find_skills, install_skill
-description: Tools for discovering, loading, and installing skills. Skills are SKILL.md files with YAML frontmatter and OKF type: Skill. Skill scripts run via ${SKILL_DIR} + Bash (see Goal 320).
+title: Skills Tools — load_skill, install_skill
+description: Tools for loading and installing skills. Skills are SKILL.md files with YAML frontmatter and OKF type: Skill. Skill scripts run via ${SKILL_DIR} + Bash (see Goal 320).
 tags: [tools, skills]
 timestamp: 2026-06-18T10:00:00Z
 ---
@@ -11,8 +11,13 @@ timestamp: 2026-06-18T10:00:00Z
 | Tool | Source | Description |
 |------|--------|-------------|
 | `load_skill` | `src/tools/load_skill.rs` | Load a skill's full content into context (supports section loading) |
-| `find_skills` | `src/tools/find_skills.rs` | Search available skills by name/keyword |
 | `install_skill` | `src/tools/install_skill.rs` | Install a skill from the registry (downloads zip, extracts SKILL.md + refs/) |
+
+> Skill discovery is via the `skill_index` listing injected into the system
+> prompt — the agent reads the catalog and calls `load_skill name=<name>`
+> directly, without a dedicated search tool. The catalog is budget-aware
+> (default 8000 chars via `RECURSIVE_SKILL_INDEX_BUDGET`) so a large skill
+> library stays within the system-prompt budget.
 
 > Skill scripts are no longer invoked through a dedicated tool — the `Skill`
 > tool substitutes `${SKILL_DIR}` (or `${RECURSIVE_SKILL_DIR}`) with the

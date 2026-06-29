@@ -575,14 +575,82 @@ fn extract_body(content: &str) -> &str {
     content.trim()
 }
 
+/// Default character budget for `skill_index` rendering.
+///
+/// Overridden by `RECURSIVE_SKILL_INDEX_BUDGET` env var. Reads on every
+/// call so test setups that toggle the env var take effect immediately.
+pub fn default_skill_index_budget() -> usize {
+    std::env::var("RECURSIVE_SKILL_INDEX_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8000)
+}
+
+/// Per-entry description truncation cap used when the full rendering
+/// exceeds the budget (matches Claude Code's `MAX_LISTING_DESC_CHARS`).
+/// Operates on bytes via [`crate::truncate_str`] for char-boundary safety.
+const SKILL_INDEX_PER_ENTRY_DESC_BYTES: usize = 250;
+
 /// Render a compact "available skills" block for the system prompt.
 ///
-/// Returns empty string if no skills found.
+/// Returns empty string if no skills found. Honors a character budget —
+/// when the full rendering exceeds the budget, per-entry descriptions
+/// are truncated; if still too long, descriptions are dropped entirely
+/// and only the mode tag + name remain. The budget is read from
+/// `RECURSIVE_SKILL_INDEX_BUDGET` (default 8000).
 pub fn skill_index(skills: &[Skill]) -> String {
+    skill_index_with_budget(skills, default_skill_index_budget())
+}
+
+/// Render `skill_index` constrained to `char_budget` characters total.
+///
+/// When the total rendered length fits, the output is identical to the
+/// unconstrained format. When it overflows, descriptions are progressively
+/// truncated (char-boundary-safe via [`crate::truncate_str`]) and finally
+/// dropped, preserving the mode tag and any structural suffixes
+/// (refs/params/sections/depends_on/scripts).
+pub fn skill_index_with_budget(skills: &[Skill], char_budget: usize) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
+    // Phase 1: full render — preserves the prior behavior when under budget.
+    let full = render_skill_index(skills, |s| s.description.clone());
+    if full.len() <= char_budget {
+        return full;
+    }
+
+    // Phase 2: truncate per-entry descriptions to SKILL_INDEX_PER_ENTRY_DESC_BYTES
+    // bytes (≈ 250 ASCII chars), char-boundary-safe.
+    let truncated = render_skill_index(skills, |s| {
+        if s.description.len() > SKILL_INDEX_PER_ENTRY_DESC_BYTES {
+            format!(
+                "{}…",
+                crate::truncate_str(&s.description, SKILL_INDEX_PER_ENTRY_DESC_BYTES)
+            )
+        } else {
+            s.description.clone()
+        }
+    });
+    if truncated.len() <= char_budget {
+        return truncated;
+    }
+
+    // Phase 3: drop descriptions entirely; names-only listing with mode tag.
+    // Even if this still exceeds the budget (degenerate: thousands of skills),
+    // return it — further compression would lose useful info.
+    render_skill_index(skills, |_| String::new())
+}
+
+/// Render the skill index, calling `desc(skill)` to obtain the per-entry
+/// description. When `desc` returns empty, the description field is omitted
+/// from the rendered line (used by the names-only fallback in phase 3).
+/// The mode tag and structural suffixes are always emitted.
+fn render_skill_index<F>(skills: &[Skill], desc: F) -> String
+where
+    F: Fn(&Skill) -> String,
+{
     let mut lines = vec![
         "".to_string(),
         "Available skills (use `load_skill` to activate):".to_string(),
@@ -635,10 +703,18 @@ pub fn skill_index(skills: &[Skill]) -> String {
         // Scripts
         let script_names: Vec<&str> = skill.scripts.iter().map(|s| s.name.as_str()).collect();
 
-        let prefix = if mode_tag.is_empty() {
-            format!("- {}: {}", skill.name, skill.description)
+        let description = desc(skill);
+        let prefix = if description.is_empty() {
+            // Names-only fallback (phase 3): keep mode tag, drop `: description`.
+            if mode_tag.is_empty() {
+                format!("- {}", skill.name)
+            } else {
+                format!("- {} {}", mode_tag, skill.name)
+            }
+        } else if mode_tag.is_empty() {
+            format!("- {}: {}", skill.name, description)
         } else {
-            format!("- {} {}: {}", mode_tag, skill.name, skill.description)
+            format!("- {} {}: {}", mode_tag, skill.name, description)
         };
 
         if suffix_parts.is_empty() {
@@ -1459,5 +1535,184 @@ mod tests {
         assert_eq!(skill.sections[0].name, "Setup");
         assert_eq!(skill.sections[1].name, "Usage");
         assert_eq!(skill.sections[2].name, "API");
+    }
+
+    // --- Goal-319: Budget-aware skill_index tests ------------------------
+
+    fn make_desc_skill(i: usize, desc: String) -> Skill {
+        Skill {
+            name: format!("skill-{i}"),
+            description: desc,
+            path: PathBuf::from(format!("/tmp/skills/skill-{i}/SKILL.md")),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+        }
+    }
+
+    /// Phase-1 path: a small skill set renders identically to the prior
+    /// unconstrained behavior when total length fits within the budget.
+    #[test]
+    fn skill_index_under_budget_unchanged() {
+        let skills = vec![
+            make_desc_skill(0, "First skill".to_string()),
+            make_desc_skill(1, "Second skill".to_string()),
+        ];
+        // Render with a generous budget that the small set easily fits.
+        let rendered = skill_index_with_budget(&skills, 5000);
+        // Headers, names, and full descriptions must all be present,
+        // no truncation.
+        assert!(rendered.contains("Available skills"));
+        assert!(rendered.contains("- skill-0: First skill"));
+        assert!(rendered.contains("- skill-1: Second skill"));
+        assert!(
+            !rendered.contains('…'),
+            "under-budget render must not truncate: {rendered}"
+        );
+    }
+
+    /// Phase-2 path: many skills with long descriptions fit under the
+    /// budget only after per-entry truncation. Truncation uses
+    /// [`crate::truncate_str`], so multi-byte chars at the boundary are safe.
+    #[test]
+    fn skill_index_over_budget_truncates_descriptions() {
+        // Each description is 1000 ASCII chars; 5 skills → phase 1 ≈ 5111
+        // bytes (over budget 2000), phase 2 ≈ 1378 bytes (fits 2000).
+        let long_desc = "x".repeat(1000);
+        let skills: Vec<Skill> = (0..5)
+            .map(|i| make_desc_skill(i, long_desc.clone()))
+            .collect();
+
+        let rendered = skill_index_with_budget(&skills, 2000);
+        assert!(
+            rendered.len() <= 2000,
+            "truncated render must fit budget (got {} bytes)",
+            rendered.len()
+        );
+        // Every truncated description ends with the ellipsis added in phase 2.
+        for line in rendered.lines() {
+            if line.starts_with("- skill-") {
+                assert!(
+                    line.contains('…'),
+                    "expected ellipsis on truncated line: {line}"
+                );
+            }
+        }
+        // Phase-2 cap is 250 bytes (ASCII), so each truncated description
+        // substring before the `…` is at most 250 bytes.
+        for line in rendered.lines() {
+            if let Some(rest) = line.split('…').next() {
+                let desc_start = rest.rfind(": ").map(|i| i + 2).unwrap_or(0);
+                let desc_bytes = rest[desc_start..].len();
+                assert!(
+                    desc_bytes <= SKILL_INDEX_PER_ENTRY_DESC_BYTES,
+                    "truncated desc must be ≤ {} bytes (was {desc_bytes}): {line}",
+                    SKILL_INDEX_PER_ENTRY_DESC_BYTES
+                );
+            }
+        }
+    }
+
+    /// Phase-3 path: many skills with long descriptions cannot fit even
+    /// when truncated → the listing degrades to `- <name>` lines with
+    /// the mode tag preserved.
+    #[test]
+    fn skill_index_severely_over_budget_falls_back_to_names_only() {
+        // 10 skills × 1000-byte descs; budget=200 forces phase 3 (names-only):
+        //   phase 1 ≈ 10173 bytes
+        //   phase 2 ≈ 2703 bytes
+        //   phase 3 ≈ 163 bytes  → fits the 200-byte budget
+        let desc = "y".repeat(1000);
+        let skills: Vec<Skill> = (0..10).map(|i| make_desc_skill(i, desc.clone())).collect();
+
+        let rendered = skill_index_with_budget(&skills, 200);
+        assert!(
+            rendered.len() <= 200,
+            "names-only fallback must fit budget (got {} bytes)",
+            rendered.len()
+        );
+        assert!(rendered.contains("Available skills"));
+        assert!(rendered.contains("- skill-0"));
+        assert!(rendered.contains("- skill-9"));
+        // Descriptions are gone, so no `:` after the name and no `…`.
+        assert!(
+            !rendered.contains('…'),
+            "names-only fallback must not contain ellipsis: {rendered}"
+        );
+        assert!(
+            !rendered.contains(": y"),
+            "names-only fallback must not include description text: {rendered}"
+        );
+    }
+
+    /// Regression: descriptions containing multi-byte (CJK) chars near the
+    /// truncation boundary must not panic. Earlier tools in this slot
+    /// byte-sliced `&desc[..N]` and panicked when byte `N` fell inside
+    /// a 3-byte CJK codepoint. The new code uses [`crate::truncate_str`].
+    #[test]
+    fn skill_index_multibyte_description_truncation_no_panic() {
+        // Pack CJK chars near the 250-byte boundary so naive byte-slicing
+        // would panic; the char-boundary-safe path must not.
+        let mut desc = "多字节描述 ".repeat(40);
+        desc.push_str(" 文案结束");
+        assert!(
+            desc.len() > SKILL_INDEX_PER_ENTRY_DESC_BYTES,
+            "fixture must exceed the per-entry desc cap"
+        );
+        let skills = vec![make_desc_skill(0, desc.clone())];
+
+        // Single-skill budget large enough to trigger phase-2 truncation but
+        // not phase-3 (names-only). Use a budget equal to the truncated size
+        // plus a small header allowance.
+        let header_overhead = 80;
+        let rendered =
+            skill_index_with_budget(&skills, SKILL_INDEX_PER_ENTRY_DESC_BYTES + header_overhead);
+        // Must contain the skill name and an ellipsis (phase 2 marker).
+        assert!(rendered.contains("skill-0"), "{rendered}");
+        assert!(
+            rendered.contains('…'),
+            "expected truncation ellipsis: {rendered}"
+        );
+        // The fact that `rendered` is a valid `String` already proves no
+        // mid-codepoint cut; this assertion documents the intent.
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
+
+    /// Consolidated env-var test for the default budget. Holds the env lock
+    /// so the test serializes against any other env-mutating test (see
+    /// AGENTS.md "Env-var tests must be ONE test").
+    #[test]
+    fn skill_index_env_budget_override() {
+        let _env_lock = crate::test_util::env_lock();
+        let original = std::env::var("RECURSIVE_SKILL_INDEX_BUDGET").ok();
+
+        // Unset → default 8000
+        std::env::remove_var("RECURSIVE_SKILL_INDEX_BUDGET");
+        assert_eq!(default_skill_index_budget(), 8000);
+
+        // Valid value → honored
+        std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "1234");
+        assert_eq!(default_skill_index_budget(), 1234);
+
+        // Garbage value → falls back to default (filter rejects non-parseable)
+        std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "not-a-number");
+        assert_eq!(default_skill_index_budget(), 8000);
+
+        // Zero → falls back to default (filter rejects n > 0)
+        std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "0");
+        assert_eq!(default_skill_index_budget(), 8000);
+
+        // Restore (or clear if it was unset originally)
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", v);
+        } else {
+            std::env::remove_var("RECURSIVE_SKILL_INDEX_BUDGET");
+        }
     }
 }

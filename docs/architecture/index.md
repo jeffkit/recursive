@@ -34,7 +34,7 @@ drill into what you need.
 * [Search Tools](tools/search.md) - Grep, Glob
 * [Memory Tools](tools/memory-tools.md) - remember/recall/forget + scratchpad
 * [Facts Tools](tools/facts-tools.md) - remember_fact/recall_fact/forget_fact/update_fact
-* [Skills Tools](tools/skills-tools.md) - load_skill, find_skills, install_skill
+* [Skills Tools](tools/skills-tools.md) - load_skill, install_skill
 * [Episodic Tool](tools/episodic-tool.md) - episodic_recall
 * [Multi-Agent Tools](tools/multi-agent.md) - AgentTool, send_message, teams
 * [Task Tools](tools/task-tools.md) - task_create/get/list/update/stop/output

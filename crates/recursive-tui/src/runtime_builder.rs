@@ -83,12 +83,11 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
 
 /// Build the TUI's system prompt: the configured base prompt followed by the
 /// discovered-skill index (so the agent knows what skills exist and can call
-/// `load_skill` / `find_skills` without first wasting a turn to discover
-/// them). Mirrors what the CLI (`recursive-cli/src/cli/builder.rs`) and the
-/// HTTP API (`src/http/handlers.rs`) already inject — the TUI previously
-/// omitted this, which is why the agent fell back to `find_skills(query="*")`
-/// on every session. Returns the base prompt unchanged when no skills are
-/// installed.
+/// `load_skill` without first wasting a turn to discover them). Mirrors what
+/// the CLI (`recursive-cli/src/cli/builder.rs`) and the HTTP API
+/// (`src/http/handlers.rs`) already inject — the TUI previously omitted this,
+/// which is why the agent fell back to a keyword search on every session.
+/// Returns the base prompt unchanged when no skills are installed.
 fn tui_system_prompt(base: &str, skills: &[Skill]) -> String {
     let idx = recursive::skills::skill_index(skills);
     if idx.is_empty() {
@@ -251,9 +250,8 @@ fn build_runtime_with_skill_tx(
         config.shell_timeout_secs,
     );
 
-    // Register skill-hub tools: find_skills (always) and install_skill (TUI only).
-    // Pass discovered skills so find_skills can search locally installed skills.
-    tools = tools.register(Arc::new(recursive::tools::FindSkills::new(skills)));
+    // Register skill-hub tools: install_skill is TUI-only (it sends events
+    // through a channel so the TUI can prompt the user).
     tools = tools.register(Arc::new(recursive::tools::InstallSkill::new(skill_tx)));
 
     let build = match AgentRuntimeBuilder::new()
