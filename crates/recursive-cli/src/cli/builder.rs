@@ -18,8 +18,8 @@ use recursive::{
     tools::{
         AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, CountLines, EditTool,
         EstimateTokens, Forget, GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember,
-        RunBackground, RunShell, RunSkillScript, ScratchpadDelete, ScratchpadGet, ScratchpadList,
-        SearchFiles, TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
+        RunBackground, RunShell, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
+        TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, RetryPolicy, ToolRegistry,
@@ -114,12 +114,7 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
     )));
     let skills = discover_loaded_skills(config);
     if !skills.is_empty() {
-        registry = registry.register(Arc::new(LoadSkill::new(skills.clone())));
-        registry = registry.register(Arc::new(RunSkillScript::new(
-            skills,
-            root.clone(),
-            Duration::from_secs(config.shell_timeout_secs),
-        )));
+        registry = registry.register(Arc::new(LoadSkill::new(skills)));
     }
     // Note: read-only checkpoint tools (checkpoint_list / checkpoint_diff)
     // are registered by the runtime when a session id is known, since

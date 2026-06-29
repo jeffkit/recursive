@@ -44,7 +44,7 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 
 ## Skills
 
-* [Skills Tools](skills-tools.md) — `load_skill`, `find_skills`, `install_skill`, `run_skill_script`
+* [Skills Tools](skills-tools.md) — `load_skill`, `find_skills`, `install_skill`
 
 ## Multi-Agent
 

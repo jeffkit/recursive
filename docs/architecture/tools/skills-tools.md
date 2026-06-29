@@ -1,7 +1,7 @@
 ---
 type: Architecture
-title: Skills Tools — load_skill, find_skills, install_skill, run_skill_script
-description: Tools for discovering, loading, installing, and running skill scripts. Skills are SKILL.md files with YAML frontmatter and OKF type: Skill.
+title: Skills Tools — load_skill, find_skills, install_skill
+description: Tools for discovering, loading, and installing skills. Skills are SKILL.md files with YAML frontmatter and OKF type: Skill. Skill scripts run via ${SKILL_DIR} + Bash (see Goal 320).
 tags: [tools, skills]
 timestamp: 2026-06-18T10:00:00Z
 ---
@@ -13,7 +13,13 @@ timestamp: 2026-06-18T10:00:00Z
 | `load_skill` | `src/tools/load_skill.rs` | Load a skill's full content into context (supports section loading) |
 | `find_skills` | `src/tools/find_skills.rs` | Search available skills by name/keyword |
 | `install_skill` | `src/tools/install_skill.rs` | Install a skill from the registry (downloads zip, extracts SKILL.md + refs/) |
-| `run_skill_script` | `src/tools/run_skill_script.rs` | Execute a script from a skill's `scripts/` directory |
+
+> Skill scripts are no longer invoked through a dedicated tool — the `Skill`
+> tool substitutes `${SKILL_DIR}` (or `${RECURSIVE_SKILL_DIR}`) with the
+> skill's absolute directory, so authors reference bundled scripts with
+> `bash ${SKILL_DIR}/scripts/foo.sh` and let the agent run them via
+> `Bash`. See [`${SKILL_DIR}` Placeholder Substitution](#skill_dir-placeholder-substitution)
+> below and the [Skills System](../skills.md) doc for the full pattern.
 
 ## Skill Discovery Paths
 

@@ -36,7 +36,6 @@ pub mod policy;
 pub mod policy_sandbox;
 pub mod registry;
 pub mod run_background;
-pub mod run_skill_script;
 pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
@@ -121,7 +120,6 @@ pub use plan_mode::{
 };
 pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
-pub use run_skill_script::RunSkillScript;
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};

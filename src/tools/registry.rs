@@ -522,7 +522,7 @@ impl ToolRegistry {
 /// baseline (e.g. `ScheduleWakeup` for loop mode, `SubAgent` when enabled).
 ///
 /// Skills are opt-in: pass a non-empty `skills` slice to register
-/// `load_skill` and `run_skill_script`. Pass `&[]` to skip.
+/// `load_skill`. Pass `&[]` to skip.
 pub fn build_standard_tools(
     workspace: &std::path::Path,
     skills: &[crate::skills::Skill],
@@ -646,13 +646,7 @@ pub fn build_standard_tools_with_roots(
     }
 
     if !skills.is_empty() {
-        registry = registry
-            .register(Arc::new(super::load_skill::LoadSkill::new(skills.to_vec())))
-            .register(Arc::new(super::run_skill_script::RunSkillScript::new(
-                skills.to_vec(),
-                workspace.to_path_buf(),
-                std::time::Duration::from_secs(shell_timeout_secs),
-            )));
+        registry = registry.register(Arc::new(super::load_skill::LoadSkill::new(skills.to_vec())));
     }
 
     registry
