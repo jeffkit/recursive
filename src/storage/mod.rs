@@ -21,6 +21,16 @@
 pub mod local;
 pub use local::LocalStorageBackend;
 
+#[cfg(feature = "workspace-store")]
+pub mod workspace_store;
+#[cfg(feature = "workspace-store")]
+pub use workspace_store::{PathEntry, SqliteWorkspaceStore, WorkspaceStore};
+
+#[cfg(all(target_os = "linux", feature = "workspace-fuse"))]
+pub mod workspace_fuse;
+#[cfg(all(target_os = "linux", feature = "workspace-fuse"))]
+pub use workspace_fuse::{WorkspaceFuse, WorkspaceFuseHandle};
+
 #[cfg(feature = "cloud-runtime")]
 pub mod redis;
 #[cfg(feature = "cloud-runtime")]

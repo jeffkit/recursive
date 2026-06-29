@@ -50,6 +50,10 @@ openai-embedding = []
 # Cosine similarity is computed in Rust; suitable for typical agent memory sizes (<10k entries).
 vector-memory = ["openai-embedding", "dep:rusqlite"]
 skill-hub = ["dep:zip"]
+# SQLite-backed workspace file store for persistent agent workspaces.
+workspace-store = ["dep:rusqlite"]
+# FUSE bridge: expose a WorkspaceStore as a host directory for virtiofsd (Linux only).
+workspace-fuse = ["workspace-store", "dep:fuser"]
 
 [lib]
 name = "recursive"
@@ -95,6 +99,7 @@ aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 bollard = { version = "0.18", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+fuser = { version = "0.14", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 wechatbot = { version = "0.3.2", optional = true }
 qrcode = { version = "0.14", optional = true }
