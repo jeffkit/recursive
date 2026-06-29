@@ -291,6 +291,13 @@ enum Cmd {
         /// On non-TTY (CI) the default is abort.
         #[arg(long, value_name = "POLICY")]
         orphans: Option<String>,
+        /// The next user message to append to the resumed session
+        /// (multi-turn converse). If omitted, a synthetic
+        /// "Continue from where you left off." message is appended so
+        /// an interrupted run can finish. Resume is driven by the
+        /// session id, never by the saved goal.
+        #[arg(short = 'p', long = "message")]
+        message: Option<String>,
     },
     /// List or inspect saved sessions.
     Sessions {
@@ -561,12 +568,14 @@ async fn main() -> anyhow::Result<()> {
                     session: resume_val,
                     from_file: None,
                     orphans: None,
+                    message: cli.prompt,
                 }
             } else if cli.continue_session {
                 Cmd::Resume {
                     session: None,
                     from_file: None,
                     orphans: None,
+                    message: cli.prompt,
                 }
             } else if let Some(prompt) = cli.prompt {
                 Cmd::Run { goal: vec![prompt] }
@@ -851,12 +860,14 @@ async fn main() -> anyhow::Result<()> {
             session,
             from_file,
             orphans,
+            message,
         } => {
             cli::resume::cmd_resume(
                 config,
                 session,
                 from_file,
                 orphans,
+                message,
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,

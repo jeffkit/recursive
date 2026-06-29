@@ -139,6 +139,19 @@ fn resolve_resume_target(
     }
 }
 
+/// Resolve the next-turn user message for a resume. An explicit,
+/// non-empty message wins; otherwise a synthetic continuation
+/// prompt is returned so an interrupted run can finish without
+/// re-injecting the saved goal (which used to duplicate the first
+/// user message in the transcript). Resume is driven by the
+/// session id — the saved goal is never read as resume input.
+fn resolve_resume_message(message: Option<String>) -> String {
+    match message {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => "Continue from where you left off.".to_string(),
+    }
+}
+
 /// `recursive resume` command: dispatches based on which of
 /// (positional `session`, `--from-file`, neither) was provided,
 /// validates the tool-registry hash, then opens the existing
@@ -149,6 +162,7 @@ pub(crate) async fn cmd_resume(
     session: Option<String>,
     from_file: Option<PathBuf>,
     orphans_flag: Option<String>,
+    message: Option<String>,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
@@ -289,13 +303,20 @@ pub(crate) async fn cmd_resume(
     // Load the seeded transcript (everything that's already on disk).
     let seed = recursive::session::SessionReader::load_messages(&session_dir)
         .with_context(|| format!("loading transcript for session {}", session_dir.display()))?;
-    let goal = meta.goal.clone();
+    // Resume is driven by the session id, not by the saved goal. The
+    // next turn is a user message: an explicit one passed via -p /
+    // --message, or a synthetic continuation prompt when none is
+    // given (mirrors Claude Code's interrupted-turn resume) so an
+    // interrupted run can finish without re-injecting the original
+    // goal (which used to duplicate the first user message in the
+    // transcript).
+    let message = resolve_resume_message(message);
 
     let shutdown = crate::shutdown_signal();
     run_resumed(
         config,
         seed,
-        goal,
+        message,
         max_transcript_chars,
         transcript_out,
         session_out,
@@ -313,7 +334,7 @@ pub(crate) async fn cmd_resume(
 pub(crate) async fn run_resumed(
     config: recursive::config::Config,
     seed: Vec<recursive::message::Message>,
-    goal: String,
+    message: String,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
@@ -341,7 +362,7 @@ pub(crate) async fn run_resumed(
         } else if session {
             match SessionWriter::create_with_tools(
                 &config.workspace,
-                &goal,
+                &message,
                 &config.model,
                 &config.provider_type,
                 &[],
@@ -390,7 +411,7 @@ pub(crate) async fn run_resumed(
         false,
         mcp_config,
         hook_timing,
-        Some(&goal),
+        Some(&message),
         Some(event_sink),
         Some(shutdown.clone()),
         true, // interactive resume — plan mode tools enabled
@@ -430,7 +451,7 @@ pub(crate) async fn run_resumed(
         tokio::spawn(stream_events(event_rx))
     };
 
-    let outcome = runtime.run(goal.clone()).await?;
+    let outcome = runtime.run(message.clone()).await?;
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
@@ -470,7 +491,7 @@ pub(crate) async fn run_resumed(
             save_session(
                 &transcript,
                 outcome.steps,
-                goal,
+                message,
                 &config.model,
                 &config.provider_type,
                 &tool_specs,
@@ -479,4 +500,39 @@ pub(crate) async fn run_resumed(
         }
     }
     exit_for_finish(&outcome.finish_reason, outcome.steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_resume_message;
+
+    #[test]
+    fn explicit_message_wins() {
+        assert_eq!(
+            resolve_resume_message(Some("what is 2+2?".into())),
+            "what is 2+2?"
+        );
+    }
+
+    #[test]
+    fn blank_message_falls_back_to_synthetic_continue() {
+        assert_eq!(
+            resolve_resume_message(Some("   ".into())),
+            "Continue from where you left off."
+        );
+    }
+
+    #[test]
+    fn missing_message_falls_back_to_synthetic_continue() {
+        assert_eq!(
+            resolve_resume_message(None),
+            "Continue from where you left off."
+        );
+    }
+
+    #[test]
+    fn whitespace_message_is_preserved_if_non_empty() {
+        // "  x  " trims non-empty → preserved verbatim (not trimmed).
+        assert_eq!(resolve_resume_message(Some("  x  ".into())), "  x  ");
+    }
 }
