@@ -199,6 +199,12 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
+    # Best-effort: a re-tagged release (e.g. fixing a broken build step
+    # after the first attempt) would re-run this job and hit "already
+    # exists" on crates.io, which is benign — the GitHub Release and
+    # binaries are the canonical distribution. Don't fail the whole
+    # release run over an already-published crate.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

@@ -39,10 +39,15 @@ COPY crates/ crates/
 COPY src/ src/
 
 # BuildKit cache mounts speed repeated builds significantly without
-# committing those caches into the final image.
-RUN --mount=type=cache,target=/build/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+# committing those caches into the final image. `sharing=locked`
+# serialises concurrent access — required for multi-arch builds
+# (linux/amd64 + linux/arm64 run in parallel inside one buildx call)
+# where the default `shared` mode races on unpacking the same crate
+# and fails with "File exists (os error 17)" on
+# `.../blake3-1.8.5/.cargo-ok` (and similar).
+RUN --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release -p recursive-cli --features http --bin recursive && \
     cp target/release/recursive /tmp/recursive
 
