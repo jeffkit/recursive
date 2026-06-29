@@ -6,6 +6,7 @@ members = [
     "crates/agui-tui",
     "crates/recursive-tui",
     "crates/recursive-cli",
+    "crates/tui-pty-harness",
 ]
 resolver = "2"
 
