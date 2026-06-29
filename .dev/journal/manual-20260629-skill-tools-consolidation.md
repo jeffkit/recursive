@@ -42,3 +42,23 @@ DeepSeek. Also fix a flow infra bug that blocked the first run.
 - `cargo fmt --all --check` — clean
 - `cargo clippy --all-targets --all-features -- -D warnings` — clean
 - `cargo test --workspace` — 0 failed
+
+## Polish follow-up (`4be0f65`)
+
+Post-merge review flagged two small blemishes; both fixed:
+
+1. **Goal 320 — literal-placeholder escape.** `substitute_skill_dir` did
+   plain string replacement, so a skill body that documented the feature
+   with literal `${SKILL_DIR}` text would have it replaced by the path.
+   Added backslash escape support: `\${SKILL_DIR}` / `\${RECURSIVE_SKILL_DIR}`
+   render as the literal placeholder (not substituted); a lone backslash
+   is preserved. Single char-boundary-safe pass, no panic on `\` at EOF.
+   Refs remain exempt. +3 tests.
+2. **Goal 319 — honest byte-budget naming.** `skill_index_with_budget`'s
+   `char_budget` param + "character budget" rustdoc was inaccurate — the
+   budget is measured in bytes (`str::len`, matching
+   `SKILL_INDEX_PER_ENTRY_DESC_BYTES` and `truncate_str`). Renamed to
+   `byte_budget` and fixed the rustdoc to state the byte semantics
+   (conservative proxy for prompt-token cost). No behavior change.
+
+Gates after polish: fmt/clippy/test green (1040 passed, +3).
