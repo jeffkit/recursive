@@ -176,6 +176,11 @@ pub struct CommandPanelState {
     pub item_count: usize,
     /// Vertical scroll offset into `lines` (for long read-only content).
     pub scroll: u16,
+    /// Number of leading non-selectable rows in `lines` before the first
+    /// selectable item (e.g. a header line + a blank spacer). The renderer
+    /// adds this to `selected` so the highlight bar lands on the same row as
+    /// the item's `▶` marker. Defaults to 0 (selection indexes `lines` 1:1).
+    pub list_offset: usize,
     /// Arbitrary string the command handler can use to carry its own payload
     /// (e.g. a pending argument name, a serialised form state).
     pub context: Option<String>,
@@ -194,6 +199,7 @@ impl CommandPanelState {
             selected: None,
             item_count,
             scroll: 0,
+            list_offset: 0,
             context: None,
         }
     }
@@ -215,6 +221,14 @@ impl CommandPanelState {
     /// (use when `lines` mixes selectable and non-selectable rows).
     pub fn with_item_count(mut self, count: usize) -> Self {
         self.item_count = count;
+        self
+    }
+
+    /// Builder — set how many leading non-selectable rows precede the first
+    /// selectable item (header + spacer). Keeps the highlight bar aligned
+    /// with the item rows.
+    pub fn with_list_offset(mut self, offset: usize) -> Self {
+        self.list_offset = offset;
         self
     }
 

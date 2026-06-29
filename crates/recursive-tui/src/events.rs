@@ -125,10 +125,13 @@ pub enum UiEvent {
 
     // ── Goal-171: session resume ────────────────────────────────────────────
     /// A previous session was successfully loaded into the runtime.
-    /// The UI should clear the in-progress transcript and show a System block.
+    /// The UI replaces its visible transcript with `blocks` (reconstructed
+    /// from the loaded session) and appends a "resumed session" System note.
     SessionResumed {
         session_id: String,
         turn_count: usize,
+        /// The resumed conversation, rebuilt from the session messages.
+        blocks: Vec<crate::model::TranscriptBlock>,
     },
 
     // ── Goal-173: MCP server list ────────────────────────────────────────────

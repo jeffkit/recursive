@@ -291,7 +291,11 @@ impl App {
             UiEvent::SessionResumed {
                 session_id,
                 turn_count,
+                blocks,
             } => {
+                // Replace the visible conversation with the resumed session's
+                // reconstructed transcript, then note the resume below it.
+                self.blocks = blocks;
                 self.blocks.push(TranscriptBlock::System {
                     text: format!("▶ Resumed session {session_id} ({turn_count} messages)"),
                 });

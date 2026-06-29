@@ -491,13 +491,18 @@ fn render_command_interact_panel(frame: &mut Frame, area: Rect, app: &App) {
         area.height.saturating_sub(2) as usize // 2 borders
     };
 
+    // The highlight bar tracks the selected *item*, but `lines` may begin
+    // with non-selectable rows (header + spacer). Map the item index to its
+    // line index via `list_offset` so the bar lands on the same row as the
+    // item's `▶` marker.
+    let highlight_line = panel.selected.map(|sel| sel + panel.list_offset);
     let mut lines: Vec<Line<'static>> = panel
         .lines
         .iter()
         .take(content_rows)
         .enumerate()
         .map(|(i, text)| {
-            let style = if panel.selected == Some(i) {
+            let style = if highlight_line == Some(i) {
                 selected_style
             } else {
                 normal_style

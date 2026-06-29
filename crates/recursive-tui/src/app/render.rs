@@ -5,7 +5,91 @@
 
 use serde_json::Value;
 
-use super::{DiffHunk, DiffLine, DiffLineKind};
+use super::{DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock};
+
+// ── Session-resume reconstruction ────────────────────────────────────
+
+/// Rebuild the visible transcript blocks from a loaded session's messages.
+///
+/// Used by `/resume`: when a previous session is selected, the runtime
+/// transcript is replaced *and* the on-screen conversation must be
+/// reconstructed so the user sees the resumed dialogue rather than just a
+/// "resumed session" note appended to the current chat.
+///
+/// Mapping:
+/// - `System` messages (the system prompt / injected context) are skipped.
+/// - `User` / `Assistant` text become their respective blocks.
+/// - assistant `reasoning_content` becomes a finalised `Reasoning` block.
+/// - assistant `tool_calls` become `ToolCall` blocks; the matching `Tool`
+///   message fills the result. Persisted results carry no success flag, so
+///   they are shown as succeeded.
+pub fn blocks_from_messages(messages: &[recursive::message::Message]) -> Vec<TranscriptBlock> {
+    use recursive::message::Role;
+
+    let mut blocks: Vec<TranscriptBlock> = Vec::new();
+    for msg in messages {
+        match msg.role {
+            Role::System => {}
+            Role::User => {
+                if !msg.content.trim().is_empty() {
+                    blocks.push(TranscriptBlock::User {
+                        text: msg.content.clone(),
+                    });
+                }
+            }
+            Role::Assistant => {
+                if let Some(reasoning) = &msg.reasoning_content {
+                    if !reasoning.trim().is_empty() {
+                        blocks.push(TranscriptBlock::Reasoning {
+                            text: reasoning.clone(),
+                            streaming: false,
+                        });
+                    }
+                }
+                if !msg.content.trim().is_empty() {
+                    blocks.push(TranscriptBlock::Assistant {
+                        text: msg.content.clone(),
+                        streaming: false,
+                        latency_ms: None,
+                    });
+                }
+                for tc in &msg.tool_calls {
+                    blocks.push(TranscriptBlock::ToolCall {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        args_preview: preview_args(&tc.arguments.to_string()),
+                        result: None,
+                    });
+                }
+            }
+            Role::Tool => {
+                let id = msg.tool_call_id.clone().unwrap_or_default();
+                let matched = blocks.iter_mut().rev().find(|b| {
+                    matches!(b, TranscriptBlock::ToolCall { id: cid, result: None, .. } if cid == &id)
+                });
+                if let Some(TranscriptBlock::ToolCall { result, .. }) = matched {
+                    *result = Some(ToolResultData {
+                        success: true,
+                        output: msg.content.clone(),
+                        expanded: false,
+                    });
+                } else {
+                    blocks.push(TranscriptBlock::ToolCall {
+                        id,
+                        name: String::new(),
+                        args_preview: String::new(),
+                        result: Some(ToolResultData {
+                            success: true,
+                            output: msg.content.clone(),
+                            expanded: false,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+    blocks
+}
 
 // ── Argument preview ─────────────────────────────────────────────────
 
@@ -158,6 +242,71 @@ mod tests {
         let preview = preview_args(r#"{"path":"src/agent.rs"}"#);
         assert!(preview.contains("path"));
         assert!(preview.contains("src/agent.rs"));
+    }
+
+    #[test]
+    fn blocks_from_messages_reconstructs_conversation() {
+        use recursive::llm::ToolCall;
+        use recursive::message::Message;
+
+        let messages = vec![
+            Message::system("you are a helpful agent"),
+            Message::user("hello"),
+            Message::assistant_with_tool_calls(
+                "let me check",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"path": "src/foo.rs"}),
+                }],
+            ),
+            Message::tool_result("call-1", "file contents here"),
+            Message::assistant("all done"),
+        ];
+
+        let blocks = blocks_from_messages(&messages);
+
+        // System message is skipped.
+        assert!(!blocks
+            .iter()
+            .any(|b| matches!(b, TranscriptBlock::System { .. })));
+
+        // User → assistant(text) → tool call(filled) → assistant(text).
+        assert!(matches!(&blocks[0], TranscriptBlock::User { text } if text == "hello"));
+        assert!(
+            matches!(&blocks[1], TranscriptBlock::Assistant { text, .. } if text == "let me check")
+        );
+        match &blocks[2] {
+            TranscriptBlock::ToolCall {
+                id, name, result, ..
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "Read");
+                let r = result.as_ref().expect("tool result should be filled");
+                assert!(r.success);
+                assert_eq!(r.output, "file contents here");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        assert!(
+            matches!(&blocks[3], TranscriptBlock::Assistant { text, .. } if text == "all done")
+        );
+    }
+
+    #[test]
+    fn blocks_from_messages_orphan_tool_result_renders_standalone() {
+        use recursive::message::Message;
+        // A tool result with no preceding tool call (truncated transcript).
+        let messages = vec![Message::tool_result("orphan", "result body")];
+        let blocks = blocks_from_messages(&messages);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            TranscriptBlock::ToolCall { id, result, .. } => {
+                assert_eq!(id, "orphan");
+                assert_eq!(result.as_ref().unwrap().output, "result body");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]

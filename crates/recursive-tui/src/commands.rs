@@ -357,6 +357,7 @@ fn cmd_journal(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
         CommandPanelState::new("journal", lines)
             .with_selection(0)
             .with_item_count(item_count)
+            .with_list_offset(2)
             .with_hint("↑↓ select entry  ·  esc close")
             .with_context(ctx),
     )
@@ -481,6 +482,7 @@ fn cmd_resume(app: &mut AppState, _args: &[String]) -> CommandOutcome {
         CommandPanelState::new("resume", lines)
             .with_selection(0)
             .with_item_count(item_count)
+            .with_list_offset(2)
             .with_hint("↑↓ select  ·  enter resume  ·  esc cancel")
             .with_context(ctx),
     )
@@ -510,6 +512,7 @@ fn cmd_theme(app: &mut AppState, args: &[String]) -> CommandOutcome {
             CommandPanelState::new("theme", lines)
                 .with_selection(selected)
                 .with_item_count(item_count)
+                .with_list_offset(2)
                 .with_hint("↑↓ select  ·  enter apply  ·  esc cancel")
                 .with_context(ctx),
         );
@@ -922,6 +925,31 @@ mod tests {
             }
             other => panic!("expected OpenPanel for /theme, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn theme_panel_list_offset_aligns_highlight_with_marker() {
+        // Regression: the highlight bar (indexed via list_offset + selected)
+        // must land on the same row as the `▶` marker that the line builder
+        // draws. Both must point at the same `lines` index.
+        let mut app = App::new();
+        let r = invoke(&mut app, "theme");
+        let panel = match r {
+            InvokeResult::Sync(CommandOutcome::OpenPanel(panel)) => panel,
+            other => panic!("expected OpenPanel for /theme, got {other:?}"),
+        };
+        let sel = panel.selected.expect("theme panel has a selection");
+        let highlight_idx = sel + panel.list_offset;
+        // The builder draws `▶` on the selected item's row.
+        let marker_idx = panel
+            .lines
+            .iter()
+            .position(|line| line.spans.iter().any(|s| s.content.contains('▶')))
+            .expect("a ▶ marker should be present");
+        assert_eq!(
+            highlight_idx, marker_idx,
+            "highlight bar row must match the ▶ marker row"
+        );
     }
 
     #[test]

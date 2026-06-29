@@ -732,6 +732,7 @@ async fn worker_loop(
                     match recursive::session::SessionReader::load_messages(&session_dir) {
                         Ok(messages) => {
                             let turn_count = messages.len();
+                            let blocks = crate::app::render::blocks_from_messages(&messages);
                             rt.set_transcript(messages);
                             let session_id = session_dir
                                 .file_name()
@@ -741,6 +742,7 @@ async fn worker_loop(
                             let _ = event_tx.send(UiEvent::SessionResumed {
                                 session_id,
                                 turn_count,
+                                blocks,
                             });
                         }
                         Err(e) => {
