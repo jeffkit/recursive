@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-use super::{resolve_within, Tool};
+use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -91,11 +91,74 @@ fn glob_matches(pattern: &str, rel_path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct GlobTool {
     pub root: PathBuf,
+    pub extra_roots: Vec<(PathBuf, AccessTier)>,
+    pub session_roots: Option<SharedSandboxRoots>,
 }
 
 impl GlobTool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            extra_roots: Vec::new(),
+            session_roots: None,
+        }
+    }
+
+    /// Append additional allowed sandbox roots. See
+    /// [`crate::tools::fs::ReadFile::with_extra_roots`].
+    pub fn with_extra_roots(
+        mut self,
+        extra: impl IntoIterator<Item = (PathBuf, AccessTier)>,
+    ) -> Self {
+        self.extra_roots.extend(extra);
+        self
+    }
+
+    /// Attach the shared, session-mutable roots slot. See [`SharedSandboxRoots`].
+    pub fn with_session_roots(mut self, slot: SharedSandboxRoots) -> Self {
+        self.session_roots = Some(slot);
+        self
+    }
+
+    /// Convenience: attach the shared slot only when `Some`.
+    pub fn with_session_roots_opt(mut self, slot: Option<SharedSandboxRoots>) -> Self {
+        if let Some(s) = slot {
+            self.session_roots = Some(s);
+        }
+        self
+    }
+
+    fn all_roots(&self) -> Vec<(PathBuf, AccessTier)> {
+        let mut v: Vec<(PathBuf, AccessTier)> = Vec::with_capacity(self.extra_roots.len() + 1);
+        v.push((self.root.clone(), AccessTier::ReadWrite));
+        v.extend(self.extra_roots.iter().cloned());
+        if let Some(slot) = &self.session_roots {
+            if let Ok(roots) = slot.read() {
+                v.extend(roots.iter().cloned());
+            }
+        }
+        v
+    }
+
+    /// Render `entry_path` relative to the primary root when possible, else
+    /// relative to any matching extra root, else as-is (absolute). This keeps
+    /// workspace hits workspace-relative while extra-root hits become absolute
+    /// so the agent can feed them back to `Read`.
+    fn relativise(&self, entry_path: &std::path::Path) -> String {
+        if let Ok(rel) = entry_path.strip_prefix(&self.root) {
+            return rel.to_string_lossy().into_owned();
+        }
+        // Hits inside an extra root are reported as absolute paths so the
+        // agent can feed them straight back to `Read` (which accepts
+        // absolute paths under any allowed root).
+        if self
+            .extra_roots
+            .iter()
+            .any(|(extra, _)| entry_path.starts_with(extra))
+        {
+            return entry_path.to_string_lossy().into_owned();
+        }
+        entry_path.to_string_lossy().into_owned()
     }
 }
 
@@ -140,10 +203,12 @@ impl Tool for GlobTool {
         }
 
         let scope = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => resolve_within(&self.root, p).map_err(|e| Error::BadToolArgs {
-                name: "Glob".into(),
-                message: format!("path: {e}"),
-            })?,
+            Some(p) => {
+                resolve_within_any(&self.all_roots(), p, false).map_err(|e| Error::BadToolArgs {
+                    name: "Glob".into(),
+                    message: format!("path: {e}"),
+                })?
+            }
             None => self.root.clone(),
         };
 
@@ -154,12 +219,7 @@ impl Tool for GlobTool {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .into_owned();
+            let rel = self.relativise(entry.path());
 
             if glob_matches(pattern, &rel) {
                 matches.push(rel);

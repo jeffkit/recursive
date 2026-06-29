@@ -47,8 +47,14 @@ pub struct Config {
     /// `None` = no limit.
     pub max_budget_usd: Option<f64>,
     /// Additional workspace-root directories the agent is allowed to access
-    /// (sandbox expansion via `--add-dir`). Empty = only `workspace`.
+    /// (sandbox expansion via `--add-dir` / `[sandbox] extra_dirs`).
+    /// Read-write: the agent can `Read`, `Write`, `Edit` inside them.
+    /// Empty = only `workspace`.
     pub extra_dirs: Vec<std::path::PathBuf>,
+    /// Additional read-only sandbox roots (`[sandbox] extra_readonly_dirs`).
+    /// The agent can `Read` / `Glob` / `Grep` inside them but `Write` /
+    /// `Edit` are rejected with a clear error. Empty = no read-only extras.
+    pub extra_readonly_dirs: Vec<std::path::PathBuf>,
     /// If non-empty, only tools whose names appear in this list are registered.
     /// Set via `--allow-tools` CLI flag or `RECURSIVE_ALLOW_TOOLS` env var.
     pub allow_tools: Vec<String>,
@@ -111,6 +117,7 @@ impl std::fmt::Debug for Config {
             .field("session_name", &self.session_name)
             .field("max_budget_usd", &self.max_budget_usd)
             .field("extra_dirs", &self.extra_dirs)
+            .field("extra_readonly_dirs", &self.extra_readonly_dirs)
             .field("allow_tools", &self.allow_tools)
             .field("context_window_override", &self.context_window_override)
             .field("subagent_max_depth", &self.subagent_max_depth)
@@ -188,6 +195,36 @@ impl Config {
         let workspace = std::env::var("RECURSIVE_WORKSPACE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        // [sandbox] extra_dirs / extra_readonly_dirs (file-only; CLI --add-dir
+        // appends to extra_dirs after from_env returns). Relative paths are
+        // resolved against the current working directory at load time so the
+        // sandbox boundary is stable for the life of the session.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let resolve_dir = |s: &str| -> PathBuf {
+            let p = PathBuf::from(s);
+            if p.is_absolute() {
+                p
+            } else {
+                cwd.join(p)
+            }
+        };
+        let (file_extra_dirs, file_extra_readonly_dirs) = file_config
+            .sandbox
+            .as_ref()
+            .map(|s| {
+                (
+                    s.extra_dirs
+                        .iter()
+                        .map(|d| resolve_dir(d))
+                        .collect::<Vec<_>>(),
+                    s.extra_readonly_dirs
+                        .iter()
+                        .map(|d| resolve_dir(d))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
 
         // provider_type must be resolved before api_base so we can pick the
         // correct endpoint for dual-protocol presets (e.g. DeepSeek supports
@@ -419,7 +456,8 @@ impl Config {
             thinking_budget: None,
             session_name: None,
             max_budget_usd: None,
-            extra_dirs: Vec::new(),
+            extra_dirs: file_extra_dirs,
+            extra_readonly_dirs: file_extra_readonly_dirs,
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth,
@@ -677,6 +715,7 @@ mod tests {
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
@@ -1169,6 +1208,7 @@ preset = "ollama"
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,

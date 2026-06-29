@@ -131,6 +131,10 @@ pub struct App {
     pub active_goal: Option<GoalState>,
     /// Goal-171: workspace root path, used by /resume to list sessions.
     pub workspace_path: std::path::PathBuf,
+    /// Session-mutable sandbox roots shared with the agent's fs tools.
+    /// Mutated by the `/add-dir` command to grant the agent runtime
+    /// access to directories outside the workspace.
+    pub session_roots: recursive::tools::SharedSandboxRoots,
     /// Goal-174: active colour palette. Defaults to [`DARK`]; switchable
     /// via `/theme <name>` without restart.
     pub theme: &'static crate::ui::theme::Theme,

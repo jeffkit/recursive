@@ -1,9 +1,12 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use recursive::config::Config;
 use recursive::llm::RetryPolicy;
-use recursive::{AgentRuntime, AgentRuntimeBuilder, ChatProvider};
+use recursive::skills::{discover_skills, Skill};
+use recursive::tools::SharedSandboxRoots;
+use recursive::{new_shared_sandbox_roots, AgentRuntime, AgentRuntimeBuilder, ChatProvider};
 
 pub enum RuntimeBuild {
     Ready(Option<Box<AgentRuntime>>),
@@ -35,45 +38,123 @@ fn build_provider(
     Ok(provider)
 }
 
-pub fn build_runtime() -> RuntimeBuild {
+/// Build the `(root, tier)` list used to expand the filesystem sandbox
+/// beyond the primary workspace. Read-write roots come from `--add-dir` /
+/// `[sandbox] extra_dirs`; read-only roots come from
+/// `[sandbox] extra_readonly_dirs`. The primary workspace itself is always
+/// added by `build_standard_tools_with_roots` as a `ReadWrite` root, so it
+/// is not duplicated here.
+fn sandbox_extra_roots(config: &Config) -> Vec<(PathBuf, recursive::AccessTier)> {
+    config
+        .extra_dirs
+        .iter()
+        .cloned()
+        .map(|p| (p, recursive::AccessTier::ReadWrite))
+        .chain(
+            config
+                .extra_readonly_dirs
+                .iter()
+                .cloned()
+                .map(|p| (p, recursive::AccessTier::ReadOnly)),
+        )
+        .collect()
+}
+
+/// Discover skills from configured search paths.
+///
+/// Defaults: <workspace>/.recursive/skills/, <workspace>/.claude/skills/, ~/.recursive/skills/, ~/.claude/skills/.
+/// Override with `RECURSIVE_SKILL_PATHS=path1:path2` (colon-separated).
+fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
+    let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
+        env_paths.split(':').map(PathBuf::from).collect()
+    } else {
+        let mut defaults = vec![
+            config.workspace.join(".recursive").join("skills"),
+            config.workspace.join(".claude").join("skills"),
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            defaults.push(PathBuf::from(&home).join(".recursive").join("skills"));
+            defaults.push(PathBuf::from(home).join(".claude").join("skills"));
+        }
+        defaults
+    };
+    discover_skills(&paths)
+}
+
+/// Build the TUI's system prompt: the configured base prompt followed by the
+/// discovered-skill index (so the agent knows what skills exist and can call
+/// `load_skill` / `find_skills` without first wasting a turn to discover
+/// them). Mirrors what the CLI (`recursive-cli/src/cli/builder.rs`) and the
+/// HTTP API (`src/http/handlers.rs`) already inject — the TUI previously
+/// omitted this, which is why the agent fell back to `find_skills(query="*")`
+/// on every session. Returns the base prompt unchanged when no skills are
+/// installed.
+fn tui_system_prompt(base: &str, skills: &[Skill]) -> String {
+    let idx = recursive::skills::skill_index(skills);
+    if idx.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\n{idx}")
+    }
+}
+
+pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
+    let session_roots = new_shared_sandbox_roots();
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            return RuntimeBuild::Offline {
-                reason: format!("failed to load configuration: {e}"),
-            };
+            return (
+                RuntimeBuild::Offline {
+                    reason: format!("failed to load configuration: {e}"),
+                },
+                session_roots,
+            );
         }
     };
 
     let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
         None => {
-            return RuntimeBuild::Offline {
-                reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
-                         OPENAI_API_KEY, or run `recursive config set \
-                         provider.api_key <KEY>` to populate \
-                         ~/.recursive/config.toml."
-                    .to_string(),
-            };
+            return (
+                RuntimeBuild::Offline {
+                    reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
+                             OPENAI_API_KEY, or run `recursive config set \
+                             provider.api_key <KEY>` to populate \
+                             ~/.recursive/config.toml."
+                        .to_string(),
+                },
+                session_roots,
+            );
         }
     };
 
     let provider = match build_provider(&config, api_key) {
         Ok(p) => p,
         Err(e) => {
-            return RuntimeBuild::Offline {
-                reason: format!("failed to build HTTP client: {e}"),
-            }
+            return (
+                RuntimeBuild::Offline {
+                    reason: format!("failed to build HTTP client: {e}"),
+                },
+                session_roots,
+            )
         }
     };
 
-    let tools =
-        recursive::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
+    let skills = discover_loaded_skills(&config);
+    let system_prompt = tui_system_prompt(&config.system_prompt, &skills);
+    let extra_roots = sandbox_extra_roots(&config);
+    let tools = recursive::tools::build_standard_tools_with_roots(
+        &config.workspace,
+        &extra_roots,
+        Some(session_roots.clone()),
+        &skills,
+        config.shell_timeout_secs,
+    );
 
-    match AgentRuntimeBuilder::new()
+    let build = match AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&config.system_prompt)
+        .system_prompt(&system_prompt)
         .max_steps(config.max_steps)
         .with_plan_mode_tools(true)
         // Stream partial tokens so the TUI shows the answer building up live
@@ -86,7 +167,8 @@ pub fn build_runtime() -> RuntimeBuild {
         Err(e) => RuntimeBuild::Offline {
             reason: format!("failed to build agent runtime: {e}"),
         },
-    }
+    };
+    (build, session_roots)
 }
 
 /// Build the agent runtime for TUI mode, returning both the runtime state and
@@ -100,63 +182,84 @@ pub fn build_runtime() -> RuntimeBuild {
 pub fn build_runtime_for_tui() -> (
     RuntimeBuild,
     tokio::sync::mpsc::UnboundedReceiver<crate::events::SkillInstallEvent>,
+    SharedSandboxRoots,
 ) {
     use crate::events::SkillInstallEvent;
     use tokio::sync::mpsc;
 
     let (skill_tx, skill_rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
 
-    let state = build_runtime_with_skill_tx(Some(skill_tx));
-    (state, skill_rx)
+    let (state, session_roots) = build_runtime_with_skill_tx(Some(skill_tx));
+    (state, skill_rx, session_roots)
 }
 
 /// Inner helper: build a runtime with optional skill-hub tool injection.
 #[cfg(feature = "skill-hub")]
 fn build_runtime_with_skill_tx(
     skill_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::events::SkillInstallEvent>>,
-) -> RuntimeBuild {
+) -> (RuntimeBuild, SharedSandboxRoots) {
+    let session_roots = new_shared_sandbox_roots();
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            return RuntimeBuild::Offline {
-                reason: format!("failed to load configuration: {e}"),
-            };
+            return (
+                RuntimeBuild::Offline {
+                    reason: format!("failed to load configuration: {e}"),
+                },
+                session_roots,
+            );
         }
     };
 
     let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
         None => {
-            return RuntimeBuild::Offline {
-                reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
-                         OPENAI_API_KEY, or run `recursive config set \
-                         provider.api_key <KEY>` to populate \
-                         ~/.recursive/config.toml."
-                    .to_string(),
-            };
+            return (
+                RuntimeBuild::Offline {
+                    reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
+                             OPENAI_API_KEY, or run `recursive config set \
+                             provider.api_key <KEY>` to populate \
+                             ~/.recursive/config.toml."
+                        .to_string(),
+                },
+                session_roots,
+            );
         }
     };
 
     let provider = match build_provider(&config, api_key) {
         Ok(p) => p,
         Err(e) => {
-            return RuntimeBuild::Offline {
-                reason: format!("failed to build HTTP client: {e}"),
-            }
+            return (
+                RuntimeBuild::Offline {
+                    reason: format!("failed to build HTTP client: {e}"),
+                },
+                session_roots,
+            )
         }
     };
 
-    let mut tools =
-        recursive::tools::build_standard_tools(&config.workspace, &[], config.shell_timeout_secs);
+    let skills = discover_loaded_skills(&config);
+    let system_prompt = tui_system_prompt(&config.system_prompt, &skills);
+    let extra_roots = sandbox_extra_roots(&config);
+
+    let mut tools = recursive::tools::build_standard_tools_with_roots(
+        &config.workspace,
+        &extra_roots,
+        Some(session_roots.clone()),
+        &skills,
+        config.shell_timeout_secs,
+    );
 
     // Register skill-hub tools: find_skills (always) and install_skill (TUI only).
-    tools = tools.register(Arc::new(recursive::tools::FindSkills::new(vec![])));
+    // Pass discovered skills so find_skills can search locally installed skills.
+    tools = tools.register(Arc::new(recursive::tools::FindSkills::new(skills)));
     tools = tools.register(Arc::new(recursive::tools::InstallSkill::new(skill_tx)));
 
-    match AgentRuntimeBuilder::new()
+    let build = match AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&config.system_prompt)
+        .system_prompt(&system_prompt)
         .max_steps(config.max_steps)
         .with_plan_mode_tools(true)
         // Stream partial tokens so the TUI shows the answer building up live
@@ -169,17 +272,59 @@ fn build_runtime_with_skill_tx(
         Err(e) => RuntimeBuild::Offline {
             reason: format!("failed to build agent runtime: {e}"),
         },
-    }
+    };
+    (build, session_roots)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use crate::backend::Backend;
     use crate::events::UiEvent;
     use crate::events::UserAction;
+    use recursive::skills::{Skill, SkillMode};
+
+    fn make_skill(name: &str, desc: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: desc.to_string(),
+            path: PathBuf::from(format!("/tmp/skills/{name}/SKILL.md")),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+        }
+    }
+
+    #[test]
+    fn tui_system_prompt_appends_skill_index() {
+        let skills = vec![
+            make_skill("pdf", "Manipulate PDF documents"),
+            make_skill("xlsx", "Read and write spreadsheets"),
+        ];
+        let prompt = tui_system_prompt("You are Recursive.", &skills);
+        assert!(prompt.starts_with("You are Recursive."), "{prompt}");
+        assert!(
+            prompt.contains("Available skills"),
+            "expected skill index header: {prompt}"
+        );
+        assert!(prompt.contains("pdf"), "missing pdf skill: {prompt}");
+        assert!(prompt.contains("xlsx"), "missing xlsx skill: {prompt}");
+    }
+
+    #[test]
+    fn tui_system_prompt_unchanged_when_no_skills() {
+        let prompt = tui_system_prompt("You are Recursive.", &[]);
+        assert_eq!(prompt, "You are Recursive.");
+    }
 
     /// RAII guard that clears API key env vars for the duration of a test
     /// and restores them on drop (including on panic).
@@ -276,7 +421,7 @@ type = "openai"
         )
         .expect("write config");
 
-        let build = build_runtime();
+        let (build, _session_roots) = build_runtime();
         match build {
             RuntimeBuild::Ready(_) => {}
             RuntimeBuild::Offline { reason } => {

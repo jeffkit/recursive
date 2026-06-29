@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::{resolve_within, Tool};
+use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -55,6 +55,15 @@ impl ReadFileState {
 #[derive(Debug, Clone)]
 pub struct ReadFile {
     pub root: PathBuf,
+    /// Additional sandbox roots beyond the primary workspace, each tagged
+    /// with an access tier. The primary `root` is always
+    /// [`AccessTier::ReadWrite`] and is prepended to this list at resolution
+    /// time so the agent can read files in declared extra directories.
+    pub extra_roots: Vec<(PathBuf, AccessTier)>,
+    /// Session-scoped, runtime-mutable roots (e.g. added via the TUI
+    /// `/add-dir` command). Consulted on every call so newly added roots
+    /// take effect immediately.
+    pub session_roots: Option<SharedSandboxRoots>,
     pub max_bytes: usize,
     /// Optional shared state slot. When `Some`, every successful read is
     /// recorded so `EditTool` can enforce the partial-read guard.
@@ -65,6 +74,8 @@ impl ReadFile {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            extra_roots: Vec::new(),
+            session_roots: None,
             max_bytes: 256 * 1024,
             read_state: None,
         }
@@ -73,6 +84,46 @@ impl ReadFile {
     pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
         self.read_state = Some(slot);
         self
+    }
+
+    /// Append additional allowed sandbox roots (e.g. from `[sandbox]
+    /// extra_dirs`). The primary workspace root is always prepended at
+    /// resolution time, so callers only need to pass the *extra* ones here.
+    pub fn with_extra_roots(
+        mut self,
+        extra: impl IntoIterator<Item = (PathBuf, AccessTier)>,
+    ) -> Self {
+        self.extra_roots.extend(extra);
+        self
+    }
+
+    /// Attach the shared, session-mutable roots slot. See [`SharedSandboxRoots`].
+    pub fn with_session_roots(mut self, slot: SharedSandboxRoots) -> Self {
+        self.session_roots = Some(slot);
+        self
+    }
+
+    /// Convenience: attach the shared slot only when `Some`. Used by
+    /// [`crate::tools::build_standard_tools_with_roots`] so headless/CLI
+    /// builds can pass `None` without conditional chaining at every call site.
+    pub fn with_session_roots_opt(mut self, slot: Option<SharedSandboxRoots>) -> Self {
+        if let Some(s) = slot {
+            self.session_roots = Some(s);
+        }
+        self
+    }
+
+    /// All roots, primary first, as consumed by [`resolve_within_any`].
+    fn all_roots(&self) -> Vec<(PathBuf, AccessTier)> {
+        let mut v: Vec<(PathBuf, AccessTier)> = Vec::with_capacity(self.extra_roots.len() + 1);
+        v.push((self.root.clone(), AccessTier::ReadWrite));
+        v.extend(self.extra_roots.iter().cloned());
+        if let Some(slot) = &self.session_roots {
+            if let Ok(roots) = slot.read() {
+                v.extend(roots.iter().cloned());
+            }
+        }
+        v
     }
 }
 
@@ -105,7 +156,7 @@ impl Tool for ReadFile {
             name: "Read".into(),
             message: "missing `path`".into(),
         })?;
-        let abs = resolve_within(&self.root, path)?;
+        let abs = resolve_within_any(&self.all_roots(), path, false)?;
         let bytes = tokio::fs::read(&abs).await.map_err(|e| Error::Tool {
             name: "Read".into(),
             call_id: None,
@@ -223,11 +274,53 @@ impl Tool for ReadFile {
 #[derive(Debug, Clone)]
 pub struct WriteFile {
     pub root: PathBuf,
+    pub extra_roots: Vec<(PathBuf, AccessTier)>,
+    pub session_roots: Option<SharedSandboxRoots>,
 }
 
 impl WriteFile {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            extra_roots: Vec::new(),
+            session_roots: None,
+        }
+    }
+
+    /// Append additional allowed sandbox roots. See [`ReadFile::with_extra_roots`].
+    pub fn with_extra_roots(
+        mut self,
+        extra: impl IntoIterator<Item = (PathBuf, AccessTier)>,
+    ) -> Self {
+        self.extra_roots.extend(extra);
+        self
+    }
+
+    /// Attach the shared, session-mutable roots slot. See [`SharedSandboxRoots`].
+    pub fn with_session_roots(mut self, slot: SharedSandboxRoots) -> Self {
+        self.session_roots = Some(slot);
+        self
+    }
+
+    /// Convenience: attach the shared slot only when `Some`. See
+    /// [`ReadFile::with_session_roots_opt`].
+    pub fn with_session_roots_opt(mut self, slot: Option<SharedSandboxRoots>) -> Self {
+        if let Some(s) = slot {
+            self.session_roots = Some(s);
+        }
+        self
+    }
+
+    fn all_roots(&self) -> Vec<(PathBuf, AccessTier)> {
+        let mut v: Vec<(PathBuf, AccessTier)> = Vec::with_capacity(self.extra_roots.len() + 1);
+        v.push((self.root.clone(), AccessTier::ReadWrite));
+        v.extend(self.extra_roots.iter().cloned());
+        if let Some(slot) = &self.session_roots {
+            if let Ok(roots) = slot.read() {
+                v.extend(roots.iter().cloned());
+            }
+        }
+        v
     }
 }
 
@@ -263,7 +356,7 @@ impl Tool for WriteFile {
                 name: "Write".into(),
                 message: "missing `contents`".into(),
             })?;
-        let abs = resolve_within(&self.root, path)?;
+        let abs = resolve_within_any(&self.all_roots(), path, true)?;
         if let Some(parent) = abs.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -442,5 +535,55 @@ line3
             .get(&tmp.path().join("f.txt"))
             .expect("should be recorded");
         assert!(!rec.is_partial, "start=1 end=N must be is_partial=false");
+    }
+
+    // ── extra_roots (sandbox expansion) tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn read_file_from_extra_root() {
+        use crate::tools::AccessTier;
+        let ws = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        std::fs::write(extra.path().join("outside.txt"), "hello-from-extra").unwrap();
+        let r = ReadFile::new(ws.path())
+            .with_extra_roots(vec![(extra.path().to_path_buf(), AccessTier::ReadOnly)]);
+        let abs = extra.path().join("outside.txt");
+        let got = r
+            .execute(json!({"path": abs.to_string_lossy()}))
+            .await
+            .unwrap();
+        assert_eq!(got, "hello-from-extra");
+    }
+
+    #[tokio::test]
+    async fn write_file_blocked_on_readonly_extra_root() {
+        use crate::tools::AccessTier;
+        let ws = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let w = WriteFile::new(ws.path())
+            .with_extra_roots(vec![(extra.path().to_path_buf(), AccessTier::ReadOnly)]);
+        let abs = extra.path().join("new.txt");
+        let err = w
+            .execute(json!({"path": abs.to_string_lossy(), "contents": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("read-only"),
+            "write to read-only extra root must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_allowed_on_readwrite_extra_root() {
+        use crate::tools::AccessTier;
+        let ws = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let w = WriteFile::new(ws.path())
+            .with_extra_roots(vec![(extra.path().to_path_buf(), AccessTier::ReadWrite)]);
+        let abs = extra.path().join("new.txt");
+        w.execute(json!({"path": abs.to_string_lossy(), "contents": "x"}))
+            .await
+            .unwrap();
+        assert!(abs.exists());
     }
 }

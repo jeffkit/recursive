@@ -528,6 +528,34 @@ pub fn build_standard_tools(
     skills: &[crate::skills::Skill],
     shell_timeout_secs: u64,
 ) -> ToolRegistry {
+    build_standard_tools_with_roots(workspace, &[], None, skills, shell_timeout_secs)
+}
+
+/// Same as [`build_standard_tools`] but accepts additional sandbox roots
+/// beyond the primary workspace. Each `(root, tier)` entry expands the
+/// containment boundary used by the structured filesystem tools
+/// (`Read` / `Write` / `Edit` / `Glob` / `Grep` / `count_lines` /
+/// `estimate_tokens`). `ReadOnly` roots permit reads only; `ReadWrite`
+/// roots also permit writes. The primary workspace is always treated as
+/// `ReadWrite` in addition to whatever is passed here.
+///
+/// `session_roots` is an optional shared, runtime-mutable slot
+/// ([`super::dispatch::SharedSandboxRoots`]); when `Some`, every structured
+/// fs tool receives a clone and consults it on each call, so the TUI
+/// `/add-dir` command (and future interactive grants) can expand the
+/// sandbox mid-session without rebuilding the runtime. Pass `None` for
+/// headless/CLI runs that don't need runtime expansion.
+///
+/// This is how `--add-dir`, `[sandbox] extra_dirs`, and the TUI `/add-dir`
+/// command make out-of-workspace files reachable by the agent without
+/// weakening the sandbox for any other tool.
+pub fn build_standard_tools_with_roots(
+    workspace: &std::path::Path,
+    extra_roots: &[(std::path::PathBuf, super::dispatch::AccessTier)],
+    session_roots: Option<super::dispatch::SharedSandboxRoots>,
+    skills: &[crate::skills::Skill],
+    shell_timeout_secs: u64,
+) -> ToolRegistry {
     let bg_manager = Arc::new(tokio::sync::Mutex::new(
         super::run_background::BackgroundJobManager::new(),
     ));
@@ -536,18 +564,36 @@ pub fn build_standard_tools(
     let mut registry = ToolRegistry::local()
         .with_read_file_state(read_state.clone())
         .register(Arc::new(
-            super::fs::ReadFile::new(workspace).with_read_state(read_state.clone()),
+            super::fs::ReadFile::new(workspace)
+                .with_extra_roots(extra_roots.iter().cloned())
+                .with_session_roots_opt(session_roots.clone())
+                .with_read_state(read_state.clone()),
         ))
-        .register(Arc::new(super::fs::WriteFile::new(workspace)))
         .register(Arc::new(
-            super::edit::EditTool::new(workspace).with_read_state(read_state.clone()),
+            super::fs::WriteFile::new(workspace)
+                .with_extra_roots(extra_roots.iter().cloned())
+                .with_session_roots_opt(session_roots.clone()),
+        ))
+        .register(Arc::new(
+            super::edit::EditTool::new(workspace)
+                .with_extra_roots(extra_roots.iter().cloned())
+                .with_session_roots_opt(session_roots.clone())
+                .with_read_state(read_state.clone()),
         ))
         .register(Arc::new(
             super::shell::RunShell::new(workspace)
                 .with_timeout(std::time::Duration::from_secs(shell_timeout_secs)),
         ))
-        .register(Arc::new(super::search::SearchFiles::new(workspace)))
-        .register(Arc::new(super::glob::GlobTool::new(workspace)))
+        .register(Arc::new(
+            super::search::SearchFiles::new(workspace)
+                .with_extra_roots(extra_roots.iter().cloned())
+                .with_session_roots_opt(session_roots.clone()),
+        ))
+        .register(Arc::new(
+            super::glob::GlobTool::new(workspace)
+                .with_extra_roots(extra_roots.iter().cloned())
+                .with_session_roots_opt(session_roots.clone()),
+        ))
         .register(Arc::new(super::run_background::RunBackground::new(
             workspace,
             bg_manager.clone(),
@@ -555,9 +601,11 @@ pub fn build_standard_tools(
         .register(Arc::new(super::run_background::CheckBackground::new(
             bg_manager,
         )))
-        .register(Arc::new(super::estimate_tokens::EstimateTokens::new(
-            workspace,
-        )))
+        .register(Arc::new(
+            super::estimate_tokens::EstimateTokens::new(workspace)
+                .with_extra_roots(extra_roots.iter().cloned())
+                .with_session_roots_opt(session_roots.clone()),
+        ))
         .register(Arc::new(super::memory::Remember::new(workspace)))
         .register(Arc::new(super::memory::Recall::new(workspace)))
         .register(Arc::new(super::memory::Forget::new(workspace)))

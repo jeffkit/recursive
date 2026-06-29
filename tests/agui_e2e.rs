@@ -85,6 +85,7 @@ fn mock_config(workspace: PathBuf) -> Config {
         session_name: None,
         max_budget_usd: None,
         extra_dirs: Vec::new(),
+        extra_readonly_dirs: Vec::new(),
         allow_tools: Vec::new(),
         context_window_override: None,
         subagent_max_depth: 2,

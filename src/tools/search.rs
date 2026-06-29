@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-use super::{resolve_within, Tool};
+use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -16,6 +16,8 @@ const DEFAULT_MAX_LINE_LEN: usize = 240;
 #[derive(Debug, Clone)]
 pub struct SearchFiles {
     pub root: PathBuf,
+    pub extra_roots: Vec<(PathBuf, AccessTier)>,
+    pub session_roots: Option<SharedSandboxRoots>,
     pub max_results: usize,
 }
 
@@ -23,8 +25,53 @@ impl SearchFiles {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            extra_roots: Vec::new(),
+            session_roots: None,
             max_results: DEFAULT_MAX_RESULTS,
         }
+    }
+
+    /// Append additional allowed sandbox roots. See
+    /// [`crate::tools::fs::ReadFile::with_extra_roots`].
+    pub fn with_extra_roots(
+        mut self,
+        extra: impl IntoIterator<Item = (PathBuf, AccessTier)>,
+    ) -> Self {
+        self.extra_roots.extend(extra);
+        self
+    }
+
+    /// Attach the shared, session-mutable roots slot. See [`SharedSandboxRoots`].
+    pub fn with_session_roots(mut self, slot: SharedSandboxRoots) -> Self {
+        self.session_roots = Some(slot);
+        self
+    }
+
+    /// Convenience: attach the shared slot only when `Some`.
+    pub fn with_session_roots_opt(mut self, slot: Option<SharedSandboxRoots>) -> Self {
+        if let Some(s) = slot {
+            self.session_roots = Some(s);
+        }
+        self
+    }
+
+    fn relativise(&self, path: &std::path::Path) -> std::path::PathBuf {
+        if let Ok(rel) = path.strip_prefix(&self.root) {
+            return rel.to_path_buf();
+        }
+        path.to_path_buf()
+    }
+
+    fn all_roots(&self) -> Vec<(PathBuf, AccessTier)> {
+        let mut v: Vec<(PathBuf, AccessTier)> = Vec::with_capacity(self.extra_roots.len() + 1);
+        v.push((self.root.clone(), AccessTier::ReadWrite));
+        v.extend(self.extra_roots.iter().cloned());
+        if let Some(slot) = &self.session_roots {
+            if let Ok(roots) = slot.read() {
+                v.extend(roots.iter().cloned());
+            }
+        }
+        v
     }
 }
 
@@ -88,10 +135,12 @@ impl Tool for SearchFiles {
         };
 
         let scope = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => resolve_within(&self.root, p).map_err(|e| Error::BadToolArgs {
-                name: "Grep".into(),
-                message: format!("path: {e}"),
-            })?,
+            Some(p) => {
+                resolve_within_any(&self.all_roots(), p, false).map_err(|e| Error::BadToolArgs {
+                    name: "Grep".into(),
+                    message: format!("path: {e}"),
+                })?
+            }
             None => self.root.clone(),
         };
 
@@ -125,7 +174,7 @@ impl Tool for SearchFiles {
             let Ok(contents) = std::fs::read_to_string(path) else {
                 continue;
             };
-            let rel = path.strip_prefix(&self.root).unwrap_or(path);
+            let rel = self.relativise(path);
             for (line_no, line) in contents.lines().enumerate() {
                 let is_match = match &re_opt {
                     Some(re) => re.is_match(line),

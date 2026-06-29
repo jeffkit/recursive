@@ -13,8 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use recursive::event::CompositeSink;
 use recursive::session::{SessionPersistenceSink, SessionWriter};
-use recursive::tools::PermissionHook;
-use recursive::{AgentEvent, AgentRuntime, EventSink, SessionStatus};
+use recursive::tools::{PermissionHook, SharedSandboxRoots};
+use recursive::{new_shared_sandbox_roots, AgentEvent, AgentRuntime, EventSink, SessionStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -53,6 +53,10 @@ pub struct Backend {
     /// The UI loop passes this into [`Backend::weixin_tx`] to the daemon.
     #[cfg(feature = "weixin")]
     pub weixin_tx: mpsc::UnboundedSender<WeixinBackendRequest>,
+    /// Session-mutable sandbox roots shared with the agent's fs tools.
+    /// The UI mutates this in place via `/add-dir` to grant the agent
+    /// access to directories outside the workspace at runtime.
+    pub session_roots: SharedSandboxRoots,
     _worker: JoinHandle<()>,
 }
 
@@ -60,20 +64,25 @@ impl Backend {
     pub fn spawn() -> Self {
         #[cfg(feature = "skill-hub")]
         {
-            let (state, skill_install_rx) = crate::runtime_builder::build_runtime_for_tui();
-            Self::spawn_with_state_and_skill_rx(state, skill_install_rx)
+            let (state, skill_install_rx, session_roots) =
+                crate::runtime_builder::build_runtime_for_tui();
+            Self::spawn_with_state_and_skill_rx(state, skill_install_rx, session_roots)
         }
         #[cfg(not(feature = "skill-hub"))]
         {
-            Self::spawn_with_state(build_runtime())
+            let (state, session_roots) = build_runtime();
+            Self::spawn_with_state(state, session_roots)
         }
     }
 
     pub fn spawn_with_runtime(rt: AgentRuntime) -> Self {
-        Self::spawn_with_state(RuntimeBuild::Ready(Some(Box::new(rt))))
+        Self::spawn_with_state(
+            RuntimeBuild::Ready(Some(Box::new(rt))),
+            new_shared_sandbox_roots(),
+        )
     }
 
-    fn spawn_with_state(state: RuntimeBuild) -> Self {
+    fn spawn_with_state(state: RuntimeBuild, session_roots: SharedSandboxRoots) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
@@ -106,6 +115,7 @@ impl Backend {
             #[cfg(feature = "weixin")]
             weixin_tx,
             skill_install_rx,
+            session_roots,
             _worker: worker,
         }
     }
@@ -114,6 +124,7 @@ impl Backend {
     fn spawn_with_state_and_skill_rx(
         state: RuntimeBuild,
         skill_install_rx: mpsc::UnboundedReceiver<SkillInstallEvent>,
+        session_roots: SharedSandboxRoots,
     ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -145,6 +156,7 @@ impl Backend {
             #[cfg(feature = "weixin")]
             weixin_tx,
             skill_install_rx,
+            session_roots,
             _worker: worker,
         }
     }

@@ -136,9 +136,10 @@ pub use tool_set_provider::{
 pub use tools::policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use tools::PermissionHook;
 pub use tools::{
-    build_standard_tools, AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus,
-    PlanApprovalGate, PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult,
-    RequestPlanModeTool, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch, ToolRegistry,
+    build_standard_tools, build_standard_tools_with_roots, new_shared_sandbox_roots, AccessTier,
+    AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus, PlanApprovalGate,
+    PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult, RequestPlanModeTool,
+    SharedSandboxRoots, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch, ToolRegistry,
     ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
 };
 pub use transcript::{TranscriptFile, TranscriptMeta};

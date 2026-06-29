@@ -57,6 +57,72 @@ impl Drop for RawModeGuard {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
+static PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Install a panic hook that keeps panic output off the TUI surface.
+///
+/// The default panic hook writes directly to fd 2 — the same surface the
+/// alternate screen is rendered onto. A panic inside a tool task is
+/// caught by the runtime and surfaced to the agent as
+/// "ERROR: tool task panicked during parallel execution", but the raw
+/// Rust panic text is still dumped on top of the TUI by the default
+/// hook. Because that text is not part of ratatui's diff buffer, no
+/// redraw ever erases it, so it sticks around the input box until the
+/// user resizes the terminal or runs `reset`.
+///
+/// While the TUI is active (`is_tui_quiet()` is true) we instead append
+/// the panic message to `<user_data_dir>/logs/tui-panic.log` and leave
+/// the screen untouched. When the TUI is not active, the previous
+/// (default) hook runs unchanged so panics still print normally in CLI
+/// runs and in tests. Installed at most once per process.
+fn install_tui_panic_hook() {
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !recursive::logging::is_tui_quiet() {
+                previous(info);
+                return;
+            }
+            let payload = info.payload();
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            let thread = std::thread::current()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            let _ = append_panic_log(&thread, &location, &msg);
+        }));
+    });
+}
+
+/// Append a captured panic to `<user_data_dir>/logs/tui-panic.log`.
+fn append_panic_log(thread: &str, location: &str, msg: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = recursive::paths::user_data_dir().join("logs");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("tui-panic.log");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let content = format!("[unix_ts={now}] thread '{thread}' panicked at {location}:\n{msg}\n\n");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(content.as_bytes())?;
+    Ok(())
+}
+
 /// Launch the TUI and run until the user quits.
 pub async fn run() -> io::Result<()> {
     run_with_backend(Backend::spawn()).await
@@ -67,6 +133,11 @@ pub async fn run() -> io::Result<()> {
 /// Used by `--weixin` mode where the backend is created before the TUI
 /// starts so the WeChat channel can be wired up.
 pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
+    // Route panics to a log file (not stderr) while the TUI owns the
+    // terminal, so a panicking tool task can't dump raw text onto the
+    // alternate screen where no redraw can clear it.
+    install_tui_panic_hook();
+
     // Suppress global tracing output for the duration of the TUI.
     let _quiet_guard = recursive::logging::suppress_tracing_for_tui();
 
@@ -80,6 +151,9 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     let mut backend = backend;
     let mut app = App::new();
     app.permission_hook_enabled = backend.permission_enabled.clone();
+    // Share the backend's session-mutable sandbox roots so `/add-dir` grants
+    // the agent runtime access to directories outside the workspace.
+    app.session_roots = backend.session_roots.clone();
 
     loop {
         terminal.draw(|frame| ui::chat::render(frame, &app))?;
@@ -137,5 +211,34 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
             app.scroll_offset = app.scroll_offset.saturating_sub(3);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_panic_log_writes_under_recursive_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(tmp.path());
+        append_panic_log(
+            "worker",
+            "src/x.rs:42:13",
+            "byte index 79 is not a char boundary",
+        )
+        .expect("append");
+        let log = std::fs::read_to_string(
+            recursive::paths::user_data_dir()
+                .join("logs")
+                .join("tui-panic.log"),
+        )
+        .expect("read log");
+        assert!(log.contains("thread 'worker'"), "missing thread: {log}");
+        assert!(log.contains("src/x.rs:42:13"), "missing location: {log}");
+        assert!(
+            log.contains("byte index 79 is not a char boundary"),
+            "missing message: {log}"
+        );
     }
 }

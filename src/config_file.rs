@@ -34,6 +34,11 @@ pub struct FileConfig {
     /// tools the agent may invoke. Schema mirrors
     /// [`crate::permissions::PermissionsConfig`]. See g140.
     pub permissions: Option<PermissionsSection>,
+    /// Optional `[sandbox]` section. Expands the filesystem sandbox beyond
+    /// the primary workspace so the agent can read (and, if declared,
+    /// write) files in additional directories.
+    #[serde(default)]
+    pub sandbox: Option<SandboxSection>,
 }
 
 /// [provider] section.
@@ -58,6 +63,28 @@ pub struct AgentSection {
     pub max_steps: Option<usize>,
     pub temperature: Option<f64>,
     pub shell_timeout_secs: Option<u64>,
+}
+
+/// `[sandbox]` section. Lists additional directories the agent may reach
+/// beyond the primary workspace.
+///
+/// `extra_dirs` are read-write roots (the agent can `Read`, `Write`, `Edit`
+/// inside them). `extra_readonly_dirs` are read-only roots (the agent can
+/// `Read` / `Glob` / `Grep` but not `Write` / `Edit`). Paths may be absolute
+/// or relative to the current working directory at agent start.
+///
+/// Example:
+/// ```toml
+/// [sandbox]
+/// extra_dirs = ["/opt/shared-writable"]
+/// extra_readonly_dirs = ["/etc/project-ref", "../neighbour-repo"]
+/// ```
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct SandboxSection {
+    #[serde(default)]
+    pub extra_dirs: Vec<String>,
+    #[serde(default)]
+    pub extra_readonly_dirs: Vec<String>,
 }
 
 /// [permissions] section. Wire-compatible with

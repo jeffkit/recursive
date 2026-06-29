@@ -527,9 +527,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(budget) = cli.max_budget_usd {
         config.max_budget_usd = Some(budget);
     }
-    // --add-dir: extra allowed sandbox roots.
+    // --add-dir: extra allowed sandbox roots (read-write). Appended to any
+    // roots already loaded from [sandbox] extra_dirs in config.toml so the
+    // two sources compose.
     if !cli.add_dir.is_empty() {
-        config.extra_dirs = cli.add_dir.clone();
+        config.extra_dirs.extend(cli.add_dir.clone());
     }
     // --allow-tools: restrict agent to a subset of tools.
     if let Some(ref allow) = cli.allow_tools {
@@ -661,11 +663,19 @@ async fn main() -> anyhow::Result<()> {
             // Goal-312: discover skills for skill_index injection into
             // the system prompt of every HTTP API run.
             let skills = {
-                let mut paths = vec![config.workspace.join(".recursive").join("skills")];
+                let mut paths = vec![
+                    config.workspace.join(".recursive").join("skills"),
+                    config.workspace.join(".claude").join("skills"),
+                ];
                 if let Some(home) = std::env::var_os("HOME") {
                     paths.push(
                         std::path::PathBuf::from(home)
                             .join(".recursive")
+                            .join("skills"),
+                    );
+                    paths.push(
+                        std::path::PathBuf::from(home)
+                            .join(".claude")
                             .join("skills"),
                     );
                 }
@@ -2196,6 +2206,7 @@ mod tests {
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,

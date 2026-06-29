@@ -68,7 +68,10 @@ pub mod web_search;
 
 // ── Re-exports from registry ────────────────────────────────────────────────
 
-pub use registry::{build_standard_tools, PermissionHook, SpecWithHint, Tool, ToolRegistry};
+pub use registry::{
+    build_standard_tools, build_standard_tools_with_roots, PermissionHook, SpecWithHint, Tool,
+    ToolRegistry,
+};
 
 // ── Re-exports from audit ───────────────────────────────────────────────────
 
@@ -80,6 +83,7 @@ pub use audit::{
 
 pub use dispatch::resolve_within;
 pub use dispatch::{args_preview_for_permission, ToolDispatch};
+pub use dispatch::{new_shared_sandbox_roots, resolve_within_any, AccessTier, SharedSandboxRoots};
 
 // ── Re-exports from individual tool modules ─────────────────────────────────
 

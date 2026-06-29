@@ -31,21 +31,53 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let read_state = Arc::new(Mutex::new(ReadFileState::new()));
+    // Sandbox expansion: extra read-write roots (CLI `--add-dir` +
+    // `[sandbox] extra_dirs`) and read-only roots (`[sandbox]
+    // extra_readonly_dirs`). Each structured fs tool receives these so the
+    // agent can reach out-of-workspace files without weakening the sandbox
+    // for shell/checkpoint/etc.
+    let extra_roots: Vec<(PathBuf, recursive::AccessTier)> = config
+        .extra_dirs
+        .iter()
+        .cloned()
+        .map(|p| (p, recursive::AccessTier::ReadWrite))
+        .chain(
+            config
+                .extra_readonly_dirs
+                .iter()
+                .cloned()
+                .map(|p| (p, recursive::AccessTier::ReadOnly)),
+        )
+        .collect();
     let mut registry = ToolRegistry::new(transport)
         .with_read_file_state(read_state.clone())
         .register_with_aliases(
-            Arc::new(ReadFile::new(root).with_read_state(read_state.clone())),
+            Arc::new(
+                ReadFile::new(root)
+                    .with_extra_roots(extra_roots.clone())
+                    .with_read_state(read_state.clone()),
+            ),
             &["read_file"],
         )
-        .register_with_aliases(Arc::new(WriteFile::new(root)), &["write_file"])
+        .register_with_aliases(
+            Arc::new(WriteFile::new(root).with_extra_roots(extra_roots.clone())),
+            &["write_file"],
+        )
         .register(Arc::new(
-            EditTool::new(root).with_read_state(read_state.clone()),
+            EditTool::new(root)
+                .with_extra_roots(extra_roots.clone())
+                .with_read_state(read_state.clone()),
         ))
-        .register_with_aliases(Arc::new(GlobTool::new(root)), &["list_dir", "glob"])
+        .register_with_aliases(
+            Arc::new(GlobTool::new(root).with_extra_roots(extra_roots.clone())),
+            &["list_dir", "glob"],
+        )
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
-        .register(Arc::new(SearchFiles::new(root)))
+        .register(Arc::new(
+            SearchFiles::new(root).with_extra_roots(extra_roots.clone()),
+        ))
         .register(Arc::new(WebFetch::new()))
         .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
         .register(Arc::new(CheckBackground::new(bg_manager.clone())));
@@ -53,8 +85,12 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
     {
         registry = registry.register(Arc::new(WebSearch::new()));
     }
-    registry = registry.register(Arc::new(EstimateTokens::new(root)));
-    registry = registry.register(Arc::new(CountLines::new(root)));
+    registry = registry.register(Arc::new(
+        EstimateTokens::new(root).with_extra_roots(extra_roots.clone()),
+    ));
+    registry = registry.register(Arc::new(
+        CountLines::new(root).with_extra_roots(extra_roots),
+    ));
     registry = registry
         .register(Arc::new(Remember::new(root)))
         .register(Arc::new(Recall::new(root)))
@@ -234,15 +270,19 @@ async fn register_mcp_server_tools(
 }
 
 /// Discover skills from configured search paths.
-/// Defaults: <workspace>/.recursive/skills/, ~/.recursive/skills/.
+/// Defaults: <workspace>/.recursive/skills/, <workspace>/.claude/skills/, ~/.recursive/skills/, ~/.claude/skills/.
 /// Override with RECURSIVE_SKILL_PATHS=path1:path2 (colon-separated).
 fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
         env_paths.split(':').map(PathBuf::from).collect()
     } else {
-        let mut defaults = vec![config.workspace.join(".recursive").join("skills")];
+        let mut defaults = vec![
+            config.workspace.join(".recursive").join("skills"),
+            config.workspace.join(".claude").join("skills"),
+        ];
         if let Some(home) = std::env::var_os("HOME") {
-            defaults.push(PathBuf::from(home).join(".recursive").join("skills"));
+            defaults.push(PathBuf::from(&home).join(".recursive").join("skills"));
+            defaults.push(PathBuf::from(home).join(".claude").join("skills"));
         }
         defaults
     };

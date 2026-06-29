@@ -60,6 +60,7 @@ impl App {
             current_todos: Vec::new(),
             active_goal: None,
             workspace_path: workspace,
+            session_roots: recursive::new_shared_sandbox_roots(),
             theme: &crate::ui::theme::DARK,
             modal_scroll: 0,
             active_command_panel: None,

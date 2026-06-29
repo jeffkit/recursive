@@ -159,6 +159,13 @@ impl CommandRegistry {
                     handler: CommandHandler::Sync(cmd_permissions),
                 },
                 CommandSpec {
+                    name: "add-dir",
+                    aliases: &["adddir"],
+                    summary: "Grant the agent access to an extra directory",
+                    usage: "/add-dir <path> [--ro]",
+                    handler: CommandHandler::Sync(cmd_add_dir),
+                },
+                CommandSpec {
                     name: "exit",
                     aliases: &["quit", "q"],
                     summary: "Quit the TUI",
@@ -399,6 +406,104 @@ fn cmd_permissions(app: &mut AppState, args: &[String]) -> CommandOutcome {
     app.push_system(format!(
         "Permissions hook: {}",
         if on { "on" } else { "off" }
+    ));
+    CommandOutcome::Done
+}
+
+/// `/add-dir <path> [--ro]`
+///
+/// Grant the agent runtime access to a directory outside the workspace by
+/// appending it to the session-mutable sandbox roots. `--ro` (or `:ro`
+/// suffix on the path) makes the grant read-only. Existing roots are
+/// de-duplicated; re-adding a known path just reports it.
+fn cmd_add_dir(app: &mut AppState, args: &[String]) -> CommandOutcome {
+    if args.is_empty() {
+        let listed = app
+            .session_roots
+            .read()
+            .map(|roots| {
+                if roots.is_empty() {
+                    "No extra directories granted this session.".to_string()
+                } else {
+                    roots
+                        .iter()
+                        .map(|(p, t)| {
+                            format!(
+                                "- {} ({})",
+                                p.display(),
+                                match t {
+                                    recursive::tools::AccessTier::ReadOnly => "ro",
+                                    recursive::tools::AccessTier::ReadWrite => "rw",
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            })
+            .unwrap_or_else(|_| "No extra directories granted this session.".to_string());
+        app.push_system(format!(
+            "Usage: /add-dir <path> [--ro]\n\nGranted this session:\n{listed}"
+        ));
+        return CommandOutcome::Done;
+    }
+
+    let read_only = args.iter().any(|a| a == "--ro" || a == "-r");
+    let raw = args.iter().find(|a| !a.starts_with('-'));
+    let Some(raw) = raw else {
+        app.push_error("Usage: /add-dir <path> [--ro]");
+        return CommandOutcome::Done;
+    };
+    // Allow a `:ro` suffix as shorthand for read-only.
+    let (raw_path, ro_suffix) = raw
+        .strip_suffix(":ro")
+        .map(|p| (p, true))
+        .unwrap_or((raw.as_str(), false));
+    let read_only = read_only || ro_suffix;
+
+    let candidate = std::path::Path::new(raw_path);
+    let canonical = match candidate.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            app.push_error(format!(
+                "/add-dir: cannot resolve \"{}\": {}",
+                candidate.display(),
+                e
+            ));
+            return CommandOutcome::Done;
+        }
+    };
+    if !canonical.is_dir() {
+        app.push_error(format!(
+            "/add-dir: \"{}\" is not a directory",
+            canonical.display()
+        ));
+        return CommandOutcome::Done;
+    }
+
+    let tier = if read_only {
+        recursive::tools::AccessTier::ReadOnly
+    } else {
+        recursive::tools::AccessTier::ReadWrite
+    };
+
+    let already = app
+        .session_roots
+        .read()
+        .map(|roots| roots.iter().any(|(p, _)| *p == canonical))
+        .unwrap_or(false);
+    if already {
+        app.push_system(format!("Already granted: {}", canonical.display()));
+        return CommandOutcome::Done;
+    }
+
+    if let Ok(mut roots) = app.session_roots.write() {
+        roots.push((canonical.clone(), tier));
+    }
+    app.push_system(format!(
+        "Granted agent access to {} ({})",
+        canonical.display(),
+        if read_only { "read-only" } else { "read-write" }
     ));
     CommandOutcome::Done
 }
@@ -905,6 +1010,79 @@ mod tests {
         assert!(matches!(spec.handler, CommandHandler::Async(_)));
     }
 
+    #[test]
+    fn cmd_add_dir_is_registered() {
+        let r = CommandRegistry::default_set();
+        assert!(
+            r.lookup("add-dir").is_some(),
+            "/add-dir should be registered"
+        );
+        assert!(r.lookup("adddir").is_some(), "/adddir alias should resolve");
+    }
+
+    #[test]
+    fn cmd_add_dir_grants_readwrite_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        // Fresh session_roots slot from App::new() starts empty.
+        assert!(app
+            .session_roots
+            .read()
+            .map(|r| r.is_empty())
+            .unwrap_or(true));
+        invoke(&mut app, &format!("add-dir {}", tmp.path().display()));
+        let roots = app
+            .session_roots
+            .read()
+            .expect("read session_roots")
+            .clone();
+        assert_eq!(roots.len(), 1, "exactly one root granted: {roots:?}");
+        assert_eq!(roots[0].0, tmp.path().canonicalize().unwrap());
+        assert!(matches!(
+            roots[0].1,
+            recursive::tools::AccessTier::ReadWrite
+        ));
+    }
+
+    #[test]
+    fn cmd_add_dir_ro_suffix_makes_readonly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        invoke(&mut app, &format!("add-dir {}:ro", tmp.path().display()));
+        let roots = app
+            .session_roots
+            .read()
+            .expect("read session_roots")
+            .clone();
+        assert_eq!(roots.len(), 1);
+        assert!(matches!(roots[0].1, recursive::tools::AccessTier::ReadOnly));
+    }
+
+    #[test]
+    fn cmd_add_dir_dedupes_known_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().display().to_string();
+        let mut app = App::new();
+        invoke(&mut app, &format!("add-dir {path}"));
+        invoke(&mut app, &format!("add-dir {path}"));
+        let len = app.session_roots.read().map(|r| r.len()).unwrap_or(0);
+        assert_eq!(len, 1, "re-adding a known path must not duplicate");
+    }
+
+    #[test]
+    fn cmd_add_dir_rejects_missing_path() {
+        let mut app = App::new();
+        invoke(&mut app, "add-dir /this/path/does/not/exist/recursive-test");
+        let len = app.session_roots.read().map(|r| r.len()).unwrap_or(0);
+        assert_eq!(len, 0, "missing path must not be granted");
+        // An error block should have been pushed.
+        let has_error = app
+            .blocks
+            .iter()
+            .any(|b| matches!(b, TranscriptBlock::Error { text } if text.contains("add-dir")));
+        assert!(has_error, "expected an error block mentioning /add-dir");
+    }
+
     // Goal-174: theme command tests
     #[test]
     fn cmd_theme_switches_to_light() {
@@ -972,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_includes_all_fifteen_commands() {
+    fn registry_includes_all_builtin_commands() {
         let r = CommandRegistry::default_set();
         let names: Vec<&str> = r.commands().iter().map(|c| c.name).collect();
         for expected in &[
@@ -987,6 +1165,7 @@ mod tests {
             "journal",
             "exit",
             "permissions",
+            "add-dir",
             "goal",
             "mcp",
             "theme",
@@ -996,8 +1175,8 @@ mod tests {
                 "missing /{expected}: have {names:?}"
             );
         }
-        // 11 built-in commands plus /goal, /resume, /mcp, and /theme = 15.
-        assert_eq!(names.len(), 15);
+        // 15 named above plus one lazily-registered built-in (/resume) = 16.
+        assert_eq!(names.len(), 16);
     }
 
     #[test]
@@ -1011,7 +1190,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 15);
+        assert_eq!(hits.len(), 16);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();

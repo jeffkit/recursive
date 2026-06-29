@@ -880,8 +880,9 @@ fn render_skill_install(state: &SkillInstallState) -> Vec<Line<'static>> {
                     );
                     if i == *sel {
                         out.push(Line::from(Span::styled(row_text, selected_style)));
-                        let desc = if r.description.len() > 68 {
-                            format!("  {}", &r.description[..68])
+                        let desc = if r.description.chars().count() > 68 {
+                            let s: String = r.description.chars().take(67).collect();
+                            format!("  {}…", s)
                         } else {
                             format!("  {}", r.description)
                         };

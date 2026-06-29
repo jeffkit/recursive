@@ -5,6 +5,7 @@
 //! argument preview generation, and path containment helpers.
 
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::Instrument;
 
@@ -204,57 +205,126 @@ pub fn args_preview_for_permission(arguments: &Value) -> String {
 /// For paths that do not yet exist (e.g. a new file being written), only the
 /// lexical normalisation check is performed — the caller is responsible for
 /// ensuring no symlink is created that would bridge outside the root.
-pub fn resolve_within(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf> {
-    let candidate = std::path::Path::new(path);
+pub fn resolve_within(root: &Path, path: &str) -> Result<PathBuf> {
+    resolve_within_any(&[(root.to_path_buf(), AccessTier::ReadWrite)], path, false)
+}
+
+/// Access tier for a sandbox root. `ReadOnly` roots permit read operations
+/// only; `ReadWrite` roots permit both reads and writes. The primary
+/// workspace root is always `ReadWrite`; extra dirs declared via
+/// `[sandbox] extra_readonly_dirs` (or the TUI `/add-dir --read-only` flow)
+/// are `ReadOnly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessTier {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Shared, session-scoped sandbox roots. This is the runtime-mutable
+/// companion to the static `extra_roots` baked into each tool at build
+/// time: the TUI's `/add-dir` command (and, in future, an interactive
+/// out-of-scope-read grant) appends entries here, and every structured
+/// filesystem tool consults the snapshot in [`resolve_within_any`] on
+/// each call so newly added roots take effect immediately — without
+/// rebuilding the agent runtime.
+///
+/// Uses `std::sync::RwLock` (not tokio) because tools only take a brief
+/// read snapshot inside `execute`; no `.await` is held across the guard.
+pub type SharedSandboxRoots =
+    std::sync::Arc<std::sync::RwLock<Vec<(std::path::PathBuf, AccessTier)>>>;
+
+/// Construct an empty shared sandbox-roots slot.
+pub fn new_shared_sandbox_roots() -> SharedSandboxRoots {
+    std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
+}
+
+/// Multi-root variant of [`resolve_within`]. The candidate path is resolved
+/// against a *set* of allowed roots; it is accepted when its canonical form
+/// falls under at least one root. Symlink-aware canonicalisation is applied
+/// per-root exactly as in the single-root case.
+///
+/// `write` selects the tier check: a path that is only contained by
+/// `ReadOnly` roots is rejected for write operations (`Write` / `Edit` /
+/// `StrReplace`) with a clear error, while remaining readable.
+///
+/// This is the sandbox primitive used by every structured filesystem tool
+/// (`Read` / `Write` / `Edit` / `Glob` / `Search` / `count_lines` /
+/// `estimate_tokens`). It preserves invariant #3 — every fs path is still
+/// containment-checked — while letting the operator declare additional
+/// allowed roots beyond the primary workspace.
+pub fn resolve_within_any(
+    roots: &[(PathBuf, AccessTier)],
+    path: &str,
+    write: bool,
+) -> Result<PathBuf> {
+    let candidate = Path::new(path);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        root.join(candidate)
+        let Some((first_root, _)) = roots.first() else {
+            return Err(Error::BadToolArgs {
+                name: "<fs>".into(),
+                message: format!("path `{path}` given with no sandbox roots"),
+            });
+        };
+        first_root.join(candidate)
     };
-    let abs_root = absolutise(root);
     let abs_joined = absolutise(&joined);
-    // Lexical check (works for paths that don't exist yet).
-    if !abs_joined.starts_with(&abs_root) {
+
+    // Lexical containment check against every root (works for paths that
+    // don't exist yet).
+    let mut lexical_matches: Vec<AccessTier> = Vec::new();
+    for (root, tier) in roots {
+        if abs_joined.starts_with(absolutise(root)) {
+            lexical_matches.push(*tier);
+        }
+    }
+    if lexical_matches.is_empty() {
+        return Err(Error::BadToolArgs {
+            name: "<fs>".into(),
+            message: format!("path `{path}` escapes sandbox roots"),
+        });
+    }
+
+    // Symlink-aware check: if the path exists, canonicalise it once and
+    // re-check containment against each root. A link that lexically appears
+    // inside a root but canonicalises outside *all* roots is rejected.
+    let tier_matches: Vec<AccessTier> = if abs_joined.exists() {
+        let canonical_joined = abs_joined.canonicalize().map_err(|e| Error::BadToolArgs {
+            name: "<fs>".into(),
+            message: format!("cannot resolve path `{path}`: {e}"),
+        })?;
+        let mut matches = Vec::new();
+        for (root, tier) in roots {
+            let abs_root = absolutise(root);
+            // Roots that don't exist yet fall back to the lexical form; the
+            // candidate's canonical form is then checked against it.
+            let canonical_root = abs_root.canonicalize().unwrap_or(abs_root);
+            if canonical_joined.starts_with(&canonical_root) {
+                matches.push(*tier);
+            }
+        }
+        if matches.is_empty() {
+            return Err(Error::BadToolArgs {
+                name: "<fs>".into(),
+                message: format!(
+                    "path `{path}` resolves via symlink to a location outside all sandbox roots"
+                ),
+            });
+        }
+        matches
+    } else {
+        lexical_matches
+    };
+
+    // Tier gate: writes require at least one matching ReadWrite root.
+    if write && !tier_matches.contains(&AccessTier::ReadWrite) {
         return Err(Error::BadToolArgs {
             name: "<fs>".into(),
             message: format!(
-                "path `{}` escapes workspace root `{}`",
-                path,
-                abs_root.display()
+                "path `{path}` is inside a read-only sandbox root; writes are not allowed"
             ),
         });
-    }
-    // Symlink-aware check: if the path exists, canonicalize both sides and
-    // re-check so that symlinks pointing outside the workspace are rejected.
-    if abs_joined.exists() {
-        let canonical_root = abs_root.canonicalize().map_err(|e| Error::BadToolArgs {
-            name: "<fs>".into(),
-            message: format!(
-                "cannot canonicalize workspace root `{}`: {}",
-                abs_root.display(),
-                e
-            ),
-        })?;
-        match abs_joined.canonicalize() {
-            Ok(canonical_joined) => {
-                if !canonical_joined.starts_with(&canonical_root) {
-                    return Err(Error::BadToolArgs {
-                        name: "<fs>".into(),
-                        message: format!(
-                            "path `{}` resolves via symlink to a location outside the workspace root `{}`",
-                            path,
-                            canonical_root.display()
-                        ),
-                    });
-                }
-            }
-            Err(e) => {
-                return Err(Error::BadToolArgs {
-                    name: "<fs>".into(),
-                    message: format!("cannot resolve path `{}`: {e}", path),
-                });
-            }
-        }
     }
     Ok(abs_joined)
 }
@@ -285,4 +355,90 @@ fn normalise(p: &std::path::Path) -> std::path::PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn rw(p: impl Into<PathBuf>) -> (PathBuf, AccessTier) {
+        (p.into(), AccessTier::ReadWrite)
+    }
+
+    fn ro(p: impl Into<PathBuf>) -> (PathBuf, AccessTier) {
+        (p.into(), AccessTier::ReadOnly)
+    }
+
+    #[test]
+    fn single_root_allows_inside_rejects_outside() {
+        let tmp = TempDir::new().unwrap();
+        let roots = vec![rw(tmp.path())];
+        assert!(resolve_within_any(&roots, "a.txt", false).is_ok());
+        assert!(resolve_within_any(&roots, "../escape", false).is_err());
+    }
+
+    #[test]
+    fn second_root_lets_path_outside_workspace_in() {
+        let ws = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        std::fs::write(extra.path().join("note.md"), "hi").unwrap();
+        let roots = vec![rw(ws.path()), ro(extra.path())];
+        // Relative paths resolve against the FIRST root (workspace); to read
+        // the extra dir the agent passes an absolute path.
+        let abs = extra.path().join("note.md");
+        let got = resolve_within_any(&roots, &abs.to_string_lossy(), false);
+        assert!(
+            got.is_ok(),
+            "absolute path inside extra root must be allowed"
+        );
+    }
+
+    #[test]
+    fn read_only_root_blocks_write() {
+        let ws = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let roots = vec![rw(ws.path()), ro(extra.path())];
+        let abs = extra.path().join("new.txt");
+        let err = resolve_within_any(&roots, &abs.to_string_lossy(), true).unwrap_err();
+        assert!(
+            err.to_string().contains("read-only"),
+            "write to read-only root must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn read_only_root_allows_read() {
+        let ws = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        std::fs::write(extra.path().join("note.md"), "hi").unwrap();
+        let roots = vec![rw(ws.path()), ro(extra.path())];
+        let abs = extra.path().join("note.md");
+        assert!(resolve_within_any(&roots, &abs.to_string_lossy(), false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_into_no_root_is_rejected() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let link = ws.path().join("trap");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let roots = vec![rw(ws.path())];
+        // Following the symlink lands outside every root.
+        assert!(resolve_within_any(&roots, "trap", false).is_err());
+    }
+
+    #[test]
+    fn empty_roots_rejects_everything() {
+        let err = resolve_within_any(&[], "a.txt", false).unwrap_err();
+        assert!(err.to_string().contains("no sandbox roots"));
+    }
+
+    #[test]
+    fn resolve_within_delegates_and_preserves_escapes_message() {
+        let tmp = TempDir::new().unwrap();
+        let err = resolve_within(tmp.path(), "../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("escapes"));
+    }
 }

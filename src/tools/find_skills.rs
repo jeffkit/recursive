@@ -135,9 +135,12 @@ impl Tool for FindSkills {
                 crate::skills::SkillMode::Manual => "manual",
                 crate::skills::SkillMode::Globs => "globs",
             };
-            // Truncate description to 80 chars to keep the list readable.
+            // Truncate description to keep the list readable. Use
+            // char-boundary-safe truncation: a naive `&desc[..79]` panics
+            // when byte 79 lands inside a multi-byte UTF-8 codepoint (e.g.
+            // CJK text such as "CMS图文操作…").
             let desc = if skill.description.len() > 80 {
-                format!("{}…", &skill.description[..79])
+                format!("{}…", crate::truncate_str(&skill.description, 79))
             } else {
                 skill.description.clone()
             };
@@ -273,6 +276,34 @@ mod tests {
         assert!(
             result.contains("PDF-tool"),
             "should match case-insensitively: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_skills_multibyte_description_does_not_panic() {
+        // Regression: byte-slicing `&desc[..79]` panicked when byte 79 fell
+        // inside a 3-byte CJK codepoint. The description below is long enough
+        // to trigger truncation and packs multi-byte chars near the boundary.
+        let long_desc = "CMS图文操作 - 解析用户自然语言 新增更新保存发布增加子图文点位 \
+                         映射字段后渲染 A2UI 界面以及更多后续操作流程描述文字";
+        assert!(
+            long_desc.len() > 80,
+            "fixture must exceed 80 bytes to exercise truncation"
+        );
+        let skills = vec![make_skill("cms-content-action", long_desc)];
+        let tool = FindSkills::new(skills);
+        // Must not panic; description should be truncated at a char boundary.
+        let result = tool
+            .execute(json!({"query": "cms"}))
+            .await
+            .expect("multibyte truncation must not panic");
+        assert!(
+            result.contains("cms-content-action"),
+            "expected skill in result: {result}"
+        );
+        assert!(
+            result.contains('…'),
+            "expected ellipsis after truncation: {result}"
         );
     }
 }
