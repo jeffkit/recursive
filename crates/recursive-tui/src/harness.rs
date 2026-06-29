@@ -43,7 +43,11 @@
 //! ```
 //!
 //! Exit code is non-zero if any mutant survives, so the script can gate a
-//! commit. Stage 5 wires this into the self-improve acceptance flow.
+//! commit. The full SOP (in-process harness → mutation gate → PTY tour →
+//! quality gates) is codified in `.dev/skills/tui-acceptance.md`, and the
+//! goal template at `.dev/goals/_TEMPLATE-tui-acceptance.md` embeds it
+//! into every TUI goal's Acceptance section so the self-improve loop
+//! follows it automatically.
 
 use std::collections::VecDeque;
 
