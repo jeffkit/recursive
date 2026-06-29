@@ -287,7 +287,7 @@ pub fn spawn_background_refresh() {
 mod tests {
     use super::*;
     use crate::providers::{all_presets, ModelPricingSpec, ModelSpec};
-    use crate::test_util::PinnedHome;
+    use crate::test_util::PinnedRecursiveHome;
 
     #[test]
     fn merge_overrides_bundled() {
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn needs_update_true_when_no_cache() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
-        let _pin = PinnedHome::new(tmp.path());
+        let _pin = PinnedRecursiveHome::new(tmp.path());
         assert!(needs_update());
         Ok(())
     }
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn load_cache_returns_none_when_absent() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
-        let _pin = PinnedHome::new(tmp.path());
+        let _pin = PinnedRecursiveHome::new(tmp.path());
         assert!(load_cache().is_none());
         Ok(())
     }
@@ -376,9 +376,11 @@ mod tests {
     #[test]
     fn fetch_roundtrips_through_cache_file() -> Result<(), Box<dyn std::error::Error>> {
         // No network: write a cache envelope directly and confirm load_cache
-        // parses it back. PinnedHome keeps the write inside the temp dir.
+        // parses it back. PinnedRecursiveHome points user_data_dir() at the
+        // temp dir on every platform (incl. Windows, where HOME/USERPROFILE
+        // pinning alone is unreliable).
         let tmp = tempfile::tempdir()?;
-        let _pin = PinnedHome::new(tmp.path());
+        let _pin = PinnedRecursiveHome::new(tmp.path());
 
         let cache = ProvidersCache {
             schema_version: 1,
