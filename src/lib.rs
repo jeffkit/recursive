@@ -45,6 +45,7 @@ pub mod multi;
 pub mod paths;
 pub mod permissions;
 pub mod providers;
+pub mod providers_cache;
 pub mod rewind;
 pub mod run_core;
 pub mod runtime;
@@ -102,7 +103,8 @@ pub use permissions::PermissionMode;
 pub use permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
 pub use permissions::{RuleBehavior, SharedPermissions};
 pub use providers::{
-    all_presets, all_presets_dynamic, find_preset, find_preset_extended, ModelSpec, ProviderPreset,
+    all_presets, all_presets_dynamic, all_presets_effective, find_preset, find_preset_effective,
+    find_preset_extended, ModelSpec, ProviderPreset,
 };
 pub use rewind::{
     apply_rewind, checkpoint_log_path, detect_conflicts, plan_rewind, ConflictReport, RewindPlan,

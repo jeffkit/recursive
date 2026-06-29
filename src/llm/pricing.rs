@@ -126,10 +126,13 @@ pub fn default_compact_threshold_chars(model: &str) -> usize {
     (effective_tokens as f64 * 0.8 * 4.0) as usize
 }
 
-/// Returns pricing for a model by looking it up in the bundled `providers.toml`.
-/// Returns `None` if the model is not listed or has no pricing field.
+/// Returns pricing for a model by looking it up in the **effective** preset
+/// catalog (remote cache + bundled + `providers.d/`), so per-token cost
+/// reflects upstream catalog refreshes rather than just the compile-time
+/// `providers.toml`. Returns `None` if the model is not listed or has no
+/// pricing field.
 pub fn pricing_for(model: &str) -> Option<ModelPricing> {
-    let spec = crate::providers::find_model_pricing(model)?;
+    let spec = crate::providers::find_model_pricing_effective(model)?;
     Some(ModelPricing {
         input_per_million: spec.input_per_million,
         output_per_million: spec.output_per_million,
