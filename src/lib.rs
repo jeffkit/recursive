@@ -141,6 +141,10 @@ pub use tools::{
     RequestPlanModeTool, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch, ToolRegistry,
     ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
 };
+pub use tools::{
+    kvm_available, FcExecResult, FirecrackerConfig, FirecrackerToolSetProvider, MemFs,
+    MemFsToolSetProvider,
+};
 pub use transcript::{TranscriptFile, TranscriptMeta};
 
 #[cfg(any(test, feature = "test-utils"))]

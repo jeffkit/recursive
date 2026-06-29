@@ -24,11 +24,13 @@ pub mod estimate_tokens;
 pub mod facts;
 #[cfg(feature = "skill-hub")]
 pub mod find_skills;
+pub mod firecracker_provider;
 pub mod fs;
 pub mod glob;
 #[cfg(feature = "skill-hub")]
 pub mod install_skill;
 pub mod load_skill;
+pub mod memfs_provider;
 pub mod memory;
 pub mod permission_pipeline;
 pub mod plan_mode;
@@ -100,11 +102,15 @@ pub use facts::{
 };
 #[cfg(feature = "skill-hub")]
 pub use find_skills::FindSkills;
+pub use firecracker_provider::{
+    kvm_available, FcExecResult, FirecrackerConfig, FirecrackerToolSetProvider, FirecrackerVm,
+};
 pub use fs::{ReadFile, WriteFile};
 pub use glob::GlobTool;
 #[cfg(feature = "skill-hub")]
 pub use install_skill::InstallSkill;
 pub use load_skill::LoadSkill;
+pub use memfs_provider::{MemFs, MemFsToolSetProvider};
 pub use memory::{
     load_scratchpad, scratchpad_path, scratchpad_summary, Scratchpad, ScratchpadDelete,
     ScratchpadGet, ScratchpadList, WorkingMemoryTool,
