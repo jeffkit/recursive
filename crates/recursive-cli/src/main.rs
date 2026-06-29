@@ -1548,8 +1548,8 @@ async fn cmd_providers(cmd: ProvidersCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<18} {:<14} {:<24} {}",
-                "ID", "TYPE", "DEFAULT_MODEL", "API_BASE"
+                "{:<18} {:<14} {:<24} API_BASE",
+                "ID", "TYPE", "DEFAULT_MODEL"
             );
             for p in presets {
                 println!(
