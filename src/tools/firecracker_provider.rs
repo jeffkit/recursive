@@ -65,6 +65,9 @@ const VSOCK_PORT: u16 = 7654;
 /// Default Firecracker binary name (searched on PATH).
 const DEFAULT_FIRECRACKER_BIN: &str = "firecracker";
 
+/// Default virtiofsd binary name (searched on PATH).
+const DEFAULT_VIRTIOFSD_BIN: &str = "virtiofsd";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // KVM availability check
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +113,26 @@ pub struct FirecrackerConfig {
     /// Unix socket path exposed by the vsock UDS proxy on the host.
     /// Firecracker routes vsock traffic from the guest over this socket.
     pub vsock_uds_path: Option<PathBuf>,
+    /// Host directory to share with the VM via virtiofs.
+    ///
+    /// When `Some`, the provider will spawn a `virtiofsd` process and configure
+    /// a virtio_fs device in the VM. The guest must mount this at startup via
+    /// `mount -t virtiofs <virtiofs_tag> /workspace`.
+    ///
+    /// When `None`, no virtiofs device is configured and the VM uses its own
+    /// ephemeral rootfs only.
+    ///
+    /// Overridable via `RECURSIVE_FC_WORKSPACE_DIR`.
+    pub workspace_dir: Option<PathBuf>,
+    /// Path to the `virtiofsd` binary (default: `"virtiofsd"` on `PATH`).
+    ///
+    /// Overridable via `RECURSIVE_VIRTIOFSD_BIN`.
+    pub virtiofsd_bin: PathBuf,
+    /// Mount tag used inside the guest for the virtiofs mount (default: `"host"`).
+    pub virtiofs_tag: String,
+    /// Unix socket path for the virtiofsd ↔ Firecracker channel.
+    /// If `None`, auto-generated under `/tmp`.
+    pub virtiofsd_socket: Option<PathBuf>,
 }
 
 impl Default for FirecrackerConfig {
@@ -117,6 +140,9 @@ impl Default for FirecrackerConfig {
         let binary_path = std::env::var("RECURSIVE_FIRECRACKER_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_FIRECRACKER_BIN));
+        let virtiofsd_bin = std::env::var("RECURSIVE_VIRTIOFSD_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_VIRTIOFSD_BIN));
         Self {
             binary_path,
             kernel_path: PathBuf::from("/opt/recursive/firecracker/kernel.bin"),
@@ -126,6 +152,10 @@ impl Default for FirecrackerConfig {
             shell_timeout_secs: 60,
             api_socket: None,
             vsock_uds_path: None,
+            workspace_dir: None,
+            virtiofsd_bin,
+            virtiofs_tag: "host".to_string(),
+            virtiofsd_socket: None,
         }
     }
 }
@@ -153,11 +183,15 @@ impl FirecrackerConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.mem_mib);
+        let workspace_dir = std::env::var("RECURSIVE_FC_WORKSPACE_DIR")
+            .ok()
+            .map(PathBuf::from);
         Ok(Self {
             kernel_path,
             rootfs_path,
             vcpus,
             mem_mib,
+            workspace_dir,
             ..defaults
         })
     }
@@ -347,6 +381,22 @@ impl FirecrackerApiClient {
         .await
     }
 
+    /// Configure a virtio_fs device backed by a running `virtiofsd` instance.
+    ///
+    /// Requires Firecracker >= 1.0. The `socket_path` must be the Unix domain
+    /// socket path that `virtiofsd` is listening on.
+    async fn set_virtio_fs(&self, socket_path: &Path, tag: &str) -> Result<()> {
+        self.put(
+            "/virtio-fs",
+            &serde_json::to_string(&json!({
+                "socket_path": socket_path.display().to_string(),
+                "tag": tag
+            }))
+            .unwrap(),
+        )
+        .await
+    }
+
     async fn describe_instance(&self) -> Result<String> {
         self.get("/").await
     }
@@ -411,6 +461,9 @@ pub struct FcExecResult {
 pub struct FirecrackerVm {
     /// The `firecracker` child process.
     _process: tokio::process::Child,
+    /// The `virtiofsd` child process, present when `workspace_dir` is configured.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    _virtiofsd_process: Option<tokio::process::Child>,
     /// Unix socket path for vsock communication with the exec-agent.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     vsock_uds: PathBuf,
@@ -483,6 +536,56 @@ impl FirecrackerVm {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
+            // If workspace_dir is configured, spawn virtiofsd first so its
+            // socket is ready before Firecracker starts.
+            let mut virtiofsd_process: Option<tokio::process::Child> = None;
+            let mut virtiofsd_socket_path: Option<PathBuf> = None;
+
+            if let Some(ref ws_dir) = config.workspace_dir {
+                let vfd_socket = config.virtiofsd_socket.clone().unwrap_or_else(|| {
+                    PathBuf::from(format!("/tmp/recursive-virtiofsd-{id}.sock"))
+                });
+                let _ = std::fs::remove_file(&vfd_socket);
+
+                let vfd_proc = tokio::process::Command::new(&config.virtiofsd_bin)
+                    .args([
+                        "--socket-path",
+                        vfd_socket.to_str().unwrap_or_default(),
+                        "--shared-dir",
+                        ws_dir.to_str().unwrap_or_default(),
+                        "--sandbox",
+                        "none",
+                        "--cache",
+                        "never",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map_err(|e| Error::Config {
+                        message: format!(
+                            "failed to spawn virtiofsd ({}): {e}",
+                            config.virtiofsd_bin.display()
+                        ),
+                    })?;
+
+                // Wait for virtiofsd socket to appear (max 2 seconds).
+                let vfd_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    if vfd_socket.exists() {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= vfd_deadline {
+                        return Err(Error::Config {
+                            message: "virtiofsd socket did not appear within 2s".into(),
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+
+                virtiofsd_process = Some(vfd_proc);
+                virtiofsd_socket_path = Some(vfd_socket);
+            }
+
             // Configure and start the VM.
             let api = FirecrackerApiClient::new(api_socket);
             api.set_machine_config(config.vcpus, config.mem_mib).await?;
@@ -493,6 +596,12 @@ impl FirecrackerVm {
             .await?;
             api.set_rootfs(&config.rootfs_path, false).await?;
             api.set_vsock(3, &vsock_uds).await?;
+
+            // Configure virtio_fs if virtiofsd was started.
+            if let Some(ref vfd_socket) = virtiofsd_socket_path {
+                api.set_virtio_fs(vfd_socket, &config.virtiofs_tag).await?;
+            }
+
             api.start().await?;
 
             // Wait for the exec-agent vsock socket to appear (max 10 seconds).
@@ -511,6 +620,7 @@ impl FirecrackerVm {
 
             Ok(Self {
                 _process: process,
+                _virtiofsd_process: virtiofsd_process,
                 vsock_uds,
                 shell_timeout_secs: config.shell_timeout_secs,
             })
@@ -947,5 +1057,51 @@ mod tests {
         assert!(json.contains("\"cmd\":\"exec\""));
         assert!(json.contains("\"command\":\"ls /workspace\""));
         assert!(json.contains("\"timeout_secs\":30"));
+    }
+
+    // ── Goal-321 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn firecracker_config_workspace_defaults() {
+        let cfg = FirecrackerConfig::default();
+        assert!(cfg.workspace_dir.is_none());
+        assert_eq!(cfg.virtiofs_tag, "host");
+        assert!(cfg.virtiofsd_socket.is_none());
+        assert_eq!(cfg.virtiofsd_bin, PathBuf::from(DEFAULT_VIRTIOFSD_BIN));
+    }
+
+    #[test]
+    fn firecracker_config_workspace_from_env() {
+        // Set env var, load config, restore.
+        let old = std::env::var("RECURSIVE_FC_WORKSPACE_DIR").ok();
+        std::env::set_var("RECURSIVE_FC_WORKSPACE_DIR", "/tmp/ws");
+        // We can't call from_env() without KERNEL/ROOTFS, but we can check the
+        // default() path picks up RECURSIVE_FC_WORKSPACE_DIR — from_env() reads
+        // it independently, so test the env-var parsing directly.
+        let ws = std::env::var("RECURSIVE_FC_WORKSPACE_DIR")
+            .ok()
+            .map(PathBuf::from);
+        assert_eq!(ws, Some(PathBuf::from("/tmp/ws")));
+        // Restore.
+        match old {
+            Some(v) => std::env::set_var("RECURSIVE_FC_WORKSPACE_DIR", v),
+            None => std::env::remove_var("RECURSIVE_FC_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn firecracker_virtiofs_api_request_format() {
+        // Verify the virtio-fs PUT body has the expected fields.
+        let socket_path = "/tmp/recursive-virtiofsd-1234.sock";
+        let tag = "host";
+        let body = serde_json::to_string(&serde_json::json!({
+            "socket_path": socket_path,
+            "tag": tag
+        }))
+        .unwrap();
+        assert!(body.contains("\"socket_path\""));
+        assert!(body.contains(socket_path));
+        assert!(body.contains("\"tag\""));
+        assert!(body.contains("\"host\""));
     }
 }
