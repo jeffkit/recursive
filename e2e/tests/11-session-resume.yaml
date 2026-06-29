@@ -25,6 +25,11 @@ setup:
     exec:
       container: recursive-e2e
       command: |
+        # Unset RECURSIVE_SESSIONS_DIR (set container-wide by e2e.yaml) so the
+        # session lands under RECURSIVE_HOME=/tmp/rh-resume where this test
+        # searches for it. Otherwise sessions go to /workspace/sessions and the
+        # `find /tmp/rh-resume` below returns nothing.
+        unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/rh-resume \
           recursive --workspace /workspace/test-resume \
             --api-base http://aimock:4010/v1 \
@@ -50,13 +55,20 @@ setup:
       container: recursive-e2e
       command: |
         SESSION=$(cat /tmp/resume-session-path.txt)
+        if [ -z "$SESSION" ] || [ ! -d "$SESSION" ]; then
+          echo "ERROR: no valid session path to resume from ($SESSION)"
+          exit 1
+        fi
+        unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/rh-resume \
           recursive --workspace /workspace/test-resume \
             --api-base http://aimock:4010/v1 \
             --api-key mock-key -m mock-chat \
             --max-steps 5 \
             resume "$SESSION"
-        # Copy the (now completed) session to a predictable assertions path
+        # Copy the (now completed) session to a predictable assertions path.
+        # Guard against an empty SESSION so we never `cp -r "."` (which would
+        # recursively copy the root filesystem).
         mkdir -p /tmp/sessions-resume
         cp -r "$SESSION/." /tmp/sessions-resume/
         echo done
