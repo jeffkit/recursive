@@ -2054,7 +2054,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
         let sink = TuiEventSink { tx };
         sink.emit(AgentEvent::TurnFinished { reason: "done".into(), steps: 1 }).await;
-        assert_eq!(rx.recv().await, Some(UiEvent::TurnFinished));
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert_eq!(got, Ok(Some(UiEvent::TurnFinished)));
     }
 
     #[tokio::test]

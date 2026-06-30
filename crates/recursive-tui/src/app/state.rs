@@ -420,4 +420,37 @@ mod tests {
             .unwrap();
         assert_eq!(updated.description, "Updated version");
     }
+
+    // ── Pre-existing App method coverage (file-scoped mutant gate) ─────
+
+    #[test]
+    fn push_modal_resets_scroll_and_stacks() {
+        let mut app = App::new();
+        app.modal_scroll = 7;
+        app.push_modal(crate::ui::modal::Modal::Help);
+        assert_eq!(app.modal_scroll, 0, "push_modal resets scroll to top");
+        assert_eq!(app.modals.len(), 1);
+        app.push_modal(crate::ui::modal::Modal::CostDetail);
+        assert_eq!(app.modals.len(), 2, "modals stack");
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_offset() {
+        let mut app = App::new();
+        app.scroll_offset = 42;
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_offset, 0, "scroll_to_bottom zeroes offset");
+    }
+
+    #[test]
+    fn close_command_panel_clears_panel_and_restores_prompt_mode() {
+        let mut app = App::new();
+        let panel = crate::app::CommandPanelState::new("theme", vec![]);
+        app.open_command_panel(panel);
+        assert!(app.active_command_panel.is_some(), "panel opened");
+        assert_eq!(app.prompt.mode, crate::InputMode::CommandInteract);
+        app.close_command_panel();
+        assert!(app.active_command_panel.is_none(), "panel cleared");
+        assert_eq!(app.prompt.mode, crate::InputMode::Prompt, "mode restored to Prompt");
+    }
 }
