@@ -291,10 +291,7 @@ pub enum UserAction {
     /// Stop the event-driven loop (current turn finishes, then stop).
     StopLoop,
     /// Manually inject a trigger into the loop.
-    LoopTrigger {
-        source: String,
-        prompt: String,
-    },
+    LoopTrigger { source: String, prompt: String },
 }
 
 // ── Goal-230: Skill-hub install side-channel ─────────────────────────────────

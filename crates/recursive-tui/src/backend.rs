@@ -68,8 +68,7 @@ impl Backend {
     pub fn spawn() -> Self {
         #[cfg(feature = "skill-hub")]
         {
-            let (tui_rt, skill_install_rx) =
-                crate::runtime_builder::build_runtime_for_tui();
+            let (tui_rt, skill_install_rx) = crate::runtime_builder::build_runtime_for_tui();
             Self::spawn_with_state_and_skill_rx(tui_rt, skill_install_rx)
         }
         #[cfg(not(feature = "skill-hub"))]
@@ -380,6 +379,39 @@ fn wait_wakeup(slot: &recursive::tools::WakeupSlot) -> Option<recursive::tools::
     slot.lock().ok().and_then(|mut s| s.take())
 }
 
+/// Goal-173: classify an MCP server's transport from its config fields.
+/// Extracted as a pure function so the stdio/http/unknown branching is
+/// unit-testable without spinning up `discover_mcp_servers` against a
+/// real workspace.
+fn mcp_server_transport(s: &recursive::mcp::McpServer) -> String {
+    if s.url.is_some() {
+        "http".to_string()
+    } else if !s.command.is_empty() {
+        "stdio".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Goal-230 (weixin): reduce a spawned weixin turn's nested result to the
+/// final assistant text (if any). Marked `#[mutants::skip]` because the
+/// weixin feature is outside the default / gate test feature set, so the
+/// body is dead code under `--features recursive/test-utils` and a textual
+/// mutant here would be an unkillable false positive.
+#[cfg(feature = "weixin")]
+#[mutants::skip]
+fn weixin_final_text(
+    result: std::result::Result<
+        recursive::Result<Option<recursive::RuntimeOutcome>>,
+        tokio::task::JoinError,
+    >,
+) -> Option<String> {
+    match result {
+        Ok(Ok(Some(outcome))) => outcome.final_text,
+        _ => None,
+    }
+}
+
 /// The loop arbiter: select among user actions, bg completions, and wakeups.
 ///
 /// Priority order (biased):
@@ -412,7 +444,7 @@ async fn loop_arbiter(
             Ok(UserAction::StartLoop { .. }) => {
                 // Already in loop mode — ignore duplicate.
             }
-            Ok(_) => {} // Other actions not relevant in loop mode.
+            Ok(_) => {}      // Other actions not relevant in loop mode.
             Err(_) => break, // Channel closed or empty.
         }
     }
@@ -493,7 +525,6 @@ async fn loop_arbiter(
         }
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
@@ -658,10 +689,7 @@ async fn worker_loop(
                 let recovered = recovered.into_inner();
                 *rt_opt = Some(recovered);
                 let _ = event_tx.send(UiEvent::TurnFinished);
-                let final_text = match result {
-                    Ok(Ok(Some(outcome))) => outcome.final_text,
-                    _ => None,
-                };
+                let final_text = weixin_final_text(result);
                 let _ = wx_req.reply_tx.send(final_text);
             } else {
                 let _ = wx_req.reply_tx.send(None);
@@ -706,9 +734,7 @@ async fn worker_loop(
                         let ws = resolve_workspace_root();
                         let goal_slug: String = goal.chars().take(200).collect();
                         let model = crate::cost::detect_model_name();
-                        if let Ok(sw) =
-                            SessionWriter::create(&ws, &goal_slug, &model, "tui")
-                        {
+                        if let Ok(sw) = SessionWriter::create(&ws, &goal_slug, &model, "tui") {
                             let sw_arc = Arc::new(std::sync::Mutex::new(sw));
                             let composite = Arc::new(CompositeSink::new([
                                 Box::new(TuiEventSink {
@@ -716,15 +742,15 @@ async fn worker_loop(
                                 }) as Box<dyn EventSink>,
                                 Box::new(SessionPersistenceSink::new(sw_arc.clone())),
                             ]));
-                            let Some(rt_mut) = rt_opt.as_mut() else { continue };
+                            let Some(rt_mut) = rt_opt.as_mut() else {
+                                continue;
+                            };
                             rt_mut.set_event_sink(composite);
                             session_writer = Some(sw_arc);
                         }
                     }
 
-                    let _ = event_tx.send(UiEvent::LoopStarted {
-                        goal: goal.clone(),
-                    });
+                    let _ = event_tx.send(UiEvent::LoopStarted { goal: goal.clone() });
 
                     // Kick off the first turn by sending the goal as a message.
                     queued_messages.push_back(goal);
@@ -973,7 +999,8 @@ async fn worker_loop(
                 // Goal-323: mutual exclusion — reject SetGoal during event loop.
                 if loop_state.is_some() {
                     let _ = event_tx.send(UiEvent::Error {
-                        message: "Cannot set goal: an event loop is active. Use /loop stop first.".into(),
+                        message: "Cannot set goal: an event loop is active. Use /loop stop first."
+                            .into(),
                     });
                     continue;
                 }
@@ -1089,19 +1116,10 @@ async fn worker_loop(
                         .unwrap_or_default();
                     let entries: Vec<crate::ui::modal::McpEntry> = servers
                         .iter()
-                        .map(|s| {
-                            let transport = if s.url.is_some() {
-                                "http".to_string()
-                            } else if !s.command.is_empty() {
-                                "stdio".to_string()
-                            } else {
-                                "unknown".to_string()
-                            };
-                            crate::ui::modal::McpEntry {
-                                name: s.name.clone(),
-                                transport,
-                                enabled: true,
-                            }
+                        .map(|s| crate::ui::modal::McpEntry {
+                            name: s.name.clone(),
+                            transport: mcp_server_transport(s),
+                            enabled: true,
                         })
                         .collect();
                     let _ = tx.send(UiEvent::McpServersLoaded { entries });
@@ -1611,8 +1629,8 @@ mod tests {
         let mut backend = Backend::spawn_with_runtime(rt);
 
         // Drain RuntimeReady.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
-            .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
 
         backend
             .action_tx
@@ -1656,8 +1674,8 @@ mod tests {
             .expect("runtime builds");
         let mut backend = Backend::spawn_with_runtime(rt);
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
-            .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
 
         // Start loop, let first turn complete.
         backend
@@ -1720,8 +1738,8 @@ mod tests {
             .expect("runtime builds");
         let mut backend = Backend::spawn_with_runtime(rt);
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
-            .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
 
         backend
             .action_tx
@@ -1799,8 +1817,8 @@ mod tests {
             .expect("runtime builds");
         let mut backend = Backend::spawn_with_runtime(rt);
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
-            .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
 
         backend
             .action_tx
@@ -1869,7 +1887,10 @@ mod tests {
 
     #[test]
     fn map_partial_reasoning_to_reasoning_partial() {
-        let ev = AgentEvent::PartialReasoning { text: "th".into(), step: 0 };
+        let ev = AgentEvent::PartialReasoning {
+            text: "th".into(),
+            step: 0,
+        };
         assert_eq!(
             map_agent_event(ev),
             Some(UiEvent::ReasoningPartial { text: "th".into() })
@@ -1878,10 +1899,15 @@ mod tests {
 
     #[test]
     fn map_reasoning_to_reasoning() {
-        let ev = AgentEvent::Reasoning { text: "think".into(), step: 0 };
+        let ev = AgentEvent::Reasoning {
+            text: "think".into(),
+            step: 0,
+        };
         assert_eq!(
             map_agent_event(ev),
-            Some(UiEvent::Reasoning { content: "think".into() })
+            Some(UiEvent::Reasoning {
+                content: "think".into()
+            })
         );
     }
 
@@ -1925,66 +1951,101 @@ mod tests {
 
     #[test]
     fn map_latency_to_latency() {
-        let ev = AgentEvent::Latency { step: 0, llm_ms: 123 };
+        let ev = AgentEvent::Latency {
+            step: 0,
+            llm_ms: 123,
+        };
         assert_eq!(map_agent_event(ev), Some(UiEvent::Latency { llm_ms: 123 }));
     }
 
     #[test]
     fn map_turn_finished_to_turn_finished() {
-        let ev = AgentEvent::TurnFinished { reason: "done".into(), steps: 3 };
+        let ev = AgentEvent::TurnFinished {
+            reason: "done".into(),
+            steps: 3,
+        };
         assert_eq!(map_agent_event(ev), Some(UiEvent::TurnFinished));
     }
 
     #[test]
     fn map_plan_mode_requested() {
-        let ev = AgentEvent::PlanModeRequested { reason: "why".into() };
+        let ev = AgentEvent::PlanModeRequested {
+            reason: "why".into(),
+        };
         assert_eq!(
             map_agent_event(ev),
-            Some(UiEvent::PlanModeRequested { reason: "why".into() })
+            Some(UiEvent::PlanModeRequested {
+                reason: "why".into()
+            })
         );
     }
 
     #[test]
     fn map_plan_mode_approved() {
-        assert_eq!(map_agent_event(AgentEvent::PlanModeApproved), Some(UiEvent::PlanModeApproved));
+        assert_eq!(
+            map_agent_event(AgentEvent::PlanModeApproved),
+            Some(UiEvent::PlanModeApproved)
+        );
     }
 
     #[test]
     fn map_plan_mode_rejected() {
-        let ev = AgentEvent::PlanModeRejected { reason: "no".into() };
+        let ev = AgentEvent::PlanModeRejected {
+            reason: "no".into(),
+        };
         assert_eq!(
             map_agent_event(ev),
-            Some(UiEvent::PlanModeRejected { reason: "no".into() })
+            Some(UiEvent::PlanModeRejected {
+                reason: "no".into()
+            })
         );
     }
 
     #[test]
     fn map_todo_updated() {
         let ev = AgentEvent::TodoUpdated { todos: vec![] };
-        assert_eq!(map_agent_event(ev), Some(UiEvent::TodoUpdated { todos: vec![] }));
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::TodoUpdated { todos: vec![] })
+        );
     }
 
     #[test]
     fn map_goal_continuing() {
-        let ev = AgentEvent::GoalContinuing { reason: "not yet".into(), turns: 2 };
+        let ev = AgentEvent::GoalContinuing {
+            reason: "not yet".into(),
+            turns: 2,
+        };
         assert_eq!(
             map_agent_event(ev),
-            Some(UiEvent::GoalContinuing { reason: "not yet".into(), turns: 2 })
+            Some(UiEvent::GoalContinuing {
+                reason: "not yet".into(),
+                turns: 2
+            })
         );
     }
 
     #[test]
     fn map_goal_achieved() {
-        let ev = AgentEvent::GoalAchieved { condition: "done".into(), turns: 5 };
+        let ev = AgentEvent::GoalAchieved {
+            condition: "done".into(),
+            turns: 5,
+        };
         assert_eq!(
             map_agent_event(ev),
-            Some(UiEvent::GoalAchieved { condition: "done".into(), turns: 5 })
+            Some(UiEvent::GoalAchieved {
+                condition: "done".into(),
+                turns: 5
+            })
         );
     }
 
     #[test]
     fn map_goal_cleared() {
-        assert_eq!(map_agent_event(AgentEvent::GoalCleared), Some(UiEvent::GoalCleared));
+        assert_eq!(
+            map_agent_event(AgentEvent::GoalCleared),
+            Some(UiEvent::GoalCleared)
+        );
     }
 
     #[test]
@@ -2053,7 +2114,11 @@ mod tests {
     async fn tui_event_sink_emit_forwards_mapped_event() {
         let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
         let sink = TuiEventSink { tx };
-        sink.emit(AgentEvent::TurnFinished { reason: "done".into(), steps: 1 }).await;
+        sink.emit(AgentEvent::TurnFinished {
+            reason: "done".into(),
+            steps: 1,
+        })
+        .await;
         let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
         assert_eq!(got, Ok(Some(UiEvent::TurnFinished)));
     }
@@ -2069,11 +2134,14 @@ mod tests {
             attempt: 1,
             wait_ms: 10,
             reason: "timeout".into(),
-        }).await;
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-            .await
-            .is_err(),
-            "unmapped event must not be forwarded");
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "unmapped event must not be forwarded"
+        );
     }
 
     #[tokio::test]
@@ -2083,7 +2151,15 @@ mod tests {
             tx,
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let dec = hook.check("Bash", &serde_json::json!({})).await;
+        // Wrap in a timeout so the `delete !` mutant (which would route the
+        // disabled hook into the blocking user-request path) fails fast with
+        // a timeout error instead of hanging the mutant runner for 35s.
+        let dec = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            hook.check("Bash", &serde_json::json!({})),
+        )
+        .await
+        .expect("disabled hook must auto-allow without blocking");
         assert!(matches!(dec, recursive::agent::PermissionDecision::Allow));
     }
 
@@ -2094,9 +2170,10 @@ mod tests {
             tx,
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
-        let handle = tokio::spawn(async move {
-            hook.check("Bash", &serde_json::json!({"cmd": "ls"})).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { hook.check("Bash", &serde_json::json!({"cmd": "ls"})).await },
+            );
         let req = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("timed out")
@@ -2109,8 +2186,7 @@ mod tests {
 
     #[test]
     fn wait_wakeup_returns_none_for_empty_slot() {
-        let slot: recursive::tools::WakeupSlot =
-            Arc::new(std::sync::Mutex::new(None));
+        let slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
         assert!(wait_wakeup(&slot).is_none());
     }
 
@@ -2151,11 +2227,15 @@ mod tests {
         ]));
         let rt = AgentRuntime::builder().llm(llm).build().expect("rt");
         let mut backend = Backend::spawn_with_runtime(rt);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
 
         backend
             .action_tx
-            .send(UserAction::StartLoop { goal: "g".into(), max_turns: 1 })
+            .send(UserAction::StartLoop {
+                goal: "g".into(),
+                max_turns: 1,
+            })
             .unwrap();
 
         let mut seen_turn = false;
@@ -2193,11 +2273,15 @@ mod tests {
         }]));
         let rt = AgentRuntime::builder().llm(llm).build().expect("rt");
         let mut backend = Backend::spawn_with_runtime(rt);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
 
         backend
             .action_tx
-            .send(UserAction::StartLoop { goal: "g".into(), max_turns: 0 })
+            .send(UserAction::StartLoop {
+                goal: "g".into(),
+                max_turns: 0,
+            })
             .unwrap();
 
         let mut seen_turn = false;
@@ -2221,7 +2305,10 @@ mod tests {
         }
         let _ = backend.action_tx.send(UserAction::Shutdown);
         assert!(seen_turn, "expected the first turn to run");
-        assert!(!seen_stopped, "unlimited loop (max_turns=0) must not auto-stop");
+        assert!(
+            !seen_stopped,
+            "unlimited loop (max_turns=0) must not auto-stop"
+        );
     }
 
     // ── Pre-existing: wait_for_cancel semantics ───────────────────────
@@ -2272,5 +2359,130 @@ mod tests {
             result.is_err(),
             "wait_for_cancel must block while flag is false and no notify fires"
         );
+    }
+
+    // ── Pre-existing: mcp_server_transport classification ─────────────
+
+    #[test]
+    fn mcp_server_transport_classifies_http_url() {
+        let s = recursive::mcp::McpServer {
+            name: "h".into(),
+            command: String::new(),
+            args: vec![],
+            url: Some("http://x".into()),
+            env: None,
+        };
+        assert_eq!(mcp_server_transport(&s), "http");
+    }
+
+    #[test]
+    fn mcp_server_transport_classifies_stdio_command() {
+        // Non-empty command with no URL → stdio. This kills the
+        // `delete !` mutant, which would fall through to "unknown".
+        let s = recursive::mcp::McpServer {
+            name: "s".into(),
+            command: "node".into(),
+            args: vec![],
+            url: None,
+            env: None,
+        };
+        assert_eq!(mcp_server_transport(&s), "stdio");
+    }
+
+    #[test]
+    fn mcp_server_transport_classifies_unknown_when_empty() {
+        let s = recursive::mcp::McpServer {
+            name: "u".into(),
+            command: String::new(),
+            args: vec![],
+            url: None,
+            env: None,
+        };
+        assert_eq!(mcp_server_transport(&s), "unknown");
+    }
+
+    // ── Goal-323: max_turns counts arbiter-driven Run turns (582 path) ──
+
+    #[tokio::test]
+    async fn max_turns_cap_counts_arbiter_run_turns() {
+        // Drive a second turn via LoopTrigger (the arbiter Run path that
+        // increments turns_run at the `ls.turns_run += 1` line inside the
+        // ArbiterDecision::Run arm). The trigger is sent right after
+        // StartLoop so the arbiter's try_recv drains it on the second
+        // iteration (after the goal turn drains from the type-ahead queue)
+        // — sending it mid-turn would let run_turn_select_loop discard it.
+        // With max_turns=2 the loop must stop after the triggered turn.
+        // The `+=`→`-=`/`*=` mutants never reach the cap, so LoopStopped
+        // never fires and this test times out without seeing it.
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "second".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let rt = AgentRuntime::builder().llm(llm).build().expect("rt");
+        let mut backend = Backend::spawn_with_runtime(rt);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+
+        backend
+            .action_tx
+            .send(UserAction::StartLoop {
+                goal: "g".into(),
+                max_turns: 2,
+            })
+            .unwrap();
+
+        // Each turn emits TurnStarted once, but TurnFinished twice: once
+        // from the runtime event sink (during the turn) and once from the
+        // backend after run_turn_select_loop returns. The second
+        // TurnFinished is the safe "worker is looping back" signal — a
+        // trigger sent earlier would be discarded by run_turn_select_loop.
+        let mut turns = 0;
+        let mut finished = 0;
+        let mut sent_trigger = false;
+        let mut seen_stopped = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::TurnStarted)) => turns += 1,
+                Ok(Some(UiEvent::TurnFinished)) => {
+                    finished += 1;
+                    // After turn 1's second TurnFinished, the worker is back
+                    // in the arbiter — safe to inject the Run trigger.
+                    if finished == 2 && !sent_trigger {
+                        let _ = backend.action_tx.send(UserAction::LoopTrigger {
+                            source: "test".into(),
+                            prompt: "p".into(),
+                        });
+                        sent_trigger = true;
+                    }
+                }
+                Ok(Some(UiEvent::LoopStopped)) => {
+                    seen_stopped = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert_eq!(turns, 2, "expected exactly two turns before the cap");
+        assert!(seen_stopped, "expected LoopStopped after max_turns=2");
     }
 }

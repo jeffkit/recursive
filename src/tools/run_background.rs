@@ -740,7 +740,7 @@ mod tests {
         // Spawn a task that waits for the notify.
         let handle = tokio::spawn(async move {
             b.wait(); // signal ready
-            // timeout(5s) prevents test hang if notify never fires.
+                      // timeout(5s) prevents test hang if notify never fires.
             tokio::time::timeout(Duration::from_secs(5), notify.notified()).await
         });
 

@@ -287,9 +287,7 @@ impl App {
                 self.loop_state = None;
             }
             UiEvent::LoopTurnScheduled { source, delay_secs } => {
-                let delay_str = delay_secs
-                    .map(|d| format!(" in {d}s"))
-                    .unwrap_or_default();
+                let delay_str = delay_secs.map(|d| format!(" in {d}s")).unwrap_or_default();
                 self.blocks.push(TranscriptBlock::System {
                     text: format!("Loop turn scheduled [{source}]{delay_str}"),
                 });

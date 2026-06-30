@@ -205,8 +205,10 @@ pub fn build_runtime() -> TuiRuntime {
 /// [`build_runtime`] plus a dummy `()` receiver; the caller must not rely on
 /// the receiver type unless the feature is enabled.
 #[cfg(feature = "skill-hub")]
-pub fn build_runtime_for_tui(
-) -> (TuiRuntime, tokio::sync::mpsc::UnboundedReceiver<crate::events::SkillInstallEvent>) {
+pub fn build_runtime_for_tui() -> (
+    TuiRuntime,
+    tokio::sync::mpsc::UnboundedReceiver<crate::events::SkillInstallEvent>,
+) {
     use crate::events::SkillInstallEvent;
     use tokio::sync::mpsc;
 

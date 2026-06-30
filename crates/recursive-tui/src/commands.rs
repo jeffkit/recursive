@@ -597,7 +597,15 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
                 return Vec::new();
             }
             let (goal, max_turns) = parse_loop_start_args(&raw);
-            app.push_system(format!("Loop started: \"{}\" (max {} turns)", goal, if max_turns > 0 { max_turns.to_string() } else { "unlimited".to_string() }));
+            app.push_system(format!(
+                "Loop started: \"{}\" (max {} turns)",
+                goal,
+                if max_turns > 0 {
+                    max_turns.to_string()
+                } else {
+                    "unlimited".to_string()
+                }
+            ));
             app.loop_state = Some(crate::app::LoopUiState {
                 goal: goal.clone(),
                 turns_run: 0,
@@ -1728,10 +1736,17 @@ mod tests {
     #[test]
     fn lookup_skill_returns_none_when_builtin_shadows() {
         let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("help", &[])]);
-        assert!(r.lookup_skill("help").is_none(), "built-in name shadows skill");
+        assert!(
+            r.lookup_skill("help").is_none(),
+            "built-in name shadows skill"
+        );
         // A distinct alias not claimed by any built-in still resolves to the skill.
-        let r2 = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("help", &["hlpx"])]);
-        assert!(r2.lookup_skill("hlpx").is_some(), "non-built-in alias resolves");
+        let r2 = CommandRegistry::default_set()
+            .with_skill_commands(vec![sample_skill("help", &["hlpx"])]);
+        assert!(
+            r2.lookup_skill("hlpx").is_some(),
+            "non-built-in alias resolves"
+        );
     }
 
     #[test]
@@ -1743,7 +1758,8 @@ mod tests {
 
     #[test]
     fn lookup_skill_finds_skill_by_alias() {
-        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &["fb"])]);
+        let r =
+            CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &["fb"])]);
         let s = r.lookup_skill("fb").expect("skill by alias");
         assert_eq!(s.name, "frob");
     }
@@ -1759,7 +1775,10 @@ mod tests {
         let mut app = App::new();
         for arg in ["on", "true", "1"] {
             let r = invoke(&mut app, &format!("permissions {arg}"));
-            assert!(matches!(r, InvokeResult::Sync(CommandOutcome::Done)), "arg {arg}");
+            assert!(
+                matches!(r, InvokeResult::Sync(CommandOutcome::Done)),
+                "arg {arg}"
+            );
             assert!(
                 app.permission_hook_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -1780,13 +1799,19 @@ mod tests {
         app.auto_allowed_tools.insert("Bash".into());
         for arg in ["off", "false", "0"] {
             let r = invoke(&mut app, &format!("permissions {arg}"));
-            assert!(matches!(r, InvokeResult::Sync(CommandOutcome::Done)), "arg {arg}");
+            assert!(
+                matches!(r, InvokeResult::Sync(CommandOutcome::Done)),
+                "arg {arg}"
+            );
             assert!(
                 !app.permission_hook_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
                 "arg {arg} should disable"
             );
-            assert!(app.auto_allowed_tools.is_empty(), "arg {arg} should clear auto-allow");
+            assert!(
+                app.auto_allowed_tools.is_empty(),
+                "arg {arg} should clear auto-allow"
+            );
         }
         match app.blocks.last() {
             Some(TranscriptBlock::System { text }) => assert!(text.contains("off"), "got {text:?}"),
@@ -1881,7 +1906,10 @@ mod tests {
         let r = invoke(&mut app, "goal achieve X or stop after 5 turns");
         match r {
             InvokeResult::Async(actions) => match &actions[0] {
-                UserAction::SetGoal { condition, max_turns } => {
+                UserAction::SetGoal {
+                    condition,
+                    max_turns,
+                } => {
                     assert_eq!(condition, "achieve X");
                     assert_eq!(*max_turns, 5);
                 }

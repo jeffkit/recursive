@@ -383,7 +383,10 @@ mod tests {
     fn status_bar_shows_no_loop_when_inactive() {
         let app = App::new();
         let text = line_text(&build_line(&app));
-        assert!(!text.contains("loop:"), "no loop segment when inactive: {text:?}");
+        assert!(
+            !text.contains("loop:"),
+            "no loop segment when inactive: {text:?}"
+        );
     }
 
     #[test]
@@ -420,7 +423,10 @@ mod tests {
         });
         let text = line_text(&build_line(&app));
         assert!(text.contains("loop: turn 3"), "got {text:?}");
-        assert!(!text.contains("loop: turn 3/"), "unlimited must not show /max: {text:?}");
+        assert!(
+            !text.contains("loop: turn 3/"),
+            "unlimited must not show /max: {text:?}"
+        );
     }
 
     #[test]
@@ -434,7 +440,10 @@ mod tests {
             max_turns: 0,
         });
         let text = line_text(&build_line(&app));
-        assert!(text.contains('│'), "expected separator before loop segment: {text:?}");
+        assert!(
+            text.contains('│'),
+            "expected separator before loop segment: {text:?}"
+        );
     }
 
     #[test]
@@ -469,8 +478,20 @@ mod tests {
             render(f, f.area(), &app);
         })
         .expect("draw");
-        let text: String = term.backend().buffer().content().into_iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("deepseek-chat"), "render wrote model: {text:?}");
-        assert!(text.contains("loop: turn 1/5"), "render wrote loop: {text:?}");
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("deepseek-chat"),
+            "render wrote model: {text:?}"
+        );
+        assert!(
+            text.contains("loop: turn 1/5"),
+            "render wrote loop: {text:?}"
+        );
     }
 }
