@@ -92,6 +92,21 @@ testing the wrong thing too.
   `dep_check_script_exists_*` / `cargo_toml_is_valid` tests still run on
   Windows, so invariant #6 is not skipped wholesale.
 
+- `crates/recursive-tui/tests/pty_regression.rs` — added
+  `#[cfg_attr(target_os = "windows", ignore)]` to both PTY integration
+  tests (`pty_boot_renders_splash`, `pty_help_command_opens_modal`).
+  These boot the real `recursive-tui` binary under a PTY via
+  `tui_pty_harness`; on `windows-latest` runners the portable-pty
+  backend never releases the child + screen-poll loop, so both tests
+  hang forever (libtest logs "has been running for over 60 seconds",
+  then the run sits idle until the 6h job timeout / cancellation —
+  observed on run 28428043005). This hang was **masked** on Windows by
+  fail-fast: an earlier test binary always failed first, so cargo never
+  reached the `pty_regression` binary. Fixing the upstream failures
+  unmasked it. The in-process `Harness` (src/harness.rs) still covers
+  logic + rendering on Windows; only the terminal-IO PTY layer is
+  skipped, matching the repo convention for PTY/shell-driven tests.
+
 ## Tests added
 
 None — these are fixes to existing tests plus a doc-comment correction.
@@ -105,6 +120,8 @@ None — these are fixes to existing tests plus a doc-comment correction.
   providers tests that were failing on Windows CI and the
   `dep_check_script_passes` invariant (now ignored on Windows — see
   Files touched)
+- `cargo test -p recursive-tui --test pty_regression`: 2 passed on
+  macOS (the Windows ignore is target-gated, so unix still runs them)
 
 ## Notes
 

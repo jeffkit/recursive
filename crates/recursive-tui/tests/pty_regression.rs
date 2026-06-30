@@ -60,7 +60,19 @@ fn tour(keys: &str, wait_ms: u64) -> String {
 /// `/help` hint. This pins the alternate-screen + raw-mode boot path — if
 /// any of that regresses, the splash never reaches the screen and this test
 /// fails instead of a human noticing a blank terminal.
+/// Ignored on Windows: `tui_pty_harness` drives a real PTY + the
+/// `recursive-tui` subprocess, and on `windows-latest` CI both this test and
+/// `pty_help_command_opens_modal` hang forever (libtest reports "has been
+/// running for over 60 seconds" and the run only ends on the 6h job timeout /
+/// cancellation). The portable-pty backend on Windows runners does not release
+/// the child + screen-poll loop the way it does on unix, so the snapshot never
+/// returns. The in-process `Harness` (src/harness.rs) still covers the logic +
+/// rendering layer on Windows; only the terminal-IO PTY layer is skipped there.
+/// This matches the repo convention of ignoring PTY/shell-driven tests on
+/// Windows — see `crates/recursive-tui/src/backend.rs` and
+/// `.dev/journal/manual-20260603-fix-ci-windows-tests.md`.
 #[test]
+#[cfg_attr(target_os = "windows", ignore)]
 fn pty_boot_renders_splash() {
     let text = tour("", 3000);
     assert!(
@@ -78,6 +90,7 @@ fn pty_boot_renders_splash() {
 /// (raw-mode key decoding, EnterAlternateScreen, modal overlay) — the layer
 /// the in-process harness covers only synthetically.
 #[test]
+#[cfg_attr(target_os = "windows", ignore)]
 fn pty_help_command_opens_modal() {
     let text = tour("/help\r", 3000);
     // The help modal lists available slash commands. Assert a stable,
