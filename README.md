@@ -87,10 +87,27 @@ The kernel has five concepts, each independently testable:
 - Agent loop respects a step budget (`max_steps`) and emits
   `FinishReason::BudgetExceeded` rather than looping forever.
 
-## CLI
+## Installation
+
+### Homebrew (macOS Apple Silicon)
 
 ```bash
-cargo install --path .   # or once published: cargo install recursive-agent
+brew install jeffkit/tap/recursive
+```
+
+Intel Macs: `brew install` will print a message pointing at
+`cargo install recursive-cli --locked` — see the formula for context.
+
+### Pre-built binaries (Linux, macOS, Windows)
+
+Grab the asset matching your platform from
+<https://github.com/jeffkit/recursive/releases/latest>, extract, and put
+`recursive` on your `$PATH`.
+
+### From source
+
+```bash
+cargo install --path .   # or, once published: cargo install recursive-cli
 ```
 
 > The crate is published as `recursive-agent` because the name `recursive` was
