@@ -54,6 +54,7 @@ pub mod session;
 pub mod skills;
 pub mod skills_injector;
 pub mod storage;
+pub mod system_prompt;
 pub mod tasks;
 pub mod team;
 pub mod tool_set_provider;
@@ -91,8 +92,8 @@ pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
 pub use migrate::{migrate_workspace, MigrateReport};
 pub use multi::{
-    coordinator_system_prompt, AgentMessage, AgentPool, AgentRole, MemoryEntry, MessageBus,
-    MessageType, SharedMemory,
+    coordinator_system_prompt, register_subagent_if_enabled, AgentMessage, AgentPool, AgentRole,
+    MemoryEntry, MessageBus, MessageType, SharedMemory,
 };
 pub use paths::{
     legacy_paths_in_workspace, user_data_dir, user_scratchpad_path, user_sessions_dir,
@@ -132,6 +133,7 @@ pub use storage::S3StorageBackend;
 pub use storage::{
     AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
+pub use system_prompt::assemble_system_prompt;
 pub use tool_set_provider::{
     LocalToolSetProvider, PolicyToolSetProvider, SandboxMode, ToolSetProvider,
 };

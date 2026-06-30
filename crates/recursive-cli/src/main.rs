@@ -535,6 +535,12 @@ async fn main() -> anyhow::Result<()> {
         config.system_prompt.push('\n');
         config.system_prompt.push_str(extra);
     }
+    // Note: project context (AGENTS.md + CLAUDE.md), skill index, and the
+    // sub-agent coordinator prompt are NOT baked in here. Each agent-loop
+    // channel assembles them via `assemble_system_prompt` at runtime-build
+    // time, so the common prompt structure has a single maintenance point
+    // and `config.system_prompt` stays the channel-prepared base (working
+    // principles + memory layers + any --append-system-prompt).
     if matches!(cli.permission_mode.as_deref(), Some("auto")) {
         config.headless = true;
     }
@@ -657,15 +663,6 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             let tools = cli::builder::build_tools(&config).await;
-            let tool_infos: Vec<recursive::http::ToolInfo> = tools
-                .specs()
-                .into_iter()
-                .map(|spec| recursive::http::ToolInfo {
-                    name: spec.name,
-                    description: spec.description,
-                    parameters: spec.parameters,
-                })
-                .collect();
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
             let retry = RetryPolicy {
@@ -694,31 +691,23 @@ async fn main() -> anyhow::Result<()> {
                         Arc::new(openai)
                     }
                 };
+            // Register the unified `Agent` tool when sub-agent is enabled, so
+            // the HTTP API matches CLI/TUI capabilities. Done before deriving
+            // tool_infos so /tools/list also advertises the Agent tool.
+            let tools = recursive::register_subagent_if_enabled(tools, &config, provider.clone());
+            let tool_infos: Vec<recursive::http::ToolInfo> = tools
+                .specs()
+                .into_iter()
+                .map(|spec| recursive::http::ToolInfo {
+                    name: spec.name,
+                    description: spec.description,
+                    parameters: spec.parameters,
+                })
+                .collect();
             let slash_commands: Vec<recursive::http::SlashCommandInfo> = Vec::new();
             // Goal-312: discover skills for skill_index injection into
             // the system prompt of every HTTP API run.
-            let skills = {
-                let mut paths = vec![
-                    config.workspace.join(".recursive").join("skills"),
-                    config.workspace.join(".claude").join("skills"),
-                ];
-                if let Some(home) = std::env::var_os("HOME") {
-                    paths.push(
-                        std::path::PathBuf::from(home.clone())
-                            .join(".recursive")
-                            .join("skills"),
-                    );
-                    paths.push(
-                        std::path::PathBuf::from(home)
-                            .join(".claude")
-                            .join("skills"),
-                    );
-                }
-                if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
-                    paths = env_paths.split(':').map(std::path::PathBuf::from).collect();
-                }
-                recursive::skills::discover_skills(&paths)
-            };
+            let skills = cli::builder::discover_loaded_skills(&config);
             let session_ttl_secs: u64 = std::env::var("RECURSIVE_SESSION_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1721,10 +1710,21 @@ async fn run_loop(
         }
     };
 
+    // Sub-agent tool registration (channel-agnostic) + common prompt assembly,
+    // matching every other agent-loop surface.
+    tools = recursive::register_subagent_if_enabled(tools, &config, provider.clone());
+    let skills = cli::builder::discover_loaded_skills(&config);
+    let system_prompt = recursive::assemble_system_prompt(
+        &config.system_prompt,
+        &config.workspace,
+        &skills,
+        config.subagent_enabled,
+    );
+
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&config.system_prompt)
+        .system_prompt(&system_prompt)
         .max_steps(config.max_steps)
         .streaming(stream)
         .shutdown_token(shutdown.clone());
@@ -2315,6 +2315,7 @@ mod tests {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
+            subagent_enabled: false,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
             stuck_window: 10,

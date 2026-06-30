@@ -528,7 +528,16 @@ pub fn build_standard_tools(
     skills: &[crate::skills::Skill],
     shell_timeout_secs: u64,
 ) -> ToolRegistry {
-    build_standard_tools_with_roots(workspace, &[], None, skills, shell_timeout_secs)
+    build_standard_tools_with_roots(
+        workspace,
+        &[],
+        None,
+        skills,
+        shell_timeout_secs,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Same as [`build_standard_tools`] but accepts additional sandbox roots
@@ -549,12 +558,22 @@ pub fn build_standard_tools(
 /// This is how `--add-dir`, `[sandbox] extra_dirs`, and the TUI `/add-dir`
 /// command make out-of-workspace files reachable by the agent without
 /// weakening the sandbox for any other tool.
+///
+/// `web_search_provider`, `web_search_api_key`, `web_search_jina_key` are
+/// optional search config values from the runtime Config. When `None`,
+/// `WebSearch` falls back to env vars / Jina zero-config. These are exposed
+/// at this level so all frontends (CLI, TUI, HTTP) get kernel-level config
+/// propagation without each frontend wiring them separately.
+#[allow(clippy::too_many_arguments)]
 pub fn build_standard_tools_with_roots(
     workspace: &std::path::Path,
     extra_roots: &[(std::path::PathBuf, super::dispatch::AccessTier)],
     session_roots: Option<super::dispatch::SharedSandboxRoots>,
     skills: &[crate::skills::Skill],
     shell_timeout_secs: u64,
+    web_search_provider: Option<String>,
+    web_search_api_key: Option<String>,
+    web_search_jina_key: Option<String>,
 ) -> ToolRegistry {
     let bg_manager = Arc::new(tokio::sync::Mutex::new(
         super::run_background::BackgroundJobManager::new(),
@@ -642,7 +661,12 @@ pub fn build_standard_tools_with_roots(
 
     #[cfg(feature = "web_search")]
     {
-        registry = registry.register(Arc::new(super::web_search::WebSearch::new()));
+        let search = super::web_search::WebSearch::new().with_search_config(
+            web_search_provider,
+            web_search_api_key,
+            web_search_jina_key,
+        );
+        registry = registry.register(Arc::new(search));
     }
 
     if !skills.is_empty() {

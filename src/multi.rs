@@ -3,6 +3,7 @@
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
+use crate::tools::{AgentDefinitions, AgentTool, ToolRegistry};
 use crate::{ChatProvider, Config};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -434,6 +435,37 @@ pub fn coordinator_system_prompt() -> &'static str {
     )
 }
 
+/// Register the unified `Agent` (sub-agent / team coordination) tool on `tools`
+/// when `config.subagent_enabled` is true. This is the single, channel-agnostic
+/// hook called by every agent-loop entry point (CLI run / loop, HTTP API, TUI)
+/// after they build their base tool registry and resolve their provider, so
+/// the `Agent` tool and the coordinator prompt injected by
+/// [`crate::system_prompt::assemble_system_prompt`] stay in sync across all
+/// surfaces. Returns `tools` unchanged when sub-agent is disabled.
+pub fn register_subagent_if_enabled(
+    tools: ToolRegistry,
+    config: &Config,
+    provider: Arc<dyn ChatProvider>,
+) -> ToolRegistry {
+    if !config.subagent_enabled {
+        return tools;
+    }
+    let defs = AgentDefinitions::load(&config.workspace).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load agent definitions: {e}");
+        AgentDefinitions::default()
+    });
+    let agent = AgentTool::new(
+        &config.workspace,
+        provider,
+        tools.fork(),
+        config.subagent_max_depth,
+        0,
+        None,
+    )
+    .with_definitions(defs);
+    tools.register(Arc::new(agent))
+}
+
 /// Default role set for common multi-agent patterns.
 pub fn default_roles() -> Vec<AgentRole> {
     vec![
@@ -495,6 +527,7 @@ mod tests {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
+            subagent_enabled: false,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
             stuck_window: 10,

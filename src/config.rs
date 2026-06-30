@@ -66,6 +66,12 @@ pub struct Config {
     /// Maximum nesting depth for sub-agents and parallel workers.
     /// Read from `RECURSIVE_SUBAGENT_MAX_DEPTH` env var, defaults to 2.
     pub subagent_max_depth: usize,
+    /// Whether the unified `Agent` tool (sub-agent / team coordination) is
+    /// registered and the coordinator workflow prompt is injected. Read from
+    /// `RECURSIVE_SUBAGENT_ENABLED` or `RECURSIVE_TEAM_ENABLED` (= "1"),
+    /// defaults to false. Honoured uniformly by every agent-loop channel
+    /// (CLI run / loop, HTTP API, TUI).
+    pub subagent_enabled: bool,
     /// When `false` (default), API callers who request `"bypass"` permission
     /// mode are silently downgraded to `Default`. Set to `true` via
     /// `RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1` to honour bypass requests.
@@ -130,6 +136,7 @@ impl std::fmt::Debug for Config {
             .field("allow_tools", &self.allow_tools)
             .field("context_window_override", &self.context_window_override)
             .field("subagent_max_depth", &self.subagent_max_depth)
+            .field("subagent_enabled", &self.subagent_enabled)
             .field("allow_bypass_permissions", &self.allow_bypass_permissions)
             .field("max_search_rounds", &self.max_search_rounds)
             .field("stuck_window", &self.stuck_window)
@@ -372,6 +379,13 @@ impl Config {
             })
             .unwrap_or(2);
 
+        let subagent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED")
+            .map(|s| s == "1")
+            .unwrap_or(false)
+            || std::env::var("RECURSIVE_TEAM_ENABLED")
+                .map(|s| s == "1")
+                .unwrap_or(false);
+
         let allow_bypass_permissions = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS")
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
@@ -520,6 +534,7 @@ impl Config {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth,
+            subagent_enabled,
             allow_bypass_permissions,
             max_search_rounds,
             stuck_window,
@@ -639,9 +654,9 @@ pub fn default_system_prompt() -> String {
     .join("\n")
 }
 
-/// Maximum size for project context file (AGENTS.md) in bytes.
-/// 16 KB is enough for a detailed project context without blowing
-/// the context window.
+/// Maximum size for each project context file (AGENTS.md / CLAUDE.md) in
+/// bytes. 16 KB per file is enough for a detailed project context without
+/// blowing the context window; both files combined cap at 32 KB.
 const MAX_PROJECT_CONTEXT_SIZE: usize = 16 * 1024;
 
 /// Maximum size for memory files (user.md, project.md) in bytes.
@@ -680,35 +695,66 @@ fn load_memory_file(path: &Path) -> Option<String> {
     }
 }
 
-/// Load project context from AGENTS.md at workspace root.
+/// Load project context from the workspace root, merging `AGENTS.md` and
+/// `CLAUDE.md` when present.
 ///
-/// Returns the file content if present, truncated to 16 KB with a
-/// marker if larger. Returns None if absent.
+/// Each file is capped at [`MAX_PROJECT_CONTEXT_SIZE`] bytes with a truncation
+/// marker when larger. The returned string is empty of outer heading — callers
+/// wrap it (see [`prepend_project_context`]). Sections are emitted under
+/// `## AGENTS.md` / `## CLAUDE.md` sub-headers, only for files that exist.
+/// Returns `None` when neither file is present.
 pub fn load_project_context(workspace: &Path) -> Option<String> {
-    let path = workspace.join("AGENTS.md");
+    let agents = load_capped_md(&workspace.join("AGENTS.md"), "AGENTS.md");
+    let claude = load_capped_md(&workspace.join("CLAUDE.md"), "CLAUDE.md");
+
+    match (agents, claude) {
+        (None, None) => None,
+        (Some(a), None) => Some(format!("## AGENTS.md\n\n{a}")),
+        (None, Some(c)) => Some(format!("## CLAUDE.md\n\n{c}")),
+        (Some(a), Some(c)) => Some(format!("## AGENTS.md\n\n{a}\n\n## CLAUDE.md\n\n{c}")),
+    }
+}
+
+/// Read a single markdown context file, capping at [`MAX_PROJECT_CONTEXT_SIZE`]
+/// bytes and appending a truncation marker when larger. Returns `None` when the
+/// file is absent or unreadable.
+fn load_capped_md(path: &Path, label: &str) -> Option<String> {
     if !path.exists() {
         return None;
     }
-
-    let metadata = std::fs::metadata(&path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     let file_size = metadata.len() as usize;
 
     if file_size <= MAX_PROJECT_CONTEXT_SIZE {
-        let content = std::fs::read_to_string(&path).ok()?;
-        Some(content)
+        let content = std::fs::read_to_string(path).ok()?;
+        if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        }
     } else {
-        // File is too large: read first 16 KB and append truncation marker
-        let mut file = std::fs::File::open(&path).ok()?;
+        let mut file = std::fs::File::open(path).ok()?;
         use std::io::Read;
         let mut buffer = vec![0u8; MAX_PROJECT_CONTEXT_SIZE];
         let bytes_read = file.read(&mut buffer).ok()?;
         buffer.truncate(bytes_read);
         let content = String::from_utf8_lossy(&buffer).to_string();
-        let truncated_msg = format!(
-            "\n\n[…truncated, AGENTS.md is {} KB; consider trimming for fresh agent sessions]",
+        Some(format!(
+            "{content}\n\n[…truncated, {label} is {} KB; consider trimming for fresh agent sessions]",
             file_size / 1024
-        );
-        Some(content + &truncated_msg)
+        ))
+    }
+}
+
+/// Prepend the project context block (`AGENTS.md` + `CLAUDE.md`) to `base`,
+/// separated by a horizontal rule. Returns `base` unchanged when neither file
+/// exists. Used at every agent-construction entry point (CLI run, MCP, HTTP
+/// API, TUI) so all paths see the same project context regardless of which
+/// surface launched the agent.
+pub fn prepend_project_context(base: &str, workspace: &Path) -> String {
+    match load_project_context(workspace) {
+        Some(ctx) => format!("# Project context\n\n{ctx}\n\n---\n\n{base}"),
+        None => base.to_string(),
     }
 }
 
@@ -781,6 +827,7 @@ mod tests {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
+            subagent_enabled: false,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
             stuck_window: 10,
@@ -906,6 +953,69 @@ mod tests {
         // No AGENTS.md file
         let content = load_project_context(tmp.path());
         assert!(content.is_none());
+    }
+
+    #[test]
+    fn test_d_load_project_context_includes_claude_md() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("CLAUDE.md");
+        std::fs::write(&path, "# CLAUDE\n\nOnly claude here").expect("write");
+
+        let content = load_project_context(tmp.path());
+        assert!(content.is_some());
+        let c = content.unwrap();
+        assert!(
+            c.contains("## CLAUDE.md"),
+            "should have CLAUDE.md header: {c}"
+        );
+        assert!(c.contains("Only claude here"));
+        assert!(
+            !c.contains("## AGENTS.md"),
+            "no AGENTS.md section expected: {c}"
+        );
+    }
+
+    #[test]
+    fn test_e_load_project_context_merges_both_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("AGENTS.md"), "agents-body").expect("write agents");
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude-body").expect("write claude");
+
+        let content = load_project_context(tmp.path());
+        assert!(content.is_some());
+        let c = content.unwrap();
+        assert!(c.contains("## AGENTS.md"), "missing AGENTS.md header: {c}");
+        assert!(c.contains("## CLAUDE.md"), "missing CLAUDE.md header: {c}");
+        assert!(c.contains("agents-body"));
+        assert!(c.contains("claude-body"));
+        // AGENTS.md section should come before CLAUDE.md section.
+        let agents_idx = c.find("## AGENTS.md").unwrap();
+        let claude_idx = c.find("## CLAUDE.md").unwrap();
+        assert!(
+            agents_idx < claude_idx,
+            "AGENTS.md should precede CLAUDE.md"
+        );
+    }
+
+    #[test]
+    fn test_prepend_project_context_wraps_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("AGENTS.md"), "agents-body").expect("write");
+
+        let out = prepend_project_context("BASE", tmp.path());
+        assert!(out.starts_with("# Project context\n\n"), "{out}");
+        assert!(out.contains("## AGENTS.md"));
+        assert!(
+            out.contains("\n\n---\n\nBASE"),
+            "base should follow separator: {out}"
+        );
+    }
+
+    #[test]
+    fn test_prepend_project_context_no_op_when_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = prepend_project_context("BASE", tmp.path());
+        assert_eq!(out, "BASE");
     }
 
     // --- Memory layer tests ---
@@ -1277,6 +1387,7 @@ preset = "ollama"
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
+            subagent_enabled: false,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
             stuck_window: 10,

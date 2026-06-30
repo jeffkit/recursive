@@ -6,7 +6,10 @@ use recursive::config::Config;
 use recursive::llm::RetryPolicy;
 use recursive::skills::{discover_skills, Skill};
 use recursive::tools::SharedSandboxRoots;
-use recursive::{new_shared_sandbox_roots, AgentRuntime, AgentRuntimeBuilder, ChatProvider};
+use recursive::{
+    assemble_system_prompt, new_shared_sandbox_roots, register_subagent_if_enabled, AgentRuntime,
+    AgentRuntimeBuilder, ChatProvider,
+};
 
 pub enum RuntimeBuild {
     Ready(Option<Box<AgentRuntime>>),
@@ -81,22 +84,6 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
-/// Build the TUI's system prompt: the configured base prompt followed by the
-/// discovered-skill index (so the agent knows what skills exist and can call
-/// `load_skill` without first wasting a turn to discover them). Mirrors what
-/// the CLI (`recursive-cli/src/cli/builder.rs`) and the HTTP API
-/// (`src/http/handlers.rs`) already inject — the TUI previously omitted this,
-/// which is why the agent fell back to a keyword search on every session.
-/// Returns the base prompt unchanged when no skills are installed.
-fn tui_system_prompt(base: &str, skills: &[Skill]) -> String {
-    let idx = recursive::skills::skill_index(skills);
-    if idx.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}\n{idx}")
-    }
-}
-
 pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
     let session_roots = new_shared_sandbox_roots();
     let config = match Config::from_env() {
@@ -140,7 +127,6 @@ pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
     };
 
     let skills = discover_loaded_skills(&config);
-    let system_prompt = tui_system_prompt(&config.system_prompt, &skills);
     let extra_roots = sandbox_extra_roots(&config);
     let tools = recursive::tools::build_standard_tools_with_roots(
         &config.workspace,
@@ -148,6 +134,18 @@ pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
         Some(session_roots.clone()),
         &skills,
         config.shell_timeout_secs,
+        config.web_search_provider.clone(),
+        config.web_search_api_key.clone(),
+        config.web_search_jina_key.clone(),
+    );
+    // Channel-agnostic sub-agent tool registration, in lockstep with the
+    // coordinator prompt injected by `assemble_system_prompt`.
+    let tools = register_subagent_if_enabled(tools, &config, provider.clone());
+    let system_prompt = assemble_system_prompt(
+        &config.system_prompt,
+        &config.workspace,
+        &skills,
+        config.subagent_enabled,
     );
 
     let build = match AgentRuntimeBuilder::new()
@@ -239,7 +237,6 @@ fn build_runtime_with_skill_tx(
     };
 
     let skills = discover_loaded_skills(&config);
-    let system_prompt = tui_system_prompt(&config.system_prompt, &skills);
     let extra_roots = sandbox_extra_roots(&config);
 
     let mut tools = recursive::tools::build_standard_tools_with_roots(
@@ -248,11 +245,24 @@ fn build_runtime_with_skill_tx(
         Some(session_roots.clone()),
         &skills,
         config.shell_timeout_secs,
+        config.web_search_provider.clone(),
+        config.web_search_api_key.clone(),
+        config.web_search_jina_key.clone(),
     );
 
     // Register skill-hub tools: install_skill is TUI-only (it sends events
     // through a channel so the TUI can prompt the user).
     tools = tools.register(Arc::new(recursive::tools::InstallSkill::new(skill_tx)));
+
+    // Channel-agnostic sub-agent tool registration, in lockstep with the
+    // coordinator prompt injected by `assemble_system_prompt`.
+    tools = register_subagent_if_enabled(tools, &config, provider.clone());
+    let system_prompt = assemble_system_prompt(
+        &config.system_prompt,
+        &config.workspace,
+        &skills,
+        config.subagent_enabled,
+    );
 
     let build = match AgentRuntimeBuilder::new()
         .llm(provider)
@@ -277,52 +287,11 @@ fn build_runtime_with_skill_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use crate::backend::Backend;
     use crate::events::UiEvent;
     use crate::events::UserAction;
-    use recursive::skills::{Skill, SkillMode};
-
-    fn make_skill(name: &str, desc: &str) -> Skill {
-        Skill {
-            name: name.to_string(),
-            description: desc.to_string(),
-            path: PathBuf::from(format!("/tmp/skills/{name}/SKILL.md")),
-            mode: SkillMode::Manual,
-            triggers: vec![],
-            hint: String::new(),
-            depends_on: vec![],
-            refs: vec![],
-            params: vec![],
-            scripts: vec![],
-            sections: vec![],
-            globs: None,
-        }
-    }
-
-    #[test]
-    fn tui_system_prompt_appends_skill_index() {
-        let skills = vec![
-            make_skill("pdf", "Manipulate PDF documents"),
-            make_skill("xlsx", "Read and write spreadsheets"),
-        ];
-        let prompt = tui_system_prompt("You are Recursive.", &skills);
-        assert!(prompt.starts_with("You are Recursive."), "{prompt}");
-        assert!(
-            prompt.contains("Available skills"),
-            "expected skill index header: {prompt}"
-        );
-        assert!(prompt.contains("pdf"), "missing pdf skill: {prompt}");
-        assert!(prompt.contains("xlsx"), "missing xlsx skill: {prompt}");
-    }
-
-    #[test]
-    fn tui_system_prompt_unchanged_when_no_skills() {
-        let prompt = tui_system_prompt("You are Recursive.", &[]);
-        assert_eq!(prompt, "You are Recursive.");
-    }
 
     /// RAII guard that clears API key env vars for the duration of a test
     /// and restores them on drop (including on panic).

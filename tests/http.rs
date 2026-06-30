@@ -48,6 +48,7 @@ mod http_tests {
             allow_tools: Vec::new(),
             context_window_override: None,
             subagent_max_depth: 2,
+            subagent_enabled: false,
             allow_bypass_permissions: false,
             max_search_rounds: 3,
             stuck_window: 10,

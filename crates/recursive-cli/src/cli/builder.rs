@@ -4,22 +4,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use recursive::config::{load_project_context, Config};
+use recursive::config::Config;
 use recursive::coordinator;
 use recursive::mcp::{discover_mcp_servers, load_mcp_config, McpClient, McpServer, McpTool};
-use recursive::multi::coordinator_system_prompt;
-use recursive::skills::{discover_skills, skill_index, skills_for_injection, Skill};
+use recursive::skills::{discover_skills, skills_for_injection, Skill};
 #[cfg(feature = "web_search")]
 use recursive::tools::WebSearch;
 use recursive::{
+    assemble_system_prompt,
     llm::{AnthropicProvider, ChatProvider, OpenAiProvider},
+    register_subagent_if_enabled,
     tools::fs::ReadFileState,
     tools::EpisodicRecall,
     tools::{
-        AgentDefinitions, AgentTool, BackgroundJobManager, CheckBackground, CountLines, EditTool,
-        EstimateTokens, Forget, GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember,
-        RunBackground, RunShell, ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles,
-        TodoWriteTool, ToolTransport, WebFetch, WorkingMemoryTool, WriteFile,
+        BackgroundJobManager, CheckBackground, CountLines, EditTool, EstimateTokens, Forget,
+        GlobTool, LoadSkill, LocalTransport, ReadFile, Recall, Remember, RunBackground, RunShell,
+        ScratchpadDelete, ScratchpadGet, ScratchpadList, SearchFiles, TodoWriteTool, ToolTransport,
+        WebFetch, WorkingMemoryTool, WriteFile,
     },
     tools::{ForgetFact, RecallFact, RememberFact, UpdateFact},
     AgentRuntime, AgentRuntimeBuilder, EventSink, NullSink, RetryPolicy, ToolRegistry,
@@ -272,7 +273,7 @@ async fn register_mcp_server_tools(
 /// Discover skills from configured search paths.
 /// Defaults: <workspace>/.recursive/skills/, <workspace>/.claude/skills/, ~/.recursive/skills/, ~/.claude/skills/.
 /// Override with RECURSIVE_SKILL_PATHS=path1:path2 (colon-separated).
-fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
+pub(crate) fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
         env_paths.split(':').map(PathBuf::from).collect()
     } else {
@@ -349,68 +350,26 @@ pub(crate) async fn build_runtime(
     // allow-list (Read/Grep/Glob/team_*/task_*/etc.) and drop Edit/Write/Bash.
     coordinator::filter_registry(&mut tools);
 
-    // Accept both the old name (backward compat) and the clearer new name
-    let sub_agent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED").as_deref() == Ok("1")
-        || std::env::var("RECURSIVE_TEAM_ENABLED").as_deref() == Ok("1");
-    if sub_agent_enabled {
-        let max_depth = config.subagent_max_depth;
-        // Single unified agent tool — replaces SubAgent, SpawnWorkerTool,
-        // and SpawnWorkersParallel.  The caller controls execution via
-        //  (single / parallel / sequential) and .
-        let defs = AgentDefinitions::load(&config.workspace).unwrap_or_else(|e| {
-            tracing::warn!("Failed to load agent definitions: {e}");
-            AgentDefinitions::default()
-        });
-        let agent = AgentTool::new(
-            &config.workspace,
-            provider.clone(),
-            tools.fork(),
-            max_depth,
-            0,
-            None,
-        )
-        .with_definitions(defs);
-        tools = tools.register(Arc::new(agent));
-    }
+    // Sub-agent / team coordination is a channel-agnostic capability: every
+    // agent-loop surface registers the unified `Agent` tool when
+    // `config.subagent_enabled` is set, in lockstep with the coordinator
+    // prompt injected by `assemble_system_prompt`.
+    tools = register_subagent_if_enabled(tools, config, provider.clone());
 
     let skills = discover_loaded_skills(config);
-    let project_context = load_project_context(&config.workspace);
 
-    // Gap-3: When sub-agent / worker mode is enabled, append the coordinator
-    // workflow prompt so the agent knows how to design and orchestrate a team.
-    let coordinator_suffix = if sub_agent_enabled {
-        format!(
-            "\n\n---\n\n## Coordinator workflow\n\n{}",
-            coordinator_system_prompt()
-        )
-    } else {
-        String::new()
-    };
+    // Common system-prompt assembly (project context + base + skill index +
+    // coordinator workflow/sub_agent note when enabled) lives in one place.
+    let mut system_prompt = assemble_system_prompt(
+        &config.system_prompt,
+        &config.workspace,
+        &skills,
+        config.subagent_enabled,
+    );
 
-    let mut system_prompt = match (&project_context, skills.is_empty()) {
-        (Some(ctx), true) => {
-            format!(
-                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}{}",
-                ctx, config.system_prompt, coordinator_suffix
-            )
-        }
-        (Some(ctx), false) => {
-            format!(
-                "# Project context (AGENTS.md)\n\n{}\n\n---\n\n{}\n{}{}",
-                ctx,
-                config.system_prompt,
-                skill_index(&skills),
-                coordinator_suffix
-            )
-        }
-        (None, true) => format!("{}{}", config.system_prompt, coordinator_suffix),
-        (None, false) => format!(
-            "{}\n{}{}",
-            config.system_prompt,
-            skill_index(&skills),
-            coordinator_suffix
-        ),
-    };
+    // CLI-run-only: auto-load matching skill *bodies* based on the goal (the
+    // index above only lists skill names). Other channels don't have a goal
+    // at prompt-build time, so this stays a CLI-run-specific suffix.
     let injected = skills_for_injection(&skills, goal.unwrap_or(""));
     if !injected.is_empty() {
         let mut injection_block = String::new();
@@ -450,14 +409,6 @@ pub(crate) async fn build_runtime(
             system_prompt, injection_block
         );
     }
-    let system_prompt = if sub_agent_enabled {
-        format!(
-            "{}\n\nWhen you need to do focused research or scan files without polluting your main context, use the `sub_agent` tool. It spawns a fresh agent with its own transcript and a restricted tool set (read-only by default).",
-            system_prompt
-        )
-    } else {
-        system_prompt
-    };
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)

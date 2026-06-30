@@ -92,17 +92,14 @@ pub(super) async fn run_agent(
             p
         }
     };
-    // Goal-312: append skill index so the agent knows what skills
-    // are available and can call load_skill effectively.
-    let system_prompt = {
-        let mut sp = system_prompt;
-        let idx = crate::skills::skill_index(&state.skills);
-        if !idx.is_empty() {
-            sp.push('\n');
-            sp.push_str(&idx);
-        }
-        sp
-    };
+    // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
+    // + base + skill index + coordinator/sub_agent note (when enabled).
+    let system_prompt = crate::assemble_system_prompt(
+        &system_prompt,
+        &state.config.workspace,
+        &state.skills,
+        state.config.subagent_enabled,
+    );
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
@@ -207,17 +204,14 @@ pub(super) async fn create_session(
             p
         }
     };
-    // Goal-312: append skill index so the agent knows what skills
-    // are available and can call load_skill effectively.
-    let system_prompt = {
-        let mut sp = system_prompt;
-        let idx = crate::skills::skill_index(&state.skills);
-        if !idx.is_empty() {
-            sp.push('\n');
-            sp.push_str(&idx);
-        }
-        sp
-    };
+    // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
+    // + base + skill index + coordinator/sub_agent note (when enabled).
+    let system_prompt = crate::assemble_system_prompt(
+        &system_prompt,
+        &state.config.workspace,
+        &state.skills,
+        state.config.subagent_enabled,
+    );
     let max_steps = body
         .max_steps
         .map(|n| n as usize)
@@ -529,16 +523,14 @@ pub(super) async fn fork_session(
     let new_id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
     let system_prompt = state.config.system_prompt.clone();
-    // Goal-312: append skill index so the forked session also has skills.
-    let system_prompt = {
-        let mut sp = system_prompt;
-        let idx = crate::skills::skill_index(&state.skills);
-        if !idx.is_empty() {
-            sp.push('\n');
-            sp.push_str(&idx);
-        }
-        sp
-    };
+    // Common system-prompt assembly so the forked session matches every
+    // other channel (project context + skill index + sub-agent note).
+    let system_prompt = crate::assemble_system_prompt(
+        &system_prompt,
+        &state.config.workspace,
+        &state.skills,
+        state.config.subagent_enabled,
+    );
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
@@ -1411,16 +1403,14 @@ pub(super) async fn agui_run(
             )
         })?;
 
-    // Goal-312: append skill index to system prompt.
-    let system_prompt = {
-        let mut sp = state.config.system_prompt.clone();
-        let idx = crate::skills::skill_index(&state.skills);
-        if !idx.is_empty() {
-            sp.push('\n');
-            sp.push_str(&idx);
-        }
-        sp
-    };
+    // Common system-prompt assembly: project context + skill index +
+    // coordinator/sub_agent note (when enabled).
+    let system_prompt = crate::assemble_system_prompt(
+        &state.config.system_prompt,
+        &state.config.workspace,
+        &state.skills,
+        state.config.subagent_enabled,
+    );
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
