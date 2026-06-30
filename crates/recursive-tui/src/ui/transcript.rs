@@ -239,7 +239,12 @@ fn render_assistant(
     // code with syntax highlighting, etc.). The first line picks up
     // the bullet prefix; subsequent lines share the 2-space indent
     // so wrapping reads naturally.
-    let md_lines = markdown::render_markdown(text, width);
+    //
+    // Reserve 2 columns for the `indent` prefix prepended to every
+    // emitted line below, so width-sized constructs (the `---`
+    // horizontal rule, tables) don't overflow the panel and wrap a
+    // stray `─` onto the next row.
+    let md_lines = markdown::render_markdown(text, width.saturating_sub(2));
     let mut iter = md_lines.into_iter();
     if let Some(first) = iter.next() {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(first.spans.len() + 2);

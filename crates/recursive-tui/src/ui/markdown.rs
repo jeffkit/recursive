@@ -518,9 +518,13 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                         })
                         .collect();
                     let row_refs: Vec<&str> = raw_rows.iter().map(String::as_str).collect();
-                    // Subtract gutter width (2) so the table fits within the
-                    // available render width. Width==0 means no limit.
-                    let table_max = width.saturating_sub(2);
+                    // `width` already excludes the 2-column indent that the
+                    // caller (`render_assistant`) prepends to every line, so
+                    // the table can use the full `width` as its budget
+                    // (the table's own `"  "` gutter is accounted for inside
+                    // `render_table` via `gutter_len`). Width==0 means no
+                    // limit.
+                    let table_max = width;
                     out.extend(render_table(
                         &row_refs,
                         "  ",
@@ -1196,6 +1200,56 @@ mod tests {
         assert_eq!(
             rule_count, 40,
             "expected 40 box-drawing chars, got {text:?}"
+        );
+    }
+
+    // Regression: when render_assistant prepends a 2-space indent to every
+    // markdown line and then hard-wraps at the panel width, a `---`
+    // horizontal rule sized to the full panel width overflows by 2 columns
+    // and wraps a stray `─` onto the next row. The caller must reserve the
+    // indent by passing `width - 2` to render_markdown; this test simulates
+    // that contract so the rule fits exactly within the panel.
+    #[test]
+    fn horizontal_rule_fits_panel_with_two_space_indent() {
+        use crate::ui::transcript::wrap_lines_to_width;
+        let panel_width: u16 = 40;
+        let indent = Span::raw("  ");
+        let md_lines = render_markdown("---", panel_width.saturating_sub(2));
+        // Mimic render_assistant: prepend the 2-space indent to every line.
+        let indented: Vec<Line<'static>> = md_lines
+            .into_iter()
+            .map(|l| {
+                let mut spans = vec![indent.clone()];
+                spans.extend(l.spans);
+                Line::from(spans)
+            })
+            .collect();
+        let physical = wrap_lines_to_width(&indented, panel_width);
+        // The rule must occupy exactly one physical row — no stray `─`
+        // wrapping onto a second line.
+        let rule_rows: Vec<&Line<'static>> = physical
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains('\u{2500}'))
+            })
+            .collect();
+        assert_eq!(
+            rule_rows.len(),
+            1,
+            "horizontal rule wrapped to {} rows; expected 1",
+            rule_rows.len()
+        );
+        let row_text: String = rule_rows[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let rule_count = row_text.chars().filter(|c| *c == '\u{2500}').count();
+        assert_eq!(
+            rule_count, 38,
+            "expected 38 `─` chars (40 - 2 indent), got {rule_count}"
         );
     }
 }
