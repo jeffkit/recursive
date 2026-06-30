@@ -83,7 +83,12 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
         .register(Arc::new(CheckBackground::new(bg_manager.clone())));
     #[cfg(feature = "web_search")]
     {
-        registry = registry.register(Arc::new(WebSearch::new()));
+        let search = WebSearch::new().with_search_config(
+            config.web_search_provider.clone(),
+            config.web_search_api_key.clone(),
+            config.web_search_jina_key.clone(),
+        );
+        registry = registry.register(Arc::new(search));
     }
     registry = registry.register(Arc::new(
         EstimateTokens::new(root).with_extra_roots(extra_roots.clone()),

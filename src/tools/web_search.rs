@@ -60,6 +60,15 @@ pub struct WebSearch {
     /// A single override is sufficient because integration tests run one
     /// provider at a time against a mockito server.
     test_base_url: Option<String>,
+    /// Optional search provider name override (from Config).
+    /// Takes precedence over `RECURSIVE_WEB_SEARCH_PROVIDER` env var.
+    provider_override: Option<String>,
+    /// Optional search API key override (from Config).
+    /// Takes precedence over `RECURSIVE_WEB_SEARCH_API_KEY` env var.
+    api_key_override: Option<String>,
+    /// Optional Jina API key override (from Config).
+    /// Takes precedence over `RECURSIVE_WEB_SEARCH_JINA_KEY` env var.
+    jina_key_override: Option<String>,
 }
 
 impl Default for WebSearch {
@@ -87,7 +96,24 @@ impl WebSearch {
         Self {
             client,
             test_base_url: None,
+            provider_override: None,
+            api_key_override: None,
+            jina_key_override: None,
         }
+    }
+
+    /// Configure search provider and API keys from Config values.
+    /// When set, these take precedence over `RECURSIVE_WEB_SEARCH_*` env vars.
+    pub fn with_search_config(
+        mut self,
+        provider: Option<String>,
+        api_key: Option<String>,
+        jina_key: Option<String>,
+    ) -> Self {
+        self.provider_override = provider;
+        self.api_key_override = api_key;
+        self.jina_key_override = jina_key;
+        self
     }
 
     /// Test-only constructor that redirects all provider requests to `base_url`.
@@ -102,6 +128,9 @@ impl WebSearch {
         Self {
             client,
             test_base_url: Some(base_url.into()),
+            provider_override: None,
+            api_key_override: None,
+            jina_key_override: None,
         }
     }
 
@@ -114,13 +143,19 @@ impl WebSearch {
             .to_string()
     }
 
-    /// Read provider + api_key from env. Returns `None` if not configured.
-    fn load_config() -> Option<(Provider, String)> {
-        let provider_str = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok()?;
-        let api_key = std::env::var("RECURSIVE_WEB_SEARCH_API_KEY").ok()?;
-        if provider_str.is_empty() || api_key.is_empty() {
-            return None;
-        }
+    /// Read provider + api_key from config override or env. Returns `None` if not configured.
+    fn load_config(&self) -> Option<(Provider, String)> {
+        // Check struct overrides first, then fall back to env vars.
+        let provider_str = self
+            .provider_override
+            .clone()
+            .or_else(|| std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok())
+            .filter(|s| !s.is_empty())?;
+        let api_key = self
+            .api_key_override
+            .clone()
+            .or_else(|| std::env::var("RECURSIVE_WEB_SEARCH_API_KEY").ok())
+            .filter(|s| !s.is_empty())?;
         let provider = Provider::from_str(&provider_str)?;
         Some((provider, api_key))
     }
@@ -422,11 +457,14 @@ impl WebSearch {
             .header("Accept", "text/markdown")
             .header("X-No-Cache", "true");
 
-        // Optional: use a Jina API key for higher quota
-        if let Ok(key) = std::env::var("RECURSIVE_WEB_SEARCH_JINA_KEY") {
-            if !key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {key}"));
-            }
+        // Optional: use a Jina API key for higher quota (override or env var)
+        let jina_key = self
+            .jina_key_override
+            .clone()
+            .or_else(|| std::env::var("RECURSIVE_WEB_SEARCH_JINA_KEY").ok())
+            .filter(|k| !k.is_empty());
+        if let Some(key) = jina_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
         let resp = req.send().await.map_err(|e| Error::Tool {
@@ -549,7 +587,7 @@ impl Tool for WebSearch {
             .clamp(1, MAX_NUM_RESULTS);
 
         // If no provider is configured, fall back to Jina AI Search (zero-config).
-        let Some((provider, api_key)) = Self::load_config() else {
+        let Some((provider, api_key)) = self.load_config() else {
             return self.search_jina_fallback(query).await;
         };
 

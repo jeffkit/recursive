@@ -39,6 +39,18 @@ pub struct FileConfig {
     /// write) files in additional directories.
     #[serde(default)]
     pub sandbox: Option<SandboxSection>,
+    /// Optional `[search]` section. Web search provider configuration.
+    /// Falls back to `RECURSIVE_WEB_SEARCH_*` env vars.
+    #[serde(default)]
+    pub search: Option<SearchSection>,
+    /// Optional `[stuck]` section. Stuck detection thresholds.
+    /// Falls back to `RECURSIVE_STUCK_*` env vars.
+    #[serde(default)]
+    pub stuck: Option<StuckSection>,
+    /// Optional `[limits]` section. Runtime limits.
+    /// Falls back to `RECURSIVE_*` env vars.
+    #[serde(default)]
+    pub limits: Option<LimitsSection>,
 }
 
 /// [provider] section.
@@ -90,6 +102,85 @@ pub struct SandboxSection {
 /// [permissions] section. Wire-compatible with
 /// [`crate::permissions::PermissionsConfig`] but lives here so config
 /// loading does not couple to that crate.
+/// `[search]` section. Web search provider configuration.
+///
+/// Falls back to `RECURSIVE_WEB_SEARCH_PROVIDER`, `RECURSIVE_WEB_SEARCH_API_KEY`,
+/// and `RECURSIVE_WEB_SEARCH_JINA_KEY` env vars respectively.
+///
+/// Example:
+/// ```toml
+/// [search]
+/// provider = "brave"
+/// api_key = "BSA..."
+/// jina_key = "jina_..."
+/// ```
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct SearchSection {
+    /// Search provider name: brave, tavily, serper, bocha, bing.
+    /// Corresponding env var: `RECURSIVE_WEB_SEARCH_PROVIDER`.
+    pub provider: Option<String>,
+    /// API key for the chosen search provider.
+    /// Corresponding env var: `RECURSIVE_WEB_SEARCH_API_KEY`.
+    /// ⚠️  Like provider.api_key, storing search keys in config.toml
+    /// means an agent with `run_shell` can `cat` them out. Consider
+    /// using the env var or `set-secret` instead.
+    pub api_key: Option<String>,
+    /// Optional Jina AI Search API key for higher quota.
+    /// Corresponding env var: `RECURSIVE_WEB_SEARCH_JINA_KEY`.
+    pub jina_key: Option<String>,
+}
+
+/// `[stuck]` section. Stuck detection thresholds.
+///
+/// Falls back to `RECURSIVE_STUCK_WINDOW` and `RECURSIVE_STUCK_ERROR_RATE`
+/// env vars respectively.
+///
+/// Example:
+/// ```toml
+/// [stuck]
+/// window = 10
+/// error_rate = 0.8
+/// ```
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct StuckSection {
+    /// Number of recent steps to check for stuck detection.
+    /// Corresponding env var: `RECURSIVE_STUCK_WINDOW`.
+    pub window: Option<usize>,
+    /// Fraction of steps in the window that must be errors to declare
+    /// the agent "stuck". Corresponding env var: `RECURSIVE_STUCK_ERROR_RATE`.
+    pub error_rate: Option<f64>,
+}
+
+/// `[limits]` section. Various runtime limits and thresholds.
+///
+/// Falls back to individual `RECURSIVE_*` env vars.
+///
+/// Example:
+/// ```toml
+/// [limits]
+/// max_search_rounds = 5
+/// subagent_max_depth = 3
+/// max_concurrent_runs = 8
+/// goal_eval_transcript_tail = 12
+/// ```
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct LimitsSection {
+    /// Maximum number of ToolSearchTool round-trips per
+    /// `complete_with_search` / `stream_with_search` call.
+    /// Corresponding env var: `RECURSIVE_MAX_SEARCH_ROUNDS`. Default: 3.
+    pub max_search_rounds: Option<usize>,
+    /// Maximum nesting depth for sub-agents and parallel workers.
+    /// Corresponding env var: `RECURSIVE_SUBAGENT_MAX_DEPTH`. Default: 2.
+    pub subagent_max_depth: Option<usize>,
+    /// Maximum number of concurrent agent runs across all HTTP endpoints.
+    /// Corresponding env var: `RECURSIVE_MAX_CONCURRENT_RUNS`. Default: 8.
+    pub max_concurrent_runs: Option<usize>,
+    /// Number of most-recent transcript messages passed to the goal
+    /// evaluator judge on each turn.
+    /// Corresponding env var: `RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL`. Default: 12.
+    pub goal_eval_transcript_tail: Option<usize>,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct PermissionsSection {
     #[serde(default)]
@@ -442,6 +533,70 @@ preset = "deepseek"
         assert!(p.api_base.is_none());
         assert!(p.model.is_none());
         assert!(p.api_key.is_none());
+    }
+
+    #[test]
+    fn parse_search_stuck_limits_sections() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[search]
+provider = "brave"
+api_key = "BSA-test-key"
+jina_key = "jina-test-key"
+
+[stuck]
+window = 15
+error_rate = 0.7
+
+[limits]
+max_search_rounds = 5
+subagent_max_depth = 3
+max_concurrent_runs = 16
+goal_eval_transcript_tail = 20
+"#,
+        )
+        .unwrap();
+
+        let config = FileConfig::load_from(tmp.path()).unwrap().unwrap();
+
+        // [search]
+        let s = config.search.unwrap();
+        assert_eq!(s.provider.as_deref(), Some("brave"));
+        assert_eq!(s.api_key.as_deref(), Some("BSA-test-key"));
+        assert_eq!(s.jina_key.as_deref(), Some("jina-test-key"));
+
+        // [stuck]
+        let st = config.stuck.unwrap();
+        assert_eq!(st.window, Some(15));
+        assert_eq!(st.error_rate, Some(0.7));
+
+        // [limits]
+        let l = config.limits.unwrap();
+        assert_eq!(l.max_search_rounds, Some(5));
+        assert_eq!(l.subagent_max_depth, Some(3));
+        assert_eq!(l.max_concurrent_runs, Some(16));
+        assert_eq!(l.goal_eval_transcript_tail, Some(20));
+    }
+
+    #[test]
+    fn search_stuck_limits_are_optional() {
+        // A config with only [provider] must not error on missing new sections.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[provider]
+model = "test-model"
+"#,
+        )
+        .unwrap();
+
+        let config = FileConfig::load_from(tmp.path()).unwrap().unwrap();
+        assert!(config.search.is_none());
+        assert!(config.stuck.is_none());
+        assert!(config.limits.is_none());
     }
 
     #[test]
