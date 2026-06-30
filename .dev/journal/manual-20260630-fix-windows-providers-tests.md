@@ -66,6 +66,16 @@ testing the wrong thing too.
   of the Windows fix, but it blocked the workspace clippy gate
   (`-D warnings`). Mechanical fix applied per clippy's own suggestion.
   (Left uncommitted — not part of the shipped fix.)
+- `crates/recursive-tui/src/ui/status.rs` — fixed
+  `abbreviate_workspace_replaces_home_prefix` test assertion to be
+  cross-platform. The production `abbreviate_workspace` correctly
+  produces `~\projects\Recursive` on Windows (backslash separator), but
+  the test hardcoded `starts_with("~/")` (forward slash), which only
+  holds on Unix. Now asserts `~` prefix + either separator + trailing
+  `projects/Recursive`. This failure was masked on Windows by
+  fail-fast: the invariants binary used to fail before the recursive-tui
+  lib binary ran; once invariants was ignored on Windows, cargo
+  proceeded to recursive-tui lib and this assertion failed.
 - `tests/invariants/dep_justification.rs` — added
   `#[cfg_attr(target_os = "windows", ignore)]` to
   `dep_check_script_passes`. This test shells out to `bash` to run

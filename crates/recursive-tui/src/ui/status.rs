@@ -266,11 +266,24 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             let p = home.join("projects/Recursive");
             let abbreviated = abbreviate_workspace(&p);
+            // The home prefix is replaced with `~`; the remaining path keeps
+            // the platform separator (`/` on Unix, `\` on Windows), so assert
+            // a `~` prefix followed by EITHER separator rather than hardcoding
+            // `~/` (which fails on Windows where `dirs::home_dir()` returns a
+            // `C:\Users\...` path and `Path::display()` uses backslashes).
             assert!(
-                abbreviated.starts_with("~/"),
+                abbreviated.starts_with('~'),
                 "expected ~-prefixed path, got {abbreviated:?}"
             );
-            assert!(abbreviated.ends_with("projects/Recursive"));
+            let after_tilde = &abbreviated[1..];
+            assert!(
+                after_tilde.starts_with('/') || after_tilde.starts_with('\\'),
+                "expected a path separator after ~, got {abbreviated:?}"
+            );
+            assert!(
+                abbreviated.ends_with("projects/Recursive"),
+                "expected trailing projects/Recursive, got {abbreviated:?}"
+            );
         }
     }
 
