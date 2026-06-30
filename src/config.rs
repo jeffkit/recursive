@@ -90,6 +90,15 @@ pub struct Config {
     /// Default 12. Set via `RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL` env var.
     /// Goal-291.
     pub goal_eval_transcript_tail: usize,
+    /// Web search provider name (brave, tavily, serper, bocha, bing).
+    /// Set via `RECURSIVE_WEB_SEARCH_PROVIDER` env var or `[search]` config.
+    pub web_search_provider: Option<String>,
+    /// API key for the web search provider.
+    /// Set via `RECURSIVE_WEB_SEARCH_API_KEY` env var or `[search]` config.
+    pub web_search_api_key: Option<String>,
+    /// Jina AI Search API key for higher quota.
+    /// Set via `RECURSIVE_WEB_SEARCH_JINA_KEY` env var or `[search]` config.
+    pub web_search_jina_key: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -127,6 +136,15 @@ impl std::fmt::Debug for Config {
             .field("stuck_error_rate", &self.stuck_error_rate)
             .field("max_concurrent_runs", &self.max_concurrent_runs)
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
+            .field("web_search_provider", &self.web_search_provider)
+            .field(
+                "web_search_api_key",
+                &self.web_search_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "web_search_jina_key",
+                &self.web_search_jina_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -346,6 +364,12 @@ impl Config {
         let subagent_max_depth = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                file_config
+                    .limits
+                    .as_ref()
+                    .and_then(|l| l.subagent_max_depth)
+            })
             .unwrap_or(2);
 
         let allow_bypass_permissions = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS")
@@ -356,21 +380,35 @@ impl Config {
         let max_search_rounds = std::env::var("RECURSIVE_MAX_SEARCH_ROUNDS")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                file_config
+                    .limits
+                    .as_ref()
+                    .and_then(|l| l.max_search_rounds)
+            })
             .unwrap_or(3);
 
         let stuck_window = std::env::var("RECURSIVE_STUCK_WINDOW")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| file_config.stuck.as_ref().and_then(|s| s.window))
             .unwrap_or(10usize);
 
         let stuck_error_rate = std::env::var("RECURSIVE_STUCK_ERROR_RATE")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| file_config.stuck.as_ref().and_then(|s| s.error_rate))
             .unwrap_or(0.8f64);
 
         let max_concurrent_runs = std::env::var("RECURSIVE_MAX_CONCURRENT_RUNS")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                file_config
+                    .limits
+                    .as_ref()
+                    .and_then(|l| l.max_concurrent_runs)
+            })
             .unwrap_or(8usize);
 
         // Goal-291: tail window for the goal-evaluator judge. Default 12,
@@ -379,7 +417,28 @@ impl Config {
         let goal_eval_transcript_tail = std::env::var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                file_config
+                    .limits
+                    .as_ref()
+                    .and_then(|l| l.goal_eval_transcript_tail)
+            })
             .unwrap_or(12usize);
+
+        // Web search config: env var > file config > None
+        let file_search = file_config.search.as_ref();
+        let web_search_provider = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| file_search.and_then(|s| s.provider.clone()));
+        let web_search_api_key = std::env::var("RECURSIVE_WEB_SEARCH_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| file_search.and_then(|s| s.api_key.clone()));
+        let web_search_jina_key = std::env::var("RECURSIVE_WEB_SEARCH_JINA_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| file_search.and_then(|s| s.jina_key.clone()));
 
         // Assemble system prompt with memory layers.
         // Order: most stable first (user.md), most volatile last (memory_summary).
@@ -467,6 +526,9 @@ impl Config {
             stuck_error_rate,
             max_concurrent_runs,
             goal_eval_transcript_tail,
+            web_search_provider,
+            web_search_api_key,
+            web_search_jina_key,
         })
     }
 
@@ -725,6 +787,9 @@ mod tests {
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
             goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
         };
         assert_eq!(config.retry_max, 2);
         assert_eq!(config.retry_initial_backoff_secs, 1);
@@ -1218,6 +1283,9 @@ preset = "ollama"
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
             goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: Some("sk-secret".into()),
+            web_search_jina_key: None,
         };
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret"));

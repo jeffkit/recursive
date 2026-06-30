@@ -54,6 +54,9 @@ mod http_tests {
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
             goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
         }
     }
 
