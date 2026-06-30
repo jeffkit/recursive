@@ -31,6 +31,11 @@ WORKDIR /build
 # Docker layer caching keeps the dep download/compile out of most
 # rebuilds even without a cargo-chef-style stub.
 COPY Cargo.toml Cargo.lock ./
+# `providers.toml` is referenced from `src/providers.rs` via
+# `include_str!("../providers.toml")` — a compile-time include that
+# cargo will not find unless we copy the file into the build context
+# alongside the workspace metadata.
+COPY providers.toml ./
 COPY crates/ crates/
 
 # Real source. Examples and tests are excluded via .dockerignore so
