@@ -194,6 +194,16 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
+          # `gh release create` invoked with the auto-issued GITHUB_TOKEN
+          # leaves the release as a draft (the token cannot publish). For
+          # a tag-driven release we want it public immediately, otherwise
+          # the assets URL returns 404 for everyone without a token, and
+          # downstream package managers (Homebrew, Scoop, AUR...) silently
+          # fail to fetch their source tarball.
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+
   # ── 4. Publish to crates.io ────────────────────────────────────────────────
   publish-crate:
     name: Publish to crates.io
