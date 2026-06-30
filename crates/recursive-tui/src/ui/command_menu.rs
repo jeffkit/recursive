@@ -16,10 +16,66 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::App;
-use crate::commands::CommandSpec;
+use crate::commands::{CommandRegistry, CommandSpec};
+use crate::skill_commands::SkillCommand;
 
 /// Maximum number of candidate rows to display in the popup.
 pub const MAX_VISIBLE: usize = 8;
+
+/// A single entry in the combined command-menu popup — either a built-in
+/// command or a Goal-169/322 skill-backed command.
+///
+/// Public (Goal-322) so both the renderer and
+/// [`crate::app::App::handle_command_menu_key`] share the same
+/// source-of-truth for ordering and length.
+pub enum MenuEntry<'a> {
+    Builtin(&'a CommandSpec),
+    Skill(&'a SkillCommand),
+}
+
+impl<'a> MenuEntry<'a> {
+    pub fn name(&self) -> &str {
+        match self {
+            MenuEntry::Builtin(s) => s.name,
+            MenuEntry::Skill(s) => &s.name,
+        }
+    }
+    pub fn summary(&self) -> &str {
+        match self {
+            MenuEntry::Builtin(s) => s.summary,
+            MenuEntry::Skill(s) => &s.description,
+        }
+    }
+    pub fn is_skill(&self) -> bool {
+        matches!(self, MenuEntry::Skill(_))
+    }
+    /// The argument_hint (e.g. `<file>`) for skill entries; empty for
+    /// built-ins and skills without a hint.
+    pub fn argument_hint(&self) -> &str {
+        match self {
+            MenuEntry::Skill(s) => &s.argument_hint,
+            MenuEntry::Builtin(_) => "",
+        }
+    }
+}
+
+/// Build the combined (built-ins first, then skills) command menu entry
+/// list, truncated to [`MAX_VISIBLE`].  Returns entries whose name or
+/// alias starts with `buffer` (with the leading `/` stripped).
+///
+/// This is the single source of truth used by both the renderer and the
+/// keyboard handler.
+pub fn command_menu_entries<'a>(registry: &'a CommandRegistry, buffer: &str) -> Vec<MenuEntry<'a>> {
+    let builtin = registry.search(buffer);
+    let skills = registry.search_skills(buffer);
+    let mut combined: Vec<MenuEntry<'_>> = builtin
+        .iter()
+        .map(|s| MenuEntry::Builtin(s))
+        .chain(skills.iter().map(|s| MenuEntry::Skill(s)))
+        .collect();
+    combined.truncate(MAX_VISIBLE);
+    combined
+}
 
 /// Compute the longest common prefix of `s1` and `s2`. Pure, used by
 /// [`tab_completion_target`] and exposed for tests.
@@ -61,6 +117,35 @@ pub fn tab_completion_target(buffer: &str, matches: &[&CommandSpec]) -> Option<S
     }
 }
 
+/// Return the canonical name to autocomplete to from a list of name
+/// strings (works across both built-in and skill entries).
+///
+/// Algorithm: zero matches yields `None`; exactly one match yields
+/// `Some(name)`; multiple matches yield the longest common prefix of
+/// all names, but only if it strictly extends the buffer (otherwise
+/// `None`, leaving the buffer alone).
+pub fn tab_complete_names(buffer: &str, names: &[&str]) -> Option<String> {
+    let buf = buffer.trim_start_matches('/');
+    match names.len() {
+        0 => None,
+        1 => Some(names[0].to_string()),
+        _ => {
+            let mut common: &str = names[0];
+            for name in &names[1..] {
+                common = longest_common_prefix(common, name);
+                if common.is_empty() {
+                    break;
+                }
+            }
+            if common.len() > buf.len() {
+                Some(common.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Compute the rectangle to render the popup in, given the input
 /// box's `area` and the number of candidate rows. Returns `None`
 /// when the popup doesn't fit (terminal too short or candidates
@@ -83,51 +168,20 @@ pub fn popup_rect(input_area: Rect, candidate_count: usize, frame_area: Rect) ->
     })
 }
 
-/// A single entry in the combined command-menu popup — either a built-in
-/// command or a Goal-169 skill-backed command.
-enum MenuEntry<'a> {
-    Builtin(&'a crate::commands::CommandSpec),
-    Skill(&'a crate::skill_commands::SkillCommand),
-}
-
-impl<'a> MenuEntry<'a> {
-    fn name(&self) -> &str {
-        match self {
-            MenuEntry::Builtin(s) => s.name,
-            MenuEntry::Skill(s) => &s.name,
-        }
-    }
-    fn summary(&self) -> &str {
-        match self {
-            MenuEntry::Builtin(s) => s.summary,
-            MenuEntry::Skill(s) => &s.description,
-        }
-    }
-    fn is_skill(&self) -> bool {
-        matches!(self, MenuEntry::Skill(_))
-    }
-}
-
 /// Render the popup. No-op when the input mode is not Command, the
 /// buffer is empty, or no matches are available.
 ///
 /// Goal-169: the popup now shows both built-in and skill-backed commands
 /// (skills are suffixed with `[skill]` in a dim colour so the user can
 /// distinguish them at a glance).
+/// Goal-322: skill rows with a non-empty `argument_hint` show the hint
+/// in dim colour.
 pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
     if app.prompt.mode != crate::app::InputMode::Command {
         return;
     }
-    let builtin_matches = app.commands.search(&app.prompt.buffer);
-    let skill_matches = app.commands.search_skills(&app.prompt.buffer);
 
-    // Combine: built-ins first, then skills.
-    let mut combined: Vec<MenuEntry<'_>> = builtin_matches
-        .iter()
-        .map(|s| MenuEntry::Builtin(s))
-        .chain(skill_matches.iter().map(|s| MenuEntry::Skill(s)))
-        .collect();
-    combined.truncate(MAX_VISIBLE);
+    let combined = command_menu_entries(&app.commands, &app.prompt.buffer);
 
     if combined.is_empty() {
         return;
@@ -144,6 +198,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
     let normal_style = Style::default().fg(Color::White);
     let summary_style = Style::default().fg(Color::DarkGray);
     let skill_badge_style = Style::default().fg(Color::Green);
+    let hint_style = Style::default().fg(Color::DarkGray);
 
     let lines: Vec<Line<'static>> = combined
         .iter()
@@ -160,6 +215,10 @@ pub fn render(frame: &mut Frame, input_area: Rect, app: &App) {
             ];
             if entry.is_skill() {
                 spans.push(Span::styled(" [skill]".to_string(), skill_badge_style));
+            }
+            let hint = entry.argument_hint();
+            if !hint.is_empty() {
+                spans.push(Span::styled(format!(" {hint}"), hint_style));
             }
             Line::from(spans)
         })
@@ -341,15 +400,7 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_command_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let builtin_matches = app.commands.search(&app.prompt.buffer);
-    let skill_matches = app.commands.search_skills(&app.prompt.buffer);
-
-    let mut combined: Vec<MenuEntry<'_>> = builtin_matches
-        .iter()
-        .map(|s| MenuEntry::Builtin(s))
-        .chain(skill_matches.iter().map(|s| MenuEntry::Skill(s)))
-        .collect();
-    combined.truncate(MAX_VISIBLE);
+    let combined = command_menu_entries(&app.commands, &app.prompt.buffer);
 
     if combined.is_empty() {
         return;
@@ -362,6 +413,7 @@ fn render_command_panel(frame: &mut Frame, area: Rect, app: &App) {
     let normal_style = Style::default().fg(Color::White);
     let summary_style = Style::default().fg(Color::DarkGray);
     let skill_badge_style = Style::default().fg(Color::Green);
+    let hint_style = Style::default().fg(Color::DarkGray);
 
     let lines: Vec<Line<'static>> = combined
         .iter()
@@ -378,6 +430,10 @@ fn render_command_panel(frame: &mut Frame, area: Rect, app: &App) {
             ];
             if entry.is_skill() {
                 spans.push(Span::styled(" [skill]".to_string(), skill_badge_style));
+            }
+            let hint = entry.argument_hint();
+            if !hint.is_empty() {
+                spans.push(Span::styled(format!(" {hint}"), hint_style));
             }
             Line::from(spans)
         })
@@ -743,5 +799,95 @@ mod tests {
         let _ = app.handle_key(key(KeyCode::Esc));
         assert!(app.prompt.buffer.is_empty());
         assert_eq!(app.prompt.mode, InputMode::Prompt);
+    }
+
+    // ── Goal-322: command_menu_entries integration ─────────────────────
+
+    #[test]
+    fn command_menu_entries_includes_skills() {
+        let mut r = crate::commands::CommandRegistry::default_set();
+        let skill = crate::skill_commands::SkillCommand {
+            name: "refactor".to_string(),
+            description: "Refactor code".to_string(),
+            aliases: vec!["rf".to_string()],
+            argument_hint: "<file>".to_string(),
+            allowed_tools: None,
+            prompt_template: "Refactor $ARGUMENTS".to_string(),
+            source_path: std::path::PathBuf::from("/fake/refactor.md"),
+        };
+        r = r.with_skill_commands(vec![skill]);
+        // Use prefix "re" so built-in matches are minimal and skill shows up.
+        let entries = command_menu_entries(&r, "re");
+        assert!(!entries.is_empty());
+        let has_skill = entries.iter().any(|e| e.name() == "refactor");
+        assert!(has_skill);
+    }
+
+    #[test]
+    fn command_menu_entries_builtins_come_before_skills() {
+        let mut r = crate::commands::CommandRegistry::default_set();
+        let skill = crate::skill_commands::SkillCommand {
+            name: "resume-train".to_string(),
+            description: "A skill".to_string(),
+            aliases: vec![],
+            argument_hint: "".to_string(),
+            allowed_tools: None,
+            prompt_template: "".to_string(),
+            source_path: std::path::PathBuf::from("/fake/resume-train.md"),
+        };
+        r = r.with_skill_commands(vec![skill]);
+        // "res" matches built-in "resume" and skill "resume-train".
+        let entries = command_menu_entries(&r, "res");
+        // "resume" (built-in) should appear before "resume-train" (skill).
+        let resume_pos = entries.iter().position(|e| e.name() == "resume");
+        let skill_pos = entries.iter().position(|e| e.name() == "resume-train");
+        assert!(resume_pos < skill_pos);
+    }
+
+    #[test]
+    fn tab_complete_names_works_with_skills() {
+        let names = vec!["refactor", "review"];
+        // "re" has common prefix "re" which is the same as input, so None.
+        assert_eq!(tab_complete_names("re", &names), None);
+        // "ref" has one match.
+        let names = vec!["refactor"];
+        assert_eq!(
+            tab_complete_names("ref", &names),
+            Some("refactor".to_string())
+        );
+        // Empty returns None.
+        assert_eq!(tab_complete_names("zzz", &[] as &[&str]), None);
+    }
+
+    #[test]
+    fn skill_row_with_argument_hint_renders_hint() {
+        let mut app = fresh_command_app();
+        let mut r = crate::commands::CommandRegistry::default_set();
+        let skill = crate::skill_commands::SkillCommand {
+            name: "refactor".to_string(),
+            description: "Refactor code".to_string(),
+            aliases: vec![],
+            argument_hint: "<file>".to_string(),
+            allowed_tools: None,
+            prompt_template: "".to_string(),
+            source_path: std::path::PathBuf::from("/fake/refactor.md"),
+        };
+        r = r.with_skill_commands(vec![skill]);
+        app.commands = r;
+        app.prompt.buffer = "ref".into();
+        let entries = command_menu_entries(&app.commands, &app.prompt.buffer);
+        // The skill entry should have the argument_hint.
+        let skill_entry = entries.iter().find(|e| e.name() == "refactor").unwrap();
+        assert_eq!(skill_entry.argument_hint(), "<file>");
+        assert!(skill_entry.is_skill());
+    }
+
+    #[test]
+    fn menu_entry_builtin_has_empty_argument_hint() {
+        let r = crate::commands::CommandRegistry::default_set();
+        let entries = command_menu_entries(&r, "help");
+        let help_entry = entries.iter().find(|e| e.name() == "help").unwrap();
+        assert!(!help_entry.is_skill());
+        assert!(help_entry.argument_hint().is_empty());
     }
 }

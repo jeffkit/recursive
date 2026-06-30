@@ -383,6 +383,7 @@ impl App {
                 }
                 '/' => {
                     self.prompt.mode = InputMode::Command;
+                    self.try_reload_skills();
                     return;
                 }
                 _ => {}
@@ -544,8 +545,9 @@ impl App {
     /// consumed; the outer `None` means "fall through to the regular
     /// chat key path".
     pub fn handle_command_menu_key(&mut self, key: KeyEvent) -> Option<Option<UserAction>> {
-        use crate::ui::command_menu;
-        let matches_count = self.commands.search(&self.prompt.buffer).len();
+        use crate::ui::command_menu::{self, command_menu_entries, tab_complete_names};
+        let entries = command_menu_entries(&self.commands, &self.prompt.buffer);
+        let matches_count = entries.len().min(command_menu::MAX_VISIBLE);
 
         match key.code {
             KeyCode::Up => {
@@ -562,18 +564,15 @@ impl App {
                 }
                 let next = match self.command_menu_selected {
                     None => 0,
-                    Some(n) if n + 1 < matches_count.min(command_menu::MAX_VISIBLE) => n + 1,
+                    Some(n) if n + 1 < matches_count => n + 1,
                     Some(n) => n,
                 };
                 self.command_menu_selected = Some(next);
                 Some(None)
             }
             KeyCode::Tab => {
-                let registry = self.commands.clone();
-                let matches = registry.search(&self.prompt.buffer);
-                if let Some(target) =
-                    command_menu::tab_completion_target(&self.prompt.buffer, &matches)
-                {
+                let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
+                if let Some(target) = tab_complete_names(&self.prompt.buffer, &names) {
                     self.prompt.buffer = target;
                     self.prompt.cursor = self.prompt.buffer.len();
                     self.command_menu_selected = None;
@@ -581,14 +580,12 @@ impl App {
                 Some(None)
             }
             KeyCode::Enter => {
-                // If a menu item is selected, execute it; otherwise
-                // fall through to the regular submit path so the
-                // user's literal buffer is dispatched.
+                // If a menu item is selected, fill the buffer with its
+                // name; otherwise fall through to the regular submit
+                // path so the user's literal buffer is dispatched.
                 if let Some(idx) = self.command_menu_selected {
-                    let registry = self.commands.clone();
-                    let matches = registry.search(&self.prompt.buffer);
-                    if let Some(spec) = matches.get(idx) {
-                        let chosen = spec.name.to_string();
+                    if let Some(entry) = entries.get(idx) {
+                        let chosen = entry.name().to_string();
                         self.prompt.buffer = chosen;
                         self.prompt.cursor = self.prompt.buffer.len();
                     }
@@ -2695,5 +2692,80 @@ mod perm_tests {
                 ..
             }
         )));
+    }
+}
+
+// ── Goal-322: skill command-menu keyboard navigation ────────────────────────
+
+#[cfg(test)]
+mod skill_command_menu_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::{App, AppScreen, InputMode};
+    use crate::skill_commands::SkillCommand;
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn app_with_skill() -> App {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        let mut registry = crate::commands::CommandRegistry::default_set();
+        let skill = SkillCommand {
+            name: "refactor".to_string(),
+            description: "Refactor code".to_string(),
+            aliases: vec![],
+            argument_hint: "<file>".to_string(),
+            allowed_tools: None,
+            prompt_template: "Refactor $ARGUMENTS".to_string(),
+            source_path: std::path::PathBuf::from("/fake/refactor.md"),
+        };
+        registry = registry.with_skill_commands(vec![skill]);
+        app.commands = registry;
+        app.prompt.mode = InputMode::Command;
+        app
+    }
+
+    #[test]
+    fn down_moves_highlight_onto_skill_row() {
+        let mut app = app_with_skill();
+        app.prompt.buffer = String::new();
+        // Push Down enough times to move past all built-ins onto the skill.
+        let max_visible = crate::ui::command_menu::MAX_VISIBLE;
+        for _ in 0..max_visible {
+            let _ = app.handle_command_menu_key(k(KeyCode::Down));
+        }
+        // Should have a selection.
+        assert!(app.command_menu_selected.is_some());
+        let sel = app.command_menu_selected.unwrap();
+        assert!(
+            sel < max_visible,
+            "selected index {sel} should be within MAX_VISIBLE {max_visible}"
+        );
+    }
+
+    #[test]
+    fn enter_on_skill_row_sets_buffer_to_skill_name() {
+        let mut app = app_with_skill();
+        app.prompt.buffer = "ref".to_string();
+        let entries =
+            crate::ui::command_menu::command_menu_entries(&app.commands, &app.prompt.buffer);
+        let skill_idx = entries
+            .iter()
+            .position(|e| e.name() == "refactor")
+            .expect("refactor should be in menu entries");
+        app.command_menu_selected = Some(skill_idx);
+        let _ = app.handle_command_menu_key(k(KeyCode::Enter));
+        assert_eq!(app.prompt.buffer, "refactor");
+    }
+
+    #[test]
+    fn tab_completes_skill_name_from_prefix() {
+        let mut app = app_with_skill();
+        app.prompt.buffer = "ref".to_string();
+        let _ = app.handle_command_menu_key(k(KeyCode::Tab));
+        // "ref" matches only "refactor" — Tab should complete.
+        assert_eq!(app.prompt.buffer, "refactor");
     }
 }

@@ -131,6 +131,10 @@ pub struct App {
     pub active_goal: Option<GoalState>,
     /// Goal-171: workspace root path, used by /resume to list sessions.
     pub workspace_path: std::path::PathBuf,
+    /// Goal-322: timestamp (wall-clock) of the last skill reload, used
+    /// for cheap debounce on `/` keypress. `None` means never reloaded
+    /// (the initial `App::new` load counts as "reloaded").
+    pub last_skill_reload: Option<Instant>,
     /// Session-mutable sandbox roots shared with the agent's fs tools.
     /// Mutated by the `/add-dir` command to grant the agent runtime
     /// access to directories outside the workspace.

@@ -8,8 +8,10 @@
 //! ## Search paths (priority order — first name wins on collision)
 //!
 //! 1. `<workspace>/.recursive/skills/` — project-level (committed to repo)
-//! 2. `~/.recursive/skills/` — user-level (global)
-//! 3. Built-in commands from `CommandRegistry::default_set()` (never shadowed
+//! 2. `<workspace>/.claude/skills/` — project-level (Claude Code skills)
+//! 3. `~/.recursive/skills/` — user-level (global)
+//! 4. `~/.claude/skills/` — user-level (global, Claude Code skills)
+//! 5. Built-in commands from `CommandRegistry::default_set()` (never shadowed
 //!    by skills)
 //!
 //! ## Skill file format
@@ -77,35 +79,63 @@ pub struct SkillCommandLoader;
 impl SkillCommandLoader {
     /// Load all skill files from the standard search paths.
     ///
-    /// Project-level skills (`.recursive/skills/`) take priority over
-    /// user-level skills (`~/.recursive/skills/`).  Name collisions are
-    /// resolved by first-seen wins (project > user).
+    /// Priority order (first-seen wins on name collision):
+    /// 1. `<workspace>/.recursive/skills/`
+    /// 2. `<workspace>/.claude/skills/`
+    /// 3. `~/.recursive/skills/`
+    /// 4. `~/.claude/skills/`
+    ///
+    /// `~/.cursor/skills-cursor/` is deliberately excluded — those are
+    /// Cursor-IDE skills, not Recursive skills.
     pub fn load(workspace: &Path) -> Vec<SkillCommand> {
         let mut commands: Vec<SkillCommand> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // 1. Project-level.
-        let project_dir = workspace.join(".recursive").join("skills");
-        for skill in Self::load_dir(&project_dir) {
-            if seen.insert(skill.name.clone()) {
-                commands.push(skill);
-            }
-        }
-
-        // 2. User-level.
-        if let Some(home) = dirs::home_dir() {
-            let user_dir = home.join(".recursive").join("skills");
-            for skill in Self::load_dir(&user_dir) {
+        // Helper: load from a dir and add unseen skills.
+        let mut add_dir = |dir: &Path| {
+            for skill in Self::load_dir(dir) {
                 if seen.insert(skill.name.clone()) {
                     commands.push(skill);
                 }
             }
+        };
+
+        // 1. Project-level: .recursive/skills/
+        add_dir(&workspace.join(".recursive").join("skills"));
+        // 2. Project-level: .claude/skills/
+        add_dir(&workspace.join(".claude").join("skills"));
+
+        // 3–4. User-level.
+        if let Some(home) = dirs::home_dir() {
+            add_dir(&home.join(".recursive").join("skills"));
+            add_dir(&home.join(".claude").join("skills"));
         }
 
         commands
     }
 
-    /// Load all `*.md` skill files from a single directory.
+    /// Return the four standard search paths (regardless of whether they
+    /// exist on disk). Used by the lazy-reload mtime check.
+    pub fn search_paths(workspace: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![
+            workspace.join(".recursive").join("skills"),
+            workspace.join(".claude").join("skills"),
+        ];
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join(".recursive").join("skills"));
+            paths.push(home.join(".claude").join("skills"));
+        }
+        paths
+    }
+
+    /// Load skill files from a single directory.
+    ///
+    /// Supports two formats:
+    /// - **Flat `*.md`** files (legacy / simple skills): parsed directly.
+    /// - **Directory-based `<name>/SKILL.md`** (standard skill layout):
+    ///   each sub-directory that contains a `SKILL.md` file is parsed,
+    ///   and the directory name is used as the default `name` when
+    ///   the frontmatter omits it.
     ///
     /// Files that fail to read or parse are skipped with a `tracing::warn!`
     /// so users debugging "why isn't my skill showing up?" can find the
@@ -127,19 +157,76 @@ impl SkillCommandLoader {
             }
         };
 
-        let mut skills: Vec<SkillCommand> = entries
-            .flatten()
-            .filter(|e| {
-                e.path()
+        let mut skills: Vec<SkillCommand> = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if ft.is_dir() {
+                // Directory-based: <name>/SKILL.md
+                let skill_md = path.join("SKILL.md");
+                if skill_md.is_file() {
+                    // Use the directory name as the default name stem.
+                    if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if let Some(skill) = Self::parse_dir_skill(dir_name, &skill_md) {
+                            skills.push(skill);
+                        }
+                    }
+                }
+            } else if ft.is_file() {
+                // Flat .md file (legacy compatibility).
+                if path
                     .extension()
                     .map(|x| x.eq_ignore_ascii_case("md"))
                     .unwrap_or(false)
-            })
-            .filter_map(|e| Self::parse_file(&e.path()))
-            .collect();
+                {
+                    if let Some(skill) = Self::parse_file(&path) {
+                        skills.push(skill);
+                    }
+                }
+            }
+        }
 
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
+    }
+
+    /// Parse a directory-based skill: read `<dir>/SKILL.md` and use
+    /// `dir_name` as the fallback name (overridden by frontmatter `name`).
+    fn parse_dir_skill(dir_name: &str, skill_md_path: &Path) -> Option<SkillCommand> {
+        let raw = match std::fs::read_to_string(skill_md_path) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    target: "recursive::tui::skill_commands",
+                    path = %skill_md_path.display(),
+                    error = %err,
+                    "skill_commands: failed to read SKILL.md; skipping directory skill"
+                );
+                return None;
+            }
+        };
+        // Use the same parser but with a synthetic path that carries the
+        // directory name as the stem so parse_content falls back to it.
+        let synthetic = PathBuf::from(format!("/fake/{dir_name}.md"));
+        let parsed = Self::parse_content(&synthetic, &raw);
+        if parsed.is_none() {
+            tracing::warn!(
+                target: "recursive::tui::skill_commands",
+                path = %skill_md_path.display(),
+                "skill_commands: directory skill front-matter / name empty; skipping"
+            );
+            return None;
+        }
+        // Fix up source_path to point at the real SKILL.md.
+        Some(SkillCommand {
+            source_path: skill_md_path.to_path_buf(),
+            ..parsed.unwrap()
+        })
     }
 
     /// Parse a single skill file. Returns `None` on IO / parse errors and
@@ -460,5 +547,130 @@ $ARGUMENTS
         let (fm, body) = split_frontmatter(content);
         assert!(fm.is_none());
         assert!(body.contains("just body"));
+    }
+
+    // ── Goal-322: directory-based skills ────────────────────────────────────
+
+    #[test]
+    fn load_dir_loads_directory_based_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("refactor");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Refactor code\n---\nRefactor: $ARGUMENTS\n",
+        )
+        .unwrap();
+
+        let skills = SkillCommandLoader::load_dir(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "refactor");
+        assert_eq!(skills[0].description, "Refactor code");
+        assert_eq!(skills[0].prompt_template, "Refactor: $ARGUMENTS");
+    }
+
+    #[test]
+    fn load_dir_directory_skill_name_from_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("my-folder");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\n---\nReview code\n",
+        )
+        .unwrap();
+
+        let skills = SkillCommandLoader::load_dir(dir.path());
+        assert_eq!(skills.len(), 1);
+        // Frontmatter `name` wins over directory name.
+        assert_eq!(skills[0].name, "review");
+    }
+
+    #[test]
+    fn load_dir_flat_md_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.md"), "Say hello with $ARGUMENTS").unwrap();
+        let skills = SkillCommandLoader::load_dir(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "hello");
+    }
+
+    #[test]
+    fn load_dir_directory_without_skill_md_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("empty-dir")).unwrap();
+        let skills = SkillCommandLoader::load_dir(dir.path());
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn load_dir_mixed_flat_and_directory_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        // Flat skill.
+        std::fs::write(dir.path().join("flat.md"), "Flat skill body\n").unwrap();
+        // Directory skill.
+        let skill_dir = dir.path().join("dir-skill");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Directory skill\n---\nBody\n",
+        )
+        .unwrap();
+        // Another directory without SKILL.md.
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+
+        let skills = SkillCommandLoader::load_dir(dir.path());
+        assert_eq!(skills.len(), 2);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"dir-skill"));
+        assert!(names.contains(&"flat"));
+    }
+
+    // ── Goal-322: .claude/skills search path ────────────────────────────────
+
+    #[test]
+    fn load_dir_scans_claude_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_skills = dir.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&claude_skills).unwrap();
+        // Directory-based skill inside .claude/skills/
+        let skill_dir = claude_skills.join("a2ui");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Render A2UI widgets\n---\nRender: $ARGUMENTS\n",
+        )
+        .unwrap();
+
+        // load_dir on the specific .claude/skills/ path picks up the skill.
+        let skills = SkillCommandLoader::load_dir(&claude_skills);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "a2ui");
+    }
+
+    #[test]
+    fn load_dir_recursive_skills_win_over_claude_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        // .recursive/skills/refactor.md
+        let rec = dir.path().join(".recursive").join("skills");
+        std::fs::create_dir_all(&rec).unwrap();
+        std::fs::write(rec.join("refactor.md"), "Project refactor\n").unwrap();
+        // .claude/skills/refactor/SKILL.md
+        let claude = dir.path().join(".claude").join("skills").join("refactor");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("SKILL.md"),
+            "---\ndescription: Claude refactor\n---\nClaude refactor prompt\n",
+        )
+        .unwrap();
+
+        // load_dir on each individually: both should load.
+        let rec_skills = SkillCommandLoader::load_dir(&rec);
+        assert_eq!(rec_skills.len(), 1);
+        assert_eq!(rec_skills[0].name, "refactor");
+
+        let claude_skills = SkillCommandLoader::load_dir(&claude.parent().unwrap());
+        assert_eq!(claude_skills.len(), 1);
+        assert_eq!(claude_skills[0].name, "refactor");
     }
 }

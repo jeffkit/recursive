@@ -60,11 +60,28 @@ impl App {
             current_todos: Vec::new(),
             active_goal: None,
             workspace_path: workspace,
+            last_skill_reload: Some(Instant::now()),
             session_roots: recursive::new_shared_sandbox_roots(),
             theme: &crate::ui::theme::DARK,
             modal_scroll: 0,
             active_command_panel: None,
         }
+    }
+
+    /// Goal-322: lazy-reload skill commands from disk when the user presses
+    /// `/` to enter the command menu. Uses a time-based debounce
+    /// (500 ms between reloads) to avoid heavy scanning on every
+    /// keystroke in the command menu.
+    pub fn try_reload_skills(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_skill_reload {
+            if now.duration_since(last) < std::time::Duration::from_millis(500) {
+                return;
+            }
+        }
+        let skills = crate::skill_commands::SkillCommandLoader::load(&self.workspace_path);
+        self.commands.set_skill_commands(skills);
+        self.last_skill_reload = Some(now);
     }
 
     /// Push a modal onto the stack and reset the modal scroll to the top.
@@ -343,5 +360,63 @@ mod tests {
     #[test]
     fn estimate_cost_minimax_m3_is_known() {
         assert!(estimate_cost("MiniMax-M3", 1000, 1000, 0, 0).is_some());
+    }
+
+    // ── Goal-322: skill lazy reload ──────────────────────────────────────
+
+    #[test]
+    fn try_reload_skills_picks_up_new_skill_after_debounce() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let skills_dir = ws.path().join(".recursive").join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
+
+        // Write a uniquely-named skill file.
+        let skill_dir = skills_dir.join("goal322-unique");
+        std::fs::create_dir(&skill_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: First version\n---\nHello\n",
+        )
+        .expect("write");
+
+        // Build an App with the temp workspace, backdate last_skill_reload
+        // so the debounce is expired.
+        let mut app = App::new();
+        app.workspace_path = ws.path().to_path_buf();
+        app.last_skill_reload =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(600));
+
+        // Reload should pick up the unique skill.
+        app.try_reload_skills();
+        let has_unique = app
+            .commands
+            .skill_commands()
+            .iter()
+            .any(|s| s.name == "goal322-unique");
+        assert!(has_unique, "should contain goal322-unique after reload");
+
+        // Immediate second reload should no-op (debounce).
+        let count_before = app.commands.skill_commands().len();
+        app.try_reload_skills();
+        let count_after = app.commands.skill_commands().len();
+        assert_eq!(count_before, count_after);
+
+        // Backdate again and modify the file.
+        app.last_skill_reload =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(600));
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Updated version\n---\nUpdated\n",
+        )
+        .expect("write");
+
+        app.try_reload_skills();
+        let updated = app
+            .commands
+            .skill_commands()
+            .iter()
+            .find(|s| s.name == "goal322-unique")
+            .unwrap();
+        assert_eq!(updated.description, "Updated version");
     }
 }

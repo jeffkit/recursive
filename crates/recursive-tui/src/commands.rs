@@ -219,6 +219,11 @@ impl CommandRegistry {
         self
     }
 
+    /// Goal-322: replace skill commands in-place (for lazy reload).
+    pub fn set_skill_commands(&mut self, skills: Vec<SkillCommand>) {
+        self.skill_commands = skills;
+    }
+
     /// Return a reference to the loaded skill commands.
     pub fn skill_commands(&self) -> &[SkillCommand] {
         &self.skill_commands
