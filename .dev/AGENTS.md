@@ -216,6 +216,22 @@ tests/
    The full SOP is `.dev/skills/tui-acceptance.md`; the in-process harness
    is `crates/recursive-tui/src/harness.rs`.
 
+   **TUI changes must land tests in the same change** (contract, not just
+   gate). Any edit to `crates/recursive-tui/src/` MUST ship a test covering
+   the new/changed behaviour in the SAME commit:
+   - in-process: a `#[cfg(test)] mod tests` block in the changed file
+     (`use crate::harness::Harness;`), asserting via `Screen::find_row` /
+     `row_has_bg_color` / `text()` — NOT internal-state peeks;
+   - or integration: a case under `crates/recursive-tui/tests/`;
+   - or PTY: a case in `crates/tui-pty-harness/` for terminal-IO behaviour
+     the in-process harness can't reach.
+   Two flow gates enforce this: `tui-presence` (fast — fails if TUI src
+   changed with no test-bearing addition; `RECURSIVE_TUI_TEST_PRESENCE=0`
+   opt-out for a pure refactor, documented in the journal) runs BEFORE
+   `tui-mutants` (slow — rejects tests that pass but don't pin behaviour).
+   Write the test as you write the code, not after the gate fires — the
+   mutation gate will catch tautological tests, costing a resume-fix cycle.
+
    **E2E test authoring rules (applies when a goal touches `e2e/`).**
    The container binary (`recursive-e2e`) may lag the source tree. Before
    writing E2E assertions, verify the actual tool names and env-var support:

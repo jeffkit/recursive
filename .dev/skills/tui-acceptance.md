@@ -53,6 +53,23 @@ cargo test -p recursive-tui            # dev-dep enables test-utils; no flag nee
 
 All green before proceeding.
 
+### 2.5. Presence check — did you actually add a test? (enforced, fast)
+
+```bash
+.dev/scripts/tui-test-presence.sh
+```
+
+Exit 0 if no `crates/recursive-tui/src/` file changed, OR a test-bearing
+change was detected (a new `#[test]` / `#[cfg(test)]` / `mod tests` in a
+changed src file, a change under `crates/recursive-tui/tests/`, or a
+`tui-pty-harness` change). Exit 1 if TUI src changed with no test
+addition — fix by writing the test (step 1), not by opting out. Set
+`RECURSIVE_TUI_TEST_PRESENCE=0` only for a pure refactor with no
+behaviour change, and document why in the journal. This runs as the
+flow `tui-presence` gate BEFORE `tui-mutants`, so the cheap "you forgot
+tests" case is caught in milliseconds instead of a mutation-gate
+resume-fix cycle.
+
 ### 3. Prove the tests bite — mutation gate (enforced)
 
 ```bash

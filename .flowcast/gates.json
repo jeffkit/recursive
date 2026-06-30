@@ -1,10 +1,16 @@
 {
-  "_comment": "recursive 项目特定质量门（committed）。flowcast self-improve flow 经 loadGates 加载，与内置 cargo test/clippy/fmt 门用 mergeGates 合并（项目门追加在后）。新增门或覆盖同名内置门都在这里声明，不改 flow 代码。",
+  "_comment": "recursive 项目特定质量门（committed）。flowcast self-improve flow 经 loadGates 加载，与内置 cargo test/clippy/fmt 门用 mergeGates 合并（项目门追加在后，按对象顺序）。新增门或覆盖同名内置门都在这里声明，不改 flow 代码。",
   "gates": {
     "e2e": {
       "cmd": "sh .dev/scripts/e2e-gate.sh",
       "onFail": "resume-fix",
       "timeout": 600000
+    },
+    "tui-presence": {
+      "_comment": "快存在性门：动了 crates/recursive-tui/src/ 就必须有测试改动（#[test]/#[cfg(test)]/mod tests 或 tests/ 或 tui-pty-harness）。零测试提前拦，省一次 resume-fix。排在 tui-mutants 前。RECURSIVE_TUI_TEST_PRESENCE=0 opt-out（纯重构，journal 说明）。",
+      "cmd": "sh .dev/scripts/tui-test-presence.sh",
+      "onFail": "resume-fix",
+      "timeout": 60000
     },
     "tui-mutants": {
       "_comment": "TUI 测试有效性门（stage 3/5）。tui-mutants.sh 自带变更检测：未动 crates/recursive-tui/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix 把 survivor 报告喂回 agent 强化测试后再跑一次——这正是 effectiveness loop 的价值；cargo-mutants 缺失时 resume-fix 会让 agent 装上它（或装不上则硬回滚）。",

@@ -34,18 +34,23 @@ All three must be clean. If clippy has warnings, fix them — the self-improve
 script treats clippy failures as rollback triggers.
 
 If your change touches `crates/recursive-tui/src/`, also run the TUI
-mutation gate and the PTY tour described in `.dev/skills/tui-acceptance.md`:
+test gates and the PTY tour described in `.dev/skills/tui-acceptance.md`:
 
 ```bash
+.dev/scripts/tui-test-presence.sh    # fast: must exit 0 (you added tests)
 .dev/scripts/tui-mutants.sh          # must exit 0 (no surviving mutants)
 ```
 
-`self-improve.sh` enforces this as a hard gate (`RECURSIVE_TUI_MUTANTS`),
+The presence gate fails if TUI src changed with no test-bearing addition
+(`RECURSIVE_TUI_TEST_PRESENCE=0` opt-out for a pure refactor — document
+why). The mutation gate fails if tests pass but don't pin behaviour.
+`self-improve.sh` enforces these as hard gates (`RECURSIVE_TUI_MUTANTS`),
 so a TUI change that lands weak tests gets rolled back. The canonical
 self-improve path is the Flowcast flow (`.dev/flows/self-improve.flow.js`);
-its `tui-mutants` project gate (declared in `.flowcast/gates.json`) runs
-`tui-mutants.sh` with `onFail: resume-fix`, so surviving mutants are fed
-back to the agent to strengthen tests. `self-improve.sh` is deprecated —
+its `tui-presence` and `tui-mutants` project gates (declared in
+`.flowcast/gates.json`) run `tui-test-presence.sh` then `tui-mutants.sh`
+with `onFail: resume-fix`, so missing/weak tests are fed back to the
+agent. `self-improve.sh` is deprecated —
 see the warning at its top.
 
 ## Code conventions

@@ -157,10 +157,12 @@ path is the Flowcast flow. Concretely:
 
 ## Notes
 
-- The mutation gate (P1) is enforced via `self-improve.sh`, not via a
+- The mutation gate (P1) is enforced by the Flowcast self-improve flow
+  via the `tui-mutants` project gate in `.flowcast/gates.json`, not via a
   `cargo test` — `cargo-mutants` mutates source in-place and is slow, so
-  it belongs in the wrapper, not the test suite. Run manually:
-  `.dev/scripts/tui-mutants.sh`.
+  it belongs in the flow's gate chain, not the test suite. Run manually:
+  `.dev/scripts/tui-mutants.sh`. The legacy `self-improve.sh` is
+  deprecated and does NOT carry this gate.
 - The PTY regression test boots the real binary; it inherits the user's
   `~/.recursive/config.toml`. That's fine — the splash renders regardless
   of online/offline state. If the binary ever fails to boot without
@@ -168,3 +170,32 @@ path is the Flowcast flow. Concretely:
 - Did NOT touch the worktree workflow — this was a direct manual edit
   session in the main checkout (no in-flight self-improve run; `.dev/runs/`
   and `.worktrees/` checked empty).
+
+## Follow-up: close the "write tests when writing TUI code" gap (A+B+C)
+
+Operator flagged a gap: the mutation gate is *reactive* — it only fires
+after a run, so an agent writing TUI code with zero/tautological tests
+wastes a resume-fix cycle, and direct (non-flow) edits had no
+enforcement at all. Closed at three layers:
+
+- **A. Contract**: `.dev/AGENTS.md` now states TUI src changes MUST ship
+  a test in the same commit (in-process `Harness`, `tests/`, or PTY), so
+  the flow's system-prompt injection makes the agent proactive.
+- **B. Goal template**: `.dev/goals/_TEMPLATE-tui-acceptance.md` marks
+  the Tests section REQUIRED and adds a presence-gate acceptance bullet.
+- **C. Presence pre-gate**: new `.dev/scripts/tui-test-presence.sh` —
+  fast (ms) check that fails (exit 1) if `crates/recursive-tui/src/`
+  changed with no test-bearing addition (`#[test]`/`#[cfg(test)]`/`mod
+  tests` in a changed src file, a `tests/` change, or a `tui-pty-harness`
+  change). `RECURSIVE_TUI_TEST_PRESENCE=0` opt-out for pure refactors
+  (journal-documented). Registered as the `tui-presence` flow gate in
+  `.flowcast/gates.json`, ordered BEFORE `tui-mutants` (final chain:
+  test → clippy → fmt → e2e → tui-presence → tui-mutants). Verified all
+  three paths: skip (no TUI src), pass (test marker added), fail (src
+  only). Also documented in CLAUDE.md mandatory gates for direct edits.
+
+No git pre-commit hook added — the repo has no committed-hook convention
+(`.git/hooks` is local-only), so a hook wouldn't share across clones.
+Direct-edit enforcement relies on the CLAUDE.md instruction + the script;
+flow enforcement is automatic. A committed `core.hooksPath`-based hook
+is a possible future hardening.
