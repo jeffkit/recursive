@@ -61,8 +61,8 @@ tests/
    exit code by inspecting `outcome.finish` AFTER persisting the
    transcript — see `main.rs::exit_for_finish`. **NEVER** introduce
    a new `Error::XxxBudget` or `Error::XxxLimit` variant that
-   short-circuits the transcript save. self-improve.sh's auto-resume
-   gate depends on the saved transcript existing on disk.
+   short-circuits the transcript save. The self-improve flow's auto-resume
+   step depends on the saved transcript existing on disk.
    Automated test: `tests/invariants/finish_reason_data.rs`
 8. **Tool-call ↔ tool-result pairing.** Every `Role::Tool` message
    in the transcript MUST be immediately preceded by a `Role::Assistant`
@@ -165,18 +165,18 @@ tests/
    All four must be green before you stop. `-D warnings` means even a
    clippy *warning* will fail the build.
 
-   **`cargo fmt --all` is enforced as a hard gate by `self-improve.sh`**
+   **`cargo fmt --all` is enforced as a hard gate by the self-improve flow**
    (since g141): if `cargo fmt --all -- --check` is non-zero after your
-   edits, the wrapper rolls the run back. Running `cargo fmt --all`
-   in-place is sufficient — the wrapper re-checks via `--check`. Only
-   set `RECURSIVE_FMT_CHECK=0` if you have a documented reason in the
+   edits, the flow rolls the run back (the fmt gate uses `onFail: autofix`,
+   so it first runs `cargo fmt --all` in place, then re-checks). Only set
+   `RECURSIVE_FMT_CHECK=0` if you have a documented reason in the
    journal entry.
 
    **`cargo clippy --all-targets --all-features -- -D warnings` is also
-   a hard gate by `self-improve.sh`** (since g262 — added after a
+   a hard gate by the self-improve flow** (since g262 — added after a
    deepseek-pro run landed 2 unused imports that `cargo test` accepted
    but `cargo clippy` rejected): if the clippy run is non-zero after
-   your edits, the wrapper invokes a one-shot resume-fix replay
+   your edits, the flow invokes a one-shot resume-fix replay
    asking you to clean up the lints, then re-runs the gate. A
    mechanical lint (needless_borrow, redundant_clone, unused_imports)
    is almost always a one-line change — do not push back. Only set
@@ -184,20 +184,37 @@ tests/
    clippy-dirty code (very rare; document the reason in the journal
    entry).
 
-   **E2E smoke is a hard gate by `self-improve.sh`** (restored after
-   being silently skipped on g262): the wrapper runs
+   **E2E smoke is a hard gate by the self-improve flow** (restored after
+   being silently skipped on g262): the flow runs the `e2e` project gate
+   declared in `.flowcast/gates.json` →
    `cd e2e && argusai -c e2e.yaml run -s smoke` (3 scenarios: basic
    Write, basic Read, session-recording assertions).
    Replay mode — deterministic, no API key, ~700ms. If it fails the
-   wrapper invokes a one-shot resume-fix replay asking you to fix
+   flow invokes a one-shot resume-fix replay asking you to fix
    the regression. If the E2E prerequisites are missing (argusai not
    on PATH, no `e2e/e2e.yaml`, or `e2e/plugins/dist/index.js` not
-   built) the gate is HARD-FAIL — the wrapper rolls back. argusai
-   is normally picked up via fnm's multishell path, but the wrapper
+   built) the gate is HARD-FAIL — the flow rolls back. argusai
+   is normally picked up via fnm's multishell path, but the gate
    has a fallback to the stable fnm install path
    (`$FNM_DIR/node-versions/*/installation/bin/argusai`) for
    non-interactive subprocesses. Only set `RECURSIVE_SMOKE_TEST=0`
    if Docker is genuinely unavailable in the run environment.
+
+   **TUI mutation gate is a hard gate by the self-improve flow** (added in the
+   tui-test review): when a goal changes anything under
+   `crates/recursive-tui/src/`, the flow's `tui-mutants` project gate
+   (declared in `.flowcast/gates.json`) runs
+   `.dev/scripts/tui-mutants.sh` (scoped to the changed files) after the
+   e2e gate. A surviving mutant = a test that passes but doesn't pin the
+   changed behaviour → `onFail: resume-fix` (the flow feeds the survivor
+   report back to the agent to strengthen tests, then re-runs the gate);
+   still failing → rollback. `cargo-mutants` missing is also a hard
+   failure — install it (`cargo install cargo-mutants`). `tui-mutants.sh`
+   self-skips (exit 0) when no TUI source changed, so non-TUI goals pay
+   nothing. The legacy `.dev/scripts/self-improve.sh` is deprecated and
+   does NOT carry this gate — use the flow.
+   The full SOP is `.dev/skills/tui-acceptance.md`; the in-process harness
+   is `crates/recursive-tui/src/harness.rs`.
 
    **E2E test authoring rules (applies when a goal touches `e2e/`).**
    The container binary (`recursive-e2e`) may lag the source tree. Before

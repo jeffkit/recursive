@@ -214,19 +214,23 @@ impl SkillCommandLoader {
         // directory name as the stem so parse_content falls back to it.
         let synthetic = PathBuf::from(format!("/fake/{dir_name}.md"));
         let parsed = Self::parse_content(&synthetic, &raw);
-        if parsed.is_none() {
-            tracing::warn!(
-                target: "recursive::tui::skill_commands",
-                path = %skill_md_path.display(),
-                "skill_commands: directory skill front-matter / name empty; skipping"
-            );
-            return None;
-        }
-        // Fix up source_path to point at the real SKILL.md.
-        Some(SkillCommand {
-            source_path: skill_md_path.to_path_buf(),
-            ..parsed.unwrap()
-        })
+        // Fix up source_path to point at the real SKILL.md. `parse_content`
+        // returns None on empty front-matter / name; warn and skip there
+        // rather than unwrapping (the crate denies `unwrap_used` in
+        // non-test code).
+        let mut parsed = match parsed {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    target: "recursive::tui::skill_commands",
+                    path = %skill_md_path.display(),
+                    "skill_commands: directory skill front-matter / name empty; skipping"
+                );
+                return None;
+            }
+        };
+        parsed.source_path = skill_md_path.to_path_buf();
+        Some(parsed)
     }
 
     /// Parse a single skill file. Returns `None` on IO / parse errors and
@@ -669,7 +673,7 @@ $ARGUMENTS
         assert_eq!(rec_skills.len(), 1);
         assert_eq!(rec_skills[0].name, "refactor");
 
-        let claude_skills = SkillCommandLoader::load_dir(&claude.parent().unwrap());
+        let claude_skills = SkillCommandLoader::load_dir(claude.parent().unwrap());
         assert_eq!(claude_skills.len(), 1);
         assert_eq!(claude_skills[0].name, "refactor");
     }

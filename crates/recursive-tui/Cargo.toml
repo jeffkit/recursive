@@ -33,6 +33,11 @@ tempfile = "3"
 # `--features recursive/test-utils` CLI flag needed. Required by the
 # in-process harness workflow (see src/harness.rs).
 recursive = { package = "recursive-agent", path = "../..", features = ["test-utils"] }
+# PTY integration-layer harness. Used by tests/pty_regression.rs to run the
+# real `recursive-tui` binary under a PTY and assert on the rendered screen —
+# the layer the in-process harness can't reach (raw mode, alternate screen,
+# mouse). See `.dev/skills/tui-acceptance.md` step 4.
+tui-pty-harness = { path = "../tui-pty-harness" }
 
 [features]
 default = ["skill-hub"]

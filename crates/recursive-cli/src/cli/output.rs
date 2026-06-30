@@ -108,12 +108,12 @@ pub(crate) fn save_session(
 }
 
 /// Return Err iff the finish reason should propagate as a non-zero binary
-/// exit code so that self-improve.sh's auto-resume gate fires. The
+/// exit code so that the self-improve flow's auto-resume step fires. The
 /// transcript has already been saved by the caller before this is called.
 ///
 /// `Cancelled` is intentionally **not** an error: shutdown via SIGINT
 /// or SIGTERM is user-initiated, the saved transcript is intact, and
-/// self-improve.sh must NOT auto-resume something the user explicitly
+/// the self-improve flow must NOT auto-resume something the user explicitly
 /// stopped. The fall-through `_ => Ok(())` covers it.
 pub(crate) fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
     match finish {

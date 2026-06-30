@@ -29,8 +29,8 @@ Add a `#[cfg(test)]` test driving the change through `Harness`
 (`use crate::harness::Harness;`). Prefer visual assertions
 (`Screen::find_row` / `row_has_bg_color` / `text()` / `numbered()`)
 over internal-state peeks. For highlight/marker alignment, assert on the
-**specific** colour via `row_has_bg_color`, not `has_bg` (panel base
-fills every row).
+**specific** colour via `row_has_bg_color`, not a coarse "any bg" check
+(panel base fills every row; the old `has_bg` helper was removed for this).
 
 <sketch the exact assertions the test should make>
 

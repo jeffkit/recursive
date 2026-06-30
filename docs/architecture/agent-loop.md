@@ -39,7 +39,8 @@ Configured via `AgentConfig`:
 - `stuck_error_rate` — default 0.8 (fraction of errors to trigger Stuck)
 
 When triggered, `FinishReason::Stuck` is returned and the transcript is saved
-so `self-improve.sh` can inspect what went wrong.
+so the self-improve flow (`.dev/flows/self-improve.flow.js`) can inspect what
+went wrong.
 
 ## Compaction
 

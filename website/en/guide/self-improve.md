@@ -4,18 +4,23 @@ One of Recursive's most distinctive features is that it runs its own development
 
 ## How it works
 
-The self-improvement loop lives in `.dev/scripts/self-improve.sh`. At a high level:
+The self-improvement loop is orchestrated by a Flowcast flow at
+`.dev/flows/self-improve.flow.js` (launched via
+`.dev/scripts/launch-flow.sh`; see `.dev/flows/SELF_IMPROVE.md`). At a
+high level:
 
 ```
 1. Read goal from .dev/goals/ or .dev/ROADMAP.md
 2. Launch recursive loop with coding tools (read_file, write_file, apply_patch, run_shell)
 3. Agent reads the codebase, understands the goal, makes changes
-4. Run `cargo test` to verify
-5. Run `cargo clippy` to check quality
-6. If all pass: commit the changes
-7. If fail: rollback, try again with adjusted approach
-8. Emit an observation to .dev/journal/ for the next run
+4. Quality gates: cargo test / clippy / fmt (+ project gates from .flowcast/gates.json)
+5. If all pass: commit the changes
+6. If fail: resume-fix once, then rollback
+7. Emit an observation to .dev/journal/ for the next run
 ```
+
+> The legacy `.dev/scripts/self-improve.sh` bash wrapper is deprecated;
+> the flow is the canonical, auditable, resumable path.
 
 ## The observation system
 

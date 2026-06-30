@@ -53,7 +53,7 @@ cargo test -p recursive-tui            # dev-dep enables test-utils; no flag nee
 
 All green before proceeding.
 
-### 3. Prove the tests bite — mutation gate
+### 3. Prove the tests bite — mutation gate (enforced)
 
 ```bash
 .dev/scripts/tui-mutants.sh                       # auto: files changed vs main
@@ -64,6 +64,20 @@ All green before proceeding.
 - **Exit non-zero** (survivors) → read `mutants.out/missed.txt`, add or
   strengthen the harness test that should have caught each survivor,
   re-run until green.
+
+**This step is a hard gate in the self-improve flow** (since the tui-test
+review): the flow's `tui-mutants` project gate — declared in
+`.flowcast/gates.json` and loaded via `mergeGates` — runs
+`tui-mutants.sh` after the e2e gate when a goal changes anything under
+`crates/recursive-tui/src/`. It uses `onFail: resume-fix`: the flow feeds
+the survivor report back to the agent to strengthen tests, then re-runs
+the gate; still failing → rollback (same shape as clippy/e2e).
+`cargo-mutants` missing is also a hard failure — install it
+(`cargo install cargo-mutants`). `tui-mutants.sh` self-skips (exit 0)
+when no TUI source changed, so non-TUI goals pay nothing. So step 3 is
+no longer advisory; an agent that skips it cannot land weak TUI tests.
+The legacy `.dev/scripts/self-improve.sh` is deprecated and does NOT
+carry this gate — use the flow (`.dev/flows/self-improve.flow.js`).
 
 Scope to the **touched files only** (the default). A whole-crate run is
 slow and out of scope for a single change. Exceptions: survivors in
@@ -109,10 +123,17 @@ block on it unless your change is in `recursive-cli`.
 
 - ❌ Asserting only on `App` internal fields when a `Screen::find_row`
   assertion would catch the rendering too.
-- ❌ Using `Screen::has_bg` / `row_has_bg` to detect a highlight bar —
-  panel base fills make every row "have bg". Use `row_has_bg_color` with
-  the specific highlight colour.
+- ❌ Using a "any background" check to detect a highlight bar — panel
+  base fills make every row "have bg". The coarse `Screen::has_bg` /
+  `row_has_bg` helpers were removed for this reason; use `row_has_bg_color`
+  with the specific highlight colour (or `row_has_bg_other_than` with the
+  panel's base colour to filter it out).
 - ❌ Skipping step 3 because step 2 passed — passing tests can be
-  tautologies; the mutation gate is the effectiveness check.
+  tautologies; the mutation gate is the effectiveness check (and a hard
+  gate in the self-improve flow via `.flowcast/gates.json`).
 - ❌ PTY-tour with a relative `--bin` path — the spawner won't find it.
 - ❌ Mutating the whole crate every commit — scope to touched files.
+- ❌ Sleeping a fixed `--wait-ms` and hoping the TUI finished — the PTY
+  harness now polls for screen stability (`--stable-ms`). Prefer the
+  `tui_pty_harness` lib in tests over shelling out, and set `--stable-ms`
+  high enough for slow CI boots.

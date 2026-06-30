@@ -26,12 +26,15 @@ inside the product surface.
   (steps, tool-call mix, errors, cost) auto-extracted from each
   journal by `scripts/observe.sh` and pinned to a rolling
   comparison table.
-- `scripts/self-improve.sh` — wrapper that points Recursive at its own
-  source, injects `AGENTS.md` + recent journal as the system prompt, runs
-  the agent, verifies tests, then either commits or rolls back.
-- `scripts/parallel-self-improve.sh` — wraps the above in a fresh git
-  worktree on a new branch, so multiple goals can run concurrently
-  without touching each other.
+- `scripts/launch-flow.sh` — **canonical** launcher for the Flowcast
+  self-improve flow (`.dev/flows/self-improve.flow.js`); see
+  `.dev/flows/SELF_IMPROVE.md`. Enforces cargo test/clippy/fmt + project
+  gates from `.flowcast/gates.json` (`e2e`, `tui-mutants`).
+- `scripts/self-improve.sh` — ⚠️ **deprecated** legacy bash wrapper.
+  Kept for historical reference; gates added after flow adoption may be
+  missing here. Use `launch-flow.sh` instead.
+- `scripts/parallel-self-improve.sh` — ⚠️ **deprecated** wrapper around
+  the legacy bash script. The flow handles worktree isolation itself.
 - `scripts/observe.sh` — journal → structured metrics extractor.
 
 ## Why a `.dev/` boundary
@@ -48,12 +51,14 @@ feature of the product. Keeping these artifacts under `.dev/` means:
 ## How to invoke a self-improvement cycle
 
 ```bash
-# from the repo root, with a clean working tree on a committed HEAD:
-.dev/scripts/self-improve.sh .dev/goals/02-anti-stuck.md
+# canonical: Flowcast flow (auditable, observable, resumable)
+.dev/scripts/launch-flow.sh --goal-file .dev/goals/02-anti-stuck.md --provider deepseek
+# see .dev/flows/SELF_IMPROVE.md for the full flag set
 ```
 
-The script will commit on success and hard-reset on failure. You only need
-to read the resulting journal entry to know what happened.
+The flow commits on success and rolls back on failure. You only need
+to read the resulting journal entry to know what happened. The legacy
+`.dev/scripts/self-improve.sh .dev/goals/02-anti-stuck.md` is deprecated.
 
 ## How to cut a release
 

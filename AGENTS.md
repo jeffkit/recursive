@@ -2,9 +2,11 @@
 
 You are operating in the **recursive-agent** workspace. This is the
 self-improving coding-agent project. The dev loop drives agents
-(MiniMax / DeepSeek / GLM) to land roadmap features via
-`.dev/scripts/self-improve.sh`. Detailed contract is in
-`.dev/AGENTS.md` — read it before making changes.
+(MiniMax / DeepSeek / GLM) to land roadmap features via the Flowcast
+flow `.dev/flows/self-improve.flow.js` (launched by
+`.dev/scripts/launch-flow.sh`; see `.dev/flows/SELF_IMPROVE.md`). The
+legacy `.dev/scripts/self-improve.sh` is deprecated. Detailed contract is
+in `.dev/AGENTS.md` — read it before making changes.
 
 ## What you should know up front
 
@@ -25,7 +27,7 @@ self-improving coding-agent project. The dev loop drives agents
   in `.dev/AGENTS.md`). `cargo test` is the canonical verifier.
 
 - **`cargo clippy --all-targets -- -D warnings` is enforced.** A
-  clippy lint will cause `self-improve.sh` to roll back the entire
+  clippy lint will cause the self-improve flow to roll back the entire
   product commit. Run clippy locally before declaring done.
 
 - **Lint-as-you-go.** Use `cargo fmt --all` before committing.

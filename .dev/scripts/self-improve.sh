@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# ⚠️ DEPRECATED — kept only for historical reference. Do NOT run this for new
+# self-improve work. The canonical self-improve path is the Flowcast flow at
+# `.dev/flows/self-improve.flow.js` (see `.dev/flows/SELF_IMPROVE.md`), launched
+# via `.dev/scripts/launch-flow.sh`. That flow is auditable, observable, and
+# resumable, and is where the project quality gates (cargo test/clippy/fmt +
+# project gates from `.flowcast/gates.json`, including the TUI mutation gate)
+# are enforced. This bash wrapper is no longer maintained — quality gates added
+# after 2026-06-15 (flow adoption) live only in the flow and may be MISSING here.
+# A stderr warning is printed on every invocation to steer operators to the flow.
+#
 # self-improve.sh — DEVELOPER-only wrapper: invoke Recursive against its own source.
 #
 # This script is NOT part of the shipping product. Self-improvement is a
@@ -12,6 +22,16 @@
 #     auto-commits all changes with a descriptive message and prints
 #     a "READY TO LAND" pointer for the operator.
 #   - On any failure: hard-resets to baseline. Nothing in src/ survives.
+
+# Deprecation nudge: warn once per invocation, but still run so existing
+# automation that hasn't migrated yet doesn't silently break. Set
+# RECURSIVE_LEGACY_BASH_SELF_IMPROVE=1 to silence (acknowledged-deprecated use).
+if [[ "${RECURSIVE_LEGACY_BASH_SELF_IMPROVE:-0}" != "1" ]]; then
+  echo "[self-improve.sh] ⚠️ DEPRECATED: use the Flowcast flow instead —" >&2
+  echo "[self-improve.sh]    .dev/scripts/launch-flow.sh --goal-file <goal>  (see .dev/flows/SELF_IMPROVE.md)" >&2
+  echo "[self-improve.sh]    This bash wrapper is unmaintained; gates added after flow adoption may be missing here." >&2
+  echo "[self-improve.sh]    Set RECURSIVE_LEGACY_BASH_SELF_IMPROVE=1 to silence this warning." >&2
+fi
 #
 # Usage:
 #   .dev/scripts/self-improve.sh .dev/goals/02-foo.md

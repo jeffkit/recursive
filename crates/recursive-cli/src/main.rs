@@ -2332,7 +2332,7 @@ mod tests {
     // the non-streaming code path called `bool::then(...).unwrap()` and
     // panicked because `then(false)` returns None. This made every
     // `recursive run` (default: stream=false) panic at startup, which
-    // in turn broke all parallel-self-improve.sh launches in batch 13.
+    // in turn broke all parallel self-improve launches in batch 13.
     /// Smoke test for `build_runtime` across the matrix of stream flag and
     /// provider selector. Consolidated into ONE test per AGENTS.md guidance
     /// because the anthropic branch reads `RECURSIVE_PROVIDER_TYPE` from the

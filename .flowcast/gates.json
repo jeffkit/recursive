@@ -5,6 +5,12 @@
       "cmd": "sh .dev/scripts/e2e-gate.sh",
       "onFail": "resume-fix",
       "timeout": 600000
+    },
+    "tui-mutants": {
+      "_comment": "TUI 测试有效性门（stage 3/5）。tui-mutants.sh 自带变更检测：未动 crates/recursive-tui/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix 把 survivor 报告喂回 agent 强化测试后再跑一次——这正是 effectiveness loop 的价值；cargo-mutants 缺失时 resume-fix 会让 agent 装上它（或装不上则硬回滚）。",
+      "cmd": "sh .dev/scripts/tui-mutants.sh",
+      "onFail": "resume-fix",
+      "timeout": 1200000
     }
   }
 }

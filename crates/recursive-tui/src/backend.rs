@@ -1167,4 +1167,103 @@ mod tests {
             std::env::set_var("OPENAI_API_KEY", v);
         }
     }
+
+    // ── Goal-170: real cancel-during-turn aborts the in-flight task,
+    //    truncates the transcript, and emits UiEvent::Interrupted. The
+    //    earlier `interrupt_action_sets_cancel_flag` only checks the flag
+    //    flips; this one drives the full worker_loop path with a Ready
+    //    runtime whose tool hangs, so the abort actually has something to
+    //    cancel — covering the backend layer the in-process harness can't
+    //    reach (it doesn't spin up a backend).
+    use recursive::llm::{Completion, MockProvider, ToolCall};
+    use recursive::tools::{Tool, ToolRegistry};
+    use recursive::AgentRuntime;
+    use serde_json::{json, Value};
+
+    /// A tool that never returns — `std::future::pending` parks forever so
+    /// the turn task stays in-flight until the worker aborts it.
+    struct HangTool;
+
+    #[async_trait::async_trait]
+    impl Tool for HangTool {
+        fn spec(&self) -> recursive::llm::ToolSpec {
+            recursive::llm::ToolSpec {
+                name: "hang".into(),
+                description: "test tool that never returns".into(),
+                parameters: json!({"type":"object","properties":{}}),
+            }
+        }
+        async fn execute(&self, _args: Value) -> recursive::error::Result<String> {
+            std::future::pending::<()>().await;
+            Ok("never".into())
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    async fn interrupt_aborts_running_turn_and_emits_interrupted() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(
+            MockProvider::new(vec![Completion {
+                content: "calling hang".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "hang".into(),
+                    arguments: json!({}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            }])
+            .with_on_complete(notify.clone()),
+        );
+        let tools = ToolRegistry::local().register(Arc::new(HangTool));
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .tools(tools)
+            .build()
+            .expect("runtime builds");
+
+        let mut backend = Backend::spawn_with_runtime(rt);
+        backend
+            .action_tx
+            .send(UserAction::SendMessage("hi".into()))
+            .unwrap();
+
+        // Wait until the mock completion has returned — at that point the
+        // agent is dispatching the hang tool and the turn is genuinely
+        // in-flight, so an Interrupt won't be cleared by the turn-start
+        // `cancel_flag.store(false)` reset (line ~504/814 in worker_loop).
+        // `notify.notified()` is single-use but re-entrant: if the mock
+        // already fired, the first await returns immediately.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), notify.notified()).await;
+        // Give the worker a beat to enter the tool dispatch path.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        backend.action_tx.send(UserAction::Interrupt).unwrap();
+
+        let mut got_interrupted = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::Interrupted)) => {
+                    got_interrupted = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(
+            got_interrupted,
+            "Interrupt should abort the running turn and emit UiEvent::Interrupted"
+        );
+    }
 }

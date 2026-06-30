@@ -11,6 +11,10 @@ publish = false
 name = "tui-pty"
 path = "src/main.rs"
 
+[lib]
+name = "tui_pty_harness"
+path = "src/lib.rs"
+
 [dependencies]
 # portable-pty: cross-platform PTY (wezterm's crate). Implementing PTY
 # allocation by hand is infeasible across macOS/Linux/Windows; this is the

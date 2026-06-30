@@ -61,8 +61,8 @@ provider with HTTP 400.
 ## Resume
 
 `AgentRuntime` can reload a previous session's transcript and continue from
-where it left off. The `self-improve.sh` auto-resume gate checks that a saved
-transcript exists before attempting resume.
+where it left off. The self-improve flow's auto-resume step checks that a
+saved transcript exists before attempting resume.
 
 ## Migration
 

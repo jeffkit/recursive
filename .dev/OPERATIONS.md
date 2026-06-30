@@ -1,5 +1,16 @@
 # OPERATIONS.md — orchestrator handover (v2)
 
+> **⚠️ Canonical path is the Flowcast flow.** The self-improve loop is
+> orchestrated by `.dev/flows/self-improve.flow.js`, launched via
+> `.dev/scripts/launch-flow.sh`; see `.dev/flows/SELF_IMPROVE.md` for the
+> authoritative SOP. Quality gates (cargo test/clippy/fmt + project gates
+> from `.flowcast/gates.json`, including `e2e` and `tui-mutants`) are
+> enforced by the flow. The bash wrappers `.dev/scripts/self-improve.sh`
+> and `parallel-self-improve.sh` are **deprecated** (see the deprecation
+> banner at the top of `self-improve.sh`); the bash-specific sections
+> below are retained as legacy reference and may describe gates the flow
+> has since moved into `.flowcast/gates.json`.
+
 > **Audience.** Any agent or human picking up the **self-improve loop**
 > for this repo after the previous orchestrator went away.
 >

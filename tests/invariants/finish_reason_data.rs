@@ -7,7 +7,7 @@
 // `outcome.finish` AFTER persisting the transcript — see
 // `main.rs::exit_for_finish`. NEVER introduce a new `Error::XxxBudget` or
 // `Error::XxxLimit` variant that short-circuits the transcript save.
-// self-improve.sh's auto-resume gate depends on the saved transcript
+// The self-improve flow's auto-resume step depends on the saved transcript
 // existing on disk."
 //
 // This test verifies:
@@ -15,7 +15,7 @@
 // - No `Error` variant corresponds to a `FinishReason` tag (no
 //   `Error::XxxBudget` etc.)
 // - `FinishReason` Display format is stable (used in CLI exit codes and
-//   self-improve.sh auto-resume)
+//   the self-improve flow's auto-resume)
 
 use recursive::agent::FinishReason;
 
@@ -61,7 +61,7 @@ fn finish_reason_serde_roundtrip() {
 
 // ── Display format is stable ───────────────────────────────────────────────
 
-/// `FinishReason::Display` is used by self-improve.sh auto-resume gate.
+/// `FinishReason::Display` is used by the self-improve flow's auto-resume step.
 /// It must be stable across refactors.
 #[test]
 fn finish_reason_display_is_stable() {

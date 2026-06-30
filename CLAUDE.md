@@ -33,6 +33,21 @@ cargo fmt --all
 All three must be clean. If clippy has warnings, fix them — the self-improve
 script treats clippy failures as rollback triggers.
 
+If your change touches `crates/recursive-tui/src/`, also run the TUI
+mutation gate and the PTY tour described in `.dev/skills/tui-acceptance.md`:
+
+```bash
+.dev/scripts/tui-mutants.sh          # must exit 0 (no surviving mutants)
+```
+
+`self-improve.sh` enforces this as a hard gate (`RECURSIVE_TUI_MUTANTS`),
+so a TUI change that lands weak tests gets rolled back. The canonical
+self-improve path is the Flowcast flow (`.dev/flows/self-improve.flow.js`);
+its `tui-mutants` project gate (declared in `.flowcast/gates.json`) runs
+`tui-mutants.sh` with `onFail: resume-fix`, so surviving mutants are fed
+back to the agent to strengthen tests. `self-improve.sh` is deprecated —
+see the warning at its top.
+
 ## Code conventions
 
 - **Prefer `Edit` discipline mentally**: when editing existing files,
@@ -64,9 +79,11 @@ This keeps the observation history coherent with the self-improve loop runs.
 ## Parallel workflow context
 
 This project also uses Recursive's **self-improve loop** (orchestrated via
-`.dev/scripts/self-improve.sh`) where Recursive edits its own source.
-If you're about to do work that could conflict with an in-flight self-improve
-run, check first:
+the Flowcast flow at `.dev/flows/self-improve.flow.js`, launched by
+`.dev/scripts/launch-flow.sh`; see `.dev/flows/SELF_IMPROVE.md`) where
+Recursive edits its own source. The legacy `.dev/scripts/self-improve.sh`
+is deprecated. If you're about to do work that could conflict with an
+in-flight self-improve run, check first:
 
 ```bash
 ls .dev/runs/ 2>/dev/null
@@ -193,8 +210,10 @@ runtime state between cases through temp files (`echo "$ID" > /tmp/my-sid`).
 ## Skills available in this project
 
 - `/recursive-loop` — act as the loop orchestrator: read roadmap, pick goals,
-  launch `self-improve.sh`, handle results. Use this when the user wants
-  Recursive to self-improve rather than you directly editing code.
+  launch the Flowcast self-improve flow (`.dev/flows/self-improve.flow.js`
+  via `.dev/scripts/launch-flow.sh`), handle results. Use this when the
+  user wants Recursive to self-improve rather than you directly editing code.
+  The legacy `.dev/scripts/self-improve.sh` is deprecated.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

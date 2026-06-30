@@ -11,7 +11,7 @@
 //!
 //! - **Observation:** `harness.render().text()` / `numbered()` gives a
 //!   deterministic string snapshot of the screen the AI can read and
-//!   assert against. Cell-level style access (`has_bg`, `style`) lets
+//!   assert against. Cell-level style access (`bg`, `style`) lets
 //!   tests verify *visual* properties (e.g. the highlight bar and the
 //!   `▶` marker share a row) rather than just internal state.
 //! - **Effectiveness:** because these tests are fast and deterministic,
@@ -54,7 +54,7 @@ use std::collections::VecDeque;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::Terminal;
 
 use crate::app::App;
@@ -100,8 +100,8 @@ impl Screen {
     }
 
     /// The background colour at `(x, y)`, or `None` if unset / `Reset`.
-    /// Use this (rather than [`Screen::has_bg`]) when you need to tell a
-    /// highlight bar apart from a panel block's uniform base fill.
+    /// Use this when you need to tell a highlight bar apart from a panel
+    /// block's uniform base fill.
     pub fn bg(&self, x: u16, y: u16) -> Option<Color> {
         match self.buf[(x, y)].style().bg {
             Some(Color::Reset) | None => None,
@@ -118,24 +118,6 @@ impl Screen {
     /// Pass a panel's base colour to filter out its uniform block background.
     pub fn row_has_bg_other_than(&self, y: u16, base: Color) -> bool {
         (0..self.width).any(|x| matches!(self.bg(x, y), Some(c) if c != base))
-    }
-
-    /// `true` if the cell has any non-default background (a coloured or
-    /// reversed fill). Coarse — does not distinguish a highlight from a
-    /// block's base fill; prefer [`Screen::bg`] / [`Screen::row_has_bg_color`]
-    /// for highlight-bar detection.
-    pub fn has_bg(&self, x: u16, y: u16) -> bool {
-        self.bg(x, y).is_some()
-            || self.buf[(x, y)]
-                .style()
-                .add_modifier
-                .intersects(Modifier::REVERSED)
-    }
-
-    /// `true` if any cell on row `y` carries a background fill. Coarse;
-    /// see [`Screen::has_bg`].
-    pub fn row_has_bg(&self, y: u16) -> bool {
-        (0..self.width).any(|x| self.has_bg(x, y))
     }
 
     /// The full text of row `y`, with trailing spaces trimmed.
