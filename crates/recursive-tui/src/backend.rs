@@ -545,9 +545,22 @@ async fn worker_loop(
     let mut loop_state: Option<LoopState> = None;
 
     loop {
+        // Goal-323: enforce the loop's max-turns cap (0 = unlimited) before
+        // scheduling the next turn — whether it drains from the type-ahead
+        // queue or is chosen by the arbiter.
+        if let Some(ls) = loop_state.as_ref() {
+            if ls.max_turns > 0 && ls.turns_run >= ls.max_turns {
+                let _ = event_tx.send(UiEvent::LoopStopped);
+                loop_state = None;
+                continue;
+            }
+        }
         // Drain any messages queued during the previous turn before blocking on
         // new input, so type-ahead is processed in submission order.
         let action = if let Some(text) = queued_messages.pop_front() {
+            if let Some(ls) = loop_state.as_mut() {
+                ls.turns_run += 1;
+            }
             Either::Left(UserAction::SendMessage(text))
         } else if loop_state.as_ref().is_some_and(|ls| ls.active) {
             // Goal-323: event-driven loop mode — poll the arbiter for next prompt.
@@ -564,9 +577,9 @@ async fn worker_loop(
                     source,
                     delay_secs,
                 } => {
-                    if let Some(ref ls) = loop_state {
+                    if let Some(ls) = loop_state.as_mut() {
                         let _ = event_tx.send(UiEvent::LoopTurnScheduled { source, delay_secs });
-                        let _ = ls; // silence unused warning
+                        ls.turns_run += 1;
                     }
                     // Use the prompt as a SendMessage to drive one turn through
                     // the existing spawn → run_turn_select_loop → recover path.
@@ -2113,5 +2126,100 @@ mod tests {
         assert_eq!(req.prompt, "go");
         // Slot is cleared after take.
         assert!(wait_wakeup(&slot).is_none());
+    }
+
+    // ── Goal-323: max_turns cap enforcement ────────────────────────────
+
+    #[tokio::test]
+    async fn max_turns_cap_auto_stops_loop() {
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "second".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let rt = AgentRuntime::builder().llm(llm).build().expect("rt");
+        let mut backend = Backend::spawn_with_runtime(rt);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+
+        backend
+            .action_tx
+            .send(UserAction::StartLoop { goal: "g".into(), max_turns: 1 })
+            .unwrap();
+
+        let mut seen_turn = false;
+        let mut seen_stopped = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::TurnFinished)) => seen_turn = true,
+                Ok(Some(UiEvent::LoopStopped)) => {
+                    seen_stopped = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(seen_turn, "expected the capped turn to run");
+        assert!(seen_stopped, "expected LoopStopped after max_turns=1");
+    }
+
+    #[tokio::test]
+    async fn max_turns_zero_runs_unlimited_without_auto_stop() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "first".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let rt = AgentRuntime::builder().llm(llm).build().expect("rt");
+        let mut backend = Backend::spawn_with_runtime(rt);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+
+        backend
+            .action_tx
+            .send(UserAction::StartLoop { goal: "g".into(), max_turns: 0 })
+            .unwrap();
+
+        let mut seen_turn = false;
+        let mut seen_stopped = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::TurnFinished)) => seen_turn = true,
+                Ok(Some(UiEvent::LoopStopped)) => {
+                    seen_stopped = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(seen_turn, "expected the first turn to run");
+        assert!(!seen_stopped, "unlimited loop (max_turns=0) must not auto-stop");
     }
 }
