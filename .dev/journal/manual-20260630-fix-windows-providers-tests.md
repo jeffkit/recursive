@@ -121,6 +121,20 @@ testing the wrong thing too.
   by the providers/invariants failures. Each upstream fix unmasked the
   next.
 
+- `crates/tui-pty-harness/src/lib.rs` — added
+  `#[cfg_attr(target_os = "windows", ignore)]` to the two real-PTY
+  smoke tests (`spawn_and_snapshot_captures_child_output`,
+  `stability_poll_returns_early_when_child_exits`). Same root cause as
+  the `pty_regression` hang: the portable-pty backend never returns on
+  `windows-latest` CI, so libtest logs "has been running for over 60
+  seconds" and the run idles until the job timeout (observed on run
+  28443630127). Compounded by `echo` being a `cmd.exe` builtin with no
+  `echo.exe` on Windows PATH. The four pure-logic tests (parse_keys,
+  shell_split) still run on Windows; only the real-PTY smoke tests are
+  skipped. This hang was **masked** on Windows by fail-fast — the
+  recursive-tui lib binary (with the symlink tests) used to fail before
+  the tui-pty-harness lib binary ever ran.
+
 ## Tests added
 
 None — these are fixes to existing tests plus a doc-comment correction.

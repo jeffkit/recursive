@@ -413,7 +413,16 @@ mod tests {
     /// Real PTY smoke test: spawn `echo hello` under a PTY and confirm the
     /// snapshot captures the echoed output. Proves the portable-pty + vt100
     /// pipeline actually reflects what the child wrote.
+    ///
+    /// Ignored on Windows: the portable-pty backend hangs on `windows-latest`
+    /// CI (libtest reports "has been running for over 60 seconds" and the run
+    /// sits idle until the job timeout), and `echo` is a `cmd.exe` builtin with
+    /// no `echo.exe` on PATH anyway. The pure-logic tests (parse_keys,
+    /// shell_split) still run on Windows; only the real-PTY smoke tests are
+    /// skipped. See `crates/recursive-tui/tests/pty_regression.rs` for the
+    /// same convention applied to the TUI PTY tour.
     #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
     fn spawn_and_snapshot_captures_child_output() {
         // echo works on all platforms. stable_ms is small so the snapshot
         // fires as soon as echo's output lands rather than waiting the
@@ -443,6 +452,7 @@ mod tests {
     /// should finish well under one second. This guards against regressions
     /// where the poll loop accidentally waits the full cap.
     #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
     fn stability_poll_returns_early_when_child_exits() {
         let start = Instant::now();
         let spec = RunSpec {
