@@ -1437,4 +1437,463 @@ mod tests {
             other => panic!("expected Async([Compact]), got {other:?}"),
         }
     }
+
+    // ── Goal-323: /loop command tests ───────────────────────────────
+
+    #[test]
+    fn parse_loop_start_args_no_max_defaults_unlimited() {
+        let (goal, max) = parse_loop_start_args("watch the build");
+        assert_eq!(goal, "watch the build");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_loop_start_args_with_max_n() {
+        let (goal, max) = parse_loop_start_args("watch the build max 5");
+        assert_eq!(goal, "watch the build");
+        assert_eq!(max, 5);
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_case_insensitive() {
+        let (goal, max) = parse_loop_start_args("GO MAX 3");
+        assert_eq!(goal, "GO");
+        assert_eq!(max, 3);
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_zero_is_explicit() {
+        let (goal, max) = parse_loop_start_args("do stuff max 0");
+        assert_eq!(goal, "do stuff");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_non_numeric_defaults_zero() {
+        let (goal, max) = parse_loop_start_args("go max abc");
+        assert_eq!(goal, "go");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_loop_start_args_trims_goal() {
+        let (goal, _) = parse_loop_start_args("   trim me   ");
+        assert_eq!(goal, "trim me");
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_must_be_delimited_by_spaces() {
+        let (goal, max) = parse_loop_start_args("watch max5");
+        assert_eq!(goal, "watch max5");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_goal_args_no_suffix_defaults_twenty() {
+        let (cond, max) = parse_goal_args("achieve X");
+        assert_eq!(cond, "achieve X");
+        assert_eq!(max, 20);
+    }
+
+    #[test]
+    fn parse_goal_args_with_stop_after_n() {
+        let (cond, max) = parse_goal_args("achieve X or stop after 5 turns");
+        assert_eq!(cond, "achieve X");
+        assert_eq!(max, 5);
+    }
+
+    #[test]
+    fn parse_goal_args_stop_after_non_numeric_defaults_twenty() {
+        let (cond, max) = parse_goal_args("X or stop after abc turns");
+        assert_eq!(cond, "X");
+        assert_eq!(max, 20);
+    }
+
+    #[test]
+    fn parse_goal_args_case_insensitive_suffix() {
+        let (cond, max) = parse_goal_args("X OR STOP AFTER 7 turns");
+        assert_eq!(cond, "X");
+        assert_eq!(max, 7);
+    }
+
+    #[test]
+    fn cmd_loop_no_args_no_active_loop() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("No active loop"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_no_args_shows_active_loop_status() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 2,
+            max_turns: 5,
+        });
+        let r = invoke(&mut app, "loop");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Loop active"), "got {text:?}");
+                assert!(text.contains("2/5"));
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_no_args_unlimited_max_shown() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 3,
+            max_turns: 0,
+        });
+        let r = invoke(&mut app, "loop");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("unlimited"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_start_emits_start_action_and_state() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start watch the build");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::StartLoop { goal, max_turns } => {
+                        assert_eq!(goal, "watch the build");
+                        assert_eq!(*max_turns, 0);
+                    }
+                    other => panic!("expected StartLoop, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async, got {other:?}"),
+        }
+        let ls = app.loop_state.as_ref().expect("loop_state set");
+        assert_eq!(ls.goal, "watch the build");
+        assert_eq!(ls.max_turns, 0);
+        assert_eq!(ls.turns_run, 0);
+    }
+
+    #[test]
+    fn cmd_loop_start_with_max_n() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start watch max 3");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::StartLoop { goal, max_turns } => {
+                    assert_eq!(goal, "watch");
+                    assert_eq!(*max_turns, 3);
+                }
+                other => panic!("expected StartLoop, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_start_empty_goal_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(app.loop_state.is_none(), "no state on usage error");
+    }
+
+    #[test]
+    fn cmd_loop_stop_emits_stop_and_clears_state() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 1,
+            max_turns: 0,
+        });
+        let r = invoke(&mut app, "loop stop");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions, vec![UserAction::StopLoop]);
+            }
+            other => panic!("expected Async([StopLoop]), got {other:?}"),
+        }
+        assert!(app.loop_state.is_none());
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Loop stopped"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_trigger_emits_manual_trigger() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop trigger check it");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::LoopTrigger { source, prompt } => {
+                    assert_eq!(source, "manual");
+                    assert_eq!(prompt, "check it");
+                }
+                other => panic!("expected LoopTrigger, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_trigger_empty_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop trigger");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_unknown_subcommand_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop frobnicate");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Unknown /loop sub-command"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_includes_loop_command() {
+        let r = CommandRegistry::default_set();
+        assert!(r.lookup("loop").is_some(), "/loop should be registered");
+        let spec = r.lookup("loop").unwrap();
+        assert!(matches!(spec.handler, CommandHandler::Async(_)));
+    }
+
+    // ── Pre-existing coverage: CommandSpec Debug, lookup_skill, ─────────
+    //    cmd_permissions, cmd_add_dir flags, cmd_goal status/clear.
+
+    #[test]
+    fn command_spec_debug_includes_all_fields() {
+        let spec = CommandSpec {
+            name: "frob",
+            aliases: &["f", "fb"],
+            summary: "frob a thing",
+            usage: "/frob <x>",
+            handler: CommandHandler::Sync(cmd_clear),
+        };
+        let s = format!("{spec:?}");
+        assert!(s.contains("CommandSpec"), "got {s:?}");
+        assert!(s.contains("frob"), "name missing: {s:?}");
+        assert!(s.contains("frob a thing"), "summary missing: {s:?}");
+        assert!(s.contains("/frob <x>"), "usage missing: {s:?}");
+        assert!(s.contains("<fn>"), "handler placeholder missing: {s:?}");
+    }
+
+    fn sample_skill(name: &str, aliases: &[&str]) -> crate::skill_commands::SkillCommand {
+        crate::skill_commands::SkillCommand {
+            name: name.into(),
+            description: "desc".into(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            argument_hint: "".into(),
+            allowed_tools: None,
+            prompt_template: "do $ARGUMENTS".into(),
+            source_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn lookup_skill_returns_none_when_builtin_shadows() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("help", &[])]);
+        assert!(r.lookup_skill("help").is_none(), "built-in name shadows skill");
+        // A distinct alias not claimed by any built-in still resolves to the skill.
+        let r2 = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("help", &["hlpx"])]);
+        assert!(r2.lookup_skill("hlpx").is_some(), "non-built-in alias resolves");
+    }
+
+    #[test]
+    fn lookup_skill_finds_skill_by_name() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &[])]);
+        let s = r.lookup_skill("frob").expect("skill by name");
+        assert_eq!(s.name, "frob");
+    }
+
+    #[test]
+    fn lookup_skill_finds_skill_by_alias() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &["fb"])]);
+        let s = r.lookup_skill("fb").expect("skill by alias");
+        assert_eq!(s.name, "frob");
+    }
+
+    #[test]
+    fn lookup_skill_returns_none_for_unknown() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &[])]);
+        assert!(r.lookup_skill("nope").is_none());
+    }
+
+    #[test]
+    fn cmd_permissions_on_enables_hook() {
+        let mut app = App::new();
+        for arg in ["on", "true", "1"] {
+            let r = invoke(&mut app, &format!("permissions {arg}"));
+            assert!(matches!(r, InvokeResult::Sync(CommandOutcome::Done)), "arg {arg}");
+            assert!(
+                app.permission_hook_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "arg {arg} should enable"
+            );
+        }
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => assert!(text.contains("on"), "got {text:?}"),
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_permissions_off_disables_and_clears_auto_allow() {
+        let mut app = App::new();
+        app.permission_hook_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.auto_allowed_tools.insert("Bash".into());
+        for arg in ["off", "false", "0"] {
+            let r = invoke(&mut app, &format!("permissions {arg}"));
+            assert!(matches!(r, InvokeResult::Sync(CommandOutcome::Done)), "arg {arg}");
+            assert!(
+                !app.permission_hook_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "arg {arg} should disable"
+            );
+            assert!(app.auto_allowed_tools.is_empty(), "arg {arg} should clear auto-allow");
+        }
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => assert!(text.contains("off"), "got {text:?}"),
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_permissions_no_arg_shows_usage_with_current_state() {
+        let mut app = App::new();
+        app.permission_hook_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = invoke(&mut app, "permissions");
+        assert!(matches!(r, InvokeResult::Sync(CommandOutcome::Done)));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+                assert!(text.contains("currently off"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_add_dir_dash_dash_ro_flag_grants_readonly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        invoke(&mut app, &format!("add-dir {} --ro", tmp.path().display()));
+        let roots = app.session_roots.read().expect("read").clone();
+        assert_eq!(roots.len(), 1);
+        assert!(matches!(roots[0].1, recursive::tools::AccessTier::ReadOnly));
+    }
+
+    #[test]
+    fn cmd_add_dir_short_r_flag_grants_readonly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        invoke(&mut app, &format!("add-dir {} -r", tmp.path().display()));
+        let roots = app.session_roots.read().expect("read").clone();
+        assert_eq!(roots.len(), 1);
+        assert!(matches!(roots[0].1, recursive::tools::AccessTier::ReadOnly));
+    }
+
+    #[test]
+    fn cmd_goal_no_args_no_active_goal() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("No active goal"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_goal_clear_emits_clear_action() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal clear");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions, vec![UserAction::ClearGoal]);
+            }
+            other => panic!("expected Async([ClearGoal]), got {other:?}"),
+        }
+        assert!(app.active_goal.is_none());
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Goal cleared"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_goal_clear_is_case_insensitive() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal CLEAR");
+        assert_eq!(
+            match r {
+                InvokeResult::Async(a) => a,
+                _ => vec![],
+            },
+            vec![UserAction::ClearGoal]
+        );
+    }
+
+    #[test]
+    fn cmd_goal_set_emits_set_goal_with_parsed_max() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal achieve X or stop after 5 turns");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::SetGoal { condition, max_turns } => {
+                    assert_eq!(condition, "achieve X");
+                    assert_eq!(*max_turns, 5);
+                }
+                other => panic!("expected SetGoal, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Goal set"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
 }
