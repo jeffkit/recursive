@@ -2222,4 +2222,54 @@ mod tests {
         assert!(seen_turn, "expected the first turn to run");
         assert!(!seen_stopped, "unlimited loop (max_turns=0) must not auto-stop");
     }
+
+    // ── Pre-existing: wait_for_cancel semantics ───────────────────────
+
+    #[tokio::test]
+    async fn wait_for_cancel_returns_immediately_when_flag_already_set() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_for_cancel(flag, notify),
+        )
+        .await
+        .expect("should return immediately when flag is set");
+    }
+
+    #[tokio::test]
+    async fn wait_for_cancel_blocks_until_flag_set_and_notified() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let flag_clone = flag.clone();
+        let notify_clone = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify_clone.notify_one();
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_cancel(flag, notify),
+        )
+        .await
+        .expect("timed out waiting for cancel");
+    }
+
+    #[tokio::test]
+    async fn wait_for_cancel_must_block_when_flag_false_and_no_notify() {
+        // If wait_for_cancel is replaced with `()` it returns immediately and
+        // this timeout succeeds — failing the assertion. The real impl blocks.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_for_cancel(flag, notify),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "wait_for_cancel must block while flag is false and no notify fires"
+        );
+    }
 }
