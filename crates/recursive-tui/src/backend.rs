@@ -1850,4 +1850,268 @@ mod tests {
         let _ = backend.action_tx.send(UserAction::Shutdown);
         assert!(got_triggered, "expected LoopTurnScheduled source=manual");
     }
+
+    // ── Pre-existing coverage: map_agent_event remaining variants, ─────
+    //    TuiEventSink::emit, TuiPermissionHook, wait_wakeup.
+
+    #[test]
+    fn map_partial_reasoning_to_reasoning_partial() {
+        let ev = AgentEvent::PartialReasoning { text: "th".into(), step: 0 };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::ReasoningPartial { text: "th".into() })
+        );
+    }
+
+    #[test]
+    fn map_reasoning_to_reasoning() {
+        let ev = AgentEvent::Reasoning { text: "think".into(), step: 0 };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::Reasoning { content: "think".into() })
+        );
+    }
+
+    #[test]
+    fn map_tool_call_to_tool_call() {
+        let ev = AgentEvent::ToolCall {
+            name: "Read".into(),
+            id: "c1".into(),
+            arguments: "{}".into(),
+            step: 0,
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::ToolCall {
+                id: "c1".into(),
+                name: "Read".into(),
+                arguments: "{}".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn map_usage_to_usage() {
+        let ev = AgentEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_hit_tokens: 30,
+            cache_miss_tokens: 40,
+            step: 0,
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_hit_tokens: 30,
+                cache_miss_tokens: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn map_latency_to_latency() {
+        let ev = AgentEvent::Latency { step: 0, llm_ms: 123 };
+        assert_eq!(map_agent_event(ev), Some(UiEvent::Latency { llm_ms: 123 }));
+    }
+
+    #[test]
+    fn map_turn_finished_to_turn_finished() {
+        let ev = AgentEvent::TurnFinished { reason: "done".into(), steps: 3 };
+        assert_eq!(map_agent_event(ev), Some(UiEvent::TurnFinished));
+    }
+
+    #[test]
+    fn map_plan_mode_requested() {
+        let ev = AgentEvent::PlanModeRequested { reason: "why".into() };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::PlanModeRequested { reason: "why".into() })
+        );
+    }
+
+    #[test]
+    fn map_plan_mode_approved() {
+        assert_eq!(map_agent_event(AgentEvent::PlanModeApproved), Some(UiEvent::PlanModeApproved));
+    }
+
+    #[test]
+    fn map_plan_mode_rejected() {
+        let ev = AgentEvent::PlanModeRejected { reason: "no".into() };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::PlanModeRejected { reason: "no".into() })
+        );
+    }
+
+    #[test]
+    fn map_todo_updated() {
+        let ev = AgentEvent::TodoUpdated { todos: vec![] };
+        assert_eq!(map_agent_event(ev), Some(UiEvent::TodoUpdated { todos: vec![] }));
+    }
+
+    #[test]
+    fn map_goal_continuing() {
+        let ev = AgentEvent::GoalContinuing { reason: "not yet".into(), turns: 2 };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::GoalContinuing { reason: "not yet".into(), turns: 2 })
+        );
+    }
+
+    #[test]
+    fn map_goal_achieved() {
+        let ev = AgentEvent::GoalAchieved { condition: "done".into(), turns: 5 };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::GoalAchieved { condition: "done".into(), turns: 5 })
+        );
+    }
+
+    #[test]
+    fn map_goal_cleared() {
+        assert_eq!(map_agent_event(AgentEvent::GoalCleared), Some(UiEvent::GoalCleared));
+    }
+
+    #[test]
+    fn map_hook_started() {
+        let ev = AgentEvent::HookStarted {
+            hook_event: "PreTool".into(),
+            hook_name: "fmt".into(),
+            status_message: Some("running".into()),
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::HookStarted {
+                hook_event: "PreTool".into(),
+                hook_name: "fmt".into(),
+                status_message: Some("running".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn map_hook_progress() {
+        let ev = AgentEvent::HookProgress {
+            hook_event: "PreTool".into(),
+            hook_name: "fmt".into(),
+            last_line: "ok".into(),
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::HookProgress {
+                hook_event: "PreTool".into(),
+                hook_name: "fmt".into(),
+                last_line: "ok".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn map_hook_finished() {
+        let ev = AgentEvent::HookFinished {
+            hook_event: "PreTool".into(),
+            hook_name: "fmt".into(),
+            outcome: "passed".into(),
+            duration_ms: 42,
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::HookFinished {
+                hook_event: "PreTool".into(),
+                hook_name: "fmt".into(),
+                outcome: "passed".into(),
+                duration_ms: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn map_hook_system_message() {
+        let ev = AgentEvent::HookSystemMessage { text: "hi".into() };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::HookSystemMessage { text: "hi".into() })
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_event_sink_emit_forwards_mapped_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let sink = TuiEventSink { tx };
+        sink.emit(AgentEvent::TurnFinished { reason: "done".into(), steps: 1 }).await;
+        assert_eq!(rx.recv().await, Some(UiEvent::TurnFinished));
+    }
+
+    #[tokio::test]
+    async fn tui_event_sink_emit_drops_unmapped_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let sink = TuiEventSink { tx };
+        // An event not handled by map_agent_event falls through to `_ => None`
+        // and must not send anything on the channel.
+        sink.emit(AgentEvent::LlmRetry {
+            step: 0,
+            attempt: 1,
+            wait_ms: 10,
+            reason: "timeout".into(),
+        }).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .is_err(),
+            "unmapped event must not be forwarded");
+    }
+
+    #[tokio::test]
+    async fn permission_hook_disabled_auto_allows() {
+        let (tx, _rx) = mpsc::unbounded_channel::<PermissionRequest>();
+        let hook = TuiPermissionHook {
+            tx,
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let dec = hook.check("Bash", &serde_json::json!({})).await;
+        assert!(matches!(dec, recursive::agent::PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn permission_hook_enabled_requests_user_and_allows_on_true() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PermissionRequest>();
+        let hook = TuiPermissionHook {
+            tx,
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let handle = tokio::spawn(async move {
+            hook.check("Bash", &serde_json::json!({"cmd": "ls"})).await
+        });
+        let req = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("request received");
+        assert_eq!(req.tool_name, "Bash");
+        let _ = req.reply.send(true);
+        let dec = handle.await.expect("join");
+        assert!(matches!(dec, recursive::agent::PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn wait_wakeup_returns_none_for_empty_slot() {
+        let slot: recursive::tools::WakeupSlot =
+            Arc::new(std::sync::Mutex::new(None));
+        assert!(wait_wakeup(&slot).is_none());
+    }
+
+    #[test]
+    fn wait_wakeup_takes_pending_request() {
+        let slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(Some(
+            recursive::tools::WakeupRequest {
+                delay: std::time::Duration::from_secs(1),
+                reason: "timer".into(),
+                prompt: "go".into(),
+            },
+        )));
+        let req = wait_wakeup(&slot).expect("Some");
+        assert_eq!(req.prompt, "go");
+        // Slot is cleared after take.
+        assert!(wait_wakeup(&slot).is_none());
+    }
 }
