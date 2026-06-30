@@ -31,7 +31,17 @@ fn dep_check_script_exists_and_is_executable() {
 
 /// Run the dep-check script. It should pass when Cargo.toml is unchanged
 /// relative to HEAD~1, or when all changes have journal justification.
+///
+/// Ignored on Windows: the script is a bash script, and on `windows-latest`
+/// runners `bash` resolves to WSL's `bash.exe`, which fails immediately with
+/// "Windows Subsystem for Linux has no installed distributions." (Git Bash is
+/// present but not on PATH.) This matches the existing convention of ignoring
+/// shell-driven tests on Windows — see `crates/recursive-tui/src/backend.rs`
+/// and `.dev/journal/manual-20260603-fix-ci-windows-tests.md`. The
+/// `cargo_toml_is_valid` and `dep_check_script_exists_*` tests still run on
+/// Windows, so the invariant is not silently skipped wholesale.
 #[test]
+#[cfg_attr(target_os = "windows", ignore)]
 fn dep_check_script_passes() {
     let script = workspace_root().join("scripts").join("check-new-deps.sh");
 

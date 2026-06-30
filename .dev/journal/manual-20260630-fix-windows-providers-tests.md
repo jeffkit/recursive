@@ -65,6 +65,22 @@ testing the wrong thing too.
   **pre-existing uncommitted WIP** (symlink-resolution test). Not part
   of the Windows fix, but it blocked the workspace clippy gate
   (`-D warnings`). Mechanical fix applied per clippy's own suggestion.
+  (Left uncommitted — not part of the shipped fix.)
+- `tests/invariants/dep_justification.rs` — added
+  `#[cfg_attr(target_os = "windows", ignore)]` to
+  `dep_check_script_passes`. This test shells out to `bash` to run
+  `scripts/check-new-deps.sh`; on `windows-latest` runners `bash`
+  resolves to WSL's `bash.exe`, which aborts with "Windows Subsystem for
+  Linux has no installed distributions." (Git Bash is bundled but not on
+  PATH.) This failure was always present on Windows but was **masked** by
+  the providers lib-test failure: `cargo test --workspace` fails fast at
+  the first failing test binary, and the lib binary failed before the
+  invariants binary ever ran. Fixing the providers tests unmasked it.
+  Ignoring the shell-driven check on Windows matches the existing
+  convention (`crates/recursive-tui/src/backend.rs`,
+  `src/session/mod.rs`). The sibling
+  `dep_check_script_exists_*` / `cargo_toml_is_valid` tests still run on
+  Windows, so invariant #6 is not skipped wholesale.
 
 ## Tests added
 
@@ -76,7 +92,9 @@ None — these are fixes to existing tests plus a doc-comment correction.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
   clean
 - `cargo test --workspace`: all green (0 failed), including the 4
-  providers tests that were failing on Windows CI
+  providers tests that were failing on Windows CI and the
+  `dep_check_script_passes` invariant (now ignored on Windows — see
+  Files touched)
 
 ## Notes
 
