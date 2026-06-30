@@ -376,4 +376,101 @@ mod tests {
         // turn_cache = 500 > 0 → should show "0%"
         assert!(text.contains("0%"), "expected 0% cache rate, got: {text:?}");
     }
+
+    // ── Goal-323: loop state indicator + pre-existing status.rs coverage ──
+
+    #[test]
+    fn status_bar_shows_no_loop_when_inactive() {
+        let app = App::new();
+        let text = line_text(&build_line(&app));
+        assert!(!text.contains("loop:"), "no loop segment when inactive: {text:?}");
+    }
+
+    #[test]
+    fn status_bar_shows_loop_idle() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 0,
+            max_turns: 0,
+        });
+        let text = line_text(&build_line(&app));
+        assert!(text.contains("loop: idle"), "got {text:?}");
+    }
+
+    #[test]
+    fn status_bar_shows_loop_turn_with_max() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 1,
+            max_turns: 5,
+        });
+        let text = line_text(&build_line(&app));
+        assert!(text.contains("loop: turn 1/5"), "got {text:?}");
+    }
+
+    #[test]
+    fn status_bar_shows_loop_turn_unlimited() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 3,
+            max_turns: 0,
+        });
+        let text = line_text(&build_line(&app));
+        assert!(text.contains("loop: turn 3"), "got {text:?}");
+        assert!(!text.contains("loop: turn 3/"), "unlimited must not show /max: {text:?}");
+    }
+
+    #[test]
+    fn status_bar_loop_segment_uses_separator() {
+        // The loop segment is preceded by a separator ("│"); if separator()
+        // is replaced with Default::default() this fails.
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 0,
+            max_turns: 0,
+        });
+        let text = line_text(&build_line(&app));
+        assert!(text.contains('│'), "expected separator before loop segment: {text:?}");
+    }
+
+    #[test]
+    fn separator_contains_pipe() {
+        let s = separator();
+        assert!(s.content.contains('│'), "got {:?}", s.content);
+    }
+
+    #[test]
+    fn human_count_k_and_m_boundaries() {
+        // 1000 must format as "1.0k" (kills `< 1000` → `<= 1000` mutant).
+        assert_eq!(human_count(1000), "1.0k");
+        // 1_000_000 must format as "1.0M" (kills `< 1_000_000` → `<= 1_000_000`).
+        assert_eq!(human_count(1_000_000), "1.0M");
+    }
+
+    #[test]
+    fn render_draws_status_line_into_buffer() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new();
+        app.model_name = "deepseek-chat".into();
+        app.connected = true;
+        app.workspace_path = std::path::PathBuf::from("/tmp/ws");
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 1,
+            max_turns: 5,
+        });
+        let backend = TestBackend::new(400, 1);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            render(f, f.area(), &app);
+        })
+        .expect("draw");
+        let text: String = term.backend().buffer().content().into_iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("deepseek-chat"), "render wrote model: {text:?}");
+        assert!(text.contains("loop: turn 1/5"), "render wrote loop: {text:?}");
+    }
 }
