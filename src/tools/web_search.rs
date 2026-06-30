@@ -171,7 +171,6 @@ impl WebSearch {
             .client
             .get(&url)
             .header("Accept", "application/json")
-            .header("Accept-Encoding", "gzip")
             .header("X-Subscription-Token", api_key)
             .query(&[("q", query), ("count", &num.to_string())])
             .send()
@@ -183,21 +182,30 @@ impl WebSearch {
             })?;
 
         let status = resp.status();
-        let body: Value = resp.json().await.map_err(|e| Error::Tool {
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
             call_id: None,
-            message: format!("Brave response parse failed: {e}"),
+            message: format!("Brave response read failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
                 call_id: None,
-                message: format!("Brave HTTP {status}: {body}"),
+                message: format!("Brave HTTP {status}: {body_text}"),
             });
         }
 
-        let results = body["web"]["results"]
+        // SAFETY: serde_json::from_str is safe on arbitrary input and only
+        // returns an Err on malformed JSON.
+        #[allow(clippy::unwrap_in_result)]
+        let data: Value = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("Brave response parse failed: {e}"),
+        })?;
+
+        let results = data["web"]["results"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -240,19 +248,27 @@ impl WebSearch {
             })?;
 
         let status = resp.status();
-        let data: Value = resp.json().await.map_err(|e| Error::Tool {
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
             call_id: None,
-            message: format!("Tavily response parse failed: {e}"),
+            message: format!("Tavily response read failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
                 call_id: None,
-                message: format!("Tavily HTTP {status}: {data}"),
+                message: format!("Tavily HTTP {status}: {body_text}"),
             });
         }
+
+        // SAFETY: serde_json::from_str is safe on arbitrary input.
+        #[allow(clippy::unwrap_in_result)]
+        let data: Value = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("Tavily response parse failed: {e}"),
+        })?;
 
         let results = data["results"].as_array().cloned().unwrap_or_default();
         Ok(results
@@ -292,19 +308,27 @@ impl WebSearch {
             })?;
 
         let status = resp.status();
-        let data: Value = resp.json().await.map_err(|e| Error::Tool {
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
             call_id: None,
-            message: format!("Serper response parse failed: {e}"),
+            message: format!("Serper response read failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
                 call_id: None,
-                message: format!("Serper HTTP {status}: {data}"),
+                message: format!("Serper HTTP {status}: {body_text}"),
             });
         }
+
+        // SAFETY: serde_json::from_str is safe on arbitrary input.
+        #[allow(clippy::unwrap_in_result)]
+        let data: Value = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("Serper response parse failed: {e}"),
+        })?;
 
         let results = data["organic"].as_array().cloned().unwrap_or_default();
         Ok(results
@@ -345,19 +369,27 @@ impl WebSearch {
             })?;
 
         let status = resp.status();
-        let data: Value = resp.json().await.map_err(|e| Error::Tool {
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
             call_id: None,
-            message: format!("Bocha response parse failed: {e}"),
+            message: format!("Bocha response read failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
                 call_id: None,
-                message: format!("Bocha HTTP {status}: {data}"),
+                message: format!("Bocha HTTP {status}: {body_text}"),
             });
         }
+
+        // SAFETY: serde_json::from_str is safe on arbitrary input.
+        #[allow(clippy::unwrap_in_result)]
+        let data: Value = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("Bocha response parse failed: {e}"),
+        })?;
 
         // Bocha returns { data: { webPages: { value: [...] } } }
         let results = data["data"]["webPages"]["value"]
@@ -391,19 +423,27 @@ impl WebSearch {
             })?;
 
         let status = resp.status();
-        let data: Value = resp.json().await.map_err(|e| Error::Tool {
+        let body_text = resp.text().await.map_err(|e| Error::Tool {
             name: "WebSearch".into(),
             call_id: None,
-            message: format!("Bing response parse failed: {e}"),
+            message: format!("Bing response read failed: {e}"),
         })?;
 
         if !status.is_success() {
             return Err(Error::Tool {
                 name: "WebSearch".into(),
                 call_id: None,
-                message: format!("Bing HTTP {status}: {data}"),
+                message: format!("Bing HTTP {status}: {body_text}"),
             });
         }
+
+        // SAFETY: serde_json::from_str is safe on arbitrary input.
+        #[allow(clippy::unwrap_in_result)]
+        let data: Value = serde_json::from_str(&body_text).map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("Bing response parse failed: {e}"),
+        })?;
 
         let results = data["webPages"]["value"]
             .as_array()
