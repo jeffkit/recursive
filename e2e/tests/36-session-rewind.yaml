@@ -24,6 +24,7 @@ setup:
       command: |
         rm -rf /workspace/test-rewind /tmp/rh-rewind
         mkdir -p /workspace/test-rewind /tmp/rh-rewind
+        unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-rewind \
         recursive --workspace /workspace/test-rewind \
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
@@ -89,6 +90,7 @@ cases:
     exec:
       container: recursive-e2e
       command: |
+        unset RECURSIVE_SESSIONS_DIR  # setup wrote the session under RECURSIVE_HOME (see setup)
         RECURSIVE_HOME=/tmp/rh-rewind \
           recursive --workspace /workspace/test-rewind \
             sessions list 2>&1

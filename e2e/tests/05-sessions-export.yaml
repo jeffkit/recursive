@@ -18,6 +18,7 @@ setup:
     exec:
       container: recursive-e2e
       command: |
+        unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/recursive-home-05 \
         recursive --workspace /workspace/test-05 \
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \

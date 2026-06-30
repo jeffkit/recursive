@@ -123,13 +123,20 @@ or modifying any E2E test, internalize these hard-won rules:
 
 ### Session path isolation (mandatory for `recursive-session:` assertions)
 
-The container binary ignores `RECURSIVE_SESSIONS_DIR`. Sessions land at
-`RECURSIVE_HOME/workspaces/{SHA256_HASH}/sessions/`. **Never hardcode this path.**
+`RECURSIVE_SESSIONS_DIR` is a **hard override** (`src/paths.rs::user_sessions_dir`):
+when set, sessions land exactly there, ignoring `RECURSIVE_HOME`. The
+`recursive-e2e` container sets `RECURSIVE_SESSIONS_DIR=/workspace/sessions`
+(see `e2e/e2e.yaml`), so a bare `RECURSIVE_HOME=/tmp/rh-... recursive run`
+writes the session to `/workspace/sessions`, **not** under `RECURSIVE_HOME` —
+and a subsequent `find /tmp/rh-...` silently finds nothing, failing the
+assertion with "No session directory found".
 
 Required pattern for every agent `run` that needs a `recursive-session:` assertion:
 
 ```bash
-# 1. Isolate with a unique RECURSIVE_HOME
+# 1. Unset the container-wide override AND isolate with a unique RECURSIVE_HOME.
+#    Without `unset`, the session lands at /workspace/sessions and the find below misses it.
+unset RECURSIVE_SESSIONS_DIR
 RECURSIVE_HOME=/tmp/rh-mytest recursive run --max-steps 3 ...
 
 # 2. Dynamically locate the transcript
@@ -143,6 +150,11 @@ assert:
   recursive-session:
     input: /tmp/sessions-mytest
 ```
+
+Any case that re-uses the setup session via a discovery command (`sessions list`,
+`episodic_recall`, etc.) must also `unset RECURSIVE_SESSIONS_DIR` so it looks
+under the same `RECURSIVE_HOME`. See `e2e/tests/11-session-resume.yaml` and
+`e2e/tests/00-smoke.yaml` for the canonical form.
 
 Always clean up in teardown:
 ```bash

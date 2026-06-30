@@ -22,26 +22,41 @@ setup:
     exec:
       container: recursive-e2e
       command: |
+        # Unset RECURSIVE_SESSIONS_DIR (set container-wide by e2e.yaml to
+        # /workspace/sessions) so the session lands under RECURSIVE_HOME
+        # and the find below can locate .meta.json. Without this the hard
+        # override in src/paths.rs::user_sessions_dir writes the session
+        # outside /tmp/rh-smoke-01 and the recursive-session assertion fails.
+        unset RECURSIVE_SESSIONS_DIR
+        rm -rf /tmp/rh-smoke-01 /tmp/sessions-smoke-01
         RECURSIVE_HOME=/tmp/rh-smoke-01 \
           recursive --workspace /workspace/smoke-01 \
             --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
             --max-steps 5 \
             run "Create a file called smoke.txt with content 'ok'"
         SESSION=$(find /tmp/rh-smoke-01 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
-        [ -n "$SESSION" ] && mkdir -p /tmp/sessions-smoke-01 && cp -r "$SESSION/." /tmp/sessions-smoke-01/
+        if [ -n "$SESSION" ]; then
+          mkdir -p /tmp/sessions-smoke-01
+          cp -r "$SESSION/." /tmp/sessions-smoke-01/
+        fi
         echo done
 
   - name: "Run read_file scenario (smoke-02)"
     exec:
       container: recursive-e2e
       command: |
+        unset RECURSIVE_SESSIONS_DIR
+        rm -rf /tmp/rh-smoke-02 /tmp/sessions-smoke-02
         RECURSIVE_HOME=/tmp/rh-smoke-02 \
           recursive --workspace /workspace/smoke-02 \
             --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
             --max-steps 5 \
             run "Read the file input.txt and tell me what it contains"
         SESSION=$(find /tmp/rh-smoke-02 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
-        [ -n "$SESSION" ] && mkdir -p /tmp/sessions-smoke-02 && cp -r "$SESSION/." /tmp/sessions-smoke-02/
+        if [ -n "$SESSION" ]; then
+          mkdir -p /tmp/sessions-smoke-02
+          cp -r "$SESSION/." /tmp/sessions-smoke-02/
+        fi
         echo done
 
 cases:
