@@ -11,6 +11,15 @@ use recursive::{
     AgentRuntimeBuilder, ChatProvider,
 };
 
+/// Output of a TUI runtime build: the runtime state plus shared handles
+/// the loop arbiter needs (wakeup slot, background job manager).
+pub struct TuiRuntime {
+    pub state: RuntimeBuild,
+    pub session_roots: SharedSandboxRoots,
+    pub wakeup_slot: recursive::tools::WakeupSlot,
+    pub bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>>,
+}
+
 pub enum RuntimeBuild {
     Ready(Option<Box<AgentRuntime>>),
     Offline { reason: String },
@@ -84,25 +93,31 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
-pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
+pub fn build_runtime() -> TuiRuntime {
     let session_roots = new_shared_sandbox_roots();
+    let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
+    let bg_manager = Arc::new(tokio::sync::Mutex::new(
+        recursive::tools::BackgroundJobManager::new(),
+    ));
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            return (
-                RuntimeBuild::Offline {
+            return TuiRuntime {
+                state: RuntimeBuild::Offline {
                     reason: format!("failed to load configuration: {e}"),
                 },
                 session_roots,
-            );
+                wakeup_slot,
+                bg_manager,
+            };
         }
     };
 
     let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
         None => {
-            return (
-                RuntimeBuild::Offline {
+            return TuiRuntime {
+                state: RuntimeBuild::Offline {
                     reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
                              OPENAI_API_KEY, or run `recursive config set \
                              provider.api_key <KEY>` to populate \
@@ -110,19 +125,23 @@ pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
                         .to_string(),
                 },
                 session_roots,
-            );
+                wakeup_slot,
+                bg_manager,
+            };
         }
     };
 
     let provider = match build_provider(&config, api_key) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                RuntimeBuild::Offline {
+            return TuiRuntime {
+                state: RuntimeBuild::Offline {
                     reason: format!("failed to build HTTP client: {e}"),
                 },
                 session_roots,
-            )
+                wakeup_slot,
+                bg_manager,
+            };
         }
     };
 
@@ -137,7 +156,12 @@ pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
         config.web_search_provider.clone(),
         config.web_search_api_key.clone(),
         config.web_search_jina_key.clone(),
+        Some(bg_manager.clone()),
     );
+    // Register ScheduleWakeup so the agent can schedule its own next turn.
+    let tools = tools.register(Arc::new(recursive::tools::ScheduleWakeup::new(
+        wakeup_slot.clone(),
+    )));
     // Channel-agnostic sub-agent tool registration, in lockstep with the
     // coordinator prompt injected by `assemble_system_prompt`.
     let tools = register_subagent_if_enabled(tools, &config, provider.clone());
@@ -165,7 +189,12 @@ pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
             reason: format!("failed to build agent runtime: {e}"),
         },
     };
-    (build, session_roots)
+    TuiRuntime {
+        state: build,
+        session_roots,
+        wakeup_slot,
+        bg_manager,
+    }
 }
 
 /// Build the agent runtime for TUI mode, returning both the runtime state and
@@ -176,43 +205,46 @@ pub fn build_runtime() -> (RuntimeBuild, SharedSandboxRoots) {
 /// [`build_runtime`] plus a dummy `()` receiver; the caller must not rely on
 /// the receiver type unless the feature is enabled.
 #[cfg(feature = "skill-hub")]
-pub fn build_runtime_for_tui() -> (
-    RuntimeBuild,
-    tokio::sync::mpsc::UnboundedReceiver<crate::events::SkillInstallEvent>,
-    SharedSandboxRoots,
-) {
+pub fn build_runtime_for_tui(
+) -> (TuiRuntime, tokio::sync::mpsc::UnboundedReceiver<crate::events::SkillInstallEvent>) {
     use crate::events::SkillInstallEvent;
     use tokio::sync::mpsc;
 
     let (skill_tx, skill_rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
 
-    let (state, session_roots) = build_runtime_with_skill_tx(Some(skill_tx));
-    (state, skill_rx, session_roots)
+    let tui_rt = build_runtime_with_skill_tx(Some(skill_tx));
+    (tui_rt, skill_rx)
 }
 
 /// Inner helper: build a runtime with optional skill-hub tool injection.
 #[cfg(feature = "skill-hub")]
 fn build_runtime_with_skill_tx(
     skill_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::events::SkillInstallEvent>>,
-) -> (RuntimeBuild, SharedSandboxRoots) {
+) -> TuiRuntime {
     let session_roots = new_shared_sandbox_roots();
+    let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
+    let bg_manager = Arc::new(tokio::sync::Mutex::new(
+        recursive::tools::BackgroundJobManager::new(),
+    ));
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            return (
-                RuntimeBuild::Offline {
+            return TuiRuntime {
+                state: RuntimeBuild::Offline {
                     reason: format!("failed to load configuration: {e}"),
                 },
                 session_roots,
-            );
+                wakeup_slot,
+                bg_manager,
+            };
         }
     };
 
     let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
         None => {
-            return (
-                RuntimeBuild::Offline {
+            return TuiRuntime {
+                state: RuntimeBuild::Offline {
                     reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
                              OPENAI_API_KEY, or run `recursive config set \
                              provider.api_key <KEY>` to populate \
@@ -220,19 +252,23 @@ fn build_runtime_with_skill_tx(
                         .to_string(),
                 },
                 session_roots,
-            );
+                wakeup_slot,
+                bg_manager,
+            };
         }
     };
 
     let provider = match build_provider(&config, api_key) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                RuntimeBuild::Offline {
+            return TuiRuntime {
+                state: RuntimeBuild::Offline {
                     reason: format!("failed to build HTTP client: {e}"),
                 },
                 session_roots,
-            )
+                wakeup_slot,
+                bg_manager,
+            };
         }
     };
 
@@ -248,7 +284,13 @@ fn build_runtime_with_skill_tx(
         config.web_search_provider.clone(),
         config.web_search_api_key.clone(),
         config.web_search_jina_key.clone(),
+        Some(bg_manager.clone()),
     );
+
+    // Register ScheduleWakeup for loop-mode agent self-scheduling.
+    tools = tools.register(Arc::new(recursive::tools::ScheduleWakeup::new(
+        wakeup_slot.clone(),
+    )));
 
     // Register skill-hub tools: install_skill is TUI-only (it sends events
     // through a channel so the TUI can prompt the user).
@@ -281,7 +323,12 @@ fn build_runtime_with_skill_tx(
             reason: format!("failed to build agent runtime: {e}"),
         },
     };
-    (build, session_roots)
+    TuiRuntime {
+        state: build,
+        session_roots,
+        wakeup_slot,
+        bg_manager,
+    }
 }
 
 #[cfg(test)]
@@ -388,8 +435,8 @@ type = "openai"
         )
         .expect("write config");
 
-        let (build, _session_roots) = build_runtime();
-        match build {
+        let tui_rt = build_runtime();
+        match tui_rt.state {
             RuntimeBuild::Ready(_) => {}
             RuntimeBuild::Offline { reason } => {
                 panic!("expected Ready when config.toml has api_key, got Offline: {reason}");

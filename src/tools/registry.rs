@@ -537,6 +537,7 @@ pub fn build_standard_tools(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -564,6 +565,12 @@ pub fn build_standard_tools(
 /// `WebSearch` falls back to env vars / Jina zero-config. These are exposed
 /// at this level so all frontends (CLI, TUI, HTTP) get kernel-level config
 /// propagation without each frontend wiring them separately.
+///
+/// `bg_manager` is an optional shared background-job manager. When `Some`,
+/// `RunBackground` and `CheckBackground` tools use the shared manager
+/// instead of creating their own. This lets the TUI backend observe job
+/// completions via the same manager. When `None` (default for CLI/HTTP
+/// paths), a new manager is created internally.
 #[allow(clippy::too_many_arguments)]
 pub fn build_standard_tools_with_roots(
     workspace: &std::path::Path,
@@ -574,10 +581,13 @@ pub fn build_standard_tools_with_roots(
     web_search_provider: Option<String>,
     web_search_api_key: Option<String>,
     web_search_jina_key: Option<String>,
+    bg_manager: Option<Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>>,
 ) -> ToolRegistry {
-    let bg_manager = Arc::new(tokio::sync::Mutex::new(
-        super::run_background::BackgroundJobManager::new(),
-    ));
+    let bg_manager = bg_manager.unwrap_or_else(|| {
+        Arc::new(tokio::sync::Mutex::new(
+            super::run_background::BackgroundJobManager::new(),
+        ))
+    });
     let todo_list = Arc::new(std::sync::RwLock::new(Vec::<super::todo::TodoItem>::new()));
     let read_state = Arc::new(Mutex::new(ReadFileState::new()));
     let mut registry = ToolRegistry::local()

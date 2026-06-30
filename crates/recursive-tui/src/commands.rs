@@ -204,6 +204,14 @@ impl CommandRegistry {
                     usage: "/theme <name>",
                     handler: CommandHandler::Sync(cmd_theme),
                 },
+                // Goal-323: event-driven loop.
+                CommandSpec {
+                    name: "loop",
+                    aliases: &[],
+                    summary: "Event-driven loop (/loop start|stop|trigger)",
+                    usage: "/loop start <goal> [max N] | /loop stop | /loop trigger <text>",
+                    handler: CommandHandler::Async(cmd_loop),
+                },
             ],
             skill_commands: Vec::new(),
         }
@@ -553,6 +561,91 @@ fn cmd_goal(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
         condition,
         max_turns,
     }]
+}
+
+/// `/loop [start <goal> [max N]] | stop | trigger <text>`
+fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
+    if args.is_empty() {
+        // Show current loop status.
+        let status = app
+            .loop_state
+            .as_ref()
+            .map(|ls| {
+                format!(
+                    "Loop active — goal: \"{}\", turns: {}/{}",
+                    ls.goal,
+                    ls.turns_run,
+                    if ls.max_turns > 0 {
+                        ls.max_turns.to_string()
+                    } else {
+                        "unlimited".to_string()
+                    }
+                )
+            })
+            .unwrap_or_else(|| "No active loop.".to_string());
+        app.push_system(status);
+        return Vec::new();
+    }
+
+    let sub = args[0].as_str();
+    match sub {
+        "start" => {
+            // Parse: /loop start <goal> [max N]
+            let raw = args[1..].join(" ");
+            if raw.trim().is_empty() {
+                app.push_error("Usage: /loop start <goal> [max N]");
+                return Vec::new();
+            }
+            let (goal, max_turns) = parse_loop_start_args(&raw);
+            app.push_system(format!("Loop started: \"{}\" (max {} turns)", goal, if max_turns > 0 { max_turns.to_string() } else { "unlimited".to_string() }));
+            app.loop_state = Some(crate::app::LoopUiState {
+                goal: goal.clone(),
+                turns_run: 0,
+                max_turns,
+            });
+            vec![UserAction::StartLoop { goal, max_turns }]
+        }
+        "stop" => {
+            app.loop_state = None;
+            app.push_system("Loop stopped.");
+            vec![UserAction::StopLoop]
+        }
+        "trigger" => {
+            let text = args[1..].join(" ");
+            if text.trim().is_empty() {
+                app.push_error("Usage: /loop trigger <text>");
+                return Vec::new();
+            }
+            app.push_system(format!("Loop trigger: {text}"));
+            vec![UserAction::LoopTrigger {
+                source: "manual".to_string(),
+                prompt: text,
+            }]
+        }
+        _ => {
+            app.push_error(format!(
+                "Unknown /loop sub-command: {sub}. Try /loop start|stop|trigger."
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// Parse `"<goal> [max N]"` from the raw argument string.
+/// Returns `(goal, max_turns)`. Default max_turns = 0 (unlimited).
+fn parse_loop_start_args(raw: &str) -> (String, u32) {
+    let lower = raw.to_lowercase();
+    if let Some(pos) = lower.rfind(" max ") {
+        let suffix = &raw[pos + 5..];
+        let n: u32 = suffix
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let goal = raw[..pos].trim().to_string();
+        return (goal, n);
+    }
+    (raw.trim().to_string(), 0)
 }
 
 /// Parse `"<condition> [or stop after N turns]"` from the raw argument string.
@@ -1181,7 +1274,8 @@ mod tests {
             );
         }
         // 15 named above plus one lazily-registered built-in (/resume) = 16.
-        assert_eq!(names.len(), 16);
+        // Plus /loop (Goal-323) = 17.
+        assert_eq!(names.len(), 17);
     }
 
     #[test]
@@ -1195,7 +1289,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 16);
+        assert_eq!(hits.len(), 17);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();

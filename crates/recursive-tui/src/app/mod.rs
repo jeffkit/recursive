@@ -129,6 +129,8 @@ pub struct App {
     pub current_todos: Vec<recursive::tools::todo::TodoItem>,
     /// Goal-168: mirrored goal state, updated by `UiEvent::Goal*` events.
     pub active_goal: Option<GoalState>,
+    /// Goal-323: mirrored event-loop state, updated by /loop start/stop.
+    pub loop_state: Option<LoopUiState>,
     /// Goal-171: workspace root path, used by /resume to list sessions.
     pub workspace_path: std::path::PathBuf,
     /// Goal-322: timestamp (wall-clock) of the last skill reload, used
@@ -158,7 +160,13 @@ pub struct App {
     pub active_command_panel: Option<CommandPanelState>,
 }
 
-// ── CommandPanelState ────────────────────────────────────────────────────────
+/// Goal-323: UI-level mirror of event-driven loop state.
+#[derive(Debug, Clone)]
+pub struct LoopUiState {
+    pub goal: String,
+    pub turns_run: u32,
+    pub max_turns: u32, // 0 = unlimited
+}
 
 /// State for the interactive panel that expands below the input box when a
 /// slash-command requires user interaction (a form, picker, confirmation, …).

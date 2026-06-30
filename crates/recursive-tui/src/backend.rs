@@ -22,7 +22,7 @@ use crate::bash::{build_bash_registry, resolve_workspace_root, run_bash_command}
 #[cfg(feature = "weixin")]
 use crate::events::WeixinBackendRequest;
 use crate::events::{PermissionRequest, SkillInstallEvent, UiEvent, UserAction};
-use crate::runtime_builder::RuntimeBuild;
+use crate::runtime_builder::{RuntimeBuild, TuiRuntime};
 
 /// Local helper to fan-out from two channels in the worker loop.
 enum Either<L, R> {
@@ -57,6 +57,10 @@ pub struct Backend {
     /// The UI mutates this in place via `/add-dir` to grant the agent
     /// access to directories outside the workspace at runtime.
     pub session_roots: SharedSandboxRoots,
+    /// Goal-323: shared wakeup slot for loop-mode agent self-scheduling.
+    pub wakeup_slot: recursive::tools::WakeupSlot,
+    /// Goal-323: shared background job manager for loop-mode completion detection.
+    pub bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>>,
     _worker: JoinHandle<()>,
 }
 
@@ -64,25 +68,29 @@ impl Backend {
     pub fn spawn() -> Self {
         #[cfg(feature = "skill-hub")]
         {
-            let (state, skill_install_rx, session_roots) =
+            let (tui_rt, skill_install_rx) =
                 crate::runtime_builder::build_runtime_for_tui();
-            Self::spawn_with_state_and_skill_rx(state, skill_install_rx, session_roots)
+            Self::spawn_with_state_and_skill_rx(tui_rt, skill_install_rx)
         }
         #[cfg(not(feature = "skill-hub"))]
         {
-            let (state, session_roots) = build_runtime();
-            Self::spawn_with_state(state, session_roots)
+            let tui_rt = build_runtime();
+            Self::spawn_with_state(tui_rt)
         }
     }
 
     pub fn spawn_with_runtime(rt: AgentRuntime) -> Self {
-        Self::spawn_with_state(
-            RuntimeBuild::Ready(Some(Box::new(rt))),
-            new_shared_sandbox_roots(),
-        )
+        Self::spawn_with_state(TuiRuntime {
+            state: RuntimeBuild::Ready(Some(Box::new(rt))),
+            session_roots: new_shared_sandbox_roots(),
+            wakeup_slot: Arc::new(std::sync::Mutex::new(None)),
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                recursive::tools::BackgroundJobManager::new(),
+            )),
+        })
     }
 
-    fn spawn_with_state(state: RuntimeBuild, session_roots: SharedSandboxRoots) -> Self {
+    fn spawn_with_state(tui_rt: TuiRuntime) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
@@ -94,14 +102,20 @@ impl Backend {
         #[cfg(feature = "weixin")]
         let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
 
+        let session_roots = tui_rt.session_roots.clone();
+        let wakeup_slot = tui_rt.wakeup_slot.clone();
+        let bg_manager = tui_rt.bg_manager.clone();
+
         let worker = tokio::spawn(worker_loop(
-            state,
+            tui_rt.state,
             action_rx,
             event_tx,
             perm_tx,
             cancel_flag.clone(),
             cancel_notify.clone(),
             permission_enabled.clone(),
+            wakeup_slot.clone(),
+            bg_manager.clone(),
             #[cfg(feature = "weixin")]
             weixin_rx,
         ));
@@ -116,15 +130,16 @@ impl Backend {
             weixin_tx,
             skill_install_rx,
             session_roots,
+            wakeup_slot,
+            bg_manager,
             _worker: worker,
         }
     }
 
     #[cfg(feature = "skill-hub")]
     fn spawn_with_state_and_skill_rx(
-        state: RuntimeBuild,
+        tui_rt: TuiRuntime,
         skill_install_rx: mpsc::UnboundedReceiver<SkillInstallEvent>,
-        session_roots: SharedSandboxRoots,
     ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -135,14 +150,20 @@ impl Backend {
         #[cfg(feature = "weixin")]
         let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
 
+        let session_roots = tui_rt.session_roots.clone();
+        let wakeup_slot = tui_rt.wakeup_slot.clone();
+        let bg_manager = tui_rt.bg_manager.clone();
+
         let worker = tokio::spawn(worker_loop(
-            state,
+            tui_rt.state,
             action_rx,
             event_tx,
             perm_tx,
             cancel_flag.clone(),
             cancel_notify.clone(),
             permission_enabled.clone(),
+            wakeup_slot.clone(),
+            bg_manager.clone(),
             #[cfg(feature = "weixin")]
             weixin_rx,
         ));
@@ -157,6 +178,8 @@ impl Backend {
             weixin_tx,
             skill_install_rx,
             session_roots,
+            wakeup_slot,
+            bg_manager,
             _worker: worker,
         }
     }
@@ -320,6 +343,158 @@ impl PermissionHook for TuiPermissionHook {
     }
 }
 
+// ── Goal-323: Loop arbiter types ───────────────────────────────────────────
+
+/// Active event-driven loop state.
+#[derive(Debug)]
+struct LoopState {
+    active: bool,
+    turns_run: u32,
+    max_turns: u32, // 0 = unlimited
+}
+
+/// Decision returned by the loop arbiter.
+enum ArbiterDecision {
+    /// Run a turn with this prompt.
+    Run {
+        prompt: String,
+        source: String,
+        delay_secs: Option<u64>,
+    },
+    /// Stop the loop (user requested, or max turns reached).
+    Stop,
+    /// No trigger ready yet — stay idle.
+    Idle,
+    /// Forward this action back to the main loop for processing
+    /// (e.g. SetGoal, Compact, RunShell — actions not relevant to
+    /// the arbiter's trigger selection).
+    Forward(UserAction),
+}
+
+/// Wait for a wakeup request from the agent's `schedule_wakeup` tool.
+///
+/// Returns `None` when the slot is empty (nothing scheduled) — the caller
+/// should treat this as `Idle`. When a request is present, returns it and
+/// clears the slot.
+fn wait_wakeup(slot: &recursive::tools::WakeupSlot) -> Option<recursive::tools::WakeupRequest> {
+    slot.lock().ok().and_then(|mut s| s.take())
+}
+
+/// The loop arbiter: select among user actions, bg completions, and wakeups.
+///
+/// Priority order (biased):
+/// 1. User actions (StopLoop, Interrupt, Shutdown, SendMessage, LoopTrigger)
+/// 2. Background job completion
+/// 3. Scheduled wakeup
+async fn loop_arbiter(
+    action_rx: &mut mpsc::UnboundedReceiver<UserAction>,
+    wakeup_slot: &recursive::tools::WakeupSlot,
+    bg_manager: &Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>>,
+    queued_messages: &mut std::collections::VecDeque<String>,
+) -> ArbiterDecision {
+    // Priority 1: drain any pending user actions (non-blocking).
+    loop {
+        match action_rx.try_recv() {
+            Ok(UserAction::StopLoop | UserAction::Interrupt | UserAction::Shutdown) => {
+                return ArbiterDecision::Stop;
+            }
+            Ok(UserAction::SendMessage(text)) => {
+                queued_messages.push_back(text);
+                // Continue draining in case there's more.
+            }
+            Ok(UserAction::LoopTrigger { source, prompt }) => {
+                return ArbiterDecision::Run {
+                    prompt: format!("[trigger:{source}] {prompt}"),
+                    source,
+                    delay_secs: None,
+                };
+            }
+            Ok(UserAction::StartLoop { .. }) => {
+                // Already in loop mode — ignore duplicate.
+            }
+            Ok(_) => {} // Other actions not relevant in loop mode.
+            Err(_) => break, // Channel closed or empty.
+        }
+    }
+
+    // Priority 2..N: block on the first trigger.
+    let bg_notify = {
+        let mgr = bg_manager.lock().await;
+        mgr.completed_notify()
+    };
+
+    tokio::select! {
+        biased;
+        // User actions during wait.
+        action = action_rx.recv() => {
+            match action {
+                Some(UserAction::StopLoop | UserAction::Interrupt | UserAction::Shutdown) => {
+                    ArbiterDecision::Stop
+                }
+                Some(UserAction::SendMessage(text)) => {
+                    queued_messages.push_back(text);
+                    ArbiterDecision::Idle
+                }
+                Some(UserAction::LoopTrigger { source, prompt }) => {
+                    ArbiterDecision::Run {
+                        prompt: format!("[trigger:{source}] {prompt}"),
+                        source,
+                        delay_secs: None,
+                    }
+                }
+                Some(UserAction::StartLoop { .. }) => {
+                    // Already in loop mode — ignore duplicate.
+                    ArbiterDecision::Idle
+                }
+                Some(other) => {
+                    // Forward unknown actions to the main loop for processing.
+                    ArbiterDecision::Forward(other)
+                }
+                None => ArbiterDecision::Stop,
+            }
+        }
+        // Background job completed.
+        _ = bg_notify.notified() => {
+            let mut mgr = bg_manager.lock().await;
+            if let Some((id, output)) = mgr.take_completed() {
+                ArbiterDecision::Run {
+                    prompt: format!("Background job '{}' completed:\n{}", id, output),
+                    source: "bg-complete".to_string(),
+                    delay_secs: None,
+                }
+            } else {
+                // Spurious wakeup — nothing to do.
+                ArbiterDecision::Idle
+            }
+        }
+        // Scheduled wakeup.
+        req = async {
+            // Poll the wakeup slot periodically until something arrives.
+            loop {
+                if let Some(req) = wait_wakeup(wakeup_slot) {
+                    return Some(req);
+                }
+                // Brief sleep to avoid busy-looping; the other branches
+                // in the select! will still preempt this.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        } => {
+            match req {
+                Some(req) => {
+                    tokio::time::sleep(req.delay).await;
+                    ArbiterDecision::Run {
+                        prompt: req.prompt.clone(),
+                        source: "wakeup".to_string(),
+                        delay_secs: Some(req.delay.as_secs()),
+                    }
+                }
+                None => ArbiterDecision::Idle,
+            }
+        }
+    }
+}
+
+
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     mut state: RuntimeBuild,
@@ -329,6 +504,8 @@ async fn worker_loop(
     cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
     permission_enabled: Arc<AtomicBool>,
+    wakeup_slot: recursive::tools::WakeupSlot,
+    bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>>,
     #[cfg(feature = "weixin")] mut weixin_rx: mpsc::UnboundedReceiver<WeixinBackendRequest>,
 ) {
     if let RuntimeBuild::Ready(rt_opt) = &mut state {
@@ -364,11 +541,52 @@ async fn worker_loop(
     // type-ahead queueing rather than silent message loss.
     let mut queued_messages: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
+    // Goal-323: event-driven loop state. None = loop not active.
+    let mut loop_state: Option<LoopState> = None;
+
     loop {
         // Drain any messages queued during the previous turn before blocking on
         // new input, so type-ahead is processed in submission order.
         let action = if let Some(text) = queued_messages.pop_front() {
             Either::Left(UserAction::SendMessage(text))
+        } else if loop_state.as_ref().is_some_and(|ls| ls.active) {
+            // Goal-323: event-driven loop mode — poll the arbiter for next prompt.
+            let decision = loop_arbiter(
+                &mut action_rx,
+                &wakeup_slot,
+                &bg_manager,
+                &mut queued_messages,
+            )
+            .await;
+            match decision {
+                ArbiterDecision::Run {
+                    prompt,
+                    source,
+                    delay_secs,
+                } => {
+                    if let Some(ref ls) = loop_state {
+                        let _ = event_tx.send(UiEvent::LoopTurnScheduled { source, delay_secs });
+                        let _ = ls; // silence unused warning
+                    }
+                    // Use the prompt as a SendMessage to drive one turn through
+                    // the existing spawn → run_turn_select_loop → recover path.
+                    // The SendMessage handler will emit TurnStarted/TurnFinished.
+                    Either::Left(UserAction::SendMessage(prompt))
+                }
+                ArbiterDecision::Stop => {
+                    let _ = event_tx.send(UiEvent::LoopStopped);
+                    loop_state = None;
+                    continue;
+                }
+                ArbiterDecision::Idle => {
+                    let _ = event_tx.send(UiEvent::LoopIdle);
+                    continue;
+                }
+                ArbiterDecision::Forward(action) => {
+                    // Forward the action to the main match block for processing.
+                    Either::Left(action)
+                }
+            }
         } else {
             // Select on both the user-action channel and the WeChat side-channel.
             // WeChat messages processed here behave like SendMessage turns but
@@ -444,6 +662,81 @@ async fn worker_loop(
         };
 
         match action {
+            // ── Goal-323: event-driven loop actions ───────────────────────
+            UserAction::StartLoop { goal, max_turns } => {
+                if let RuntimeBuild::Ready(rt_opt) = &mut state {
+                    let Some(rt_ref) = rt_opt.as_ref() else {
+                        tracing::warn!("backend: runtime not initialized in StartLoop");
+                        continue;
+                    };
+                    // Mutual exclusion: if goal loop is active, reject.
+                    if rt_ref.current_goal().is_some() {
+                        let _ = event_tx.send(UiEvent::Error {
+                            message: "Cannot start loop: a goal loop is already active. Use /goal clear first.".into(),
+                        });
+                        continue;
+                    }
+                    if loop_state.is_some() {
+                        let _ = event_tx.send(UiEvent::Error {
+                            message: "Loop is already active. Use /loop stop first.".into(),
+                        });
+                        continue;
+                    }
+                    loop_state = Some(LoopState {
+                        active: true,
+                        turns_run: 0,
+                        max_turns,
+                    });
+
+                    // Ensure session writer is created so loop turns are persisted.
+                    if session_writer.is_none() {
+                        let ws = resolve_workspace_root();
+                        let goal_slug: String = goal.chars().take(200).collect();
+                        let model = crate::cost::detect_model_name();
+                        if let Ok(sw) =
+                            SessionWriter::create(&ws, &goal_slug, &model, "tui")
+                        {
+                            let sw_arc = Arc::new(std::sync::Mutex::new(sw));
+                            let composite = Arc::new(CompositeSink::new([
+                                Box::new(TuiEventSink {
+                                    tx: event_tx.clone(),
+                                }) as Box<dyn EventSink>,
+                                Box::new(SessionPersistenceSink::new(sw_arc.clone())),
+                            ]));
+                            let Some(rt_mut) = rt_opt.as_mut() else { continue };
+                            rt_mut.set_event_sink(composite);
+                            session_writer = Some(sw_arc);
+                        }
+                    }
+
+                    let _ = event_tx.send(UiEvent::LoopStarted {
+                        goal: goal.clone(),
+                    });
+
+                    // Kick off the first turn by sending the goal as a message.
+                    queued_messages.push_back(goal);
+                } else if let RuntimeBuild::Offline { reason } = &state {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: reason.clone(),
+                    });
+                }
+            }
+
+            UserAction::StopLoop => {
+                loop_state = None;
+                let _ = event_tx.send(UiEvent::LoopStopped);
+            }
+
+            UserAction::LoopTrigger { source, prompt } => {
+                if loop_state.is_some() {
+                    queued_messages.push_back(format!("[trigger:{source}] {prompt}"));
+                } else {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: "No active loop. Use /loop start first.".into(),
+                    });
+                }
+            }
+
             UserAction::Shutdown => {
                 if let Some(sw_arc) = session_writer.take() {
                     if let Ok(mut sw) = sw_arc.lock() {
@@ -664,6 +957,13 @@ async fn worker_loop(
                 condition,
                 max_turns,
             } => {
+                // Goal-323: mutual exclusion — reject SetGoal during event loop.
+                if loop_state.is_some() {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: "Cannot set goal: an event loop is active. Use /loop stop first.".into(),
+                    });
+                    continue;
+                }
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
                     let pre_turn_len = {
                         let Some(rt_ref) = rt_opt.as_ref() else {
@@ -1265,5 +1565,289 @@ mod tests {
             got_interrupted,
             "Interrupt should abort the running turn and emit UiEvent::Interrupted"
         );
+    }
+
+    // ── Goal-323: Loop arbiter tests ──────────────────────────────────
+
+    /// Smoke test: verify the LoopState type compiles and has expected defaults.
+    #[test]
+    fn loop_state_defaults() {
+        let ls = LoopState {
+            active: true,
+            turns_run: 5,
+            max_turns: 10,
+        };
+        assert!(ls.active);
+        assert_eq!(ls.turns_run, 5);
+        assert_eq!(ls.max_turns, 10);
+    }
+
+    #[tokio::test]
+    async fn start_loop_emits_loop_started_and_runs_turn() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "working".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .build()
+            .expect("runtime builds");
+        let mut backend = Backend::spawn_with_runtime(rt);
+
+        // Drain RuntimeReady.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
+            .await;
+
+        backend
+            .action_tx
+            .send(UserAction::StartLoop {
+                goal: "test goal".into(),
+                max_turns: 2,
+            })
+            .unwrap();
+
+        let mut seen_started = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::LoopStarted { .. })) => seen_started = true,
+                Ok(Some(UiEvent::TurnFinished)) => break,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(seen_started, "expected LoopStarted");
+    }
+
+    #[tokio::test]
+    async fn stop_loop_emits_loop_stopped() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .build()
+            .expect("runtime builds");
+        let mut backend = Backend::spawn_with_runtime(rt);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
+            .await;
+
+        // Start loop, let first turn complete.
+        backend
+            .action_tx
+            .send(UserAction::StartLoop {
+                goal: "test".into(),
+                max_turns: 10,
+            })
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::TurnFinished)) => break,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+
+        backend.action_tx.send(UserAction::StopLoop).unwrap();
+
+        let mut seen_stopped = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::LoopStopped)) => {
+                    seen_stopped = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(seen_stopped, "expected LoopStopped");
+    }
+
+    #[tokio::test]
+    async fn set_goal_rejected_during_loop() {
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .build()
+            .expect("runtime builds");
+        let mut backend = Backend::spawn_with_runtime(rt);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
+            .await;
+
+        backend
+            .action_tx
+            .send(UserAction::StartLoop {
+                goal: "test".into(),
+                max_turns: 10,
+            })
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::TurnFinished)) => break,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+
+        backend
+            .action_tx
+            .send(UserAction::SetGoal {
+                condition: "achieve".into(),
+                max_turns: 5,
+            })
+            .unwrap();
+
+        let mut got_error = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::Error { message })) => {
+                    assert!(message.contains("event loop is active"));
+                    got_error = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(got_error, "expected Error for SetGoal during loop");
+    }
+
+    #[tokio::test]
+    async fn loop_trigger_runs_turn() {
+        let llm = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "first".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "triggered".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .build()
+            .expect("runtime builds");
+        let mut backend = Backend::spawn_with_runtime(rt);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv())
+            .await;
+
+        backend
+            .action_tx
+            .send(UserAction::StartLoop {
+                goal: "goal".into(),
+                max_turns: 0,
+            })
+            .unwrap();
+
+        // Wait for the first turn to complete.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::TurnFinished)) => break,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+
+        // Send the trigger.
+        backend
+            .action_tx
+            .send(UserAction::LoopTrigger {
+                source: "manual".into(),
+                prompt: "check".into(),
+            })
+            .unwrap();
+
+        // Collect all events until the second TurnFinished.
+        let mut got_triggered = false;
+        let mut turn_finished_count = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::LoopTurnScheduled { source, .. })) => {
+                    if source == "manual" {
+                        got_triggered = true;
+                    }
+                }
+                Ok(Some(UiEvent::TurnFinished)) => {
+                    turn_finished_count += 1;
+                    if turn_finished_count >= 2 {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(got_triggered, "expected LoopTurnScheduled source=manual");
     }
 }

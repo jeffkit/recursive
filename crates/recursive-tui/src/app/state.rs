@@ -59,6 +59,7 @@ impl App {
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
             current_todos: Vec::new(),
             active_goal: None,
+            loop_state: None,
             workspace_path: workspace,
             last_skill_reload: Some(Instant::now()),
             session_roots: recursive::new_shared_sandbox_roots(),

@@ -273,6 +273,33 @@ impl App {
                 });
                 self.active_goal = None;
             }
+            // ── Goal-323: event-driven loop events ─────────────────────────
+            UiEvent::LoopStarted { goal } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Loop started: \"{goal}\""),
+                });
+                // LoopUiState already set by cmd_loop handler.
+            }
+            UiEvent::LoopStopped => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: "Loop stopped.".into(),
+                });
+                self.loop_state = None;
+            }
+            UiEvent::LoopTurnScheduled { source, delay_secs } => {
+                let delay_str = delay_secs
+                    .map(|d| format!(" in {d}s"))
+                    .unwrap_or_default();
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Loop turn scheduled [{source}]{delay_str}"),
+                });
+                if let Some(ref mut ls) = self.loop_state {
+                    ls.turns_run = ls.turns_run.saturating_add(1);
+                }
+            }
+            UiEvent::LoopIdle => {
+                // No-op: the loop is waiting. Don't flood the transcript.
+            }
             // ── Goal-170: turn abort ──────────────────────────────────────────
             UiEvent::Interrupted => {
                 self.blocks.push(TranscriptBlock::System {

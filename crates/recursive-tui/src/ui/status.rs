@@ -135,6 +135,25 @@ pub fn build_line(app: &App) -> Line<'static> {
         ));
     }
 
+    // [loop] — Goal-323: event-driven loop state indicator
+    if let Some(ls) = &app.loop_state {
+        spans.push(separator());
+        let label = if ls.turns_run == 0 && ls.max_turns == 0 {
+            "loop: idle".to_string()
+        } else if ls.max_turns > 0 {
+            format!("loop: turn {}/{}", ls.turns_run, ls.max_turns)
+        } else {
+            format!("loop: turn {}", ls.turns_run)
+        };
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::LightGreen)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     Line::from(spans)
 }
 
