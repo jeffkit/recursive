@@ -107,6 +107,20 @@ testing the wrong thing too.
   logic + rendering on Windows; only the terminal-IO PTY layer is
   skipped, matching the repo convention for PTY/shell-driven tests.
 
+- `crates/recursive-tui/src/skill_commands.rs` — the two symlink
+  regression tests (`load_dir_follows_symlinks_to_directories`,
+  `load_dir_follows_symlinks_to_flat_md_files`) only created their
+  symlinks under `#[cfg(unix)]`, so on Windows the link was never
+  created and `load_dir` saw an empty dir → assertion failure. Added
+  per-platform symlink creation: `std::os::windows::fs::symlink_dir`
+  for the directory-symlink test and `symlink_file` for the flat-md
+  test (`windows-latest` runners have Developer Mode on, so symlink
+  creation is permitted). This failure was **masked** on Windows by
+  fail-fast — the recursive-tui lib binary failed at the
+  `abbreviate_workspace` test before reaching these, and earlier still
+  by the providers/invariants failures. Each upstream fix unmasked the
+  next.
+
 ## Tests added
 
 None — these are fixes to existing tests plus a doc-comment correction.

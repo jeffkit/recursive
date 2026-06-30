@@ -701,14 +701,15 @@ $ARGUMENTS
         let link_dir: PathBuf = dir.path().join("link-dir");
         std::fs::create_dir(&link_dir).unwrap();
         // Symlink inside link-dir: `symlinked-skill -> ../real-skills/my-skill`
+        let target = dir.path().join("real-skills").join("my-skill");
+        let link = link_dir.join("symlinked-skill");
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(
-                dir.path().join("real-skills").join("my-skill"),
-                link_dir.join("symlinked-skill"),
-            )
-            .unwrap();
-        }
+        std::os::unix::fs::symlink(target, link).unwrap();
+        // Windows: symlinks need Developer Mode (enabled on `windows-latest`
+        // CI runners) or admin. `symlink_dir` creates a directory symlink;
+        // `unix::fs::symlink` is unix-only, so we branch per-platform here.
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
 
         let skills = SkillCommandLoader::load_dir(&link_dir);
         assert!(!skills.is_empty(), "should load skill through symlink");
@@ -726,11 +727,12 @@ $ARGUMENTS
         // Create a symlink directory and a symlink to the flat md file.
         let link_dir: PathBuf = dir.path().join("link-flat");
         std::fs::create_dir(&link_dir).unwrap();
+        let target = real_dir.join("hello.md");
+        let link = link_dir.join("hello.md");
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(real_dir.join("hello.md"), link_dir.join("hello.md"))
-                .unwrap();
-        }
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link).unwrap();
 
         let skills = SkillCommandLoader::load_dir(&link_dir);
         assert_eq!(skills.len(), 1, "should load flat skill through symlink");
