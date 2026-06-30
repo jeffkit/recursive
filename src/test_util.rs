@@ -122,11 +122,26 @@ impl Drop for PinnedRecursiveHomeNoLock {
 
 /// Same as [`PinnedRecursiveHome`] but for `HOME`.
 ///
+/// # Windows caveat — prefer [`PinnedRecursiveHome`] for `dirs`-based paths
+///
 /// On Windows the `dirs::home_dir()` crate (used by
-/// `config_file::config_file_path`) resolves via `SHGetKnownFolderPath`
-/// / `%USERPROFILE%` and ignores `%HOME%`. Pinning `HOME` alone on
-/// Windows leaves config-file resolution pointing at the real user
-/// profile, so we also pin `USERPROFILE` there.
+/// `paths::user_data_dir` and `config_file::config_file_path` as the
+/// fallback when `RECURSIVE_HOME` is unset) resolves **only** via
+/// `SHGetKnownFolderPath(FOLDERID_Profile)` and ignores **both** `%HOME%`
+/// and `%USERPROFILE%` at runtime. Setting those env vars therefore does
+/// NOT redirect `dirs::home_dir()`. This guard pins them anyway because
+/// some product code reads `HOME` directly via `std::env::var_os("HOME")`
+/// (e.g. `config::load_user_memory`, `tools::facts` global scope), and
+/// that code IS redirected by this guard.
+///
+/// For any test that exercises a `dirs::home_dir()`-based path
+/// (`user_data_dir`, `config_file_path`, `providers_d_dir`, …) on
+/// Windows, use [`PinnedRecursiveHome`] instead — `user_data_dir()` and
+/// `config_file_path()` short-circuit on `RECURSIVE_HOME` before ever
+/// consulting `dirs::home_dir()`, so the pin takes effect on every
+/// platform. See `src/providers.rs` tests and
+/// `crates/recursive-tui/src/runtime_builder.rs` for the canonical
+/// pattern.
 pub struct PinnedHome {
     _guard: MutexGuard<'static, ()>,
     prev_home: Option<std::ffi::OsString>,

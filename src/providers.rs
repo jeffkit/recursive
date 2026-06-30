@@ -328,10 +328,18 @@ mod tests {
     #[test]
     fn additional_presets_returns_empty_when_dir_absent() -> Result<(), Box<dyn std::error::Error>>
     {
-        // Pin HOME + RECURSIVE_HOME so the test does not see a real
+        // Pin RECURSIVE_HOME so the test does not see a real
         // `~/.recursive/providers.d/` from the developer's machine.
         let tmp = tempfile::tempdir()?;
-        let _pin = crate::test_util::PinnedHome::new(tmp.path());
+        // PinnedRecursiveHome (sets RECURSIVE_HOME) instead of PinnedHome:
+        // `user_data_dir()` short-circuits on RECURSIVE_HOME first, then
+        // falls back to `dirs::home_dir()`. On Windows, `dirs::home_dir()`
+        // resolves via SHGetKnownFolderPath(FOLDERID_Profile) and ignores
+        // both HOME and USERPROFILE env vars, so PinnedHome cannot
+        // redirect it. Pinning RECURSIVE_HOME at `<tmp>/.recursive` makes
+        // `user_data_dir()` return `<tmp>/.recursive` on every platform,
+        // which is exactly where the test writes its providers.d override.
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
         assert!(
             additional_presets().is_empty(),
             "no providers.d/ under temp home, expected empty list"
@@ -342,7 +350,9 @@ mod tests {
     #[test]
     fn additional_presets_loads_valid_file() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
-        let _pin = crate::test_util::PinnedHome::new(tmp.path());
+        // PinnedRecursiveHome, not PinnedHome — see the first test in this
+        // module for why RECURSIVE_HOME is required on Windows.
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
 
         let dir = tmp.path().join(".recursive").join("providers.d");
         write_user_override(
@@ -381,7 +391,9 @@ key_url = "https://x"
     #[test]
     fn additional_presets_skips_invalid_file() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
-        let _pin = crate::test_util::PinnedHome::new(tmp.path());
+        // PinnedRecursiveHome, not PinnedHome — see the first test in this
+        // module for why RECURSIVE_HOME is required on Windows.
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
 
         let dir = tmp.path().join(".recursive").join("providers.d");
         // Malformed: missing `[[providers]]` array-of-tables header.
@@ -401,7 +413,9 @@ key_url = "https://x"
     #[test]
     fn find_preset_extended_finds_user_override() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
-        let _pin = crate::test_util::PinnedHome::new(tmp.path());
+        // PinnedRecursiveHome, not PinnedHome — see the first test in this
+        // module for why RECURSIVE_HOME is required on Windows.
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
 
         let dir = tmp.path().join(".recursive").join("providers.d");
         write_user_override(
