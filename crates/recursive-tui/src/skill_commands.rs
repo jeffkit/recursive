@@ -161,12 +161,17 @@ impl SkillCommandLoader {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
+            // Use fs::metadata(path) — not entry.file_type() or entry.metadata().
+            // entry.file_type() does NOT follow symlinks (per Rust docs).
+            // entry.metadata() is documented to follow symlinks but on macOS
+            // it does not (known platform quirk), so we call fs::metadata directly
+            // on the resolved path to safely handle symlinks to skill directories.
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
                 Err(_) => continue,
             };
 
-            if ft.is_dir() {
+            if meta.is_dir() {
                 // Directory-based: <name>/SKILL.md
                 let skill_md = path.join("SKILL.md");
                 if skill_md.is_file() {
@@ -177,7 +182,7 @@ impl SkillCommandLoader {
                         }
                     }
                 }
-            } else if ft.is_file() {
+            } else if meta.is_file() {
                 // Flat .md file (legacy compatibility).
                 if path
                     .extension()
@@ -676,5 +681,59 @@ $ARGUMENTS
         let claude_skills = SkillCommandLoader::load_dir(claude.parent().unwrap());
         assert_eq!(claude_skills.len(), 1);
         assert_eq!(claude_skills[0].name, "refactor");
+    }
+
+    // ── Symlink resolution ─────────────────────────────────────────────────
+
+    #[test]
+    fn load_dir_follows_symlinks_to_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a real skill directory + SKILL.md.
+        let real_skill = dir.path().join("real-skills").join("my-skill");
+        std::fs::create_dir_all(&real_skill).unwrap();
+        std::fs::write(
+            real_skill.join("SKILL.md"),
+            "---\ndescription: A real skill\n---\nDo: $ARGUMENTS\n",
+        )
+        .unwrap();
+
+        // Create a symlink directory that points to the real skill dir.
+        let link_dir: PathBuf = dir.path().join("link-dir");
+        std::fs::create_dir(&link_dir).unwrap();
+        // Symlink inside link-dir: `symlinked-skill -> ../real-skills/my-skill`
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                dir.path().join("real-skills").join("my-skill"),
+                link_dir.join("symlinked-skill"),
+            )
+            .unwrap();
+        }
+
+        let skills = SkillCommandLoader::load_dir(&link_dir);
+        assert!(!skills.is_empty(), "should load skill through symlink");
+        assert_eq!(skills[0].name, "symlinked-skill");
+    }
+
+    #[test]
+    fn load_dir_follows_symlinks_to_flat_md_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a real flat .md file.
+        let real_dir = dir.path().join("real-files");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("hello.md"), "Say hello to $ARGUMENTS\n").unwrap();
+
+        // Create a symlink directory and a symlink to the flat md file.
+        let link_dir: PathBuf = dir.path().join("link-flat");
+        std::fs::create_dir(&link_dir).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(real_dir.join("hello.md"), link_dir.join("hello.md"))
+                .unwrap();
+        }
+
+        let skills = SkillCommandLoader::load_dir(&link_dir);
+        assert_eq!(skills.len(), 1, "should load flat skill through symlink");
+        assert_eq!(skills[0].name, "hello");
     }
 }
