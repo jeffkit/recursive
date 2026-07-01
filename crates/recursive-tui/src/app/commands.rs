@@ -3290,3 +3290,102 @@ mod picker_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod handle_key_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::{App, InputMode};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ctrl_r_in_history_search_cycles_selected() {
+        // kills: delete HistorySearch match arm (121), `+`→`-`/`*`, `%`→`/`/`+` (125)
+        let mut app = App::new();
+        app.prompt.mode = InputMode::HistorySearch;
+        app.hsearch_matches = vec![0, 1, 2];
+        app.hsearch_selected = 1;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(action.is_none());
+        assert_eq!(app.hsearch_selected, 2); // (1 + 1) % 3
+    }
+
+    #[test]
+    fn ctrl_r_in_history_search_empty_matches_no_panic() {
+        // kills delete `!` in `if !self.hsearch_matches.is_empty()` (123):
+        // orig skips on empty → no-op; mutant enters → `(0+1) % 0` panics → caught
+        let mut app = App::new();
+        app.prompt.mode = InputMode::HistorySearch;
+        app.hsearch_matches = vec![];
+        app.hsearch_selected = 0;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(action.is_none());
+        assert_eq!(app.hsearch_selected, 0);
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_no_submit() {
+        // kills `||`→`&&` in Enter modifier guard (168):
+        // orig (any modifier): inserts '\n' → buffer "x\n", no submit.
+        // mutant (all modifiers): guard false → submit_prompt("x") → buffer cleared + action.
+        let mut app = App::new();
+        app.prompt.buffer = "x".to_string();
+        app.prompt.cursor = 1;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(action.is_none(), "Shift+Enter must not submit");
+        assert_eq!(app.prompt.buffer, "x\n");
+    }
+
+    #[test]
+    fn plain_j_inserts_j_not_newline() {
+        // kills Ctrl+J guard → `true` (183):
+        // orig: 'j' without CONTROL → handle_char_input('j') → buffer "xj".
+        // mutant: `Char('j') if true` matches → insert_char('\n') → buffer "x\n".
+        let mut app = App::new();
+        app.prompt.buffer = "x".to_string();
+        app.prompt.cursor = 1;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(action.is_none());
+        assert_eq!(app.prompt.buffer, "xj");
+    }
+
+    #[test]
+    fn delete_key_deletes_forward() {
+        // kills delete Delete match arm (234): mutant falls to `_ => None`, buffer unchanged.
+        let mut app = App::new();
+        app.prompt.buffer = "ab".to_string();
+        app.prompt.cursor = 0;
+        let action = app.handle_key(k(KeyCode::Delete));
+        assert!(action.is_none());
+        assert_eq!(app.prompt.buffer, "b");
+    }
+
+    #[test]
+    fn ctrl_c_clears_non_empty_buffer_in_prompt_mode() {
+        // kills `||`→`&&` in step-3 guard (336):
+        // orig (`!empty || mode!=Prompt`): clears buffer → "".
+        // mutant (`!empty && mode!=Prompt`): mode==Prompt → false → skip clear → buffer "x".
+        let mut app = App::new();
+        app.prompt.buffer = "x".to_string();
+        app.prompt.mode = InputMode::Prompt;
+        let action = app.handle_ctrl_c();
+        assert!(action.is_none());
+        assert_eq!(app.prompt.buffer, "");
+    }
+
+    #[test]
+    fn esc_resets_non_prompt_mode_to_prompt() {
+        // kills `!=`→`==` in handle_esc step-1 guard (284):
+        // orig (`!empty || mode!=Prompt`): mode=Command → true → reset to Prompt.
+        // mutant (`!empty || mode==Prompt`): mode=Command → false → skip → stays Command.
+        let mut app = App::new();
+        app.prompt.mode = InputMode::Command;
+        app.prompt.buffer = String::new();
+        let action = app.handle_esc();
+        assert!(action.is_none());
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+    }
+}
