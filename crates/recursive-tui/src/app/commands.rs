@@ -2769,3 +2769,190 @@ mod skill_command_menu_tests {
         assert_eq!(app.prompt.buffer, "refactor");
     }
 }
+
+#[cfg(test)]
+mod history_search_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::{App, InputMode};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn kc(code: KeyCode, c: char) -> KeyEvent {
+        let _ = c;
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn app_with_history(entries: &[&str]) -> App {
+        let mut app = App::new();
+        app.prompt.history = entries.iter().map(|s| s.to_string()).collect();
+        app
+    }
+
+    #[test]
+    fn should_walk_history_up_false_when_history_empty() {
+        // kills "replace should_walk_history_up -> bool with true"
+        let app = app_with_history(&[]);
+        assert!(!app.should_walk_history_up());
+    }
+
+    #[test]
+    fn should_walk_history_up_requires_empty_buffer_when_not_walking() {
+        // not walking (history_idx None) + non-empty buffer → false (entry point rule)
+        let mut app = app_with_history(&["abc", "def"]);
+        app.prompt.buffer = "x".to_string();
+        assert!(!app.should_walk_history_up());
+        // empty buffer → true (entry point)
+        app.prompt.buffer.clear();
+        assert!(app.should_walk_history_up());
+    }
+
+    #[test]
+    fn should_walk_history_up_true_when_already_walking() {
+        let mut app = app_with_history(&["abc"]);
+        app.prompt.history_idx = Some(0);
+        app.prompt.buffer = "x".to_string();
+        assert!(app.should_walk_history_up());
+    }
+
+    #[test]
+    fn should_walk_history_down_false_when_not_walking() {
+        // kills "replace should_walk_history_down -> bool with true"
+        let app = app_with_history(&["abc", "def"]);
+        assert!(!app.should_walk_history_down());
+    }
+
+    #[test]
+    fn should_walk_history_down_true_when_walking() {
+        let mut app = app_with_history(&["abc"]);
+        app.prompt.history_idx = Some(0);
+        assert!(app.should_walk_history_down());
+    }
+
+    #[test]
+    fn hsearch_up_decrements_selected() {
+        // kills: delete Up arm, `> 0`→`== 0`, `-=`→`+=`, `-=`→`/=`
+        let mut app = app_with_history(&["abc", "def", "ghi"]);
+        app.enter_history_search_mode();
+        app.hsearch_selected = 2;
+        let _ = app.handle_history_search_key(k(KeyCode::Up));
+        assert_eq!(app.hsearch_selected, 1);
+    }
+
+    #[test]
+    fn hsearch_up_at_zero_does_not_underflow() {
+        // kills `> 0`→`>= 0` (would underflow) and confirms clamp at 0
+        let mut app = app_with_history(&["abc", "def"]);
+        app.enter_history_search_mode();
+        app.hsearch_selected = 0;
+        let _ = app.handle_history_search_key(k(KeyCode::Up));
+        assert_eq!(app.hsearch_selected, 0);
+    }
+
+    #[test]
+    fn hsearch_up_guard_short_circuits_on_empty_matches() {
+        // kills `&&`→`||`: empty matches + selected>0 → original no move, mutant moves
+        let mut app = app_with_history(&["abc"]);
+        app.hsearch_matches.clear();
+        app.hsearch_selected = 2;
+        let _ = app.handle_history_search_key(k(KeyCode::Up));
+        assert_eq!(app.hsearch_selected, 2);
+    }
+
+    #[test]
+    fn hsearch_down_increments_selected() {
+        // kills: delete Down arm, `<`→`>`, `+=`→`-=`, `+=`→`*=`
+        let mut app = app_with_history(&["abc", "def", "ghi"]);
+        app.enter_history_search_mode();
+        app.hsearch_selected = 0;
+        let _ = app.handle_history_search_key(k(KeyCode::Down));
+        assert_eq!(app.hsearch_selected, 1);
+    }
+
+    #[test]
+    fn hsearch_down_clamps_at_last_and_guard_short_circuits() {
+        // selected at last: `selected+1 < len` false → no move.
+        // kills `&&`→`||` (would move past end) and `+`→`*` in guard (2*1<3 true → would move)
+        let mut app = app_with_history(&["abc", "def", "ghi"]);
+        app.enter_history_search_mode();
+        app.hsearch_selected = 2;
+        let _ = app.handle_history_search_key(k(KeyCode::Down));
+        assert_eq!(app.hsearch_selected, 2);
+    }
+
+    #[test]
+    fn hsearch_char_appends_to_query_and_refreshes_matches() {
+        // kills: delete Char arm, and refresh_hsearch_matches -> ()
+        let mut app = app_with_history(&["abc", "axy", "xyz"]);
+        app.enter_history_search_mode(); // matches = [2,1,0] (most-recent-first)
+        assert_eq!(app.hsearch_matches.len(), 3);
+        let _ = app.handle_history_search_key(kc(KeyCode::Char('a'), 'a'));
+        assert_eq!(app.hsearch_query, "a");
+        // prefix matches for 'a': "abc"(0),"axy"(1) → reversed → [1,0]
+        assert_eq!(app.hsearch_matches, vec![1, 0]);
+    }
+
+    #[test]
+    fn hsearch_backspace_truncates_last_char() {
+        // kills 791 `-`→`+` and `-`→`/` in new_len = query.len() - last_len
+        let mut app = app_with_history(&["abc", "def"]);
+        app.enter_history_search_mode();
+        app.hsearch_query = "ab".to_string();
+        let _ = app.handle_history_search_key(k(KeyCode::Backspace));
+        assert_eq!(app.hsearch_query, "a");
+    }
+
+    #[test]
+    fn hsearch_backspace_on_empty_query_exits_mode() {
+        let mut app = app_with_history(&["abc"]);
+        app.enter_history_search_mode();
+        assert_eq!(app.prompt.mode, InputMode::HistorySearch);
+        let _ = app.handle_history_search_key(k(KeyCode::Backspace));
+        assert_ne!(app.prompt.mode, InputMode::HistorySearch);
+    }
+
+    #[test]
+    fn hsearch_esc_exits_mode() {
+        let mut app = app_with_history(&["abc"]);
+        app.enter_history_search_mode();
+        let _ = app.handle_history_search_key(k(KeyCode::Esc));
+        assert_ne!(app.prompt.mode, InputMode::HistorySearch);
+    }
+
+    #[test]
+    fn hsearch_enter_commits_selected_entry_to_buffer() {
+        // history ["abc","def"] → empty-query matches = [1,0] (most-recent-first)
+        // selected=0 → matches[0]=1 → history[1]="def"
+        let mut app = app_with_history(&["abc", "def"]);
+        app.enter_history_search_mode();
+        assert_eq!(app.hsearch_matches, vec![1, 0]);
+        app.hsearch_selected = 0;
+        let _ = app.handle_history_search_key(k(KeyCode::Enter));
+        assert_eq!(app.prompt.buffer, "def");
+        assert_ne!(app.prompt.mode, InputMode::HistorySearch);
+    }
+
+    #[test]
+    fn refresh_hsearch_matches_resets_selected_when_out_of_range() {
+        // selected >= matches.len().max(1) → reset to 0
+        let mut app = app_with_history(&["abc", "def", "ghi"]);
+        app.enter_history_search_mode();
+        app.hsearch_selected = 5; // out of range (3 matches)
+        app.refresh_hsearch_matches();
+        assert_eq!(app.hsearch_selected, 0);
+    }
+
+    #[test]
+    fn refresh_hsearch_matches_keeps_in_range_selected() {
+        // kills `>=`→`<`: selected=1, 2 matches → original keeps 1, mutant resets to 0
+        let mut app = app_with_history(&["abc", "axy", "xyz"]);
+        // query "a" → prefix matches [0,1] → reversed → [1,0]
+        app.hsearch_query = "a".to_string();
+        app.hsearch_selected = 1;
+        app.refresh_hsearch_matches();
+        assert_eq!(app.hsearch_matches, vec![1, 0]);
+        assert_eq!(app.hsearch_selected, 1);
+    }
+}
