@@ -2962,7 +2962,7 @@ mod picker_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::app::App;
-    use crate::ui::modal::{McpEntry, Modal, ResumeEntry};
+    use crate::ui::modal::{ConfirmAction, JournalEntry, McpEntry, Modal, ResumeEntry};
     use crate::UserAction;
 
     fn k(code: KeyCode) -> KeyEvent {
@@ -3125,8 +3125,7 @@ mod picker_tests {
     // ── modal_scroll_follow_selection ──────────────────────────────
     #[test]
     fn modal_scroll_follows_selection_upward() {
-        // selection above viewport → scroll up to row-1.
-        // kills: -> () (no change), `+`→`*` in `selected + 2` (row=0 → scroll 0), `>`→`>=`
+        // kills: -> () (no change→10), `+`→`*` in `selected + 2` (row=0 → scroll 0)
         let mut app = App::new();
         app.modal_scroll = 10;
         app.modal_scroll_follow_selection(2); // row = 4 < 10 → scroll = 3
@@ -3134,13 +3133,26 @@ mod picker_tests {
     }
 
     #[test]
-    fn modal_scroll_follows_selection_downward() {
-        // selection below viewport → scroll down.
-        // kills: `+`→`-`/`*` in `row + 1`, `-`→`+` in `row + 1 - MODAL_LIST_VISIBLE`
+    fn modal_scroll_follows_selection_downward_with_offset() {
+        // Non-zero modal_scroll so both `+` operators in the elif are exercised.
+        // row=33, row+1=34 > 5+28=33 → scroll = 34-28 = 6.
+        // kills: `+`→`-`/`*` in `row + 1` (32/33 > 33 false → stays 5),
+        //        `+`→`*` in `modal_scroll + 28` (5*28=140 → 34>140 false → stays 5),
+        //        `-`→`+` in `row + 1 - MODAL_LIST_VISIBLE` (34+28=62)
         let mut app = App::new();
-        app.modal_scroll = 0;
-        app.modal_scroll_follow_selection(50); // row=52, 53 > 0+28 → 53-28 = 25
-        assert_eq!(app.modal_scroll, 25);
+        app.modal_scroll = 5;
+        app.modal_scroll_follow_selection(31);
+        assert_eq!(app.modal_scroll, 6);
+    }
+
+    #[test]
+    fn modal_scroll_boundary_row_equals_scroll_stays() {
+        // row == modal_scroll exactly: orig `<` false → no change; mutant `<=` → scroll 3.
+        // kills: `<`→`<=` in `if row < self.modal_scroll`
+        let mut app = App::new();
+        app.modal_scroll = 4;
+        app.modal_scroll_follow_selection(2); // row = 4 == 4 → no change
+        assert_eq!(app.modal_scroll, 4);
     }
 
     #[test]
@@ -3149,5 +3161,132 @@ mod picker_tests {
         app.modal_scroll = 0;
         app.modal_scroll_follow_selection(5); // row=7, 7<0 false, 8>28 false → no change
         assert_eq!(app.modal_scroll, 0);
+    }
+
+    // ── handle_modal_key: Enter / scroll / Journal ──────────────────
+    fn journal(entries: usize, selected: usize) -> Modal {
+        Modal::Journal {
+            entries: (0..entries)
+                .map(|i| JournalEntry {
+                    name: format!("j{i}"),
+                    preview: String::new(),
+                })
+                .collect(),
+            selected,
+        }
+    }
+
+    #[test]
+    fn modal_enter_on_confirm_exit_quits_and_pops() {
+        // kills delete Enter arm (mutant: Enter falls to `_ => {}`, no quit/pop)
+        let mut app = App::new();
+        app.modals.push(Modal::Confirm {
+            prompt: "exit?".into(),
+            on_yes: ConfirmAction::Exit,
+        });
+        assert!(app.handle_modal_key(k(KeyCode::Enter)));
+        assert!(
+            app.should_quit,
+            "Enter on Confirm Exit should set should_quit"
+        );
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn modal_enter_on_confirm_clear_resets_transcript() {
+        // kills delete Enter arm (mutant: no reset → blocks keep the User block)
+        let mut app = App::new();
+        app.modals.push(Modal::Confirm {
+            prompt: "clear?".into(),
+            on_yes: ConfirmAction::Clear,
+        });
+        app.blocks
+            .push(crate::model::TranscriptBlock::User { text: "x".into() });
+        app.blocks
+            .push(crate::model::TranscriptBlock::User { text: "y".into() });
+        assert_eq!(app.blocks.len(), 2);
+        assert!(app.handle_modal_key(k(KeyCode::Enter)));
+        // reset_transcript clears and pushes a single "Conversation cleared." System block
+        assert_eq!(app.blocks.len(), 1);
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn modal_enter_on_non_confirm_pops() {
+        // kills delete Enter arm's else branch (non-confirm dismiss)
+        let mut app = App::new();
+        app.modals.push(Modal::Help);
+        assert!(app.handle_modal_key(k(KeyCode::Enter)));
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn modal_pageup_step_10_on_text_modal() {
+        // kills `==`→`!=` in `if key.code == KeyCode::PageUp` (mutant: step=1 → scroll 19)
+        let mut app = App::new();
+        app.modals.push(Modal::Help);
+        app.modal_scroll = 20;
+        assert!(app.handle_modal_key(k(KeyCode::PageUp)));
+        assert_eq!(app.modal_scroll, 10);
+    }
+
+    #[test]
+    fn modal_pagedown_step_10_on_text_modal() {
+        // kills `==`→`!=` in `if key.code == KeyCode::PageDown` (mutant: step=1 → scroll 1)
+        let mut app = App::new();
+        app.modals.push(Modal::Help);
+        app.modal_scroll = 0;
+        assert!(app.handle_modal_key(k(KeyCode::PageDown)));
+        assert_eq!(app.modal_scroll, 10);
+    }
+
+    #[test]
+    fn modal_journal_up_decrements_selected() {
+        // kills delete Up arm + `>`→`>=` (selected=2: orig 2>0 → 1; mutant `>=` same here)
+        let mut app = App::new();
+        app.modals.push(journal(3, 2));
+        assert!(app.handle_modal_key(k(KeyCode::Up)));
+        match app.modals.last() {
+            Some(Modal::Journal { selected, .. }) => assert_eq!(*selected, 1),
+            _ => panic!("journal modal gone"),
+        }
+    }
+
+    #[test]
+    fn modal_journal_up_at_zero_stays() {
+        // kills `>`→`>=` in `if *selected > 0`: orig 0>0 false → stays 0;
+        // mutant 0>=0 true → `*selected -= 1` underflows (panic) → caught
+        let mut app = App::new();
+        app.modals.push(journal(3, 0));
+        assert!(app.handle_modal_key(k(KeyCode::Up)));
+        match app.modals.last() {
+            Some(Modal::Journal { selected, .. }) => assert_eq!(*selected, 0),
+            _ => panic!("journal modal gone"),
+        }
+    }
+
+    #[test]
+    fn modal_journal_down_increments_selected() {
+        // kills delete Down arm
+        let mut app = App::new();
+        app.modals.push(journal(3, 0));
+        assert!(app.handle_modal_key(k(KeyCode::Down)));
+        match app.modals.last() {
+            Some(Modal::Journal { selected, .. }) => assert_eq!(*selected, 1),
+            _ => panic!("journal modal gone"),
+        }
+    }
+
+    #[test]
+    fn modal_journal_down_at_last_stays() {
+        // selected=last (2 of 3): `2+1 < 3` false → no move.
+        // kills `<`→`<=` (3<=3 true → inc to 3) and `+`→`*` (2*1=2<3 true → inc to 3)
+        let mut app = App::new();
+        app.modals.push(journal(3, 2));
+        assert!(app.handle_modal_key(k(KeyCode::Down)));
+        match app.modals.last() {
+            Some(Modal::Journal { selected, .. }) => assert_eq!(*selected, 2),
+            _ => panic!("journal modal gone"),
+        }
     }
 }
