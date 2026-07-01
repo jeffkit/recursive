@@ -1924,4 +1924,304 @@ mod tests {
             other => panic!("expected System, got {other:?}"),
         }
     }
+
+    // ── Pre-existing: build_*_lines / serde_*_context renderers ─────────
+
+    fn text_of(lines: &[ratatui::text::Line<'_>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn build_cost_lines_computes_per_token_costs() {
+        use crate::cost::UsageStats;
+        let mut usage = UsageStats::default();
+        usage.total_input = 1_000_000;
+        usage.total_output = 2_000_000;
+        usage.last_latency_ms = 1_500;
+        let model = "MiniMax-M3";
+        let pricing = recursive::llm::pricing_for(model).expect("MiniMax-M3 has pricing");
+        let cost_in = 1_000_000.0 * pricing.input_per_million / 1_000_000.0;
+        let cost_out = 2_000_000.0 * pricing.output_per_million / 1_000_000.0;
+        let cost_total = cost_in + cost_out;
+
+        let text = text_of(&build_cost_lines(&usage, model));
+        assert!(
+            text.contains(&format!("(${cost_in:.4})")),
+            "input cost missing in {text:?}"
+        );
+        assert!(
+            text.contains(&format!("(${cost_out:.4})")),
+            "output cost missing in {text:?}"
+        );
+        assert!(
+            text.contains(&format!("(${cost_total:.4})")),
+            "total cost missing in {text:?}"
+        );
+        assert!(text.contains("Provider         : MiniMax-M3"));
+    }
+
+    #[test]
+    fn build_model_lines_renders_model_provider_endpoint() {
+        let lines = build_model_lines();
+        assert!(lines.len() > 3, "model panel should have several lines");
+        let text = text_of(&lines);
+        assert!(text.contains("Model    :"), "got {text:?}");
+        assert!(text.contains("Provider :"), "got {text:?}");
+        assert!(text.contains("Endpoint :"), "got {text:?}");
+    }
+
+    #[test]
+    fn build_tool_lines_truncates_long_descriptions_at_60_chars() {
+        // 61-char description: `> 60` true → truncated with ellipsis.
+        let long = (0..61).map(|_| 'x').collect::<String>();
+        let lines = build_tool_lines(&[("Tool61".to_string(), long.clone())]);
+        let text = text_of(&lines);
+        assert!(
+            text.contains('…'),
+            "61-char desc should be ellipsised: {text:?}"
+        );
+        assert!(text.contains("Available tools (1)"));
+
+        // 60-char description: `> 60` false → no ellipsis. Kills `>=`/`==`.
+        let exact = (0..60).map(|_| 'y').collect::<String>();
+        let lines60 = build_tool_lines(&[("Tool60".to_string(), exact.clone())]);
+        let text60 = text_of(&lines60);
+        assert!(
+            !text60.contains('…'),
+            "60-char desc should not be ellipsised: {text60:?}"
+        );
+        assert!(text60.contains(&exact));
+    }
+
+    #[test]
+    fn build_tool_lines_empty_state_message() {
+        let lines = build_tool_lines(&[]);
+        let text = text_of(&lines);
+        assert!(text.contains("(no tools registered)"), "got {text:?}");
+        assert!(text.contains("Available tools (0)"));
+    }
+
+    fn journal(name: &str, preview: &str) -> crate::ui::modal::JournalEntry {
+        crate::ui::modal::JournalEntry {
+            name: name.to_string(),
+            preview: preview.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_journal_lines_marks_and_styles_selected_entry() {
+        let entries = vec![journal("alpha", "body"), journal("beta", "body")];
+        let lines = build_journal_lines(&entries, 0);
+        assert!(lines.len() > 3, "got {} lines", lines.len());
+        let text = text_of(&lines);
+        assert!(text.contains("Recent journal entries"));
+        assert!(text.contains("▶"), "selected marker missing: {text:?}");
+        // The selected entry's name span (spans[1]) must be yellow+bold.
+        // This kills the `i == selected` -> `!=` style mutant (969).
+        let selected_line = lines
+            .iter()
+            .find(|l| text_of(std::slice::from_ref(l)).contains("▶"))
+            .expect("selected line");
+        let name_span = &selected_line.spans[1];
+        assert_eq!(
+            name_span.style,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn build_journal_lines_truncates_preview_over_12_lines() {
+        let long_preview = (0..13)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entries = vec![journal("big", &long_preview)];
+        let text = text_of(&build_journal_lines(&entries, 0));
+        assert!(
+            text.contains("more lines)"),
+            "13-line preview should announce truncation: {text:?}"
+        );
+
+        let exact_preview = (0..12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entries12 = vec![journal("exact", &exact_preview)];
+        let text12 = text_of(&build_journal_lines(&entries12, 0));
+        assert!(
+            !text12.contains("more lines)"),
+            "12-line preview should not be truncated: {text12:?}"
+        );
+    }
+
+    #[test]
+    fn build_journal_lines_empty_state_message() {
+        let lines = build_journal_lines(&[], 0);
+        let text = text_of(&lines);
+        assert!(text.contains("no entries in .dev/journal/"), "got {text:?}");
+    }
+
+    #[test]
+    fn serde_journal_context_joins_names_with_newlines() {
+        let entries = vec![journal("a", "x"), journal("b", "y")];
+        assert_eq!(serde_journal_context(&entries), "a\nb");
+        assert_eq!(serde_journal_context(&[]), "");
+    }
+
+    fn resume(slug: &str) -> crate::ui::modal::ResumeEntry {
+        crate::ui::modal::ResumeEntry {
+            session_dir: std::path::PathBuf::from(format!("/tmp/{slug}")),
+            slug: slug.to_string(),
+            updated_at: "2026-06-01 14:22".to_string(),
+            turn_count: 3,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn build_resume_lines_marks_and_styles_selected_session() {
+        let entries = vec![resume("first"), resume("second")];
+        let lines = build_resume_lines(&entries, 1);
+        assert!(lines.len() > 3, "got {} lines", lines.len());
+        let text = text_of(&lines);
+        assert!(text.contains("Recent sessions"));
+        assert!(text.contains("▶"), "selected marker missing: {text:?}");
+        assert!(text.contains("turns:  3"));
+        // Selected entry's line span is yellow+bold — kills `==` -> `!=` (1026).
+        let selected_line = lines
+            .iter()
+            .find(|l| text_of(std::slice::from_ref(l)).contains("▶"))
+            .expect("selected line");
+        assert_eq!(
+            selected_line.spans[0].style,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn serde_resume_context_joins_session_dirs_with_newlines() {
+        let entries = vec![resume("first"), resume("second")];
+        assert_eq!(serde_resume_context(&entries), "/tmp/first\n/tmp/second");
+        assert_eq!(serde_resume_context(&[]), "");
+    }
+
+    #[test]
+    fn build_theme_picker_lines_marks_selected_theme() {
+        let lines = build_theme_picker_lines("default", 0);
+        assert!(lines.len() > 2, "got {} lines", lines.len());
+        let text = text_of(&lines);
+        assert!(text.contains("Choose theme  (current: default)"));
+        assert!(
+            text.contains("▶"),
+            "selected theme marker missing: {text:?}"
+        );
+        // The ▶ line's span must be yellow+bold — kills `i == selected` ->
+        // `!=` (1069), which would give the selected row the white style.
+        let selected_line = lines
+            .iter()
+            .find(|l| text_of(std::slice::from_ref(l)).contains('▶'))
+            .expect("selected line");
+        assert_eq!(
+            selected_line.spans[0].style,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn build_help_lines_lists_skill_commands_when_present() {
+        use crate::skill_commands::SkillCommand;
+        let mut registry = CommandRegistry::default_set();
+        registry.set_skill_commands(vec![SkillCommand {
+            name: "my-skill".to_string(),
+            description: "does a thing".to_string(),
+            aliases: vec![],
+            argument_hint: String::new(),
+            allowed_tools: None,
+            prompt_template: String::new(),
+            source_path: PathBuf::from("/tmp/my-skill"),
+        }]);
+        let text = text_of(&build_help_lines(&registry));
+        assert!(
+            text.contains("Skill Commands:"),
+            "skill section header missing: {text:?}"
+        );
+        assert!(text.contains("my-skill"), "skill name missing: {text:?}");
+    }
+
+    #[test]
+    fn build_help_lines_omits_skill_section_when_empty() {
+        let registry = CommandRegistry::default_set();
+        let text = text_of(&build_help_lines(&registry));
+        assert!(
+            !text.contains("Skill Commands:"),
+            "empty skill list should not render the section header: {text:?}"
+        );
+    }
+
+    #[test]
+    fn cmd_mcp_emits_list_mcp_servers_action() {
+        let mut app = App::new();
+        let actions = cmd_mcp(&mut app, &[]);
+        assert_eq!(actions, vec![UserAction::ListMcpServers]);
+    }
+
+    #[test]
+    fn cmd_theme_no_args_selects_current_theme_row() {
+        // Kills the `t.name == current` -> `!=` mutant in cmd_theme (714):
+        // the panel's `selected` must be the index of the current theme in
+        // ALL_THEMES, not the first theme that differs from it.
+        use crate::ui::theme::ALL_THEMES;
+        let mut app = App::new();
+        let expected = ALL_THEMES
+            .iter()
+            .position(|t| t.name == app.theme.name)
+            .unwrap_or(0);
+        let r = invoke(&mut app, "theme");
+        match r {
+            InvokeResult::Sync(CommandOutcome::OpenPanel(panel)) => {
+                assert_eq!(
+                    panel.selected,
+                    Some(expected),
+                    "theme picker should open with the current theme selected"
+                );
+            }
+            other => panic!("expected OpenPanel for /theme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_goal_single_non_clear_arg_sets_goal() {
+        // Kills `args.len() == 1 && args[0].eq_ignore_ascii_case("clear")`
+        // -> `||` (550): with a single non-"clear" arg the original sets a
+        // goal, the mutant would clear it.
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal hello");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::SetGoal {
+                        condition,
+                        max_turns,
+                    } => {
+                        assert_eq!(condition, "hello");
+                        assert_eq!(*max_turns, 0);
+                    }
+                    other => panic!("expected SetGoal, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async (SetGoal), got {other:?}"),
+        }
+    }
 }
