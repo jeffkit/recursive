@@ -50,6 +50,13 @@ fn build_provider(
     Ok(provider)
 }
 
+/// Treat an empty-string API key as missing. Extracted so the `!is_empty`
+/// guard is unit-testable — the `delete !` mutant is otherwise unobservable
+/// when the configured key is `None` (the common offline-test path).
+fn effective_api_key(api_key: Option<&str>) -> Option<&str> {
+    api_key.filter(|k| !k.is_empty())
+}
+
 /// Build the `(root, tier)` list used to expand the filesystem sandbox
 /// beyond the primary workspace. Read-write roots come from `--add-dir` /
 /// `[sandbox] extra_dirs`; read-only roots come from
@@ -113,7 +120,7 @@ pub fn build_runtime() -> TuiRuntime {
         }
     };
 
-    let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
+    let api_key = match effective_api_key(config.api_key.as_deref()) {
         Some(k) => k.to_string(),
         None => {
             return TuiRuntime {
@@ -242,7 +249,7 @@ fn build_runtime_with_skill_tx(
         }
     };
 
-    let api_key = match config.api_key.as_deref().filter(|k| !k.is_empty()) {
+    let api_key = match effective_api_key(config.api_key.as_deref()) {
         Some(k) => k.to_string(),
         None => {
             return TuiRuntime {
@@ -445,5 +452,137 @@ type = "openai"
             }
         }
         // _keys guard restores API key env vars on drop here.
+    }
+
+    // ── Pre-existing helper coverage (pulled into scope by g323 touch) ────
+
+    fn test_config() -> Config {
+        Config {
+            workspace: PathBuf::from("."),
+            api_base: "https://api.anthropic.com".to_string(),
+            api_key: Some("sk-test".to_string()),
+            model: "claude-test".to_string(),
+            provider_type: "anthropic".to_string(),
+            preset: None,
+            max_steps: 32,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
+            headless: false,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+        }
+    }
+
+    #[test]
+    fn effective_api_key_treats_empty_as_missing() {
+        assert_eq!(effective_api_key(None), None);
+        assert_eq!(effective_api_key(Some("")), None);
+        assert_eq!(effective_api_key(Some("sk-real")), Some("sk-real"));
+    }
+
+    #[test]
+    fn build_provider_selects_anthropic_for_anthropic_type() {
+        // Kills the "delete match arm anthropic" mutant: that falls through
+        // to the OpenAi branch, whose supports_deferred_tools() is false.
+        let cfg = test_config();
+        let provider =
+            build_provider(&cfg, "sk-test".to_string()).expect("anthropic provider builds");
+        assert!(
+            provider.supports_deferred_tools(),
+            "anthropic provider_type must yield a deferred-tools provider"
+        );
+    }
+
+    #[test]
+    fn build_provider_selects_openai_for_other_types() {
+        let mut cfg = test_config();
+        cfg.provider_type = "openai".to_string();
+        cfg.api_base = "https://api.openai.com".to_string();
+        let provider = build_provider(&cfg, "sk-test".to_string()).expect("openai provider builds");
+        assert!(
+            !provider.supports_deferred_tools(),
+            "non-anthropic provider_type must yield a non-deferred provider"
+        );
+    }
+
+    #[test]
+    fn sandbox_extra_roots_maps_rw_and_ro_tiers() {
+        let mut cfg = test_config();
+        cfg.extra_dirs = vec![PathBuf::from("/rw/a"), PathBuf::from("/rw/b")];
+        cfg.extra_readonly_dirs = vec![PathBuf::from("/ro/x")];
+        let roots = sandbox_extra_roots(&cfg);
+        assert_eq!(roots.len(), 3);
+        assert_eq!(
+            roots[0],
+            (PathBuf::from("/rw/a"), recursive::AccessTier::ReadWrite)
+        );
+        assert_eq!(
+            roots[1],
+            (PathBuf::from("/rw/b"), recursive::AccessTier::ReadWrite)
+        );
+        assert_eq!(
+            roots[2],
+            (PathBuf::from("/ro/x"), recursive::AccessTier::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn sandbox_extra_roots_empty_when_config_has_none() {
+        let cfg = test_config();
+        assert!(sandbox_extra_roots(&cfg).is_empty());
+    }
+
+    #[test]
+    fn discover_loaded_skills_reads_env_paths() {
+        // PinnedRecursiveHome acquires env_lock(), serialising env mutation.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+
+        let skills_root = tempfile::tempdir().expect("tempdir");
+        let skill_dir = skills_root.path().join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: demo\n---\nbody\n",
+        )
+        .expect("write SKILL.md");
+
+        let prev = std::env::var("RECURSIVE_SKILL_PATHS").ok();
+        std::env::set_var("RECURSIVE_SKILL_PATHS", skills_root.path());
+
+        let cfg = test_config();
+        let skills = discover_loaded_skills(&cfg);
+
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_SKILL_PATHS", v),
+            None => std::env::remove_var("RECURSIVE_SKILL_PATHS"),
+        }
+
+        assert!(
+            skills.iter().any(|s| s.name == "demo-skill"),
+            "expected demo-skill in {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

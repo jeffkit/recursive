@@ -1939,10 +1939,12 @@ mod tests {
     #[test]
     fn build_cost_lines_computes_per_token_costs() {
         use crate::cost::UsageStats;
-        let mut usage = UsageStats::default();
-        usage.total_input = 1_000_000;
-        usage.total_output = 2_000_000;
-        usage.last_latency_ms = 1_500;
+        let usage = UsageStats {
+            total_input: 1_000_000,
+            total_output: 2_000_000,
+            last_latency_ms: 1_500,
+            ..Default::default()
+        };
         let model = "MiniMax-M3";
         let pricing = recursive::llm::pricing_for(model).expect("MiniMax-M3 has pricing");
         let cost_in = 1_000_000.0 * pricing.input_per_million / 1_000_000.0;
@@ -2149,7 +2151,7 @@ mod tests {
             argument_hint: String::new(),
             allowed_tools: None,
             prompt_template: String::new(),
-            source_path: PathBuf::from("/tmp/my-skill"),
+            source_path: std::path::PathBuf::from("/tmp/my-skill"),
         }]);
         let text = text_of(&build_help_lines(&registry));
         assert!(
@@ -2216,7 +2218,7 @@ mod tests {
                         max_turns,
                     } => {
                         assert_eq!(condition, "hello");
-                        assert_eq!(*max_turns, 0);
+                        assert_eq!(*max_turns, 20);
                     }
                     other => panic!("expected SetGoal, got {other:?}"),
                 }

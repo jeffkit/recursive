@@ -740,6 +740,31 @@ mod tests {
         assert!(has_diff, "expected Diff block from Write");
     }
 
+    #[test]
+    fn failed_write_result_does_not_render_diff_block() {
+        // Kills `name == "Write" && success` -> `||` (61): a failed Write
+        // (success=false) whose output still matches the " to <path>" shape
+        // must NOT push a Diff block. The `||` mutant would enter the branch
+        // and synthesise a diff for the failed write.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::ToolCall {
+            id: "1".into(),
+            name: "Write".into(),
+            arguments: r#"{"path":"src/new.rs","contents":"x"}"#.into(),
+        });
+        app.handle_ui_event(UiEvent::ToolResult {
+            id: "1".into(),
+            name: "Write".into(),
+            output: "Failed to write to src/new.rs: permission denied".into(),
+            success: false,
+        });
+        let has_diff = app.blocks.iter().any(
+            |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),
+        );
+        assert!(!has_diff, "failed Write must not render a Diff block");
+    }
+
     // ── compacted ──────────────────────────────────────────────────
 
     #[test]
