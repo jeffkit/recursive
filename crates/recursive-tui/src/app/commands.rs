@@ -3497,3 +3497,138 @@ mod atfile_debt_tests {
         assert_eq!(app.atfile_query, "x");
     }
 }
+
+#[cfg(test)]
+mod command_panel_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::{App, CommandPanelState};
+    use crate::ui::theme::ALL_THEMES;
+    use crate::UserAction;
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn panel(
+        name: &str,
+        selected: Option<usize>,
+        item_count: usize,
+        context: Option<&str>,
+    ) -> CommandPanelState {
+        let mut p = CommandPanelState::new(name, vec![]);
+        p.selected = selected;
+        p.item_count = item_count;
+        p.context = context.map(|s| s.to_string());
+        p
+    }
+
+    #[test]
+    fn panel_esc_closes() {
+        // kills delete Esc arm (815)
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("theme", None, 3, None));
+        assert!(app.handle_command_panel_key(k(KeyCode::Esc)).is_none());
+        assert!(app.active_command_panel.is_none());
+    }
+
+    #[test]
+    fn panel_up_decrements_selected() {
+        // kills delete Up arm (819)
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("theme", Some(1), 3, None));
+        assert!(app.handle_command_panel_key(k(KeyCode::Up)).is_none());
+        assert_eq!(app.active_command_panel.as_ref().unwrap().selected, Some(0));
+    }
+
+    #[test]
+    fn panel_up_scrolls_when_no_selection() {
+        // kills delete Up arm's else branch (819)
+        let mut app = App::new();
+        let mut p = panel("help", None, 0, None);
+        p.scroll = 5;
+        app.active_command_panel = Some(p);
+        assert!(app.handle_command_panel_key(k(KeyCode::Up)).is_none());
+        assert_eq!(app.active_command_panel.as_ref().unwrap().scroll, 4);
+    }
+
+    #[test]
+    fn panel_down_increments_selected() {
+        // kills delete Down arm (835) + `+`→`*` in `(sel + 1).min(max)` (839):
+        // sel=1, max=2 → orig (2).min(2)=2; mutant (1*1).min(2)=1
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("theme", Some(1), 3, None));
+        assert!(app.handle_command_panel_key(k(KeyCode::Down)).is_none());
+        assert_eq!(app.active_command_panel.as_ref().unwrap().selected, Some(2));
+    }
+
+    #[test]
+    fn panel_down_scrolls_when_no_selection() {
+        // kills delete Down arm's else branch (835)
+        let mut app = App::new();
+        let mut p = panel("help", None, 0, None);
+        p.scroll = 5;
+        app.active_command_panel = Some(p);
+        assert!(app.handle_command_panel_key(k(KeyCode::Down)).is_none());
+        assert_eq!(app.active_command_panel.as_ref().unwrap().scroll, 6);
+    }
+
+    #[test]
+    fn panel_enter_resume_returns_resume_session() {
+        // kills: -> None (814), delete Enter arm (864), -> None in confirm (904),
+        //        delete "resume" arm (913)
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("resume", Some(0), 2, Some("/tmp/s0\n/tmp/s1")));
+        let action = app.handle_command_panel_key(k(KeyCode::Enter));
+        match action {
+            Some(UserAction::ResumeSession { session_dir }) => {
+                assert_eq!(session_dir, std::path::PathBuf::from("/tmp/s0"));
+            }
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+        assert!(
+            app.active_command_panel.is_none(),
+            "Enter should close panel"
+        );
+    }
+
+    #[test]
+    fn panel_enter_theme_switches_theme() {
+        // kills: delete "theme" arm in confirm (925), plus 814/864/904
+        let mut app = App::new();
+        let original = app.theme.name;
+        app.active_command_panel = Some(panel("theme", Some(1), 3, None));
+        assert!(app.handle_command_panel_key(k(KeyCode::Enter)).is_none());
+        assert_eq!(app.theme.name, ALL_THEMES[1].name);
+        assert_ne!(app.theme.name, original);
+        assert!(app.active_command_panel.is_none());
+    }
+
+    #[test]
+    fn rebuild_theme_updates_panel_lines() {
+        // kills: -> () (877), delete "theme" arm (892)
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("theme", None, 3, None));
+        assert!(app.active_command_panel.as_ref().unwrap().lines.is_empty());
+        app.rebuild_panel_lines_for_selection("theme", 1, None);
+        assert!(!app.active_command_panel.as_ref().unwrap().lines.is_empty());
+    }
+
+    #[test]
+    fn rebuild_journal_updates_panel_lines() {
+        // kills delete "journal" arm (879)
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("journal", None, 0, None));
+        app.rebuild_panel_lines_for_selection("journal", 0, None);
+        assert!(!app.active_command_panel.as_ref().unwrap().lines.is_empty());
+    }
+
+    #[test]
+    fn rebuild_resume_updates_panel_lines() {
+        // kills delete "resume" arm (885)
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("resume", None, 0, None));
+        app.rebuild_panel_lines_for_selection("resume", 0, None);
+        assert!(!app.active_command_panel.as_ref().unwrap().lines.is_empty());
+    }
+}
