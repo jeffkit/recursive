@@ -3388,4 +3388,112 @@ mod handle_key_tests {
         assert!(action.is_none());
         assert_eq!(app.prompt.mode, InputMode::Prompt);
     }
+
+    #[test]
+    fn meta_enter_inserts_newline_no_submit() {
+        // kills `||`→`&&` on the META clause (168): Shift+Enter doesn't distinguish
+        // because SHIFT already short-circuits the chain. META-only Enter does:
+        // orig (META || ...): guard true → insert '\n'; mutant (SUPER && META): false → submit.
+        let mut app = App::new();
+        app.prompt.buffer = "x".to_string();
+        app.prompt.cursor = 1;
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::META));
+        assert!(action.is_none(), "Meta+Enter must not submit");
+        assert_eq!(app.prompt.buffer, "x\n");
+    }
+
+    #[test]
+    fn backspace_in_non_prompt_mode_with_buffer_deletes_char() {
+        // kills `&&`→`||` in Backspace guard (224):
+        // orig (`is_empty() && mode!=Prompt`): buffer="x" → false → else → backspace → "".
+        // mutant (`is_empty() || mode!=Prompt`): false || true → true → reset mode, no backspace → "x".
+        let mut app = App::new();
+        app.prompt.mode = InputMode::Command;
+        app.prompt.buffer = "x".to_string();
+        app.prompt.cursor = 1;
+        let action = app.handle_key(k(KeyCode::Backspace));
+        assert!(action.is_none());
+        assert_eq!(app.prompt.buffer, "");
+    }
+
+    #[test]
+    fn up_with_non_empty_buffer_does_not_walk_history() {
+        // kills `should_walk_history_up()` guard → true (211):
+        // orig: buffer non-empty + not walking → guard false → Up falls to `_ => None`.
+        // mutant: guard true → history_prev moves to last entry (buffer="def", idx=Some(1)).
+        let mut app = App::new();
+        app.prompt.history = vec!["abc".into(), "def".into()];
+        app.prompt.buffer = "x".to_string();
+        app.prompt.cursor = 1;
+        app.prompt.history_idx = None;
+        let action = app.handle_key(k(KeyCode::Up));
+        assert!(action.is_none());
+        assert_eq!(app.prompt.buffer, "x");
+        assert!(app.prompt.history_idx.is_none());
+    }
+}
+
+#[cfg(test)]
+mod atfile_debt_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::{App, InputMode};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn refresh_atfile_suggestions_clamps_out_of_range_to_last() {
+        // kills: -> () (612, suggestions/selected unchanged → stays MAX),
+        //        `>=`→`<` (615, MAX<N false → no clamp → stays MAX),
+        //        `-`→`+`/`/` (619, clamps to len+1 or len/1 instead of len-1)
+        let mut app = App::new();
+        app.atfile_query = "Cargo".into(); // non-empty result set in this repo
+        app.atfile_selected = Some(usize::MAX);
+        app.refresh_atfile_suggestions();
+        let n = app.atfile_suggestions.len();
+        assert!(n > 0, "glob(\"Cargo\") should return files in this repo");
+        assert_eq!(app.atfile_selected, Some(n - 1));
+    }
+
+    #[test]
+    fn atfile_down_at_last_stays() {
+        // kills: guard `n + 1 < count` → true (681, always moves to n+1 = 3),
+        //        `<`→`<=` (681, 2+1<=3 true → moves to 3)
+        let mut app = App::new();
+        app.prompt.mode = InputMode::AtFile;
+        app.atfile_suggestions = vec!["a".into(), "b".into(), "c".into()];
+        app.atfile_selected = Some(2);
+        let action = app.handle_atfile_key(k(KeyCode::Down));
+        assert!(action.is_none());
+        assert_eq!(app.atfile_selected, Some(2));
+    }
+
+    #[test]
+    fn atfile_backspace_removes_last_query_char() {
+        // kills `-`→`+`/`/` in `atfile_query.len() - last_len` (700):
+        // orig: new_len = 3-1 = 2 → "ab"; mutant `+`: 3+1=4 → "abc"; mutant `/`: 3/1=3 → "abc"
+        let mut app = App::new();
+        app.prompt.mode = InputMode::AtFile;
+        app.atfile_query = "abc".into();
+        app.prompt.buffer = "@abc".into();
+        app.prompt.cursor = 4;
+        let action = app.handle_atfile_key(k(KeyCode::Backspace));
+        assert!(action.is_none());
+        assert_eq!(app.atfile_query, "ab");
+    }
+
+    #[test]
+    fn atfile_char_appends_to_query() {
+        // kills delete Char match arm (707): mutant falls to `_ => None`, query unchanged
+        let mut app = App::new();
+        app.prompt.mode = InputMode::AtFile;
+        app.atfile_query = String::new();
+        app.prompt.buffer = "@".into();
+        app.prompt.cursor = 1;
+        let action = app.handle_atfile_key(k(KeyCode::Char('x')));
+        assert!(action.is_none());
+        assert_eq!(app.atfile_query, "x");
+    }
 }
