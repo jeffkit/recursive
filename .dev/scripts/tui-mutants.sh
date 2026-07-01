@@ -12,13 +12,15 @@
 #   tui-mutants.sh <file>...               # mutate specific files
 #   tui-mutants.sh --dir src/app/render.rs # mutate a directory (recursive)
 #   tui-mutants.sh --all                   # mutate the whole crate (slow)
+#   tui-mutants.sh --jobs 6 --all          # parallel whole-crate baseline (~30-60m)
 #   tui-mutants.sh --list                  # dry run: list possible mutants, no tests
 #   tui-mutants.sh --list-files            # list source files cargo-mutants sees
 #
 # Exit code is non-zero if any mutant survives, so this can gate a commit.
-# The script guards against --in-place contamination: it refuses to run on
-# files with uncommitted changes, and on any exit (incl. SIGINT) restores
-# any file still carrying a `cargo-mutants` marker via `git checkout`.
+# --jobs N>1 uses copy mode (real source untouched); --jobs 1 (default) uses
+# --in-place. The in-place path is guarded against contamination: it refuses
+# to run on files with uncommitted changes, and on any exit (incl. SIGINT)
+# restores any file still carrying a `cargo-mutants` marker via `git checkout`.
 #
 # Prereq: `cargo install cargo-mutants` (global). The CI / self-improve
 # environment is expected to have it on PATH.
@@ -30,10 +32,38 @@ CRATE="recursive-tui"
 # ever removed.
 FEATURES="recursive/test-utils"
 
+# Parallelism. --jobs N runs N cargo build/test jobs concurrently.
+# When JOBS>1 we DROP --in-place (parallel in-place mutation would race
+# on the same source file) and use cargo-mutants' copy mode instead —
+# the real source is never mutated, so the contamination guard below is
+# a harmless no-op in that case.
+JOBS=1
+
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
   exit 2
 fi
+
+# Strip a leading/global --jobs N from the arg list so any subcommand
+# can take it, e.g. `tui-mutants.sh --jobs 6 --all`.
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --jobs)
+      JOBS="${2:?--jobs requires a number}"
+      shift 2
+      ;;
+    --jobs=*)
+      JOBS="${1#--jobs=}"
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${ARGS[@]}"
 
 # Resolve the worktree root (this script lives in <root>/.dev/scripts/).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -89,7 +119,14 @@ assert_clean() {
 
 run_mutants() {
   # $@ = extra args (e.g. --no-shuffle, --file ...)
-  cargo mutants --in-place -p "$CRATE" --features "$FEATURES" "$@"
+  local mode_args=()
+  if [[ "$JOBS" -gt 1 ]]; then
+    # Parallel: copy mode (no --in-place) so concurrent jobs don't race.
+    mode_args+=(--jobs "$JOBS")
+  else
+    mode_args+=(--in-place)
+  fi
+  cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" "$@"
 }
 
 enumerate_mutants() {
