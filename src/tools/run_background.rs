@@ -85,7 +85,10 @@ impl BackgroundJobManager {
     ///
     /// Used by the TUI loop arbiter to `select!` on job completion.
     /// When a background job enters a terminal state (Completed, Failed,
-    /// TimedOut), `notify_waiters()` is called to wake all waiters.
+    /// TimedOut), `notify_one()` is called. `notify_one()` (rather than
+    /// `notify_waiters()`) stores a permit so a completion that happens
+    /// while the arbiter is mid-turn (not yet polling) is not lost — the
+    /// next `notified()` poll consumes the stored permit.
     pub fn completed_notify(&self) -> Arc<Notify> {
         self.completed_notify.clone()
     }
@@ -119,7 +122,7 @@ impl BackgroundJobManager {
             job.state = state;
         }
         if is_terminal {
-            self.completed_notify.notify_waiters();
+            self.completed_notify.notify_one();
         }
     }
 
@@ -730,24 +733,11 @@ mod tests {
     async fn completed_notify_wakes_on_terminal_state() {
         let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
 
-        // Clone the notify before spawning the task.
         let notify = manager.lock().await.completed_notify();
 
-        // Use a barrier to ensure the spawned task is polling before we notify.
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let b = barrier.clone();
-
-        // Spawn a task that waits for the notify.
-        let handle = tokio::spawn(async move {
-            b.wait(); // signal ready
-                      // timeout(5s) prevents test hang if notify never fires.
-            tokio::time::timeout(Duration::from_secs(5), notify.notified()).await
-        });
-
-        // Wait for the spawned task to be ready.
-        barrier.wait();
-
-        // Insert and complete a job (triggers notify_waiters).
+        // notify_one() stores a permit, so a waiter registered AFTER the
+        // state change still wakes — this models the arbiter polling
+        // between turns after a job completed mid-turn (the real usage).
         {
             let mut mgr = manager.lock().await;
             let id = mgr.insert(Job {
@@ -764,63 +754,8 @@ mod tests {
             );
         }
 
-        // The spawned task should complete.
-        let result = handle.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), notify.notified()).await;
         assert!(result.is_ok(), "notify should fire on terminal state");
-    }
-
-    #[tokio::test]
-    async fn completed_notify_wakes_multiple_waiters() {
-        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
-
-        let notify = manager.lock().await.completed_notify();
-
-        // Barrier to ensure both waiters are polling before we notify.
-        let barrier = Arc::new(std::sync::Barrier::new(3)); // 2 waiters + main
-
-        // Spawn two tasks, both waiting on the same notify.
-        let h1 = tokio::spawn({
-            let n = notify.clone();
-            let b = barrier.clone();
-            async move {
-                b.wait();
-                tokio::time::timeout(Duration::from_secs(5), n.notified()).await
-            }
-        });
-        let h2 = tokio::spawn({
-            let n = notify.clone();
-            let b = barrier.clone();
-            async move {
-                b.wait();
-                tokio::time::timeout(Duration::from_secs(5), n.notified()).await
-            }
-        });
-
-        // Wait for both tasks to be ready.
-        barrier.wait();
-
-        // Complete a job.
-        {
-            let mut mgr = manager.lock().await;
-            let id = mgr.insert(Job {
-                state: JobState::Running,
-                created_at: Instant::now(),
-            });
-            mgr.update(
-                &id,
-                JobState::Completed {
-                    stdout: "done".into(),
-                    stderr: "".into(),
-                    exit_code: 0,
-                },
-            );
-        }
-
-        // Both tasks should wake (notify_waiters wakes all).
-        let r1 = h1.await.unwrap();
-        let r2 = h2.await.unwrap();
-        assert!(r1.is_ok(), "waiter 1 should wake");
-        assert!(r2.is_ok(), "waiter 2 should wake");
     }
 
     #[tokio::test]
