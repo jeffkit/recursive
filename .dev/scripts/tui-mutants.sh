@@ -12,8 +12,13 @@
 #   tui-mutants.sh <file>...               # mutate specific files
 #   tui-mutants.sh --dir src/app/render.rs # mutate a directory (recursive)
 #   tui-mutants.sh --all                   # mutate the whole crate (slow)
+#   tui-mutants.sh --list                  # dry run: list possible mutants, no tests
+#   tui-mutants.sh --list-files            # list source files cargo-mutants sees
 #
 # Exit code is non-zero if any mutant survives, so this can gate a commit.
+# The script guards against --in-place contamination: it refuses to run on
+# files with uncommitted changes, and on any exit (incl. SIGINT) restores
+# any file still carrying a `cargo-mutants` marker via `git checkout`.
 #
 # Prereq: `cargo install cargo-mutants` (global). The CI / self-improve
 # environment is expected to have it on PATH.
@@ -34,26 +39,95 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
+# ── in-place contamination guard ──────────────────────────────────────
+# cargo-mutants --in-place mutates the real source and restores on a
+# *clean* exit. If the run is interrupted (SIGINT, laptop sleep, OOM),
+# it can leave `/* ~ changed by cargo-mutants ~ */` markers in the
+# source — and a later `git add -A` will silently commit the mutant
+# (this actually happened: status.rs had `* 100.0` → `/ 100.0`).
+#
+# Mitigation: (1) refuse to run if the to-be-mutated files have
+# uncommitted changes (so `git checkout --` restore is safe and lossless);
+# (2) on ANY exit, scan the mutated files for the marker and `git
+# checkout` any that still carry it.
+MUTATED_FILES=()
+
+cleanup_mutants() {
+  local rc=$?
+  if [[ ${#MUTATED_FILES[@]} -gt 0 ]]; then
+    local dirty=()
+    for f in "${MUTATED_FILES[@]}"; do
+      if [[ -f "$f" ]] && grep -q "changed by cargo-mutants" "$f" 2>/dev/null; then
+        dirty+=("$f")
+      fi
+    done
+    if [[ ${#dirty[@]} -gt 0 ]]; then
+      echo "warn: cargo-mutants left mutations in ${#dirty[@]} file(s); restoring via git checkout:" >&2
+      printf '  %s\n' "${dirty[@]}" >&2
+      git checkout -- "${dirty[@]}" 2>/dev/null || true
+    fi
+  fi
+  exit $rc
+}
+trap cleanup_mutants EXIT
+
+assert_clean() {
+  # Refuse to mutate files with uncommitted changes — restore would clobber them.
+  local dirty=()
+  for f in "$@"; do
+    if [[ -f "$f" ]] && ! git diff --quiet -- "$f" 2>/dev/null; then
+      dirty+=("$f")
+    fi
+  done
+  if [[ ${#dirty[@]} -gt 0 ]]; then
+    echo "error: refusing to mutate files with uncommitted changes (restore would clobber):" >&2
+    printf '  %s\n' "${dirty[@]}" >&2
+    echo "commit or stash them first." >&2
+    exit 3
+  fi
+}
+
+run_mutants() {
+  # $@ = extra args (e.g. --no-shuffle, --file ...)
+  cargo mutants --in-place -p "$CRATE" --features "$FEATURES" "$@"
+}
+
+enumerate_mutants() {
+  # Dry run: list possible mutants without mutating source or running tests.
+  cargo mutants --list -p "$CRATE" --features "$FEATURES" "$@"
+}
+
 ARGS=()
-if [[ "${1:-}" == "--all" ]]; then
+if [[ "${1:-}" == "--list" ]]; then
+  # Dry enumerate: list possible mutants across the whole crate, no tests.
+  echo "Enumerating mutants in $CRATE (dry run, no tests)…" >&2
+  enumerate_mutants
+  exit 0
+elif [[ "${1:-}" == "--list-files" ]]; then
+  cargo mutants --list-files -p "$CRATE" --features "$FEATURES"
+  exit 0
+elif [[ "${1:-}" == "--all" ]]; then
   echo "Mutating the whole $CRATE crate (this can take a while)…" >&2
-  cargo mutants --in-place -p "$CRATE" --features "$FEATURES" \
-    --no-shuffle
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "crates/$CRATE/src" -name '*.rs')
+  assert_clean "${MUTATED_FILES[@]}"
+  run_mutants --no-shuffle
   exit 0
 elif [[ "${1:-}" == "--dir" ]]; then
   shift
   DIR="${1:?--dir requires a path}"
   echo "Mutating directory: $DIR" >&2
-  cargo mutants --in-place -p "$CRATE" --features "$FEATURES" \
-    --dir "$DIR" --no-shuffle
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "$DIR" -name '*.rs')
+  assert_clean "${MUTATED_FILES[@]}"
+  run_mutants --no-shuffle --dir "$DIR"
   exit 0
 elif [[ $# -gt 0 ]]; then
   echo "Mutating files: $*" >&2
   for f in "$@"; do
     ARGS+=(--file "$f")
+    MUTATED_FILES+=("$f")
   done
-  cargo mutants --in-place -p "$CRATE" --features "$FEATURES" \
-    --no-shuffle "${ARGS[@]}"
+  assert_clean "${MUTATED_FILES[@]}"
+  run_mutants --no-shuffle "${ARGS[@]}"
   exit 0
 fi
 
@@ -78,7 +152,9 @@ echo "$CHANGED" | sed 's/^/  /' >&2
 FILE_ARGS=()
 while IFS= read -r line; do
   FILE_ARGS+=(--file "$line")
+  MUTATED_FILES+=("$line")
 done <<< "$CHANGED"
 
-cargo mutants --in-place -p "$CRATE" --features "$FEATURES" \
-  --no-shuffle "${FILE_ARGS[@]}"
+assert_clean "${MUTATED_FILES[@]}"
+
+run_mutants --no-shuffle "${FILE_ARGS[@]}"
