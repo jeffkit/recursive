@@ -2956,3 +2956,198 @@ mod history_search_tests {
         assert_eq!(app.hsearch_selected, 1);
     }
 }
+
+#[cfg(test)]
+mod picker_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::App;
+    use crate::ui::modal::{McpEntry, Modal, ResumeEntry};
+    use crate::UserAction;
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn app_with_resume(entries: usize, selected: usize) -> App {
+        let mut app = App::new();
+        let entries: Vec<ResumeEntry> = (0..entries)
+            .map(|i| ResumeEntry {
+                session_dir: format!("/tmp/s{i}").into(),
+                slug: format!("s{i}"),
+                updated_at: "2026-06-01 14:22".to_string(),
+                turn_count: i,
+                cost_usd: 0.0,
+            })
+            .collect();
+        app.modals.push(Modal::ResumePicker { entries, selected });
+        app
+    }
+
+    fn app_with_mcp(entries: usize, selected: usize) -> App {
+        let mut app = App::new();
+        let entries: Vec<McpEntry> = (0..entries)
+            .map(|i| McpEntry {
+                name: format!("srv{i}"),
+                transport: "stdio".to_string(),
+                enabled: true,
+            })
+            .collect();
+        app.modals.push(Modal::McpServers { entries, selected });
+        app
+    }
+
+    fn resume_selected(app: &App) -> usize {
+        match app.modals.last() {
+            Some(Modal::ResumePicker { selected, .. }) => *selected,
+            _ => panic!("no ResumePicker modal"),
+        }
+    }
+
+    fn mcp_selected(app: &App) -> usize {
+        match app.modals.last() {
+            Some(Modal::McpServers { selected, .. }) => *selected,
+            _ => panic!("no McpServers modal"),
+        }
+    }
+
+    // ── ResumePicker ───────────────────────────────────────────────
+    #[test]
+    fn resume_esc_pops_modal() {
+        // kills delete Esc|Char('q') arm
+        let mut app = app_with_resume(3, 1);
+        assert_eq!(app.modals.len(), 1);
+        let _ = app.handle_resume_picker_key(k(KeyCode::Esc));
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn resume_q_pops_modal() {
+        let mut app = app_with_resume(3, 1);
+        let _ = app.handle_resume_picker_key(k(KeyCode::Char('q')));
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn resume_up_decrements_selected() {
+        // kills -= → += (would go to 3)
+        let mut app = app_with_resume(3, 2);
+        let _ = app.handle_resume_picker_key(k(KeyCode::Up));
+        assert_eq!(resume_selected(&app), 1);
+    }
+
+    #[test]
+    fn resume_up_clamps_at_zero() {
+        let mut app = app_with_resume(3, 0);
+        let _ = app.handle_resume_picker_key(k(KeyCode::Up));
+        assert_eq!(resume_selected(&app), 0);
+    }
+
+    #[test]
+    fn resume_down_increments_selected() {
+        // kills < → >, += → -= (underflow)
+        let mut app = app_with_resume(3, 0);
+        let _ = app.handle_resume_picker_key(k(KeyCode::Down));
+        assert_eq!(resume_selected(&app), 1);
+    }
+
+    #[test]
+    fn resume_down_clamps_at_last_and_guard_arithmetic() {
+        // selected at last (2 of 3): `selected+1 < 3` false → no move.
+        // kills `+`→`-` (2-1=1<3 true → would move) and `+`→`*` (2*1=2<3 true → would move)
+        let mut app = app_with_resume(3, 2);
+        let _ = app.handle_resume_picker_key(k(KeyCode::Down));
+        assert_eq!(resume_selected(&app), 2);
+    }
+
+    #[test]
+    fn resume_enter_returns_resume_session_action() {
+        // kills `-> Option<UserAction> with None`
+        let mut app = app_with_resume(3, 1);
+        let action = app.handle_resume_picker_key(k(KeyCode::Enter));
+        match action {
+            Some(UserAction::ResumeSession { session_dir }) => {
+                assert_eq!(session_dir, std::path::PathBuf::from("/tmp/s1"));
+            }
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+        assert!(app.modals.is_empty(), "Enter should pop the picker");
+    }
+
+    #[test]
+    fn resume_enter_on_empty_entries_pops_without_action() {
+        let mut app = app_with_resume(0, 0);
+        let action = app.handle_resume_picker_key(k(KeyCode::Enter));
+        assert!(action.is_none());
+        assert!(app.modals.is_empty());
+    }
+
+    // ── McpServers ─────────────────────────────────────────────────
+    #[test]
+    fn mcp_esc_pops_modal() {
+        // kills delete Esc|Char('q') arm
+        let mut app = app_with_mcp(3, 1);
+        let _ = app.handle_mcp_servers_key(k(KeyCode::Esc));
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn mcp_up_decrements_selected() {
+        // kills: -> None (no state change), delete Up arm, `>`→`==`/`<`, `-=`→`+=`/`/=`
+        let mut app = app_with_mcp(3, 2);
+        let _ = app.handle_mcp_servers_key(k(KeyCode::Up));
+        assert_eq!(mcp_selected(&app), 1);
+    }
+
+    #[test]
+    fn mcp_up_clamps_at_zero() {
+        let mut app = app_with_mcp(3, 0);
+        let _ = app.handle_mcp_servers_key(k(KeyCode::Up));
+        assert_eq!(mcp_selected(&app), 0);
+    }
+
+    #[test]
+    fn mcp_down_increments_selected() {
+        // kills: delete Down arm, `<`→`==`/`>`, `+=`→`-=`/`*=`
+        let mut app = app_with_mcp(3, 0);
+        let _ = app.handle_mcp_servers_key(k(KeyCode::Down));
+        assert_eq!(mcp_selected(&app), 1);
+    }
+
+    #[test]
+    fn mcp_down_clamps_at_last_and_guard_plus() {
+        // kills `+`→`*` in guard (2*1<3 true → would move past end)
+        let mut app = app_with_mcp(3, 2);
+        let _ = app.handle_mcp_servers_key(k(KeyCode::Down));
+        assert_eq!(mcp_selected(&app), 2);
+    }
+
+    // ── modal_scroll_follow_selection ──────────────────────────────
+    #[test]
+    fn modal_scroll_follows_selection_upward() {
+        // selection above viewport → scroll up to row-1.
+        // kills: -> () (no change), `+`→`*` in `selected + 2` (row=0 → scroll 0), `>`→`>=`
+        let mut app = App::new();
+        app.modal_scroll = 10;
+        app.modal_scroll_follow_selection(2); // row = 4 < 10 → scroll = 3
+        assert_eq!(app.modal_scroll, 3);
+    }
+
+    #[test]
+    fn modal_scroll_follows_selection_downward() {
+        // selection below viewport → scroll down.
+        // kills: `+`→`-`/`*` in `row + 1`, `-`→`+` in `row + 1 - MODAL_LIST_VISIBLE`
+        let mut app = App::new();
+        app.modal_scroll = 0;
+        app.modal_scroll_follow_selection(50); // row=52, 53 > 0+28 → 53-28 = 25
+        assert_eq!(app.modal_scroll, 25);
+    }
+
+    #[test]
+    fn modal_scroll_unchanged_when_selection_in_view() {
+        let mut app = App::new();
+        app.modal_scroll = 0;
+        app.modal_scroll_follow_selection(5); // row=7, 7<0 false, 8>28 false → no change
+        assert_eq!(app.modal_scroll, 0);
+    }
+}
