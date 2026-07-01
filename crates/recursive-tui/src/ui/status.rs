@@ -98,7 +98,7 @@ pub fn build_line(app: &App) -> Line<'static> {
     // `TokenUsage` docs), so this denominator is the real prompt size.
     let turn_cache = app.usage.turn_cache_hit + app.usage.turn_cache_miss;
     if turn_cache > 0 {
-        let pct = (app.usage.turn_cache_hit as f64 / turn_cache as f64) / /* ~ changed by cargo-mutants ~ */ 100.0;
+        let pct = (app.usage.turn_cache_hit as f64 / turn_cache as f64) * 100.0;
         spans.push(separator());
         spans.push(Span::styled(
             format!("📦{:.0}%", pct),
