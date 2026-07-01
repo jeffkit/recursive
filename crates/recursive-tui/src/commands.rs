@@ -204,6 +204,14 @@ impl CommandRegistry {
                     usage: "/theme <name>",
                     handler: CommandHandler::Sync(cmd_theme),
                 },
+                // Goal-323: event-driven loop.
+                CommandSpec {
+                    name: "loop",
+                    aliases: &[],
+                    summary: "Event-driven loop (/loop start|stop|trigger)",
+                    usage: "/loop start <goal> [max N] | /loop stop | /loop trigger <text>",
+                    handler: CommandHandler::Async(cmd_loop),
+                },
             ],
             skill_commands: Vec::new(),
         }
@@ -553,6 +561,99 @@ fn cmd_goal(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
         condition,
         max_turns,
     }]
+}
+
+/// `/loop [start <goal> [max N]] | stop | trigger <text>`
+fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
+    if args.is_empty() {
+        // Show current loop status.
+        let status = app
+            .loop_state
+            .as_ref()
+            .map(|ls| {
+                format!(
+                    "Loop active — goal: \"{}\", turns: {}/{}",
+                    ls.goal,
+                    ls.turns_run,
+                    if ls.max_turns > 0 {
+                        ls.max_turns.to_string()
+                    } else {
+                        "unlimited".to_string()
+                    }
+                )
+            })
+            .unwrap_or_else(|| "No active loop.".to_string());
+        app.push_system(status);
+        return Vec::new();
+    }
+
+    let sub = args[0].as_str();
+    match sub {
+        "start" => {
+            // Parse: /loop start <goal> [max N]
+            let raw = args[1..].join(" ");
+            if raw.trim().is_empty() {
+                app.push_error("Usage: /loop start <goal> [max N]");
+                return Vec::new();
+            }
+            let (goal, max_turns) = parse_loop_start_args(&raw);
+            app.push_system(format!(
+                "Loop started: \"{}\" (max {} turns)",
+                goal,
+                if max_turns > 0 {
+                    max_turns.to_string()
+                } else {
+                    "unlimited".to_string()
+                }
+            ));
+            app.loop_state = Some(crate::app::LoopUiState {
+                goal: goal.clone(),
+                turns_run: 0,
+                max_turns,
+            });
+            vec![UserAction::StartLoop { goal, max_turns }]
+        }
+        "stop" => {
+            app.loop_state = None;
+            app.push_system("Loop stopped.");
+            vec![UserAction::StopLoop]
+        }
+        "trigger" => {
+            let text = args[1..].join(" ");
+            if text.trim().is_empty() {
+                app.push_error("Usage: /loop trigger <text>");
+                return Vec::new();
+            }
+            app.push_system(format!("Loop trigger: {text}"));
+            vec![UserAction::LoopTrigger {
+                source: "manual".to_string(),
+                prompt: text,
+            }]
+        }
+        _ => {
+            app.push_error(format!(
+                "Unknown /loop sub-command: {sub}. Try /loop start|stop|trigger."
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// Parse `"<goal> [max N]"` from the raw argument string.
+/// Returns `(goal, max_turns)`. Default max_turns = 0 (unlimited).
+fn parse_loop_start_args(raw: &str) -> (String, u32) {
+    let lower = raw.to_lowercase();
+    if let Some(pos) = lower.rfind(" max ") {
+        let suffix = &raw[pos + 5..];
+        let n: u32 = suffix
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let goal = raw[..pos].trim().to_string();
+        return (goal, n);
+    }
+    (raw.trim().to_string(), 0)
 }
 
 /// Parse `"<condition> [or stop after N turns]"` from the raw argument string.
@@ -1181,7 +1282,8 @@ mod tests {
             );
         }
         // 15 named above plus one lazily-registered built-in (/resume) = 16.
-        assert_eq!(names.len(), 16);
+        // Plus /loop (Goal-323) = 17.
+        assert_eq!(names.len(), 17);
     }
 
     #[test]
@@ -1195,7 +1297,7 @@ mod tests {
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 16);
+        assert_eq!(hits.len(), 17);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();
@@ -1341,6 +1443,787 @@ mod tests {
                 assert_eq!(actions, vec![UserAction::Compact]);
             }
             other => panic!("expected Async([Compact]), got {other:?}"),
+        }
+    }
+
+    // ── Goal-323: /loop command tests ───────────────────────────────
+
+    #[test]
+    fn parse_loop_start_args_no_max_defaults_unlimited() {
+        let (goal, max) = parse_loop_start_args("watch the build");
+        assert_eq!(goal, "watch the build");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_loop_start_args_with_max_n() {
+        let (goal, max) = parse_loop_start_args("watch the build max 5");
+        assert_eq!(goal, "watch the build");
+        assert_eq!(max, 5);
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_case_insensitive() {
+        let (goal, max) = parse_loop_start_args("GO MAX 3");
+        assert_eq!(goal, "GO");
+        assert_eq!(max, 3);
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_zero_is_explicit() {
+        let (goal, max) = parse_loop_start_args("do stuff max 0");
+        assert_eq!(goal, "do stuff");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_non_numeric_defaults_zero() {
+        let (goal, max) = parse_loop_start_args("go max abc");
+        assert_eq!(goal, "go");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_loop_start_args_trims_goal() {
+        let (goal, _) = parse_loop_start_args("   trim me   ");
+        assert_eq!(goal, "trim me");
+    }
+
+    #[test]
+    fn parse_loop_start_args_max_must_be_delimited_by_spaces() {
+        let (goal, max) = parse_loop_start_args("watch max5");
+        assert_eq!(goal, "watch max5");
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn parse_goal_args_no_suffix_defaults_twenty() {
+        let (cond, max) = parse_goal_args("achieve X");
+        assert_eq!(cond, "achieve X");
+        assert_eq!(max, 20);
+    }
+
+    #[test]
+    fn parse_goal_args_with_stop_after_n() {
+        let (cond, max) = parse_goal_args("achieve X or stop after 5 turns");
+        assert_eq!(cond, "achieve X");
+        assert_eq!(max, 5);
+    }
+
+    #[test]
+    fn parse_goal_args_stop_after_non_numeric_defaults_twenty() {
+        let (cond, max) = parse_goal_args("X or stop after abc turns");
+        assert_eq!(cond, "X");
+        assert_eq!(max, 20);
+    }
+
+    #[test]
+    fn parse_goal_args_case_insensitive_suffix() {
+        let (cond, max) = parse_goal_args("X OR STOP AFTER 7 turns");
+        assert_eq!(cond, "X");
+        assert_eq!(max, 7);
+    }
+
+    #[test]
+    fn cmd_loop_no_args_no_active_loop() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("No active loop"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_no_args_shows_active_loop_status() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 2,
+            max_turns: 5,
+        });
+        let r = invoke(&mut app, "loop");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Loop active"), "got {text:?}");
+                assert!(text.contains("2/5"));
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_no_args_unlimited_max_shown() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 3,
+            max_turns: 0,
+        });
+        let r = invoke(&mut app, "loop");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("unlimited"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_start_emits_start_action_and_state() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start watch the build");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::StartLoop { goal, max_turns } => {
+                        assert_eq!(goal, "watch the build");
+                        assert_eq!(*max_turns, 0);
+                    }
+                    other => panic!("expected StartLoop, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async, got {other:?}"),
+        }
+        let ls = app.loop_state.as_ref().expect("loop_state set");
+        assert_eq!(ls.goal, "watch the build");
+        assert_eq!(ls.max_turns, 0);
+        assert_eq!(ls.turns_run, 0);
+    }
+
+    #[test]
+    fn cmd_loop_start_with_max_n() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start watch max 3");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::StartLoop { goal, max_turns } => {
+                    assert_eq!(goal, "watch");
+                    assert_eq!(*max_turns, 3);
+                }
+                other => panic!("expected StartLoop, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_start_empty_goal_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(app.loop_state.is_none(), "no state on usage error");
+    }
+
+    #[test]
+    fn cmd_loop_stop_emits_stop_and_clears_state() {
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 1,
+            max_turns: 0,
+        });
+        let r = invoke(&mut app, "loop stop");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions, vec![UserAction::StopLoop]);
+            }
+            other => panic!("expected Async([StopLoop]), got {other:?}"),
+        }
+        assert!(app.loop_state.is_none());
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Loop stopped"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_trigger_emits_manual_trigger() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop trigger check it");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::LoopTrigger { source, prompt } => {
+                    assert_eq!(source, "manual");
+                    assert_eq!(prompt, "check it");
+                }
+                other => panic!("expected LoopTrigger, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_trigger_empty_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop trigger");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_unknown_subcommand_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop frobnicate");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Unknown /loop sub-command"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_includes_loop_command() {
+        let r = CommandRegistry::default_set();
+        assert!(r.lookup("loop").is_some(), "/loop should be registered");
+        let spec = r.lookup("loop").unwrap();
+        assert!(matches!(spec.handler, CommandHandler::Async(_)));
+    }
+
+    // ── Pre-existing coverage: CommandSpec Debug, lookup_skill, ─────────
+    //    cmd_permissions, cmd_add_dir flags, cmd_goal status/clear.
+
+    #[test]
+    fn command_spec_debug_includes_all_fields() {
+        let spec = CommandSpec {
+            name: "frob",
+            aliases: &["f", "fb"],
+            summary: "frob a thing",
+            usage: "/frob <x>",
+            handler: CommandHandler::Sync(cmd_clear),
+        };
+        let s = format!("{spec:?}");
+        assert!(s.contains("CommandSpec"), "got {s:?}");
+        assert!(s.contains("frob"), "name missing: {s:?}");
+        assert!(s.contains("frob a thing"), "summary missing: {s:?}");
+        assert!(s.contains("/frob <x>"), "usage missing: {s:?}");
+        assert!(s.contains("<fn>"), "handler placeholder missing: {s:?}");
+    }
+
+    fn sample_skill(name: &str, aliases: &[&str]) -> crate::skill_commands::SkillCommand {
+        crate::skill_commands::SkillCommand {
+            name: name.into(),
+            description: "desc".into(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            argument_hint: "".into(),
+            allowed_tools: None,
+            prompt_template: "do $ARGUMENTS".into(),
+            source_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn lookup_skill_returns_none_when_builtin_shadows() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("help", &[])]);
+        assert!(
+            r.lookup_skill("help").is_none(),
+            "built-in name shadows skill"
+        );
+        // A distinct alias not claimed by any built-in still resolves to the skill.
+        let r2 = CommandRegistry::default_set()
+            .with_skill_commands(vec![sample_skill("help", &["hlpx"])]);
+        assert!(
+            r2.lookup_skill("hlpx").is_some(),
+            "non-built-in alias resolves"
+        );
+    }
+
+    #[test]
+    fn lookup_skill_finds_skill_by_name() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &[])]);
+        let s = r.lookup_skill("frob").expect("skill by name");
+        assert_eq!(s.name, "frob");
+    }
+
+    #[test]
+    fn lookup_skill_finds_skill_by_alias() {
+        let r =
+            CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &["fb"])]);
+        let s = r.lookup_skill("fb").expect("skill by alias");
+        assert_eq!(s.name, "frob");
+    }
+
+    #[test]
+    fn lookup_skill_returns_none_for_unknown() {
+        let r = CommandRegistry::default_set().with_skill_commands(vec![sample_skill("frob", &[])]);
+        assert!(r.lookup_skill("nope").is_none());
+    }
+
+    #[test]
+    fn cmd_permissions_on_enables_hook() {
+        let mut app = App::new();
+        for arg in ["on", "true", "1"] {
+            let r = invoke(&mut app, &format!("permissions {arg}"));
+            assert!(
+                matches!(r, InvokeResult::Sync(CommandOutcome::Done)),
+                "arg {arg}"
+            );
+            assert!(
+                app.permission_hook_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "arg {arg} should enable"
+            );
+        }
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => assert!(text.contains("on"), "got {text:?}"),
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_permissions_off_disables_and_clears_auto_allow() {
+        let mut app = App::new();
+        app.permission_hook_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.auto_allowed_tools.insert("Bash".into());
+        for arg in ["off", "false", "0"] {
+            let r = invoke(&mut app, &format!("permissions {arg}"));
+            assert!(
+                matches!(r, InvokeResult::Sync(CommandOutcome::Done)),
+                "arg {arg}"
+            );
+            assert!(
+                !app.permission_hook_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "arg {arg} should disable"
+            );
+            assert!(
+                app.auto_allowed_tools.is_empty(),
+                "arg {arg} should clear auto-allow"
+            );
+        }
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => assert!(text.contains("off"), "got {text:?}"),
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_permissions_no_arg_shows_usage_with_current_state() {
+        let mut app = App::new();
+        app.permission_hook_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = invoke(&mut app, "permissions");
+        assert!(matches!(r, InvokeResult::Sync(CommandOutcome::Done)));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+                assert!(text.contains("currently off"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_add_dir_dash_dash_ro_flag_grants_readonly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        invoke(&mut app, &format!("add-dir {} --ro", tmp.path().display()));
+        let roots = app.session_roots.read().expect("read").clone();
+        assert_eq!(roots.len(), 1);
+        assert!(matches!(roots[0].1, recursive::tools::AccessTier::ReadOnly));
+    }
+
+    #[test]
+    fn cmd_add_dir_short_r_flag_grants_readonly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new();
+        invoke(&mut app, &format!("add-dir {} -r", tmp.path().display()));
+        let roots = app.session_roots.read().expect("read").clone();
+        assert_eq!(roots.len(), 1);
+        assert!(matches!(roots[0].1, recursive::tools::AccessTier::ReadOnly));
+    }
+
+    #[test]
+    fn cmd_goal_no_args_no_active_goal() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("No active goal"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_goal_clear_emits_clear_action() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal clear");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions, vec![UserAction::ClearGoal]);
+            }
+            other => panic!("expected Async([ClearGoal]), got {other:?}"),
+        }
+        assert!(app.active_goal.is_none());
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Goal cleared"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_goal_clear_is_case_insensitive() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal CLEAR");
+        assert_eq!(
+            match r {
+                InvokeResult::Async(a) => a,
+                _ => vec![],
+            },
+            vec![UserAction::ClearGoal]
+        );
+    }
+
+    #[test]
+    fn cmd_goal_set_emits_set_goal_with_parsed_max() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal achieve X or stop after 5 turns");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::SetGoal {
+                    condition,
+                    max_turns,
+                } => {
+                    assert_eq!(condition, "achieve X");
+                    assert_eq!(*max_turns, 5);
+                }
+                other => panic!("expected SetGoal, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+        match app.blocks.last() {
+            Some(TranscriptBlock::System { text }) => {
+                assert!(text.contains("Goal set"), "got {text:?}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    // ── Pre-existing: build_*_lines / serde_*_context renderers ─────────
+
+    fn text_of(lines: &[ratatui::text::Line<'_>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn build_cost_lines_computes_per_token_costs() {
+        use crate::cost::UsageStats;
+        let usage = UsageStats {
+            total_input: 1_000_000,
+            total_output: 2_000_000,
+            last_latency_ms: 1_500,
+            ..Default::default()
+        };
+        let model = "MiniMax-M3";
+        let pricing = recursive::llm::pricing_for(model).expect("MiniMax-M3 has pricing");
+        let cost_in = 1_000_000.0 * pricing.input_per_million / 1_000_000.0;
+        let cost_out = 2_000_000.0 * pricing.output_per_million / 1_000_000.0;
+        let cost_total = cost_in + cost_out;
+
+        let text = text_of(&build_cost_lines(&usage, model));
+        assert!(
+            text.contains(&format!("(${cost_in:.4})")),
+            "input cost missing in {text:?}"
+        );
+        assert!(
+            text.contains(&format!("(${cost_out:.4})")),
+            "output cost missing in {text:?}"
+        );
+        assert!(
+            text.contains(&format!("(${cost_total:.4})")),
+            "total cost missing in {text:?}"
+        );
+        assert!(text.contains("Provider         : MiniMax-M3"));
+    }
+
+    #[test]
+    fn build_model_lines_renders_model_provider_endpoint() {
+        let lines = build_model_lines();
+        assert!(lines.len() > 3, "model panel should have several lines");
+        let text = text_of(&lines);
+        assert!(text.contains("Model    :"), "got {text:?}");
+        assert!(text.contains("Provider :"), "got {text:?}");
+        assert!(text.contains("Endpoint :"), "got {text:?}");
+    }
+
+    #[test]
+    fn build_tool_lines_truncates_long_descriptions_at_60_chars() {
+        // 61-char description: `> 60` true → truncated with ellipsis.
+        let long = (0..61).map(|_| 'x').collect::<String>();
+        let lines = build_tool_lines(&[("Tool61".to_string(), long.clone())]);
+        let text = text_of(&lines);
+        assert!(
+            text.contains('…'),
+            "61-char desc should be ellipsised: {text:?}"
+        );
+        assert!(text.contains("Available tools (1)"));
+
+        // 60-char description: `> 60` false → no ellipsis. Kills `>=`/`==`.
+        let exact = (0..60).map(|_| 'y').collect::<String>();
+        let lines60 = build_tool_lines(&[("Tool60".to_string(), exact.clone())]);
+        let text60 = text_of(&lines60);
+        assert!(
+            !text60.contains('…'),
+            "60-char desc should not be ellipsised: {text60:?}"
+        );
+        assert!(text60.contains(&exact));
+    }
+
+    #[test]
+    fn build_tool_lines_empty_state_message() {
+        let lines = build_tool_lines(&[]);
+        let text = text_of(&lines);
+        assert!(text.contains("(no tools registered)"), "got {text:?}");
+        assert!(text.contains("Available tools (0)"));
+    }
+
+    fn journal(name: &str, preview: &str) -> crate::ui::modal::JournalEntry {
+        crate::ui::modal::JournalEntry {
+            name: name.to_string(),
+            preview: preview.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_journal_lines_marks_and_styles_selected_entry() {
+        let entries = vec![journal("alpha", "body"), journal("beta", "body")];
+        let lines = build_journal_lines(&entries, 0);
+        assert!(lines.len() > 3, "got {} lines", lines.len());
+        let text = text_of(&lines);
+        assert!(text.contains("Recent journal entries"));
+        assert!(text.contains("▶"), "selected marker missing: {text:?}");
+        // The selected entry's name span (spans[1]) must be yellow+bold.
+        // This kills the `i == selected` -> `!=` style mutant (969).
+        let selected_line = lines
+            .iter()
+            .find(|l| text_of(std::slice::from_ref(l)).contains("▶"))
+            .expect("selected line");
+        let name_span = &selected_line.spans[1];
+        assert_eq!(
+            name_span.style,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn build_journal_lines_truncates_preview_over_12_lines() {
+        let long_preview = (0..13)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entries = vec![journal("big", &long_preview)];
+        let text = text_of(&build_journal_lines(&entries, 0));
+        assert!(
+            text.contains("more lines)"),
+            "13-line preview should announce truncation: {text:?}"
+        );
+
+        let exact_preview = (0..12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entries12 = vec![journal("exact", &exact_preview)];
+        let text12 = text_of(&build_journal_lines(&entries12, 0));
+        assert!(
+            !text12.contains("more lines)"),
+            "12-line preview should not be truncated: {text12:?}"
+        );
+    }
+
+    #[test]
+    fn build_journal_lines_empty_state_message() {
+        let lines = build_journal_lines(&[], 0);
+        let text = text_of(&lines);
+        assert!(text.contains("no entries in .dev/journal/"), "got {text:?}");
+    }
+
+    #[test]
+    fn serde_journal_context_joins_names_with_newlines() {
+        let entries = vec![journal("a", "x"), journal("b", "y")];
+        assert_eq!(serde_journal_context(&entries), "a\nb");
+        assert_eq!(serde_journal_context(&[]), "");
+    }
+
+    fn resume(slug: &str) -> crate::ui::modal::ResumeEntry {
+        crate::ui::modal::ResumeEntry {
+            session_dir: std::path::PathBuf::from(format!("/tmp/{slug}")),
+            slug: slug.to_string(),
+            updated_at: "2026-06-01 14:22".to_string(),
+            turn_count: 3,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn build_resume_lines_marks_and_styles_selected_session() {
+        let entries = vec![resume("first"), resume("second")];
+        let lines = build_resume_lines(&entries, 1);
+        assert!(lines.len() > 3, "got {} lines", lines.len());
+        let text = text_of(&lines);
+        assert!(text.contains("Recent sessions"));
+        assert!(text.contains("▶"), "selected marker missing: {text:?}");
+        assert!(text.contains("turns:  3"));
+        // Selected entry's line span is yellow+bold — kills `==` -> `!=` (1026).
+        let selected_line = lines
+            .iter()
+            .find(|l| text_of(std::slice::from_ref(l)).contains("▶"))
+            .expect("selected line");
+        assert_eq!(
+            selected_line.spans[0].style,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn serde_resume_context_joins_session_dirs_with_newlines() {
+        let entries = vec![resume("first"), resume("second")];
+        assert_eq!(serde_resume_context(&entries), "/tmp/first\n/tmp/second");
+        assert_eq!(serde_resume_context(&[]), "");
+    }
+
+    #[test]
+    fn build_theme_picker_lines_marks_selected_theme() {
+        let lines = build_theme_picker_lines("default", 0);
+        assert!(lines.len() > 2, "got {} lines", lines.len());
+        let text = text_of(&lines);
+        assert!(text.contains("Choose theme  (current: default)"));
+        assert!(
+            text.contains("▶"),
+            "selected theme marker missing: {text:?}"
+        );
+        // The ▶ line's span must be yellow+bold — kills `i == selected` ->
+        // `!=` (1069), which would give the selected row the white style.
+        let selected_line = lines
+            .iter()
+            .find(|l| text_of(std::slice::from_ref(l)).contains('▶'))
+            .expect("selected line");
+        assert_eq!(
+            selected_line.spans[0].style,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn build_help_lines_lists_skill_commands_when_present() {
+        use crate::skill_commands::SkillCommand;
+        let mut registry = CommandRegistry::default_set();
+        registry.set_skill_commands(vec![SkillCommand {
+            name: "my-skill".to_string(),
+            description: "does a thing".to_string(),
+            aliases: vec![],
+            argument_hint: String::new(),
+            allowed_tools: None,
+            prompt_template: String::new(),
+            source_path: std::path::PathBuf::from("/tmp/my-skill"),
+        }]);
+        let text = text_of(&build_help_lines(&registry));
+        assert!(
+            text.contains("Skill Commands:"),
+            "skill section header missing: {text:?}"
+        );
+        assert!(text.contains("my-skill"), "skill name missing: {text:?}");
+    }
+
+    #[test]
+    fn build_help_lines_omits_skill_section_when_empty() {
+        let registry = CommandRegistry::default_set();
+        let text = text_of(&build_help_lines(&registry));
+        assert!(
+            !text.contains("Skill Commands:"),
+            "empty skill list should not render the section header: {text:?}"
+        );
+    }
+
+    #[test]
+    fn cmd_mcp_emits_list_mcp_servers_action() {
+        let mut app = App::new();
+        let actions = cmd_mcp(&mut app, &[]);
+        assert_eq!(actions, vec![UserAction::ListMcpServers]);
+    }
+
+    #[test]
+    fn cmd_theme_no_args_selects_current_theme_row() {
+        // Kills the `t.name == current` -> `!=` mutant in cmd_theme (714):
+        // the panel's `selected` must be the index of the current theme in
+        // ALL_THEMES, not the first theme that differs from it.
+        use crate::ui::theme::ALL_THEMES;
+        let mut app = App::new();
+        let expected = ALL_THEMES
+            .iter()
+            .position(|t| t.name == app.theme.name)
+            .unwrap_or(0);
+        let r = invoke(&mut app, "theme");
+        match r {
+            InvokeResult::Sync(CommandOutcome::OpenPanel(panel)) => {
+                assert_eq!(
+                    panel.selected,
+                    Some(expected),
+                    "theme picker should open with the current theme selected"
+                );
+            }
+            other => panic!("expected OpenPanel for /theme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_goal_single_non_clear_arg_sets_goal() {
+        // Kills `args.len() == 1 && args[0].eq_ignore_ascii_case("clear")`
+        // -> `||` (550): with a single non-"clear" arg the original sets a
+        // goal, the mutant would clear it.
+        let mut app = App::new();
+        let r = invoke(&mut app, "goal hello");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::SetGoal {
+                        condition,
+                        max_turns,
+                    } => {
+                        assert_eq!(condition, "hello");
+                        assert_eq!(*max_turns, 20);
+                    }
+                    other => panic!("expected SetGoal, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async (SetGoal), got {other:?}"),
         }
     }
 }

@@ -273,6 +273,31 @@ impl App {
                 });
                 self.active_goal = None;
             }
+            // ── Goal-323: event-driven loop events ─────────────────────────
+            UiEvent::LoopStarted { goal } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Loop started: \"{goal}\""),
+                });
+                // LoopUiState already set by cmd_loop handler.
+            }
+            UiEvent::LoopStopped => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: "Loop stopped.".into(),
+                });
+                self.loop_state = None;
+            }
+            UiEvent::LoopTurnScheduled { source, delay_secs } => {
+                let delay_str = delay_secs.map(|d| format!(" in {d}s")).unwrap_or_default();
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Loop turn scheduled [{source}]{delay_str}"),
+                });
+                if let Some(ref mut ls) = self.loop_state {
+                    ls.turns_run = ls.turns_run.saturating_add(1);
+                }
+            }
+            UiEvent::LoopIdle => {
+                // No-op: the loop is waiting. Don't flood the transcript.
+            }
             // ── Goal-170: turn abort ──────────────────────────────────────────
             UiEvent::Interrupted => {
                 self.blocks.push(TranscriptBlock::System {
@@ -713,6 +738,31 @@ mod tests {
             |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),
         );
         assert!(has_diff, "expected Diff block from Write");
+    }
+
+    #[test]
+    fn failed_write_result_does_not_render_diff_block() {
+        // Kills `name == "Write" && success` -> `||` (61): a failed Write
+        // (success=false) whose output still matches the " to <path>" shape
+        // must NOT push a Diff block. The `||` mutant would enter the branch
+        // and synthesise a diff for the failed write.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::ToolCall {
+            id: "1".into(),
+            name: "Write".into(),
+            arguments: r#"{"path":"src/new.rs","contents":"x"}"#.into(),
+        });
+        app.handle_ui_event(UiEvent::ToolResult {
+            id: "1".into(),
+            name: "Write".into(),
+            output: "Failed to write to src/new.rs: permission denied".into(),
+            success: false,
+        });
+        let has_diff = app.blocks.iter().any(
+            |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),
+        );
+        assert!(!has_diff, "failed Write must not render a Diff block");
     }
 
     // ── compacted ──────────────────────────────────────────────────

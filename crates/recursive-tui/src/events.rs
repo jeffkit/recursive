@@ -174,6 +174,24 @@ pub enum UiEvent {
         /// The raw message text.
         text: String,
     },
+
+    // ── Goal-323: event-driven loop events ───────────────────────────────────
+    /// An event-driven loop has been started.
+    LoopStarted {
+        /// The goal the loop is pursuing.
+        goal: String,
+    },
+    /// The event-driven loop has stopped (user request or max turns).
+    LoopStopped,
+    /// A new turn has been scheduled by the loop arbiter.
+    LoopTurnScheduled {
+        /// Source of the trigger: "wakeup", "bg-complete", "manual".
+        source: String,
+        /// For wakeup triggers, the delay before the turn.
+        delay_secs: Option<u64>,
+    },
+    /// The loop is idle, waiting for a trigger (background job, wakeup, user).
+    LoopIdle,
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
@@ -261,6 +279,19 @@ pub enum UserAction {
     // ── Goal-173: MCP server list ────────────────────────────────────────────
     /// List configured MCP servers.
     ListMcpServers,
+
+    // ── Goal-323: event-driven loop actions ──────────────────────────────────
+    /// Start an event-driven loop with the given goal.
+    StartLoop {
+        /// The initial goal prompt (also the first turn's prompt).
+        goal: String,
+        /// Max autonomous turns; 0 = unlimited.
+        max_turns: u32,
+    },
+    /// Stop the event-driven loop (current turn finishes, then stop).
+    StopLoop,
+    /// Manually inject a trigger into the loop.
+    LoopTrigger { source: String, prompt: String },
 }
 
 // ── Goal-230: Skill-hub install side-channel ─────────────────────────────────

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use super::resolve_within;
@@ -59,6 +60,10 @@ pub struct Job {
 pub struct BackgroundJobManager {
     jobs: HashMap<String, Job>,
     next_id: u64,
+    /// Notifies waiters when a job enters a terminal state
+    /// (Completed, Failed, TimedOut). Used by the TUI loop arbiter
+    /// to wake on background job completion.
+    completed_notify: Arc<Notify>,
 }
 
 impl Default for BackgroundJobManager {
@@ -72,7 +77,20 @@ impl BackgroundJobManager {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
+            completed_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Return a clone of the completed-notify handle.
+    ///
+    /// Used by the TUI loop arbiter to `select!` on job completion.
+    /// When a background job enters a terminal state (Completed, Failed,
+    /// TimedOut), `notify_one()` is called. `notify_one()` (rather than
+    /// `notify_waiters()`) stores a permit so a completion that happens
+    /// while the arbiter is mid-turn (not yet polling) is not lost — the
+    /// next `notified()` poll consumes the stored permit.
+    pub fn completed_notify(&self) -> Arc<Notify> {
+        self.completed_notify.clone()
     }
 
     /// Generate a new unique job ID.
@@ -96,8 +114,15 @@ impl BackgroundJobManager {
 
     /// Update a job's state.
     fn update(&mut self, id: &str, state: JobState) {
+        let is_terminal = matches!(
+            state,
+            JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut
+        );
         if let Some(job) = self.jobs.get_mut(id) {
             job.state = state;
+        }
+        if is_terminal {
+            self.completed_notify.notify_one();
         }
     }
 
@@ -702,5 +727,135 @@ mod tests {
             created_at: Instant::now(),
         });
         assert!(manager.take_completed().is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_notify_wakes_on_terminal_state() {
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+
+        let notify = manager.lock().await.completed_notify();
+
+        // notify_one() stores a permit, so a waiter registered AFTER the
+        // state change still wakes — this models the arbiter polling
+        // between turns after a job completed mid-turn (the real usage).
+        {
+            let mut mgr = manager.lock().await;
+            let id = mgr.insert(Job {
+                state: JobState::Running,
+                created_at: Instant::now(),
+            });
+            mgr.update(
+                &id,
+                JobState::Completed {
+                    stdout: "done".into(),
+                    stderr: "".into(),
+                    exit_code: 0,
+                },
+            );
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), notify.notified()).await;
+        assert!(result.is_ok(), "notify should fire on terminal state");
+    }
+
+    #[tokio::test]
+    async fn completed_notify_does_not_fire_for_running_job() {
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+
+        let notify = manager.lock().await.completed_notify();
+
+        // Insert a running job (should NOT trigger notify).
+        {
+            let mut mgr = manager.lock().await;
+            mgr.insert(Job {
+                state: JobState::Running,
+                created_at: Instant::now(),
+            });
+        }
+
+        // The notify should timeout (running jobs don't fire it).
+        let result = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
+        assert!(result.is_err(), "notify should not fire for running jobs");
+    }
+
+    #[tokio::test]
+    async fn completed_notify_fires_for_timed_out_job() {
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+
+        let notify = manager.lock().await.completed_notify();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), notify.notified()).await
+        });
+
+        {
+            let mut mgr = manager.lock().await;
+            let id = mgr.insert(Job {
+                state: JobState::Running,
+                created_at: Instant::now(),
+            });
+            mgr.update(&id, JobState::TimedOut);
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "notify should fire for TimedOut");
+    }
+
+    #[tokio::test]
+    async fn completed_notify_fires_for_failed_job() {
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+
+        let notify = manager.lock().await.completed_notify();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), notify.notified()).await
+        });
+
+        {
+            let mut mgr = manager.lock().await;
+            let id = mgr.insert(Job {
+                state: JobState::Running,
+                created_at: Instant::now(),
+            });
+            mgr.update(
+                &id,
+                JobState::Failed {
+                    message: "boom".into(),
+                },
+            );
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "notify should fire for Failed");
+    }
+
+    #[tokio::test]
+    async fn shared_bg_manager_sees_jobs_from_tool() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+
+        // Run a quick command
+        let result = run_tool
+            .execute(json!({"command": "echo shared-test"}))
+            .await
+            .unwrap();
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let job_id = parsed["job_id"].as_str().unwrap().to_string();
+        assert_eq!(parsed["status"], "spawned");
+
+        // Wait for completion via the shared manager.
+        let notify = manager.lock().await.completed_notify();
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("notify should fire");
+
+        // take_completed from the shared manager should return the job.
+        let mut mgr = manager.lock().await;
+        let (id, output) = mgr.take_completed().unwrap();
+        assert_eq!(id, job_id);
+        assert!(output.contains("shared-test"));
     }
 }

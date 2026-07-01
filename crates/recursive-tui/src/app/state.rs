@@ -59,6 +59,7 @@ impl App {
             permission_hook_enabled: Arc::new(AtomicBool::new(false)),
             current_todos: Vec::new(),
             active_goal: None,
+            loop_state: None,
             workspace_path: workspace,
             last_skill_reload: Some(Instant::now()),
             session_roots: recursive::new_shared_sandbox_roots(),
@@ -73,7 +74,14 @@ impl App {
     /// (500 ms between reloads) to avoid heavy scanning on every
     /// keystroke in the command menu.
     pub fn try_reload_skills(&mut self) {
-        let now = Instant::now();
+        self.try_reload_skills_at(Instant::now());
+    }
+
+    /// Testable core of [`try_reload_skills`]: debounce by exactly 500ms
+    /// against the supplied `now`, so tests can hit the boundary with
+    /// exact `Instant` arithmetic (real-time jitter makes the 500ms edge
+    /// unobservable otherwise).
+    pub fn try_reload_skills_at(&mut self, now: Instant) {
         if let Some(last) = self.last_skill_reload {
             if now.duration_since(last) < std::time::Duration::from_millis(500) {
                 return;
@@ -418,5 +426,149 @@ mod tests {
             .find(|s| s.name == "goal322-unique")
             .unwrap();
         assert_eq!(updated.description, "Updated version");
+    }
+
+    // ── Pre-existing App method coverage (file-scoped mutant gate) ─────
+
+    #[test]
+    fn push_modal_resets_scroll_and_stacks() {
+        let mut app = App::new();
+        app.modal_scroll = 7;
+        app.push_modal(crate::ui::modal::Modal::Help);
+        assert_eq!(app.modal_scroll, 0, "push_modal resets scroll to top");
+        assert_eq!(app.modals.len(), 1);
+        app.push_modal(crate::ui::modal::Modal::CostDetail);
+        assert_eq!(app.modals.len(), 2, "modals stack");
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_offset() {
+        let mut app = App::new();
+        app.scroll_offset = 42;
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_offset, 0, "scroll_to_bottom zeroes offset");
+    }
+
+    #[test]
+    fn close_command_panel_clears_panel_and_restores_prompt_mode() {
+        let mut app = App::new();
+        let panel = crate::app::CommandPanelState::new("theme", vec![]);
+        app.open_command_panel(panel);
+        assert!(app.active_command_panel.is_some(), "panel opened");
+        assert_eq!(app.prompt.mode, crate::InputMode::CommandInteract);
+        app.close_command_panel();
+        assert!(app.active_command_panel.is_none(), "panel cleared");
+        assert_eq!(
+            app.prompt.mode,
+            crate::InputMode::Prompt,
+            "mode restored to Prompt"
+        );
+    }
+
+    #[test]
+    fn try_reload_skills_boundary_500ms_reloads_and_kills_le_mutants() {
+        use std::time::Instant;
+        // Exact 500ms edge: `<` reloads, `<=`/`==` return. Real-time jitter
+        // can't hit this edge, so we drive the testable `_at` variant with
+        // exact `Instant` arithmetic.
+        let mut app = App::new();
+        let base = Instant::now();
+        app.last_skill_reload = Some(base);
+
+        // 499ms: still within debounce → no reload (last unchanged).
+        app.try_reload_skills_at(base + std::time::Duration::from_millis(499));
+        assert_eq!(
+            app.last_skill_reload,
+            Some(base),
+            "499ms is within the 500ms debounce; no reload"
+        );
+
+        // Exactly 500ms: debounce expired → reload (last advanced to base+500).
+        app.try_reload_skills_at(base + std::time::Duration::from_millis(500));
+        assert_eq!(
+            app.last_skill_reload,
+            Some(base + std::time::Duration::from_millis(500)),
+            "500ms boundary expires debounce and reloads"
+        );
+    }
+
+    #[cfg(feature = "skill-hub")]
+    #[test]
+    fn handle_skill_search_request_pushes_results_modal_and_pending_search() {
+        use crate::app::PendingSkillInstall;
+        use crate::events::SkillSearchRequest;
+        use crate::ui::modal::{Modal, SkillInstallPage};
+
+        let mut app = App::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let req = SkillSearchRequest {
+            query: "pdf".to_string(),
+            results: vec![],
+            reply: tx,
+        };
+
+        app.handle_skill_search_request(req);
+
+        // A SkillInstall modal on the Results page must be pushed.
+        match app.modals.last() {
+            Some(Modal::SkillInstall(state)) => {
+                assert_eq!(state.query, "pdf");
+                assert!(matches!(
+                    state.page,
+                    SkillInstallPage::Results { selected: 0 }
+                ));
+            }
+            other => panic!("expected SkillInstall modal, got {:?}", other),
+        }
+        // The phase-1 Search reply sender must be parked on the app.
+        assert!(matches!(
+            app.pending_skill_install,
+            Some(PendingSkillInstall::Search(_))
+        ));
+    }
+
+    #[cfg(feature = "skill-hub")]
+    #[test]
+    fn handle_skill_files_request_advances_modal_to_files_and_pending_files() {
+        use crate::app::PendingSkillInstall;
+        use crate::events::{SkillFilesRequest, SkillSearchRequest, SkillZipFile};
+        use crate::ui::modal::{Modal, SkillInstallPage};
+
+        let mut app = App::new();
+        // Seed phase-1 so phase-2 has a modal to advance and a sender to drop.
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        app.handle_skill_search_request(SkillSearchRequest {
+            query: "pdf".to_string(),
+            results: vec![],
+            reply: tx1,
+        });
+
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let req = SkillFilesRequest {
+            slug: "pdf".to_string(),
+            files: vec![SkillZipFile {
+                path: "pdf/SKILL.md".to_string(),
+                content: "hi".to_string(),
+                size: 2,
+            }],
+            reply: tx2,
+        };
+        app.handle_skill_files_request(req);
+
+        match app.modals.last() {
+            Some(Modal::SkillInstall(state)) => {
+                assert_eq!(state.slug.as_deref(), Some("pdf"));
+                assert_eq!(state.files.len(), 1);
+                assert!(matches!(
+                    state.page,
+                    SkillInstallPage::Files { selected: 0 }
+                ));
+            }
+            other => panic!("expected SkillInstall modal, got {:?}", other),
+        }
+        assert!(matches!(
+            app.pending_skill_install,
+            Some(PendingSkillInstall::Files(_))
+        ));
     }
 }

@@ -129,6 +129,8 @@ pub struct App {
     pub current_todos: Vec<recursive::tools::todo::TodoItem>,
     /// Goal-168: mirrored goal state, updated by `UiEvent::Goal*` events.
     pub active_goal: Option<GoalState>,
+    /// Goal-323: mirrored event-loop state, updated by /loop start/stop.
+    pub loop_state: Option<LoopUiState>,
     /// Goal-171: workspace root path, used by /resume to list sessions.
     pub workspace_path: std::path::PathBuf,
     /// Goal-322: timestamp (wall-clock) of the last skill reload, used
@@ -158,7 +160,13 @@ pub struct App {
     pub active_command_panel: Option<CommandPanelState>,
 }
 
-// ── CommandPanelState ────────────────────────────────────────────────────────
+/// Goal-323: UI-level mirror of event-driven loop state.
+#[derive(Debug, Clone)]
+pub struct LoopUiState {
+    pub goal: String,
+    pub turns_run: u32,
+    pub max_turns: u32, // 0 = unlimited
+}
 
 /// State for the interactive panel that expands below the input box when a
 /// slash-command requires user interaction (a form, picker, confirmation, …).
@@ -278,4 +286,49 @@ pub struct PendingPermission {
     pub tool_name: String,
     pub args_preview: String,
     pub reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel_with_n_lines(n: usize) -> CommandPanelState {
+        let lines: Vec<ratatui::text::Line<'static>> =
+            (0..n).map(|_| ratatui::text::Line::raw("x")).collect();
+        CommandPanelState::new("test", lines)
+    }
+
+    #[test]
+    fn with_hint_grows_height_to_lines_plus_three() {
+        // Kills `self.lines.len() as u16 + 3` -> `-`/`*` (226): the hint
+        // footer must raise the panel height to lines.len()+3.
+        let panel = panel_with_n_lines(5).with_hint("↑↓ navigate");
+        assert_eq!(panel.height, 8, "height should be lines(5) + 3");
+        assert_eq!(panel.hint.as_deref(), Some("↑↓ navigate"));
+    }
+
+    #[test]
+    fn scroll_down_advances_and_clamps_scroll() {
+        // Kills `scroll_down -> ()` (259) and `(self.scroll + n)` -> `-`/`*`
+        // (260): scroll must increase by n and clamp at lines.len()-1.
+        let mut panel = panel_with_n_lines(5);
+        assert_eq!(panel.scroll, 0);
+        panel.scroll_down(2);
+        assert_eq!(panel.scroll, 2, "scroll should advance by 2");
+        // Clamp at max = lines.len()-1 = 4.
+        panel.scroll_down(10);
+        assert_eq!(panel.scroll, 4, "scroll should clamp at lines.len()-1");
+    }
+
+    #[test]
+    fn scroll_up_decreases_scroll_clamped_to_zero() {
+        // Kills `scroll_up -> ()` (265): scroll must decrease, not stay put.
+        let mut panel = panel_with_n_lines(5);
+        panel.scroll_down(4);
+        assert_eq!(panel.scroll, 4);
+        panel.scroll_up(2);
+        assert_eq!(panel.scroll, 2, "scroll_up should decrease scroll");
+        panel.scroll_up(10);
+        assert_eq!(panel.scroll, 0, "scroll_up should clamp at 0");
+    }
 }
