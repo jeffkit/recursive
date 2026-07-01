@@ -3632,3 +3632,54 @@ mod command_panel_tests {
         assert!(!app.active_command_panel.as_ref().unwrap().lines.is_empty());
     }
 }
+
+#[cfg(test)]
+mod command_menu_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::App;
+    use crate::ui::command_menu::{self, command_menu_entries};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn matches_count(app: &App) -> usize {
+        let entries = command_menu_entries(&app.commands, &app.prompt.buffer);
+        entries.len().min(command_menu::MAX_VISIBLE)
+    }
+
+    #[test]
+    fn cmd_menu_down_at_last_stays() {
+        // kills: guard `n + 1 < matches_count` -> true (567, moves to 8),
+        //        `<`->`<=` (567, 8<=8 true -> moves to 8)
+        let mut app = App::new();
+        app.prompt.buffer = "/".to_string(); // yields >= MAX_VISIBLE entries
+        let mc = matches_count(&app);
+        assert!(mc >= 8, "need >=8 entries for boundary, got {mc}");
+        let last = mc - 1;
+        app.command_menu_selected = Some(last);
+        assert_eq!(app.handle_command_menu_key(k(KeyCode::Down)), Some(None));
+        assert_eq!(app.command_menu_selected, Some(last));
+    }
+
+    #[test]
+    fn cmd_menu_down_from_none_starts_at_zero() {
+        // covers delete Down arm: orig None -> Some(0); mutant -> stays None
+        let mut app = App::new();
+        app.prompt.buffer = "/".to_string();
+        app.command_menu_selected = None;
+        assert_eq!(app.handle_command_menu_key(k(KeyCode::Down)), Some(None));
+        assert_eq!(app.command_menu_selected, Some(0));
+    }
+
+    #[test]
+    fn cmd_menu_up_decrements_selected() {
+        // covers delete Up arm: orig Some(1) -> Some(0); mutant -> stays Some(1)
+        let mut app = App::new();
+        app.prompt.buffer = "/".to_string();
+        app.command_menu_selected = Some(1);
+        assert_eq!(app.handle_command_menu_key(k(KeyCode::Up)), Some(None));
+        assert_eq!(app.command_menu_selected, Some(0));
+    }
+}
