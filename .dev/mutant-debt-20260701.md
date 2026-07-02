@@ -8,7 +8,7 @@ This is the work list for strengthening TUI tests. Knock out a file by writing t
 
 | File | Missed |
 |---|---:|
-| `app/commands.rs` | 108 |
+| `app/commands.rs` | 3 ✅ (was 108; 3 unkillable — see notes) |
 | `ui/command_menu.rs` | 31 |
 | `ui/markdown.rs` | 28 |
 | `completion.rs` | 17 |
@@ -24,7 +24,25 @@ This is the work list for strengthening TUI tests. Knock out a file by writing t
 | `ui/modal.rs` | 1 |
 | **total** | **219** |
 
-### app/commands.rs (108)
+### app/commands.rs (108 → 3)
+
+**Status (2026-07-02): DONE.** Killed 105/108 via 8 batches in the
+`tui-mutant-debt` worktree (147 `#[test]`s in the file). Scoped
+`tui-mutants.sh --jobs 6` now reports **3 missed, 294 caught, 17 unviable,
+5 timeout**. The 3 survivors are accepted as behavior-equivalent / dead
+code (not worth killing without restructuring):
+
+- `215:30: replace match guard self.should_walk_history_down() with true`
+  — `should_walk_history_down()` is `history_idx.is_some()`; `history_next`
+  returns false (no-op) when not walking, so `guard → true` is behavior-
+  equivalent.
+- `279:44: replace <= with > in App::handle_esc` — the result is bound to
+  `_within_window` and never used (dead code).
+- `1445:27: replace > with >= in App::modal_scroll_follow_selection` — at
+  the exact boundary `row+1 == modal_scroll+28`, entering the elif body
+  sets `modal_scroll` to the same value it already holds (idempotent).
+
+Original missed list (for reference):
 
 - `121:17: delete match arm InputMode::HistorySearch in App::handle_key`
 - `123:24: delete ! in App::handle_key`
