@@ -273,7 +273,9 @@ All 7 debt-listed mutants killed. Full-file scan: 27 mutants → 26 caught, 1 mi
 - `233:41: replace == with != in render_todo_panel`
 - `309:5: replace render_plan_mode_request_banner with ()`
 
-### lib.rs (5)
+### lib.rs (5 → 1 unkillable) ✅ done 2026-07-02
+
+All 5 debt-listed mutants killed except `60:9 RawModeGuard::drop -> ()` (unkillable: the drop body only emits crossterm terminal commands whose effects are not observable from a unit test). Full-file scan: 9 mutants → 8 caught, 1 missed.
 
 - `60:9: replace <impl Drop for RawModeGuard>::drop with ()`
 - `215:9: delete match arm MouseEventKind::ScrollUp in handle_mouse`
