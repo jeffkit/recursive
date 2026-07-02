@@ -374,4 +374,34 @@ mod tests {
         let path = extract_write_file_path_from_result("Wrote 42 bytes to crates/foo/bar.rs");
         assert_eq!(path.as_deref(), Some("crates/foo/bar.rs"));
     }
+
+    #[test]
+    fn parse_v4a_patch_splits_multiple_hunks() {
+        // kills delete `!` (171:16) in `if !current.is_empty()`: at the
+        // first `@@` anchor `current` is empty, so the mutant
+        // (`if current.is_empty()`) pushes an empty hunk and later merges
+        // the real hunk content.
+        let patch =
+            "*** Begin Patch\n*** Update File: src/foo.rs\n@@ h1\n+a\n@@ h2\n+b\n*** End Patch";
+        let (path, hunks) = parse_v4a_patch(patch).unwrap();
+        assert_eq!(path, "src/foo.rs");
+        assert_eq!(hunks.len(), 2, "expected two hunks, got {hunks:?}");
+        assert!(!hunks[0].lines.is_empty(), "first hunk should have lines");
+    }
+
+    #[test]
+    fn parse_v4a_patch_bare_anchor_omits_empty_context() {
+        // A bare `@@` line (no anchor text) must not produce an empty
+        // Context line. kills delete `!` (177:16) in `if !text.is_empty()`.
+        let patch = "*** Begin Patch\n*** Update File: src/foo.rs\n@@\n+a\n*** End Patch";
+        let (_path, hunks) = parse_v4a_patch(patch).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert!(
+            !hunks[0]
+                .lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Context && l.text.is_empty()),
+            "no empty context line expected; got {hunks:?}"
+        );
+    }
 }
