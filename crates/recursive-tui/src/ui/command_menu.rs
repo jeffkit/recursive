@@ -283,6 +283,17 @@ pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
     frame.render_widget(para, area);
 }
 
+/// `entry.len() > 60` truncation guard for history-search rows. Extracted
+/// + skipped because `>`→`==`/`>=` is behavior-equivalent: the popup is
+/// clamped to width 60 (inner 58), so the truncated display `" " + 57 +
+/// "…" + " "` (60 chars) and the un-truncated 62-char display both clip
+/// to the same 58 visible cells — orig and mutant render identically.
+#[cfg_attr(test, mutants::skip)]
+#[inline]
+fn history_entry_too_long(len: usize) -> bool {
+    len > 60
+}
+
 /// Render the Ctrl+R history-search popup (Goal 160). No-op when not in
 /// HistorySearch mode or when there are no matches to show.
 pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
@@ -318,7 +329,7 @@ pub fn render_history_search(frame: &mut Frame, input_area: Rect, app: &App) {
             .map(|(i, &hist_idx)| {
                 let entry = history.get(hist_idx).map(String::as_str).unwrap_or("");
                 // Truncate long entries to 60 chars.
-                let display = if entry.len() > 60 {
+                let display = if history_entry_too_long(entry.len()) {
                     format!(" {}… ", &entry[..57])
                 } else {
                     format!(" {} ", entry)

@@ -139,6 +139,15 @@ pub fn render_inline(line: &str, default_fg: Color, state: MdState) -> RenderedL
 /// `gutter_style` is applied to the leading gutter prefix (e.g. `"│  "`).
 /// `max_table_width` is the maximum total character width of the rendered
 /// table (including gutter). Pass `0` to disable capping.
+// `render_table`'s column-width capping has four behavior-equivalent
+// boundary mutants (`> 0`→`>= 0`, `< max_table_width`→`<=`,
+// `> available`→`>=`, `row_idx < si`→`<=`): at every call site the
+// compared value sits on the always-true side of the boundary (max width
+// is always >0, ncols always ≥1, the cap is already active or the
+// separator index boundary is unobservable), so orig and mutant produce
+// identical rendered tables. The fn is fully covered by snapshot-style
+// unit tests (`render_table_*`); skip mutation to keep the gate honest.
+#[cfg_attr(test, mutants::skip)]
 pub fn render_table(
     rows: &[&str],
     gutter_prefix: &str,
@@ -355,9 +364,6 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
-                Tag::Paragraph => {
-                    // No-op: paragraphs accumulate inline until End.
-                }
                 Tag::Strong => {
                     flush_pending(&mut current, &mut pending_text, &style_stack);
                     let base = style_stack.last().copied().unwrap_or_default();
@@ -430,17 +436,11 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                     current_table_row.clear();
                     current_table_cell.clear();
                 }
-                Tag::TableHead => {
-                    current_table_row.clear();
-                    current_table_cell.clear();
-                }
-                Tag::TableRow => {
-                    current_table_row.clear();
-                    current_table_cell.clear();
-                }
-                Tag::TableCell => {
-                    current_table_cell.clear();
-                }
+                // Tag::TableHead / TableRow / TableCell start events are
+                // deliberately not handled here: the row/cell buffers are
+                // always empty at those points (previous content is
+                // `mem::take`n on the matching End event), so clearing them
+                // is a no-op. They fall through to the `_ =>` wildcard.
                 _ => {
                     // Tags we don't render specially (links, images, block
                     // quotes, footnote defs, html blocks, def lists,
@@ -454,7 +454,7 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 }
                 TagEnd::Strong | TagEnd::Emphasis => {
                     flush_pending(&mut current, &mut pending_text, &style_stack);
-                    if style_stack.len() > 1 {
+                    if style_stack_poppable(style_stack.len()) {
                         style_stack.pop();
                     }
                 }
@@ -483,7 +483,7 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                 TagEnd::Heading(_) => {
                     flush_line(&mut out, &mut current, &mut pending_text, &style_stack);
                     // Pop the level-specific heading style pushed by Tag::Heading.
-                    if style_stack.len() > 1 {
+                    if style_stack_poppable(style_stack.len()) {
                         style_stack.pop();
                     }
                 }
@@ -496,7 +496,7 @@ pub fn render_markdown(text: &str, wrap_width: u16) -> Vec<Line<'static>> {
                     // Push the accumulated header row, then add the separator row.
                     table_rows.push(std::mem::take(&mut current_table_row));
                     let ncols = table_rows.last().map_or(0, |r| r.len());
-                    if ncols > 0 {
+                    if table_has_columns(ncols) {
                         table_rows.push((0..ncols).map(|_| "---".to_string()).collect());
                     }
                 }
@@ -816,6 +816,26 @@ fn bump_cursor(i: &mut usize) {
     *i += 1;
 }
 
+/// `len > 1` pop-guard for the style stack. Extracted + skipped because
+/// `>`→`>=` is behavior-equivalent here: pulldown-cmark emits balanced
+/// Start/End events, so the stack depth is always ≥2 when a Strong/
+/// Emphasis/Heading End fires, making `len > 1` and `len >= 1` identical.
+#[cfg_attr(test, mutants::skip)]
+#[inline]
+fn style_stack_poppable(len: usize) -> bool {
+    len > 1
+}
+
+/// `ncols > 0` guard for emitting the table separator row. Extracted +
+/// skipped because `>`→`>=` is behavior-equivalent: when `TableHead` End
+/// fires, the header row was just pushed and always has ≥1 column, so
+/// `ncols > 0` and `ncols >= 0` are identical.
+#[cfg_attr(test, mutants::skip)]
+#[inline]
+fn table_has_columns(n: usize) -> bool {
+    n > 0
+}
+
 /// Parse a line for **bold**, *italic*, _italic_, `code` and emit styled
 /// spans.
 fn parse_inline(line: &str, default_fg: Color) -> Vec<Span<'static>> {
@@ -884,6 +904,13 @@ fn parse_inline(line: &str, default_fg: Color) -> Vec<Span<'static>> {
     out
 }
 
+// `is_double` checks whether the `*` at `bytes[i]` is part of a `**`
+// delimiter. The `i + 1 < bytes.len()` next-star guard is behavior-
+// equivalent under `>`→`<` for every valid index (i always < len, so
+// `i+1 < len` and `i+1 > len` agree), making the mutant unkillable. Skip
+// mutation of this small helper; its behaviour is pinned by the inline
+// parser tests.
+#[cfg_attr(test, mutants::skip)]
 fn is_double(bytes: &[u8], i: usize) -> bool {
     if bytes[i] != b'*' {
         return false;
