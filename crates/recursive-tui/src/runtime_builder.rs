@@ -603,11 +603,11 @@ type = "openai"
 
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(
-            names.iter().any(|n| *n == "demo-skill"),
+            names.contains(&"demo-skill"),
             "expected demo-skill in {names:?}"
         );
         assert!(
-            names.iter().any(|n| *n == "other-skill"),
+            names.contains(&"other-skill"),
             "expected other-skill (OS-native separator split) in {names:?}"
         );
     }

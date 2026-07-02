@@ -266,11 +266,11 @@ mod debt_tests {
             "no backslash separators expected; got {out:?}"
         );
         assert!(
-            out.iter().any(|p| p == "d1/d2/deep.txt"),
+            out.contains(&"d1/d2/deep.txt".to_string()),
             "expected forward-slash rel path; got {out:?}"
         );
         assert!(
-            out.iter().any(|p| p == "d1/d2/d3/nested.txt"),
+            out.contains(&"d1/d2/d3/nested.txt".to_string()),
             "expected forward-slash rel path; got {out:?}"
         );
     }
