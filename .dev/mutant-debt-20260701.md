@@ -21,7 +21,7 @@ This is the work list for strengthening TUI tests. Knock out a file by writing t
 | `bash.rs` | 1 |
 | `cost.rs` | 1 |
 | `ui/input.rs` | 1 |
-| `ui/modal.rs` | 1 |
+| `ui/modal.rs` | 1 ✅ (was 1 + 57 full-file scan; 0 missed) |
 | **total** | **219** |
 
 ### app/commands.rs (108 → 3)
@@ -320,7 +320,29 @@ All 2 debt-listed mutants killed. Full-file scan: 76 mutants → 72 caught, 4 mi
 
 - `45:20: replace < with <= in render`
 
-### ui/modal.rs (1)
+### ui/modal.rs (1 → 0)
+
+**Status (2026-07-02): DONE.** The single debt-listed mutant
+(`742:5 load_recent_journal_entries -> vec![]`) was killed. A full-file
+`tui-mutants.sh` scan then surfaced 57 more missed mutants across the
+modal body renderers; all were killed by a batch of `TestBackend`-based
+tests in the `tui-mutant-debt-rest` worktree, bringing the file to
+**0 missed** (70 mutants: 67 caught, 3 unviable).
+
+Tests added cover: `render_cost_body` (exact USD cost strings for a
+priced model, killing the `*`/`/`/`+` arithmetic mutants),
+`render_journal_body` (selected marker `▶`, selected-row Yellow fg, and
+the `total > 12` preview-truncation boundary at 12/13 lines),
+`render_resume_picker_body` and `render_mcp_servers_body` (selected
+marker + Yellow fg via a `cell_style_where` buffer inspector that skips
+the modal's border cells), `render_skill_install` Results page (result
+name, `downloads >= 1_000` → `1.5k` formatting, selected-row desc
+emission, and `description.chars().count() > 68` truncation boundary at
+68/69 chars) and Files page (`size >= 1024` → `2.0kb` formatting,
+selected-row Cyan bg), and `load_recent_sessions` (real sessions via
+`SessionWriter` under an isolated `RECURSIVE_SESSIONS_DIR`, killing the
+`-> vec![]` replacement, the `!` deletion on `goal.is_empty()`, and the
+`> 40` slug-truncation boundary at 40/41 chars).
 
 - `742:5: replace load_recent_journal_entries -> Vec<JournalEntry> with vec![]`
 
