@@ -300,7 +300,10 @@ All 3 debt-listed mutants killed. Full-file scan: 31 mutants → 26 caught, 3 un
 - `119:26: replace <= with > in clamp`
 - `223:38: replace + with - in extract_write_file_path_from_result`
 
-### ui/transcript.rs (2)
+### ui/transcript.rs (2 → 4 unkillable) ✅ done 2026-07-02
+
+All 2 debt-listed mutants killed. Full-file scan: 76 mutants → 72 caught, 4 missed (unkillable).
+- `143:5` / `165:47` (`render_weixin_message`, ×4 mutants): the `weixin` feature is OFF in the default feature set used by `tui-mutants.sh`, so these `#[cfg(feature = "weixin")]` functions don't compile — the mutant never takes effect and tests always pass. Covered by `#[cfg(feature = "weixin")]` tests under `--features weixin` (2 pass), but the default-feature gate can't observe them.
 
 - `84:44: replace > with >= in wrap_lines_to_width`
 - `638:5: replace render_plan_mode_request -> Vec<Line<'static>> with vec![Default::default()]`
