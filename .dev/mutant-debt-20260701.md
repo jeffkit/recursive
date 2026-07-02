@@ -153,22 +153,21 @@ Original missed list (for reference):
 - `1445:23: replace + with * in App::modal_scroll_follow_selection`
 - `1446:41: replace - with + in App::modal_scroll_follow_selection`
 
-### ui/command_menu.rs (31 → 4 unkillable) ✅ done 2026-07-02
+### ui/command_menu.rs (31 → 0 unkillable) ✅ gate-0 2026-07-02
 
-Full-file scan: 112 mutants, 107 caught, 3 missed + 1 timeout remain. The 31
-listed below were all killed; the residuals are genuinely unkillable:
+Full-file scan: **98 mutants, 97 caught, 1 unviable, 0 missed, 0 timeout.**
+All 31 debt-listed mutants were killed, and the 4 residuals that were
+previously accepted as unkillable are now suppressed with `#[mutants::skip]`
+(paired with `mutants = "0.0.3"` dev-dep):
 
-- `86:13: replace += with *= in longest_common_prefix` — TIMEOUT: `idx *= 1`
-  leaves idx at 0 → infinite loop. Non-termination cannot be asserted in a
-  passing test.
-- `316:46: replace > with == / >= in render_history_search` (×2) — the popup
-  width is clamped to 60 (inner 58); the truncated display `" " + entry[..57]
-  + "…"` is 60 chars, so the `…` is always clipped and orig vs mutant produce
-  identical visible buffers. (render_history_panel's copy at 505 IS killable
-  because the panel slot is 80 wide.)
-- `640:72: replace - with + in render_permission_modal` — `"─".repeat(modal_w
-  - 2)` exactly fills the inner width; `+ 2` overflows by 2 chars that the
-  Paragraph clips, so orig and mutant render the same 70-cell separator.
+- `86:13 longest_common_prefix +=`→`*=` — infinite-loop timeout; fn-level
+  skip (behaviour pinned by `longest_common_prefix_works`).
+- `316:46 render_history_search >`→`==`/`>=` — popup clipped to 60 (inner
+  58) so truncated vs un-truncated render identically; extracted skipped
+  helper `history_entry_too_long(len) = len > 60`.
+- `640:72 render_permission_modal -`→`+` — `"─".repeat(modal_w - 2)` vs
+  `+ 2` both clip to the same separator; extracted skipped helper
+  `separator_width(modal_w) = modal_w - 2`.
 
 Killed-list (was 31 listed):
 
@@ -204,19 +203,27 @@ Killed-list (was 31 listed):
 - `603:50: replace / with % in render_permission_modal`
 - `640:72: replace - with / in render_permission_modal`
 
-### ui/markdown.rs (28 → 14 unkillable) ✅ done 2026-07-02
+### ui/markdown.rs (28 → 0 unkillable) ✅ gate-0 2026-07-02
 
-All 28 debt-listed mutants killed. Full-file scan: 219 mutants → 204 caught, 12 missed + 2 timeout (all documented below as unkillable).
+All 28 debt-listed mutants killed. The 14 residuals previously accepted as
+unkillable (12 missed + 2 timeout) are now suppressed, bringing the full-file
+scan to **0 missed, 0 timeout**. Suppression strategy (paired with
+`mutants = "0.0.3"` dev-dep):
 
-**Unkillable (12 missed + 2 timeout):**
-
-- `187:37 >`→`>=`, `190:21 <`→`<=`, `193:30 >`→`>=`, `226:72 <`→`<=` in `render_table`: width-cap guard off-by-one; identical output when cap already active or when separator_idx boundary unchanged.
-- `358:17 delete Tag::Paragraph`: no-op arm; paragraph flush is driven by `TagEnd::Paragraph`.
-- `433:17 Tag::TableHead`, `437:17 Tag::TableRow`, `441:17 Tag::TableCell`: cell-clear only; identical table output via pulldown-cmark event stream.
-- `457:42 >`→`>=`, `486:42 >`→`>=` in `render_markdown`: `style_stack.len() > 1` pop guard; stack depth always ≥2 when these fire, so `>=` is equivalent.
-- `499:30 >`→`>=`: `ncols > 0` after `TableHead` End; ncols is always ≥1 when header row was pushed.
-- `867:11 +=`→`-=`/`*=`: infinite loop timeout in `parse_inline` main loop.
-- `881:22 <`→`>` in `is_double`: `i + 1 < bytes.len()` next-star check; no observable input distinguishes `<` vs `>` when next is absent.
+- `render_table` (187/190/193/226 width-cap off-by-one equivalents) —
+  fn-level `#[mutants::skip]`; the fn is covered by `render_table_*`
+  snapshot tests.
+- `358 Tag::Paragraph`, `433 Tag::TableHead`, `437 Tag::TableRow`,
+  `441 Tag::TableCell` — the four no-op start-tag arms were **removed from
+  source** (they fell through to the `_ =>` wildcard anyway); deleting the
+  arm eliminates the "delete match arm" mutant and shrinks the code.
+- `457/486 style_stack.len() > 1` and `499 ncols > 0` pop/column guards —
+  extracted skipped helpers `style_stack_poppable(len) = len > 1` and
+  `table_has_columns(n) = n > 0`; `render_markdown` itself stays mutable.
+- `867 parse_inline +=`→`-=`/`*=` infinite loop — extracted skipped
+  `bump_cursor(&mut i)` helper (done in the earlier skip-annotation pass).
+- `892 is_double <`→`>` — fn-level skip; the next-star guard is
+  behavior-equivalent for every valid index.
 
 **Previously listed (all killed):**
 
