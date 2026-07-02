@@ -1501,6 +1501,20 @@ mod debt_tests {
         );
     }
 
+    #[test]
+    fn render_markdown_list_then_paragraph_are_separate_lines() {
+        // kills delete TagEnd::Item arm (480): the item's End flush is the
+        // only flush between a list and a following paragraph (the next
+        // Item-start flush doesn't fire). orig -> "• a" + "para" (2 lines);
+        // mutant -> "• apara" (1 line).
+        let lines = render_markdown("- a\n\npara", 80);
+        assert!(
+            lines.len() >= 2,
+            "expected list item and paragraph on separate lines, got {} lines: {lines:?}",
+            lines.len()
+        );
+    }
+
     // ── render_markdown: heading level colours (411, 414, 417) ──────────
 
     fn has_fg(lines: &[Line<'_>], fg: Color) -> bool {
