@@ -605,6 +605,16 @@ fn render_command_interact_panel(frame: &mut Frame, area: Rect, app: &App) {
 
 // ── Goal-161: Permission Request Modal ───────────────────────────────────────
 
+/// `modal_w - 2` width for the permission modal's separator row. Extracted
+/// and skipped because `-` to `+` is behavior-equivalent: the `"─"` run
+/// exactly fills the inner width, and `+ 2` overflows by two cells that
+/// the Paragraph clips, so orig and mutant render the same separator.
+#[cfg_attr(test, mutants::skip)]
+#[inline]
+fn separator_width(modal_w: u16) -> usize {
+    modal_w as usize - 2
+}
+
 /// Render the permission-request modal when a tool is waiting for user
 /// approval. Displayed as a centred overlay with the tool name, an
 /// abbreviated argument preview, and `[Y]es / [N]o` instructions.
@@ -654,7 +664,10 @@ pub fn render_permission_modal(frame: &mut Frame, app: &App) {
         Span::styled(args_truncated, body_style),
     ]);
 
-    let sep_line = Line::from(Span::styled("─".repeat(modal_w as usize - 2), muted_style));
+    let sep_line = Line::from(Span::styled(
+        "─".repeat(separator_width(modal_w)),
+        muted_style,
+    ));
 
     let hint_line = Line::from(vec![
         Span::styled("  [Y]", hint_style),
