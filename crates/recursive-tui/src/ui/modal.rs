@@ -1142,4 +1142,23 @@ mod tests {
         assert!(text.contains("/my-skill"));
         assert!(text.contains("A test skill"));
     }
+
+    #[test]
+    fn load_recent_journal_entries_returns_repo_entries() {
+        // kills load_recent_journal_entries -> vec![] (742:5). Build a
+        // tempdir with a `.dev/journal/*.md` file, cd into it, and confirm
+        // orig returns a non-empty list (the mutant returns empty).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = tmp.path().join(".dev").join("journal");
+        std::fs::create_dir_all(&journal_dir).expect("mkdir");
+        std::fs::write(journal_dir.join("entry.md"), "# entry\nbody\n").expect("write");
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("cd");
+        let entries = load_recent_journal_entries(5);
+        std::env::set_current_dir(prev).expect("restore cwd");
+        assert!(
+            !entries.is_empty(),
+            "expected recent journal entries from .dev/journal"
+        );
+    }
 }

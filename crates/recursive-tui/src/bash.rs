@@ -53,3 +53,19 @@ pub async fn run_bash_command(
         success,
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_workspace_root_reads_recursive_workspace_env() {
+        // kills resolve_workspace_root -> Default::default() (20:5): the
+        // mutant returns an empty PathBuf; orig honours the env var.
+        std::env::set_var("RECURSIVE_WORKSPACE", "/tmp/debt-ws-marker");
+        let root = resolve_workspace_root();
+        std::env::remove_var("RECURSIVE_WORKSPACE");
+        assert_eq!(root, PathBuf::from("/tmp/debt-ws-marker"));
+        assert!(!root.as_os_str().is_empty());
+    }
+}

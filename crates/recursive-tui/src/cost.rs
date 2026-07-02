@@ -161,3 +161,20 @@ pub fn estimate_cost(
     };
     Some(pricing.cost_usd(usage))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_state_finish_clears_running_flag() {
+        // kills TurnState::finish -> () (110:9): the mutant leaves
+        // `running == true` after finish.
+        let mut t = TurnState::default();
+        t.start();
+        assert!(t.running);
+        t.finish();
+        assert!(!t.running, "finish should clear running");
+        assert!(t.started_at.is_none(), "finish should clear started_at");
+    }
+}

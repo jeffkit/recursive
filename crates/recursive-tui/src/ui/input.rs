@@ -285,4 +285,34 @@ mod tests {
         // editable area, plus 2 for borders, plus 1 for the footer.
         assert!(h_max <= MAX_VISIBLE_ROWS + 2 + 1);
     }
+
+    #[test]
+    fn render_draws_input_box_when_height_is_two() {
+        // area.height == 2: orig `2 < 2` is false -> renders the input
+        // box (top border visible). mutant `<=` (45:20): `2 <= 2` is true
+        // -> early return -> blank buffer. Use a taller frame so the
+        // hint_area (y = 3) stays in-bounds and orig doesn't panic.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let app = App::new();
+        let backend = TestBackend::new(40, 5);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| render(fr, Rect::new(0, 0, 40, 2), &app))
+            .expect("draw infallible");
+        let buf = term.backend().buffer();
+        let row: String = (0..40)
+            .map(|x| {
+                buf.cell((x, 0))
+                    .expect("cell")
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
+        assert!(
+            !row.trim().is_empty(),
+            "expected the input box to be rendered at height 2; got {row:?}"
+        );
+    }
 }
