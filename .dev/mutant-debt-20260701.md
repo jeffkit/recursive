@@ -291,7 +291,10 @@ All 3 debt-listed mutants killed. Full-file scan: 39 mutants → 34 caught, 5 un
 - `120:9: replace SkillCommandLoader::search_paths -> Vec<PathBuf> with vec![Default::default()]`
 - `384:27: replace && with || in parse_inline_list`
 
-### app/render.rs (3)
+### app/render.rs (3 → 2 unkillable) ✅ done 2026-07-02
+
+All 3 debt-listed mutants killed. Full-file scan: 31 mutants → 26 caught, 3 unviable, 2 missed (unkillable).
+- `161:13` / `162:13` `||`→`&&` in `parse_v4a_patch` marker-skip guard: `*** Begin Patch` / `*** End Patch` / `*** End of File` lines don't match any `@@`/`+`/`-`/` ` hunk prefix, so whether the guard skips them or not, no `DiffLine` is emitted — output identical.
 
 - `42:24: delete ! in blocks_from_messages`
 - `119:26: replace <= with > in clamp`
