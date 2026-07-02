@@ -347,6 +347,8 @@ fn render_plan_mode_request_banner(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod debt_tests {
     use super::*;
+    use crate::model::TranscriptBlock;
+    use crate::ui::modal::Modal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -505,6 +507,38 @@ mod debt_tests {
         assert!(
             all_text(&buf).contains("DoThing"),
             "Pending item should show content 'DoThing'"
+        );
+    }
+
+    #[test]
+    fn render_scrolls_up_without_panicking() {
+        // kills 117:32 `-`->`+` in `max_scroll - capped`: with a scroll
+        // offset larger than the visible height, the mutant computes
+        // `start = max_scroll + capped`, which overshoots `total_rows` and
+        // panics indexing `physical[start..end]`. orig clamps to a valid
+        // window. We only assert the draw completes (no panic).
+        let mut app = App::new();
+        app.blocks = (0..20)
+            .map(|i| TranscriptBlock::User {
+                text: format!("row{i}a\nrow{i}b\nrow{i}c"),
+            })
+            .collect();
+        app.scroll_offset = 10;
+        let _ = draw(&app, 80, 12);
+    }
+
+    #[test]
+    fn render_shows_modal_when_modals_nonempty() {
+        // kills delete `!` in `if !app.modals.is_empty()` (155:8): the
+        // mutant skips `modal::render` when modals are non-empty, so the
+        // modal title " Help " never appears.
+        let mut app = App::new();
+        app.turn.running = true;
+        app.modals = vec![Modal::Help];
+        let buf = draw(&app, 80, 24);
+        assert!(
+            all_text(&buf).contains(" Help "),
+            "expected the Help modal title to be rendered"
         );
     }
 }
