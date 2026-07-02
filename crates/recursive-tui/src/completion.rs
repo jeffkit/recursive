@@ -144,3 +144,162 @@ pub fn collect_files(
         }
     }
 }
+
+#[cfg(test)]
+mod debt_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn write(root: &std::path::Path, rel: &str) -> PathBuf {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    // ── default_offline_tool_catalog (25) ───────────────────────────────
+
+    #[test]
+    fn default_offline_tool_catalog_has_six_named_entries() {
+        // kills all three 25:5 mutants:
+        //  - vec![]                -> len 0
+        //  - vec![(empty, empty)]  -> len 1 + empty name
+        //  - vec![(empty, "xyzzy")] -> len 1 + empty name
+        let cat = default_offline_tool_catalog();
+        assert_eq!(cat.len(), 6, "expected 6 tools, got {} entries", cat.len());
+        assert!(
+            cat.iter().all(|(n, _)| !n.is_empty()),
+            "every tool name must be non-empty; got {cat:?}"
+        );
+        assert_eq!(cat[0].0, "Read");
+    }
+
+    // ── glob_workspace_files (86) ───────────────────────────────────────
+
+    #[test]
+    fn glob_workspace_files_finds_cargo_toml_in_cwd() {
+        // kills glob_workspace_files -> vec![] (86): the mutant returns an
+        // empty vec regardless of query, so it would never contain
+        // "Cargo.toml". Runs in the crate's worktree which always has a
+        // root Cargo.toml.
+        let results = glob_workspace_files("cargo");
+        assert!(
+            results.iter().any(|p| p.contains("Cargo.toml")),
+            "expected Cargo.toml among results, got {results:?}"
+        );
+    }
+
+    // ── collect_files -> () (118:5) ─────────────────────────────────────
+
+    #[test]
+    fn collect_files_populates_out_vec() {
+        // kills collect_files -> () (118:5).
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "a.txt");
+        let mut out: Vec<String> = Vec::new();
+        collect_files(dir.path(), dir.path(), 0, "", &mut out);
+        assert_eq!(out, vec!["a.txt".to_string()]);
+    }
+
+    // ── depth guard (118:14) + depth increment (133:46) ─────────────────
+
+    #[test]
+    fn collect_files_walks_four_levels_deep() {
+        // 5 nested files at depths 1..5. orig walks while depth <= 3, so it
+        // collects l1/l2/l3 but NOT l4 or deep (the depth-4 dir is never
+        // recursed into because `depth + 1 == 4 > 3`).
+        // Kills 118:14 `>`->`==`/`>=` (depth-3 returns early -> l3 missing),
+        // 118:14 `>`->`<` (depth-0 returns early -> l1 missing), and 133:46
+        // `+`->`*` (depth never grows -> walks arbitrarily deep -> deep.txt
+        // present).
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "d1/l1.txt");
+        write(dir.path(), "d1/d2/l2.txt");
+        write(dir.path(), "d1/d2/d3/l3.txt");
+        write(dir.path(), "d1/d2/d3/d4/l4.txt");
+        write(dir.path(), "d1/d2/d3/d4/deep.txt");
+        let mut out: Vec<String> = Vec::new();
+        collect_files(dir.path(), dir.path(), 0, "", &mut out);
+        let mut sorted = out.clone();
+        sorted.sort();
+        assert!(
+            sorted.contains(&"d1/l1.txt".to_string()),
+            "depth-1 file should be collected; got {sorted:?}"
+        );
+        assert!(
+            sorted.contains(&"d1/d2/d3/l3.txt".to_string()),
+            "depth-3 file should be collected; got {sorted:?}"
+        );
+        assert!(
+            !sorted.contains(&"d1/d2/d3/d4/deep.txt".to_string()),
+            "depth-5 file should NOT be collected (depth>3); got {sorted:?}"
+        );
+        assert!(
+            !sorted.contains(&"d1/d2/d3/d4/l4.txt".to_string()),
+            "depth-4 file should NOT be collected; got {sorted:?}"
+        );
+    }
+
+    // ── skip predicates (129) ───────────────────────────────────────────
+
+    #[test]
+    fn collect_files_skips_hidden_target_and_node_modules() {
+        // kills all three 129 mutants:
+        //  - 129:50 `starts_with('.') ==`->`!=` : enters ".hidden"
+        //  - 129:74 `== "target"`->`!=`         : enters "target"
+        //  - 129:62 `||`->`&&`                  : enters every excluded dir
+        // Under orig the files inside these dirs are never collected.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".hidden/secret.txt");
+        write(dir.path(), "target/build.txt");
+        write(dir.path(), "node_modules/pkg.txt");
+        write(dir.path(), "keep.txt");
+        let mut out: Vec<String> = Vec::new();
+        collect_files(dir.path(), dir.path(), 0, "", &mut out);
+        let mut sorted = out.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["keep.txt".to_string()]);
+    }
+
+    // ── query filter (139:34) ───────────────────────────────────────────
+
+    #[test]
+    fn collect_files_nonempty_query_matches_substring() {
+        // kills 139:34 `||`->`&&`: with a non-empty query the mutant becomes
+        // `query.is_empty() && rel.contains(query)` which is always false,
+        // so nothing is collected.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "alpha.rs");
+        write(dir.path(), "beta.rs");
+        let mut out: Vec<String> = Vec::new();
+        collect_files(dir.path(), dir.path(), 0, "alph", &mut out);
+        assert_eq!(out, vec!["alpha.rs".to_string()]);
+    }
+
+    // ── out-len cap (140:30, 140:55) ────────────────────────────────────
+
+    #[test]
+    fn collect_files_caps_at_four_times_max_suggestions() {
+        // 49 files, empty query -> orig collects until out.len() reaches
+        // MAX_ATFILE_SUGGESTIONS * 4 == 48, then stops. So exactly 48.
+        // Kills 140:30 `<`->`==`/`>` (collects 0) and `<=` (collects 49),
+        // and 140:55 `*`->`/` (cap becomes 12/4 == 3 -> collects 3).
+        let dir = TempDir::new().unwrap();
+        for i in 0..49 {
+            write(dir.path(), &format!("f{i:02}.txt"));
+        }
+        let mut out: Vec<String> = Vec::new();
+        collect_files(dir.path(), dir.path(), 0, "", &mut out);
+        assert_eq!(
+            out.len(),
+            MAX_ATFILE_SUGGESTIONS * 4,
+            "expected exactly {} entries, got {}",
+            MAX_ATFILE_SUGGESTIONS * 4,
+            out.len()
+        );
+    }
+}
