@@ -82,10 +82,13 @@ fn sandbox_extra_roots(config: &Config) -> Vec<(PathBuf, recursive::AccessTier)>
 /// Discover skills from configured search paths.
 ///
 /// Defaults: <workspace>/.recursive/skills/, <workspace>/.claude/skills/, ~/.recursive/skills/, ~/.claude/skills/.
-/// Override with `RECURSIVE_SKILL_PATHS=path1:path2` (colon-separated).
+/// Override with `RECURSIVE_SKILL_PATHS=path1;path2` on Windows or
+/// `RECURSIVE_SKILL_PATHS=path1:path2` on Unix (OS-native path separator).
 fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
-        env_paths.split(':').map(PathBuf::from).collect()
+        // Use the OS-native separator so Windows drive paths like `C:\skills`
+        // aren't split on the colon in the drive letter.
+        std::env::split_paths(&env_paths).collect()
     } else {
         let mut defaults = vec![
             config.workspace.join(".recursive").join("skills"),
@@ -568,8 +571,27 @@ type = "openai"
         )
         .expect("write SKILL.md");
 
+        // A second skills root, joined with the OS-native path separator
+        // (`;` on Windows, `:` on Unix). This pins that
+        // `discover_loaded_skills` uses `split_paths` rather than a hardcoded
+        // `:` split, which on Windows would fragment `C:\skills` at the drive
+        // letter's colon.
+        let skills_root_b = tempfile::tempdir().expect("tempdir");
+        let skill_dir_b = skills_root_b.path().join("other-skill");
+        std::fs::create_dir_all(&skill_dir_b).expect("mkdir");
+        std::fs::write(
+            skill_dir_b.join("SKILL.md"),
+            "---\ndescription: other\n---\nbody\n",
+        )
+        .expect("write SKILL.md");
+        let joined = std::env::join_paths([
+            std::path::Path::new(skills_root.path()),
+            std::path::Path::new(skills_root_b.path()),
+        ])
+        .expect("join_paths");
+
         let prev = std::env::var("RECURSIVE_SKILL_PATHS").ok();
-        std::env::set_var("RECURSIVE_SKILL_PATHS", skills_root.path());
+        std::env::set_var("RECURSIVE_SKILL_PATHS", &joined);
 
         let cfg = test_config();
         let skills = discover_loaded_skills(&cfg);
@@ -579,10 +601,14 @@ type = "openai"
             None => std::env::remove_var("RECURSIVE_SKILL_PATHS"),
         }
 
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(
-            skills.iter().any(|s| s.name == "demo-skill"),
-            "expected demo-skill in {:?}",
-            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+            names.iter().any(|n| *n == "demo-skill"),
+            "expected demo-skill in {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| *n == "other-skill"),
+            "expected other-skill (OS-native separator split) in {names:?}"
         );
     }
 }

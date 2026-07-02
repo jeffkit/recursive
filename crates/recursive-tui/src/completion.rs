@@ -132,9 +132,12 @@ pub fn collect_files(
         if path.is_dir() {
             collect_files(root, &path, depth + 1, query, out);
         } else if path.is_file() {
+            // Normalize to forward slashes so relative paths are stable across
+            // platforms (Windows `strip_prefix` yields `d1\d2\l3.txt`, but
+            // callers and tests expect `d1/d2/l3.txt`).
             let rel = path
                 .strip_prefix(root)
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_else(|_| name_str.to_string());
             if (query.is_empty() || rel.to_lowercase().contains(query))
                 && out.len() < MAX_ATFILE_SUGGESTIONS * 4
@@ -241,6 +244,34 @@ mod debt_tests {
         assert!(
             !sorted.contains(&"d1/d2/d3/d4/l4.txt".to_string()),
             "depth-4 file should NOT be collected; got {sorted:?}"
+        );
+    }
+
+    // ── path separator normalization (135:137) ───────────────────────────
+
+    #[test]
+    fn collect_files_emits_forward_slash_relative_paths() {
+        // Pins the cross-platform contract: relative paths returned by
+        // `collect_files` always use forward slashes, even on Windows where
+        // `Path::strip_prefix(..).to_string_lossy()` would otherwise yield
+        // `d1\d2\file.txt`. Without normalization the `@`-completion menu and
+        // any path-based assertion would be OS-dependent.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "d1/d2/deep.txt");
+        write(dir.path(), "d1/d2/d3/nested.txt");
+        let mut out: Vec<String> = Vec::new();
+        collect_files(dir.path(), dir.path(), 0, "", &mut out);
+        assert!(
+            out.iter().all(|p| !p.contains('\\')),
+            "no backslash separators expected; got {out:?}"
+        );
+        assert!(
+            out.iter().any(|p| p == "d1/d2/deep.txt"),
+            "expected forward-slash rel path; got {out:?}"
+        );
+        assert!(
+            out.iter().any(|p| p == "d1/d2/d3/nested.txt"),
+            "expected forward-slash rel path; got {out:?}"
         );
     }
 
