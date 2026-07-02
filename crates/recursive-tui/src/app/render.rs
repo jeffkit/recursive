@@ -330,4 +330,48 @@ mod tests {
         assert!(kinds.contains(&DiffLineKind::Add));
         assert!(kinds.contains(&DiffLineKind::Remove));
     }
+
+    // ── debt tests (2026-07-02) ───────────────────────────────────────────
+
+    #[test]
+    fn blocks_from_messages_emits_reasoning_block_when_non_empty() {
+        // Assistant message with non-empty reasoning_content and empty
+        // content. orig pushes a Reasoning block; mutant `delete !` (42:24)
+        // flips the guard to `if reasoning.trim().is_empty()` -> skips it.
+        use recursive::message::Message;
+        let msg = Message {
+            role: recursive::message::Role::Assistant,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            reasoning_content: Some("thinking hard".to_string()),
+            is_compaction_summary: false,
+        };
+        let blocks = blocks_from_messages(&[msg]);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected exactly one Reasoning block, got {blocks:?}"
+        );
+        assert!(matches!(
+            &blocks[0],
+            TranscriptBlock::Reasoning { text, .. } if text == "thinking hard"
+        ));
+    }
+
+    #[test]
+    fn clamp_returns_input_unchanged_at_exact_max() {
+        // kills `<=`->`>` (119:26): at chars().count() == max, orig returns
+        // the string unchanged; mutant enters the truncation branch and
+        // appends `…`.
+        assert_eq!(clamp("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn extract_write_file_path_from_result_finds_path_after_to() {
+        // kills `+`->`-` (223:38): `trimmed[idx + 4..]` vs `idx - 4`. The
+        // mutant slices the wrong region (and would underflow if idx < 4).
+        let path = extract_write_file_path_from_result("Wrote 42 bytes to crates/foo/bar.rs");
+        assert_eq!(path.as_deref(), Some("crates/foo/bar.rs"));
+    }
 }
