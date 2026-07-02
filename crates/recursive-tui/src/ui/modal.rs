@@ -1161,4 +1161,35 @@ mod tests {
             "expected recent journal entries from .dev/journal"
         );
     }
+
+    #[test]
+    fn modal_title_returns_label_per_variant() {
+        // kills Modal::title -> ""/"xyzzy" (145:9).
+        assert_eq!(Modal::Help.title(), " Help ");
+        assert_eq!(Modal::CostDetail.title(), " Token usage ");
+        assert_eq!(Modal::ModelInfo.title(), " Model ");
+    }
+
+    #[test]
+    fn short_returns_input_under_max_and_truncates_over() {
+        // kills short -> String::new()/"xyzzy" (713:5) and `<=`->`>` (713:26).
+        assert_eq!(short("abc", 3), "abc"); // boundary: 3 <= 3 -> no truncate
+        assert_eq!(short("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn short_desc_takes_first_line_trimmed() {
+        // kills short_desc -> String::new()/"xyzzy" (722:5) and `<=`->`>` (723:33).
+        assert_eq!(short_desc("line1\nline2", 5), "line1"); // boundary 5<=5
+        assert_eq!(short_desc("  trim  ", 10), "trim");
+    }
+
+    #[test]
+    fn plan_review_args_preview_quotes_string_value() {
+        // kills plan_review_args_preview -> String::new()/"xyzzy" (693:5).
+        assert_eq!(
+            plan_review_args_preview(&serde_json::json!("abc")),
+            "\"abc\""
+        );
+    }
 }
