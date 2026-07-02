@@ -738,4 +738,41 @@ $ARGUMENTS
         assert_eq!(skills.len(), 1, "should load flat skill through symlink");
         assert_eq!(skills[0].name, "hello");
     }
+
+    // ── debt tests (2026-07-02) ───────────────────────────────────────────
+
+    #[test]
+    fn search_paths_includes_workspace_skill_dirs() {
+        // kills search_paths -> vec![] (120:9: empty) and
+        // -> vec![Default::default()] (120:9: a single empty PathBuf).
+        let ws = PathBuf::from("/tmp/debt-ws");
+        let paths = SkillCommandLoader::search_paths(&ws);
+        assert!(
+            paths.len() >= 2,
+            "expected at least the two workspace paths, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&ws.join(".recursive").join("skills")),
+            "expected workspace .recursive/skills path; got {paths:?}"
+        );
+        assert!(
+            paths.contains(&ws.join(".claude").join("skills")),
+            "expected workspace .claude/skills path; got {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.as_os_str().is_empty()),
+            "no path should be empty; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn parse_inline_list_unclosed_bracket_treated_as_single() {
+        // "[abc" starts with '[' but does not end with ']'. orig: the
+        // `&&` is false -> falls through to the single-element branch ->
+        // ["[abc"]. mutant `||`: the guard is true -> slices off the
+        // first and last char -> ["ab"].
+        // kills 384:27 `&&`->`||`.
+        let parsed = parse_inline_list("[abc");
+        assert_eq!(parsed, vec!["[abc".to_string()]);
+    }
 }
