@@ -204,36 +204,23 @@ Killed-list (was 31 listed):
 - `603:50: replace / with % in render_permission_modal`
 - `640:72: replace - with / in render_permission_modal`
 
-### ui/markdown.rs (28)
+### ui/markdown.rs (28 → 14 unkillable) ✅ done 2026-07-02
 
-- `33:5: replace syntax_set -> &'static SyntaxSet with Box::leak(Box::new(Default::default()))`
-- `38:5: replace theme_set -> &'static ThemeSet with Box::leak(Box::new(Default::default()))`
-- `187:24: replace > with < in render_table`
-- `189:35: replace + with * in render_table`
-- `189:43: replace * with + in render_table`
-- `189:43: replace * with / in render_table`
-- `190:21: replace < with <= in render_table`
-- `196:44: replace / with * in render_table`
-- `257:56: replace - with + in render_table`
-- `290:5: replace is_table_line -> bool with false`
-- `358:17: delete match arm Tag::Paragraph in render_markdown`
-- `366:17: delete match arm Tag::Emphasis in render_markdown`
-- `381:17: delete match arm Tag::List(start) in render_markdown`
-- `408:17: delete match arm Tag::Heading{level, ..} in render_markdown`
-- `433:17: delete match arm Tag::TableHead in render_markdown`
-- `477:17: delete match arm TagEnd::List(_) in render_markdown`
-- `480:17: delete match arm TagEnd::Item in render_markdown`
-- `483:17: delete match arm TagEnd::Heading(_) in render_markdown`
-- `499:30: replace > with >= in render_markdown`
-- `695:5: replace syntect_color_to_ratatui -> Color with Default::default()`
-- `711:71: replace || with && in parse_table_rows`
-- `781:43: replace < with <= in strip_heading`
-- `783:16: replace += with -= in strip_heading`
-- `827:20: replace > with >= in parse_inline`
-- `858:26: replace > with >= in parse_inline`
-- `877:5: replace is_double -> bool with false`
-- `877:17: replace != with == in is_double`
-- `880:18: replace > with < in is_double`
+All 28 debt-listed mutants killed. Full-file scan: 219 mutants → 204 caught, 12 missed + 2 timeout (all documented below as unkillable).
+
+**Unkillable (12 missed + 2 timeout):**
+
+- `187:37 >`→`>=`, `190:21 <`→`<=`, `193:30 >`→`>=`, `226:72 <`→`<=` in `render_table`: width-cap guard off-by-one; identical output when cap already active or when separator_idx boundary unchanged.
+- `358:17 delete Tag::Paragraph`: no-op arm; paragraph flush is driven by `TagEnd::Paragraph`.
+- `433:17 Tag::TableHead`, `437:17 Tag::TableRow`, `441:17 Tag::TableCell`: cell-clear only; identical table output via pulldown-cmark event stream.
+- `457:42 >`→`>=`, `486:42 >`→`>=` in `render_markdown`: `style_stack.len() > 1` pop guard; stack depth always ≥2 when these fire, so `>=` is equivalent.
+- `499:30 >`→`>=`: `ncols > 0` after `TableHead` End; ncols is always ≥1 when header row was pushed.
+- `867:11 +=`→`-=`/`*=`: infinite loop timeout in `parse_inline` main loop.
+- `881:22 <`→`>` in `is_double`: `i + 1 < bytes.len()` next-star check; no observable input distinguishes `<` vs `>` when next is absent.
+
+**Previously listed (all killed):**
+
+- ~~`33:5` syntax_set~~, ~~`38:5` theme_set~~, ~~`187:24 >`→`<`~~, ~~`189:35 +`→`*`~~, ~~`189:43 *`→`+`/`*`→`/`~~, ~~`196:44 /`→`*`~~, ~~`257:56 -`→`+`~~, ~~`290:5 is_table_line→false`~~, ~~`366:17 Tag::Emphasis~~, ~~`381:17 Tag::List~~, ~~`408:17 Tag::Heading~~, ~~`477:17 TagEnd::List~~, ~~`480:17 TagEnd::Item~~, ~~`483:17 TagEnd::Heading~~, ~~`695:5 syntect_color_to_ratatui~~, ~~`711:71 ||`→`&&`~~, ~~`781:43 <`→`<=`~~, ~~`783:16 +=`→`-=`~~, ~~`827:20 >`→`>=`~~, ~~`858:26 >`→`>=`~~, ~~`877:5 is_double→false`~~, ~~`877:17 !=`→`==`~~, ~~`880:18 >`→`<`~~
 
 ### completion.rs (17)
 
