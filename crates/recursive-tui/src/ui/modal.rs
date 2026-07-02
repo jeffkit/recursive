@@ -1192,4 +1192,110 @@ mod tests {
             "\"abc\""
         );
     }
+
+    fn draw_modal_text(app: &crate::app::App) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| crate::ui::modal::render(fr, app))
+            .expect("draw infallible");
+        let buf = term.backend().buffer();
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn render_cost_body_emits_token_usage() {
+        // kills render_cost_body -> vec![]/vec![default] (303:5).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::CostDetail];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("Token usage"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_model_body_emits_model_name() {
+        // kills render_model_body -> vec![]/vec![default] (376:5).
+        let mut app = crate::app::App::new();
+        app.model_name = "debt-model-marker".into();
+        app.modals = vec![Modal::ModelInfo];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("debt-model-marker"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_tool_body_emits_tool_entries() {
+        // kills render_tool_body -> vec![]/vec![default] (415:5).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::ToolList {
+            entries: vec![("DebtTool".to_string(), "desc".to_string())],
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("DebtTool"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_journal_body_emits_entry_name() {
+        // kills render_journal_body -> vec![]/vec![default] (449:5).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::Journal {
+            entries: vec![JournalEntry {
+                name: "debt-entry.md".into(),
+                preview: "preview".into(),
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("debt-entry.md"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_resume_picker_body_emits_slug() {
+        // kills render_resume_picker_body -> vec![]/vec![default] (505:5).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::ResumePicker {
+            entries: vec![ResumeEntry {
+                session_dir: ".".into(),
+                slug: "debt-resume-slug".into(),
+                updated_at: "2026-01-01 00:00".into(),
+                cost_usd: 0.0,
+                turn_count: 0,
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("debt-resume-slug"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_confirm_body_emits_prompt() {
+        // kills render_confirm_body -> vec![]/vec![default] (596:5).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::Confirm {
+            prompt: "debt-confirm-prompt".into(),
+            on_yes: ConfirmAction::Exit,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("debt-confirm-prompt"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_plan_review_emits_plan_text() {
+        // kills render_plan_review -> vec![]/vec![default] (626:5).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::PlanReview {
+            plan_text: "debt-plan-text-marker".into(),
+            tool_calls: vec![],
+            edited_text: None,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("debt-plan-text-marker"), "got {text:?}");
+    }
 }
