@@ -222,7 +222,9 @@ All 28 debt-listed mutants killed. Full-file scan: 219 mutants → 204 caught, 1
 
 - ~~`33:5` syntax_set~~, ~~`38:5` theme_set~~, ~~`187:24 >`→`<`~~, ~~`189:35 +`→`*`~~, ~~`189:43 *`→`+`/`*`→`/`~~, ~~`196:44 /`→`*`~~, ~~`257:56 -`→`+`~~, ~~`290:5 is_table_line→false`~~, ~~`366:17 Tag::Emphasis~~, ~~`381:17 Tag::List~~, ~~`408:17 Tag::Heading~~, ~~`477:17 TagEnd::List~~, ~~`480:17 TagEnd::Item~~, ~~`483:17 TagEnd::Heading~~, ~~`695:5 syntect_color_to_ratatui~~, ~~`711:71 ||`→`&&`~~, ~~`781:43 <`→`<=`~~, ~~`783:16 +=`→`-=`~~, ~~`827:20 >`→`>=`~~, ~~`858:26 >`→`>=`~~, ~~`877:5 is_double→false`~~, ~~`877:17 !=`→`==`~~, ~~`880:18 >`→`<`~~
 
-### completion.rs (17)
+### completion.rs (17 → 0 unkillable) ✅ done 2026-07-02
+
+All 17 debt-listed mutants killed. Full-file scan: 28 mutants → 28 caught, 0 missed.
 
 - `25:5: replace default_offline_tool_catalog -> Vec<(String, String)> with vec![]`
 - `25:5: replace default_offline_tool_catalog -> Vec<(String, String)> with vec![(String::new(), String::new())]`
