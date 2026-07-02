@@ -249,4 +249,73 @@ mod tests {
             "missing message: {log}"
         );
     }
+
+    // ── debt tests (2026-07-02) ───────────────────────────────────────────
+
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn handle_mouse_scroll_up_increases_offset() {
+        // kills delete ScrollUp arm (215:9).
+        let mut app = App::new();
+        app.scroll_offset = 0;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.scroll_offset, 3);
+    }
+
+    #[test]
+    fn handle_mouse_scroll_down_decreases_offset() {
+        // kills delete ScrollDown arm (218:9).
+        let mut app = App::new();
+        app.scroll_offset = 5;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.scroll_offset, 2);
+    }
+
+    #[test]
+    fn install_tui_panic_hook_writes_log_when_quiet() {
+        // With is_tui_quiet=true, a panic must be appended to
+        // tui-panic.log (not printed via the default hook).
+        // kills install_tui_panic_hook -> () (87:5: hook never installed ->
+        //   default hook runs -> no log file) and delete `!` (90:16: guard
+        //   flips to `if is_tui_quiet()` -> the mutant calls the previous
+        //   (default) hook instead of writing the log).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(tmp.path());
+        let _quiet = recursive::logging::suppress_tracing_for_tui();
+
+        install_tui_panic_hook();
+        let result = std::panic::catch_unwind(|| {
+            panic!("debt-test-panic-marker-XYZ");
+        });
+        assert!(result.is_err(), "expected the panic to be caught");
+
+        // Restore the default hook so later tests aren't affected.
+        let _installed = std::panic::take_hook();
+
+        let log_path = recursive::paths::user_data_dir()
+            .join("logs")
+            .join("tui-panic.log");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_else(|_| String::new());
+        assert!(
+            log.contains("debt-test-panic-marker-XYZ"),
+            "expected panic marker in log; got: {log}"
+        );
+    }
 }
