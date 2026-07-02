@@ -1082,4 +1082,40 @@ mod tests {
         assert!(s.contains("12"));
         assert!(s.contains("compacted"));
     }
+
+    // ── debt tests (2026-07-02) ───────────────────────────────────────────
+
+    #[test]
+    fn wrap_lines_to_width_keeps_exact_width_on_one_row() {
+        // A span whose visual width exactly equals `w` must stay on a
+        // single row. orig: `cur_w + cw > w` is false at the boundary
+        // (5 + 0..5 never exceeds 5). mutant `>=` breaks before the last
+        // char (5 >= 5) -> two rows.
+        // kills 84:44 `>`->`>=`.
+        let lines = vec![Line::from(Span::raw("abcde"))];
+        let wrapped = wrap_lines_to_width(&lines, 5);
+        assert_eq!(
+            wrapped.len(),
+            1,
+            "exact-width row should not wrap; got {wrapped:?}"
+        );
+        assert_eq!(line_text(&wrapped[0]), "abcde");
+    }
+
+    #[test]
+    fn render_plan_mode_request_pending_shows_request_ui() {
+        // kills render_plan_mode_request -> vec![Default::default()]
+        // (638:5): the mutant returns a single empty Line.
+        let lines = render_plan_mode_request("because reasons", None);
+        assert!(
+            lines.len() > 1,
+            "expected the full request UI, got {lines:?}"
+        );
+        let text = full_text(&lines);
+        assert!(
+            text.contains("Plan Mode Request"),
+            "expected 'Plan Mode Request' header; got {text:?}"
+        );
+        assert!(text.contains("because reasons"));
+    }
 }
