@@ -394,12 +394,12 @@ fn mcp_server_transport(s: &recursive::mcp::McpServer) -> String {
 }
 
 /// Goal-230 (weixin): reduce a spawned weixin turn's nested result to the
-/// final assistant text (if any). Marked `#[mutants::skip]` because the
-/// weixin feature is outside the default / gate test feature set, so the
-/// body is dead code under `--features recursive/test-utils` and a textual
-/// mutant here would be an unkillable false positive.
+/// final assistant text (if any). Gated behind `#[cfg(feature = "weixin")]`
+/// so the body is dead code under the default / gate test feature set
+/// (`--features recursive/test-utils`) and no mutants are generated for it
+/// there; under `--all-features` the body is live and its mutants are
+/// killable.
 #[cfg(feature = "weixin")]
-#[mutants::skip]
 fn weixin_final_text(
     result: std::result::Result<
         recursive::Result<Option<recursive::RuntimeOutcome>>,
