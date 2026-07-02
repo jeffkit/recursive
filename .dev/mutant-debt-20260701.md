@@ -153,7 +153,24 @@ Original missed list (for reference):
 - `1445:23: replace + with * in App::modal_scroll_follow_selection`
 - `1446:41: replace - with + in App::modal_scroll_follow_selection`
 
-### ui/command_menu.rs (31)
+### ui/command_menu.rs (31 → 4 unkillable) ✅ done 2026-07-02
+
+Full-file scan: 112 mutants, 107 caught, 3 missed + 1 timeout remain. The 31
+listed below were all killed; the residuals are genuinely unkillable:
+
+- `86:13: replace += with *= in longest_common_prefix` — TIMEOUT: `idx *= 1`
+  leaves idx at 0 → infinite loop. Non-termination cannot be asserted in a
+  passing test.
+- `316:46: replace > with == / >= in render_history_search` (×2) — the popup
+  width is clamped to 60 (inner 58); the truncated display `" " + entry[..57]
+  + "…"` is 60 chars, so the `…` is always clipped and orig vs mutant produce
+  identical visible buffers. (render_history_panel's copy at 505 IS killable
+  because the panel slot is 80 wide.)
+- `640:72: replace - with + in render_permission_modal` — `"─".repeat(modal_w
+  - 2)` exactly fills the inner width; `+ 2` overflows by 2 chars that the
+  Paragraph clips, so orig and mutant render the same 70-cell separator.
+
+Killed-list (was 31 listed):
 
 - `44:9: replace MenuEntry<'a>::summary -> &str with ""`
 - `44:9: replace MenuEntry<'a>::summary -> &str with "xyzzy"`
