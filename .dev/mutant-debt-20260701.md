@@ -260,7 +260,10 @@ All 11 debt-listed mutants killed except `383:35 >`→`>=` (unkillable: after `p
 - `383:35: replace > with >= in PromptInputState::record_submission`
 - `384:51: replace - with / in PromptInputState::record_submission`
 
-### ui/chat.rs (7)
+### ui/chat.rs (7 → 1 unkillable) ✅ done 2026-07-02
+
+All 7 debt-listed mutants killed. Full-file scan: 27 mutants → 26 caught, 1 missed (unkillable).
+- `195:20 >`→`>=` in `render_empty_state`: when `area.height == content_h`, orig skips padding (`> 9` false) and mutant pads by `(h - h)/2 == 0` (`>= 9` true) — both produce zero padding, identical output.
 
 - `30:5: replace todo_panel_height -> u16 with 0`
 - `45:65: replace || with && in render`
