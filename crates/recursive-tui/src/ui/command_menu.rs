@@ -890,4 +890,212 @@ mod tests {
         assert!(!help_entry.is_skill());
         assert!(help_entry.argument_hint().is_empty());
     }
+
+    #[test]
+    fn summary_returns_builtin_summary() {
+        // kills summary -> "" / "xyzzy" (44) for the Builtin arm
+        use crate::commands::{CommandHandler, CommandOutcome, CommandSpec};
+        let spec = CommandSpec {
+            name: "x",
+            aliases: &[],
+            summary: "sum-desc",
+            usage: "",
+            handler: CommandHandler::Sync(|_, _| CommandOutcome::Done),
+        };
+        let entry = MenuEntry::Builtin(&spec);
+        assert_eq!(entry.summary(), "sum-desc");
+    }
+
+    #[test]
+    fn summary_returns_skill_description() {
+        // kills summary -> "" / "xyzzy" (44) for the Skill arm
+        use crate::skill_commands::SkillCommand;
+        let skill = SkillCommand {
+            name: "x".into(),
+            description: "skill-desc".into(),
+            aliases: vec![],
+            argument_hint: "".into(),
+            allowed_tools: None,
+            prompt_template: "".into(),
+            source_path: std::path::PathBuf::from("/fake/x.md"),
+        };
+        let entry = MenuEntry::Skill(&skill);
+        assert_eq!(entry.summary(), "skill-desc");
+    }
+
+    #[test]
+    fn tab_completion_target_single_exact_match_returns_some() {
+        // kills delete match arm 1 (102): with buf==name, the `1 =>` arm
+        // returns Some(name) while the `_ =>` fallback returns None
+        // (common.len() > buf.len() is false).
+        use crate::commands::{CommandHandler, CommandOutcome, CommandSpec};
+        let spec = CommandSpec {
+            name: "help",
+            aliases: &[],
+            summary: "",
+            usage: "",
+            handler: CommandHandler::Sync(|_, _| CommandOutcome::Done),
+        };
+        let matches: Vec<&CommandSpec> = vec![&spec];
+        assert_eq!(
+            tab_completion_target("help", &matches),
+            Some("help".to_string())
+        );
+    }
+
+    #[test]
+    fn tab_completion_target_multi_common_extends_buffer() {
+        // kills `>`->`<` (111): common "hel" (3) > buf "he" (2) -> Some;
+        // mutant `<`: 3 < 2 false -> None.
+        use crate::commands::{CommandHandler, CommandOutcome, CommandSpec};
+        let s1 = CommandSpec {
+            name: "help",
+            aliases: &[],
+            summary: "",
+            usage: "",
+            handler: CommandHandler::Sync(|_, _| CommandOutcome::Done),
+        };
+        let s2 = CommandSpec {
+            name: "hello",
+            aliases: &[],
+            summary: "",
+            usage: "",
+            handler: CommandHandler::Sync(|_, _| CommandOutcome::Done),
+        };
+        let matches: Vec<&CommandSpec> = vec![&s1, &s2];
+        assert_eq!(
+            tab_completion_target("he", &matches),
+            Some("hel".to_string())
+        );
+    }
+
+    #[test]
+    fn tab_complete_names_single_exact_match_returns_some() {
+        // kills delete match arm 1 (131): buf==name -> `1 =>` Some; `_ =>` None.
+        let names = vec!["refactor"];
+        assert_eq!(
+            tab_complete_names("refactor", &names),
+            Some("refactor".to_string())
+        );
+    }
+
+    #[test]
+    fn tab_complete_names_multi_common_extends_buffer() {
+        // kills `>`->`<` (140): common "abc" (3) > buf "ab" (2) -> Some;
+        // mutant `<`: 3 < 2 false -> None.
+        let names = vec!["abcdef", "abcxyz"];
+        assert_eq!(tab_complete_names("ab", &names), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn popup_rect_some_when_fits() {
+        // kills -> None (154) and `-`->`+` in Rect y (165:25): orig y = 10-5 = 5.
+        let input = Rect::new(0, 10, 40, 3);
+        let frame = Rect::new(0, 0, 80, 24);
+        let r = popup_rect(input, 3, frame).expect("should fit");
+        assert_eq!(r.y, 5); // 10 - (3+2)
+        assert_eq!(r.height, 5); // 3 rows + 2 borders
+    }
+
+    #[test]
+    fn popup_rect_boundary_y_equals_popup_h_still_fits() {
+        // kills `<`->`==`/`<=` (159:21): input_area.y == popup_h (5).
+        // orig `<`: 5<5 false -> falls through -> Some; mutant `==`/`<=`: true -> None.
+        let input = Rect::new(0, 5, 40, 3);
+        let frame = Rect::new(0, 0, 80, 24);
+        assert!(popup_rect(input, 3, frame).is_some());
+    }
+
+    #[test]
+    fn popup_rect_none_when_frame_overlaps_popup() {
+        // kills `-`->`+` in the if condition (159:62):
+        // orig: frame.y(6) > input.y - popup_h(10-5=5) -> 6>5 true -> None.
+        // mutant `+`: 6 > 10+5=15 false -> Some.
+        let input = Rect::new(0, 10, 40, 3);
+        let frame = Rect::new(0, 6, 80, 24);
+        assert!(popup_rect(input, 3, frame).is_none());
+    }
+
+    #[test]
+    fn popup_rect_none_when_no_candidates() {
+        let input = Rect::new(0, 10, 40, 3);
+        let frame = Rect::new(0, 0, 80, 24);
+        assert!(popup_rect(input, 0, frame).is_none());
+    }
+
+    // ── panel_height (pure) ──────────────────────────────────────────────
+
+    fn app_mode(mode: InputMode) -> App {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = mode;
+        app
+    }
+
+    #[test]
+    fn panel_height_command_mode_with_skill() {
+        // kills delete Command arm (351), `+`->`-`/`*` in builtin+skills
+        // sum (353), and `+`->`-` in visible+2 (358).
+        // buffer "re" -> builtin /resume (1) + skill refactor (1) -> n=2
+        // -> visible 2 -> height 4.
+        use crate::skill_commands::SkillCommand;
+        let skill = SkillCommand {
+            name: "refactor".into(),
+            description: "Refactor".into(),
+            aliases: vec![],
+            argument_hint: "".into(),
+            allowed_tools: None,
+            prompt_template: "".into(),
+            source_path: std::path::PathBuf::from("/fake/refactor.md"),
+        };
+        let r = crate::commands::CommandRegistry::default_set().with_skill_commands(vec![skill]);
+        let mut app = app_mode(InputMode::Command);
+        app.commands = r;
+        app.prompt.buffer = "re".into();
+        // Sanity: ensure both contribute (n=2, not 1 or 0).
+        assert_eq!(
+            app.commands.search("re").len() + app.commands.search_skills("re").len(),
+            2
+        );
+        assert_eq!(panel_height(&app), 4);
+    }
+
+    #[test]
+    fn panel_height_atfile_mode() {
+        // kills delete AtFile arm (361) and `+`->`-` in n+2 (366).
+        let mut app = app_mode(InputMode::AtFile);
+        app.atfile_suggestions = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(panel_height(&app), 5); // 3 + 2 borders
+    }
+
+    #[test]
+    fn panel_height_atfile_mode_empty_is_zero() {
+        let app = app_mode(InputMode::AtFile);
+        assert_eq!(panel_height(&app), 0);
+    }
+
+    #[test]
+    fn panel_height_history_search_mode() {
+        // kills `+`->`-` in clamp(1,MAX)+2 (371).
+        let mut app = app_mode(InputMode::HistorySearch);
+        app.hsearch_matches = vec![0, 1];
+        assert_eq!(panel_height(&app), 4); // 2 + 2 borders
+    }
+
+    #[test]
+    fn panel_height_command_interact_capped() {
+        // kills `+`->`-` in MAX_VISIBLE+2 cap (377): height 20 -> min(20,10)=10;
+        // mutant `-`: min(20, 8-2=6) = 6.
+        let mut app = app_mode(crate::app::InputMode::CommandInteract);
+        let mut panel = crate::app::CommandPanelState::new("cmd", vec![]);
+        panel.height = 20;
+        app.active_command_panel = Some(panel);
+        assert_eq!(panel_height(&app), 10);
+    }
+
+    #[test]
+    fn panel_height_prompt_mode_zero() {
+        let app = app_mode(InputMode::Prompt);
+        assert_eq!(panel_height(&app), 0);
+    }
 }
