@@ -3631,6 +3631,28 @@ mod command_panel_tests {
         app.rebuild_panel_lines_for_selection("resume", 0, None);
         assert!(!app.active_command_panel.as_ref().unwrap().lines.is_empty());
     }
+
+    #[test]
+    fn panel_pageup_decrements_scroll() {
+        // kills delete PageUp arm (852)
+        let mut app = App::new();
+        let mut p = panel("help", None, 0, None);
+        p.scroll = 15;
+        app.active_command_panel = Some(p);
+        assert!(app.handle_command_panel_key(k(KeyCode::PageUp)).is_none());
+        assert_eq!(app.active_command_panel.as_ref().unwrap().scroll, 5);
+    }
+
+    #[test]
+    fn panel_pagedown_increments_scroll() {
+        // kills delete PageDown arm (858)
+        let mut app = App::new();
+        let mut p = panel("help", None, 0, None);
+        p.scroll = 5;
+        app.active_command_panel = Some(p);
+        assert!(app.handle_command_panel_key(k(KeyCode::PageDown)).is_none());
+        assert_eq!(app.active_command_panel.as_ref().unwrap().scroll, 15);
+    }
 }
 
 #[cfg(test)]
@@ -3681,5 +3703,280 @@ mod command_menu_tests {
         app.command_menu_selected = Some(1);
         assert_eq!(app.handle_command_menu_key(k(KeyCode::Up)), Some(None));
         assert_eq!(app.command_menu_selected, Some(0));
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "skill-hub")]
+mod skill_install_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::{App, PendingSkillInstall};
+    use crate::events::{SkillSearchResult, SkillZipFile};
+    use crate::ui::modal::{Modal, SkillInstallPage, SkillInstallState};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn result(slug: &str) -> SkillSearchResult {
+        SkillSearchResult {
+            slug: slug.into(),
+            name: slug.into(),
+            description: String::new(),
+            downloads: 0,
+            stars: 0,
+            version: String::new(),
+        }
+    }
+
+    fn file(path: &str) -> SkillZipFile {
+        SkillZipFile {
+            path: path.into(),
+            content: String::new(),
+            size: 0,
+        }
+    }
+
+    fn app_at(page: SkillInstallPage, results: usize, files: usize) -> App {
+        let mut app = App::new();
+        let state = SkillInstallState {
+            query: String::new(),
+            results: (0..results).map(|i| result(&format!("s{i}"))).collect(),
+            slug: None,
+            files: (0..files).map(|i| file(&format!("f{i}"))).collect(),
+            page,
+        };
+        app.modals.push(Modal::SkillInstall(state));
+        app
+    }
+
+    fn page_of(app: &App) -> SkillInstallPage {
+        match app.modals.last() {
+            Some(Modal::SkillInstall(s)) => s.page.clone(),
+            _ => panic!("no SkillInstall modal"),
+        }
+    }
+
+    // ── Results page ───────────────────────────────────────────────
+    #[test]
+    fn results_up_decrements_selected() {
+        // kills: delete Up (1213), `>`→`<`/`==` (1215, stays 2), `-`→`+` (1217, →3)
+        let mut app = app_at(SkillInstallPage::Results { selected: 2 }, 3, 0);
+        app.handle_skill_install_key(k(KeyCode::Up));
+        assert_eq!(page_of(&app), SkillInstallPage::Results { selected: 1 });
+    }
+
+    #[test]
+    fn results_up_at_zero_stays() {
+        // kills `>`→`>=` and `>`→`==` (1215): orig 0>0 false → stays; mutant decs → underflow panic
+        let mut app = app_at(SkillInstallPage::Results { selected: 0 }, 3, 0);
+        app.handle_skill_install_key(k(KeyCode::Up));
+        assert_eq!(page_of(&app), SkillInstallPage::Results { selected: 0 });
+    }
+
+    #[test]
+    fn results_down_increments_selected() {
+        // kills: delete Down (1222), `<`→`>` (1225, stays 0), `+`→`*` (1227, 0*1=0 → stays 0)
+        let mut app = app_at(SkillInstallPage::Results { selected: 0 }, 3, 0);
+        app.handle_skill_install_key(k(KeyCode::Down));
+        assert_eq!(page_of(&app), SkillInstallPage::Results { selected: 1 });
+    }
+
+    #[test]
+    fn results_down_at_last_stays() {
+        // kills `<`→`<=` (1225, inc to 3) and `+`→`-` (1227, 2-1=1<2 true → inc to 2)
+        let mut app = app_at(SkillInstallPage::Results { selected: 2 }, 3, 0);
+        app.handle_skill_install_key(k(KeyCode::Down));
+        assert_eq!(page_of(&app), SkillInstallPage::Results { selected: 2 });
+    }
+
+    #[test]
+    fn results_enter_sends_slug() {
+        // kills delete Enter arm (1232)
+        let mut app = app_at(SkillInstallPage::Results { selected: 1 }, 3, 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.pending_skill_install = Some(PendingSkillInstall::Search(tx));
+        app.handle_skill_install_key(k(KeyCode::Enter));
+        assert_eq!(rx.blocking_recv().unwrap(), Some("s1".to_string()));
+    }
+
+    #[test]
+    fn results_esc_sends_none_and_pops() {
+        let mut app = app_at(SkillInstallPage::Results { selected: 0 }, 3, 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.pending_skill_install = Some(PendingSkillInstall::Search(tx));
+        app.handle_skill_install_key(k(KeyCode::Esc));
+        assert_eq!(rx.blocking_recv().unwrap(), None);
+        assert!(app.modals.is_empty());
+    }
+
+    // ── Files page ─────────────────────────────────────────────────
+    #[test]
+    fn files_up_decrements_selected() {
+        // kills: delete Up (1258), `>`→`<`/`==` (1260), `-`→`+`/`/` (1262)
+        let mut app = app_at(SkillInstallPage::Files { selected: 2 }, 0, 3);
+        app.handle_skill_install_key(k(KeyCode::Up));
+        assert_eq!(page_of(&app), SkillInstallPage::Files { selected: 1 });
+    }
+
+    #[test]
+    fn files_up_at_zero_stays() {
+        // kills `>`→`>=`/`==` (1260): orig stays; mutant decs → panic
+        let mut app = app_at(SkillInstallPage::Files { selected: 0 }, 0, 3);
+        app.handle_skill_install_key(k(KeyCode::Up));
+        assert_eq!(page_of(&app), SkillInstallPage::Files { selected: 0 });
+    }
+
+    #[test]
+    fn files_down_increments_selected() {
+        // kills: delete Down (1267), `<`→`>`/`==` (1270), `+`→`*`/`-` (1272)
+        let mut app = app_at(SkillInstallPage::Files { selected: 0 }, 0, 3);
+        app.handle_skill_install_key(k(KeyCode::Down));
+        assert_eq!(page_of(&app), SkillInstallPage::Files { selected: 1 });
+    }
+
+    #[test]
+    fn files_down_at_last_stays() {
+        // kills `<`→`<=` (1270, inc to 3) and `+`→`-` (1272, 2-1=1<2 → inc to 2)
+        let mut app = app_at(SkillInstallPage::Files { selected: 2 }, 0, 3);
+        app.handle_skill_install_key(k(KeyCode::Down));
+        assert_eq!(page_of(&app), SkillInstallPage::Files { selected: 2 });
+    }
+
+    #[test]
+    fn files_v_opens_preview() {
+        // kills delete Char('v')/Enter arm (1277)
+        let mut app = app_at(SkillInstallPage::Files { selected: 1 }, 0, 3);
+        app.handle_skill_install_key(k(KeyCode::Char('v')));
+        assert_eq!(
+            page_of(&app),
+            SkillInstallPage::Preview {
+                file_idx: 1,
+                scroll: 0
+            }
+        );
+    }
+
+    #[test]
+    fn files_y_sends_true_and_pops() {
+        // kills delete Char('y') arm (1285)
+        let mut app = app_at(SkillInstallPage::Files { selected: 0 }, 0, 3);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.pending_skill_install = Some(PendingSkillInstall::Files(tx));
+        app.handle_skill_install_key(k(KeyCode::Char('y')));
+        assert!(rx.blocking_recv().unwrap());
+        assert!(app.modals.is_empty());
+    }
+
+    #[test]
+    fn files_esc_sends_false_and_pops() {
+        // kills delete Esc arm (1293)
+        let mut app = app_at(SkillInstallPage::Files { selected: 0 }, 0, 3);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.pending_skill_install = Some(PendingSkillInstall::Files(tx));
+        app.handle_skill_install_key(k(KeyCode::Esc));
+        assert!(!rx.blocking_recv().unwrap());
+        assert!(app.modals.is_empty());
+    }
+
+    // ── Preview page ───────────────────────────────────────────────
+    #[test]
+    fn preview_up_decrements_scroll() {
+        // kills delete Up arm (1305)
+        let mut app = app_at(
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 5,
+            },
+            0,
+            3,
+        );
+        app.handle_skill_install_key(k(KeyCode::Up));
+        assert_eq!(
+            page_of(&app),
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 4
+            }
+        );
+    }
+
+    #[test]
+    fn preview_down_increments_scroll() {
+        // kills delete Down arm (1314)
+        let mut app = app_at(
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 5,
+            },
+            0,
+            3,
+        );
+        app.handle_skill_install_key(k(KeyCode::Down));
+        assert_eq!(
+            page_of(&app),
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 6
+            }
+        );
+    }
+
+    #[test]
+    fn preview_pageup_decrements_scroll_by_10() {
+        // kills delete PageUp arm (1323)
+        let mut app = app_at(
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 15,
+            },
+            0,
+            3,
+        );
+        app.handle_skill_install_key(k(KeyCode::PageUp));
+        assert_eq!(
+            page_of(&app),
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 5
+            }
+        );
+    }
+
+    #[test]
+    fn preview_pagedown_increments_scroll_by_10() {
+        // covers delete PageDown arm
+        let mut app = app_at(
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 5,
+            },
+            0,
+            3,
+        );
+        app.handle_skill_install_key(k(KeyCode::PageDown));
+        assert_eq!(
+            page_of(&app),
+            SkillInstallPage::Preview {
+                file_idx: 0,
+                scroll: 15
+            }
+        );
+    }
+
+    #[test]
+    fn preview_esc_returns_to_files() {
+        // kills delete Esc arm (1341)
+        let mut app = app_at(
+            SkillInstallPage::Preview {
+                file_idx: 2,
+                scroll: 3,
+            },
+            0,
+            3,
+        );
+        app.handle_skill_install_key(k(KeyCode::Esc));
+        assert_eq!(page_of(&app), SkillInstallPage::Files { selected: 2 });
     }
 }
