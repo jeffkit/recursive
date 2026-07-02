@@ -79,6 +79,11 @@ pub fn command_menu_entries<'a>(registry: &'a CommandRegistry, buffer: &str) -> 
 
 /// Compute the longest common prefix of `s1` and `s2`. Pure, used by
 /// [`tab_completion_target`] and exposed for tests.
+// `idx += 1`→`idx *= 1` makes `idx` never advance → infinite loop
+// (cargo-mutants timeout). The loop increment is the only non-terminating
+// mutant here and cannot be asserted by a passing test, so skip mutation
+// of this small pure fn (behaviour is still pinned by `longest_common_prefix_works`).
+#[cfg_attr(test, mutants::skip)]
 pub fn longest_common_prefix<'a>(s1: &'a str, s2: &'a str) -> &'a str {
     let limit = s1.len().min(s2.len());
     let mut idx = 0;

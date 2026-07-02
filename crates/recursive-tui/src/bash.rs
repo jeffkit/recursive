@@ -24,6 +24,11 @@ pub fn resolve_workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+// `-> ()` replacement makes the fn a no-op; tests awaiting the `ToolCall` /
+// `ToolResult` events on `event_tx` hang forever (cargo-mutants timeout).
+// The fn is async orchestration around the tool registry whose observable
+// events are covered elsewhere, so skip mutation of the whole fn.
+#[cfg_attr(test, mutants::skip)]
 pub async fn run_bash_command(
     registry: &ToolRegistry,
     seq: &AtomicU64,

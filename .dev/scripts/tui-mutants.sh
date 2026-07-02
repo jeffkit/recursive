@@ -29,8 +29,11 @@ set -euo pipefail
 CRATE="recursive-tui"
 # test-utils is a dev-dependency feature of recursive-tui; passing it
 # explicitly is harmless and keeps the runner robust if the dev-dep is
-# ever removed.
-FEATURES="recursive/test-utils"
+# ever removed. `weixin` is included so the #[cfg(feature = "weixin")]
+# renderers (e.g. render_weixin_message) are actually compiled and their
+# mutants become observable — without it the gate reports cfg-off
+# mutants as false-positive "missed".
+FEATURES="recursive/test-utils,weixin"
 
 # Parallelism. --jobs N runs N cargo build/test jobs concurrently.
 # When JOBS>1 we DROP --in-place (parallel in-place mutation would race

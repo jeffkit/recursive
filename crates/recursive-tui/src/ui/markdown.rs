@@ -805,6 +805,17 @@ fn strip_bullet(line: &str) -> Option<(&str, &str)> {
     Some((&line[..indent_len], body))
 }
 
+/// Advance the parse cursor by one byte. Extracted as a helper so the
+/// `*i += 1` increment can be marked `#[mutants::skip]` — mutating it to
+/// `*i *= 1` / `*i -= 1` would hang `parse_inline` in an infinite loop
+/// (cargo-mutants timeout), and non-termination cannot be asserted by a
+/// passing test. `parse_inline` itself stays fully mutable.
+#[cfg_attr(test, mutants::skip)]
+#[inline]
+fn bump_cursor(i: &mut usize) {
+    *i += 1;
+}
+
 /// Parse a line for **bold**, *italic*, _italic_, `code` and emit styled
 /// spans.
 fn parse_inline(line: &str, default_fg: Color) -> Vec<Span<'static>> {
@@ -864,7 +875,7 @@ fn parse_inline(line: &str, default_fg: Color) -> Vec<Span<'static>> {
                 }
             }
         }
-        i += 1;
+        bump_cursor(&mut i);
     }
     flush_plain(&mut out, line, plain_start, bytes.len(), plain_style);
     if out.is_empty() {

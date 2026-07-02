@@ -28,6 +28,12 @@ dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"
+# Inert attribute crate recognized by `cargo-mutants`. Used to tag
+# functions/expressions that are structurally untestable (infinite-loop
+# mutants, terminal-I/O side effects) so the mutant gate stops counting
+# them as missed. `#[cfg_attr(test, mutants::skip)]` keeps it a
+# dev-only dependency with zero production-binary impact.
+mutants = "0.0.3"
 # Enables the kernel's test-utils (MockProvider etc.) for the TUI's own
 # test suite so `cargo test -p recursive-tui` is self-contained — no
 # `--features recursive/test-utils` CLI flag needed. Required by the

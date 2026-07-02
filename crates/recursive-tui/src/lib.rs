@@ -56,6 +56,11 @@ use crate::events::UserAction;
 struct RawModeGuard;
 
 impl Drop for RawModeGuard {
+    // `drop -> ()` only suppresses crossterm terminal commands (disable raw
+    // mode, leave alternate screen, disable mouse capture) whose effects land
+    // on the real terminal and are not observable from a unit test. Skip
+    // mutation of the drop body.
+    #[cfg_attr(test, mutants::skip)]
     fn drop(&mut self) {
         let _ = io::stdout().execute(DisableMouseCapture);
         let _ = io::stdout().execute(LeaveAlternateScreen);

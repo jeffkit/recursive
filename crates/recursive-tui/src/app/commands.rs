@@ -273,11 +273,6 @@ impl App {
         use std::time::Instant;
 
         let now = Instant::now();
-        let _within_window = self
-            .double_press
-            .last_esc_at
-            .map(|t| now.duration_since(t) <= double_press_window())
-            .unwrap_or(false);
         self.double_press.last_esc_at = Some(now);
 
         // Step 1: non-empty buffer or non-Prompt mode → clear.
