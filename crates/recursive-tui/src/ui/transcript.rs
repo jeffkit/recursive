@@ -1123,11 +1123,15 @@ mod tests {
 
     #[test]
     fn render_blocks_separates_with_blank_line() {
-        // kills 29:14 `>`->`>=`/`==`/`<`: two blocks must be separated by
-        // a blank line, and the first block must not be preceded by one.
+        // Two non-User blocks so the only blank line is the `i > 0`
+        // separator (User blocks add their own trailing blank, which would
+        // mask the separator mutant).
+        // kills 29:14 `>`->`>=`/`==`/`<`.
         let blocks = vec![
-            TranscriptBlock::User {
+            TranscriptBlock::Assistant {
                 text: "first".into(),
+                streaming: false,
+                latency_ms: None,
             },
             TranscriptBlock::Assistant {
                 text: "second".into(),
@@ -1143,7 +1147,7 @@ mod tests {
         );
         assert!(
             lines.iter().any(|l| line_text(l).is_empty()),
-            "expected a blank separator line"
+            "expected a blank separator line between blocks"
         );
     }
 
@@ -1204,13 +1208,14 @@ mod tests {
 
     #[test]
     fn plan_args_preview_value_below_20_chars_not_truncated() {
-        // kills 596:54 `>`->`<` (mutant truncates short strings).
+        // kills 596:54 `>`->`<` (mutant truncates short strings -> emits `…`).
         let v = "1234567890123456"; // 16 chars
         let s = plan_args_preview(&serde_json::json!({"k": v}), 100);
         assert!(
-            s.contains(v),
+            !s.contains('…'),
             "16-char value should not be truncated; got {s}"
         );
+        assert!(s.contains(v));
     }
 
     #[test]
