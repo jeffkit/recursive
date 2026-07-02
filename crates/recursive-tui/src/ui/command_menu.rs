@@ -1061,6 +1061,17 @@ mod tests {
     }
 
     #[test]
+    fn panel_height_command_mode_visible_three() {
+        // kills `+`->`*` in visible+2 (358): 3 builtin matches "c" -> n=3
+        // -> visible 3 -> height 5; mutant `*`: 3*2=6; mutant `-`: 3-2=1.
+        let mut app = app_mode(InputMode::Command);
+        app.commands = crate::commands::CommandRegistry::default_set();
+        app.prompt.buffer = "c".into();
+        assert_eq!(app.commands.search("c").len(), 3);
+        assert_eq!(panel_height(&app), 5);
+    }
+
+    #[test]
     fn panel_height_atfile_mode() {
         // kills delete AtFile arm (361) and `+`->`-` in n+2 (366).
         let mut app = app_mode(InputMode::AtFile);
@@ -1076,10 +1087,11 @@ mod tests {
 
     #[test]
     fn panel_height_history_search_mode() {
-        // kills `+`->`-` in clamp(1,MAX)+2 (371).
+        // kills `+`->`-` and `+`->`*` in clamp(1,MAX)+2 (371): 3+2=5; mutant
+        // `*`: 3*2=6; mutant `-`: 3-2=1.
         let mut app = app_mode(InputMode::HistorySearch);
-        app.hsearch_matches = vec![0, 1];
-        assert_eq!(panel_height(&app), 4); // 2 + 2 borders
+        app.hsearch_matches = vec![0, 1, 2];
+        assert_eq!(panel_height(&app), 5); // 3 + 2 borders
     }
 
     #[test]
@@ -1276,5 +1288,207 @@ mod render_debt_tests {
         let buf = draw(80, 24, |f| render_permission_modal(f, &app));
         // Modal y=8; sep line is the 5th content line -> row 13.
         assert_eq!(count_symbol(&buf, 13, 80, "─"), 70);
+    }
+
+    // ── render() command popup (the overlay variant) ────────────────────
+
+    fn command_app_skill_hint() -> App {
+        let skill = SkillCommand {
+            name: "refactor".into(),
+            description: "Refactor".into(),
+            aliases: vec![],
+            argument_hint: "<file>".into(),
+            allowed_tools: None,
+            prompt_template: "".into(),
+            source_path: std::path::PathBuf::from("/fake/refactor.md"),
+        };
+        let r = crate::commands::CommandRegistry::default_set().with_skill_commands(vec![skill]);
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::Command;
+        app.commands = r;
+        app.prompt.buffer = "ref".into();
+        app
+    }
+
+    #[test]
+    fn render_popup_renders_command_and_skill_hint() {
+        // kills render -> () (180), `!=`->`==` guard in-mode (180), and
+        // delete `!` so the skill argument hint shows (220).
+        let app = command_app_skill_hint();
+        let buf = draw(80, 24, |f| render(f, Rect::new(0, 20, 80, 3), &app));
+        assert!(any_row_contains(&buf, "refactor", 80, 24));
+        assert!(any_row_contains(&buf, "<file>", 80, 24));
+    }
+
+    #[test]
+    fn render_popup_skips_when_not_in_command_mode() {
+        // kills `!=`->`==` guard from the other side (180): Prompt mode ->
+        // orig skips; mutant `==` renders.
+        let mut app = command_app_skill_hint();
+        app.prompt.mode = InputMode::Prompt;
+        let buf = draw(80, 24, |f| render(f, Rect::new(0, 20, 80, 3), &app));
+        assert!(!any_row_contains(&buf, "refactor", 80, 24));
+        assert!(!any_row_contains(&buf, "Commands", 80, 24));
+    }
+
+    #[test]
+    fn render_popup_highlights_selected_entry() {
+        // kills `==`->`!=` in command_menu_selected (207): selected=0 ->
+        // row 0 (clear) Yellow bg; mutant highlights the other rows.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::Command;
+        app.commands = crate::commands::CommandRegistry::default_set();
+        app.prompt.buffer = "c".into(); // clear / compact / cost (3)
+        app.command_menu_selected = Some(0);
+        let buf = draw(80, 24, |f| render(f, Rect::new(0, 20, 80, 3), &app));
+        // popup_h = 3+2 = 5; input.y=20 -> popup y=15; rows 16,17,18 = entries.
+        assert!(row_has_bg(&buf, 16, 80, Color::Yellow));
+        assert!(!row_has_bg(&buf, 17, 80, Color::Yellow));
+    }
+
+    // ── render_atfile() popup ───────────────────────────────────────────
+
+    fn atfile_app(suggestions: Vec<String>, selected: Option<usize>) -> App {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::AtFile;
+        app.atfile_suggestions = suggestions;
+        app.atfile_selected = selected;
+        app.atfile_query = "q".into();
+        app
+    }
+
+    #[test]
+    fn render_atfile_popup_renders_in_mode() {
+        // kills render_atfile -> () (239) and `!=`->`==` guard in-mode (239).
+        let app = atfile_app(vec!["a.txt".into(), "b.txt".into()], None);
+        let buf = draw(80, 24, |f| render_atfile(f, Rect::new(0, 20, 80, 3), &app));
+        assert!(any_row_contains(&buf, "a.txt", 80, 24));
+    }
+
+    #[test]
+    fn render_atfile_popup_skips_when_not_in_mode() {
+        // kills `!=`->`==` guard from the other side (239).
+        let mut app = atfile_app(vec!["a.txt".into()], None);
+        app.prompt.mode = InputMode::Prompt;
+        let buf = draw(80, 24, |f| render_atfile(f, Rect::new(0, 20, 80, 3), &app));
+        assert!(!any_row_contains(&buf, "a.txt", 80, 24));
+        assert!(!any_row_contains(&buf, "@files", 80, 24));
+    }
+
+    #[test]
+    fn render_atfile_popup_highlights_selected() {
+        // kills `==`->`!=` in atfile_selected (262): selected=0 -> row 0 Cyan.
+        let app = atfile_app(vec!["a.txt".into(), "b.txt".into()], Some(0));
+        let buf = draw(80, 24, |f| render_atfile(f, Rect::new(0, 20, 80, 3), &app));
+        // popup_h = 2+2 = 4; y=16; rows 17,18 = entries.
+        assert!(row_has_bg(&buf, 17, 80, Color::Cyan));
+        assert!(!row_has_bg(&buf, 18, 80, Color::Cyan));
+    }
+
+    // ── render_panel: AtFile dispatch + selection highlights ─────────────
+
+    #[test]
+    fn render_panel_dispatches_atfile_mode() {
+        // kills delete AtFile arm in render_panel (395) and
+        // render_atfile_panel -> () (451).
+        let app = atfile_app(vec!["foo.txt".into()], None);
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(any_row_contains(&buf, "foo.txt", 80, 24));
+    }
+
+    #[test]
+    fn render_panel_command_mode_highlights_selected() {
+        // kills `==`->`!=` in render_command_panel (422): selected=0 ->
+        // row 0 (clear) Yellow bg; mutant highlights the others.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::Command;
+        app.commands = crate::commands::CommandRegistry::default_set();
+        app.prompt.buffer = "c".into(); // 3 entries -> rows 21,22,23 (fit 24-tall buf)
+        app.command_menu_selected = Some(0);
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(row_has_bg(&buf, 21, 80, Color::Yellow));
+        assert!(!row_has_bg(&buf, 22, 80, Color::Yellow));
+    }
+
+    #[test]
+    fn render_panel_atfile_highlights_selected() {
+        // kills `==`->`!=` in render_atfile_panel (467): selected=0 -> row 0 Cyan.
+        let app = atfile_app(vec!["a.txt".into(), "b.txt".into()], Some(0));
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(row_has_bg(&buf, 21, 80, Color::Cyan));
+        assert!(!row_has_bg(&buf, 22, 80, Color::Cyan));
+    }
+
+    // ── render_history_panel: truncation + selection (panel variant) ────
+
+    #[test]
+    fn render_panel_history_search_truncates_long_entry() {
+        // kills `>`->`==`/`>=` in render_history_panel (505): 61 chars ->
+        // orig truncates with `…` (panel inner width 78 fits the 60-char
+        // display, so `…` is visible); mutants `==`/`>=` at 61: 61==60
+        // false / 61>=60 true -> `==` no truncate, `>=` truncates.
+        // Using 61 chars: orig `…`, `==` no `…` -> assert `…` kills `==`.
+        let entry = "a".repeat(61);
+        let app = history_app(vec![entry], vec![0], 0);
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(any_row_contains(&buf, "…", 80, 24));
+    }
+
+    #[test]
+    fn render_panel_history_search_keeps_exact_60_entry() {
+        // kills `>`->`>=`/`==` in render_history_panel (505) at the ==60
+        // boundary: 60 chars -> orig NO truncate; mutants truncate -> `…`.
+        let entry = "a".repeat(60);
+        let app = history_app(vec![entry], vec![0], 0);
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(!any_row_contains(&buf, "…", 80, 24));
+    }
+
+    #[test]
+    fn render_panel_history_search_highlights_selected() {
+        // kills `==`->`!=` in render_history_panel (510): selected=0 ->
+        // row 0 LightGreen bg.
+        let app = history_app(vec!["aaa".into(), "bbb".into()], vec![0, 1], 0);
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(row_has_bg(&buf, 21, 80, Color::LightGreen));
+        assert!(!row_has_bg(&buf, 22, 80, Color::LightGreen));
+    }
+
+    // ── render_permission_modal: args truncation (630) ──────────────────
+
+    #[test]
+    fn permission_modal_args_no_truncate_at_exactly_60() {
+        // kills `>`->`==`/`>=` in args truncation (630): 60 chars -> orig
+        // no `…`; mutants `==`/`>=` truncate -> `…`.
+        let args = "a".repeat(60);
+        let app = app_with_permission("T", &args);
+        let buf = draw(80, 24, |f| render_permission_modal(f, &app));
+        assert!(!any_row_contains(&buf, "…", 80, 24));
+    }
+
+    #[test]
+    fn permission_modal_args_truncate_over_60() {
+        // kills `>`->`<` in args truncation (630): 61 chars -> orig `…`;
+        // mutant `<`: 61<60 false -> no `…`.
+        let args = "a".repeat(61);
+        let app = app_with_permission("T", &args);
+        let buf = draw(80, 24, |f| render_permission_modal(f, &app));
+        assert!(any_row_contains(&buf, "…", 80, 24));
+    }
+
+    // ── popup_rect: `-`->`/` boundary (159:62) ───────────────────────────
+
+    #[test]
+    fn popup_rect_some_when_frame_just_below_popup() {
+        // kills `-`->`/` (159:62): input.y=10, popup_h=5, frame.y=3.
+        // orig: 3 > 10-5=5 -> 3>5 false -> Some; mutant `/`: 3 > 10/5=2 ->
+        // 3>2 true -> None.
+        let input = Rect::new(0, 10, 40, 3);
+        let frame = Rect::new(0, 3, 80, 24);
+        assert!(popup_rect(input, 3, frame).is_some());
     }
 }
