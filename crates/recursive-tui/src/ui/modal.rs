@@ -1298,4 +1298,311 @@ mod tests {
         let text = draw_modal_text(&app);
         assert!(text.contains("debt-plan-text-marker"), "got {text:?}");
     }
+
+    // ── buffer/style inspection helpers (kill style + arithmetic mutants) ──
+
+    fn draw_modal_buffer(app: &crate::app::App) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(96, 30);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| crate::ui::modal::render(fr, app))
+            .expect("draw infallible");
+        term.backend().buffer().clone()
+    }
+
+    fn cell_style_where(
+        buf: &ratatui::buffer::Buffer,
+        needle: &str,
+    ) -> Option<ratatui::style::Style> {
+        // Locate the first row whose concatenated cell symbols contain
+        // `needle`, then return the style of the cell at the cell-offset
+        // where `needle` begins. This skips the modal's border cells
+        // (which carry the block's border style, not the row's).
+        for y in 0..buf.area.height {
+            let cells: Vec<(&str, ratatui::style::Style)> = (0..buf.area.width)
+                .map(|x| {
+                    let c = buf.cell((x, y)).expect("cell");
+                    (c.symbol(), c.style())
+                })
+                .collect();
+            let row: String = cells.iter().map(|(s, _)| *s).collect();
+            if let Some(byte_idx) = row.find(needle) {
+                let mut acc = 0usize;
+                for (sym, sty) in cells {
+                    if acc == byte_idx {
+                        return Some(sty);
+                    }
+                    acc += sym.len();
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn render_cost_body_emits_exact_cost_strings() {
+        // kills arithmetic mutants on the cost math (304/306/307).
+        let model = "gpt-4o-mini";
+        let mut app = crate::app::App::new();
+        app.model_name = model.into();
+        app.usage.total_input = 2_000_000;
+        app.usage.total_output = 4_000_000;
+        app.modals = vec![Modal::CostDetail];
+        let text = draw_modal_text(&app);
+        let p = recursive::llm::pricing_for(model).expect("known priced model");
+        let cin = 2_000_000.0 * p.input_per_million / 1_000_000.0;
+        let cout = 4_000_000.0 * p.output_per_million / 1_000_000.0;
+        let ctot = cin + cout;
+        assert!(text.contains(&format!("(${cin:.4})")), "in: {text:?}");
+        assert!(text.contains(&format!("(${cout:.4})")), "out: {text:?}");
+        assert!(text.contains(&format!("(${ctot:.4})")), "tot: {text:?}");
+    }
+
+    #[test]
+    fn render_journal_body_marks_selected_entry() {
+        // kills `==`->`!=` on the selected-marker (465) and style (466).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::Journal {
+            entries: vec![JournalEntry {
+                name: "debt-entry.md".into(),
+                preview: "preview".into(),
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains('▶'), "selected marker missing: {text:?}");
+        let buf = draw_modal_buffer(&app);
+        assert_eq!(
+            cell_style_where(&buf, "debt-entry.md").and_then(|s| s.fg),
+            Some(Color::Yellow),
+            "selected journal entry should be yellow"
+        );
+    }
+
+    #[test]
+    fn render_journal_body_truncates_preview_over_12_lines() {
+        // kills `>`->`==`/`<` (489): 13 lines => "more lines" present.
+        let preview = (0..13)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::Journal {
+            entries: vec![JournalEntry {
+                name: "n.md".into(),
+                preview,
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(
+            text.contains("more lines"),
+            "13-line preview should show more-lines hint: {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_journal_body_keeps_preview_at_12_lines() {
+        // kills `>`->`>=` (489): exactly 12 lines => no "more lines".
+        let preview = (0..12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::Journal {
+            entries: vec![JournalEntry {
+                name: "n.md".into(),
+                preview,
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(
+            !text.contains("more lines"),
+            "12-line preview should not show more-lines hint: {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_resume_picker_body_marks_selected_entry() {
+        // kills `==`->`!=` on the selected-marker (525) and style (526).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::ResumePicker {
+            entries: vec![ResumeEntry {
+                session_dir: ".".into(),
+                slug: "debt-resume-slug".into(),
+                updated_at: "2026-01-01 00:00".into(),
+                cost_usd: 0.0,
+                turn_count: 0,
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains('▶'), "selected marker missing: {text:?}");
+        let buf = draw_modal_buffer(&app);
+        assert_eq!(
+            cell_style_where(&buf, "debt-resume-slug").and_then(|s| s.fg),
+            Some(Color::Yellow),
+            "selected resume entry should be yellow"
+        );
+    }
+
+    #[test]
+    fn render_mcp_servers_body_marks_selected_entry() {
+        // kills `==`->`!=` on the selected-marker (570) and style (572).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::McpServers {
+            entries: vec![McpEntry {
+                name: "debt-mcp".into(),
+                transport: "stdio".into(),
+                enabled: true,
+            }],
+            selected: 0,
+        }];
+        let text = draw_modal_text(&app);
+        assert!(text.contains('▶'), "selected marker missing: {text:?}");
+        let buf = draw_modal_buffer(&app);
+        assert_eq!(
+            cell_style_where(&buf, "debt-mcp").and_then(|s| s.fg),
+            Some(Color::Yellow),
+            "selected mcp entry should be yellow"
+        );
+    }
+
+    #[cfg(feature = "skill-hub")]
+    #[test]
+    fn render_skill_install_results_emits_name_downloads_and_truncated_desc() {
+        use crate::events::SkillSearchResult;
+        // kills 846 (fn -> vec![]), 871 (downloads >= -> <),
+        // 881 (selected == -> !=), 883 (desc > 68 -> == / <).
+        let desc69: String = "x".repeat(69);
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::SkillInstall(SkillInstallState {
+            query: "debt-query".into(),
+            results: vec![SkillSearchResult {
+                slug: "s".into(),
+                name: "debt-skill-name".into(),
+                description: desc69,
+                downloads: 1_500,
+                stars: 7,
+                version: "1.0".into(),
+            }],
+            slug: None,
+            files: vec![],
+            page: SkillInstallPage::Results { selected: 0 },
+        })];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("debt-skill-name"), "name missing: {text:?}");
+        assert!(text.contains("1.5k"), "downloads formatting: {text:?}");
+        // 881 suppresses the desc line entirely on mutant; 883-==/< drop the ellipsis.
+        assert!(
+            text.contains('…'),
+            "69-char desc should be truncated with ellipsis: {text:?}"
+        );
+    }
+
+    #[cfg(feature = "skill-hub")]
+    #[test]
+    fn render_skill_install_results_desc_boundary_68_not_truncated() {
+        use crate::events::SkillSearchResult;
+        // kills 883 (desc > 68 -> >=): 68 chars => no ellipsis.
+        let desc68: String = "x".repeat(68);
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::SkillInstall(SkillInstallState {
+            query: "q".into(),
+            results: vec![SkillSearchResult {
+                slug: "s".into(),
+                name: "debt-skill-68".into(),
+                description: desc68,
+                downloads: 5,
+                stars: 0,
+                version: "1.0".into(),
+            }],
+            slug: None,
+            files: vec![],
+            page: SkillInstallPage::Results { selected: 0 },
+        })];
+        let text = draw_modal_text(&app);
+        assert!(
+            !text.contains('…'),
+            "68-char desc should NOT be truncated: {text:?}"
+        );
+    }
+
+    #[cfg(feature = "skill-hub")]
+    #[test]
+    fn render_skill_install_files_emits_size_and_selected_bg() {
+        use crate::events::SkillZipFile;
+        // kills 917 (size >= 1024 -> <) and 923 (selected == -> !=).
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::SkillInstall(SkillInstallState {
+            query: "q".into(),
+            results: vec![],
+            slug: Some("debt-slug".into()),
+            files: vec![SkillZipFile {
+                path: "debt-file.md".into(),
+                content: "x".into(),
+                size: 2_048,
+            }],
+            page: SkillInstallPage::Files { selected: 0 },
+        })];
+        let text = draw_modal_text(&app);
+        assert!(text.contains("2.0kb"), "size formatting: {text:?}");
+        let buf = draw_modal_buffer(&app);
+        assert_eq!(
+            cell_style_where(&buf, "debt-file.md").and_then(|s| s.bg),
+            Some(Color::Cyan),
+            "selected file row should have cyan bg"
+        );
+    }
+
+    #[test]
+    fn load_recent_sessions_truncates_long_goal_and_keeps_short() {
+        // kills 798 (fn -> vec![]), 808 (! on goal.is_empty()),
+        // 813 (slug > 40 -> == / >= / <).
+        use recursive::SessionWriter;
+        let ws_a = tempfile::tempdir().expect("tempdir a");
+        let ws_b = tempfile::tempdir().expect("tempdir b");
+        let sessions = tempfile::tempdir().expect("sessions tempdir");
+        let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_SESSIONS_DIR", sessions.path());
+        // Two distinct workspaces => distinct session ids even within the
+        // same second, so the per-session locks never collide.
+        let goal41: String = "g".repeat(41);
+        let goal40: String = "h".repeat(40);
+        let _w1 = SessionWriter::create(ws_a.path(), &goal41, "m", "p").expect("create1");
+        let _w2 = SessionWriter::create(ws_b.path(), &goal40, "m", "p").expect("create2");
+        let entries = load_recent_sessions(ws_a.path(), 10);
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+            None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+        }
+        assert_eq!(entries.len(), 2, "should find both sessions: {:?}", entries);
+        let long = entries
+            .iter()
+            .find(|e| e.slug.ends_with('…'))
+            .expect("expected one truncated slug");
+        assert_eq!(
+            long.slug.chars().count(),
+            40,
+            "truncated slug len: {}",
+            long.slug
+        );
+        let short = entries
+            .iter()
+            .find(|e| !e.slug.ends_with('…'))
+            .expect("expected one non-truncated slug");
+        assert_eq!(
+            short.slug.chars().count(),
+            40,
+            "short slug len: {}",
+            short.slug
+        );
+        assert!(
+            short.slug.chars().all(|c| c == 'h'),
+            "short slug should be 40 h's: {}",
+            short.slug
+        );
+    }
 }
