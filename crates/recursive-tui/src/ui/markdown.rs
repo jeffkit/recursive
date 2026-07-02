@@ -1450,11 +1450,180 @@ mod debt_tests {
         // kills delete TagEnd::List arm (477): without popping the inner
         // (ordered) list, the following outer item inherits the inner's
         // ListState and gets a "3." prefix instead of the "• " bullet.
+        // orig: "1." "2." (inner) then "• " (outer 'after'); mutant: "3. ".
         let lines = render_markdown("- outer\n  1. inner1\n  2. inner2\n- after", 80);
         let text = all_text(&lines);
         assert!(
             text.contains('\u{2022}'),
             "expected a bullet for the outer 'after' item; got {text:?}"
+        );
+        assert!(
+            !text.contains("3."),
+            "outer 'after' should NOT inherit the inner ordered counter; got {text:?}"
+        );
+    }
+
+    // ── render_markdown: soft/hard break + paragraph flush (452, 581, 591) ─
+
+    #[test]
+    fn render_markdown_soft_break_inserts_space() {
+        // kills delete Event::SoftBreak arm (581): orig joins lines with a
+        // space; mutant drops the space -> "helloworld".
+        let lines = render_markdown("hello\nworld", 80);
+        let text = all_text(&lines);
+        assert!(
+            text.contains("hello world"),
+            "expected soft break to insert a space; got {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_hard_break_flushes_line() {
+        // kills delete Event::HardBreak arm (591): orig flushes -> 2 lines;
+        // mutant (no flush) -> 1 line.
+        let lines = render_markdown("line1  \nline2", 80);
+        assert!(
+            lines.len() >= 2,
+            "expected hard break to split into 2 lines, got {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn render_markdown_two_paragraphs_are_two_lines() {
+        // kills delete TagEnd::Paragraph arm (452): orig flushes between
+        // paragraphs -> 2 lines; mutant -> 1 merged line.
+        let lines = render_markdown("para1\n\npara2", 80);
+        assert!(
+            lines.len() >= 2,
+            "expected two paragraphs on separate lines, got {}",
+            lines.len()
+        );
+    }
+
+    // ── render_markdown: heading level colours (411, 414, 417) ──────────
+
+    fn has_fg(lines: &[Line<'_>], fg: Color) -> bool {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.fg == Some(fg))
+    }
+
+    #[test]
+    fn render_markdown_h1_is_light_cyan() {
+        // kills delete HeadingLevel::H1 arm (411): mutant falls to `_ =>`
+        // (Blue) so H1 is no longer LightCyan.
+        let lines = render_markdown("# H1", 80);
+        assert!(has_fg(&lines, Color::LightCyan), "H1 should be LightCyan");
+    }
+
+    #[test]
+    fn render_markdown_h2_is_cyan() {
+        // kills delete HeadingLevel::H2 arm (414).
+        let lines = render_markdown("## H2", 80);
+        assert!(has_fg(&lines, Color::Cyan), "H2 should be Cyan");
+    }
+
+    #[test]
+    fn render_markdown_h3_is_light_blue() {
+        // kills delete HeadingLevel::H3 arm (417).
+        let lines = render_markdown("### H3", 80);
+        assert!(has_fg(&lines, Color::LightBlue), "H3 should be LightBlue");
+    }
+
+    // ── render_markdown: style pop on end (455, 457, 486) ───────────────
+
+    #[test]
+    fn render_markdown_bold_style_does_not_persist_past_end() {
+        // kills delete TagEnd::Strong|Emphasis (455) and `>`->`==`/`<` in
+        // the `len > 1` pop guard (457): without popping, the bold style
+        // leaks onto the following plain text.
+        let lines = render_markdown("**b** plain", 80);
+        let plain_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref().contains("plain"));
+        let span = plain_span.expect("a span containing 'plain' must exist");
+        assert!(
+            !span.style.add_modifier.contains(Modifier::BOLD),
+            "'plain' should not be bold; got {span:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_heading_style_does_not_persist_past_end() {
+        // kills `>`->`==`/`<` in the heading `len > 1` pop guard (486):
+        // without popping, the LightCyan heading style leaks onto "body".
+        let lines = render_markdown("# H\nbody", 80);
+        let body_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref().contains("body"));
+        let span = body_span.expect("a span containing 'body' must exist");
+        assert_ne!(
+            span.style.fg,
+            Some(Color::LightCyan),
+            "'body' should not inherit the heading colour; got {span:?}"
+        );
+    }
+
+    // ── parse_table_rows: alignment separator (711:84) ──────────────────
+
+    #[test]
+    fn parse_table_rows_detects_alignment_separator() {
+        // kills the inner `||`->`&&` (711:84): a `:`-alignment separator is
+        // detected under orig; mutant makes `:` chars fail the dash check.
+        let parsed = parse_table_rows(&["|:--:|:--:|"]);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].0, "alignment separator should be flagged is_sep");
+    }
+
+    // ── make_border_line: border width + separator count (733, 736) ─────
+
+    #[test]
+    fn render_table_top_border_has_correct_width_and_separators() {
+        // 3 cols, each width 3 (content "xxx"), gutter "", max=0 (no cap).
+        // top border width = 1 + 3*(3+2) + 2 sep + 1 = 1+15+2+1 = 19.
+        // sep count (┬) = ncols-1 = 2.
+        // Kills 733 `+`->`*` (w+2 -> w*2 -> wider), 736:14 `<`->`==`/`>`/`<=`
+        // and 736:33 `-`->`+`/`/` (sep count changes).
+        let rows = [
+            "| xxx | xxx | xxx |",
+            "|---|---|---|",
+            "| yyy | yyy | yyy |",
+        ];
+        let lines = render_table(&row_refs(&rows), "", Style::default(), 0);
+        let top = line_text(&lines[0]);
+        let top_w = unicode_width::UnicodeWidthStr::width(top.as_str());
+        assert_eq!(top_w, 19, "top border width {top_w} != 19: {top:?}");
+        let sep_count = top.chars().filter(|c| *c == '┬').count();
+        assert_eq!(sep_count, 2, "expected 2 ┬ separators, got {top:?}");
+    }
+
+    // ── truncate_to_visual_width (763) ──────────────────────────────────
+
+    #[test]
+    fn truncate_to_visual_width_budget_boundary() {
+        // kills `>`->`>=` in `vis_w + cw > budget` (763): "abcdef" with
+        // max_width 3 -> budget 2. orig: 'a'(1),'b'(2) then 'c' 2+1>2 break
+        // -> "ab…"; mutant `>=`: 'b' 1+1>=2 break -> "a…".
+        let (out, w) = truncate_to_visual_width("abcdef", 3);
+        assert_eq!(out, "ab…");
+        assert_eq!(w, 3);
+    }
+
+    // ── is_double: next-non-star (880:33) ───────────────────────────────
+
+    #[test]
+    fn is_double_minus_one_index_detects_prev_star() {
+        // kills `-`->`/` in `bytes[i - 1]` (880:33): mutant reads bytes[i]
+        // (the char itself, always '*' in this branch) so any '*' at i>0 is
+        // treated as double. "a*b*": orig italicises "b"; mutant skips.
+        let spans = parse_inline("a*b*", Color::White);
+        assert!(
+            italic_count(&spans) >= 1,
+            "expected italic for 'b' in 'a*b*'; got spans={spans:?}"
         );
     }
 
