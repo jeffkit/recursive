@@ -1296,3 +1296,265 @@ fn render_markdown_table_end_to_end() {
     // Should be more than 3 lines (top + header + divider + 2 data + bottom = 6).
     assert!(lines.len() >= 6, "expected ≥6 lines, got {}", lines.len());
 }
+
+#[cfg(test)]
+mod debt_tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+    fn line_width(line: &Line<'_>) -> usize {
+        unicode_width::UnicodeWidthStr::width(line_text(line).as_str())
+    }
+    fn all_text(lines: &[Line<'_>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+    fn row_refs<'a>(rows: &'a [&'a str]) -> Vec<&'a str> {
+        rows.iter().copied().collect()
+    }
+
+    // ── lazy init (33, 38) ──────────────────────────────────────────────
+
+    #[test]
+    fn syntax_set_loads_defaults_not_empty() {
+        // kills syntax_set -> Default::default() (33): the default SyntaxSet
+        // has no syntaxes; the loaded one has many.
+        assert!(syntax_set().syntaxes().len() > 1);
+    }
+
+    #[test]
+    fn theme_set_loads_defaults_not_empty() {
+        // kills theme_set -> Default::default() (38).
+        assert!(theme_set().themes.len() > 1);
+    }
+
+    // ── is_table_line (290) ──────────────────────────────────────────────
+
+    #[test]
+    fn is_table_line_detects_pipe_prefix() {
+        // kills is_table_line -> false (290).
+        assert!(is_table_line("| a | b |"));
+        assert!(is_table_line("  |x|"));
+        assert!(!is_table_line("no pipe here"));
+    }
+
+    // ── render_table width cap (187, 189, 196) ──────────────────────────
+
+    #[test]
+    fn render_table_caps_single_wide_column_to_budget() {
+        // ncols=1, gutter="", content width 3, max=6.
+        // orig: overhead=0+1+3=4, available=2, cap (3*2)/3=2 -> width 6.
+        // Kills: 187 `>`->`<` (skips cap -> width 7), 189:35 `+`->`*`
+        // (overhead 3 -> available 3 -> no cap -> width 7), 189:43 `*`->`+`
+        // (overhead 5 -> available 1 -> cap 1 -> width 5), 196 `/`->`*`
+        // (cap huge -> width huge).
+        let rows = ["| xxx |", "|---|", "| yyy |"];
+        let lines = render_table(&row_refs(&rows), "", Style::default(), 6);
+        assert!(lines.len() >= 4, "expected ≥4 lines, got {}", lines.len());
+        // The data row (index 3) width must equal the budget 6.
+        let data_w = line_width(&lines[3]);
+        assert_eq!(data_w, 6, "data row width {data_w} != budget 6");
+    }
+
+    #[test]
+    fn render_table_caps_three_columns_division_operator() {
+        // ncols=3, gutter="", each col width 3, max=13.
+        // orig: overhead=0+1+9=10, available=3, cap (3*3)/9=1 -> width 13.
+        // Kills 189:43 `*`->`/`: overhead=0+1+3/3=2 -> available=11 -> cap
+        // (3*11)/9=3 -> width 19.
+        let rows = [
+            "| xxx | xxx | xxx |",
+            "|---|---|---|",
+            "| yyy | yyy | yyy |",
+        ];
+        let lines = render_table(&row_refs(&rows), "", Style::default(), 13);
+        let data_w = line_width(&lines[3]);
+        assert_eq!(data_w, 13, "data row width {data_w} != budget 13");
+    }
+
+    #[test]
+    fn render_table_header_only_has_no_divider() {
+        // kills `-`->`+` in `data_rows.len() - 1` (257): with only a header
+        // data row, is_last_data is true -> no divider (3 lines); mutant
+        // makes is_last_data always false -> divider printed (4 lines).
+        let rows = ["| H |", "|---|"];
+        let lines = render_table(&row_refs(&rows), "", Style::default(), 0);
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected top+header+bottom, got {} lines",
+            lines.len()
+        );
+    }
+
+    // ── parse_table_rows separator detection (711) ──────────────────────
+
+    #[test]
+    fn parse_table_rows_detects_dash_separator() {
+        // kills `||`->`&&` (711): non-empty all-dash cells are separators
+        // under orig (`false || true`); mutant `&&` gives false.
+        let parsed = parse_table_rows(&["|---|---|"]);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].0, "separator row should be flagged is_sep=true");
+    }
+
+    // ── render_markdown delete-arm mutants ──────────────────────────────
+
+    #[test]
+    fn render_markdown_emphasis_produces_italic() {
+        // kills delete Tag::Emphasis arm (366).
+        let lines = render_markdown("*italic text*", 80);
+        let has_italic = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(has_italic, "expected an italic span for *italic text*");
+    }
+
+    #[test]
+    fn render_markdown_ordered_list_numbers_items() {
+        // kills delete Tag::List(start) arm (381): without the push, items
+        // fall back to the bullet prefix instead of "1. "/"2. ".
+        let lines = render_markdown("1. first\n2. second", 80);
+        let text = all_text(&lines);
+        assert!(text.contains("1."), "expected '1.' prefix; got {text:?}");
+        assert!(text.contains("2."), "expected '2.' prefix; got {text:?}");
+    }
+
+    #[test]
+    fn render_markdown_heading_is_bold() {
+        // kills delete Tag::Heading arm (408).
+        let lines = render_markdown("# Title", 80);
+        let has_bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_bold, "expected a bold heading span");
+    }
+
+    #[test]
+    fn render_markdown_heading_then_paragraph_are_two_lines() {
+        // kills delete TagEnd::Heading arm (483): without the flush+pop the
+        // heading and paragraph merge into one styled line.
+        let lines = render_markdown("# H\nbody", 80);
+        assert!(
+            lines.len() >= 2,
+            "expected heading and body on separate lines, got {} lines",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn render_markdown_nested_list_outer_bullet_after_inner() {
+        // kills delete TagEnd::List arm (477): without popping the inner
+        // (ordered) list, the following outer item inherits the inner's
+        // ListState and gets a "3." prefix instead of the "• " bullet.
+        let lines = render_markdown("- outer\n  1. inner1\n  2. inner2\n- after", 80);
+        let text = all_text(&lines);
+        assert!(
+            text.contains('\u{2022}'),
+            "expected a bullet for the outer 'after' item; got {text:?}"
+        );
+    }
+
+    // ── syntect_color_to_ratatui (695) ──────────────────────────────────
+
+    #[test]
+    fn syntect_color_to_ratatui_maps_rgb() {
+        // kills -> Default::default() (695).
+        let style = SyntectStyle {
+            foreground: syntect::highlighting::Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            ..Default::default()
+        };
+        assert_eq!(syntect_color_to_ratatui(style), Color::Rgb(10, 20, 30));
+    }
+
+    // ── strip_heading (781, 783) ────────────────────────────────────────
+
+    #[test]
+    fn strip_heading_seven_hashes_is_none() {
+        // kills `<`->`<=` (781): 7 hashes -> orig stops at 6 then fails the
+        // space check (rest="# x") -> None; mutant loops a 7th time -> Some.
+        assert_eq!(strip_heading("####### x"), None);
+    }
+
+    #[test]
+    fn strip_heading_single_hash_strips() {
+        // kills `+=`->`-=` (783): underflow on the first increment either
+        // panics (caught) or wraps, diverging from Some("x").
+        assert_eq!(strip_heading("# x"), Some("x"));
+        assert_eq!(strip_heading("## y"), Some("y"));
+    }
+
+    // ── parse_inline (827, 858) ─────────────────────────────────────────
+
+    #[test]
+    fn parse_inline_bold_at_start_has_no_leading_empty_span() {
+        // kills `>`->`>=` in flush_plain (827): at i=0 with bold found,
+        // flush_plain(0,0) -> orig `0>0` false (no empty span); mutant
+        // `0>=0` true (pushes an empty leading span).
+        let spans = parse_inline("**bold**", Color::White);
+        assert!(!spans.is_empty());
+        assert!(
+            !spans[0].content.as_ref().is_empty(),
+            "first span should be the bold span, not empty; got {spans:?}"
+        );
+        assert_eq!(spans[0].content.as_ref(), "bold");
+    }
+
+    #[test]
+    fn parse_inline_double_underscore_stays_plain() {
+        // kills `>`->`>=` in `close > i + 1` (858): "__" -> orig skips
+        // (close==i+1) keeping "a__b" plain; mutant treats it as empty
+        // italic, dropping the underscores -> text "ab".
+        let spans = parse_inline("a__b", Color::White);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "a__b");
+    }
+
+    // ── is_double (877, 880) ────────────────────────────────────────────
+
+    fn italic_count(spans: &[Span<'_>]) -> usize {
+        spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::ITALIC))
+            .count()
+    }
+
+    #[test]
+    fn is_double_prevents_star_part_of_double_as_italic() {
+        // kills is_double -> false (877:5): "*a**b*" -> orig one italic span
+        // ("a"); mutant (always false) also italicises "b" -> two italic
+        // spans.
+        let spans = parse_inline("*a**b*", Color::White);
+        assert_eq!(italic_count(&spans), 1, "spans={spans:?}");
+    }
+
+    #[test]
+    fn is_double_underscore_adjacent_to_star_is_not_double() {
+        // kills `!=`->`==` (877:17): "_*x*_" -> orig opens italic on the
+        // leading "_" (is_double false for non-'*') -> italic span; mutant
+        // returns true for the "_" next to "*" -> italic skipped.
+        let spans = parse_inline("_*x*_", Color::White);
+        assert!(
+            italic_count(&spans) >= 1,
+            "expected italic for '_*x*_' ; got spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn is_double_prev_star_detected() {
+        // kills `>`->`<` in `i > 0` (880): "a**b*" -> orig keeps "a**b*"
+        // plain (the '*' at index 2 has a preceding '*'); mutant makes
+        // `prev` always false, so that '*' opens an italic, dropping a '*'.
+        let spans = parse_inline("a**b*", Color::White);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "a**b*");
+    }
+}
