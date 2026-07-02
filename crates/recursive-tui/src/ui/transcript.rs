@@ -1118,4 +1118,228 @@ mod tests {
         );
         assert!(text.contains("because reasons"));
     }
+
+    // ── debt tests batch (2026-07-02) ────────────────────────────────────
+
+    #[test]
+    fn render_blocks_separates_with_blank_line() {
+        // kills 29:14 `>`->`>=`/`==`/`<`: two blocks must be separated by
+        // a blank line, and the first block must not be preceded by one.
+        let blocks = vec![
+            TranscriptBlock::User {
+                text: "first".into(),
+            },
+            TranscriptBlock::Assistant {
+                text: "second".into(),
+                streaming: false,
+                latency_ms: None,
+            },
+        ];
+        let lines = render_blocks(&blocks, &UsageStats::default(), &theme::DARK, 80);
+        assert!(
+            line_text(&lines[0]).contains("first"),
+            "first line should be the first block; got {:?}",
+            line_text(&lines[0])
+        );
+        assert!(
+            lines.iter().any(|l| line_text(l).is_empty()),
+            "expected a blank separator line"
+        );
+    }
+
+    #[test]
+    fn wrap_lines_to_width_emits_oversized_glyph_on_one_row() {
+        // A single wide char (width 2) on a row narrower than it (w=1)
+        // must still be emitted on a single row. orig: `cur_w > 0` is
+        // false at cur_w==0, suppressing the break. mutant `>=` (84:44):
+        // `cur_w >= 0` is always true -> breaks first -> emits an empty row.
+        let lines = vec![Line::from(Span::raw("中"))];
+        let wrapped = wrap_lines_to_width(&lines, 1);
+        assert_eq!(wrapped.len(), 1, "wide glyph should stay on one row");
+    }
+
+    #[test]
+    fn format_size_bytes_tier() {
+        // kills 425:5 -> String::new()/xyzzy, 425:14 `<`->`>`/`==`.
+        assert_eq!(format_size(500), "500 B");
+    }
+
+    #[test]
+    fn format_size_kilobyte_boundary() {
+        // kills 425:14 `<`->`<=`/`==`, 427:28 `*`->`/`.
+        assert_eq!(format_size(1024), "1.0 KB");
+    }
+
+    #[test]
+    fn format_size_kilobyte_mid() {
+        // kills 427:21 `<`->`>`, 427:28 `*`->`+`.
+        assert_eq!(format_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn format_size_megabyte_boundary() {
+        // kills 427:21 `<`->`<=`/`==`.
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn plan_args_preview_object_string_value() {
+        // kills 588:5 -> String::new()/xyzzy.
+        let s = plan_args_preview(&serde_json::json!({"k": "v"}), 100);
+        assert!(s.contains("k="), "expected key; got {s}");
+        assert!(s.contains("v"), "expected value; got {s}");
+    }
+
+    #[test]
+    fn plan_args_preview_value_at_20_chars_not_truncated() {
+        // kills 596:54 `>`->`==`/`>=` (boundary: 20 chars triggers truncation
+        // in the mutant but not orig).
+        let v = "12345678901234567890"; // 20 chars
+        let s = plan_args_preview(&serde_json::json!({"k": v}), 100);
+        assert!(
+            s.contains(v),
+            "20-char value should not be truncated; got {s}"
+        );
+    }
+
+    #[test]
+    fn plan_args_preview_value_below_20_chars_not_truncated() {
+        // kills 596:54 `>`->`<` (mutant truncates short strings).
+        let v = "1234567890123456"; // 16 chars
+        let s = plan_args_preview(&serde_json::json!({"k": v}), 100);
+        assert!(
+            s.contains(v),
+            "16-char value should not be truncated; got {s}"
+        );
+    }
+
+    #[test]
+    fn plan_args_preview_raw_at_limit_not_truncated() {
+        // raw = `"ab"` (4 chars), limit = 4. kills 613:28 `>`->`==`/`>=`.
+        let s = plan_args_preview(&serde_json::json!("ab"), 4);
+        assert_eq!(s, "\"ab\"");
+    }
+
+    #[test]
+    fn plan_args_preview_raw_below_limit_not_truncated() {
+        // raw = `"a"` (3 chars), limit = 4. kills 613:28 `>`->`<`.
+        let s = plan_args_preview(&serde_json::json!("a"), 4);
+        assert_eq!(s, "\"a\"");
+    }
+
+    #[test]
+    fn plan_args_preview_raw_over_limit_truncates_with_ellipsis() {
+        // raw = `"abcdefghij"` (12), limit = 5 -> `"abc…`. kills 614:51
+        // `-`->`+` (take 6 -> `"abcde…`) and `-`->`/` (take 5 -> `"abcd…`).
+        let s = plan_args_preview(&serde_json::json!("abcdefghij"), 5);
+        assert_eq!(s, "\"abc…");
+    }
+
+    #[test]
+    fn render_error_emits_text_line() {
+        // kills 472:5 -> vec![]/vec![Default::default()].
+        let lines = render_error("boom", &theme::DARK);
+        assert_eq!(lines.len(), 1);
+        assert!(line_text(&lines[0]).contains("boom"));
+    }
+
+    #[test]
+    fn render_plan_proposal_emits_header() {
+        // kills 494:5 -> vec![]/vec![Default::default()].
+        let lines = render_plan_proposal("plan body", &[]);
+        assert!(
+            full_text(&lines).contains("Plan Proposal"),
+            "expected Plan Proposal header"
+        );
+    }
+
+    #[test]
+    fn render_tool_call_failure_uses_error_color_for_args() {
+        // kills delete match arm (332:9): success:false must use
+        // tool_err_fg for the body/args; the mutant falls through to
+        // `_ => status_fg`.
+        let th = &theme::DARK;
+        let result = ToolResultData {
+            success: false,
+            output: "boom".into(),
+            expanded: false,
+        };
+        let lines = render_tool_call("Read", "args", &Some(result), th);
+        let args_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("args"))
+            .expect("args span");
+        assert_eq!(
+            args_span.style.fg,
+            Some(th.tool_err_fg),
+            "failure args should use tool_err_fg"
+        );
+    }
+
+    #[test]
+    fn render_tool_call_shows_size_row_when_output_nonempty() {
+        // kills delete `!` (383:16): orig pushes the size row; mutant
+        // (`if size.is_empty()`) skips it when size is non-empty.
+        let th = &theme::DARK;
+        let result = ToolResultData {
+            success: true,
+            output: "x".into(),
+            expanded: false,
+        };
+        let lines = render_tool_call("Read", "args", &Some(result), th);
+        let text = full_text(&lines);
+        assert!(text.contains("1 B"), "expected size row; got {text}");
+    }
+
+    #[test]
+    fn render_tool_call_six_lines_fully_visible_unexpanded() {
+        // n==6: orig shows all 6 lines (n<=6) with no "more lines" footer.
+        // kills 396:57 `<=`->`>` (mutant takes 3 + footer) and 407:32
+        // `>`->`>=` (mutant adds footer at n==6).
+        let th = &theme::DARK;
+        let output = "l1\nl2\nl3\nl4\nl5\nl6";
+        let result = ToolResultData {
+            success: true,
+            output: output.into(),
+            expanded: false,
+        };
+        let lines = render_tool_call("Read", "args", &Some(result), th);
+        let text = full_text(&lines);
+        assert!(
+            text.contains("l6"),
+            "6th line should be visible; got {text}"
+        );
+        assert!(
+            !text.contains("more lines"),
+            "no footer expected at n==6; got {text}"
+        );
+    }
+
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn render_weixin_message_shows_user_and_text() {
+        // kills 143:5 -> vec![]/vec![Default::default()].
+        let lines = render_weixin_message("alice", "hello");
+        let text = full_text(&lines);
+        assert!(text.contains("alice"));
+        assert!(text.contains("hello"));
+    }
+
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn render_weixin_message_continuation_indent_is_user_len_plus_six() {
+        // kills 165:47 `+`->`-`/`*`: indent = user_id.len() + 6 spaces.
+        let lines = render_weixin_message("abc", "line1\nline2");
+        let indent = lines[1]
+            .spans
+            .first()
+            .map(|s| s.content.as_ref().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            indent,
+            " ".repeat(3 + 6),
+            "expected 9-space indent; got {indent:?}"
+        );
+    }
 }
