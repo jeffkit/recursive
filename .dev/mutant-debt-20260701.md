@@ -244,7 +244,9 @@ All 17 debt-listed mutants killed. Full-file scan: 28 mutants → 28 caught, 0 m
 - `140:30: replace < with <= in collect_files`
 - `140:55: replace * with / in collect_files`
 
-### input_state.rs (11)
+### input_state.rs (11 → 1 unkillable) ✅ done 2026-07-02
+
+All 11 debt-listed mutants killed except `383:35 >`→`>=` (unkillable: after `push`, `len` is always ≥ `HISTORY_CAPACITY + 1`, so `len > cap` and `len >= cap` trigger identically with the same `overflow = len - cap` drain). Full-file scan: 85 mutants → 81 caught, 1 missed, 3 unviable.
 
 - `202:9: replace PromptInputState::delete_forward with ()`
 - `202:24: replace >= with < in PromptInputState::delete_forward`
