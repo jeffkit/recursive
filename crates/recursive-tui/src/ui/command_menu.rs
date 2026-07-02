@@ -1099,3 +1099,182 @@ mod tests {
         assert_eq!(panel_height(&app), 0);
     }
 }
+
+#[cfg(test)]
+mod render_debt_tests {
+    use super::*;
+    use crate::app::{App, AppScreen, InputMode, PendingPermission};
+    use crate::skill_commands::SkillCommand;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    fn draw(width: u16, height: u16, f: impl FnOnce(&mut ratatui::Frame)) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| f(fr)).expect("draw infallible");
+        term.backend().buffer().clone()
+    }
+
+    fn row_text(buf: &Buffer, y: u16, width: u16) -> String {
+        let mut s = String::new();
+        for x in 0..width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.trim_end().to_string()
+    }
+
+    fn any_row_contains(buf: &Buffer, needle: &str, width: u16, height: u16) -> bool {
+        (0..height).any(|y| row_text(buf, y, width).contains(needle))
+    }
+
+    fn row_has_bg(buf: &Buffer, y: u16, width: u16, color: Color) -> bool {
+        (0..width).any(|x| buf[(x, y)].style().bg == Some(color))
+    }
+
+    fn count_symbol(buf: &Buffer, y: u16, width: u16, sym: &str) -> usize {
+        (0..width).filter(|&x| buf[(x, y)].symbol() == sym).count()
+    }
+
+    fn history_app(history: Vec<String>, matches: Vec<usize>, selected: usize) -> App {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::HistorySearch;
+        app.prompt.history = history;
+        app.hsearch_matches = matches;
+        app.hsearch_selected = selected;
+        app.hsearch_query = "q".into();
+        app
+    }
+
+    // ── render_history_search ────────────────────────────────────────────
+
+    #[test]
+    fn history_search_renders_in_mode() {
+        // kills render_history_search -> () (284) and `!=`->`==` guard (284).
+        let app = history_app(vec!["hello world".into()], vec![0], 0);
+        let buf = draw(80, 24, |f| {
+            render_history_search(f, Rect::new(0, 20, 80, 3), &app);
+        });
+        assert!(any_row_contains(&buf, "hello", 80, 24));
+    }
+
+    #[test]
+    fn history_search_skips_when_not_in_mode() {
+        // kills `!=`->`==` from the other side: not in mode -> no render.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::Prompt;
+        app.prompt.history = vec!["hello".into()];
+        app.hsearch_matches = vec![0];
+        app.hsearch_query = "q".into();
+        let buf = draw(80, 24, |f| {
+            render_history_search(f, Rect::new(0, 20, 80, 3), &app);
+        });
+        assert!(!any_row_contains(&buf, "hello", 80, 24));
+        assert!(!any_row_contains(&buf, "🔍", 80, 24));
+    }
+
+    #[test]
+    fn history_search_highlights_selected_row() {
+        // kills `==`->`!=` (321): selected=0 -> row 0 highlighted (LightGreen bg);
+        // mutant highlights row 1 instead.
+        let app = history_app(vec!["aaa".into(), "bbb".into()], vec![0, 1], 0);
+        let buf = draw(80, 24, |f| {
+            render_history_search(f, Rect::new(0, 20, 80, 3), &app);
+        });
+        // Popup at y=16..19; match 0 ("aaa") on row 17, match 1 ("bbb") on 18.
+        assert!(row_has_bg(&buf, 17, 80, Color::LightGreen));
+        assert!(!row_has_bg(&buf, 18, 80, Color::LightGreen));
+    }
+
+    // ── render_panel dispatch + private panels ───────────────────────────
+
+    fn panel_area() -> Rect {
+        Rect::new(0, 20, 80, 8)
+    }
+
+    #[test]
+    fn render_panel_dispatches_command_mode() {
+        // kills delete Command arm in render_panel (394).
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::Command;
+        app.prompt.buffer = "he".into();
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(any_row_contains(&buf, "help", 80, 24));
+    }
+
+    #[test]
+    fn render_panel_dispatches_history_search_mode() {
+        // kills delete HistorySearch arm (396) and render_history_panel -> () (486).
+        let app = history_app(vec!["foo entry".into()], vec![0], 0);
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(any_row_contains(&buf, "foo entry", 80, 24));
+    }
+
+    #[test]
+    fn render_command_panel_shows_skill_argument_hint() {
+        // kills delete `!` in `if !hint.is_empty()` (435).
+        let skill = SkillCommand {
+            name: "refactor".into(),
+            description: "Refactor".into(),
+            aliases: vec![],
+            argument_hint: "<file>".into(),
+            allowed_tools: None,
+            prompt_template: "".into(),
+            source_path: std::path::PathBuf::from("/fake/refactor.md"),
+        };
+        let r = crate::commands::CommandRegistry::default_set().with_skill_commands(vec![skill]);
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::Command;
+        app.commands = r;
+        app.prompt.buffer = "ref".into();
+        let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
+        assert!(any_row_contains(&buf, "<file>", 80, 24));
+    }
+
+    // ── render_permission_modal ──────────────────────────────────────────
+
+    fn app_with_permission(tool: &str, args: &str) -> App {
+        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.pending_permission = Some(PendingPermission {
+            tool_name: tool.into(),
+            args_preview: args.into(),
+            reply: tx,
+        });
+        app
+    }
+
+    #[test]
+    fn permission_modal_renders_when_pending() {
+        // kills render_permission_modal -> () (595).
+        let app = app_with_permission("MyTool", "some args");
+        let buf = draw(80, 24, |f| render_permission_modal(f, &app));
+        assert!(any_row_contains(&buf, "MyTool", 80, 24));
+        assert!(any_row_contains(&buf, "Permission", 80, 24));
+    }
+
+    #[test]
+    fn permission_modal_centered_x_uses_division() {
+        // kills `/`->`%` (603): width 80, modal_w 72 -> x = (80-72)/2 = 4.
+        // orig corner "┌" at (4, 8); mutant `%`: x = 8 % 2 = 0 -> corner at (0, 8).
+        let app = app_with_permission("T", "a");
+        let buf = draw(80, 24, |f| render_permission_modal(f, &app));
+        assert_eq!(buf[(4, 8)].symbol(), "┌");
+    }
+
+    #[test]
+    fn permission_modal_separator_length_uses_subtraction() {
+        // kills `-`->`/` (640): sep = "─".repeat(modal_w - 2) = 70;
+        // mutant `/`: "─".repeat(modal_w / 2) = 36.
+        let app = app_with_permission("T", "a");
+        let buf = draw(80, 24, |f| render_permission_modal(f, &app));
+        // Modal y=8; sep line is the 5th content line -> row 13.
+        assert_eq!(count_symbol(&buf, 13, 80, "─"), 70);
+    }
+}
