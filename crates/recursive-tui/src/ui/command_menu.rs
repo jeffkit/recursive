@@ -284,10 +284,11 @@ pub fn render_atfile(frame: &mut Frame, input_area: Rect, app: &App) {
 }
 
 /// `entry.len() > 60` truncation guard for history-search rows. Extracted
-/// + skipped because `>`→`==`/`>=` is behavior-equivalent: the popup is
-/// clamped to width 60 (inner 58), so the truncated display `" " + 57 +
-/// "…" + " "` (60 chars) and the un-truncated 62-char display both clip
-/// to the same 58 visible cells — orig and mutant render identically.
+/// and skipped because `>` to `==`/`>=` is behavior-equivalent: the popup
+/// is clamped to width 60 (inner 58), so the truncated 60-char display
+/// (`space` + 57 chars + ellipsis + `space`) and the un-truncated 62-char
+/// display both clip to the same 58 visible cells — orig and mutant render
+/// identically.
 #[cfg_attr(test, mutants::skip)]
 #[inline]
 fn history_entry_too_long(len: usize) -> bool {
