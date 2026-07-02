@@ -511,4 +511,86 @@ mod tests {
         // Middle line is empty; col 1 clamps to 0.
         assert_eq!(p.cursor, 4, "empty line, col 0");
     }
+
+    // ── debt tests (2026-07-02) ───────────────────────────────────────────
+
+    #[test]
+    fn delete_forward_removes_char_at_cursor() {
+        // kills delete_forward -> () (202:9), `>=`->`<` (202:24: mutant
+        // returns early when cursor < len, so nothing is deleted), and
+        // `+`->`-` (208:39: `cursor - i` underflows / inverts the drain
+        // range -> panics or wrong slice).
+        let mut p = s("abc", 1);
+        p.delete_forward();
+        assert_eq!(p.buffer, "ac");
+        assert_eq!(p.cursor, 1);
+    }
+
+    #[test]
+    fn move_end_lands_at_line_newline() {
+        // "ab\ncd" with cursor 0 -> move_end finds '\n' at index 2 ->
+        // cursor = 0 + 2 = 2 (the newline position).
+        // kills `+`->`*` (251:34: cursor = 0*2 = 0, no move) and `+`->`-`
+        // (251:34: 0-2 underflows -> panic).
+        let mut p = s("ab\ncd", 0);
+        p.move_end();
+        assert_eq!(p.cursor, 2);
+    }
+
+    #[test]
+    fn move_next_line_advances_past_trailing_newline() {
+        // "a\n" with cursor 0: the cursor is NOT on the last line
+        // (buffer[0..] contains '\n'), so move_next_line proceeds.
+        // cur_line_end = 1, next_line_start = 2 == buffer.len() (2).
+        // orig: `2 > 2` is false -> continues -> cursor lands at 2.
+        // kills `>`->`==` and `>`->`>=` (302:28: guard returns early ->
+        // cursor stays 0).
+        let mut p = s("a\n", 0);
+        p.move_next_line();
+        assert_eq!(p.cursor, 2);
+    }
+
+    #[test]
+    fn cursor_on_last_line_true_when_no_trailing_newline() {
+        // kills cursor_on_last_line -> false (320:9).
+        let p = s("hello", 3);
+        assert!(p.cursor_on_last_line());
+    }
+
+    #[test]
+    fn history_prev_stashes_current_buffer_as_draft() {
+        // kills enter_history_walk -> () (326:9): the mutant skips the
+        // draft stash, so after walking back the draft is empty instead
+        // of "current".
+        let mut p = PromptInputState {
+            buffer: "current".to_string(),
+            cursor: 7,
+            history: vec!["old".to_string()],
+            ..PromptInputState::default()
+        };
+        assert!(p.history_prev());
+        assert_eq!(p.buffer, "old");
+        assert_eq!(p.draft, "current", "draft should stash the live buffer");
+    }
+
+    #[test]
+    fn record_submission_drains_overflow_beyond_capacity() {
+        // Pre-fill history to HISTORY_CAPACITY + 10, then record one more.
+        // orig: push -> len = cap+11; `len > cap` -> overflow = 11 ->
+        // drain 11 -> len = cap.
+        // kills `-`->`/` (384:51: overflow = (cap+11)/cap = 1 -> drains
+        // only 1 -> len = cap+10).
+        let mut p = PromptInputState {
+            history: (0..HISTORY_CAPACITY + 10)
+                .map(|i| format!("h{i}"))
+                .collect(),
+            ..PromptInputState::default()
+        };
+        p.record_submission("new".to_string());
+        assert_eq!(
+            p.history.len(),
+            HISTORY_CAPACITY,
+            "history should be capped at HISTORY_CAPACITY"
+        );
+    }
 }
