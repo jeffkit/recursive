@@ -346,6 +346,55 @@ selected-row Cyan bg), and `load_recent_sessions` (real sessions via
 
 - `742:5: replace load_recent_journal_entries -> Vec<JournalEntry> with vec![]`
 
+## Post-cleanup: skip annotations + gate fix (2026-07-02)
+
+After the per-file cleanup, two structural follow-ups landed in the
+`tui-mutant-debt-rest` worktree to remove residuals that are **not test
+deficiencies** and would otherwise keep the gate non-zero forever:
+
+1. **`#[cfg_attr(test, mutants::skip)]` on structurally untestable code**
+   (added `mutants = "0.0.3"` as a recursive-tui dev-dependency — inert,
+   zero production-binary impact):
+   - `ui/command_menu.rs::longest_common_prefix` — `idx += 1`→`*= 1` hangs
+     (infinite loop). Whole-fn skip; behaviour still pinned by
+     `longest_common_prefix_works`.
+   - `ui/markdown.rs`: extracted a `bump_cursor(&mut i)` helper (skipped)
+     so `parse_inline`'s `i += 1`→`*=`/`-=` hang is suppressed **without**
+     losing mutation coverage on `parse_inline` itself.
+   - `bash.rs::run_bash_command` — `-> ()` makes the fn a no-op; tests
+     awaiting its `ToolCall`/`ToolResult` events hang. Fn-level skip.
+   - `lib.rs::RawModeGuard::drop` — body only emits crossterm terminal
+     commands (disable raw mode / leave alt screen / disable mouse) whose
+     effects are not observable from a unit test. Fn-level skip.
+
+2. **Removed dead code**: `app/commands.rs::handle_esc` had a
+   `_within_window` binding computed but never read (the real double-press
+   check is recomputed further down). Deleted; the `<=`→`>` mutant on that
+   binding can no longer be generated.
+
+3. **Mutant gate feature fix**: `tui-mutants.sh` `FEATURES` now includes
+   `weixin` (`recursive/test-utils,weixin`). Previously the gate ran with
+   `weixin` OFF, so `#[cfg(feature = "weixin")]` renderers
+   (`render_weixin_message`) were never compiled and their mutants were
+   false-positive "missed". With the feature on, those 4 mutants are
+   killed by the existing `--features weixin` tests.
+
+**Verification** (`tui-mutants.sh --jobs 4` over the five skip/gate-fix
+files): the infinite-loop/terminal-I/O **timeouts are gone** for
+command_menu / markdown / bash / lib, and the **4 weixin mutants are gone**
+from transcript. Remaining residuals in those files are exactly the
+documented **behavior-equivalent** ones (command_menu 316:46 ×2 clipping
+equivalence; markdown 187/190/193/226/358/433/437/441/457/486/499/892 —
+width-cap off-by-one, no-op Tag arms, always-true pop guards, unobservable
+`is_double` next-star check), which are the mutation-score ceiling, not
+test debt.
+
+> `app/commands.rs` is **not** re-gated here: its test additions live in
+> the sibling `tui-mutant-debt` worktree, so a gate run on this branch
+> surfaces `handle_skill_install_key` match-arm-deletion timeouts that are
+> already resolved there. The dead-code removal itself is covered by the
+> 660 passing recursive-tui unit tests.
+
 ## Timeout (verify individually — may be slow-test false positives)
 
 - `33:5: replace run_bash_command with ()`
