@@ -343,3 +343,168 @@ fn render_plan_mode_request_banner(frame: &mut Frame, area: Rect) {
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
+
+#[cfg(test)]
+mod debt_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+    use recursive::tools::todo::{TodoItem, TodoStatus};
+
+    fn draw(app: &App, w: u16, h: u16) -> Buffer {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| render(fr, app)).expect("draw infallible");
+        term.backend().buffer().clone()
+    }
+
+    fn all_text(buf: &Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    fn row_y_containing(buf: &Buffer, needle: &str) -> Option<u16> {
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            if row.contains(needle) {
+                return Some(y);
+            }
+        }
+        None
+    }
+
+    fn todo(content: &str, status: TodoStatus, active_form: Option<&str>) -> TodoItem {
+        TodoItem {
+            content: content.to_string(),
+            status,
+            active_form: active_form.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn todo_panel_height_zero_when_empty() {
+        let app = App::new();
+        assert_eq!(todo_panel_height(&app), 0);
+    }
+
+    #[test]
+    fn todo_panel_height_grows_with_items_and_caps_at_six() {
+        // kills todo_panel_height -> 0 (30:5).
+        let mut app = App::new();
+        app.current_todos = vec![todo("a", TodoStatus::Pending, None)];
+        assert_eq!(todo_panel_height(&app), 3); // 1 item + 2 border
+        app.current_todos = (0..6)
+            .map(|i| todo(&format!("t{i}"), TodoStatus::Pending, None))
+            .collect();
+        assert_eq!(todo_panel_height(&app), 8); // 6 + 2
+        app.current_todos = (0..7)
+            .map(|i| todo(&format!("t{i}"), TodoStatus::Pending, None))
+            .collect();
+        assert_eq!(todo_panel_height(&app), 8); // capped 6 + 2
+    }
+
+    #[test]
+    fn render_plan_banner_on_approval_only() {
+        // plan_awaiting_approval=true, plan_mode_request_pending=false.
+        // orig: `true || false` -> banner height 1 -> banner visible.
+        // mutant `&&`: `true && false` -> height 0 -> banner not drawn.
+        // kills 45:65 `||`->`&&`.
+        let mut app = App::new();
+        app.plan_awaiting_approval = true;
+        app.plan_mode_request_pending = false;
+        let buf = draw(&app, 80, 24);
+        assert!(
+            all_text(&buf).contains("Plan awaiting approval"),
+            "expected plan approval banner text"
+        );
+    }
+
+    #[test]
+    fn render_plan_mode_banner_when_pending() {
+        // kills render_plan_mode_request_banner -> () (309:5).
+        let mut app = App::new();
+        app.plan_mode_request_pending = true;
+        app.plan_awaiting_approval = false;
+        let buf = draw(&app, 80, 24);
+        assert!(
+            all_text(&buf).contains("Plan mode request"),
+            "expected plan mode request banner text"
+        );
+    }
+
+    #[test]
+    fn render_empty_state_centers_logo_vertically() {
+        // blocks empty + turn not running -> render_empty_state. With a
+        // tall terminal the logo is padded down by (mh-9)/2 rows. mutant
+        // `/`->`%` pads by (mh-9)%2 (0 or 1) -> logo near the top.
+        // kills 196:45 `/`->`%`.
+        let app = App::new();
+        let buf = draw(&app, 80, 60);
+        let y = row_y_containing(&buf, "┬─┐").expect("logo row should be present");
+        assert!(
+            y >= 10,
+            "logo should be vertically centred (y>=10), got y={y}"
+        );
+    }
+
+    #[test]
+    fn render_todo_panel_visible_when_todos_present() {
+        // turn.running=true so the empty-state splash is NOT shown; the
+        // todo panel renders below the messages area.
+        // kills render_todo_panel -> () (211:5).
+        let mut app = App::new();
+        app.current_todos = vec![todo("Task one", TodoStatus::Pending, None)];
+        app.turn.running = true;
+        let buf = draw(&app, 80, 24);
+        assert!(
+            all_text(&buf).contains("Tasks"),
+            "expected todo panel title 'Tasks'"
+        );
+    }
+
+    #[test]
+    fn render_todo_panel_counts_completed_in_title() {
+        // 3 todos: 1 Completed, 2 Pending. orig title "1/3 done".
+        // mutant `==`->`!=`: counts non-Completed -> "2/3 done".
+        // kills 214:30 `==`->`!=`.
+        let mut app = App::new();
+        app.current_todos = vec![
+            todo("done", TodoStatus::Completed, None),
+            todo("p1", TodoStatus::Pending, None),
+            todo("p2", TodoStatus::Pending, None),
+        ];
+        app.turn.running = true;
+        let buf = draw(&app, 80, 24);
+        assert!(
+            all_text(&buf).contains("1/3"),
+            "expected '1/3' in todo title"
+        );
+    }
+
+    #[test]
+    fn render_todo_panel_uses_content_for_pending_item() {
+        // Pending item: orig uses `content` ("DoThing"); mutant `==`->`!=`
+        // (InProgress filter) uses `active_form` ("DoingThing") because
+        // Pending != InProgress. "DoingThing" does not contain "DoThing"
+        // as a substring, so checking for "DoThing" distinguishes them.
+        // kills 233:41 `==`->`!=`.
+        let mut app = App::new();
+        app.current_todos = vec![todo("DoThing", TodoStatus::Pending, Some("DoingThing"))];
+        app.turn.running = true;
+        let buf = draw(&app, 80, 24);
+        assert!(
+            all_text(&buf).contains("DoThing"),
+            "Pending item should show content 'DoThing'"
+        );
+    }
+}
