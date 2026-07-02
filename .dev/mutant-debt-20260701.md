@@ -283,7 +283,9 @@ All 5 debt-listed mutants killed except `60:9 RawModeGuard::drop -> ()` (unkilla
 - `90:16: delete ! in install_tui_panic_hook`
 - `87:5: replace install_tui_panic_hook with ()`
 
-### skill_commands.rs (3)
+### skill_commands.rs (3 → 0 unkillable) ✅ done 2026-07-02
+
+All 3 debt-listed mutants killed. Full-file scan: 39 mutants → 34 caught, 5 unviable, 0 missed.
 
 - `120:9: replace SkillCommandLoader::search_paths -> Vec<PathBuf> with vec![]`
 - `120:9: replace SkillCommandLoader::search_paths -> Vec<PathBuf> with vec![Default::default()]`
