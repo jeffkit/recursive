@@ -1311,7 +1311,7 @@ mod debt_tests {
         lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
     fn row_refs<'a>(rows: &'a [&'a str]) -> Vec<&'a str> {
-        rows.iter().copied().collect()
+        rows.to_vec()
     }
 
     // ── lazy init (33, 38) ──────────────────────────────────────────────
