@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileS
 import { tmpdir } from 'os'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { execFileSync, spawnSync } from 'child_process'
+import { execFileSync, spawnSync, spawn } from 'child_process'
 
 // 结构化 E2E：用假 recursive 二进制 + 假 cargo 在临时 git 仓里跑完整 flow，
 // 验证 checkpoint→guard→gate→verdict→回滚 全链路，不依赖真实 LLM / API。
@@ -186,4 +186,123 @@ test('E2E fmt 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () => {
   )
 
   rmSync(root, { recursive: true, force: true })
+})
+
+test('E2E commit-pending 成功路径：完整门全绿 → 补提交', () => {
+  // --commit-pending 跳过 agent，对工作树改动跑完整门链，全绿则提交。
+  const { root, repo, binDir } = setup()
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  // 制造未提交改动（修改已跟踪文件，git diff --stat HEAD 才非空）
+  writeFileSync(join(repo, 'src', 'lib.rs'), 'pub fn y() {}\n')
+
+  const r = spawnSync('node', [FLOW, '--run-id', 'e2e-cp-ok', '--repo', repo, '--goal', 'add a helper', '--commit-pending'], {
+    cwd: repo, encoding: 'utf8',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+    timeout: 60_000,
+  })
+  assert.equal(r.status, 0, `commit-pending 应正常退出:\n${r.stdout}\n${r.stderr}`)
+  assert.notEqual(git(['rev-parse', 'HEAD'], repo), baseline, 'commit-pending 全绿应产生提交')
+
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('E2E commit-pending 失败路径：门红灯 → 不提交 + exitCode 1 + 改动保留', () => {
+  const { root, repo, binDir } = setup()
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  writeFileSync(join(repo, 'src', 'lib.rs'), 'pub fn y() {}\n')
+
+  const r = spawnSync('node', [FLOW, '--run-id', 'e2e-cp-fail', '--repo', repo, '--goal', 'add a helper', '--commit-pending'], {
+    cwd: repo, encoding: 'utf8',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CARGO_FAIL: 'test' },
+    timeout: 60_000,
+  })
+  assert.equal(r.status, 1, `commit-pending 门红应退出 1:\n${r.stdout}\n${r.stderr}`)
+  assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, '门红不应提交（HEAD 不变）')
+  // 改动保留（不回滚），便于人手动修复后重试
+  assert.match(git(['status', '--porcelain', '--', 'src/lib.rs'], repo), /^\s*M/, '改动应保留待人处理')
+
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('E2E reviewer 未配置 → UNAVAILABLE（不回滚）→ committed', () => {
+  // 不传 --no-review 也不配 reviewer-provider：selfReview 走 misconfig 分支，
+  // reviewWithRetry 返回 UNAVAILABLE(misconfig)。质量门全绿 → 自动提交，不误回滚。
+  // 这覆盖「reviewer 缺配」与「代码真有问题」被区分的修复。
+  const { root, repo, binDir } = setup()
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  const runId = 'e2e-rev-misconfig'
+
+  const r = spawnSync('node', [FLOW, '--run-id', runId, '--repo', repo, '--goal', 'add a helper'], {
+    cwd: repo, encoding: 'utf8',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+    timeout: 60_000,
+  })
+  assert.equal(r.status, 0, `flow 应正常退出:\n${r.stdout}\n${r.stderr}`)
+  assert.notEqual(git(['rev-parse', 'HEAD'], repo), baseline, 'reviewer 未配置应走 UNAVAILABLE → committed，而非回滚')
+
+  const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
+  assert.equal(state.summary.verdict, 'committed', `verdict 应为 committed，实际: ${state.summary.verdict}`)
+
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('E2E reviewer 正常返回无 VERDICT → UNAVAILABLE（不回滚）→ committed', async () => {
+  // reviewer 正常跑完（exit 0）但没按格式给 VERDICT 行：旧代码「保守判否」会 NEEDS_FIX 回滚，
+  // 现应重试后归 UNAVAILABLE → 不丢弃成果。用假 recursive 始终输出无 VERDICT 文本来模拟。
+  // 伪 API 必须用独立子进程跑：flow 经 spawnSync 调用，会阻塞本测试进程事件循环，
+  // 若 server 与测试同进程则无法响应 flow 的 provider-ping（12s 超时）。
+  const { root, repo, binDir } = setup()
+  const serverScript = join(root, 'fake-api-server.js')
+  writeFileSync(serverScript, `const h=require('node:http');const s=h.createServer((q,r)=>{r.writeHead(200,{'content-type':'application/json'});r.end('{"data":[]}')});s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port))});`)
+  const fakeApi = spawn('node', [serverScript], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] })
+  fakeApi.unref()
+  // await 端口号：事件循环转动后 server 子进程的 stdout 'data' 事件才触发。
+  const port = await new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error('fake api server 5s 内未启动')), 5000)
+    fakeApi.stdout.on('data', d => { clearTimeout(to); resolve(+String(d).trim()) })
+    fakeApi.on('error', reject)
+  })
+
+  const recBin = join(repo, 'target', 'release', 'recursive')
+  // 覆盖假 recursive：主 run 正常改文件；reviewer 调用（带 --allow-tools）输出无 VERDICT 文本
+  const FAKE_NOVERDICT = `#!/bin/sh
+T=""; prev=""
+for a in "$@"; do [ "$prev" = "--transcript-out" ] && T="$a"; prev="$a"; done
+[ -n "$T" ] && printf '{"messages":[{"r":1}]}' > "$T"
+is_review=0
+for a in "$@"; do [ "$a" = "--allow-tools" ] && is_review=1; done
+if [ "$is_review" = "1" ]; then
+  echo "looked at the diff, seems fine, no major issues"
+  exit 0
+else
+  echo "change $$ $(date +%s)" >> CHANGED.txt
+  echo "[done after 3 steps] reason: Done"
+  exit 0
+fi
+`
+  writeFileSync(recBin, FAKE_NOVERDICT); chmodSync(recBin, 0o755)
+  // 仓内 .flowcast/providers.json 注入 openai 型伪 bundle，使 selfReview 进入 spawn 分支（非 misconfig）。
+  mkdirSync(join(repo, '.flowcast'), { recursive: true })
+  writeFileSync(join(repo, '.flowcast', 'providers.json'), JSON.stringify({
+    providers: { fake: { type: 'openai', apiBase: `http://127.0.0.1:${port}`, apiKey: 'k', model: 'm' } },
+  }))
+  git(['add', '.'], repo); git(['commit', '-q', '-m', 'add fake provider'], repo)
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  const runId = 'e2e-rev-no-verdict'
+
+  try {
+    const r = spawnSync('node', [FLOW, '--run-id', runId, '--repo', repo, '--goal', 'add a helper', '--provider', 'fake', '--reviewer-provider', 'fake'], {
+      cwd: repo, encoding: 'utf8',
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      timeout: 60_000,
+    })
+    assert.equal(r.status, 0, `flow 应正常退出:\n${r.stdout}\n${r.stderr}`)
+    assert.notEqual(git(['rev-parse', 'HEAD'], repo), baseline, 'reviewer 无 verdict 应走 UNAVAILABLE → committed，而非回滚')
+
+    const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
+    assert.equal(state.summary.verdict, 'committed', `verdict 应为 committed，实际: ${state.summary.verdict}`)
+  } finally {
+    try { process.kill(fakeApi.pid, 'SIGKILL') } catch { /* 已退出 */ }
+    rmSync(root, { recursive: true, force: true })
+  }
 })
