@@ -315,4 +315,59 @@ mod tests {
             "expected the input box to be rendered at height 2; got {row:?}"
         );
     }
+
+    #[test]
+    fn visible_rows_counts_trailing_newline_as_extra_row() {
+        // "a\n" -> lines() yields 1, trailing +1 -> total 2. mutant
+        // `+`->`-` (38:23): 1 - 1 = 0 -> clamp(1) = 1.
+        assert_eq!(visible_rows("a\n"), 2);
+        assert_eq!(visible_rows("a"), 1);
+    }
+
+    #[test]
+    fn indicator_style_has_mode_colour_and_bold() {
+        // kills indicator_style -> Default::default() (120:5).
+        let style = indicator_style(InputMode::Prompt);
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(
+            (style.add_modifier & Modifier::BOLD) == Modifier::BOLD,
+            "indicator style should be bold"
+        );
+    }
+
+    #[test]
+    fn input_box_title_returns_mode_label() {
+        // kills input_box_title -> ""/"xyzzy" (134:5).
+        assert_eq!(input_box_title(InputMode::Prompt), " Input ");
+        assert_eq!(input_box_title(InputMode::Bash), " Bash ");
+    }
+
+    #[test]
+    fn render_first_line_prefix_uses_indicator_on_first_row() {
+        // Multi-line buffer: orig prefixes the first row with the mode
+        // indicator (`! ` for Bash) and subsequent rows with two spaces.
+        // mutant `==`->`!=` (82:35) swaps them -> the `a` row gets `  `
+        // and the `b` row gets `! `, so `! a` never appears.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new();
+        app.prompt.mode = InputMode::Bash;
+        app.prompt.buffer = "a\nb".into();
+        let backend = TestBackend::new(40, 8);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| render(fr, fr.area(), &app))
+            .expect("draw infallible");
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("! a"),
+            "expected `! a` prefix on the first content row; got {text:?}"
+        );
+    }
 }
