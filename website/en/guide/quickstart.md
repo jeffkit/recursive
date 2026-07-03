@@ -62,7 +62,7 @@ One goal per line. Type `:q` to exit.
 export RECURSIVE_API_KEY="$OPENAI_API_KEY"
 export RECURSIVE_API_BASE="https://api.openai.com/v1"
 export RECURSIVE_MODEL="gpt-4o"
-recursive run "explain src/agent.rs"
+recursive run "explain src/kernel.rs"
 ```
 
 ### Anthropic (Claude)
@@ -72,7 +72,7 @@ export RECURSIVE_API_KEY="$ANTHROPIC_API_KEY"
 export RECURSIVE_API_BASE="https://api.anthropic.com"
 export RECURSIVE_MODEL="claude-sonnet-4-5"
 export RECURSIVE_PROVIDER_TYPE="anthropic"
-recursive run "explain src/agent.rs"
+recursive run "explain src/kernel.rs"
 ```
 
 ### GLM / Zhipu

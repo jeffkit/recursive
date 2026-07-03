@@ -67,16 +67,18 @@ The kernel has five concepts, each independently testable:
 | Concept | Where | Role |
 |---|---|---|
 | `Message` | `src/message.rs` | The only data primitive: chat messages with optional tool calls. |
-| `LlmProvider` | `src/llm/` | Trait for model backends. Adapters: HTTP (OpenAI-compatible), Mock. |
+| `ChatProvider` | `src/llm/` | Trait for model backends. Adapters: HTTP (OpenAI-compatible), Anthropic, Mock. |
 | `Tool` + `ToolRegistry` | `src/tools/` | Trait for side effects the model can request. Sandboxed to a workspace. |
-| `Agent` | `src/agent.rs` | The loop. Receives a goal, alternates model ↔ tools, emits events. |
-| `StepEvent` | `src/agent.rs` | Observer channel for UI / logging / replay. |
+| `AgentKernel` | `src/kernel.rs` | Stateless single-turn executor. Receives a `TurnContext`, returns a `TurnOutcome`. |
+| `AgentRuntime` | `src/runtime.rs` | Stateful wrapper. Owns the transcript, message queue, compaction, and cross-turn state. |
+
+The actual ReAct step loop lives in [`src/run_core.rs::RunCore::run_inner`](src/run_core.rs). The kernel/wrapper split was introduced after the legacy `Agent` / `StepEvent` types were removed (Goal 219). For a deeper tour, see [`docs/architecture/agent-loop.md`](docs/architecture/agent-loop.md).
 
 ### Orthogonality
 
-- **New tool?** Implement `Tool`, register it. No agent changes.
-- **New model backend?** Implement `LlmProvider`. No tool/agent changes.
-- **New UI / observer?** Subscribe to the `StepEvent` channel. No loop changes.
+- **New tool?** Implement `Tool`, register it. No kernel/runtime changes.
+- **New model backend?** Implement `ChatProvider`. No tool/kernel changes.
+- **New UI / observer?** Subscribe to the `AgentEvent` stream via `EventSink`. No loop changes.
 - **New finish reason?** Add a variant to `FinishReason`. Callers can match if they care.
 
 ### Safety primitives baked in
