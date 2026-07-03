@@ -13,14 +13,18 @@ explicitly asked otherwise.
 ## Before touching any code
 
 1. Read `.dev/AGENTS.md` — the full invariant list. Especially:
-   - Invariant #1: Agent loop stays small. Don't branch inside `agent.rs::Agent::run`.
+   - Invariant #1: Agent loop stays small. Don't branch inside `src/run_core.rs::RunCore::run_inner`.
    - Invariant #3: Sandbox. All fs/shell tools go through `tools::resolve_within`.
    - Invariant #5: No `unwrap()`/`expect()` in non-test code.
    - Invariant #7: Finish reasons are data, not errors.
    - Invariant #8: Tool-call ↔ tool-result pairing must be preserved.
 
-2. Check which files your change touches. If you're touching `src/agent.rs`
-   main loop, reconsider — new capabilities belong in tools or providers.
+2. Check which files your change touches. If you're touching the kernel
+   (`src/kernel.rs`) or the ReAct step loop (`src/run_core.rs::RunCore::run_inner`),
+   reconsider — new capabilities belong in tools or providers. The legacy
+   `src/agent.rs` was split into `src/agent/types.rs` (FinishReason etc.),
+   `src/kernel.rs` (stateless executor), and `src/runtime.rs` (stateful wrapper)
+   during Goal 219.
 
 ## Mandatory quality gates (run before declaring done)
 
@@ -58,8 +62,8 @@ see the warning at its top.
 - **Prefer `Edit` discipline mentally**: when editing existing files,
   make minimal, surgical changes. Don't rewrite a whole file to fix one thing.
 - **New tool** → new file under `src/tools/`, register in `src/tools/mod.rs`.
-- **New provider** → new file under `src/llm/`, implement `LlmProvider` trait.
-- **New capability** → never add it as a branch inside `agent.rs::Agent::run`.
+- **New provider** → new file under `src/llm/`, implement `ChatProvider` trait.
+- **New capability** → never add it as a branch inside `src/run_core.rs::RunCore::run_inner`.
 - **Error variants** → add to `src/error.rs`. Never `unwrap()` in product code.
 - **Tests** → `#[cfg(test)] mod tests` in the same file. Every new public
   function/tool/provider gets unit tests.

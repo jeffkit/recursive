@@ -1,10 +1,21 @@
 //! Integration tests for the HTTP API (feature = "http").
 
+// Shared fixtures (mock_config / sample_state / sample_state_with_provider /
+// SET_INSECURE_OK) live in `tests/http_common/mod.rs`. They were inlined here
+// pre-P0-3 and moved out as part of the P0-3 cleanup so the fixtures can be
+// reused by future per-feature-area splits of this file. Declared at the file
+// root (not inside `mod http_tests`) so `#[path]` resolves relative to
+// `tests/http.rs` itself (= `tests/`), exactly like the `tests/invariants/`
+// split does. Gated on `feature = "http"` because the fixtures depend on
+// `recursive::http` types that only exist under that feature.
+#[cfg(feature = "http")]
+#[path = "http_common/mod.rs"]
+mod common;
+
 #[cfg(feature = "http")]
 mod http_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use recursive::config::Config;
     use recursive::http::{
         build_router, build_router_with_auth, build_router_with_auth_and_rate_limit,
         map_agent_event, AppState, AuthConfig, JwtConfig, Metrics, RateLimiter, SessionState,
@@ -14,123 +25,11 @@ mod http_tests {
     use recursive::runtime::AgentRuntimeBuilder;
     use recursive::tools::ToolRegistry;
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::{broadcast, RwLock};
     use tower::ServiceExt;
 
-    /// Since Goal 277, the HTTP server default-deny requires the
-    /// insecure-ok debug escape hatch for no-auth integration tests.
-    static SET_INSECURE_OK: std::sync::Once = std::sync::Once::new();
-
-    fn mock_config() -> Config {
-        Config {
-            workspace: PathBuf::from("/tmp"),
-            api_base: "https://example.invalid/v1".into(),
-            api_key: Some("test-key".into()),
-            model: "mock".into(),
-            provider_type: "openai".into(),
-            preset: None,
-            max_steps: 32,
-            temperature: 0.0,
-            system_prompt: "You are a test assistant.".into(),
-            retry_max: 0,
-            retry_initial_backoff_secs: 1,
-            retry_max_backoff_secs: 1,
-            shell_timeout_secs: 5,
-            headless: false,
-            memory_summary_limit: 5,
-            thinking_budget: None,
-            session_name: None,
-            max_budget_usd: None,
-            extra_dirs: Vec::new(),
-            extra_readonly_dirs: Vec::new(),
-            allow_tools: Vec::new(),
-            context_window_override: None,
-            subagent_max_depth: 2,
-            subagent_enabled: false,
-            allow_bypass_permissions: false,
-            max_search_rounds: 3,
-            stuck_window: 10,
-            stuck_error_rate: 0.8,
-            max_concurrent_runs: 8,
-            goal_eval_transcript_tail: 12,
-            web_search_provider: None,
-            web_search_api_key: None,
-            web_search_jina_key: None,
-        }
-    }
-
-    fn sample_state() -> AppState {
-        SET_INSECURE_OK.call_once(|| {
-            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
-        });
-        let provider = Arc::new(MockProvider::new(vec![Completion {
-            content: "hello".into(),
-            tool_calls: vec![],
-            finish_reason: Some("stop".into()),
-            usage: None,
-            reasoning_content: None,
-        }]));
-        AppState {
-            tools: vec![
-                ToolInfo {
-                    name: "Read".into(),
-                    description: "Read a file from the workspace".into(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string" }
-                        },
-                        "required": ["path"]
-                    }),
-                },
-                ToolInfo {
-                    name: "Write".into(),
-                    description: "Write content to a file".into(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string" },
-                            "content": { "type": "string" }
-                        },
-                        "required": ["path", "content"]
-                    }),
-                },
-            ],
-            config: mock_config(),
-            tool_registry: ToolRegistry::local(),
-            provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            event_channels: Arc::new(RwLock::new(HashMap::new())),
-            metrics: Arc::new(Metrics::default()),
-            slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
-            rate_limiter: RateLimiter::new(10, 1.0),
-            skills: vec![],
-        }
-    }
-
-    fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
-        SET_INSECURE_OK.call_once(|| {
-            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
-        });
-        AppState {
-            tools: vec![],
-            config: mock_config(),
-            tool_registry: ToolRegistry::local(),
-            provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            event_channels: Arc::new(RwLock::new(HashMap::new())),
-            metrics: Arc::new(Metrics::default()),
-            slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
-            rate_limiter: RateLimiter::new(10, 1.0),
-            skills: vec![],
-        }
-    }
+    use crate::common::{mock_config, sample_state, sample_state_with_provider};
 
     #[tokio::test]
     async fn health_returns_ok() {
