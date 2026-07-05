@@ -1,21 +1,42 @@
 # Recursive
 
-A minimal, orthogonal, embeddable coding agent kernel in Rust.
+A Rust coding-agent platform: a small ReAct kernel plus the surrounding
+HTTP API, MCP, multi-agent orchestration, and TUI that turn it into a
+full development tool.
 
 [![CI](https://github.com/jeffkit/recursive/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffkit/recursive/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/recursive-agent.svg)](https://crates.io/crates/recursive-agent)
 [![Docs.rs](https://docs.rs/recursive-agent/badge.svg)](https://docs.rs/recursive-agent)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Recursive is a tiny ReAct-style agent loop that wires together:
+At its core Recursive is a ReAct loop that wires together:
 
 - an **LLM provider** (OpenAI-compatible HTTP by default; works with OpenAI,
-  GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, …)
-- a **tool registry** (`read_file`, `write_file`, `apply_patch`, `list_dir`,
-  `run_shell` out of the box; trivially extensible)
+  GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, …; plus a
+  native Anthropic adapter)
+- a **tool registry** (`Read`, `Write`, `Edit`, `Glob`, `Bash`,
+  `WebFetch`, `WebSearch`, plan-mode, checkpoints, todo, …; plus
+  coordinator-only `team_*` / `task_*` tools and a deferred-tool loader)
 - a **transcript** plus a `StepEvent` stream you can observe
 
-The whole kernel is intentionally small enough to read in one sitting.
+Around that kernel the platform adds opt-in surfaces:
+
+- **HTTP API** — axum-based REST + SSE server with sessions, rate-limiting,
+  JWT/API-key auth, OpenAPI spec (feature `http`)
+- **MCP** — both as a client (consume external MCP servers) and a server
+  (expose Recursive's tools to other MCP-aware agents) (feature `mcp`)
+- **TUI** — ratatui-based interactive client with streaming tool indicators,
+  plan mode, and command palette (`crates/recursive-tui`)
+- **Multi-agent** — agent pool, shared memory, messaging bus, plan-mode
+  coordination (feature `coordinator-mode`)
+- **Cloud runtime** — Redis session store, S3 transcript storage, Docker /
+  E2B sandboxes (features `cloud-runtime` / `e2b-sandbox`)
+- **Vector memory** — sqlite-vec + OpenAI embeddings for episodic recall
+  (feature `vector-memory`)
+- **Loop mode** — `recursive loop` for self-scheduling autonomous agent runs
+
+Embedding just the kernel (no HTTP / TUI / cloud) is supported via
+`--no-default-features`.
 
 ## What's New in v0.5.0
 

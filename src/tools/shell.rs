@@ -91,6 +91,14 @@ impl Tool for RunShell {
         cmd.current_dir(&cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Defence in depth against orphan processes on timeout: Tokio's
+        // `Child` defaults to `kill_on_drop = false`, so a bare `return Err`
+        // in the timeout branch would leave the shell and any of its
+        // descendants running. The timeout branch also calls `start_kill`
+        // explicitly so the intent is visible at the call site, but
+        // `kill_on_drop(true)` covers the case where a future refactor
+        // adds another early return (panic, `?` propagation, etc.).
+        cmd.kill_on_drop(true);
 
         // Apply optional env overrides
         if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
@@ -132,6 +140,13 @@ impl Tool for RunShell {
                 message: format!("wait failed: {e}"),
             })?,
             Err(_) => {
+                // Best-effort SIGKILL of the timed-out process group.
+                // `kill_on_drop(true)` set at spawn is the safety net,
+                // but explicit kill here ensures the OS reaps the child
+                // promptly rather than waiting for the Drop to fire when
+                // the error path returns. `start_kill` is non-blocking
+                // and tolerant of the child having already exited.
+                let _ = child.start_kill();
                 return Err(Error::Tool {
                     name: "Bash".into(),
                     call_id: None,
@@ -211,6 +226,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
+    }
+
+    // Regression: before P0-A, the timeout branch returned Err without
+    // killing the spawned child. `kill_on_drop(true)` and an explicit
+    // `start_kill` together guarantee the child is reaped. We verify by
+    // having the child `exec sleep` (so the shell PID *becomes* the
+    // sleep PID — killing the child kills the actual sleeper), writing
+    // that PID to a marker file, then `kill -0`-polling after the
+    // timeout. Pre-fix this test hangs for the full 30s sleep; post-fix
+    // the PID is gone within a couple of seconds.
+    #[tokio::test]
+    async fn timeout_kills_child_process() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("child.pid");
+        let marker_str = marker.to_string_lossy().into_owned();
+        // `exec` replaces the sh process with sleep, so the PID we
+        // capture is the PID `start_kill` targets.
+        let command = format!("echo $$ > {marker_str} && exec sleep 30");
+        let tool = RunShell::new(tmp.path()).with_timeout(Duration::from_millis(150));
+        let err = tool
+            .execute(json!({ "command": command }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Tool { .. }));
+
+        let pid_str = std::fs::read_to_string(&marker)
+            .expect("child should have written its PID before exec");
+        let pid: i32 = pid_str
+            .trim()
+            .parse()
+            .expect("PID file should contain a number");
+
+        // Poll `kill -0` for up to 5 seconds; the child must be gone.
+        // We shell out instead of binding libc to honour AGENTS.md's
+        // "no new deps without justification" rule.
+        let mut dead = false;
+        for _ in 0..50 {
+            let probe = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .output()
+                .expect("kill -0 probe should spawn");
+            if !probe.status.success() {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            dead,
+            "timed-out child PID {pid} still alive after 5s — orphan"
+        );
     }
 
     #[tokio::test]

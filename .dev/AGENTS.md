@@ -17,25 +17,80 @@ src/
   error.rs          Error / Result; add variants here, never `unwrap()` in code
   message.rs        Message + Role; the only data primitive on the wire
   config.rs         env + CLI driven Config
-  agent.rs          the loop. KEEP TINY. Add capabilities elsewhere.
+  agent/types.rs    FinishReason, PermissionDecision, PermissionHook, PlanningMode
+                    (the legacy src/agent.rs was split in Goal 219 — the runtime
+                    loop now lives in kernel.rs + run_core.rs, see below)
+  kernel.rs         stateless single-turn ReAct executor (AgentKernel + TurnContext)
+  run_core.rs       the ReAct step loop itself (RunCore::run_inner).
+                    KEEP TINY. New capabilities go in tools/, not as new
+                    branches in run_inner. This is the file Invariant #1
+                    protects.
+  runtime.rs        stateful wrapper (AgentRuntime) — transcript, checkpoints,
+                    goal state, message queue, cross-turn compaction
+  runtime_goal.rs   GoalState / GoalStatus / GoalEvaluator (auto-loop judge)
+  coordinator.rs    coordinator-mode orchestrator (multi-agent dispatch)
+  multi.rs          multi-agent pool, shared memory, message bus
+  compact.rs        LLM-driven transcript compaction
+  checkpoint.rs     git-backed shadow-repo snapshots + restore
+  transcript.rs     on-disk transcript (jsonl) reader/writer
+  session/          session lifecycle, persistence, resume, orphan cleanup
+  hooks/            lifecycle hook registry + external hook runner
+  permissions/      layered permissions + auto-classifier
+  memory/           scratchpad + vector memory (sqlite_vec / openai_embedding)
+  storage/          storage backends (local / s3 / redis)
+  http/             axum HTTP API + SSE + auth + rate-limit (feature = "http")
+  mcp.rs            MCP client (model context protocol)
+  mcp_server.rs     expose tools as an MCP server (feature = "mcp")
+  skills.rs         skill discovery + injection
   llm/
-    mod.rs          LlmProvider trait + ToolSpec / ToolCall / Completion
-    mock.rs         MockProvider for tests
+    mod.rs          ChatProvider trait + ToolSpec / ToolCall / Completion
     openai.rs       OpenAI-compatible HTTP adapter
+    anthropic.rs    Anthropic native API adapter
+    mock.rs         MockProvider for tests
+    search.rs       deferred-tool search engine (software ToolSearch)
+    pricing.rs      cost tracking
   tools/
     mod.rs          Tool trait + ToolRegistry + path sandboxing
+    dispatch.rs     invoke_with_audit + touched-file recording + sandbox roots
+    registry.rs     ToolRegistry state, permissions, hooks, classifier
     fs.rs           Read, Write, Glob
-    shell.rs        Bash (timeout, output cap)
-  main.rs           CLI: run / repl / tools
+    shell.rs        Bash (timeout, output cap, kill_on_drop)
+    edit.rs         str_replace Edit tool
+    agent.rs        AgentTool (sub-agent spawn) + shared memory bridge
+    a2a.rs          A2A (agent-to-agent) protocol tools
+    checkpoint.rs   checkpoint_save / checkpoint_list / checkpoint_diff
+    episodic_recall.rs   search past sessions
+    facts.rs        RememberFact / RecallFact / FactStore
+    memory.rs       Scratchpad tools + WorkingMemory
+    send_message.rs WorkerMailbox (coordinator ↔ worker)
+    plan_mode.rs    EnterPlanMode / ExitPlanMode / approval gates
+    todo.rs         TodoWriteTool (task list)
+    web_fetch.rs / web_search.rs     web tools (feature-gated)
+    permission_pipeline.rs / policy_sandbox.rs / audit.rs
+                    pre-execution permission orchestration + audit records
+    task_*.rs / team_*.rs   coordinator-mode task/team tools
+    transport.rs    pluggable transport (local / docker / e2b / ssh)
+    docker_sandbox.rs / docker_provider.rs / e2b_provider.rs
+                    sandboxed Bash providers (feature-gated)
+    run_background.rs       background-job Bash manager
+  main.rs / crates/recursive-cli   CLI: run / repl / tools / loop / http / mcp
+  crates/recursive-tui             ratatui TUI
+  crates/agui-{protocol,client,tui}   AG-UI protocol stack
 
 tests/
+  invariants/       the 8 invariant tests (loop_size, sandbox, pairing, ...)
   smoke.rs          end-to-end: scripted LLM + real fs tools
+  http.rs           HTTP API integration tests
+  http_common/      shared fixtures for HTTP tests
+
+e2e/
+  tests/            container-based end-to-end scenarios (argusai)
 ```
 
 ## Invariants (DO NOT BREAK)
 
 1. **Agent loop stays small.** New capabilities are tools or providers, not
-   branches inside `agent.rs::Agent::run`.
+   branches inside `src/run_core.rs::RunCore::run_inner`.
    Automated test: `tests/invariants/loop_size_orthogonality.rs` (invariant #1)
 2. **Orthogonality.** Tools must not depend on LLM internals; providers must
    not depend on tools.
