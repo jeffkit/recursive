@@ -38,48 +38,53 @@ Around that kernel the platform adds opt-in surfaces:
 Embedding just the kernel (no HTTP / TUI / cloud) is supported via
 `--no-default-features`.
 
-## What's New in v0.5.0
-
-- **HTTP API** — axum-based REST server with sessions, SSE streaming, OpenAPI spec
-- **Terminal UI** — ratatui-based TUI with streaming tool indicators, plan mode
-- **Multi-Agent** — agent pool, shared memory, messaging bus, pipeline & team orchestration
-- **Python SDK** — `pip install recursive-client` for programmatic access
-- **Loop Mode** — `recursive loop` for self-scheduling autonomous agent runs
+> The crate is published as `recursive-agent` because the name `recursive`
+> was taken on crates.io. The installed binary is still called `recursive`,
+> and the library is imported as `use recursive::*;`.
 
 ## At a glance
 
+Wire up an OpenAI-compatible LLM, register some tools, and drive the
+agent loop. This is the v0.7 surface — the legacy `Agent` type from
+v0.5 was split into `AgentKernel` (stateless) and `AgentRuntime`
+(stateful wrapper) during Goal 219.
+
 ```rust
+use recursive::llm::OpenAiProvider;
+use recursive::runtime::AgentRuntime;
+use recursive::tools::{ReadFile, RunShell, ToolRegistry, WriteFile};
 use std::sync::Arc;
-use recursive::{
-    Agent, ToolRegistry,
-    llm::OpenAiProvider,
-    tools::{ApplyPatch, ListDir, ReadFile, RunShell, WriteFile},
-};
 
 # async fn run() -> anyhow::Result<()> {
-let llm = Arc::new(OpenAiProvider::new(
+let llm = OpenAiProvider::new(
     "https://api.openai.com/v1",
     std::env::var("OPENAI_API_KEY")?,
     "gpt-4o-mini",
-));
+)?;
 
 let tools = ToolRegistry::local()
     .register(Arc::new(ReadFile::new(".")))
     .register(Arc::new(WriteFile::new(".")))
-    .register(Arc::new(ApplyPatch::new(".")))
-    .register(Arc::new(ListDir::new(".")))
     .register(Arc::new(RunShell::new(".")));
 
-let mut agent = Agent::builder()
-    .llm(llm)
+let mut runtime = AgentRuntime::builder()
+    .llm(Arc::new(llm))
     .tools(tools)
     .max_steps(20)
+    .system_prompt("You are a helpful coding assistant.")
     .build()?;
 
-let outcome = agent.run("list the files in src and summarise them").await?;
-println!("{}", outcome.final_message.unwrap_or_default());
+let outcome = runtime
+    .run("list the files in src and summarise them")
+    .await?;
+
+println!("{}", outcome.final_text.unwrap_or_default());
 # Ok(()) }
 ```
+
+Run it with no API key by swapping `OpenAiProvider` for the
+scriptable `MockProvider` — see `examples/basic.rs` and
+`examples/with_tools.rs`.
 
 ## Design
 
@@ -132,10 +137,6 @@ Grab the asset matching your platform from
 ```bash
 cargo install --path .   # or, once published: cargo install recursive-cli
 ```
-
-> The crate is published as `recursive-agent` because the name `recursive` was
-> taken on crates.io. The installed binary is still called `recursive`, and the
-> library is imported as `use recursive::*;`.
 
 ```bash
 # one-off goal

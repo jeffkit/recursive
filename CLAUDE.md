@@ -101,6 +101,40 @@ ls .worktrees/ 2>/dev/null
 
 Don't edit files that a live worktree run is working on.
 
+### Known self-improve failure modes (treat as experimental)
+
+The flow is *not* a fully reliable pipeline. Three failure modes have
+been observed in production and are not yet fixed — assume any of these
+can happen on a given run, and design your workflow around them rather
+than treating the green-path as guaranteed.
+
+1. **Auto-rollback can fail silently when the agent dies mid-fix.** If
+   the agent crashes from an unrecoverable LLM error (auth, quota,
+   malformed provider response), the worktree may be left in a dirty
+   state and the flow's rollback step never runs. **Always check
+   `git -C .worktrees/<name> status` after a run before assuming the
+   rollback succeeded.** A dirty tree means you must `git restore`
+   manually.
+
+2. **Cross-PR landing during a run creates phantom deletions.** When
+   the user (or another agent) merges a PR to `main` while a self-improve
+   run is in flight on a branch forked from old `main`, the eventual
+   merge of the agent branch will appear to delete files that the
+   cross-PR added. **Before merging an agent branch, rebase it onto
+   current `main`** so the diff is computed against the up-to-date
+   tree. `git log --oneline <agent-branch>..main` shows the
+   intervening commits.
+
+3. **`self-improve.sh` is deprecated — always use `parallel-self-improve.sh`.**
+   The legacy script does not handle concurrent runs, does not isolate
+   per-goal worktrees, and does not resume cleanly on context loss. The
+   argument order also differs: `parallel-self-improve.sh` takes
+   `<provider> <goal-file>` (provider first, then goal). The legacy
+   script is kept only for archaeological reference and may be removed.
+
+These three are *known*. New failure modes should be added here as
+they're discovered, not silently worked around.
+
 ## Worktree workflow
 
 All feature development happens in a dedicated worktree, not on the main

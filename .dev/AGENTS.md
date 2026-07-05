@@ -1,5 +1,17 @@
 # AGENTS.md — Project map for Recursive
 
+> **Two files, two audiences — read both.**
+> - **This file** (`.dev/AGENTS.md`) — source-code invariants. Read
+>   before editing `src/`. Documents the 8 invariants the kernel and
+>   run loop depend on, the current module layout, and the quality
+>   gates that must pass before a commit lands.
+> - **`/AGENTS.md`** (project root) — short runtime contract Recursive
+>   injects into its own system prompt at v0.7 (loaded by
+>   `src/config.rs::load_project_context`). Says how to *operate* the
+>   agent: patch format, stuck detection, tool-call pairing. Useful
+>   background when you're changing the prompt, tool registry, or
+>   stuck-detection logic.
+
 You (the agent) are reading this because you are about to modify your own
 source. This file is the contract between you and the supervisor.
 
