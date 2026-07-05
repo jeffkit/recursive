@@ -1,5 +1,15 @@
 # AGENTS.md — Working contract for AI agents in this repo
 
+> **Two files, two audiences — read both.**
+> - **This file** (`/AGENTS.md`) — short runtime contract Recursive
+>   injects into its own system prompt at v0.7 (loaded by
+>   `src/config.rs::load_project_context`). Says how to *operate* the
+>   agent: patch format, stuck detection, tool-call pairing.
+> - **`.dev/AGENTS.md`** — the source-code invariants. Says how to
+>   *modify* the agent: 8 invariants the kernel/run loop depends on,
+>   the current `src/` layout, the quality gates. Read it before
+>   editing `src/`.
+
 You are operating in the **recursive-agent** workspace. This is the
 self-improving coding-agent project. The dev loop drives agents
 (MiniMax / DeepSeek / GLM) to land roadmap features via the Flowcast

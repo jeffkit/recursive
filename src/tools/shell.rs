@@ -16,6 +16,11 @@ use super::Tool;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
+/// Hard ceiling for the LLM-supplied `max_output_bytes` arg. Generous
+/// enough for a full `cargo build` diagnostic dump, small enough that a
+/// runaway command can't exhaust the agent's memory.
+const MAX_OUTPUT_BYTES_HARD_CAP: usize = 2 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct RunShell {
     pub root: PathBuf,
@@ -34,6 +39,16 @@ impl RunShell {
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        self
+    }
+
+    /// Override the default per-stream output cap. Useful when the host
+    /// wants every `Bash` call to retain more (or less) output than the
+    /// 128 KiB default. The LLM can also request a larger cap per-call
+    /// via the `max_output_bytes` arg; this setter only changes the
+    /// baseline the per-call arg is clamped against.
+    pub fn with_max_output_bytes(mut self, n: usize) -> Self {
+        self.max_output_bytes = n.min(MAX_OUTPUT_BYTES_HARD_CAP);
         self
     }
 }
@@ -63,6 +78,11 @@ impl Tool for RunShell {
                         "additionalProperties": {
                             "type": "string"
                         }
+                    },
+                    "max_output_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Per-stream (stdout / stderr) byte cap. Defaults to the tool's configured limit (128 KiB). Pass a larger value (≤ 2 MiB) when you need the full output of a verbose command — e.g. `cargo build` error logs — and the default would truncate the relevant lines. The cap is applied per-stream; both stdout and stderr are bounded independently."
                     }
                 },
                 "required": ["command"]
@@ -128,7 +148,15 @@ impl Tool for RunShell {
             message: "stderr was not piped".into(),
         })?;
 
-        let max = self.max_output_bytes;
+        // LLM may ask for a larger per-stream cap when it knows it needs
+        // the full output (e.g. a long `cargo build` diagnostic). Clamp
+        // to the hard cap so a malformed request can't exhaust memory;
+        // values below the configured default are honoured too, since a
+        // smaller cap is always safe.
+        let max = match args.get("max_output_bytes").and_then(|v| v.as_u64()) {
+            Some(n) => (n as usize).min(MAX_OUTPUT_BYTES_HARD_CAP),
+            None => self.max_output_bytes,
+        };
         let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
         let stderr_task = tokio::spawn(async move { read_capped(&mut stderr, max).await });
 
@@ -226,6 +254,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
+    }
+
+    // The default 128 KiB cap truncates `cargo build`-sized diagnostics
+    // before the relevant error lines. The LLM can opt out per-call by
+    // passing `max_output_bytes`. We verify that:
+    //   1. The arg actually raises the cap (200 KiB output is preserved).
+    //   2. The hard cap (2 MiB) is enforced — a 16 MiB request still
+    //      truncates well below that, so a malformed request can't OOM
+    //      the agent.
+    #[tokio::test]
+    async fn per_call_max_output_bytes_can_raise_within_hard_cap() {
+        let tmp = TempDir::new().unwrap();
+        let tool = RunShell::new(tmp.path());
+        // 200 KiB of `x` lines; default cap would truncate, requested
+        // cap (200 * 1024) keeps it whole.
+        let wanted_bytes = 200 * 1024;
+        let out = tool
+            .execute(json!({
+                "command": format!("yes x | head -c {}", wanted_bytes),
+                "max_output_bytes": wanted_bytes,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("[output truncated]"),
+            "output was truncated despite the per-call cap: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_call_max_output_bytes_clamped_to_hard_cap() {
+        let tmp = TempDir::new().unwrap();
+        let tool = RunShell::new(tmp.path());
+        // 4 MiB request: clamped to 2 MiB hard cap. 3 MiB of output
+        // therefore truncates.
+        let out = tool
+            .execute(json!({
+                "command": "yes x | head -c 3145728",
+                "max_output_bytes": 4_194_304u32,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[output truncated]"),
+            "hard cap was not enforced: {out}"
+        );
     }
 
     // Regression: before P0-A, the timeout branch returned Err without
