@@ -135,6 +135,28 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Assemble the final outcome for a run that terminates with `finish`
+    /// at step `steps`. All early-return paths in [`run_inner`] route here
+    /// so the seven-field struct cannot drift out of sync across sites.
+    fn make_outcome(
+        self,
+        finish: FinishReason,
+        steps: usize,
+        final_message: Option<String>,
+        total_usage: TokenUsage,
+        tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
+    ) -> RunInnerOutcome {
+        RunInnerOutcome {
+            messages: self.messages,
+            final_message,
+            finish_reason: finish,
+            total_usage,
+            total_llm_latency_ms: self.total_llm_latency_ms,
+            steps,
+            tool_audits,
+        }
+    }
+
     /// Call the LLM once, delegating retry handling to the provider's
     /// internal `RetryPolicy`. Goal-288 removed the outer retry loop so
     /// there is exactly one retry layer.
@@ -542,15 +564,13 @@ impl<'a> RunCore<'a> {
                         llm_latency_ms = self.total_llm_latency_ms,
                         "agent.run.complete"
                     );
-                    return Ok(RunInnerOutcome {
-                        messages: self.messages,
+                    return Ok(self.make_outcome(
+                        finish,
+                        finished_steps,
                         final_message,
-                        finish_reason: finish,
                         total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                        steps: finished_steps,
                         tool_audits,
-                    });
+                    ));
                 }
             }
 
@@ -591,15 +611,13 @@ impl<'a> RunCore<'a> {
                         llm_latency_ms = self.total_llm_latency_ms,
                         "agent.run.complete"
                     );
-                    return Ok(RunInnerOutcome {
-                        messages: self.messages,
+                    return Ok(self.make_outcome(
+                        finish,
+                        step,
                         final_message,
-                        finish_reason: finish,
                         total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                        steps: step,
                         tool_audits,
-                    });
+                    ));
                 }
             }
 
@@ -704,16 +722,13 @@ impl<'a> RunCore<'a> {
                     reason: finish_reason_str(&finish),
                     steps: step,
                 });
-                let outcome = RunInnerOutcome {
-                    messages: self.messages,
+                return Ok(self.make_outcome(
+                    finish,
+                    step,
                     final_message,
-                    finish_reason: finish,
                     total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
                     tool_audits,
-                };
-                return Ok(outcome);
+                ));
             }
 
             self.push_message(Message::assistant_with_tool_calls(
@@ -762,15 +777,13 @@ impl<'a> RunCore<'a> {
                     reason: finish_reason_str(&finish),
                     steps: step,
                 });
-                return Ok(RunInnerOutcome {
-                    messages: self.messages,
+                return Ok(self.make_outcome(
+                    finish,
+                    step,
                     final_message,
-                    finish_reason: finish,
                     total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
                     tool_audits,
-                });
+                ));
             }
 
             // Stuck detection may fire while iterating the results of a
@@ -853,15 +866,13 @@ impl<'a> RunCore<'a> {
                     reason: finish_reason_str(&finish),
                     steps: step,
                 });
-                return Ok(RunInnerOutcome {
-                    messages: self.messages,
+                return Ok(self.make_outcome(
+                    finish,
+                    step,
                     final_message,
-                    finish_reason: finish,
                     total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
                     tool_audits,
-                });
+                ));
             }
 
             // Goal-318: after every tool-result batch, check whether any result
@@ -876,20 +887,12 @@ impl<'a> RunCore<'a> {
 
         warn!(target: "recursive::agent", "step budget exceeded");
         let finish = FinishReason::BudgetExceeded;
+        let steps = self.max_steps;
         self.emit(AgentEvent::TurnFinished {
             reason: finish_reason_str(&finish),
-            steps: self.max_steps,
+            steps,
         });
-        let outcome = RunInnerOutcome {
-            messages: self.messages,
-            final_message,
-            finish_reason: finish,
-            total_usage,
-            total_llm_latency_ms: self.total_llm_latency_ms,
-            steps: self.max_steps,
-            tool_audits,
-        };
-        Ok(outcome)
+        Ok(self.make_outcome(finish, steps, final_message, total_usage, tool_audits))
     }
 }
 
