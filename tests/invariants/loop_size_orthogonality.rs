@@ -72,10 +72,16 @@ fn runtime_stays_manageable() {
 /// can't silently inflate it — they must split a helper or move into a
 /// tool / provider instead.
 ///
-/// The threshold is 400 lines, just above the post-G219 baseline (~394).
-/// When this test fires, the right move is usually to extract a phase of
-/// the loop into a sibling helper (e.g. `dispatch_tool_batch`,
-/// `handle_completion`) — NOT to bump the threshold.
+/// The threshold is 150 lines, just above the post-P1-1 baseline (~117).
+/// The original G219 baseline was ~394 lines; the P1-1 split (July 2026)
+/// extracted `make_outcome`, `check_shutdown`, `enforce_transcript_budget`,
+/// `drain_mailbox`, `handle_no_tool_calls`, `process_tool_results`, and
+/// `dispatch_llm_step` as sibling helpers, leaving the loop body as a
+/// small linear sequence: drain mailbox → check budget → call LLM →
+/// handle no-tool-calls → execute tools → process results.
+///
+/// When this test fires, the right move is usually to extract another
+/// phase of the loop into a sibling helper — NOT to bump the threshold.
 #[test]
 fn run_inner_function_body_stays_small() {
     let path = src_file("run_core.rs");
@@ -108,8 +114,8 @@ fn run_inner_function_body_stays_small() {
 
     let body_lines = end_line - sig_line + 1;
     assert!(
-        body_lines <= 400,
-        "invariant #1 violation: RunCore::run_inner is {body_lines} lines (limit: 400). \
+        body_lines <= 150,
+        "invariant #1 violation: RunCore::run_inner is {body_lines} lines (limit: 150). \
          Split a phase of the loop into a sibling helper, or move the new capability \
          into a tool / provider. Do NOT bump the threshold."
     );
