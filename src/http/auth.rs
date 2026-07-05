@@ -3,8 +3,12 @@
 //! Provides API-key and JWT bearer-token authentication. When no
 //! credentials are configured (the default), the middleware returns
 //! 503 Service Unavailable unless the explicit debug escape hatch
-//! `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` is set — this must NEVER be
-//! used in production.
+//! `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` is set. The escape hatch is
+//! **honoured only in debug builds** (`cargo run`, `cargo test`); a
+//! release build silently ignores it and returns 503 instead, so a
+//! Docker image or `--release` binary cannot be tricked into running
+//! unauthenticated by an operator "temporarily" setting the env var
+//! in production.
 
 use axum::http::StatusCode;
 use std::sync::Arc;
@@ -199,29 +203,46 @@ pub(super) async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if !auth.is_enabled() {
-        if !std::env::var("RECURSIVE_HTTP_AUTH_INSECURE_OK")
+        // SEC-007: `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` is a development-only
+        // escape hatch. Release builds **ignore it** so a Docker image or
+        // built binary cannot be tricked into running unauthenticated by an
+        // operator "temporarily" setting the env var in production. Debug
+        // builds (the default `cargo run` / `cargo test` flow) still honour
+        // it so local dev stays frictionless.
+        let insecure_ok_set = std::env::var("RECURSIVE_HTTP_AUTH_INSECURE_OK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if insecure_ok_set && cfg!(debug_assertions) {
+            tracing::warn!(
+                "RECURSIVE_HTTP_AUTH_INSECURE_OK=1 set — bypassing auth. \
+                 Honoured because this is a debug build; release builds \
+                 ignore this switch and return 503 instead. Never use \
+                 this in production."
+            );
+            return next.run(req).await;
+        }
+        if insecure_ok_set && cfg!(not(debug_assertions)) {
+            tracing::error!(
+                "RECURSIVE_HTTP_AUTH_INSECURE_OK is set but ignored in \
+                 release builds. Configure RECURSIVE_HTTP_AUTH_KEYS or \
+                 RECURSIVE_HTTP_AUTH_JWT_SECRET, or unset the env var."
+            );
+        } else {
             tracing::error!(
                 "HTTP server is running with NO auth configured. \
                  Set RECURSIVE_HTTP_AUTH_KEYS=<comma-separated-keys> \
                  or RECURSIVE_HTTP_AUTH_JWT_SECRET=<secret>. \
-                 To override for local dev only, set \
-                 RECURSIVE_HTTP_AUTH_INSECURE_OK=1."
+                 (Debug builds also honour RECURSIVE_HTTP_AUTH_INSECURE_OK=1 \
+                 for local dev.)"
             );
-            let mut resp = axum::response::Response::new(axum::body::Body::from(
-                "auth not configured; set RECURSIVE_HTTP_AUTH_KEYS or \
-                 RECURSIVE_HTTP_AUTH_INSECURE_OK=1 (local dev only)",
-            ));
-            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            return resp;
         }
-        tracing::warn!(
-            "RECURSIVE_HTTP_AUTH_INSECURE_OK=1 set — bypassing auth. \
-             This must NEVER be used in production."
-        );
-        return next.run(req).await;
+        let mut resp = axum::response::Response::new(axum::body::Body::from(
+            "auth not configured; set RECURSIVE_HTTP_AUTH_KEYS or \
+             RECURSIVE_HTTP_AUTH_JWT_SECRET (release builds ignore \
+             RECURSIVE_HTTP_AUTH_INSECURE_OK)",
+        ));
+        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        return resp;
     }
     // Try X-API-Key first (cheaper than JWT verify).
     if !auth.keys.is_empty() {
@@ -364,5 +385,35 @@ mod tests {
         unsafe {
             std::env::remove_var("RECURSIVE_HTTP_AUTH_INSECURE_OK");
         }
+    }
+
+    // SEC-007 regression test: the bypass must be gated on `cfg!(debug_assertions)`,
+    // and the release branch must explicitly reject it. We use source-grep
+    // because a runtime test cannot observe `cfg!` from inside the test
+    // binary (which is always compiled with debug_assertions). This mirrors
+    // the pattern used in `src/http/mod.rs::goal_272_route_level_auth_bypass`
+    // for pinning the structural auth invariant.
+    #[test]
+    fn insecure_ok_bypass_is_gated_on_debug_assertions() {
+        let src = include_str!("auth.rs");
+        let middleware_body = src
+            .split("pub(super) async fn auth_middleware")
+            .nth(1)
+            .expect("auth_middleware must exist");
+        // The bypass branch must be conditional on cfg!(debug_assertions).
+        // Without this gate the bypass would also fire in release builds,
+        // defeating the whole point of SEC-007.
+        assert!(
+            middleware_body.contains("cfg!(debug_assertions)"),
+            "auth_middleware must gate INSECURE_OK bypass on cfg!(debug_assertions)"
+        );
+        // And the release branch must explicitly check + log when the env
+        // var was set but ignored, so an operator who sets it in prod gets
+        // a loud error rather than a silent 503 with no clue why.
+        assert!(
+            middleware_body.contains("cfg!(not(debug_assertions))"),
+            "auth_middleware must have an explicit release-build branch that \
+             surfaces a misuse warning when INSECURE_OK is set"
+        );
     }
 }
