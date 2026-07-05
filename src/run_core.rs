@@ -135,6 +135,38 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Apply transcript-budget enforcement for this step. When configured
+    /// (`max_transcript_chars`) the transcript is trimmed and re-measured;
+    /// if it still exceeds the limit, returns `Some((finish, step))` for
+    /// the caller to route through [`make_outcome`].
+    fn enforce_transcript_budget(
+        &mut self,
+        step: usize,
+        total_usage: &TokenUsage,
+    ) -> Option<(FinishReason, usize)> {
+        let limit = self.max_transcript_chars?;
+        self.maybe_trim_transcript(limit, step);
+        let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        if chars < limit {
+            return None;
+        }
+        let finish = FinishReason::TranscriptLimit { chars, limit };
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: step,
+        });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = step,
+            tokens_in = total_usage.prompt_tokens,
+            tokens_out = total_usage.completion_tokens,
+            finish = ?finish,
+            llm_latency_ms = self.total_llm_latency_ms,
+            "agent.run.complete"
+        );
+        Some((finish, step))
+    }
+
     /// Check the shutdown token at the top of a step. Returns `Some((
     /// finish, finished_steps))` when the run should terminate with
     /// [`FinishReason::Cancelled`]; the caller routes the pair through
@@ -609,32 +641,15 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- transcript budget ------------------------------------------------
-            if let Some(limit) = self.max_transcript_chars {
-                self.maybe_trim_transcript(limit, step);
-                let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
-                if chars >= limit {
-                    let finish = FinishReason::TranscriptLimit { chars, limit };
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: step,
-                    });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = step,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(self.make_outcome(
-                        finish,
-                        step,
-                        final_message,
-                        total_usage,
-                        tool_audits,
-                    ));
-                }
+            if let Some((finish, finish_step)) = self.enforce_transcript_budget(step, &total_usage)
+            {
+                return Ok(self.make_outcome(
+                    finish,
+                    finish_step,
+                    final_message,
+                    total_usage,
+                    tool_audits,
+                ));
             }
 
             // ---- compaction -------------------------------------------------------
