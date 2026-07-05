@@ -135,6 +135,150 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Process the result of a tool batch: emit per-call `ToolResult`
+    /// events, push paired tool_result messages, run sliding-window
+    /// stuck detection, then optionally terminate the run.
+    ///
+    /// Returns `Some(finish)` when the run should end after this batch
+    /// (sentinel pre-pass hits `PermissionDenialLimit`, or stuck
+    /// detection triggers `Stuck`); the caller routes the finish through
+    /// [`make_outcome`]. Returns `None` when the loop should continue.
+    ///
+    /// **Invariant #8**: every tool_call in the batch is paired with a
+    /// tool_result message before any early return. The sentinel pre-pass
+    /// scans the whole batch first and flushes all tool_results
+    /// atomically; the stuck-detection loop likewise pushes each
+    /// tool_result before recording the (deferred) finish verdict. We
+    /// never mid-batch return.
+    ///
+    /// When returning `None`, also runs the Globs-mode skill injector
+    /// against the result strings so the next step can pick up
+    /// path-triggered skills.
+    #[allow(clippy::too_many_arguments)]
+    fn process_tool_results(
+        &mut self,
+        results: &[ToolCallOutcome],
+        step: usize,
+        recent_errors: &mut std::collections::VecDeque<(bool, String)>,
+        tool_audits: &mut std::collections::HashMap<
+            crate::tools::AuditKey,
+            crate::tools::AuditMeta,
+        >,
+        skill_injector: &mut SkillInjector,
+    ) -> Option<FinishReason> {
+        // Goal-285: sentinel pre-pass — detect before any push_message calls.
+        // When the sentinel appears at index N > 0, flushing incrementally
+        // would duplicate results[0..N] in the transcript; scan first, flush
+        // once atomically, return immediately.
+        if results.iter().any(|o| o.result == DENIAL_LIMIT_SENTINEL) {
+            for o in results {
+                if let Some(a) = &o.audit {
+                    tool_audits.insert((self.turn, o.id.clone()), a.clone());
+                }
+                let is_error = o.result.starts_with("ERROR: ") || o.result == DENIAL_LIMIT_SENTINEL;
+                self.emit(AgentEvent::ToolResult {
+                    id: o.id.clone(),
+                    name: o.name.clone(),
+                    output: o.result.clone(),
+                    step,
+                    is_error,
+                });
+                self.push_message(Message::tool_result(o.id.clone(), o.result.clone()));
+            }
+            let finish = FinishReason::PermissionDenialLimit;
+            self.emit(AgentEvent::TurnFinished {
+                reason: finish_reason_str(&finish),
+                steps: step,
+            });
+            return Some(finish);
+        }
+
+        // Stuck detection may fire while iterating the results of a
+        // multi-call step. Returning mid-loop (as this code used to do)
+        // left the assistant message's remaining tool_calls without
+        // matching tool_result messages — orphaned `tool_use` blocks
+        // that the provider rejects on the *next* turn with HTTP 400.
+        // Record the stuck verdict here but defer the actual return
+        // until the loop has pushed a tool_result for every call.
+        let mut stuck_finish: Option<FinishReason> = None;
+        for ToolCallOutcome {
+            id,
+            name,
+            result,
+            audit,
+        } in results
+        {
+            let is_error = result.starts_with("ERROR: ");
+            self.emit(AgentEvent::ToolResult {
+                id: id.clone(),
+                name: name.clone(),
+                output: result.clone(),
+                step,
+                is_error,
+            });
+            if let Some(a) = audit {
+                tool_audits.insert((self.turn, id.clone()), a.clone());
+            }
+            self.push_message(Message::tool_result(id.clone(), result.clone()));
+
+            // Sliding-window stuck detection: track whether each tool call
+            // was an error. Triggers when the error rate in the last
+            // stuck_window steps exceeds stuck_error_rate, catching loops
+            // that cycle across different tools (e.g. A→B→A→B).
+            if recent_errors.len() == self.stuck_window {
+                recent_errors.pop_front();
+            }
+            recent_errors.push_back((is_error, name.clone()));
+
+            if stuck_finish.is_none() && recent_errors.len() == self.stuck_window {
+                let error_entries: Vec<&str> = recent_errors
+                    .iter()
+                    .filter(|(is_err, _)| *is_err)
+                    .map(|(_, n)| n.as_str())
+                    .collect();
+                let error_count = error_entries.len();
+                let rate = error_count as f64 / self.stuck_window as f64;
+                if rate >= self.stuck_error_rate {
+                    let mut counts: std::collections::HashMap<&str, usize> =
+                        std::collections::HashMap::new();
+                    for n in &error_entries {
+                        *counts.entry(n).or_default() += 1;
+                    }
+                    let top_tool = counts
+                        .into_iter()
+                        .max_by_key(|&(_, c)| c)
+                        .map(|(n, _)| n)
+                        .unwrap_or(name.as_str());
+                    stuck_finish = Some(FinishReason::Stuck {
+                        repeated_call: top_tool.to_string(),
+                        repeats: error_count,
+                    });
+                }
+            }
+        }
+
+        // Deferred stuck termination: every tool_call now has its matching
+        // tool_result in the transcript, so ending the turn here cannot
+        // leave orphaned `tool_use` blocks behind.
+        if let Some(finish) = stuck_finish {
+            self.emit(AgentEvent::TurnFinished {
+                reason: finish_reason_str(&finish),
+                steps: step,
+            });
+            return Some(finish);
+        }
+
+        // Goal-318: after every tool-result batch, check whether any result
+        // references a path matching a Globs-mode skill. Inject once per skill.
+        let result_strings: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
+        for (skill_name, skill_body) in skill_injector.check(&result_strings) {
+            self.push_message(Message::system(format!(
+                "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
+            )));
+        }
+        None
+    }
+
     /// Finalise a step whose LLM completion carried no tool calls. Pushes
     /// the assistant message + reasoning onto the transcript, classifies
     /// the finish reason (`ProviderStop` for non-`stop`/`end_turn`
@@ -804,34 +948,13 @@ impl<'a> RunCore<'a> {
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
-            // ── Goal-285: sentinel pre-pass — detect before any push_message calls ──────
-            // The old code checked for DENIAL_LIMIT_SENTINEL inside the outer loop.
-            // When sentinel appeared at index N > 0, results[0..N] had already been
-            // pushed by the outer loop's push_message; the nested inner loop then
-            // pushed ALL results again, duplicating results[0..N] in the transcript.
-            //
-            // Fix: scan first, flush once atomically, return immediately.
-            if results.iter().any(|o| o.result == DENIAL_LIMIT_SENTINEL) {
-                for o in &results {
-                    if let Some(a) = &o.audit {
-                        tool_audits.insert((self.turn, o.id.clone()), a.clone());
-                    }
-                    let is_error =
-                        o.result.starts_with("ERROR: ") || o.result == DENIAL_LIMIT_SENTINEL;
-                    self.emit(AgentEvent::ToolResult {
-                        id: o.id.clone(),
-                        name: o.name.clone(),
-                        output: o.result.clone(),
-                        step,
-                        is_error,
-                    });
-                    self.push_message(Message::tool_result(o.id.clone(), o.result.clone()));
-                }
-                let finish = FinishReason::PermissionDenialLimit;
-                self.emit(AgentEvent::TurnFinished {
-                    reason: finish_reason_str(&finish),
-                    steps: step,
-                });
+            if let Some(finish) = self.process_tool_results(
+                &results,
+                step,
+                &mut recent_errors,
+                &mut tool_audits,
+                &mut skill_injector,
+            ) {
                 return Ok(self.make_outcome(
                     finish,
                     step,
@@ -839,104 +962,6 @@ impl<'a> RunCore<'a> {
                     total_usage,
                     tool_audits,
                 ));
-            }
-
-            // Stuck detection may fire while iterating the results of a
-            // multi-call step. Returning mid-loop (as this code used to do)
-            // left the assistant message's remaining tool_calls without
-            // matching tool_result messages — orphaned `tool_use` blocks that
-            // the provider rejects on the *next* turn with HTTP 400
-            // ("tool_use ids ... were found without tool_result blocks").
-            // Invariant #8 requires every tool_call be paired before the turn
-            // ends, so we record the stuck verdict here but defer the actual
-            // return until the loop has pushed a tool_result for every call.
-            let mut stuck_finish: Option<FinishReason> = None;
-            for ToolCallOutcome {
-                id,
-                name,
-                result,
-                audit,
-            } in &results
-            {
-                let is_error = result.starts_with("ERROR: ");
-                self.emit(AgentEvent::ToolResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    output: result.clone(),
-                    step,
-                    is_error,
-                });
-                // Goal-153: accumulate audit keyed by (turn, tool_call_id).
-                if let Some(a) = audit {
-                    tool_audits.insert((self.turn, id.clone()), a.clone());
-                }
-
-                // Push the tool_result before any (deferred) early
-                // termination so the tool_call ↔ tool_result pairing stays
-                // intact for the whole batch.
-                self.push_message(Message::tool_result(id.clone(), result.clone()));
-
-                // Sliding-window stuck detection: track whether each tool call
-                // was an error. Triggers when the error rate in the last
-                // stuck_window steps exceeds stuck_error_rate, catching loops
-                // that cycle across different tools (e.g. A→B→A→B).
-                if recent_errors.len() == self.stuck_window {
-                    recent_errors.pop_front();
-                }
-                recent_errors.push_back((is_error, name.clone()));
-
-                if stuck_finish.is_none() && recent_errors.len() == self.stuck_window {
-                    let error_entries: Vec<&str> = recent_errors
-                        .iter()
-                        .filter(|(is_err, _)| *is_err)
-                        .map(|(_, n)| n.as_str())
-                        .collect();
-                    let error_count = error_entries.len();
-                    let rate = error_count as f64 / self.stuck_window as f64;
-                    if rate >= self.stuck_error_rate {
-                        // Find the most frequently appearing tool name in the error window.
-                        let mut counts: std::collections::HashMap<&str, usize> =
-                            std::collections::HashMap::new();
-                        for n in &error_entries {
-                            *counts.entry(n).or_default() += 1;
-                        }
-                        let top_tool = counts
-                            .into_iter()
-                            .max_by_key(|&(_, c)| c)
-                            .map(|(n, _)| n)
-                            .unwrap_or(name.as_str());
-                        stuck_finish = Some(FinishReason::Stuck {
-                            repeated_call: top_tool.to_string(),
-                            repeats: error_count,
-                        });
-                    }
-                }
-            }
-
-            // Deferred stuck termination: every tool_call now has its matching
-            // tool_result in the transcript, so ending the turn here cannot
-            // leave orphaned `tool_use` blocks behind.
-            if let Some(finish) = stuck_finish {
-                self.emit(AgentEvent::TurnFinished {
-                    reason: finish_reason_str(&finish),
-                    steps: step,
-                });
-                return Ok(self.make_outcome(
-                    finish,
-                    step,
-                    final_message,
-                    total_usage,
-                    tool_audits,
-                ));
-            }
-
-            // Goal-318: after every tool-result batch, check whether any result
-            // references a path matching a Globs-mode skill.  Inject once per skill.
-            let result_strings: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
-            for (skill_name, skill_body) in skill_injector.check(&result_strings) {
-                self.push_message(Message::system(format!(
-                    "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
-                )));
             }
         }
 
