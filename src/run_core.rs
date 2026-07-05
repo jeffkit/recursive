@@ -135,6 +135,34 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Finalise a step whose LLM completion carried no tool calls. Pushes
+    /// the assistant message + reasoning onto the transcript, classifies
+    /// the finish reason (`ProviderStop` for non-`stop`/`end_turn`
+    /// provider reasons, else `NoMoreToolCalls`), emits `TurnFinished`,
+    /// and returns `Some(finish)` so the caller routes through
+    /// [`make_outcome`]. Returns `None` when the caller should continue
+    /// with tool dispatch.
+    fn handle_no_tool_calls(
+        &mut self,
+        completion: &Completion,
+        step: usize,
+    ) -> Option<FinishReason> {
+        if !completion.tool_calls.is_empty() {
+            return None;
+        }
+        self.push_message(Message::assistant(completion.content.clone()));
+        self.attach_reasoning_content(completion.reasoning_content.clone());
+        let finish = match completion.finish_reason.as_deref() {
+            Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r.to_string()),
+            _ => FinishReason::NoMoreToolCalls,
+        };
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: step,
+        });
+        Some(finish)
+    }
+
     /// Drain any messages that a coordinator pushed via `send_message`
     /// since the last step, appending each as a user-role turn so the
     /// LLM sees coordinator instructions on the next reasoning step.
@@ -748,17 +776,7 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- no tool calls → finish -------------------------------------------
-            if completion.tool_calls.is_empty() {
-                self.push_message(Message::assistant(completion.content.clone()));
-                self.attach_reasoning_content(completion.reasoning_content.clone());
-                let finish = match completion.finish_reason {
-                    Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
-                    _ => FinishReason::NoMoreToolCalls,
-                };
-                self.emit(AgentEvent::TurnFinished {
-                    reason: finish_reason_str(&finish),
-                    steps: step,
-                });
+            if let Some(finish) = self.handle_no_tool_calls(&completion, step) {
                 return Ok(self.make_outcome(
                     finish,
                     step,
