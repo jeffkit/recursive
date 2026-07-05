@@ -135,6 +135,27 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Drain any messages that a coordinator pushed via `send_message`
+    /// since the last step, appending each as a user-role turn so the
+    /// LLM sees coordinator instructions on the next reasoning step.
+    /// No-op when no mailbox is configured.
+    async fn drain_mailbox(&mut self) {
+        let Some(mailbox) = self.mailbox.as_ref() else {
+            return;
+        };
+        let pending = mailbox.drain_all().await;
+        for msg_text in pending {
+            self.push_message(Message {
+                role: crate::message::Role::User,
+                content: format!("[coordinator]: {msg_text}"),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            });
+        }
+    }
+
     /// Apply transcript-budget enforcement for this step. When configured
     /// (`max_transcript_chars`) the transcript is trimmed and re-measured;
     /// if it still exceeds the limit, returns `Some((finish, step))` for
@@ -623,22 +644,7 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- mailbox drain (coordinator → worker mid-run messages) -----------
-            // Drain any messages that a coordinator pushed via `send_message`.
-            // Each pending message is appended as a user-role turn so the LLM
-            // sees coordinator instructions on the next reasoning step.
-            if let Some(ref mailbox) = self.mailbox {
-                let pending = mailbox.drain_all().await;
-                for msg_text in pending {
-                    self.push_message(Message {
-                        role: crate::message::Role::User,
-                        content: format!("[coordinator]: {msg_text}"),
-                        tool_calls: vec![],
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        is_compaction_summary: false,
-                    });
-                }
-            }
+            self.drain_mailbox().await;
 
             // ---- transcript budget ------------------------------------------------
             if let Some((finish, finish_step)) = self.enforce_transcript_budget(step, &total_usage)
