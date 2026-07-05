@@ -125,6 +125,26 @@ impl CheckpointState {
     }
 }
 
+/// Session-lifecycle state. Currently a single `closed` flag set by
+/// `AgentRuntime::close()` to prevent duplicate `SessionEnd` events on
+/// repeat calls. Kept as a sub-struct so future session-scoped signals
+/// (last-activity timestamps, abort signals, etc.) have an obvious
+/// home without bloating `AgentRuntime`'s top-level field list.
+///
+/// Named `SessionLifecycle` (not `SessionState`) to avoid confusion with
+/// `crate::http::SessionState` and `agui_tui::app::SessionState`, which
+/// describe session *metadata* (id, prompt count, last-active timestamp)
+/// rather than the runtime's own lifecycle phase.
+struct SessionLifecycle {
+    closed: bool,
+}
+
+impl SessionLifecycle {
+    fn open() -> Self {
+        Self { closed: false }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // AgentRuntime
 // ──────────────────────────────────────────────────────────────────────────
@@ -150,6 +170,10 @@ pub struct AgentRuntime {
     /// Checkpoint subsystem (snapshot, session-id, writer, touched-files).
     /// Grouped to reduce field count; inactive when checkpoints are disabled.
     checkpoints: CheckpointState,
+    /// Session-lifecycle signals (close flag, future per-session toggles).
+    /// See [`SessionLifecycle`] — kept small for now but is the natural home
+    /// for any new "set once at session start / flip once at close" state.
+    session: SessionLifecycle,
     /// Goal-167: shared task-list state written by `todo_write` calls.
     /// Read back via [`current_todos`](AgentRuntime::current_todos).
     todo_list: Arc<RwLock<Vec<TodoItem>>>,
@@ -171,9 +195,6 @@ pub struct AgentRuntime {
     /// Deferred `TurnFinished` event held by `execute_kernel_turn` until
     /// `emit_turn_messages` can flush it after all assistant messages.
     deferred_turn_finished: Option<AgentEvent>,
-    /// Set by `close()` after `SessionEnd` has been fired; prevents duplicate
-    /// `SessionEnd` events when `close()` is called more than once.
-    session_closed: bool,
     /// Goal-291: number of most-recent transcript messages passed to the
     /// goal-evaluator judge on each turn. Smaller values reduce judge cost;
     /// larger values give the judge more context for long sessions.
@@ -277,10 +298,10 @@ impl AgentRuntime {
     /// give hooks a chance to do post-session cleanup. Calling `run()` after
     /// `close()` is safe but `SessionEnd` will not fire again.
     pub async fn close(&mut self, last_outcome: Option<&RuntimeOutcome>) {
-        if self.session_closed {
+        if self.session.closed {
             return;
         }
-        self.session_closed = true;
+        self.session.closed = true;
         if let Some(outcome) = last_outcome {
             if !matches!(outcome.finish_reason, FinishReason::Cancelled) {
                 self.kernel
@@ -1301,7 +1322,7 @@ impl AgentRuntimeBuilder {
             goal_state: Arc::new(RwLock::new(None)),
             message_queue: std::collections::VecDeque::new(),
             deferred_turn_finished: None,
-            session_closed: false,
+            session: SessionLifecycle::open(),
             goal_eval_transcript_tail: self.goal_eval_transcript_tail,
         })
     }
