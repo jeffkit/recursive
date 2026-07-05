@@ -135,6 +135,112 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Execute one LLM call for this step and surface everything the
+    /// loop body needs: stream-forwarding task, latency tracking,
+    /// token-usage accumulation, and the ordered `Reasoning` /
+    /// `AssistantText` events.
+    ///
+    /// Returns the raw [`Completion`] plus `Some(text)` when the step
+    /// produced non-empty assistant content (which becomes the
+    /// candidate `final_message`). The caller decides what to do with
+    /// the completion (no-tool-calls path vs. tool-dispatch path) and
+    /// owns pushing assistant messages onto the transcript —
+    /// `dispatch_llm_step` deliberately does not mutate `self.messages`.
+    async fn dispatch_llm_step(
+        &mut self,
+        specs: &[crate::llm::ToolSpec],
+        step: usize,
+        total_usage: &mut TokenUsage,
+    ) -> crate::error::Result<(Completion, Option<String>)> {
+        debug!(target: "recursive::agent", step, "calling llm");
+        let start = std::time::Instant::now();
+        // Spin up the partial-token forwarder when streaming so the
+        // UI gets live `PartialToken` / `PartialReasoning` events.
+        let mut forward_handle = None;
+        let stream_tx: Option<StreamSender> = if self.streaming {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamChunk>();
+            let events_tx = self.events.clone();
+            forward_handle = Some(tokio::spawn(async move {
+                while let Some(chunk) = delta_rx.recv().await {
+                    if let Some(ref tx) = events_tx {
+                        let event = match chunk {
+                            StreamChunk::Text(text) => AgentEvent::PartialToken { text, step },
+                            StreamChunk::Reasoning(text) => {
+                                AgentEvent::PartialReasoning { text, step }
+                            }
+                        };
+                        let _ = tx.send(event);
+                    }
+                }
+            }));
+            Some(delta_tx)
+        } else {
+            None
+        };
+        let mut completion: Completion = self.call_llm(specs, stream_tx).await?;
+        // Drain the partial-token forwarder before emitting any further
+        // events. `call_llm` drops `stream_tx` on return, which closes
+        // `delta_rx` and lets the spawned task finish; awaiting it
+        // guarantees every `PartialToken` has been pushed to the event
+        // sink *before* the finalising `AssistantText`. Without this the
+        // two tasks race on the shared sink and a late token can arrive
+        // after the assistant block was finalised, spawning a duplicate
+        // streaming block in the UI.
+        if let Some(handle) = forward_handle.take() {
+            let _ = handle.await;
+        }
+        // Normalise chain-of-thought that the model emitted inline as
+        // `<think>…</think>` in `content` (common for OpenAI-compatible
+        // DeepSeek-R1 deployments that don't use the dedicated
+        // `reasoning_content` SSE field) into the reasoning channel, so
+        // the thinking block renders instead of being dropped by the
+        // markdown HTML-block parser.
+        completion.extract_inline_reasoning();
+        let llm_ms = start.elapsed().as_millis() as u64;
+        self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
+        self.emit(AgentEvent::Latency { step, llm_ms });
+
+        if let Some(u) = completion.usage {
+            *total_usage = total_usage.accumulate(u);
+            self.emit(AgentEvent::Usage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cache_hit_tokens: u.cache_hit_tokens,
+                cache_miss_tokens: u.cache_miss_tokens,
+                step,
+            });
+        }
+
+        // Surface reasoning / thinking content to UI consumers (TUI) as
+        // a separate event so it can be rendered as a `thinking…` block.
+        // Providers that stream reasoning tokens accumulate them into
+        // the final string before this point; we emit exactly once per
+        // step. Emit this BEFORE AssistantText so the TUI's
+        // `Reasoning { text }` block lands above the matching
+        // `Assistant { text }` block — the model thinks first, then
+        // speaks, and the visual order should match.
+        if let Some(reasoning) = &completion.reasoning_content {
+            if !reasoning.is_empty() {
+                self.emit(AgentEvent::Reasoning {
+                    text: reasoning.clone(),
+                    step,
+                });
+            }
+        }
+
+        let new_final_message = if !completion.content.is_empty() {
+            self.emit(AgentEvent::AssistantText {
+                text: completion.content.clone(),
+                step,
+            });
+            Some(completion.content.clone())
+        } else {
+            None
+        };
+
+        Ok((completion, new_final_message))
+    }
+
     /// Process the result of a tool batch: emit per-call `ToolResult`
     /// events, push paired tool_result messages, run sliding-window
     /// stuck detection, then optionally terminate the run.
@@ -834,89 +940,11 @@ impl<'a> RunCore<'a> {
             self.maybe_compact(step).await?;
 
             // ---- LLM call (with retry) --------------------------------------------
-            debug!(target: "recursive::agent", step, "calling llm");
-            let start = std::time::Instant::now();
-            let mut forward_handle = None;
-            let stream_tx: Option<StreamSender> = if self.streaming {
-                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamChunk>();
-                let events_tx = self.events.clone();
-                forward_handle = Some(tokio::spawn(async move {
-                    while let Some(chunk) = delta_rx.recv().await {
-                        if let Some(ref tx) = events_tx {
-                            let event = match chunk {
-                                StreamChunk::Text(text) => AgentEvent::PartialToken { text, step },
-                                StreamChunk::Reasoning(text) => {
-                                    AgentEvent::PartialReasoning { text, step }
-                                }
-                            };
-                            let _ = tx.send(event);
-                        }
-                    }
-                }));
-                Some(delta_tx)
-            } else {
-                None
-            };
-            let mut completion: Completion = self.call_llm(&specs, stream_tx).await?;
-            // Drain the partial-token forwarder before emitting any further
-            // events. `call_llm` drops `stream_tx` on return, which closes
-            // `delta_rx` and lets the spawned task finish; awaiting it
-            // guarantees every `PartialToken` has been pushed to the event
-            // sink *before* the finalising `AssistantText`. Without this the
-            // two tasks race on the shared sink and a late token can arrive
-            // after the assistant block was finalised, spawning a duplicate
-            // streaming block in the UI.
-            if let Some(handle) = forward_handle.take() {
-                let _ = handle.await;
-            }
-            // Normalise chain-of-thought that the model emitted inline as
-            // `<think>…</think>` in `content` (common for OpenAI-compatible
-            // DeepSeek-R1 deployments that don't use the dedicated
-            // `reasoning_content` SSE field) into the reasoning channel, so
-            // the thinking block renders instead of being dropped by the
-            // markdown HTML-block parser.
-            completion.extract_inline_reasoning();
-            let llm_ms = start.elapsed().as_millis() as u64;
-            self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
-            self.emit(AgentEvent::Latency { step, llm_ms });
-
-            if let Some(u) = completion.usage {
-                total_usage = total_usage.accumulate(u);
-                self.emit(AgentEvent::Usage {
-                    input_tokens: u.prompt_tokens,
-                    output_tokens: u.completion_tokens,
-                    cache_hit_tokens: u.cache_hit_tokens,
-                    cache_miss_tokens: u.cache_miss_tokens,
-                    step,
-                });
-            }
-
-            // Surface reasoning / thinking content to UI consumers
-            // (TUI) as a separate event so it can be rendered as a
-            // `thinking…` block. Providers that stream reasoning
-            // tokens accumulate them into the final string before
-            // this point; we emit exactly once per step.
-            //
-            // Emit this BEFORE AssistantText so the TUI's
-            // `Reasoning { text }` block lands above the matching
-            // `Assistant { text }` block in the transcript — the
-            // model thinks first, then speaks, and the visual order
-            // should match.
-            if let Some(reasoning) = &completion.reasoning_content {
-                if !reasoning.is_empty() {
-                    self.emit(AgentEvent::Reasoning {
-                        text: reasoning.clone(),
-                        step,
-                    });
-                }
-            }
-
-            if !completion.content.is_empty() {
-                self.emit(AgentEvent::AssistantText {
-                    text: completion.content.clone(),
-                    step,
-                });
-                final_message = Some(completion.content.clone());
+            let (completion, new_final_message) = self
+                .dispatch_llm_step(&specs, step, &mut total_usage)
+                .await?;
+            if let Some(text) = new_final_message {
+                final_message = Some(text);
             }
 
             // ---- no tool calls → finish -------------------------------------------
