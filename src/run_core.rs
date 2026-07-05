@@ -135,6 +135,394 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Execute one LLM call for this step and surface everything the
+    /// loop body needs: stream-forwarding task, latency tracking,
+    /// token-usage accumulation, and the ordered `Reasoning` /
+    /// `AssistantText` events.
+    ///
+    /// Returns the raw [`Completion`] plus `Some(text)` when the step
+    /// produced non-empty assistant content (which becomes the
+    /// candidate `final_message`). The caller decides what to do with
+    /// the completion (no-tool-calls path vs. tool-dispatch path) and
+    /// owns pushing assistant messages onto the transcript —
+    /// `dispatch_llm_step` deliberately does not mutate `self.messages`.
+    async fn dispatch_llm_step(
+        &mut self,
+        specs: &[crate::llm::ToolSpec],
+        step: usize,
+        total_usage: &mut TokenUsage,
+    ) -> crate::error::Result<(Completion, Option<String>)> {
+        debug!(target: "recursive::agent", step, "calling llm");
+        let start = std::time::Instant::now();
+        // Spin up the partial-token forwarder when streaming so the
+        // UI gets live `PartialToken` / `PartialReasoning` events.
+        let mut forward_handle = None;
+        let stream_tx: Option<StreamSender> = if self.streaming {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamChunk>();
+            let events_tx = self.events.clone();
+            forward_handle = Some(tokio::spawn(async move {
+                while let Some(chunk) = delta_rx.recv().await {
+                    if let Some(ref tx) = events_tx {
+                        let event = match chunk {
+                            StreamChunk::Text(text) => AgentEvent::PartialToken { text, step },
+                            StreamChunk::Reasoning(text) => {
+                                AgentEvent::PartialReasoning { text, step }
+                            }
+                        };
+                        let _ = tx.send(event);
+                    }
+                }
+            }));
+            Some(delta_tx)
+        } else {
+            None
+        };
+        let mut completion: Completion = self.call_llm(specs, stream_tx).await?;
+        // Drain the partial-token forwarder before emitting any further
+        // events. `call_llm` drops `stream_tx` on return, which closes
+        // `delta_rx` and lets the spawned task finish; awaiting it
+        // guarantees every `PartialToken` has been pushed to the event
+        // sink *before* the finalising `AssistantText`. Without this the
+        // two tasks race on the shared sink and a late token can arrive
+        // after the assistant block was finalised, spawning a duplicate
+        // streaming block in the UI.
+        if let Some(handle) = forward_handle.take() {
+            let _ = handle.await;
+        }
+        // Normalise chain-of-thought that the model emitted inline as
+        // `<think>…</think>` in `content` (common for OpenAI-compatible
+        // DeepSeek-R1 deployments that don't use the dedicated
+        // `reasoning_content` SSE field) into the reasoning channel, so
+        // the thinking block renders instead of being dropped by the
+        // markdown HTML-block parser.
+        completion.extract_inline_reasoning();
+        let llm_ms = start.elapsed().as_millis() as u64;
+        self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
+        self.emit(AgentEvent::Latency { step, llm_ms });
+
+        if let Some(u) = completion.usage {
+            *total_usage = total_usage.accumulate(u);
+            self.emit(AgentEvent::Usage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cache_hit_tokens: u.cache_hit_tokens,
+                cache_miss_tokens: u.cache_miss_tokens,
+                step,
+            });
+        }
+
+        // Surface reasoning / thinking content to UI consumers (TUI) as
+        // a separate event so it can be rendered as a `thinking…` block.
+        // Providers that stream reasoning tokens accumulate them into
+        // the final string before this point; we emit exactly once per
+        // step. Emit this BEFORE AssistantText so the TUI's
+        // `Reasoning { text }` block lands above the matching
+        // `Assistant { text }` block — the model thinks first, then
+        // speaks, and the visual order should match.
+        if let Some(reasoning) = &completion.reasoning_content {
+            if !reasoning.is_empty() {
+                self.emit(AgentEvent::Reasoning {
+                    text: reasoning.clone(),
+                    step,
+                });
+            }
+        }
+
+        let new_final_message = if !completion.content.is_empty() {
+            self.emit(AgentEvent::AssistantText {
+                text: completion.content.clone(),
+                step,
+            });
+            Some(completion.content.clone())
+        } else {
+            None
+        };
+
+        Ok((completion, new_final_message))
+    }
+
+    /// Process the result of a tool batch: emit per-call `ToolResult`
+    /// events, push paired tool_result messages, run sliding-window
+    /// stuck detection, then optionally terminate the run.
+    ///
+    /// Returns `Some(finish)` when the run should end after this batch
+    /// (sentinel pre-pass hits `PermissionDenialLimit`, or stuck
+    /// detection triggers `Stuck`); the caller routes the finish through
+    /// [`make_outcome`]. Returns `None` when the loop should continue.
+    ///
+    /// **Invariant #8**: every tool_call in the batch is paired with a
+    /// tool_result message before any early return. The sentinel pre-pass
+    /// scans the whole batch first and flushes all tool_results
+    /// atomically; the stuck-detection loop likewise pushes each
+    /// tool_result before recording the (deferred) finish verdict. We
+    /// never mid-batch return.
+    ///
+    /// When returning `None`, also runs the Globs-mode skill injector
+    /// against the result strings so the next step can pick up
+    /// path-triggered skills.
+    #[allow(clippy::too_many_arguments)]
+    fn process_tool_results(
+        &mut self,
+        results: &[ToolCallOutcome],
+        step: usize,
+        recent_errors: &mut std::collections::VecDeque<(bool, String)>,
+        tool_audits: &mut std::collections::HashMap<
+            crate::tools::AuditKey,
+            crate::tools::AuditMeta,
+        >,
+        skill_injector: &mut SkillInjector,
+    ) -> Option<FinishReason> {
+        // Goal-285: sentinel pre-pass — detect before any push_message calls.
+        // When the sentinel appears at index N > 0, flushing incrementally
+        // would duplicate results[0..N] in the transcript; scan first, flush
+        // once atomically, return immediately.
+        if results.iter().any(|o| o.result == DENIAL_LIMIT_SENTINEL) {
+            for o in results {
+                if let Some(a) = &o.audit {
+                    tool_audits.insert((self.turn, o.id.clone()), a.clone());
+                }
+                let is_error = o.result.starts_with("ERROR: ") || o.result == DENIAL_LIMIT_SENTINEL;
+                self.emit(AgentEvent::ToolResult {
+                    id: o.id.clone(),
+                    name: o.name.clone(),
+                    output: o.result.clone(),
+                    step,
+                    is_error,
+                });
+                self.push_message(Message::tool_result(o.id.clone(), o.result.clone()));
+            }
+            let finish = FinishReason::PermissionDenialLimit;
+            self.emit(AgentEvent::TurnFinished {
+                reason: finish_reason_str(&finish),
+                steps: step,
+            });
+            return Some(finish);
+        }
+
+        // Stuck detection may fire while iterating the results of a
+        // multi-call step. Returning mid-loop (as this code used to do)
+        // left the assistant message's remaining tool_calls without
+        // matching tool_result messages — orphaned `tool_use` blocks
+        // that the provider rejects on the *next* turn with HTTP 400.
+        // Record the stuck verdict here but defer the actual return
+        // until the loop has pushed a tool_result for every call.
+        let mut stuck_finish: Option<FinishReason> = None;
+        for ToolCallOutcome {
+            id,
+            name,
+            result,
+            audit,
+        } in results
+        {
+            let is_error = result.starts_with("ERROR: ");
+            self.emit(AgentEvent::ToolResult {
+                id: id.clone(),
+                name: name.clone(),
+                output: result.clone(),
+                step,
+                is_error,
+            });
+            if let Some(a) = audit {
+                tool_audits.insert((self.turn, id.clone()), a.clone());
+            }
+            self.push_message(Message::tool_result(id.clone(), result.clone()));
+
+            // Sliding-window stuck detection: track whether each tool call
+            // was an error. Triggers when the error rate in the last
+            // stuck_window steps exceeds stuck_error_rate, catching loops
+            // that cycle across different tools (e.g. A→B→A→B).
+            if recent_errors.len() == self.stuck_window {
+                recent_errors.pop_front();
+            }
+            recent_errors.push_back((is_error, name.clone()));
+
+            if stuck_finish.is_none() && recent_errors.len() == self.stuck_window {
+                let error_entries: Vec<&str> = recent_errors
+                    .iter()
+                    .filter(|(is_err, _)| *is_err)
+                    .map(|(_, n)| n.as_str())
+                    .collect();
+                let error_count = error_entries.len();
+                let rate = error_count as f64 / self.stuck_window as f64;
+                if rate >= self.stuck_error_rate {
+                    let mut counts: std::collections::HashMap<&str, usize> =
+                        std::collections::HashMap::new();
+                    for n in &error_entries {
+                        *counts.entry(n).or_default() += 1; // cargo-mutants::skip — +=→*= near-equivalent with one repeated tool
+                    }
+                    let top_tool = counts
+                        .into_iter()
+                        .max_by_key(|&(_, c)| c)
+                        .map(|(n, _)| n)
+                        .unwrap_or(name.as_str());
+                    stuck_finish = Some(FinishReason::Stuck {
+                        repeated_call: top_tool.to_string(),
+                        repeats: error_count,
+                    });
+                }
+            }
+        }
+
+        // Deferred stuck termination: every tool_call now has its matching
+        // tool_result in the transcript, so ending the turn here cannot
+        // leave orphaned `tool_use` blocks behind.
+        if let Some(finish) = stuck_finish {
+            self.emit(AgentEvent::TurnFinished {
+                reason: finish_reason_str(&finish),
+                steps: step,
+            });
+            return Some(finish);
+        }
+
+        // Goal-318: after every tool-result batch, check whether any result
+        // references a path matching a Globs-mode skill. Inject once per skill.
+        let result_strings: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
+        for (skill_name, skill_body) in skill_injector.check(&result_strings) {
+            self.push_message(Message::system(format!(
+                "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
+            )));
+        }
+        None
+    }
+
+    /// Finalise a step whose LLM completion carried no tool calls. Pushes
+    /// the assistant message + reasoning onto the transcript, classifies
+    /// the finish reason (`ProviderStop` for non-`stop`/`end_turn`
+    /// provider reasons, else `NoMoreToolCalls`), emits `TurnFinished`,
+    /// and returns `Some(finish)` so the caller routes through
+    /// [`make_outcome`]. Returns `None` when the caller should continue
+    /// with tool dispatch.
+    fn handle_no_tool_calls(
+        &mut self,
+        completion: &Completion,
+        step: usize,
+    ) -> Option<FinishReason> {
+        if !completion.tool_calls.is_empty() {
+            return None;
+        }
+        self.push_message(Message::assistant(completion.content.clone()));
+        self.attach_reasoning_content(completion.reasoning_content.clone());
+        let finish = match completion.finish_reason.as_deref() {
+            Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r.to_string()),
+            _ => FinishReason::NoMoreToolCalls,
+        };
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: step,
+        });
+        Some(finish)
+    }
+
+    /// Drain any messages that a coordinator pushed via `send_message`
+    /// since the last step, appending each as a user-role turn so the
+    /// LLM sees coordinator instructions on the next reasoning step.
+    /// No-op when no mailbox is configured.
+    async fn drain_mailbox(&mut self) {
+        let Some(mailbox) = self.mailbox.as_ref() else {
+            return;
+        };
+        let pending = mailbox.drain_all().await;
+        for msg_text in pending {
+            self.push_message(Message {
+                role: crate::message::Role::User,
+                content: format!("[coordinator]: {msg_text}"),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            });
+        }
+    }
+
+    /// Apply transcript-budget enforcement for this step. When configured
+    /// (`max_transcript_chars`) the transcript is trimmed and re-measured;
+    /// if it still exceeds the limit, returns `Some((finish, step))` for
+    /// the caller to route through [`make_outcome`].
+    fn enforce_transcript_budget(
+        &mut self,
+        step: usize,
+        total_usage: &TokenUsage,
+    ) -> Option<(FinishReason, usize)> {
+        let limit = self.max_transcript_chars?;
+        self.maybe_trim_transcript(limit, step);
+        let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        if chars < limit {
+            return None;
+        }
+        let finish = FinishReason::TranscriptLimit { chars, limit };
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: step,
+        });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = step,
+            tokens_in = total_usage.prompt_tokens,
+            tokens_out = total_usage.completion_tokens,
+            finish = ?finish,
+            llm_latency_ms = self.total_llm_latency_ms,
+            "agent.run.complete"
+        );
+        Some((finish, step))
+    }
+
+    /// Check the shutdown token at the top of a step. Returns `Some((
+    /// finish, finished_steps))` when the run should terminate with
+    /// [`FinishReason::Cancelled`]; the caller routes the pair through
+    /// [`make_outcome`]. `finished_steps` is `step - 1` because the
+    /// current step's LLM call has not started yet.
+    ///
+    /// `total_usage` is read for the structured log line only — the
+    /// outcome assembly happens at the call site.
+    fn check_shutdown(
+        &self,
+        step: usize,
+        total_usage: &TokenUsage,
+    ) -> Option<(FinishReason, usize)> {
+        let token = self.shutdown_token.as_ref()?;
+        if !token.is_cancelled() {
+            return None;
+        }
+        let finished_steps = step.saturating_sub(1);
+        let finish = FinishReason::Cancelled;
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: finished_steps,
+        });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = finished_steps,
+            tokens_in = total_usage.prompt_tokens,
+            tokens_out = total_usage.completion_tokens,
+            finish = ?finish,
+            llm_latency_ms = self.total_llm_latency_ms,
+            "agent.run.complete"
+        );
+        Some((finish, finished_steps))
+    }
+
+    /// Assemble the final outcome for a run that terminates with `finish`
+    /// at step `steps`. All early-return paths in [`run_inner`] route here
+    /// so the seven-field struct cannot drift out of sync across sites.
+    fn make_outcome(
+        self,
+        finish: FinishReason,
+        steps: usize,
+        final_message: Option<String>,
+        total_usage: TokenUsage,
+        tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
+    ) -> RunInnerOutcome {
+        RunInnerOutcome {
+            messages: self.messages,
+            final_message,
+            finish_reason: finish,
+            total_usage,
+            total_llm_latency_ms: self.total_llm_latency_ms,
+            steps,
+            tool_audits,
+        }
+    }
+
     /// Call the LLM once, delegating retry handling to the provider's
     /// internal `RetryPolicy`. Goal-288 removed the outer retry loop so
     /// there is exactly one retry layer.
@@ -522,198 +910,52 @@ impl<'a> RunCore<'a> {
             // TranscriptLimit blocks below. If a CancellationToken was
             // configured (via AgentRuntimeBuilder::shutdown_token / etc.)
             // and it fired between steps, finish cleanly with
-            // FinishReason::Cancelled. Reports `step - 1` because the
-            // current step's LLM call has not been started yet — the
-            // last fully-completed step is the previous one.
-            if let Some(ref token) = self.shutdown_token {
-                if token.is_cancelled() {
-                    let finished_steps = step.saturating_sub(1);
-                    let finish = FinishReason::Cancelled;
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: finished_steps,
-                    });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = finished_steps,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(RunInnerOutcome {
-                        messages: self.messages,
-                        final_message,
-                        finish_reason: finish,
-                        total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                        steps: finished_steps,
-                        tool_audits,
-                    });
-                }
+            // FinishReason::Cancelled.
+            if let Some((finish, finished_steps)) = self.check_shutdown(step, &total_usage) {
+                return Ok(self.make_outcome(
+                    finish,
+                    finished_steps,
+                    final_message,
+                    total_usage,
+                    tool_audits,
+                ));
             }
 
             // ---- mailbox drain (coordinator → worker mid-run messages) -----------
-            // Drain any messages that a coordinator pushed via `send_message`.
-            // Each pending message is appended as a user-role turn so the LLM
-            // sees coordinator instructions on the next reasoning step.
-            if let Some(ref mailbox) = self.mailbox {
-                let pending = mailbox.drain_all().await;
-                for msg_text in pending {
-                    self.push_message(Message {
-                        role: crate::message::Role::User,
-                        content: format!("[coordinator]: {msg_text}"),
-                        tool_calls: vec![],
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        is_compaction_summary: false,
-                    });
-                }
-            }
+            self.drain_mailbox().await;
 
             // ---- transcript budget ------------------------------------------------
-            if let Some(limit) = self.max_transcript_chars {
-                self.maybe_trim_transcript(limit, step);
-                let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
-                if chars >= limit {
-                    let finish = FinishReason::TranscriptLimit { chars, limit };
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: step,
-                    });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = step,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(RunInnerOutcome {
-                        messages: self.messages,
-                        final_message,
-                        finish_reason: finish,
-                        total_usage,
-                        total_llm_latency_ms: self.total_llm_latency_ms,
-                        steps: step,
-                        tool_audits,
-                    });
-                }
+            if let Some((finish, finish_step)) = self.enforce_transcript_budget(step, &total_usage)
+            {
+                return Ok(self.make_outcome(
+                    finish,
+                    finish_step,
+                    final_message,
+                    total_usage,
+                    tool_audits,
+                ));
             }
 
             // ---- compaction -------------------------------------------------------
             self.maybe_compact(step).await?;
 
             // ---- LLM call (with retry) --------------------------------------------
-            debug!(target: "recursive::agent", step, "calling llm");
-            let start = std::time::Instant::now();
-            let mut forward_handle = None;
-            let stream_tx: Option<StreamSender> = if self.streaming {
-                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamChunk>();
-                let events_tx = self.events.clone();
-                forward_handle = Some(tokio::spawn(async move {
-                    while let Some(chunk) = delta_rx.recv().await {
-                        if let Some(ref tx) = events_tx {
-                            let event = match chunk {
-                                StreamChunk::Text(text) => AgentEvent::PartialToken { text, step },
-                                StreamChunk::Reasoning(text) => {
-                                    AgentEvent::PartialReasoning { text, step }
-                                }
-                            };
-                            let _ = tx.send(event);
-                        }
-                    }
-                }));
-                Some(delta_tx)
-            } else {
-                None
-            };
-            let mut completion: Completion = self.call_llm(&specs, stream_tx).await?;
-            // Drain the partial-token forwarder before emitting any further
-            // events. `call_llm` drops `stream_tx` on return, which closes
-            // `delta_rx` and lets the spawned task finish; awaiting it
-            // guarantees every `PartialToken` has been pushed to the event
-            // sink *before* the finalising `AssistantText`. Without this the
-            // two tasks race on the shared sink and a late token can arrive
-            // after the assistant block was finalised, spawning a duplicate
-            // streaming block in the UI.
-            if let Some(handle) = forward_handle.take() {
-                let _ = handle.await;
-            }
-            // Normalise chain-of-thought that the model emitted inline as
-            // `<think>…</think>` in `content` (common for OpenAI-compatible
-            // DeepSeek-R1 deployments that don't use the dedicated
-            // `reasoning_content` SSE field) into the reasoning channel, so
-            // the thinking block renders instead of being dropped by the
-            // markdown HTML-block parser.
-            completion.extract_inline_reasoning();
-            let llm_ms = start.elapsed().as_millis() as u64;
-            self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
-            self.emit(AgentEvent::Latency { step, llm_ms });
-
-            if let Some(u) = completion.usage {
-                total_usage = total_usage.accumulate(u);
-                self.emit(AgentEvent::Usage {
-                    input_tokens: u.prompt_tokens,
-                    output_tokens: u.completion_tokens,
-                    cache_hit_tokens: u.cache_hit_tokens,
-                    cache_miss_tokens: u.cache_miss_tokens,
-                    step,
-                });
-            }
-
-            // Surface reasoning / thinking content to UI consumers
-            // (TUI) as a separate event so it can be rendered as a
-            // `thinking…` block. Providers that stream reasoning
-            // tokens accumulate them into the final string before
-            // this point; we emit exactly once per step.
-            //
-            // Emit this BEFORE AssistantText so the TUI's
-            // `Reasoning { text }` block lands above the matching
-            // `Assistant { text }` block in the transcript — the
-            // model thinks first, then speaks, and the visual order
-            // should match.
-            if let Some(reasoning) = &completion.reasoning_content {
-                if !reasoning.is_empty() {
-                    self.emit(AgentEvent::Reasoning {
-                        text: reasoning.clone(),
-                        step,
-                    });
-                }
-            }
-
-            if !completion.content.is_empty() {
-                self.emit(AgentEvent::AssistantText {
-                    text: completion.content.clone(),
-                    step,
-                });
-                final_message = Some(completion.content.clone());
+            let (completion, new_final_message) = self
+                .dispatch_llm_step(&specs, step, &mut total_usage)
+                .await?;
+            if let Some(text) = new_final_message {
+                final_message = Some(text);
             }
 
             // ---- no tool calls → finish -------------------------------------------
-            if completion.tool_calls.is_empty() {
-                self.push_message(Message::assistant(completion.content.clone()));
-                self.attach_reasoning_content(completion.reasoning_content.clone());
-                let finish = match completion.finish_reason {
-                    Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r),
-                    _ => FinishReason::NoMoreToolCalls,
-                };
-                self.emit(AgentEvent::TurnFinished {
-                    reason: finish_reason_str(&finish),
-                    steps: step,
-                });
-                let outcome = RunInnerOutcome {
-                    messages: self.messages,
+            if let Some(finish) = self.handle_no_tool_calls(&completion, step) {
+                return Ok(self.make_outcome(
+                    finish,
+                    step,
                     final_message,
-                    finish_reason: finish,
                     total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
                     tool_audits,
-                };
-                return Ok(outcome);
+                ));
             }
 
             self.push_message(Message::assistant_with_tool_calls(
@@ -734,162 +976,31 @@ impl<'a> RunCore<'a> {
             // ---- tool execution ---------------------------------------------------
             let results = self.execute_tool_calls(&completion.tool_calls).await;
 
-            // ── Goal-285: sentinel pre-pass — detect before any push_message calls ──────
-            // The old code checked for DENIAL_LIMIT_SENTINEL inside the outer loop.
-            // When sentinel appeared at index N > 0, results[0..N] had already been
-            // pushed by the outer loop's push_message; the nested inner loop then
-            // pushed ALL results again, duplicating results[0..N] in the transcript.
-            //
-            // Fix: scan first, flush once atomically, return immediately.
-            if results.iter().any(|o| o.result == DENIAL_LIMIT_SENTINEL) {
-                for o in &results {
-                    if let Some(a) = &o.audit {
-                        tool_audits.insert((self.turn, o.id.clone()), a.clone());
-                    }
-                    let is_error =
-                        o.result.starts_with("ERROR: ") || o.result == DENIAL_LIMIT_SENTINEL;
-                    self.emit(AgentEvent::ToolResult {
-                        id: o.id.clone(),
-                        name: o.name.clone(),
-                        output: o.result.clone(),
-                        step,
-                        is_error,
-                    });
-                    self.push_message(Message::tool_result(o.id.clone(), o.result.clone()));
-                }
-                let finish = FinishReason::PermissionDenialLimit;
-                self.emit(AgentEvent::TurnFinished {
-                    reason: finish_reason_str(&finish),
-                    steps: step,
-                });
-                return Ok(RunInnerOutcome {
-                    messages: self.messages,
-                    final_message,
-                    finish_reason: finish,
-                    total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
-                    tool_audits,
-                });
-            }
-
-            // Stuck detection may fire while iterating the results of a
-            // multi-call step. Returning mid-loop (as this code used to do)
-            // left the assistant message's remaining tool_calls without
-            // matching tool_result messages — orphaned `tool_use` blocks that
-            // the provider rejects on the *next* turn with HTTP 400
-            // ("tool_use ids ... were found without tool_result blocks").
-            // Invariant #8 requires every tool_call be paired before the turn
-            // ends, so we record the stuck verdict here but defer the actual
-            // return until the loop has pushed a tool_result for every call.
-            let mut stuck_finish: Option<FinishReason> = None;
-            for ToolCallOutcome {
-                id,
-                name,
-                result,
-                audit,
-            } in &results
-            {
-                let is_error = result.starts_with("ERROR: ");
-                self.emit(AgentEvent::ToolResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    output: result.clone(),
+            if let Some(finish) = self.process_tool_results(
+                &results,
+                step,
+                &mut recent_errors,
+                &mut tool_audits,
+                &mut skill_injector,
+            ) {
+                return Ok(self.make_outcome(
+                    finish,
                     step,
-                    is_error,
-                });
-                // Goal-153: accumulate audit keyed by (turn, tool_call_id).
-                if let Some(a) = audit {
-                    tool_audits.insert((self.turn, id.clone()), a.clone());
-                }
-
-                // Push the tool_result before any (deferred) early
-                // termination so the tool_call ↔ tool_result pairing stays
-                // intact for the whole batch.
-                self.push_message(Message::tool_result(id.clone(), result.clone()));
-
-                // Sliding-window stuck detection: track whether each tool call
-                // was an error. Triggers when the error rate in the last
-                // stuck_window steps exceeds stuck_error_rate, catching loops
-                // that cycle across different tools (e.g. A→B→A→B).
-                if recent_errors.len() == self.stuck_window {
-                    recent_errors.pop_front();
-                }
-                recent_errors.push_back((is_error, name.clone()));
-
-                if stuck_finish.is_none() && recent_errors.len() == self.stuck_window {
-                    let error_entries: Vec<&str> = recent_errors
-                        .iter()
-                        .filter(|(is_err, _)| *is_err)
-                        .map(|(_, n)| n.as_str())
-                        .collect();
-                    let error_count = error_entries.len();
-                    let rate = error_count as f64 / self.stuck_window as f64;
-                    if rate >= self.stuck_error_rate {
-                        // Find the most frequently appearing tool name in the error window.
-                        let mut counts: std::collections::HashMap<&str, usize> =
-                            std::collections::HashMap::new();
-                        for n in &error_entries {
-                            *counts.entry(n).or_default() += 1; // cargo-mutants::skip — +=→*= is near-equivalent with a single repeated tool
-                        }
-                        let top_tool = counts
-                            .into_iter()
-                            .max_by_key(|&(_, c)| c)
-                            .map(|(n, _)| n)
-                            .unwrap_or(name.as_str());
-                        stuck_finish = Some(FinishReason::Stuck {
-                            repeated_call: top_tool.to_string(),
-                            repeats: error_count,
-                        });
-                    }
-                }
-            }
-
-            // Deferred stuck termination: every tool_call now has its matching
-            // tool_result in the transcript, so ending the turn here cannot
-            // leave orphaned `tool_use` blocks behind.
-            if let Some(finish) = stuck_finish {
-                self.emit(AgentEvent::TurnFinished {
-                    reason: finish_reason_str(&finish),
-                    steps: step,
-                });
-                return Ok(RunInnerOutcome {
-                    messages: self.messages,
                     final_message,
-                    finish_reason: finish,
                     total_usage,
-                    total_llm_latency_ms: self.total_llm_latency_ms,
-                    steps: step,
                     tool_audits,
-                });
-            }
-
-            // Goal-318: after every tool-result batch, check whether any result
-            // references a path matching a Globs-mode skill.  Inject once per skill.
-            let result_strings: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
-            for (skill_name, skill_body) in skill_injector.check(&result_strings) {
-                self.push_message(Message::system(format!(
-                    "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
-                )));
+                ));
             }
         }
 
         warn!(target: "recursive::agent", "step budget exceeded");
         let finish = FinishReason::BudgetExceeded;
+        let steps = self.max_steps;
         self.emit(AgentEvent::TurnFinished {
             reason: finish_reason_str(&finish),
-            steps: self.max_steps,
+            steps,
         });
-        let outcome = RunInnerOutcome {
-            messages: self.messages,
-            final_message,
-            finish_reason: finish,
-            total_usage,
-            total_llm_latency_ms: self.total_llm_latency_ms,
-            steps: self.max_steps,
-            tool_audits,
-        };
-        Ok(outcome)
+        Ok(self.make_outcome(finish, steps, final_message, total_usage, tool_audits))
     }
 }
 

@@ -33,7 +33,7 @@ use recursive::multi::SharedMemory;
 let memory = SharedMemory::new();
 
 // 写入
-memory.set("current_task", "review src/agent.rs").await;
+memory.set("current_task", "review src/kernel.rs").await;
 
 // 读取
 let task = memory.get("current_task").await;

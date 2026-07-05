@@ -251,20 +251,9 @@ impl AgentKernel {
     /// Create a new kernel with a different tool registry (same LLM, same config).
     /// Useful for Multi-Agent scenarios where sub-agents get restricted tool subsets.
     pub fn with_tools(&self, tools: ToolRegistry) -> Self {
-        Self {
-            llm: self.llm.clone(),
-            tools,
-            max_steps: self.max_steps,
-            max_transcript_chars: self.max_transcript_chars,
-            compactor: self.compactor.clone(),
-            hooks: self.hooks.clone(),
-            shutdown_token: self.shutdown_token.clone(),
-            storage: self.storage.clone(),
-            session_store: self.session_store.clone(),
-            stuck_window: self.stuck_window,
-            stuck_error_rate: self.stuck_error_rate,
-            globs_skills: self.globs_skills.clone(),
-        }
+        let mut clone = self.clone();
+        clone.tools = tools;
+        clone
     }
 
     /// Execute one turn of the ReAct loop.

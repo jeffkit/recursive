@@ -13,14 +13,18 @@ explicitly asked otherwise.
 ## Before touching any code
 
 1. Read `.dev/AGENTS.md` — the full invariant list. Especially:
-   - Invariant #1: Agent loop stays small. Don't branch inside `agent.rs::Agent::run`.
+   - Invariant #1: Agent loop stays small. Don't branch inside `src/run_core.rs::RunCore::run_inner`.
    - Invariant #3: Sandbox. All fs/shell tools go through `tools::resolve_within`.
    - Invariant #5: No `unwrap()`/`expect()` in non-test code.
    - Invariant #7: Finish reasons are data, not errors.
    - Invariant #8: Tool-call ↔ tool-result pairing must be preserved.
 
-2. Check which files your change touches. If you're touching `src/agent.rs`
-   main loop, reconsider — new capabilities belong in tools or providers.
+2. Check which files your change touches. If you're touching the kernel
+   (`src/kernel.rs`) or the ReAct step loop (`src/run_core.rs::RunCore::run_inner`),
+   reconsider — new capabilities belong in tools or providers. The legacy
+   `src/agent.rs` was split into `src/agent/types.rs` (FinishReason etc.),
+   `src/kernel.rs` (stateless executor), and `src/runtime.rs` (stateful wrapper)
+   during Goal 219.
 
 ## Mandatory quality gates (run before declaring done)
 
@@ -58,8 +62,8 @@ see the warning at its top.
 - **Prefer `Edit` discipline mentally**: when editing existing files,
   make minimal, surgical changes. Don't rewrite a whole file to fix one thing.
 - **New tool** → new file under `src/tools/`, register in `src/tools/mod.rs`.
-- **New provider** → new file under `src/llm/`, implement `LlmProvider` trait.
-- **New capability** → never add it as a branch inside `agent.rs::Agent::run`.
+- **New provider** → new file under `src/llm/`, implement `ChatProvider` trait.
+- **New capability** → never add it as a branch inside `src/run_core.rs::RunCore::run_inner`.
 - **Error variants** → add to `src/error.rs`. Never `unwrap()` in product code.
 - **Tests** → `#[cfg(test)] mod tests` in the same file. Every new public
   function/tool/provider gets unit tests.
@@ -96,6 +100,40 @@ ls .worktrees/ 2>/dev/null
 ```
 
 Don't edit files that a live worktree run is working on.
+
+### Known self-improve failure modes (treat as experimental)
+
+The flow is *not* a fully reliable pipeline. Three failure modes have
+been observed in production and are not yet fixed — assume any of these
+can happen on a given run, and design your workflow around them rather
+than treating the green-path as guaranteed.
+
+1. **Auto-rollback can fail silently when the agent dies mid-fix.** If
+   the agent crashes from an unrecoverable LLM error (auth, quota,
+   malformed provider response), the worktree may be left in a dirty
+   state and the flow's rollback step never runs. **Always check
+   `git -C .worktrees/<name> status` after a run before assuming the
+   rollback succeeded.** A dirty tree means you must `git restore`
+   manually.
+
+2. **Cross-PR landing during a run creates phantom deletions.** When
+   the user (or another agent) merges a PR to `main` while a self-improve
+   run is in flight on a branch forked from old `main`, the eventual
+   merge of the agent branch will appear to delete files that the
+   cross-PR added. **Before merging an agent branch, rebase it onto
+   current `main`** so the diff is computed against the up-to-date
+   tree. `git log --oneline <agent-branch>..main` shows the
+   intervening commits.
+
+3. **`self-improve.sh` is deprecated — always use `parallel-self-improve.sh`.**
+   The legacy script does not handle concurrent runs, does not isolate
+   per-goal worktrees, and does not resume cleanly on context loss. The
+   argument order also differs: `parallel-self-improve.sh` takes
+   `<provider> <goal-file>` (provider first, then goal). The legacy
+   script is kept only for archaeological reference and may be removed.
+
+These three are *known*. New failure modes should be added here as
+they're discovered, not silently worked around.
 
 ## Worktree workflow
 
@@ -223,7 +261,7 @@ runtime state between cases through temp files (`echo "$ID" > /tmp/my-sid`).
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Recursive** (9250 symbols, 21821 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Recursive** (10125 symbols, 24096 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

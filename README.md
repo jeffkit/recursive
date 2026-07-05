@@ -1,64 +1,90 @@
 # Recursive
 
-A minimal, orthogonal, embeddable coding agent kernel in Rust.
+A Rust coding-agent platform: a small ReAct kernel plus the surrounding
+HTTP API, MCP, multi-agent orchestration, and TUI that turn it into a
+full development tool.
 
 [![CI](https://github.com/jeffkit/recursive/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffkit/recursive/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/recursive-agent.svg)](https://crates.io/crates/recursive-agent)
 [![Docs.rs](https://docs.rs/recursive-agent/badge.svg)](https://docs.rs/recursive-agent)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Recursive is a tiny ReAct-style agent loop that wires together:
+At its core Recursive is a ReAct loop that wires together:
 
 - an **LLM provider** (OpenAI-compatible HTTP by default; works with OpenAI,
-  GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, …)
-- a **tool registry** (`read_file`, `write_file`, `apply_patch`, `list_dir`,
-  `run_shell` out of the box; trivially extensible)
+  GLM/Zhipu, DeepSeek, Moonshot, MiniMax, Together, Ollama, vLLM, …; plus a
+  native Anthropic adapter)
+- a **tool registry** (`Read`, `Write`, `Edit`, `Glob`, `Bash`,
+  `WebFetch`, `WebSearch`, plan-mode, checkpoints, todo, …; plus
+  coordinator-only `team_*` / `task_*` tools and a deferred-tool loader)
 - a **transcript** plus a `StepEvent` stream you can observe
 
-The whole kernel is intentionally small enough to read in one sitting.
+Around that kernel the platform adds opt-in surfaces:
 
-## What's New in v0.5.0
+- **HTTP API** — axum-based REST + SSE server with sessions, rate-limiting,
+  JWT/API-key auth, OpenAPI spec (feature `http`)
+- **MCP** — both as a client (consume external MCP servers) and a server
+  (expose Recursive's tools to other MCP-aware agents) (feature `mcp`)
+- **TUI** — ratatui-based interactive client with streaming tool indicators,
+  plan mode, and command palette (`crates/recursive-tui`)
+- **Multi-agent** — agent pool, shared memory, messaging bus, plan-mode
+  coordination (feature `coordinator-mode`)
+- **Cloud runtime** — Redis session store, S3 transcript storage, Docker /
+  E2B sandboxes (features `cloud-runtime` / `e2b-sandbox`)
+- **Vector memory** — sqlite-vec + OpenAI embeddings for episodic recall
+  (feature `vector-memory`)
+- **Loop mode** — `recursive loop` for self-scheduling autonomous agent runs
 
-- **HTTP API** — axum-based REST server with sessions, SSE streaming, OpenAPI spec
-- **Terminal UI** — ratatui-based TUI with streaming tool indicators, plan mode
-- **Multi-Agent** — agent pool, shared memory, messaging bus, pipeline & team orchestration
-- **Python SDK** — `pip install recursive-client` for programmatic access
-- **Loop Mode** — `recursive loop` for self-scheduling autonomous agent runs
+Embedding just the kernel (no HTTP / TUI / cloud) is supported via
+`--no-default-features`.
+
+> The crate is published as `recursive-agent` because the name `recursive`
+> was taken on crates.io. The installed binary is still called `recursive`,
+> and the library is imported as `use recursive::*;`.
 
 ## At a glance
 
+Wire up an OpenAI-compatible LLM, register some tools, and drive the
+agent loop. This is the v0.7 surface — the legacy `Agent` type from
+v0.5 was split into `AgentKernel` (stateless) and `AgentRuntime`
+(stateful wrapper) during Goal 219.
+
 ```rust
+use recursive::llm::OpenAiProvider;
+use recursive::runtime::AgentRuntime;
+use recursive::tools::{ReadFile, RunShell, ToolRegistry, WriteFile};
 use std::sync::Arc;
-use recursive::{
-    Agent, ToolRegistry,
-    llm::OpenAiProvider,
-    tools::{ApplyPatch, ListDir, ReadFile, RunShell, WriteFile},
-};
 
 # async fn run() -> anyhow::Result<()> {
-let llm = Arc::new(OpenAiProvider::new(
+let llm = OpenAiProvider::new(
     "https://api.openai.com/v1",
     std::env::var("OPENAI_API_KEY")?,
     "gpt-4o-mini",
-));
+)?;
 
 let tools = ToolRegistry::local()
     .register(Arc::new(ReadFile::new(".")))
     .register(Arc::new(WriteFile::new(".")))
-    .register(Arc::new(ApplyPatch::new(".")))
-    .register(Arc::new(ListDir::new(".")))
     .register(Arc::new(RunShell::new(".")));
 
-let mut agent = Agent::builder()
-    .llm(llm)
+let mut runtime = AgentRuntime::builder()
+    .llm(Arc::new(llm))
     .tools(tools)
     .max_steps(20)
+    .system_prompt("You are a helpful coding assistant.")
     .build()?;
 
-let outcome = agent.run("list the files in src and summarise them").await?;
-println!("{}", outcome.final_message.unwrap_or_default());
+let outcome = runtime
+    .run("list the files in src and summarise them")
+    .await?;
+
+println!("{}", outcome.final_text.unwrap_or_default());
 # Ok(()) }
 ```
+
+Run it with no API key by swapping `OpenAiProvider` for the
+scriptable `MockProvider` — see `examples/basic.rs` and
+`examples/with_tools.rs`.
 
 ## Design
 
@@ -67,16 +93,18 @@ The kernel has five concepts, each independently testable:
 | Concept | Where | Role |
 |---|---|---|
 | `Message` | `src/message.rs` | The only data primitive: chat messages with optional tool calls. |
-| `LlmProvider` | `src/llm/` | Trait for model backends. Adapters: HTTP (OpenAI-compatible), Mock. |
+| `ChatProvider` | `src/llm/` | Trait for model backends. Adapters: HTTP (OpenAI-compatible), Anthropic, Mock. |
 | `Tool` + `ToolRegistry` | `src/tools/` | Trait for side effects the model can request. Sandboxed to a workspace. |
-| `Agent` | `src/agent.rs` | The loop. Receives a goal, alternates model ↔ tools, emits events. |
-| `StepEvent` | `src/agent.rs` | Observer channel for UI / logging / replay. |
+| `AgentKernel` | `src/kernel.rs` | Stateless single-turn executor. Receives a `TurnContext`, returns a `TurnOutcome`. |
+| `AgentRuntime` | `src/runtime.rs` | Stateful wrapper. Owns the transcript, message queue, compaction, and cross-turn state. |
+
+The actual ReAct step loop lives in [`src/run_core.rs::RunCore::run_inner`](src/run_core.rs). The kernel/wrapper split was introduced after the legacy `Agent` / `StepEvent` types were removed (Goal 219). For a deeper tour, see [`docs/architecture/agent-loop.md`](docs/architecture/agent-loop.md).
 
 ### Orthogonality
 
-- **New tool?** Implement `Tool`, register it. No agent changes.
-- **New model backend?** Implement `LlmProvider`. No tool/agent changes.
-- **New UI / observer?** Subscribe to the `StepEvent` channel. No loop changes.
+- **New tool?** Implement `Tool`, register it. No kernel/runtime changes.
+- **New model backend?** Implement `ChatProvider`. No tool/kernel changes.
+- **New UI / observer?** Subscribe to the `AgentEvent` stream via `EventSink`. No loop changes.
 - **New finish reason?** Add a variant to `FinishReason`. Callers can match if they care.
 
 ### Safety primitives baked in
@@ -109,10 +137,6 @@ Grab the asset matching your platform from
 ```bash
 cargo install --path .   # or, once published: cargo install recursive-cli
 ```
-
-> The crate is published as `recursive-agent` because the name `recursive` was
-> taken on crates.io. The installed binary is still called `recursive`, and the
-> library is imported as `use recursive::*;`.
 
 ```bash
 # one-off goal

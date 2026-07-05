@@ -125,6 +125,26 @@ impl CheckpointState {
     }
 }
 
+/// Session-lifecycle state. Currently a single `closed` flag set by
+/// `AgentRuntime::close()` to prevent duplicate `SessionEnd` events on
+/// repeat calls. Kept as a sub-struct so future session-scoped signals
+/// (last-activity timestamps, abort signals, etc.) have an obvious
+/// home without bloating `AgentRuntime`'s top-level field list.
+///
+/// Named `SessionLifecycle` (not `SessionState`) to avoid confusion with
+/// `crate::http::SessionState` and `agui_tui::app::SessionState`, which
+/// describe session *metadata* (id, prompt count, last-active timestamp)
+/// rather than the runtime's own lifecycle phase.
+struct SessionLifecycle {
+    closed: bool,
+}
+
+impl SessionLifecycle {
+    fn open() -> Self {
+        Self { closed: false }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // AgentRuntime
 // ──────────────────────────────────────────────────────────────────────────
@@ -150,6 +170,10 @@ pub struct AgentRuntime {
     /// Checkpoint subsystem (snapshot, session-id, writer, touched-files).
     /// Grouped to reduce field count; inactive when checkpoints are disabled.
     checkpoints: CheckpointState,
+    /// Session-lifecycle signals (close flag, future per-session toggles).
+    /// See [`SessionLifecycle`] — kept small for now but is the natural home
+    /// for any new "set once at session start / flip once at close" state.
+    session: SessionLifecycle,
     /// Goal-167: shared task-list state written by `todo_write` calls.
     /// Read back via [`current_todos`](AgentRuntime::current_todos).
     todo_list: Arc<RwLock<Vec<TodoItem>>>,
@@ -171,9 +195,6 @@ pub struct AgentRuntime {
     /// Deferred `TurnFinished` event held by `execute_kernel_turn` until
     /// `emit_turn_messages` can flush it after all assistant messages.
     deferred_turn_finished: Option<AgentEvent>,
-    /// Set by `close()` after `SessionEnd` has been fired; prevents duplicate
-    /// `SessionEnd` events when `close()` is called more than once.
-    session_closed: bool,
     /// Goal-291: number of most-recent transcript messages passed to the
     /// goal-evaluator judge on each turn. Smaller values reduce judge cost;
     /// larger values give the judge more context for long sessions.
@@ -277,10 +298,10 @@ impl AgentRuntime {
     /// give hooks a chance to do post-session cleanup. Calling `run()` after
     /// `close()` is safe but `SessionEnd` will not fire again.
     pub async fn close(&mut self, last_outcome: Option<&RuntimeOutcome>) {
-        if self.session_closed {
+        if self.session.closed {
             return;
         }
-        self.session_closed = true;
+        self.session.closed = true;
         if let Some(outcome) = last_outcome {
             if !matches!(outcome.finish_reason, FinishReason::Cancelled) {
                 self.kernel
@@ -592,6 +613,18 @@ impl AgentRuntime {
     }
 
     /// Set a new event sink (useful for REPL mode between turns).
+    ///
+    /// **Replaces the sink AND re-registers the tools that hold an `Arc<dyn EventSink>`**
+    /// — specifically [`TodoWriteTool`](crate::tools::todo::TodoWriteTool) (Goal-167)
+    /// and [`ExitPlanModeTool`](crate::tools::plan_mode::ExitPlanModeTool) (Goal-165) —
+    /// so that `AgentEvent::TodoUpdated` and `AgentEvent::PlanProposed` reach the new
+    /// consumer (e.g. when the TUI swaps in a `TuiEventSink` after construction).
+    ///
+    /// The side effect is intentional: every caller that swaps the sink (CLI per-turn,
+    /// HTTP per-session, TUI on backend init) expects those tools to forward events to
+    /// the new sink. The method name documents the side effect; callers that only want
+    /// to swap the sink without touching the tool registry must use
+    /// [`replace_event_sink`](Self::replace_event_sink) instead.
     pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
         self.event_sink = sink.clone();
         // Goal-167: re-register TodoWriteTool with the new sink so that
@@ -610,6 +643,21 @@ impl AgentRuntime {
                 self.plan_approval_gate.clone(),
                 sink,
             )));
+    }
+
+    /// Swap the event sink **without** re-registering any sink-dependent tools.
+    ///
+    /// Use this when you know the new sink should only receive events emitted by
+    /// `AgentRuntime` itself (e.g. `MessageAppended`, `TurnFinished`, compaction
+    /// boundaries) and do not need the `TodoUpdated` / `PlanProposed` fan-out to
+    /// the new consumer. Most callers want [`set_event_sink`](Self::set_event_sink)
+    /// — its tool-reregistration side effect is what makes the TUI's
+    /// `TodoUpdated` updates reach the live UI.
+    ///
+    /// Added in the P0-2 cleanup so the implicit side effect has a non-side-effect
+    /// sibling.
+    pub fn replace_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = sink;
     }
 
     /// Goal-167: return a snapshot of the current agent task list.
@@ -1274,7 +1322,7 @@ impl AgentRuntimeBuilder {
             goal_state: Arc::new(RwLock::new(None)),
             message_queue: std::collections::VecDeque::new(),
             deferred_turn_finished: None,
-            session_closed: false,
+            session: SessionLifecycle::open(),
             goal_eval_transcript_tail: self.goal_eval_transcript_tail,
         })
     }
@@ -2726,6 +2774,75 @@ mod tests {
         assert!(
             err_str.contains("rate limited"),
             "expected rate-limited error, got: {err_str}"
+        );
+    }
+
+    // ── P0-2: set_event_sink / replace_event_sink side-effect contract ────
+
+    /// `replace_event_sink` swaps the runtime sink but must NOT touch the
+    /// tool registry. This pins down the explicit non-side-effect path —
+    /// callers that only want to redirect `MessageAppended` / `TurnFinished`
+    /// events without triggering `TodoWriteTool` / `ExitPlanModeTool`
+    /// re-registration can use this.
+    #[tokio::test]
+    async fn replace_event_sink_does_not_reregister_tools() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+
+        // Capture the pre-swap TodoWriteTool Arc identity.
+        let pre_todo = rt
+            .kernel
+            .tools()
+            .get("TodoWrite")
+            .expect("TodoWrite is in the default registry")
+            .clone();
+
+        let (new_sink, _rx) = crate::event::ChannelSink::new();
+        rt.replace_event_sink(Arc::new(new_sink));
+
+        // The registry's TodoWriteTool identity is unchanged — no re-register.
+        let post_todo = rt
+            .kernel
+            .tools()
+            .get("TodoWrite")
+            .expect("TodoWrite still registered")
+            .clone();
+        assert!(
+            Arc::ptr_eq(&pre_todo, &post_todo),
+            "replace_event_sink must not re-register TodoWriteTool"
+        );
+    }
+
+    /// `set_event_sink` keeps its existing side effect: re-registering
+    /// TodoWriteTool so it points to the new sink. This is the contract
+    /// every caller (CLI per-turn, HTTP per-session, TUI on backend init)
+    /// depends on; if you intentionally change it, also audit those callers.
+    #[tokio::test]
+    async fn set_event_sink_reregisters_todo_write_tool() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+
+        let pre_todo = rt
+            .kernel
+            .tools()
+            .get("TodoWrite")
+            .expect("TodoWrite registered")
+            .clone();
+
+        let (new_sink, _rx) = crate::event::ChannelSink::new();
+        rt.set_event_sink(Arc::new(new_sink));
+
+        let post_todo = rt
+            .kernel
+            .tools()
+            .get("TodoWrite")
+            .expect("TodoWrite still registered after set_event_sink")
+            .clone();
+        assert!(
+            !Arc::ptr_eq(&pre_todo, &post_todo),
+            "set_event_sink MUST re-register TodoWriteTool — this side effect is \
+             load-bearing for the TUI/CLI/HTTP sink-swap flows; removing it would \
+             silently drop TodoUpdated events on the new sink."
         );
     }
 }

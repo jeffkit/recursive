@@ -66,6 +66,61 @@ fn runtime_stays_manageable() {
     );
 }
 
+/// `RunCore::run_inner` is the actual ReAct step loop after Goal 219 moved
+/// it out of `Agent::run`. Invariant #1 was updated to point at it. This
+/// test pins the loop body's size in lines so future feature additions
+/// can't silently inflate it — they must split a helper or move into a
+/// tool / provider instead.
+///
+/// The threshold is 150 lines, just above the post-P1-1 baseline (~117).
+/// The original G219 baseline was ~394 lines; the P1-1 split (July 2026)
+/// extracted `make_outcome`, `check_shutdown`, `enforce_transcript_budget`,
+/// `drain_mailbox`, `handle_no_tool_calls`, `process_tool_results`, and
+/// `dispatch_llm_step` as sibling helpers, leaving the loop body as a
+/// small linear sequence: drain mailbox → check budget → call LLM →
+/// handle no-tool-calls → execute tools → process results.
+///
+/// When this test fires, the right move is usually to extract another
+/// phase of the loop into a sibling helper — NOT to bump the threshold.
+#[test]
+fn run_inner_function_body_stays_small() {
+    let path = src_file("run_core.rs");
+    let content = std::fs::read_to_string(&path).expect("run_core.rs must exist");
+
+    // Locate the `pub(crate) async fn run_inner` signature line.
+    let sig_line = content
+        .lines()
+        .position(|l| l.contains("async fn run_inner"))
+        .unwrap_or_else(|| panic!("run_core.rs: could not find `async fn run_inner`"));
+
+    // From the signature, walk forward counting brace depth until it
+    // returns to zero. The function body is signature_open_brace ..
+    // closing_brace (inclusive).
+    let lines: Vec<&str> = content.lines().collect();
+    let mut depth: i32 = 0;
+    let mut end_line: usize = 0;
+    for (i, line) in lines.iter().enumerate().skip(sig_line) {
+        depth += line.matches('{').count() as i32;
+        depth -= line.matches('}').count() as i32;
+        if depth == 0 {
+            end_line = i;
+            break;
+        }
+    }
+    assert!(
+        end_line != 0,
+        "run_core.rs: `run_inner` brace walk did not close — file is malformed"
+    );
+
+    let body_lines = end_line - sig_line + 1;
+    assert!(
+        body_lines <= 150,
+        "invariant #1 violation: RunCore::run_inner is {body_lines} lines (limit: 150). \
+         Split a phase of the loop into a sibling helper, or move the new capability \
+         into a tool / provider. Do NOT bump the threshold."
+    );
+}
+
 // ── Invariant #2: Orthogonality ────────────────────────────────────────────
 
 /// Tools must not import LLM internals beyond the `ToolSpec` shared type.
