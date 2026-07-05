@@ -135,6 +135,41 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Check the shutdown token at the top of a step. Returns `Some((
+    /// finish, finished_steps))` when the run should terminate with
+    /// [`FinishReason::Cancelled`]; the caller routes the pair through
+    /// [`make_outcome`]. `finished_steps` is `step - 1` because the
+    /// current step's LLM call has not started yet.
+    ///
+    /// `total_usage` is read for the structured log line only — the
+    /// outcome assembly happens at the call site.
+    fn check_shutdown(
+        &self,
+        step: usize,
+        total_usage: &TokenUsage,
+    ) -> Option<(FinishReason, usize)> {
+        let token = self.shutdown_token.as_ref()?;
+        if !token.is_cancelled() {
+            return None;
+        }
+        let finished_steps = step.saturating_sub(1);
+        let finish = FinishReason::Cancelled;
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: finished_steps,
+        });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = finished_steps,
+            tokens_in = total_usage.prompt_tokens,
+            tokens_out = total_usage.completion_tokens,
+            finish = ?finish,
+            llm_latency_ms = self.total_llm_latency_ms,
+            "agent.run.complete"
+        );
+        Some((finish, finished_steps))
+    }
+
     /// Assemble the final outcome for a run that terminates with `finish`
     /// at step `steps`. All early-return paths in [`run_inner`] route here
     /// so the seven-field struct cannot drift out of sync across sites.
@@ -544,34 +579,15 @@ impl<'a> RunCore<'a> {
             // TranscriptLimit blocks below. If a CancellationToken was
             // configured (via AgentRuntimeBuilder::shutdown_token / etc.)
             // and it fired between steps, finish cleanly with
-            // FinishReason::Cancelled. Reports `step - 1` because the
-            // current step's LLM call has not been started yet — the
-            // last fully-completed step is the previous one.
-            if let Some(ref token) = self.shutdown_token {
-                if token.is_cancelled() {
-                    let finished_steps = step.saturating_sub(1);
-                    let finish = FinishReason::Cancelled;
-                    self.emit(AgentEvent::TurnFinished {
-                        reason: finish_reason_str(&finish),
-                        steps: finished_steps,
-                    });
-                    tracing::info!(
-                        target: "recursive::agent",
-                        steps = finished_steps,
-                        tokens_in = total_usage.prompt_tokens,
-                        tokens_out = total_usage.completion_tokens,
-                        finish = ?finish,
-                        llm_latency_ms = self.total_llm_latency_ms,
-                        "agent.run.complete"
-                    );
-                    return Ok(self.make_outcome(
-                        finish,
-                        finished_steps,
-                        final_message,
-                        total_usage,
-                        tool_audits,
-                    ));
-                }
+            // FinishReason::Cancelled.
+            if let Some((finish, finished_steps)) = self.check_shutdown(step, &total_usage) {
+                return Ok(self.make_outcome(
+                    finish,
+                    finished_steps,
+                    final_message,
+                    total_usage,
+                    tool_audits,
+                ));
             }
 
             // ---- mailbox drain (coordinator → worker mid-run messages) -----------
