@@ -1,45 +1,36 @@
 #!/usr/bin/env bash
-# tui-mutants.sh — scoped mutation testing for recursive-tui (stage 3/5).
+# agent-mutants.sh — scoped mutation testing for recursive-agent (the main kernel crate).
 #
-# The "effectiveness loop": after the AI writes/strengthens tests for a
-# TUI change, run this to check whether those tests actually pin down the
-# changed behaviour. cargo-mutants mutates the touched source and re-runs
-# the test suite; any mutant that SURVIVES (tests still pass) marks a gap
-# in coverage — the test for that behaviour is missing or too weak.
+# Mirrors the design of tui-mutants.sh: run cargo-mutants against the touched
+# source files and fail if any mutant survives. Surviving mutants indicate that
+# the tests pass but don't actually pin the changed behaviour — i.e., the tests
+# are present but ineffective.
 #
 # Usage:
-#   tui-mutants.sh                         # auto-detect files changed vs main
-#   tui-mutants.sh <file>...               # mutate specific files
-#   tui-mutants.sh --dir src/app/render.rs # mutate a directory (recursive)
-#   tui-mutants.sh --all                   # mutate the whole crate (slow)
-#   tui-mutants.sh --jobs 6 --all          # parallel whole-crate baseline (~30-60m)
-#   tui-mutants.sh --list                  # dry run: list possible mutants, no tests
-#   tui-mutants.sh --list-files            # list source files cargo-mutants sees
+#   agent-mutants.sh                         # auto-detect files changed vs main
+#   agent-mutants.sh <file>...               # mutate specific files
+#   agent-mutants.sh --dir src/session       # mutate a whole sub-directory
+#   agent-mutants.sh --all                   # mutate the whole crate (very slow)
+#   agent-mutants.sh --jobs 6 --all          # parallel whole-crate baseline
+#   agent-mutants.sh --list                  # dry-run: list mutants, no tests
+#   agent-mutants.sh --list-files            # list source files cargo-mutants sees
 #
 # Exit code is non-zero if any mutant survives, so this can gate a commit.
-# --jobs N>1 uses copy mode (real source untouched); --jobs 1 (default) uses
-# --in-place. The in-place path is guarded against contamination: it refuses
-# to run on files with uncommitted changes, and on any exit (incl. SIGINT)
-# restores any file still carrying a `cargo-mutants` marker via `git checkout`.
+# --jobs N>1 uses copy mode (real source untouched).
+# --jobs 1 (default) uses --in-place, guarded against contamination (see below).
 #
 # Prereq: `cargo install cargo-mutants` (global). The CI / self-improve
 # environment is expected to have it on PATH.
 set -euo pipefail
 
-CRATE="recursive-tui"
-# test-utils is a dev-dependency feature of recursive-tui; passing it
-# explicitly is harmless and keeps the runner robust if the dev-dep is
-# ever removed. `weixin` is included so the #[cfg(feature = "weixin")]
-# renderers (e.g. render_weixin_message) are actually compiled and their
-# mutants become observable — without it the gate reports cfg-off
-# mutants as false-positive "missed".
-FEATURES="recursive/test-utils,weixin"
+# The workspace-level package name used with `-p`.
+CRATE="recursive-agent"
 
-# Parallelism. --jobs N runs N cargo build/test jobs concurrently.
-# When JOBS>1 we DROP --in-place (parallel in-place mutation would race
-# on the same source file) and use cargo-mutants' copy mode instead —
-# the real source is never mutated, so the contamination guard below is
-# a harmless no-op in that case.
+# Feature set: enable test-utils so test helpers compile, plus common
+# optional features that unlock more code paths / mutant candidates.
+# weixin is excluded here (UI-only, no agent-kernel logic under test).
+FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub"
+
 JOBS=1
 
 if ! command -v cargo-mutants >/dev/null 2>&1; then
@@ -47,8 +38,7 @@ if ! command -v cargo-mutants >/dev/null 2>&1; then
   exit 2
 fi
 
-# Strip a leading/global --jobs N from the arg list so any subcommand
-# can take it, e.g. `tui-mutants.sh --jobs 6 --all`.
+# Strip a leading/global --jobs N from the arg list.
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,7 +56,7 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-set -- "${ARGS[@]}"
+set -- "${ARGS[@]:-}"
 
 # Resolve the worktree root (this script lives in <root>/.dev/scripts/).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -74,15 +64,9 @@ cd "$ROOT"
 
 # ── in-place contamination guard ──────────────────────────────────────
 # cargo-mutants --in-place mutates the real source and restores on a
-# *clean* exit. If the run is interrupted (SIGINT, laptop sleep, OOM),
-# it can leave `/* ~ changed by cargo-mutants ~ */` markers in the
-# source — and a later `git add -A` will silently commit the mutant
-# (this actually happened: status.rs had `* 100.0` → `/ 100.0`).
-#
-# Mitigation: (1) refuse to run if the to-be-mutated files have
-# uncommitted changes (so `git checkout --` restore is safe and lossless);
-# (2) on ANY exit, scan the mutated files for the marker and `git
-# checkout` any that still carry it.
+# *clean* exit. If the run is interrupted, it can leave markers in the
+# source. Guard: refuse to mutate files with uncommitted changes, and on
+# ANY exit restore any file that still carries a cargo-mutants marker.
 MUTATED_FILES=()
 
 cleanup_mutants() {
@@ -105,7 +89,6 @@ cleanup_mutants() {
 trap cleanup_mutants EXIT
 
 assert_clean() {
-  # Refuse to mutate files with uncommitted changes — restore would clobber them.
   local dirty=()
   for f in "$@"; do
     if [[ -f "$f" ]] && ! git diff --quiet -- "$f" 2>/dev/null; then
@@ -121,10 +104,8 @@ assert_clean() {
 }
 
 run_mutants() {
-  # $@ = extra args (e.g. --no-shuffle, --file ...)
   local mode_args=()
   if [[ "$JOBS" -gt 1 ]]; then
-    # Parallel: copy mode (no --in-place) so concurrent jobs don't race.
     mode_args+=(--jobs "$JOBS")
   else
     mode_args+=(--in-place)
@@ -145,13 +126,11 @@ run_mutants() {
 }
 
 enumerate_mutants() {
-  # Dry run: list possible mutants without mutating source or running tests.
   cargo mutants --list -p "$CRATE" --features "$FEATURES" "$@"
 }
 
 ARGS=()
 if [[ "${1:-}" == "--list" ]]; then
-  # Dry enumerate: list possible mutants across the whole crate, no tests.
   echo "Enumerating mutants in $CRATE (dry run, no tests)…" >&2
   enumerate_mutants
   exit 0
@@ -159,8 +138,8 @@ elif [[ "${1:-}" == "--list-files" ]]; then
   cargo mutants --list-files -p "$CRATE" --features "$FEATURES"
   exit 0
 elif [[ "${1:-}" == "--all" ]]; then
-  echo "Mutating the whole $CRATE crate (this can take a while)…" >&2
-  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "crates/$CRATE/src" -name '*.rs')
+  echo "Mutating the whole $CRATE crate (this can take a long time)…" >&2
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "src" -name '*.rs')
   assert_clean "${MUTATED_FILES[@]}"
   run_mutants --no-shuffle
   exit 0
@@ -183,18 +162,16 @@ elif [[ $# -gt 0 ]]; then
   exit 0
 fi
 
-# Default: auto-detect files changed on this branch vs main (plus any
-# uncommitted edits). This is the "改某文件 → 杀该文件变异点" rule — only
-# mutate what the current change touches, keeping the run fast.
-MAP_TO_CRATE="s#^crates/$CRATE/##"
-
+# Default: auto-detect source files changed on this branch vs main
+# (plus any uncommitted edits) that belong to the main crate (src/).
+# Only mutate what the current change touches — keeps the run fast.
 CHANGED=$( {
   git diff --name-only main...HEAD 2>/dev/null || true
   git diff --name-only 2>/dev/null || true
-} | grep "^crates/$CRATE/src/" | sort -u || true )
+} | grep "^src/" | grep -v "^src/weixin\|^src/test_util" | sort -u || true )
 
 if [[ -z "$CHANGED" ]]; then
-  echo "No recursive-tui source files changed vs main. Pass file paths or --all." >&2
+  echo "No $CRATE source files changed vs main. Pass file paths or --all." >&2
   exit 0
 fi
 

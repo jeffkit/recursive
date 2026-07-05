@@ -1497,6 +1497,103 @@ api_key = "sk-from-file"
 
     // ── Goal-291: goal_eval_transcript_tail env var override ────────────
     //
+    // -----------------------------------------------------------------------
+    // context_window_tokens tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn context_window_tokens_uses_override_when_set() {
+        let config = Config {
+            context_window_override: Some(99_999),
+            ..Config {
+                workspace: PathBuf::from("."),
+                api_base: String::new(),
+                api_key: None,
+                model: "gpt-4o".into(),
+                provider_type: "openai".into(),
+                preset: None,
+                max_steps: 0,
+                temperature: 0.2,
+                system_prompt: String::new(),
+                retry_max: 2,
+                retry_initial_backoff_secs: 1,
+                retry_max_backoff_secs: 8,
+                shell_timeout_secs: 300,
+                headless: false,
+                memory_summary_limit: 5,
+                thinking_budget: None,
+                session_name: None,
+                max_budget_usd: None,
+                extra_dirs: Vec::new(),
+                extra_readonly_dirs: Vec::new(),
+                allow_tools: Vec::new(),
+                context_window_override: None,
+                subagent_max_depth: 2,
+                subagent_enabled: false,
+                allow_bypass_permissions: false,
+                max_search_rounds: 3,
+                stuck_window: 10,
+                stuck_error_rate: 0.8,
+                max_concurrent_runs: 8,
+                goal_eval_transcript_tail: 12,
+                web_search_provider: None,
+                web_search_api_key: None,
+                web_search_jina_key: None,
+            }
+        };
+        assert_eq!(
+            config.context_window_tokens(),
+            99_999,
+            "override must be used when set"
+        );
+    }
+
+    #[test]
+    fn context_window_tokens_fallback_is_nonzero() {
+        // Without an override, the function must delegate to
+        // context_window_tokens_for_model and return a reasonable value > 1.
+        let config = Config {
+            context_window_override: None,
+            model: "gpt-4o-mini".into(),
+            workspace: PathBuf::from("."),
+            api_base: String::new(),
+            api_key: None,
+            provider_type: "openai".into(),
+            preset: None,
+            max_steps: 0,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
+            headless: false,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+        };
+        let tokens = config.context_window_tokens();
+        assert!(
+            tokens > 1,
+            "context_window_tokens without override must be > 1, got {tokens}"
+        );
+    }
+
     // Consolidated per .dev/AGENTS.md §5: set_var/remove_var are
     // process-global, so we hold env_lock for the whole test body and
     // check both the default (env unset) and the override (env set).
@@ -1521,6 +1618,188 @@ api_key = "sk-from-file"
             std::env::set_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL", v);
         } else {
             std::env::remove_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // web_search empty-string filter tests
+    // (kills delete-! mutants on lines 446/450/454)
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // validate_for_agent tests
+    // (kills function-level, ||/&&, ==/!= and delete-! mutants)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal valid Config for direct construction tests.
+    fn valid_config() -> Config {
+        Config {
+            workspace: PathBuf::from("."),
+            api_base: "https://api.openai.com/v1".into(),
+            api_key: Some("sk-valid".into()),
+            model: "gpt-4o-mini".into(),
+            provider_type: "openai".into(),
+            preset: None,
+            max_steps: 0,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
+            headless: false,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+        }
+    }
+
+    #[test]
+    fn validate_for_agent_ok_with_valid_config() {
+        let config = valid_config();
+        assert!(
+            config.validate_for_agent().is_ok(),
+            "valid config must pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_for_agent_rejects_missing_api_key() {
+        let config = Config {
+            api_key: None,
+            ..valid_config()
+        };
+        let err = config.validate_for_agent().unwrap_err();
+        assert!(
+            err.contains("No API key"),
+            "missing api_key must produce 'No API key' error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_for_agent_rejects_empty_api_key() {
+        // The `|| api_key.as_deref() == Some("")` arm must trigger
+        let config = Config {
+            api_key: Some(String::new()),
+            ..valid_config()
+        };
+        let err = config.validate_for_agent().unwrap_err();
+        assert!(
+            err.contains("No API key"),
+            "empty api_key must produce 'No API key' error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_for_agent_rejects_unknown_provider() {
+        let config = Config {
+            provider_type: "unknown-provider".into(),
+            ..valid_config()
+        };
+        let err = config.validate_for_agent().unwrap_err();
+        assert!(
+            err.contains("Unknown provider type"),
+            "unknown provider must produce 'Unknown provider type' error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_for_agent_accepts_anthropic_provider() {
+        let config = Config {
+            provider_type: "anthropic".into(),
+            ..valid_config()
+        };
+        assert!(
+            config.validate_for_agent().is_ok(),
+            "anthropic provider must be valid"
+        );
+    }
+
+    #[test]
+    fn web_search_provider_empty_string_becomes_none() {
+        let _env_lock = crate::test_util::env_lock();
+        let orig = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        // Set provider to empty string — must become None, not Some("")
+        std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", "");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.web_search_provider, None,
+            "empty RECURSIVE_WEB_SEARCH_PROVIDER must be filtered to None"
+        );
+
+        // Restore
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", v);
+        } else {
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_PROVIDER");
+        }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_API_KEY");
+        }
+    }
+
+    #[test]
+    fn web_search_provider_nonempty_string_becomes_some() {
+        let _env_lock = crate::test_util::env_lock();
+        let orig = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", "bing");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.web_search_provider.as_deref(),
+            Some("bing"),
+            "non-empty RECURSIVE_WEB_SEARCH_PROVIDER must be preserved"
+        );
+
+        // Restore
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", v);
+        } else {
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_PROVIDER");
+        }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_API_KEY");
         }
     }
 }

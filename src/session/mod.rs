@@ -934,6 +934,96 @@ mod tests {
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
     }
 
+    /// Kills: `replace || with && at 306:41` and `replace || with && at 306:54`.
+    ///
+    /// The filter `c.is_alphanumeric() || *c == '_' || *c == '-'` must preserve
+    /// ALL three classes of characters.
+    ///
+    /// - Mutant at 306:41 (`&&` instead of first `||`): reduces to `*c == '-'` only,
+    ///   dropping alphanumeric AND underscore characters.  A goal with only letters
+    ///   (no `-`) would produce an empty prefix → "unnamed".
+    ///
+    /// - Mutant at 306:54 (`&&` instead of second `||`): reduces to `c.is_alphanumeric()` only,
+    ///   dropping underscore.  A goal with `_` would lose it from the prefix.
+    ///
+    /// Using "my_feature" exercises both: the alpha chars kill 306:41 and the `_` kills 306:54.
+    #[test]
+    fn default_session_path_preserves_underscore_and_alphanumeric() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let path = default_session_path(ws, "my_feature");
+        let filename = path.file_stem().unwrap().to_str().unwrap();
+        let goal_suffix = filename
+            .find("Z-")
+            .map(|i| &filename[i + 2..])
+            .expect("filename should contain Z- separator");
+        assert_eq!(
+            goal_suffix, "my_feature",
+            "goal prefix must preserve both alphanumeric chars and underscores; got: {goal_suffix}"
+        );
+    }
+
+    #[test]
+    fn default_session_path_empty_goal_uses_unnamed() {
+        // Kills: `delete !` on `if prefix.is_empty()` in default_session_path.
+        // A goal whose characters are ALL filtered out (e.g. only special symbols)
+        // must fall back to "unnamed" as the filename prefix.
+        // With the `!` deleted, the then-branch would fire when prefix is non-empty
+        // and the else-branch when it IS empty → wrong filename.
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        // All chars will be filtered: none is alphanumeric, '_', or '-'.
+        let goal = "!@#$%^&*()";
+        let path = default_session_path(ws, goal);
+        let filename = path.file_stem().unwrap().to_str().unwrap();
+
+        // The format is "{timestamp}-unnamed"; extract the suffix after "Z-".
+        let goal_suffix = filename
+            .find("Z-")
+            .map(|i| &filename[i + 2..])
+            .expect("filename should contain Z- separator");
+        assert_eq!(
+            goal_suffix, "unnamed",
+            "empty-goal filter must produce 'unnamed'"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn list_sessions_ignores_non_json_files() {
+        // Kills: `replace == with !=` on the `Some("json")` comparison in list_sessions.
+        // When non-.json files are present in the sessions dir, they must NOT appear.
+        // With `!=`, json files would be excluded and non-json files included.
+        use std::fs;
+
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        // Create a session to establish the sessions directory
+        let session = SessionFile::new("test".into(), "m".into(), "p".into(), &[], 0, vec![]);
+        let json_path = default_session_path(ws, "test");
+        session.write_to(&json_path).unwrap();
+
+        // Add a non-json file in the same directory
+        let sessions_dir = json_path.parent().unwrap();
+        fs::write(sessions_dir.join("README.txt"), b"not a session").unwrap();
+        fs::write(sessions_dir.join("tmp.bak"), b"backup").unwrap();
+
+        let sessions = list_sessions(ws).unwrap();
+
+        // Must contain exactly the one .json file
+        assert_eq!(
+            sessions.len(),
+            1,
+            "non-json files must be excluded; found: {sessions:?}"
+        );
+        assert_eq!(
+            sessions[0].extension().and_then(|e| e.to_str()),
+            Some("json"),
+        );
+    }
+
     #[test]
     fn filesystem_safe_timestamp_has_no_colons() {
         let ts = filesystem_safe_timestamp();
@@ -957,6 +1047,44 @@ mod tests {
         assert!(slug.len() <= 80);
     }
 
+    /// Kills: `replace || with && at 394:54`.
+    ///
+    /// The filter `c.is_ascii_alphanumeric() || c == '_' || c == '.'` must
+    /// preserve all three character classes.  Mutant at 394:54 replaces the
+    /// second `||` with `&&`, collapsing the condition to `c.is_ascii_alphanumeric()`
+    /// only — both `_` and `.` get replaced with `-`.
+    #[test]
+    fn workspace_slug_preserves_underscore_and_dot() {
+        let p = Path::new("/home/user_name/project.ver");
+        let slug = workspace_slug(p);
+        assert!(
+            slug.contains('_'),
+            "workspace_slug must preserve underscore; got: {slug}"
+        );
+        assert!(
+            slug.contains('.'),
+            "workspace_slug must preserve dot; got: {slug}"
+        );
+    }
+
+    #[test]
+    fn workspace_slug_truncates_to_80_chars() {
+        // Kills: `replace > with >=` on `if s.len() > 80` in workspace_slug.
+        // With `>=`, a slug of exactly 80 chars would be truncated to 80 (no change) which
+        // is fine for >= case, but a slug of exactly 81 must be truncated to 80.
+        // Simpler: use a path that produces a slug > 80 chars and verify it's capped.
+        let long_component = "a".repeat(100);
+        let p = std::path::PathBuf::from(format!("/home/user/{long_component}"));
+        let slug = workspace_slug(&p);
+        assert!(
+            slug.len() <= 80,
+            "slug must be capped at 80 chars; got length {}",
+            slug.len()
+        );
+        // Also verify slug starts without a leading dash
+        assert!(!slug.starts_with('-'), "slug must not start with dash");
+    }
+
     // ── chrono_lite_now / epoch_day_to_ymd ──────────────────────────────────
 
     #[test]
@@ -974,6 +1102,32 @@ mod tests {
         // 2100-03-01 (2100 is NOT a leap year, so 2100-02-29 doesn't exist)
         // 2100-01-01 = day 47482
         assert_eq!(epoch_day_to_ymd(47482), (2100, 1, 1));
+    }
+
+    /// Kills: `replace + with -` and `replace + with *` at line 360:33,
+    ///        `replace - with /` at line 360:47.
+    ///
+    /// Unix day 47541 is 2100-03-01.  At this day `doe = 36524` exactly
+    /// (100 * 365.24 days into era 5), which makes `doe/36524 = 1`.
+    /// When the `+doe/36524` correction is removed, negated, or replaced
+    /// by a multiply, `yoe` drops to 99 and the month formula produces
+    /// the non-existent date 2100-02-29 instead of the correct 2100-03-01.
+    #[test]
+    fn epoch_day_to_ymd_century_correction_at_doe_36524() {
+        // 2100-03-01: first day after the "no leap year in 2100" boundary.
+        assert_eq!(epoch_day_to_ymd(47541), (2100, 3, 1));
+    }
+
+    /// Kills: `replace - with +` and `replace - with /` at line 358:40.
+    ///
+    /// Unix day -719528 is year 0, January 1 (proleptic Gregorian; year 0 = 1 BC).
+    /// The adjusted epoch value is negative, triggering the `else { z - 146_096 }`
+    /// branch in the era calculation.  Both mutations compute era = 0 instead of -1,
+    /// which causes a u64 overflow in `doe` and produces a completely wrong date.
+    #[test]
+    fn epoch_day_to_ymd_negative_epoch_day_pre_ce() {
+        // Year 0 Jan 1 = Unix day -719528 (proleptic Gregorian year 0 = 1 BC).
+        assert_eq!(epoch_day_to_ymd(-719528), (0, 1, 1));
     }
 
     #[test]
@@ -1307,5 +1461,231 @@ mod tests {
         cost.accumulate(&usage_a);
         cost.accumulate(&usage_b);
         assert_eq!(cost.total_reasoning_tokens, 1500);
+    }
+
+    // -----------------------------------------------------------------------
+    // UsageMeta arithmetic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn usage_meta_accumulate_adds_tokens() {
+        let mut a = UsageMeta {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_tokens: Some(5),
+            cache_read_tokens: Some(3),
+            reasoning_tokens: Some(7),
+        };
+        let b = UsageMeta {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_tokens: Some(3),
+            cache_read_tokens: Some(4),
+            reasoning_tokens: Some(5),
+        };
+        a.accumulate(&b);
+        assert_eq!(a.input_tokens, 11, "input_tokens must add");
+        assert_eq!(a.output_tokens, 22, "output_tokens must add");
+        assert_eq!(a.cache_creation_tokens, Some(8), "cache_creation must add");
+        assert_eq!(a.cache_read_tokens, Some(7), "cache_read must add");
+        assert_eq!(a.reasoning_tokens, Some(12), "reasoning must add");
+    }
+
+    #[test]
+    fn usage_meta_accumulate_with_none_treats_as_zero() {
+        let mut a = UsageMeta {
+            input_tokens: 5,
+            output_tokens: 10,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+        };
+        let b = UsageMeta {
+            input_tokens: 3,
+            output_tokens: 4,
+            cache_creation_tokens: Some(2),
+            cache_read_tokens: Some(1),
+            reasoning_tokens: Some(6),
+        };
+        a.accumulate(&b);
+        assert_eq!(a.input_tokens, 8);
+        assert_eq!(a.output_tokens, 14);
+        assert_eq!(a.cache_creation_tokens, Some(2), "None + Some(2) = Some(2)");
+        assert_eq!(a.cache_read_tokens, Some(1), "None + Some(1) = Some(1)");
+        assert_eq!(a.reasoning_tokens, Some(6), "None + Some(6) = Some(6)");
+    }
+
+    #[test]
+    fn usage_meta_from_token_usage_positive_values() {
+        use crate::llm::TokenUsage;
+        let tu = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cache_miss_tokens: 30,
+            cache_hit_tokens: 20,
+            reasoning_tokens: 10,
+        };
+        let meta = UsageMeta::from_token_usage(&tu);
+        assert_eq!(meta.input_tokens, 100);
+        assert_eq!(meta.output_tokens, 50);
+        assert_eq!(meta.cache_creation_tokens, Some(30), "positive miss → Some");
+        assert_eq!(meta.cache_read_tokens, Some(20), "positive hit → Some");
+        assert_eq!(meta.reasoning_tokens, Some(10));
+    }
+
+    #[test]
+    fn usage_meta_from_token_usage_zero_cache_is_none() {
+        use crate::llm::TokenUsage;
+        let tu = TokenUsage {
+            prompt_tokens: 5,
+            completion_tokens: 5,
+            total_tokens: 10,
+            cache_miss_tokens: 0,
+            cache_hit_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let meta = UsageMeta::from_token_usage(&tu);
+        assert_eq!(
+            meta.cache_creation_tokens, None,
+            "zero cache_miss must produce None"
+        );
+        assert_eq!(
+            meta.cache_read_tokens, None,
+            "zero cache_hit must produce None"
+        );
+    }
+
+    #[test]
+    fn usage_meta_is_zero_both_zero() {
+        let meta = UsageMeta {
+            input_tokens: 0,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        assert!(meta.is_zero(), "both zero → is_zero returns true");
+    }
+
+    #[test]
+    fn usage_meta_is_zero_input_nonzero() {
+        let meta = UsageMeta {
+            input_tokens: 1,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        assert!(!meta.is_zero(), "nonzero input → is_zero returns false");
+    }
+
+    #[test]
+    fn usage_meta_is_zero_output_nonzero() {
+        let meta = UsageMeta {
+            input_tokens: 0,
+            output_tokens: 1,
+            ..Default::default()
+        };
+        assert!(!meta.is_zero(), "nonzero output → is_zero returns false");
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionCost accumulate arithmetic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_cost_accumulate_all_fields() {
+        let mut cost = SessionCost::default();
+        let usage = UsageMeta {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_tokens: Some(20),
+            cache_read_tokens: Some(10),
+            reasoning_tokens: Some(5),
+        };
+        cost.accumulate(&usage);
+        assert_eq!(cost.total_input_tokens, 100, "input must accumulate");
+        assert_eq!(cost.total_output_tokens, 50, "output must accumulate");
+        assert_eq!(
+            cost.total_cache_creation_tokens, 20,
+            "cache creation must accumulate"
+        );
+        assert_eq!(
+            cost.total_cache_read_tokens, 10,
+            "cache read must accumulate"
+        );
+        assert_eq!(cost.total_reasoning_tokens, 5, "reasoning must accumulate");
+    }
+
+    #[test]
+    fn session_cost_accumulate_twice_sums_correctly() {
+        let mut cost = SessionCost::default();
+        let u1 = UsageMeta {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+        };
+        let u2 = UsageMeta {
+            input_tokens: 200,
+            output_tokens: 75,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+        };
+        cost.accumulate(&u1);
+        cost.accumulate(&u2);
+        assert_eq!(cost.total_input_tokens, 300, "300 = 100 + 200");
+        assert_eq!(cost.total_output_tokens, 125, "125 = 50 + 75");
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_tool_specs determinism test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hash_tool_specs_is_deterministic() {
+        let specs = vec![
+            ToolSpec {
+                name: "Read".into(),
+                description: "read a file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "Write".into(),
+                description: "write a file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let h1 = hash_tool_specs(&specs);
+        let h2 = hash_tool_specs(&specs);
+        assert_eq!(h1, h2, "same inputs must produce same hash");
+        assert!(!h1.is_empty(), "hash must be non-empty");
+    }
+
+    #[test]
+    fn hash_tool_specs_differs_for_different_specs() {
+        let specs_a = vec![ToolSpec {
+            name: "Read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({}),
+        }];
+        let specs_b = vec![ToolSpec {
+            name: "Write".into(),
+            description: "write".into(),
+            parameters: serde_json::json!({}),
+        }];
+        assert_ne!(
+            hash_tool_specs(&specs_a),
+            hash_tool_specs(&specs_b),
+            "different specs must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn default_schema_version_is_one() {
+        assert_eq!(
+            default_schema_version(),
+            1,
+            "default schema version must be 1"
+        );
     }
 }

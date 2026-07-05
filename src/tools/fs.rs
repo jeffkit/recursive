@@ -586,4 +586,163 @@ line3
             .unwrap();
         assert!(abs.exists());
     }
+
+    // ── max_bytes boundary (kills 165:24 > with == and > with >=) ───────────
+
+    /// Kills: `replace > with ==` (165:24) and `replace > with >=` (165:24).
+    ///
+    /// The guard is `bytes.len() > max_bytes` (strictly greater-than), so a
+    /// file of exactly `max_bytes` bytes must succeed.
+    /// `> with ==` mutation: fires at exact size → false positive rejection.
+    /// `> with >=` mutation: fires at exact size → false positive rejection.
+    #[tokio::test]
+    async fn read_file_exactly_max_bytes_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let max = 256 * 1024; // ReadFile::new default
+        let content = "x".repeat(max);
+        std::fs::write(tmp.path().join("big.txt"), content.as_bytes()).unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r.execute(json!({"path": "big.txt"})).await.unwrap();
+        assert_eq!(got.len(), max, "file at exactly max_bytes must succeed");
+    }
+
+    /// Complementary: one byte over max_bytes must fail.
+    #[tokio::test]
+    async fn read_file_one_over_max_bytes_fails() {
+        let tmp = TempDir::new().unwrap();
+        let content = "x".repeat(256 * 1024 + 1);
+        std::fs::write(tmp.path().join("toobig.txt"), content.as_bytes()).unwrap();
+        let r = ReadFile::new(tmp.path());
+        let err = r.execute(json!({"path": "toobig.txt"})).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Tool { .. }),
+            "one byte over max_bytes must return Tool error: {err:?}"
+        );
+    }
+
+    // ── only start_line given (kills 187:33 && with ||) ──────────────────────
+
+    /// Kills: `replace && with ||` (187:33).
+    ///
+    /// The guard is `start_line.is_none() && end_line.is_none()`.
+    /// With `||`, providing only start_line triggers the early-return and
+    /// returns the full file without a range header.
+    /// This test verifies that supplying start_line alone produces a range
+    /// response (end defaults to total_lines).
+    #[tokio::test]
+    async fn read_file_start_only_returns_range_from_that_line() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "FIRST\nSECOND\nTHIRD\nFOURTH\nFIFTH",
+        )
+        .unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r
+            .execute(json!({"path": "f.txt", "start_line": 3}))
+            .await
+            .unwrap();
+        assert!(
+            got.starts_with("# range:"),
+            "start_line-only read must produce a range header; got: {got}"
+        );
+        assert!(got.contains("THIRD"), "line 3 must be present");
+        assert!(got.contains("FOURTH"), "line 4 must be present");
+        assert!(got.contains("FIFTH"), "line 5 must be present");
+        assert!(!got.contains("FIRST"), "line 1 must be absent");
+        assert!(!got.contains("SECOND"), "line 2 must be absent");
+    }
+
+    // ── single-line range (kills 232:18 > with >=) ────────────────────────────
+
+    /// Kills: `replace > with >=` (232:18).
+    ///
+    /// The guard is `start > end` (rejects only strictly-greater).
+    /// With `>=`, start == end is rejected as invalid, breaking single-line reads.
+    #[tokio::test]
+    async fn read_file_single_line_range_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "alpha\nbeta\ngamma\ndelta\n").unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r
+            .execute(json!({"path": "f.txt", "start_line": 2, "end_line": 2}))
+            .await
+            .unwrap();
+        assert!(got.contains("beta"), "line 2 must be present");
+        assert!(!got.contains("alpha"), "line 1 must be absent");
+        assert!(!got.contains("gamma"), "line 3 must be absent");
+    }
+
+    // ── reading the last line (kills 244:42 > with == and > with >=) ─────────
+
+    /// Kills: `replace > with ==` (244:42) and `replace > with >=` (244:42).
+    ///
+    /// After clamping, start == total_lines when reading the last line.
+    /// Both mutations turn the dead-code guard into a live false-positive that
+    /// rejects reading exactly the last line.
+    #[tokio::test]
+    async fn read_file_last_line_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "first\nsecond\nthird").unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r
+            .execute(json!({"path": "f.txt", "start_line": 3, "end_line": 3}))
+            .await
+            .unwrap();
+        assert!(got.contains("third"), "last line must be returned");
+        assert!(!got.contains("first"), "line 1 must be absent");
+        assert!(!got.contains("second"), "line 2 must be absent");
+    }
+
+    // ── is_partial when starting at line 1 but not reaching end (kills 252:39) ──
+
+    /// Kills: `replace && with ||` (252:39).
+    ///
+    /// `is_partial = !(start == 1 && end == total_lines)`.
+    /// With `||` mutation: `!(start == 1 || end == total_lines)`.
+    /// Reading lines 1..N-1 (start=1 but end < total) is a partial read
+    /// (is_partial=true).  With `||`: `!(true || false)` = false → wrong.
+    #[tokio::test]
+    async fn read_state_partial_from_line_one_not_reaching_end() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        let r = ReadFile::new(tmp.path()).with_read_state(slot.clone());
+        // start=1, end=3 of 5 lines → partial (doesn't reach line 5)
+        r.execute(json!({"path": "f.txt", "start_line": 1, "end_line": 3}))
+            .await
+            .unwrap();
+        let state = slot.lock().unwrap();
+        let rec = state
+            .get(&tmp.path().join("f.txt"))
+            .expect("must be recorded");
+        assert!(
+            rec.is_partial,
+            "lines 1-3 of 5 must be recorded as partial (is_partial=true)"
+        );
+    }
+
+    // ── range content for wider spans (kills 263:23 - with /) ─────────────────
+
+    /// Kills: `replace - with /` (263:23).
+    ///
+    /// `take(end - start + 1)` vs `take(end / start + 1)`.
+    /// For start=2, end=3: take(2) in both cases → equivalent.
+    /// For start=2, end=5: original take(4), mutant take(5/2+1)=take(3).
+    /// The 4th line ("four") would be missing with the mutant.
+    #[tokio::test]
+    async fn read_file_range_includes_all_lines_through_end() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let r = ReadFile::new(tmp.path());
+        let got = r
+            .execute(json!({"path": "f.txt", "start_line": 2, "end_line": 5}))
+            .await
+            .unwrap();
+        assert!(got.contains("two"), "line 2 must be present");
+        assert!(got.contains("three"), "line 3 must be present");
+        assert!(got.contains("four"), "line 4 must be present");
+        assert!(got.contains("five"), "line 5 must be present");
+        assert!(!got.contains("one"), "line 1 must be absent");
+    }
 }

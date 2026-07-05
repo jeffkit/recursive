@@ -17,6 +17,18 @@
       "cmd": "sh .dev/scripts/tui-mutants.sh",
       "onFail": "resume-fix",
       "timeout": 1200000
+    },
+    "agent-mutants": {
+      "_comment": "主 kernel 测试有效性门。agent-mutants.sh 自带变更检测：未动 src/（排除 src/weixin/ 和 src/test_util.rs）即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix 把 survivor 报告喂回 agent 强化测试后再跑一次。覆盖 recursive-agent crate 的全部核心逻辑（transcript、compact、session、checkpoint、tools、http、llm 等）。超时设较高值因 kernel 测试套件较重（baseline ~5min）。",
+      "cmd": "sh .dev/scripts/agent-mutants.sh",
+      "onFail": "resume-fix",
+      "timeout": 2400000
+    },
+    "cli-mutants": {
+      "_comment": "CLI crate 测试有效性门。cli-mutants.sh 自带变更检测：未动 crates/recursive-cli/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix。",
+      "cmd": "sh .dev/scripts/cli-mutants.sh",
+      "onFail": "resume-fix",
+      "timeout": 1200000
     }
   }
 }

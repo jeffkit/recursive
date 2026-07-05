@@ -609,6 +609,95 @@ mod tests {
         assert_eq!(new_kernel.max_steps, kernel.max_steps);
     }
 
+    // -- AgentKernel::run() tests -------------------------------------------
+
+    fn make_minimal_ctx(messages: Vec<Message>) -> TurnContext {
+        use std::sync::atomic::AtomicBool;
+        TurnContext {
+            messages: Arc::new(messages),
+            step_events_tx: None,
+            tool_specs: vec![],
+            streaming: false,
+            permission_hook: None,
+            exploring_plan_mode: Arc::new(AtomicBool::new(false)),
+            permission_mode: crate::permissions::PermissionMode::Default,
+            mailbox: None,
+            turn: 0,
+        }
+    }
+
+    /// Kills: `replace > with ==` (and `replace > with <`) at line 313.
+    ///
+    /// After a simple one-reply turn, `new_messages` must contain the reply.
+    /// With `== input_len`, the condition `inner.messages.len() == input_len`
+    /// is false when a reply was added (len > input_len), so `new_messages`
+    /// would be empty.
+    #[tokio::test]
+    async fn kernel_run_new_messages_contains_reply() {
+        use crate::llm::Completion;
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let kernel = AgentKernel::builder()
+            .llm(provider)
+            .max_steps(1)
+            .build()
+            .expect("build");
+
+        let ctx = make_minimal_ctx(vec![Message::user("hello".to_string())]);
+        let outcome = kernel.run(ctx).await.expect("run");
+
+        assert_eq!(
+            outcome.new_messages.len(),
+            1,
+            "new_messages must contain exactly the assistant reply; got {:?}",
+            outcome.new_messages
+        );
+        assert_eq!(outcome.new_messages[0].content, "done");
+    }
+
+    /// Kills: `replace && with ||` at line 318.
+    ///
+    /// When there is NO compaction summary, the first input message must NOT
+    /// be prepended to `new_messages`.  With `||`, the condition becomes
+    /// `!inner.messages.is_empty() || ...` which is true for any non-empty
+    /// messages list, causing the first message to ALWAYS be prepended.
+    #[tokio::test]
+    async fn kernel_run_does_not_prepend_input_to_new_messages() {
+        use crate::llm::Completion;
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "answer".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let kernel = AgentKernel::builder()
+            .llm(provider)
+            .max_steps(1)
+            .build()
+            .expect("build");
+
+        let input = Message::user("question".to_string());
+        let ctx = make_minimal_ctx(vec![input.clone()]);
+        let outcome = kernel.run(ctx).await.expect("run");
+
+        // new_messages must contain ONLY the assistant reply, not the input.
+        assert_eq!(outcome.new_messages.len(), 1, "only reply expected");
+        assert_eq!(
+            outcome.new_messages[0].content, "answer",
+            "first new message must be the reply, not the input"
+        );
+        assert!(
+            outcome.new_messages[0].content != "question",
+            "input must not appear in new_messages"
+        );
+    }
+
     // -- TurnOutcome tests --------------------------------------------------
 
     #[test]

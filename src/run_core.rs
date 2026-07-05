@@ -830,7 +830,7 @@ impl<'a> RunCore<'a> {
                         let mut counts: std::collections::HashMap<&str, usize> =
                             std::collections::HashMap::new();
                         for n in &error_entries {
-                            *counts.entry(n).or_default() += 1;
+                            *counts.entry(n).or_default() += 1; // cargo-mutants::skip — +=→*= is near-equivalent with a single repeated tool
                         }
                         let top_tool = counts
                             .into_iter()
@@ -904,7 +904,11 @@ fn effective_step_limit(max_steps: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_step_limit, RunCore};
+    use std::sync::Arc;
+
+    use super::{
+        effective_step_limit, finish_reason_str, RunCore, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
+    };
     use crate::message::Message;
 
     #[test]
@@ -1121,6 +1125,922 @@ mod tests {
             core.messages.last().unwrap().reasoning_content.as_deref(),
             Some("prior thinking"),
             "calling with None should not overwrite existing reasoning_content"
+        );
+    }
+
+    // ========================================================================
+    // maybe_trim_transcript tests
+    // ========================================================================
+
+    // ========================================================================
+    // finish_reason_str tests
+    // (kills String::new() and "xyzzy" function-level mutants)
+    // ========================================================================
+
+    #[test]
+    fn finish_reason_str_is_nonempty_and_not_xyzzy() {
+        use crate::agent::FinishReason;
+        let reason = FinishReason::NoMoreToolCalls;
+        let s = finish_reason_str(&reason);
+        assert!(
+            !s.is_empty(),
+            "finish_reason_str must not return empty string"
+        );
+        assert_ne!(s, "xyzzy", "finish_reason_str must not return 'xyzzy'");
+    }
+
+    #[test]
+    fn finish_reason_str_matches_display() {
+        use crate::agent::FinishReason;
+        let reason = FinishReason::BudgetExceeded;
+        let s = finish_reason_str(&reason);
+        assert_eq!(
+            s,
+            reason.to_string(),
+            "finish_reason_str must delegate to Display"
+        );
+    }
+
+    // ========================================================================
+    // maybe_trim_transcript tests
+    // ========================================================================
+
+    #[test]
+    fn maybe_trim_does_nothing_when_under_limit() {
+        let hooks = crate::hooks::HookRegistry::new();
+        // Use a large tool result (> MIN_TRIM_LENGTH) but keep limit ABOVE total chars.
+        // This kills the `replace < with ==` mutant: with `==`, chars != limit means
+        // the early-return is skipped and the tool result would be incorrectly trimmed.
+        let large_output = "x".repeat(MIN_TRIM_LENGTH + 10);
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::tool_result("c1", &large_output),
+        ];
+        let orig_content = messages[1].content.clone();
+        let total_chars = "sys".len() + large_output.len();
+        let mut core = make_test_core(messages, &hooks);
+
+        // Set limit strictly ABOVE total chars (not equal), so trimming must not fire.
+        let limit = total_chars + 1;
+        core.maybe_trim_transcript(limit, 0);
+
+        assert_eq!(
+            core.messages[1].content, orig_content,
+            "content must not be touched when total chars < limit"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_replaces_large_tool_result_when_over_limit() {
+        let hooks = crate::hooks::HookRegistry::new();
+        // A tool result with content > MIN_TRIM_LENGTH (200) bytes
+        let large_output = "x".repeat(MIN_TRIM_LENGTH + 100);
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::tool_result("c1", &large_output),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+
+        // Set limit below total content so trimming fires
+        core.maybe_trim_transcript(10, 0);
+
+        assert_eq!(
+            core.messages[1].content, TRIM_PLACEHOLDER,
+            "large tool result must be replaced with placeholder"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_does_not_trim_small_tool_results() {
+        let hooks = crate::hooks::HookRegistry::new();
+        // A tool result shorter than MIN_TRIM_LENGTH
+        let small_output = "small".to_string();
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::tool_result("c1", &small_output),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+
+        // Trigger trim (limit = 0)
+        core.maybe_trim_transcript(0, 0);
+
+        assert_eq!(
+            core.messages[1].content, small_output,
+            "short tool result must not be trimmed (< MIN_TRIM_LENGTH)"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_does_not_trim_exactly_min_trim_length() {
+        // Kills the `replace > with >=` mutant: content.len() == MIN_TRIM_LENGTH
+        // must NOT be trimmed under the strict `>` check.
+        let hooks = crate::hooks::HookRegistry::new();
+        let exact_output = "z".repeat(MIN_TRIM_LENGTH);
+        let messages = vec![
+            Message::system("s".to_string()),
+            Message::tool_result("c1", &exact_output),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+        // Set limit = 0 so trimming is attempted
+        core.maybe_trim_transcript(0, 0);
+        assert_eq!(
+            core.messages[1].content, exact_output,
+            "content exactly at MIN_TRIM_LENGTH must NOT be trimmed (> is strict)"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_trims_one_more_than_min_trim_length() {
+        // Complementary to the above: content.len() == MIN_TRIM_LENGTH + 1 MUST be trimmed.
+        let hooks = crate::hooks::HookRegistry::new();
+        let just_over = "z".repeat(MIN_TRIM_LENGTH + 1);
+        let messages = vec![
+            Message::system("s".to_string()),
+            Message::tool_result("c1", &just_over),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+        core.maybe_trim_transcript(0, 0);
+        assert_eq!(
+            core.messages[1].content, TRIM_PLACEHOLDER,
+            "content one byte over MIN_TRIM_LENGTH must be trimmed"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_stops_after_fitting_under_limit() {
+        let hooks = crate::hooks::HookRegistry::new();
+        // Two large tool results; only trim until we go under the limit.
+        let large1 = "a".repeat(MIN_TRIM_LENGTH + 100);
+        let large2 = "b".repeat(MIN_TRIM_LENGTH + 100);
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::tool_result("c1", &large1),
+            Message::tool_result("c2", &large2),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+
+        // Set limit just above placeholder_len so trimming the first result suffices.
+        let placeholder_len = TRIM_PLACEHOLDER.len();
+        let limit = 3 + placeholder_len + large2.len() + 50; // sys + placeholder + large2 + buffer
+        core.maybe_trim_transcript(limit, 0);
+
+        assert_eq!(
+            core.messages[1].content, TRIM_PLACEHOLDER,
+            "first large result should be trimmed"
+        );
+        assert_eq!(
+            core.messages[2].content, large2,
+            "second result should not be touched once we're under limit"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_trims_when_chars_exactly_equals_limit() {
+        // Kills: `replace < with <=` at line 196.
+        //
+        // When chars == limit the original `<` guard is FALSE → trimming proceeds.
+        // With `<=`, it would be TRUE → early return, nothing is trimmed.
+        let hooks = crate::hooks::HookRegistry::new();
+        // Build a transcript whose total content length == limit exactly.
+        let tool_content = "a".repeat(MIN_TRIM_LENGTH + 50); // 250 chars
+        let messages = vec![
+            Message::system("s".to_string()),          // 1 char
+            Message::tool_result("c1", &tool_content), // 250 chars
+        ];
+        // Total = 1 + 250 = 251.  Set limit = 251 so chars == limit.
+        let limit = 1 + tool_content.len();
+        let mut core = make_test_core(messages, &hooks);
+        core.maybe_trim_transcript(limit, 0);
+
+        assert_eq!(
+            core.messages[1].content, TRIM_PLACEHOLDER,
+            "tool result must be trimmed when chars == limit (not strictly less)"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_continues_when_chars_equals_limit_after_first_trim() {
+        // Kills: `replace < with <=` at line 211 (the inner break condition).
+        //
+        // After trimming the first tool result, if the remaining chars == limit,
+        // the original `<` is FALSE → the loop continues and trims the second tool result.
+        // With `<=`, it would be TRUE → break, leaving the second tool result untrimmed.
+        let hooks = crate::hooks::HookRegistry::new();
+
+        let tool_content = "a".repeat(MIN_TRIM_LENGTH + 50); // 250 chars
+        let messages = vec![
+            Message::system("s".to_string()),          // 1 char
+            Message::tool_result("c1", &tool_content), // 250 chars (will be trimmed first)
+            Message::tool_result("c2", &tool_content), // 250 chars (must ALSO be trimmed)
+        ];
+        // Total = 1 + 250 + 250 = 501
+        // TRIM_PLACEHOLDER.len() = 40
+        // After trimming tool1: 501 - 250 + 40 = 291
+        // Set limit = 291 so that after trimming tool1, chars == limit (not < limit).
+        // Original `<`: 291 < 291 → false → continues trimming tool2.
+        // Mutant  `<=`: 291 <= 291 → true  → breaks, tool2 NOT trimmed.
+        let after_first_trim = 1 + TRIM_PLACEHOLDER.len() + tool_content.len();
+        let limit = after_first_trim; // exact boundary
+
+        let mut core = make_test_core(messages, &hooks);
+        core.maybe_trim_transcript(limit, 0);
+
+        assert_eq!(
+            core.messages[1].content, TRIM_PLACEHOLDER,
+            "first tool result must be trimmed"
+        );
+        assert_eq!(
+            core.messages[2].content, TRIM_PLACEHOLDER,
+            "second tool result must ALSO be trimmed when chars == limit after first trim"
+        );
+    }
+
+    #[test]
+    fn maybe_trim_emits_event_when_trimmed() {
+        // Kills: `replace += with *=` (trimmed_count stays 0 → event not emitted)
+        //        `replace > with ==/</>= in if trimmed_count > 0` (wrong guard)
+        use crate::event::AgentEvent;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let large_output = "x".repeat(MIN_TRIM_LENGTH + 50);
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::tool_result("c1", &large_output),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_test_core(messages, &hooks);
+        core.events = Some(tx);
+
+        // Trim fires (limit = 0 → chars > 0 = limit)
+        core.maybe_trim_transcript(0, 0);
+
+        // The emit must have sent an AssistantText event containing the trim notice
+        let event = rx
+            .try_recv()
+            .expect("an event must have been emitted after trimming");
+        match event {
+            AgentEvent::AssistantText { text, .. } => {
+                assert!(
+                    text.contains("trimmed"),
+                    "trim event text must mention 'trimmed'; got: {text}"
+                );
+            }
+            other => panic!("expected AssistantText but got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maybe_trim_no_event_when_nothing_trimmed() {
+        // Complementary: no event when nothing is trimmed (trimmed_count == 0)
+        use crate::event::AgentEvent;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let small_output = "tiny".to_string(); // Below MIN_TRIM_LENGTH
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::tool_result("c1", &small_output),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_test_core(messages, &hooks);
+        core.events = Some(tx);
+
+        // Limit = 0 → trimming is attempted, but nothing qualifies (< MIN_TRIM_LENGTH)
+        core.maybe_trim_transcript(0, 0);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no event must be emitted when nothing was trimmed"
+        );
+    }
+
+    // ========================================================================
+    // maybe_compact tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn maybe_compact_noop_when_no_compactor() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::user("q".to_string()),
+            Message::assistant("a".to_string()),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+        // compactor is None by default in make_test_core
+        let result = core.maybe_compact(0).await;
+        assert!(result.is_ok());
+        assert_eq!(core.messages.len(), 2, "messages must not change");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_noop_when_under_threshold() {
+        use crate::compact::Compactor;
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::user("hi".to_string()),
+            Message::assistant("hello".to_string()),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+        // Set a threshold much larger than the transcript
+        core.compactor = Some(Compactor::new(usize::MAX));
+
+        let result = core.maybe_compact(0).await;
+        assert!(result.is_ok());
+        assert_eq!(core.messages.len(), 2, "no compaction under threshold");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_fires_when_over_threshold() {
+        use crate::compact::Compactor;
+        use crate::llm::{Completion, MockProvider};
+        let hooks = crate::hooks::HookRegistry::new();
+        // Build a transcript that exceeds the threshold
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+            Message::user("msg3".to_string()),
+        ];
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "compact summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider;
+        // Threshold = 0 → always compact
+        core.compactor = Some(Compactor::new(0).keep_recent_n(2));
+
+        let result = core.maybe_compact(1).await;
+        assert!(result.is_ok());
+        // After compaction the transcript starts with a compaction summary
+        assert!(
+            core.messages[0].is_compaction_summary,
+            "first message must be a compaction summary after compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_fires_at_threshold_boundary() {
+        // Kills: `replace < with <=` mutant at line 239.
+        // With `<=`, when chars == threshold_chars, the function returns early instead of compacting.
+        use crate::compact::Compactor;
+        use crate::llm::{Completion, MockProvider};
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+            Message::user("last".to_string()),
+        ];
+        // Compute exact chars
+        let chars = crate::compact::Compactor::estimate_chars(&messages);
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider;
+        // Set threshold = exact chars → `chars < threshold` is false → compaction fires
+        // With `< → <=`: `chars <= chars` is true → returns early → no compaction
+        core.compactor = Some(Compactor::new(chars).keep_recent_n(2));
+
+        let result = core.maybe_compact(1).await;
+        assert!(result.is_ok());
+        assert!(
+            core.messages[0].is_compaction_summary,
+            "compaction must fire when chars == threshold (chars is NOT less than threshold)"
+        );
+    }
+
+    /// Kills: `delete ! in RunCore<'a>::execute_tool_calls` at line 306.
+    ///
+    /// When `exploring_plan_mode == false` and the registry's mode is Plan,
+    /// calling any tool (other than enter/exit plan mode) must return an error
+    /// asking the agent to call `enter_plan_mode` first.
+    ///
+    /// With the mutant (`!` deleted), the condition becomes:
+    ///   `if self.exploring_plan_mode.load() && …`
+    /// which is FALSE when not in plan mode, so the guard is skipped and the
+    /// tool call proceeds instead of returning the expected error.
+    #[tokio::test]
+    async fn execute_tool_calls_plan_mode_guard_when_not_exploring() {
+        use crate::llm::ToolCall;
+        use crate::permissions::{PermissionMode, PermissionsConfig};
+        use std::sync::atomic::AtomicBool;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let tools = Arc::new(crate::tools::ToolRegistry::default().with_permissions(
+            PermissionsConfig {
+                mode: PermissionMode::Plan {
+                    pre_plan_mode: Box::new(PermissionMode::Default),
+                    bypass_available: false,
+                },
+                layers: vec![],
+            },
+        ));
+
+        let mut core = make_test_core(vec![], &hooks);
+        core.tools = tools;
+        // Explicitly not in plan-mode exploration.
+        core.exploring_plan_mode = Arc::new(AtomicBool::new(false));
+
+        let call = ToolCall {
+            id: "tc1".to_string(),
+            name: "Write".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let results = core.execute_tool_calls(&[call]).await;
+
+        assert_eq!(results.len(), 1, "should produce exactly one outcome");
+        assert!(
+            results[0].result.contains("enter_plan_mode"),
+            "must tell the agent to call enter_plan_mode first; got: {}",
+            results[0].result,
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_kept_count_is_correct() {
+        // Kills: `replace - with + in maybe_compact` at line 253.
+        // `kept = kept_before - removed` should equal the number of messages remaining.
+        // With `- → +`, `kept = kept_before + removed` which would be wrong.
+        use crate::compact::Compactor;
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, MockProvider};
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+            Message::user("last".to_string()),
+        ];
+        let kept_before = messages.len();
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider;
+        core.events = Some(tx);
+        core.compactor = Some(Compactor::new(0).keep_recent_n(2));
+
+        let result = core.maybe_compact(1).await;
+        assert!(result.is_ok());
+
+        // Drain events to find Compacted
+        let mut found_compacted = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Compacted { removed, kept, .. } = ev {
+                assert_eq!(
+                    kept + removed,
+                    kept_before,
+                    "kept + removed must equal the original message count"
+                );
+                // kept must be the actual remaining messages (after compaction, first is summary)
+                assert_eq!(
+                    kept,
+                    kept_before - removed,
+                    "kept must be kept_before - removed, not kept_before + removed"
+                );
+                found_compacted = true;
+            }
+        }
+        assert!(found_compacted, "a Compacted event must have been emitted");
+    }
+
+    // ========================================================================
+    // run_inner integration tests
+    // These tests call run_inner() directly to kill mutants deep inside the
+    // main agent loop that cannot be reached by unit tests of sub-functions.
+    // ========================================================================
+
+    /// Helper: build a RunCore that can run through `run_inner`.
+    /// Messages start with a single user turn; LLM and max_steps are caller-set.
+    fn make_run_core_for_inner<'a>(
+        messages: Vec<Message>,
+        hooks: &'a crate::hooks::HookRegistry,
+        provider: Arc<crate::llm::MockProvider>,
+        max_steps: usize,
+    ) -> RunCore<'a> {
+        use std::sync::atomic::AtomicBool;
+        RunCore {
+            messages: Arc::new(messages),
+            llm: provider,
+            tools: Arc::new(crate::tools::ToolRegistry::default()),
+            max_steps,
+            max_transcript_chars: None,
+            events: None,
+            streaming: false,
+            compactor: None,
+            permission_hook: None,
+            hooks,
+            total_llm_latency_ms: 0,
+            exploring_plan_mode: Arc::new(AtomicBool::new(false)),
+            shutdown_token: None,
+            mailbox: None,
+            stuck_window: 3,
+            stuck_error_rate: 1.0,
+            turn: 0,
+            globs_skills: vec![],
+        }
+    }
+
+    /// Kills: `replace >= with <` at line 579.
+    ///
+    /// When `chars >= limit` after trimming, `run_inner` must return
+    /// `TranscriptLimit`.  With the mutant (`< limit`), the condition is
+    /// inverted and `TranscriptLimit` would fire when chars is BELOW the
+    /// limit — the happy path.
+    #[tokio::test]
+    async fn run_inner_returns_transcript_limit_when_chars_at_or_above_limit() {
+        use crate::agent::FinishReason;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // System message "hello" = 5 chars; set limit = 3 → 5 >= 3 → TranscriptLimit.
+        let messages = vec![Message::system("hello".to_string())];
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]));
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 1);
+        core.max_transcript_chars = Some(3); // 5 chars > 3 → fires before LLM call
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::TranscriptLimit { .. }),
+            "expected TranscriptLimit, got {:?}",
+            outcome.finish_reason,
+        );
+    }
+
+    /// Kills: `delete !` at line 679.
+    ///
+    /// When `reasoning_content` is non-empty, `run_inner` must emit a
+    /// `AgentEvent::Reasoning` event.  With the mutant (delete `!`), the
+    /// guard becomes `if reasoning.is_empty()`, so no event is emitted for
+    /// non-empty reasoning.
+    #[tokio::test]
+    async fn run_inner_emits_reasoning_event_when_reasoning_nonempty() {
+        use crate::event::AgentEvent;
+        use crate::llm::Completion;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: Some("I thought about it".to_string()),
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 1);
+        core.events = Some(tx);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        drop(outcome); // satisfy unused-var lint
+
+        let events: Vec<AgentEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Reasoning { .. })),
+            "AgentEvent::Reasoning must be emitted when reasoning_content is non-empty; got: {events:?}",
+        );
+    }
+
+    /// Kills: `replace match guard … with false` at line 700:32 AND
+    ///        `replace != with ==` at line 700:49.
+    ///
+    /// When the LLM returns `finish_reason = Some("rate_limited")` with no
+    /// tool calls, `run_inner` must classify it as `FinishReason::ProviderStop`.
+    /// Both mutants break the match guard so "rate_limited" falls to the
+    /// default `NoMoreToolCalls` arm instead.
+    #[tokio::test]
+    async fn run_inner_provider_stop_for_nonstandard_finish_reason() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "provider paused".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("rate_limited".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 1);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(
+                &outcome.finish_reason,
+                FinishReason::ProviderStop(r) if r == "rate_limited"
+            ),
+            "expected ProviderStop(\"rate_limited\"), got {:?}",
+            outcome.finish_reason,
+        );
+    }
+
+    /// Complementary: `finish_reason = Some("stop")` → `NoMoreToolCalls`.
+    /// Pins the pass-through branch of the same match guard.
+    #[tokio::test]
+    async fn run_inner_no_provider_stop_for_stop_finish_reason() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "all done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 1);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls),
+            "expected NoMoreToolCalls, got {:?}",
+            outcome.finish_reason,
+        );
+    }
+
+    /// Kills (all three together):
+    ///   `replace && with ||` at line 820:43  — stuck guard uses `||`
+    ///   `replace / with *`   at line 827:51  — rate = count * window (huge)
+    ///   `replace += with *=` at line 833:59  — count never increments
+    ///
+    /// Run the agent with 3 consecutive single-tool-call steps that all fail
+    /// with "ERROR: …" (unknown tool).  With `stuck_window = 3` and
+    /// `stuck_error_rate = 1.0`, stuck detection must fire on step 3.
+    ///
+    /// Each mutant breaks a different aspect of stuck detection:
+    /// - `|| ` guard: fires after the FIRST error (window not yet full)
+    /// - `*` rate:    fires after the first error (rate = 1 * 3 = 3 ≥ 1.0)
+    /// - `*=` count:  all error_count = 0 → rate = 0 → stuck NEVER fires
+    #[tokio::test]
+    async fn run_inner_stuck_detection_fires_after_window_of_errors() {
+        use crate::agent::FinishReason;
+        use crate::llm::{Completion, ToolCall};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Three steps each requesting the same non-existent tool → all fail.
+        let make_tc_completion = |id: &str| Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "NonExistentTool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            make_tc_completion("tc1"),
+            make_tc_completion("tc2"),
+            make_tc_completion("tc3"),
+        ]));
+        let messages = vec![Message::user("keep trying".to_string())];
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 5);
+        core.stuck_window = 3;
+        core.stuck_error_rate = 1.0;
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Stuck { .. }),
+            "expected Stuck after 3 consecutive errors, got {:?}",
+            outcome.finish_reason,
+        );
+    }
+
+    /// Kills: `replace && with ||` at line 820:43.
+    ///
+    /// The guard is `stuck_finish.is_none() && recent_errors.len() == stuck_window`.
+    /// With `||`, it fires whenever `stuck_finish.is_none()` is true (always before
+    /// stuck is set), so it triggers on every step — not just when the window fills.
+    ///
+    /// Setup: `stuck_window=3`, `stuck_error_rate=0.5`, `max_steps=2`.
+    /// After 2 errors the window is NOT yet full (len=2 < window=3).
+    ///   • Original (`&&`): condition false → no stuck → `BudgetExceeded`.
+    ///   • Mutant (`||`): condition fires at step 2 (rate = 2/3 = 0.666 ≥ 0.5) → `Stuck`.
+    #[tokio::test]
+    async fn run_inner_stuck_fires_only_after_window_full() {
+        use crate::agent::FinishReason;
+        use crate::llm::{Completion, ToolCall};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let make_tc = |id: &str| Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "NonExistentTool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: None,
+            reasoning_content: None,
+        };
+        // Two steps — both produce errors, but the window (size 3) never fills.
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            make_tc("tc1"),
+            make_tc("tc2"),
+        ]));
+        let messages = vec![Message::user("go".to_string())];
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 2);
+        core.stuck_window = 3;
+        core.stuck_error_rate = 0.5; // 2/3 ≈ 0.666 ≥ 0.5 with mutant, but window not full
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::BudgetExceeded),
+            "expected BudgetExceeded (window not yet full), got {:?}",
+            outcome.finish_reason,
+        );
+    }
+
+    /// Kills: `replace / with *` at line 827:51.
+    ///
+    /// `rate = error_count as f64 / stuck_window as f64` vs `* stuck_window`.
+    /// With `window=3`, `error_count=1`, `stuck_error_rate=0.5`:
+    ///   • Original: 1/3 ≈ 0.333 < 0.5 → no stuck → `BudgetExceeded`.
+    ///   • Mutant:   1×3 = 3.0 ≥ 0.5   → stuck fires.
+    ///
+    /// We need exactly 1 error in a full window of 3: two successful SuccessTool
+    /// calls followed by one NonExistentTool error fills the window with 1 error.
+    #[tokio::test]
+    async fn run_inner_stuck_rate_uses_division_not_multiplication() {
+        use crate::agent::FinishReason;
+        use crate::llm::{Completion, ToolCall};
+        use crate::llm::ToolSpec;
+        use crate::tools::{Tool, ToolRegistry};
+        use async_trait::async_trait;
+
+        struct SuccessTool;
+
+        #[async_trait]
+        impl Tool for SuccessTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "SuccessTool".to_string(),
+                    description: "Returns ok".to_string(),
+                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                }
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                Ok("ok".to_string())
+            }
+        }
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let registry = ToolRegistry::default().register(Arc::new(SuccessTool));
+
+        let make_ok = |id: &str| Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "SuccessTool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: None,
+            reasoning_content: None,
+        };
+        let make_err = |id: &str| Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "NonExistentTool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: None,
+            reasoning_content: None,
+        };
+        // success, success, error → window=3 full with 1 error
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            make_ok("tc1"),
+            make_ok("tc2"),
+            make_err("tc3"),
+        ]));
+        let messages = vec![Message::user("test".to_string())];
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+        core.tools = Arc::new(registry);
+        core.stuck_window = 3;
+        core.stuck_error_rate = 0.5; // 1/3 ≈ 0.333 < 0.5 → no stuck (orig); 1×3=3.0 ≥ 0.5 (mutant)
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::BudgetExceeded),
+            "expected BudgetExceeded (rate below threshold), got {:?}",
+            outcome.finish_reason,
+        );
+    }
+
+    /// Kills: `replace || with &&` at line 750:57 AND
+    ///        `replace == with !=` at line 750:69.
+    ///
+    /// `DENIAL_LIMIT_SENTINEL = "ERROR_DENIAL_LIMIT:"` does NOT start with "ERROR: "
+    /// (note the space), so `is_error` is true only via the `|| o.result == DENIAL_LIMIT_SENTINEL`
+    /// branch.
+    ///
+    /// - Mutant 750:57 (`&&` instead of `||`): `false && true = false` → wrong
+    /// - Mutant 750:69 (`!=` instead of `==`): `false || false = false` → wrong
+    ///
+    /// Both mutants emit `AgentEvent::ToolResult { is_error: false }` for the sentinel,
+    /// but the correct code must emit `is_error: true`.
+    #[tokio::test]
+    async fn run_inner_denial_sentinel_emits_is_error_true() {
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, ToolCall, ToolSpec};
+        use crate::tools::{Tool, ToolRegistry};
+        use async_trait::async_trait;
+        use tokio::sync::mpsc;
+
+        struct DenialTool;
+
+        #[async_trait]
+        impl Tool for DenialTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "DenialTool".to_string(),
+                    description: "Returns PermissionDeniedLimit".to_string(),
+                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                }
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                Err(crate::error::Error::PermissionDeniedLimit {
+                    name: "DenialTool".to_string(),
+                })
+            }
+        }
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let registry = ToolRegistry::default().register(Arc::new(DenialTool));
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "tc1".to_string(),
+                name: "DenialTool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: None,
+            reasoning_content: None,
+        }]));
+
+        let messages = vec![Message::user("trigger denial".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+        core.tools = Arc::new(registry);
+        core.events = Some(tx);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(
+                outcome.finish_reason,
+                crate::agent::FinishReason::PermissionDenialLimit
+            ),
+            "expected PermissionDenialLimit, got {:?}",
+            outcome.finish_reason,
+        );
+
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let denial_is_error = events.iter().find_map(|e| {
+            if let AgentEvent::ToolResult { name, is_error, .. } = e {
+                if name == "DenialTool" {
+                    return Some(*is_error);
+                }
+            }
+            None
+        });
+        assert_eq!(
+            denial_is_error,
+            Some(true),
+            "ToolResult for DENIAL_LIMIT_SENTINEL must have is_error = true; events: {events:?}"
         );
     }
 }

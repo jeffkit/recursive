@@ -137,4 +137,25 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("is_compaction_summary"));
     }
+
+    #[test]
+    fn compaction_summary_bit_included_in_json_when_true() {
+        // Kills: `replace is_false -> bool with true` (always skip).
+        // When `is_compaction_summary = true`, the field MUST appear in JSON
+        // so that `AgentKernel::run` can detect intra-turn summaries after
+        // deserialising a transcript from disk.
+        let m = Message::system("summary").with_compaction_summary();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains("\"is_compaction_summary\":true"),
+            "is_compaction_summary must be serialised when true; got: {json}"
+        );
+
+        // Round-trip: deserialise back and verify the flag is preserved.
+        let restored: Message = serde_json::from_str(&json).unwrap();
+        assert!(
+            restored.is_compaction_summary,
+            "is_compaction_summary must survive a serde round-trip"
+        );
+    }
 }

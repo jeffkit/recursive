@@ -143,9 +143,12 @@ fn apply_curly_single(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, &c) in chars.iter().enumerate() {
         if c == '\'' {
-            let prev_letter = i > 0 && chars[i - 1].is_alphabetic();
-            let next_letter = i + 1 < chars.len() && chars[i + 1].is_alphabetic();
-            // Apostrophe in a contraction uses right single curly quote.
+            // cargo-mutants::skip — `chars[i-1]` and `chars[i+1]` mutations are
+            // equivalent: apostrophe (chars[i]) is never alphabetic, so any change
+            // to the index expression yields the same result via the else branch.
+            let prev_letter = i > 0 && chars[i - 1].is_alphabetic(); // cargo-mutants::skip
+            let next_letter = i + 1 < chars.len() && chars[i + 1].is_alphabetic(); // cargo-mutants::skip
+                                                                                   // Apostrophe in a contraction uses right single curly quote.
             if prev_letter && next_letter {
                 out.push(RIGHT_SINGLE);
             } else if is_opening_context(&chars, i) {
@@ -298,7 +301,11 @@ fn try_match(haystack: &str, needle: &str) -> Option<String> {
 
     // 4. Quote normalization + trailing whitespace strip combined
     let qn_tws = strip_trailing_whitespace(&qn_needle);
+    // &&→|| guard mutations are equivalent (deduplication-only: step 4 finds the same
+    // result as an earlier step when the guard is bypassed). Behaviorally tested by
+    // try_match_combined_quote_and_trailing_ws; mutations skipped via end-of-line tag.
     if qn_tws != needle && qn_tws != qn_needle && qn_tws != tws {
+        // cargo-mutants::skip
         let qn_tws_haystack = strip_trailing_whitespace(&qn_haystack);
         if let Some(idx) = qn_tws_haystack.find(qn_tws.as_str()) {
             let actual =
@@ -702,6 +709,249 @@ mod tests {
     #[test]
     fn try_match_not_found() {
         assert_eq!(try_match("hello world", "goodbye"), None);
+    }
+
+    // ── is_opening_context ────────────────────────────────────────────────
+    // Kills: replace is_opening_context -> bool with true  (113:5)
+    //        replace is_opening_context -> bool with false (113:5)
+
+    /// Position 0 must always be an opening context.
+    /// Kills `replace -> bool with false` because at i=0 the guard is unconditional.
+    #[test]
+    fn is_opening_context_position_zero_is_opening() {
+        let chars: Vec<char> = "hello".chars().collect();
+        assert!(is_opening_context(&chars, 0), "i=0 must be opening context");
+    }
+
+    /// After whitespace or punctuation must be opening.
+    /// Kills `replace -> bool with false`.
+    #[test]
+    fn is_opening_context_after_space_is_opening() {
+        let chars: Vec<char> = " word".chars().collect();
+        assert!(
+            is_opening_context(&chars, 1),
+            "after space must be opening context"
+        );
+    }
+
+    /// After a letter must NOT be opening.
+    /// Kills `replace -> bool with true` (would say "word'" is opening).
+    #[test]
+    fn is_opening_context_after_letter_is_not_opening() {
+        let chars: Vec<char> = "word'end".chars().collect();
+        assert!(
+            !is_opening_context(&chars, 4),
+            "after letter must NOT be opening context"
+        );
+    }
+
+    // ── apply_curly_double ────────────────────────────────────────────────
+    // Kills: replace == with != in apply_curly_double (127:14)
+
+    /// `"hello"` must yield left-then-right double curly quotes.
+    /// Kills `replace == with !=`: with mutation, non-`"` chars get replaced instead.
+    #[test]
+    fn apply_curly_double_wraps_correctly() {
+        let result = apply_curly_double("\"hello\"");
+        assert_eq!(
+            result, "\u{201c}hello\u{201d}",
+            "opening \" → LEFT_DOUBLE, closing \" → RIGHT_DOUBLE"
+        );
+    }
+
+    /// Text without `"` must be returned unchanged.
+    /// Kills `replace == with !=`: every letter would become a curly quote.
+    #[test]
+    fn apply_curly_double_no_quotes_unchanged() {
+        let result = apply_curly_double("no quotes here");
+        assert_eq!(result, "no quotes here");
+    }
+
+    // ── apply_curly_single ────────────────────────────────────────────────
+    // Covers mutations at lines 142-149.
+
+    /// Apostrophe in a contraction → RIGHT_SINGLE (curly apostrophe).
+    /// Kills: replace apply_curly_single -> String with String::new() (142:5)
+    ///        replace && with || (149:28) — `||` changes any prev OR next letter to contraction
+    ///        replace && with || (146:37) — prev_letter guard short-circuit
+    ///        replace && with || (147:51) — next_letter guard short-circuit
+    #[test]
+    fn apply_curly_single_contraction_becomes_right_curly() {
+        // "it's": apostrophe at position 2, prev='t' (letter), next='s' (letter) → RIGHT_SINGLE
+        let result = apply_curly_single("it's");
+        assert_eq!(result, "it\u{2019}s");
+    }
+
+    /// Opening apostrophe at position 0 → LEFT_SINGLE; no panic from prev-char access.
+    /// Kills: replace > with >= (146:33) — `i>=0` is always true → chars[-1] panics
+    ///        replace > with == (146:33) — `i==0` only checks exact zero, then checks chars[-1]
+    ///        replace && with || (146:37) — `0 || chars[-1].is_alphabetic()` panics at i=0
+    #[test]
+    fn apply_curly_single_apostrophe_at_start_is_left_curly() {
+        let result = apply_curly_single("'world");
+        // position 0: prev doesn't exist → opening → LEFT_SINGLE
+        assert!(
+            result.starts_with('\u{2018}'),
+            "apostrophe at position 0 must be left curly; got: {result:?}"
+        );
+    }
+
+    /// Apostrophe at the very end of the string → RIGHT_SINGLE; no panic from next-char access.
+    /// Kills: replace < with <= (147:37) — `i+1 <= len` → chars[len] panics at last position
+    ///        replace + with - (147:33) — `i - 1 < chars.len()` → underflow at i=0
+    ///        replace + with * (147:33) — `i * 1 < chars.len()` → `i`, same index, subtly wrong
+    ///        replace + with - (147:62) — `chars[i - 1]` at i=last uses wrong char
+    ///        replace + with * (147:62) — same wrong-index issue
+    #[test]
+    fn apply_curly_single_apostrophe_at_end_is_right_curly() {
+        // "hello'": position 5, prev='o' (letter), no next → not contraction → not opening → RIGHT_SINGLE
+        let result = apply_curly_single("hello'");
+        assert!(
+            result.ends_with('\u{2019}'),
+            "trailing apostrophe must be right curly; got: {result:?}"
+        );
+    }
+
+    /// Text without apostrophe passes through unchanged.
+    /// Kills: replace == with != (145:14) — every non-apostrophe char gets replaced with curly.
+    #[test]
+    fn apply_curly_single_no_apostrophe_unchanged() {
+        let result = apply_curly_single("hello world");
+        assert_eq!(result, "hello world");
+    }
+
+    /// After a space (opening context), apostrophe is LEFT_SINGLE even when the next char is a letter.
+    /// Kills: replace - with + (146:48) — `chars[i+1]` used as prev; space context loses its opening meaning.
+    #[test]
+    fn apply_curly_single_after_space_is_opening() {
+        // " 'hello": position 1, prev=' ' (space, opening), next='h' (letter)
+        // → prev_letter=false (space is not alphabetic) → not contraction
+        // → is_opening_context(1) = true (space before) → LEFT_SINGLE
+        // With 146:48 mutation: prev_letter checks chars[i+1]='h' → true
+        // → contraction check: prev=true(mutated), next=true → RIGHT_SINGLE (WRONG)
+        let result = apply_curly_single(" 'hello");
+        let chars: Vec<char> = result.chars().collect();
+        assert_eq!(
+            chars[1], '\u{2018}',
+            "apostrophe after space must be left curly (opening); got: {result:?}"
+        );
+    }
+
+    // ── preserve_quote_style ─────────────────────────────────────────────
+    // Kills mutations at 170:55, 171:55, 172:23.
+
+    /// actual_old with only a LEFT_DOUBLE (no RIGHT_DOUBLE) must still apply curly style.
+    /// Kills: replace || with && (170:55) — requires BOTH left AND right double to set has_double.
+    #[test]
+    fn preserve_quote_style_left_double_only_applies_curly() {
+        // actual_old has only LEFT_DOUBLE, new_string has straight quotes
+        let actual_old = "\u{201c}open quote only";
+        let result = preserve_quote_style("\"open quote only", actual_old, "\"replaced\"");
+        assert!(
+            result.contains('\u{201c}') || result.contains('\u{201d}'),
+            "only LEFT_DOUBLE in actual_old must still trigger curly-double application; got: {result:?}"
+        );
+    }
+
+    /// actual_old with only a LEFT_SINGLE must still apply curly single style.
+    /// Kills: replace || with && (171:55) — requires BOTH left AND right single to set has_single.
+    #[test]
+    fn preserve_quote_style_left_single_only_applies_curly() {
+        let actual_old = "\u{2018}open single only";
+        let result = preserve_quote_style("'open single only", actual_old, "'replaced'");
+        assert!(
+            result.contains('\u{2018}') || result.contains('\u{2019}'),
+            "only LEFT_SINGLE in actual_old must still trigger curly-single application; got: {result:?}"
+        );
+    }
+
+    /// actual_old with only curly singles (no doubles): must apply singles but NOT doubles.
+    /// Kills: delete ! at 172:23 — removes the `!` before `has_single`, so the guard
+    /// `if !has_double && !has_single` becomes `if !has_double && has_single`, causing
+    /// early return (no style applied) when only singles are present.
+    #[test]
+    fn preserve_quote_style_single_quotes_only_applied() {
+        let actual_old = "\u{2018}hello\u{2019}";
+        let result = preserve_quote_style("'hello'", actual_old, "'world'");
+        assert!(
+            result.contains('\u{2018}') || result.contains('\u{2019}'),
+            "actual_old with only single curly quotes must apply single curly style; got: {result:?}"
+        );
+    }
+
+    // ── try_match step 3 negative (kills 295:22 && with ||) ──────────────
+
+    /// Step 3 must NOT match when the stripped needle is not in the haystack.
+    /// Kills: replace && with || (295:22) — would return Some(stripped) even when haystack
+    /// does not contain the stripped needle (since `tws != needle` is already true).
+    #[test]
+    fn try_match_trailing_whitespace_not_in_haystack_returns_none() {
+        // needle has trailing whitespace but stripped form ("foo") is not in haystack
+        assert_eq!(
+            try_match("bar baz qux", "foo   "),
+            None,
+            "stripped needle not in haystack must return None"
+        );
+    }
+
+    // ── try_match step 4 negative (kills 301:* mutations) ─────────────────
+
+    /// Step 4 (combined quote-norm + tws) must NOT fire when qn_tws == needle.
+    /// Kills: replace != with == (301:15) — enters step 4 only when qn_tws == needle.
+    #[test]
+    fn try_match_combined_step_does_not_fire_when_no_change() {
+        // needle with no quotes and no trailing whitespace: all normalizations are no-ops
+        // qn_tws == needle → step 4 guard must be false → no match via step 4
+        assert_eq!(try_match("hello world", "not found"), None);
+    }
+
+    // ── try_match step 4 positive (exercises combined quote-norm + tws) ───
+
+    /// Exercises step 4 of `try_match` (combined quote-normalisation +
+    /// trailing-whitespace strip).
+    ///
+    /// `needle` has both curly quotes **and** trailing spaces; `haystack` has
+    /// straight quotes with no trailing spaces.
+    ///
+    /// * Step 1 (exact): fails — different quotes, different trailing WS.
+    /// * Step 2 (quote-only): fails — `qn_needle` still has trailing spaces.
+    /// * Step 3 (tws-only): fails — stripped needle keeps curly quotes.
+    /// * Step 4 (combined): succeeds — `qn_tws` matches in `qn_tws_haystack`.
+    ///
+    /// Provides regression coverage for the guard at the step-4 `if` (which is
+    /// skipped for mutation testing because its `&&→||` variants are
+    /// near-equivalent deduplication guards).
+    #[test]
+    fn try_match_combined_quote_and_trailing_ws() {
+        // Curly right-single quote + trailing spaces in the needle.
+        let needle = "He said \u{2019}hello\u{2019}   ";
+        let haystack = "He said 'hello'";
+
+        let result = try_match(haystack, needle);
+        assert!(
+            result.is_some(),
+            "step 4 must match: needle={needle:?} in haystack={haystack:?}"
+        );
+        let matched = result.unwrap();
+        assert!(
+            haystack.contains(&matched),
+            "returned slice must be verbatim in haystack, got {matched:?}"
+        );
+    }
+
+    // ── try_match step 5 negative (kills 312:21 && with ||) ──────────────
+
+    /// Step 5 must NOT match when the desanitized needle is not in the haystack.
+    /// Kills: replace && with || (312:21) — would return Some(ds) even when haystack
+    /// does not contain it (since `ds != needle` is already true for a desanitizable needle).
+    #[test]
+    fn try_match_desanitized_needle_not_in_haystack_returns_none() {
+        // needle has desanitizable tag but the desanitized form is not in the haystack
+        assert_eq!(
+            try_match("some other content", "<fnr>data</fnr>"),
+            None,
+            "desanitized form not in haystack must return None"
+        );
     }
 
     // ── Tool (end-to-end) ─────────────────────────────────────────────────

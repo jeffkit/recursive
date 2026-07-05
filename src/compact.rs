@@ -648,4 +648,257 @@ mod tests {
         let split = Compactor::safe_split_point(&msgs, 2);
         assert_eq!(split, 3, "split at a User message should not retreat");
     }
+
+    // ========================================================================
+    // estimate_chars — tool_calls and reasoning_content coverage
+    // ========================================================================
+
+    #[test]
+    fn estimate_chars_includes_tool_calls() {
+        use crate::llm::ToolCall;
+        // An assistant message with one tool call.
+        // name = "Read" (4 chars), arguments = "\"path\"" (6 chars), overhead = 32
+        let tool_call = ToolCall {
+            id: "c1".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!("path"),
+        };
+        let msg = Message::assistant_with_tool_calls("think".to_string(), vec![tool_call]);
+        // content=5, name=4, args=serde representation len, overhead=32
+        let args_len = msg.tool_calls[0].arguments.to_string().len();
+        let expected = 5 + (4 + args_len + 32);
+        assert_eq!(
+            Compactor::estimate_chars(&[msg]),
+            expected,
+            "tool_calls contribution must be counted"
+        );
+    }
+
+    #[test]
+    fn estimate_chars_includes_reasoning_content() {
+        let mut msg = Message::assistant("hello".to_string());
+        msg.reasoning_content = Some("some reasoning".to_string());
+        // content=5, reasoning=14
+        assert_eq!(
+            Compactor::estimate_chars(&[msg]),
+            5 + 14,
+            "reasoning_content must be counted"
+        );
+    }
+
+    #[test]
+    fn estimate_chars_tool_calls_plus_reasoning_combined() {
+        use crate::llm::ToolCall;
+        let tool_call = ToolCall {
+            id: "c2".into(),
+            name: "Write".into(),
+            arguments: serde_json::json!({"path": "x"}),
+        };
+        let mut msg = Message::assistant_with_tool_calls("".to_string(), vec![tool_call]);
+        msg.reasoning_content = Some("reason".to_string());
+        let args_len = msg.tool_calls[0].arguments.to_string().len();
+        // content=0, tool_call: name=5, args=..., +32; reasoning=6
+        let expected = (5 + args_len + 32) + 6;
+        assert_eq!(Compactor::estimate_chars(&[msg]), expected);
+    }
+
+    // ========================================================================
+    // apply_to_transcript — splice and return-value coverage
+    // ========================================================================
+
+    #[tokio::test]
+    async fn apply_to_transcript_splices_and_returns_counts() {
+        let provider = MockProvider::new(vec![Completion {
+            content: "summary of first three".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let mut transcript = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+            Message::user("msg3".to_string()),
+        ];
+
+        // keep_recent_n=2 → split=4, compact first 4 msgs → removed=4
+        let compactor = Compactor::new(50).keep_recent_n(2);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 5)
+            .await
+            .unwrap();
+
+        // Should have returned Some((removed, summary_chars))
+        let (removed, summary_chars) =
+            result.expect("should compact when transcript is long enough");
+        assert!(removed > 0, "removed must be > 0 when compaction ran");
+        assert!(summary_chars > 0, "summary_chars must be > 0");
+
+        // Transcript must start with the compaction summary
+        assert_eq!(transcript[0].role, crate::message::Role::System);
+        assert!(transcript[0].is_compaction_summary);
+        // The 2 recent messages are preserved after the summary
+        assert!(transcript.len() >= 3, "summary + at least 2 recent");
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_too_short_returns_none() {
+        // A provider that should never be called
+        let provider = MockProvider::new(vec![]);
+
+        let mut transcript = vec![
+            Message::user("only one".to_string()),
+            Message::assistant("reply".to_string()),
+        ];
+
+        // keep_recent_n=8 + 2 = 10 required, but transcript has only 2
+        let compactor = Compactor::new(50).keep_recent_n(8);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 0)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "transcript too short must return None");
+        // Transcript must not be modified
+        assert_eq!(transcript.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compact_includes_tool_calls_in_older_text() {
+        // Verify that assistant messages carrying tool_calls contribute their
+        // call summaries to the text sent to the LLM for summarization.
+        // If the `!m.tool_calls.is_empty()` guard is inverted, the calls
+        // are omitted (or spurious empty `[tool_calls: ]` is appended to
+        // messages that have no calls), which breaks the compactor's ability
+        // to preserve tool-invocation context across compaction boundaries.
+        use crate::llm::{Completion, MockProvider, ToolCall};
+        let provider = MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let tool_call = ToolCall {
+            id: "c1".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let asst_with_calls =
+            Message::assistant_with_tool_calls("thinking".to_string(), vec![tool_call]);
+        // Build transcript long enough that the tool-call pair ends up in
+        // the "older" portion: [user, asst+tc, tool_result, user] are older,
+        // [asst, user] are "recent" (keep_recent_n=2).
+        // safe_split_point with keep_n=2 on 6 msgs: initial split=4
+        // (transcript[4] = "asst" — no tool_calls, no Tool role) → no retreat.
+        let transcript = vec![
+            Message::user("start".to_string()),          // [0] older
+            asst_with_calls,                             // [1] older  ← has tool_calls
+            Message::tool_result("c1", "file contents"), // [2] older
+            Message::user("continue".to_string()),       // [3] older
+            Message::assistant("done".to_string()),      // [4] recent
+            Message::user("next".to_string()),           // [5] recent
+        ];
+
+        let compactor = Compactor::new(0).keep_recent_n(2);
+        let _ = compactor.compact(&provider, &transcript, 0).await.unwrap();
+
+        let calls = provider.calls();
+        assert!(!calls.is_empty(), "provider must have been called");
+        // The first (and only) call is the summarization request.
+        let prompt_msg = &calls[0][0];
+        assert!(
+            prompt_msg.content.contains("Read"),
+            "older_text must include the tool call name 'Read'; got: {}",
+            prompt_msg.content
+        );
+        assert!(
+            prompt_msg.content.contains("[tool_calls:"),
+            "older_text must include the [tool_calls: ...] marker; got: {}",
+            prompt_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_minimum_length_boundary() {
+        // Exactly at the boundary: keep_recent_n + 2 messages → should compact.
+        let provider = MockProvider::new(vec![Completion {
+            content: "boundary summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let keep_n = 2_usize;
+        // Minimum length = keep_n + 2 = 4
+        let mut transcript = vec![
+            Message::system("s".to_string()),
+            Message::user("u".to_string()),
+            Message::assistant("a".to_string()),
+            Message::user("u2".to_string()),
+        ];
+
+        let compactor = Compactor::new(0).keep_recent_n(keep_n);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "should compact when len == keep_recent_n + 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_boundary_plus_not_times() {
+        // Kills: `replace + with * in Compactor::apply_to_transcript` at line 225.
+        //
+        // The threshold is `keep_recent_n + 2`, NOT `keep_recent_n * 2`.
+        // At keep_recent_n=2, both formulas yield 4, so we need keep_recent_n != 2.
+        //
+        // Use keep_recent_n=3 (threshold = 3+2=5, but 3*2=6).
+        // With transcript.len() == 5:
+        //   original `+`: 5 < 5 → false → compaction fires
+        //   mutant `*`:   5 < 6 → true  → early return, no compaction
+        let provider = MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let keep_n = 3_usize;
+        // Exactly keep_n + 2 = 5 messages
+        let mut transcript = vec![
+            Message::system("s0".to_string()),
+            Message::user("u1".to_string()),
+            Message::assistant("a1".to_string()),
+            Message::user("u2".to_string()),
+            Message::assistant("a2".to_string()),
+        ];
+        assert_eq!(
+            transcript.len(),
+            keep_n + 2,
+            "test setup: must be exactly keep_n + 2 messages"
+        );
+
+        let compactor = Compactor::new(0).keep_recent_n(keep_n);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "must compact when len == keep_recent_n + 2 (threshold uses `+`, not `*`)"
+        );
+    }
 }
