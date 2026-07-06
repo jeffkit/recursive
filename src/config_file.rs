@@ -900,6 +900,58 @@ interactive = ["delete_file"]
         assert!(content.contains("OPENAI_API_KEY="));
     }
 
+    // ── set_value top-level [field] arm ──────────────────────────────────────
+
+    #[test]
+    fn set_value_top_level_key_roundtrips() {
+        // kills `delete match arm [field] in set_value` at line 286:
+        // A key without a dot (e.g. "timeout") should be inserted at the
+        // top level of the TOML document. If that arm is deleted, the key
+        // falls through to `_ => Error("invalid key format")` and the call fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        // Use a key that is valid but has no dot section.
+        // "timeout" is not a real config key but set_value writes raw TOML.
+        set_value("timeout", "30").expect("set_value with a top-level key must succeed");
+
+        let path = config_file_path().unwrap();
+        assert!(path.exists(), "config.toml must be created");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("timeout"),
+            "config.toml must contain the top-level key; got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn set_value_dotted_key_roundtrips() {
+        // kills `delete match arm [section, field] in set_value` at line 278:
+        // A dotted key like "provider.model" must be written as a nested
+        // [provider] table. If that arm is deleted, the key is written as
+        // a literal "provider.model" top-level key (wrong) or falls to `[field]`.
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        set_value("provider.model", "gpt-4o")
+            .expect("set_value with a dotted key must succeed");
+
+        let path = config_file_path().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Proper nested TOML: [provider] section, not a literal "provider.model" key
+        assert!(
+            content.contains("[provider]"),
+            "dotted key must produce a [provider] section; got:\n{content}"
+        );
+        assert!(
+            content.contains("model"),
+            "model field must appear in the config; got:\n{content}"
+        );
+        // Must be parseable by FileConfig
+        let loaded = FileConfig::load_from(&path).unwrap().unwrap();
+        assert_eq!(loaded.provider.unwrap().model.as_deref(), Some("gpt-4o"));
+    }
+
     #[test]
     fn set_secret_escapes_single_quotes() {
         // A pathological key value containing a single quote must not
