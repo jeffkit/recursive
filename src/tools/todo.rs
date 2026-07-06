@@ -287,4 +287,33 @@ mod tests {
         assert_eq!(tool.side_effect_class(), ToolSideEffect::Mutating);
         assert!(!tool.is_readonly());
     }
+
+    #[test]
+    fn is_deferred_returns_true() {
+        // kills `replace TodoWriteTool::is_deferred -> bool with false`
+        let (tool, _) = make_tool();
+        assert!(tool.is_deferred(), "TodoWriteTool must be a deferred tool");
+    }
+
+    #[tokio::test]
+    async fn remaining_excludes_completed_and_cancelled() {
+        // kills mutations in the `remaining` filter predicate:
+        // e.g. adding Completed to the filter, or removing InProgress
+        let (tool, _) = make_tool();
+        let args = json!({
+            "todos": [
+                {"content": "A", "status": "pending"},
+                {"content": "B", "status": "in_progress"},
+                {"content": "C", "status": "completed"},
+                {"content": "D", "status": "cancelled"},
+            ]
+        });
+        let result = tool.execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 4, "count must include all 4 todos");
+        assert_eq!(
+            parsed["remaining"], 2,
+            "remaining must count only pending+in_progress (not completed/cancelled)"
+        );
+    }
 }
