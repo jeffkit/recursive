@@ -2210,4 +2210,68 @@ mod tests {
         // The prompt should be unchanged.
         assert_eq!(sp, base_prompt);
     }
+
+    // ── format_timestamp ────────────────────────────────────────────────────
+
+    #[test]
+    fn format_timestamp_unix_epoch_is_1970() {
+        let ts = format_timestamp(SystemTime::UNIX_EPOCH);
+        assert_eq!(&ts[..10], "1970-01-01", "epoch date must be 1970-01-01; got {ts}");
+        assert_eq!(&ts[11..19], "00:00:00", "epoch time must be 00:00:00; got {ts}");
+        assert!(ts.ends_with('Z'), "must end with Z; got {ts}");
+    }
+
+    #[test]
+    fn format_timestamp_known_date() {
+        // 2026-07-06T00:00:00Z = 20640 days * 86400 sec = 1_783_296_000 seconds
+        let secs = 1_783_296_000u64;
+        let t = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(secs);
+        let ts = format_timestamp(t);
+        assert_eq!(&ts[..10], "2026-07-06", "expected 2026-07-06; got {ts}");
+        assert_eq!(&ts[11..19], "00:00:00", "time part must be zero; got {ts}");
+    }
+
+    #[test]
+    fn format_timestamp_time_parts_in_range() {
+        // 2026-07-06T13:45:30Z
+        let secs: u64 = 1_783_296_000 + 13 * 3600 + 45 * 60 + 30;
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let ts = format_timestamp(t);
+        assert_eq!(&ts[11..13], "13", "hours mismatch; got {ts}");
+        assert_eq!(&ts[14..16], "45", "minutes mismatch; got {ts}");
+        assert_eq!(&ts[17..19], "30", "seconds mismatch; got {ts}");
+    }
+
+    // ── sanitize_thread_id_for_session ──────────────────────────────────────
+
+    #[test]
+    fn sanitize_thread_id_valid_passthrough() {
+        assert_eq!(sanitize_thread_id_for_session("abc-123"), "abc-123");
+        assert_eq!(sanitize_thread_id_for_session("foo_bar.baz"), "foo_bar.baz");
+    }
+
+    #[test]
+    fn sanitize_thread_id_replaces_special_chars() {
+        let out = sanitize_thread_id_for_session("a/b:c");
+        assert!(!out.contains('/'), "slash must be replaced");
+        assert!(!out.contains(':'), "colon must be replaced");
+    }
+
+    #[test]
+    fn sanitize_thread_id_leading_dot_replaced() {
+        let out = sanitize_thread_id_for_session(".hidden");
+        assert!(!out.starts_with('.'), "leading dot must be replaced; got {out}");
+    }
+
+    #[test]
+    fn sanitize_thread_id_double_dot_collapsed() {
+        let out = sanitize_thread_id_for_session("a..b");
+        assert!(!out.contains(".."), "double dot must be collapsed; got {out}");
+    }
+
+    #[test]
+    fn sanitize_thread_id_empty_becomes_default() {
+        assert_eq!(sanitize_thread_id_for_session(""), "default");
+    }
 }

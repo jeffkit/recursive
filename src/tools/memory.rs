@@ -1110,4 +1110,46 @@ mod tests {
         assert_eq!(m, 7);
         assert_eq!(d, 6);
     }
+
+    // --- is_leap ---
+
+    #[test]
+    fn is_leap_regular_leap_year() {
+        // divisible by 4, not 100 → leap
+        assert!(is_leap(1972));
+        assert!(is_leap(2024));
+    }
+
+    #[test]
+    fn is_leap_century_non_leap() {
+        // divisible by 100 but not 400 → NOT leap
+        assert!(!is_leap(1900));
+        assert!(!is_leap(1800));
+    }
+
+    #[test]
+    fn is_leap_400_year_is_leap() {
+        // divisible by 400 → leap
+        assert!(is_leap(2000));
+        assert!(is_leap(1600));
+    }
+
+    #[test]
+    fn is_leap_ordinary_non_leap() {
+        // not divisible by 4 → NOT leap
+        assert!(!is_leap(1971));
+        assert!(!is_leap(2023));
+    }
+
+    // --- chrono_now_rfc3339 arithmetic ---
+
+    #[test]
+    fn chrono_now_rfc3339_minutes_and_seconds_in_range() {
+        let ts = chrono_now_rfc3339();
+        // Format: YYYY-MM-DDTHH:MM:SSZ  (positions 14-15 = minutes, 17-18 = seconds)
+        let mm: u32 = ts[14..16].parse().expect("minutes must parse");
+        let ss: u32 = ts[17..19].parse().expect("seconds must parse");
+        assert!(mm < 60, "minutes out of range: {mm}");
+        assert!(ss < 60, "seconds out of range: {ss}");
+    }
 }
