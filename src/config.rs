@@ -1734,6 +1734,12 @@ api_key = "sk-from-file"
     #[test]
     fn web_search_provider_empty_string_becomes_none() {
         let _env_lock = crate::test_util::env_lock();
+        // Pin RECURSIVE_HOME to an empty temp dir so FileConfig::load() returns
+        // None (no config.toml), preventing file-fallback from returning a real
+        // locally-configured provider like "brave" when the env var is "".
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         let orig = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok();
         let orig_model = std::env::var("RECURSIVE_MODEL").ok();
         let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
@@ -1770,6 +1776,11 @@ api_key = "sk-from-file"
     #[test]
     fn web_search_provider_nonempty_string_becomes_some() {
         let _env_lock = crate::test_util::env_lock();
+        // Pin RECURSIVE_HOME so the test is not affected by a real
+        // ~/.recursive/config.toml on the developer's machine.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         let orig = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok();
         let orig_model = std::env::var("RECURSIVE_MODEL").ok();
         let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
