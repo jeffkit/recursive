@@ -964,4 +964,124 @@ mod tests {
         }
         assert_eq!(bus.history().await.len(), 10);
     }
+
+    // --- SharedMemory::all ---
+
+    #[tokio::test]
+    async fn shared_memory_all_returns_all_entries() {
+        let mem = SharedMemory::new();
+        mem.set("x".into(), "1".into(), "a".into()).await;
+        mem.set("y".into(), "2".into(), "b".into()).await;
+        let all = mem.all().await;
+        assert_eq!(all.len(), 2, "all() must return every stored entry");
+        let mut keys: Vec<String> = all.iter().map(|e| e.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["x", "y"]);
+    }
+
+    #[tokio::test]
+    async fn shared_memory_all_empty_returns_empty_vec() {
+        let mem = SharedMemory::new();
+        assert!(mem.all().await.is_empty(), "all() on empty store must return empty vec");
+    }
+
+    // --- AgentMode::parse ---
+
+    #[test]
+    fn agent_mode_parse_single() {
+        assert_eq!(AgentMode::parse("single"), Some(AgentMode::Single));
+    }
+
+    #[test]
+    fn agent_mode_parse_parallel() {
+        assert_eq!(AgentMode::parse("parallel"), Some(AgentMode::Parallel));
+    }
+
+    #[test]
+    fn agent_mode_parse_sequential() {
+        assert_eq!(AgentMode::parse("sequential"), Some(AgentMode::Sequential));
+    }
+
+    #[test]
+    fn agent_mode_parse_unknown_returns_none() {
+        assert_eq!(AgentMode::parse(""), None);
+        assert_eq!(AgentMode::parse("xyzzy"), None);
+    }
+
+    // --- AgentPool::remove_role ---
+
+    #[test]
+    fn agent_pool_remove_role_returns_true_when_present() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut pool = AgentPool::new(provider, test_config());
+        pool.add_role(AgentRole {
+            name: "tmp".into(),
+            system_prompt: "X".into(),
+            max_steps: 1,
+            allowed_tools: vec![],
+        });
+        assert!(pool.remove_role("tmp"), "remove existing role must return true");
+        assert_eq!(pool.role_count(), 0);
+    }
+
+    #[test]
+    fn agent_pool_remove_role_returns_false_when_absent() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut pool = AgentPool::new(provider, test_config());
+        assert!(!pool.remove_role("nonexistent"), "remove absent role must return false");
+    }
+
+    // --- coordinator_system_prompt ---
+
+    #[test]
+    fn coordinator_system_prompt_is_nonempty_and_not_placeholder() {
+        let prompt = coordinator_system_prompt();
+        assert!(!prompt.is_empty(), "coordinator prompt must not be empty");
+        assert_ne!(prompt, "xyzzy", "coordinator prompt must not be xyzzy placeholder");
+        assert!(
+            prompt.contains("coordinator"),
+            "coordinator prompt must mention 'coordinator'"
+        );
+    }
+
+    // --- default_roles content ---
+
+    #[test]
+    fn default_roles_have_expected_steps_and_tools() {
+        let roles = default_roles();
+        assert!(!roles.is_empty(), "default_roles must return non-empty vec");
+
+        let planner = roles.iter().find(|r| r.name == "planner").expect("planner role");
+        let coder = roles.iter().find(|r| r.name == "coder").expect("coder role");
+        let reviewer = roles.iter().find(|r| r.name == "reviewer").expect("reviewer role");
+
+        // Each role must have a positive step limit.
+        assert!(planner.max_steps > 0);
+        assert!(coder.max_steps > 0);
+        assert!(reviewer.max_steps > 0);
+
+        // Reviewer is read-only so it must declare some allowed tools.
+        assert!(!reviewer.allowed_tools.is_empty(), "reviewer must have allowed_tools");
+
+        // Prompts must be non-empty.
+        assert!(!planner.system_prompt.is_empty());
+        assert!(!coder.system_prompt.is_empty());
+        assert!(!reviewer.system_prompt.is_empty());
+    }
+
+    // --- register_subagent_if_enabled: disabled path ---
+
+    #[test]
+    fn register_subagent_if_enabled_noop_when_disabled() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let config = test_config(); // subagent_enabled: false
+        let tools = crate::tools::ToolRegistry::local();
+        let initial_names = tools.names();
+        let result = register_subagent_if_enabled(tools, &config, provider);
+        assert_eq!(
+            result.names(),
+            initial_names,
+            "disabled subagent must not register any additional tools"
+        );
+    }
 }

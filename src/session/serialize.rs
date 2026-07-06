@@ -89,3 +89,69 @@ pub fn entry_to_message(entry: TranscriptEntry) -> crate::message::Message {
         is_compaction_summary: false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Role;
+
+    fn make_entry(role: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            uuid: String::new(),
+            parent_uuid: None,
+            source_tool_assistant_uuid: None,
+            id: "test-id".into(),
+            parent_id: None,
+            role: role.to_string(),
+            content: "hello".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            usage: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            audit: None,
+        }
+    }
+
+    #[test]
+    fn entry_to_message_system_role() {
+        assert_eq!(entry_to_message(make_entry("system")).role, Role::System);
+    }
+
+    #[test]
+    fn entry_to_message_user_role() {
+        assert_eq!(entry_to_message(make_entry("user")).role, Role::User);
+    }
+
+    #[test]
+    fn entry_to_message_assistant_role() {
+        assert_eq!(entry_to_message(make_entry("assistant")).role, Role::Assistant);
+    }
+
+    #[test]
+    fn entry_to_message_tool_role() {
+        assert_eq!(entry_to_message(make_entry("tool")).role, Role::Tool);
+    }
+
+    #[test]
+    fn entry_to_message_unknown_role_maps_to_user() {
+        assert_eq!(entry_to_message(make_entry("bogus")).role, Role::User);
+    }
+
+    #[test]
+    fn entry_to_message_is_not_compaction_summary() {
+        let msg = entry_to_message(make_entry("assistant"));
+        assert!(
+            !msg.is_compaction_summary,
+            "entry_to_message must always produce is_compaction_summary=false"
+        );
+    }
+
+    #[test]
+    fn entry_to_message_propagates_content() {
+        let mut e = make_entry("user");
+        e.content = "unique-payload-xyz".into();
+        let msg = entry_to_message(e);
+        assert_eq!(msg.content, "unique-payload-xyz");
+    }
+}
