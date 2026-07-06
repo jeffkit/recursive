@@ -1540,4 +1540,37 @@ mod tests {
         assert_eq!(evicted, 0, "must not evict when under cap");
         assert_eq!(store.active_facts().len(), 2);
     }
+
+    #[test]
+    fn fact_store_evict_at_exact_cap_is_noop() {
+        // kills `replace <= with <` in evict_to_cap (line 180)
+        // With `< cap`: active_count(3) < cap(3) is false → eviction fires wrongly.
+        // With `<= cap`: active_count(3) <= cap(3) is true → correctly returns 0.
+        let mut store = fresh_fact_store();
+        for i in 0..3 {
+            store.add(format!("fact {i}"), vec![], None);
+        }
+        assert_eq!(store.active_facts().len(), 3);
+        let evicted = store.evict_to_cap(3);
+        assert_eq!(evicted, 0, "evict_to_cap at exact cap must evict 0 facts");
+        assert_eq!(store.active_facts().len(), 3, "all 3 facts must remain active");
+    }
+
+    #[test]
+    fn fact_store_evict_marks_removed_with_sentinel() {
+        // kills function-level or body mutation of the `superseded_by = Some("__evicted__")` line
+        let mut store = fresh_fact_store();
+        for i in 0..3 {
+            store.add(format!("fact {i}"), vec![], None);
+        }
+        store.evict_to_cap(1); // evict 2 of the 3 facts
+
+        // Exactly 2 facts should be marked with the __evicted__ sentinel.
+        let evicted_count = store
+            .facts
+            .iter()
+            .filter(|f| f.superseded_by.as_deref() == Some("__evicted__"))
+            .count();
+        assert_eq!(evicted_count, 2, "evicted facts must have superseded_by = __evicted__");
+    }
 }
