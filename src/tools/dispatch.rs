@@ -441,4 +441,87 @@ mod tests {
         let err = resolve_within(tmp.path(), "../etc/passwd").unwrap_err();
         assert!(err.to_string().contains("escapes"));
     }
+
+    // ── args_preview_for_permission ──────────────────────────────────────────
+
+    #[test]
+    fn args_preview_short_object_passthrough() {
+        // kills args_preview_for_permission → String::new() and → "xyzzy"
+        // and kills `> with <` mutant (short string stays untouched)
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let preview = args_preview_for_permission(&args);
+        assert!(preview.contains("path"), "preview must contain key 'path'");
+        assert!(preview.contains("src/lib.rs"), "preview must contain value");
+        assert!(!preview.ends_with('…'), "short preview must not be truncated");
+    }
+
+    #[test]
+    fn args_preview_long_object_truncated_at_80() {
+        // kills `> with ==` and `> with >=` mutants.
+        // Use 3 keys × 30-char value each: "k1=\"xxx…\" , k2=..., k3=..." > 80 chars total.
+        let val = "x".repeat(30);
+        let args = serde_json::json!({"alpha": val, "beta": val, "gamma": val});
+        let preview = args_preview_for_permission(&args);
+        assert!(
+            preview.ends_with('…'),
+            "preview longer than 80 chars must end with ellipsis, got: {preview}"
+        );
+        assert_eq!(
+            preview.chars().count(),
+            80,
+            "truncated preview must be exactly 80 chars"
+        );
+    }
+
+    #[test]
+    fn args_preview_exactly_80_chars_not_truncated() {
+        // kills `> with >=` mutant: exactly 80 chars should NOT be truncated
+        // Build a json string whose preview is exactly 80 chars.
+        // key="k" (3 bytes with quotes→ k="<val>") → adjust val length.
+        // Let's brute-force: start short and grow until preview reaches 80.
+        let mut len = 70usize;
+        loop {
+            let val = "a".repeat(len);
+            let args = serde_json::json!({"k": val});
+            let preview = args_preview_for_permission(&args);
+            if preview.chars().count() == 80 {
+                // exactly 80 → must NOT be truncated (> 80 is false)
+                assert!(
+                    !preview.ends_with('…'),
+                    "exactly 80-char preview must not be truncated"
+                );
+                break;
+            }
+            len += 1;
+            if len > 200 {
+                break; // guard; test is best-effort if format changes
+            }
+        }
+    }
+
+    #[test]
+    fn args_preview_non_object_value() {
+        // covers the `other => other.to_string()` branch
+        let args = serde_json::json!("just a string");
+        let preview = args_preview_for_permission(&args);
+        assert!(preview.contains("just a string"), "non-object preview must contain the value");
+    }
+
+    // ── write tier gate: && vs || and delete ! ────────────────────────────────
+
+    #[test]
+    fn rw_root_allows_both_read_and_write() {
+        let tmp = TempDir::new().unwrap();
+        let roots = vec![rw(tmp.path())];
+        // read
+        assert!(
+            resolve_within_any(&roots, "a.txt", false).is_ok(),
+            "read from RW root must succeed"
+        );
+        // write
+        assert!(
+            resolve_within_any(&roots, "b.txt", true).is_ok(),
+            "write to RW root must succeed"
+        );
+    }
 }
