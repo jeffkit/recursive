@@ -153,3 +153,134 @@ pub(crate) fn blake3_canonical_json(v: &Value) -> String {
     let hash = blake3::hash(canonical.as_bytes());
     hash.to_hex().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_false (serde skip helper) ---
+
+    #[test]
+    fn is_false_returns_true_for_false() {
+        assert!(is_false(&false), "is_false(&false) must be true");
+    }
+
+    #[test]
+    fn is_false_returns_false_for_true() {
+        assert!(!is_false(&true), "is_false(&true) must be false");
+    }
+
+    // --- AuditMeta::synthetic_unknown_tool ---
+
+    #[test]
+    fn synthetic_unknown_tool_has_reasonable_fields() {
+        let meta = AuditMeta::synthetic_unknown_tool("my_tool");
+        assert!(!meta.step_id.is_empty(), "step_id must be non-empty");
+        assert!(meta.started_at > 0, "started_at must be positive");
+        assert_eq!(meta.side_effect, ToolSideEffect::External);
+        match &meta.exit_status {
+            ExitStatus::Err { message, .. } => {
+                assert!(
+                    message.contains("my_tool"),
+                    "error message must contain tool name"
+                );
+            }
+            ExitStatus::Ok => panic!("unknown tool must produce ExitStatus::Err"),
+        }
+    }
+
+    // --- TouchedFiles::is_empty ---
+
+    #[test]
+    fn touched_files_empty_paths_no_shell_is_empty() {
+        let tf = TouchedFiles::new();
+        assert!(tf.is_empty(), "no paths + no shell must be empty");
+    }
+
+    #[test]
+    fn touched_files_with_path_is_not_empty() {
+        let mut tf = TouchedFiles::new();
+        tf.paths.insert("src/main.rs".into());
+        assert!(!tf.is_empty(), "non-empty paths must not be empty");
+    }
+
+    #[test]
+    fn touched_files_saw_shell_is_not_empty() {
+        let mut tf = TouchedFiles::new();
+        tf.saw_shell = true;
+        assert!(
+            !tf.is_empty(),
+            "saw_shell=true must not be empty (kills &&→|| mutant)"
+        );
+    }
+
+    // --- TouchedFiles::paths_sorted ---
+
+    #[test]
+    fn paths_sorted_returns_sorted_vec() {
+        let mut tf = TouchedFiles::new();
+        tf.paths.insert("z.rs".into());
+        tf.paths.insert("a.rs".into());
+        tf.paths.insert("m.rs".into());
+        let sorted = tf.paths_sorted();
+        assert_eq!(sorted, vec!["a.rs", "m.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn paths_sorted_on_empty_is_empty_vec() {
+        let tf = TouchedFiles::new();
+        assert!(tf.paths_sorted().is_empty());
+    }
+
+    // --- unix_millis ---
+
+    #[test]
+    fn unix_millis_is_positive() {
+        let ms = unix_millis();
+        assert!(ms > 0, "unix_millis must return a positive timestamp; got {ms}");
+        // Sanity: must be after 2024-01-01 (1704067200000 ms)
+        assert!(ms > 1_704_067_200_000, "unix_millis must be after 2024-01-01");
+    }
+
+    // --- truncate_for_audit ---
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        let short = "hello";
+        let (out, truncated) = truncate_for_audit(short);
+        assert_eq!(out, short);
+        assert!(!truncated, "short string must not be truncated");
+    }
+
+    #[test]
+    fn truncate_long_string_is_clipped_and_flagged() {
+        let long = "x".repeat(AUDIT_ERR_MAX_BYTES + 10);
+        let (out, truncated) = truncate_for_audit(&long);
+        assert!(truncated, "long string must be flagged as truncated");
+        assert_eq!(out.len(), AUDIT_ERR_MAX_BYTES);
+    }
+
+    #[test]
+    fn truncate_exactly_max_bytes_not_truncated() {
+        let exact = "a".repeat(AUDIT_ERR_MAX_BYTES);
+        let (out, truncated) = truncate_for_audit(&exact);
+        assert!(!truncated, "exactly max bytes must NOT be truncated");
+        assert_eq!(out.len(), AUDIT_ERR_MAX_BYTES);
+    }
+
+    // --- blake3_canonical_json ---
+
+    #[test]
+    fn blake3_canonical_json_is_nonempty_and_not_placeholder() {
+        let hash = blake3_canonical_json(&serde_json::json!({"key": "value"}));
+        assert!(!hash.is_empty(), "blake3 hash must not be empty");
+        assert_ne!(hash, "xyzzy", "blake3 hash must not be placeholder");
+    }
+
+    #[test]
+    fn blake3_canonical_json_differs_for_different_inputs() {
+        let h1 = blake3_canonical_json(&serde_json::json!({"a": 1}));
+        let h2 = blake3_canonical_json(&serde_json::json!({"a": 2}));
+        assert_ne!(h1, h2, "different inputs must produce different hashes");
+    }
+}
