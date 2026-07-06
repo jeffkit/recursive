@@ -278,6 +278,58 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
+    // ── AuthConfig::is_valid unit tests ──────────────────────────────────────
+
+    #[test]
+    fn auth_config_is_valid_accepts_correct_key() {
+        // kills `replace AuthConfig::is_valid -> bool with false` and `diff == 0` mutations
+        let cfg = AuthConfig::new(vec!["correct-key".to_string()]);
+        assert!(cfg.is_valid("correct-key"), "correct key must be accepted");
+    }
+
+    #[test]
+    fn auth_config_is_valid_rejects_wrong_key() {
+        // kills `replace AuthConfig::is_valid -> bool with true` mutation
+        let cfg = AuthConfig::new(vec!["correct-key".to_string()]);
+        assert!(!cfg.is_valid("wrong-key"), "wrong key must be rejected");
+    }
+
+    #[test]
+    fn auth_config_is_valid_rejects_prefix_of_correct_key() {
+        // kills length-check removal mutations (constant-time comparison)
+        let cfg = AuthConfig::new(vec!["long-key-value".to_string()]);
+        assert!(!cfg.is_valid("long-key"), "prefix of correct key must be rejected");
+    }
+
+    #[test]
+    fn auth_config_is_valid_returns_false_for_empty_key_set() {
+        // kills `if self.keys.is_empty() { return false; }` removal mutation
+        let cfg = AuthConfig::new(vec![]);
+        assert!(!cfg.is_valid("anything"), "empty key set must always reject");
+    }
+
+    #[test]
+    fn auth_config_is_valid_accepts_any_of_multiple_keys() {
+        // kills the `found = true` assignment being replaced with a return
+        let cfg = AuthConfig::new(vec!["key-a".to_string(), "key-b".to_string()]);
+        assert!(cfg.is_valid("key-a"), "first key must be accepted");
+        assert!(cfg.is_valid("key-b"), "second key must be accepted");
+    }
+
+    #[test]
+    fn auth_config_is_enabled_true_with_api_keys() {
+        // kills `replace AuthConfig::is_enabled -> bool with false`
+        let cfg = AuthConfig::new(vec!["k".to_string()]);
+        assert!(cfg.is_enabled());
+    }
+
+    #[test]
+    fn auth_config_is_enabled_false_without_keys_or_jwt() {
+        // kills `replace !self.keys.is_empty() with false` or `|| self.jwt.is_some()` mutations
+        let cfg = AuthConfig::new(vec![]);
+        assert!(!cfg.is_enabled(), "no keys and no JWT must be disabled");
+    }
+
     fn router_with_auth(auth: AuthConfig) -> axum::Router {
         axum::Router::new()
             .route("/", get(|| async { "ok" }))
