@@ -219,6 +219,18 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    #[test]
+    fn checkpoint_log_path_has_correct_structure() {
+        // kills function-level replacement and component-order mutations
+        use std::path::PathBuf;
+        let workspace = PathBuf::from("/home/user/project");
+        let path = checkpoint_log_path(&workspace, "my-slug", "sess-01");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/user/project/.recursive/sessions/my-slug/sess-01/checkpoints.jsonl")
+        );
+    }
+
     fn has_git() -> bool {
         Command::new("git").arg("--version").output().is_ok()
     }
