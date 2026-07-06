@@ -515,4 +515,76 @@ mod tests {
         let unk = default_compact_threshold_chars("unknown-model");
         assert!(unk > 0);
     }
+
+    // ── ChatProvider default method tests ─────────────────────────────────────
+
+    /// A minimal provider that only overrides `complete()`.
+    /// All other ChatProvider methods use their trait defaults.
+    struct MinimalProvider {
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for MinimalProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> Result<Completion> {
+            Ok(Completion {
+                content: self.response.clone(),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: Some(TokenUsage::default()),
+                finish_reason: None,
+            })
+        }
+    }
+
+    #[test]
+    fn default_supports_deferred_tools_is_false() {
+        // kills `replace ChatProvider::supports_deferred_tools -> bool with true`
+        let provider = MinimalProvider { response: "hi".into() };
+        assert!(
+            !provider.supports_deferred_tools(),
+            "default supports_deferred_tools must be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_stream_sends_non_empty_content_to_channel() {
+        // kills `delete ! in ChatProvider::stream` at line 132
+        // With the mutant, content is only sent when IS empty — so this test
+        // would receive no chunk and the assertion would fail.
+        use tokio::sync::mpsc;
+        let provider = MinimalProvider { response: "hello from stream".into() };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let completion = provider.stream(&[], &[], Some(tx)).await.unwrap();
+        assert_eq!(completion.content, "hello from stream");
+
+        // The channel should have received a Text chunk with the content.
+        let chunk = rx.try_recv().expect("stream must emit at least one chunk");
+        match chunk {
+            StreamChunk::Text(t) => assert_eq!(t, "hello from stream"),
+            other => panic!("expected Text chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_stream_does_not_send_chunk_for_empty_content() {
+        // Verifies the positive case: empty content → no Text chunk sent
+        use tokio::sync::mpsc;
+        let provider = MinimalProvider { response: String::new() };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let completion = provider.stream(&[], &[], Some(tx)).await.unwrap();
+        assert!(completion.content.is_empty());
+
+        // No Text chunk should have been sent for empty content.
+        assert!(
+            rx.try_recv().is_err(),
+            "empty content must not emit a Text chunk"
+        );
+    }
 }
