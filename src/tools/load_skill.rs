@@ -1315,6 +1315,35 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_depth_exactly_at_max_succeeds() {
+        // resolve_deps is called with initial depth=1.
+        // Chain A(1) → B(2) → C(3, no further deps) — C is processed at depth 3 = MAX_DEPTH.
+        // `depth > MAX_DEPTH` (3 > 3 = false) → succeeds.
+        // Mutant `>= MAX_DEPTH` (3 >= 3 = true) → error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        create_skill(base, "skill-c", &[], "Body of C");
+        create_skill(base, "skill-b", &["skill-c"], "Body of B");
+        create_skill(base, "skill-a", &["skill-b"], "Body of A");
+
+        let skills = crate::skills::discover_skills(&[base.to_path_buf()]);
+        let tool = LoadSkill::new(skills);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "skill-a"})));
+
+        assert!(
+            result.is_ok(),
+            "chain A→B→C (resolved at depth 1/2/3 = MAX_DEPTH) must succeed, got: {:?}",
+            result
+        );
+        let output = result.unwrap();
+        assert!(output.contains("Body of C"), "must include deepest dep body");
+    }
+
+    #[test]
     fn parse_skill_meta_single_depends_on() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("test-skill");
