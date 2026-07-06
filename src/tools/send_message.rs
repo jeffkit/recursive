@@ -465,4 +465,48 @@ mod tests {
         assert!(out.contains("w1"));
         assert!(out.contains(&id.to_string()));
     }
+
+    // ── Additional targeted tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mailbox_is_empty_false_when_nonempty() {
+        // kills `replace WorkerMailbox::is_empty -> bool with true`
+        let mb = WorkerMailbox::new();
+        assert!(mb.is_empty().await, "fresh mailbox must be empty");
+        mb.push("msg".into()).await;
+        assert!(
+            !mb.is_empty().await,
+            "mailbox with a message must NOT be empty"
+        );
+    }
+
+    #[test]
+    fn send_message_tool_is_deferred() {
+        // kills `replace SendMessageTool::is_deferred -> bool with false`
+        let reg = WorkerRegistry::new();
+        let tr = Arc::new(TaskRegistry::new());
+        let tool = SendMessageTool::new(reg, tr);
+        assert!(
+            tool.is_deferred(),
+            "SendMessageTool must be deferred (depends on available workers)"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_active_workers_lists_all_registered() {
+        // kills `replace WorkerRegistry::active_workers -> Vec<String> with vec![]`
+        let reg = WorkerRegistry::new();
+        reg.register("w-alpha").await;
+        reg.register("w-beta").await;
+        let workers = reg.active_workers().await;
+        assert!(
+            workers.contains(&"w-alpha".to_string()),
+            "active_workers must include w-alpha"
+        );
+        assert!(
+            workers.contains(&"w-beta".to_string()),
+            "active_workers must include w-beta"
+        );
+        assert_eq!(workers.len(), 2, "expected exactly 2 active workers");
+    }
 }
