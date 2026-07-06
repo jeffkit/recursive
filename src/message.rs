@@ -158,4 +158,45 @@ mod tests {
             "is_compaction_summary must survive a serde round-trip"
         );
     }
+
+    #[test]
+    fn is_false_returns_true_for_false_value() {
+        // kills `replace !*b with *b` mutation in is_false()
+        assert!(is_false(&false));
+    }
+
+    #[test]
+    fn is_false_returns_false_for_true_value() {
+        // complementary: is_false(true) must be false
+        assert!(!is_false(&true));
+    }
+
+    #[test]
+    fn constructor_roles_are_correct() {
+        // kills any mutation that swaps Role variants in constructors
+        assert_eq!(Message::system("").role, Role::System);
+        assert_eq!(Message::user("").role, Role::User);
+        assert_eq!(Message::assistant("").role, Role::Assistant);
+        assert_eq!(
+            Message::assistant_with_tool_calls("", Vec::new()).role,
+            Role::Assistant
+        );
+        assert_eq!(Message::tool_result("id", "").role, Role::Tool);
+    }
+
+    #[test]
+    fn tool_result_sets_tool_call_id() {
+        // kills `tool_call_id: None` mutation in tool_result()
+        let m = Message::tool_result("call-123", "output");
+        assert_eq!(m.tool_call_id.as_deref(), Some("call-123"));
+    }
+
+    #[test]
+    fn constructors_set_empty_tool_calls_by_default() {
+        // kills mutations that set tool_calls: vec![<something>] in constructors
+        assert!(Message::system("").tool_calls.is_empty());
+        assert!(Message::user("").tool_calls.is_empty());
+        assert!(Message::assistant("").tool_calls.is_empty());
+        assert!(Message::tool_result("", "").tool_calls.is_empty());
+    }
 }

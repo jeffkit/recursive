@@ -197,6 +197,67 @@ mod tests {
         }
     }
 
+    /// Provider that returns a fixed "NO" response, used to confirm
+    /// `evaluate` can return `achieved = false`.
+    struct NoProvider;
+    #[async_trait]
+    impl ChatProvider for NoProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> Result<Completion> {
+            Ok(Completion {
+                content: "NO\nCondition not yet met.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_returns_not_achieved_for_no_response() {
+        // kills `starts_with("YES")` → `starts_with("NO")` mutation
+        let evaluator = GoalEvaluator::new(Arc::new(NoProvider));
+        let verdict = evaluator
+            .evaluate("all tests pass", &[Message::user("still failing")])
+            .await
+            .unwrap();
+        assert!(!verdict.achieved, "NO response must produce achieved=false");
+        assert!(
+            !verdict.reason.is_empty(),
+            "reason must be non-empty even for NO"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_skips_empty_content_messages() {
+        // kills `if m.content.is_empty() { None }` guard removal mutation
+        let provider = Arc::new(CapturingProvider {
+            captured_user_content: Mutex::new(String::new()),
+        });
+        let evaluator = GoalEvaluator::new(provider.clone());
+        let transcript = vec![
+            Message::user("visible"),
+            Message::user(""), // empty — must be skipped
+        ];
+        let _ = evaluator.evaluate("cond", &transcript).await.unwrap();
+        let captured = provider.captured_user_content.lock().unwrap().clone();
+        assert!(
+            captured.contains("visible"),
+            "non-empty message must appear in prompt"
+        );
+        // Count occurrences of [User]: in the prompt; only the "visible"
+        // message should appear, not the empty one.
+        let occurrences = captured.matches("[User]:").count();
+        assert_eq!(
+            occurrences, 1,
+            "only 1 non-empty User message should be included; got {occurrences} occurrences in: {captured}"
+        );
+    }
+
     /// Goal-301: a transcript with 25 messages must NOT be further
     /// truncated inside `evaluate()`.  All 25 messages must contribute
     /// to the user prompt sent to the provider.
