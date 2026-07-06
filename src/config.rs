@@ -1058,6 +1058,44 @@ mod tests {
         assert!(c.len() < large_content.len());
     }
 
+    #[test]
+    fn test_d_file_under_8kb_is_not_truncated() {
+        // A 2 KB file must NOT be truncated.
+        // Kills: `replace * with +` (8*1024 → 1032, which is < 2KB → would truncate)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&mem_dir).expect("create dirs");
+        let path = mem_dir.join("project.md");
+        // 2000 bytes > 1032 (8+1024) but < 8192 (8*1024)
+        let content = "x".repeat(2000);
+        std::fs::write(&path, &content).expect("write");
+        let loaded = load_project_memory(tmp.path()).expect("must load");
+        assert!(
+            !loaded.contains("truncated"),
+            "2 KB file must not be truncated; got: {}",
+            &loaded[..50.min(loaded.len())]
+        );
+        assert_eq!(loaded.len(), 2000, "must return full 2 KB content");
+    }
+
+    #[test]
+    fn test_e_file_exactly_8kb_is_not_truncated() {
+        // A file of exactly MAX_MEMORY_FILE_SIZE (8192) bytes must NOT be truncated.
+        // Kills: `replace > with >=` (would truncate at exactly 8192)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mem_dir = tmp.path().join(".recursive/memory");
+        std::fs::create_dir_all(&mem_dir).expect("create dirs");
+        let path = mem_dir.join("project.md");
+        let content = "y".repeat(MAX_MEMORY_FILE_SIZE); // exactly 8192 bytes
+        std::fs::write(&path, &content).expect("write");
+        let loaded = load_project_memory(tmp.path()).expect("must load");
+        assert!(
+            !loaded.contains("truncated"),
+            "exactly 8 KB file must NOT be truncated"
+        );
+        assert_eq!(loaded.len(), MAX_MEMORY_FILE_SIZE, "must return full 8 KB content");
+    }
+
     // Consolidated test for all HOME-dependent memory checks.
     // These must be ONE test because set_var("HOME", ...) is process-global
     // and parallel tests would race on it. The PinnedHome guard holds the
@@ -1111,6 +1149,16 @@ mod tests {
             assert!(prompt.contains("# Project memory"));
             assert!(prompt.contains("MIT license"));
             assert!(prompt.contains("You are Recursive"));
+            // Verify that multiple layers are separated by double newline.
+            // Kills: `replace > with <` in the `if i > 0` separator guard.
+            let user_pos = prompt.find("# User preferences").unwrap();
+            let project_pos = prompt.find("# Project memory").unwrap();
+            let between = &prompt[user_pos..project_pos];
+            assert!(
+                between.contains("\n\n"),
+                "layers must be separated by \\n\\n; between={:?}",
+                &between[..50.min(between.len())]
+            );
         }
 
         // Test F: no memory files behaves identically. We re-pin HOME to
