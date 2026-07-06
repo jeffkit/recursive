@@ -286,4 +286,106 @@ mod tests {
             "expected no-match message: {out}"
         );
     }
+
+    // ── Additional targeted tests ─────────────────────────────────────────────
+
+    #[test]
+    fn select_prefix_truncates_at_max_results() {
+        // kills `delete result.truncate(max_results)` — without truncation,
+        // all 3 specs would be returned even though max_results is 2.
+        let catalog = vec![
+            make_spec("A", "tool A"),
+            make_spec("B", "tool B"),
+            make_spec("C", "tool C"),
+        ];
+        let result = resolve("select:A,B,C", &catalog, 2);
+        assert_eq!(result.len(), 2, "select: results must be truncated to max_results");
+    }
+
+    #[test]
+    fn keyword_no_match_returns_empty() {
+        // kills `replace score > 0 with score >= 0` (score 0 must be filtered out)
+        let catalog = vec![make_spec("Read", "Read a file")];
+        let result = resolve("xyzzy_nonexistent_term", &catalog, 10);
+        assert!(result.is_empty(), "zero-score tools must not appear");
+    }
+
+    #[test]
+    fn keyword_search_ranks_higher_score_first() {
+        // kills mutation swapping sort order (ascending ↔ descending)
+        let catalog = vec![
+            make_spec("AlphaRead", "Read files"),
+            make_spec("BetaReadWrite", "Read and write files"),
+        ];
+        // "BetaReadWrite" matches both "read" and "write" → score 2
+        // "AlphaRead" matches only "read" → score 1
+        let result = resolve("read write", &catalog, 10);
+        assert!(!result.is_empty());
+        assert_eq!(
+            result[0].name, "BetaReadWrite",
+            "higher score tool must rank first"
+        );
+    }
+
+    #[test]
+    fn keyword_search_stable_sort_by_name_asc_when_equal_score() {
+        // kills mutation of `then(a.1.name.cmp(&b.1.name))` direction
+        let catalog = vec![
+            make_spec("ZTool", "do something useful"),
+            make_spec("ATool", "do something useful"),
+        ];
+        let result = resolve("something", &catalog, 10);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "ATool", "equal-score tools must sort by name asc");
+        assert_eq!(result[1].name, "ZTool");
+    }
+
+    #[test]
+    fn exact_name_match_returns_exactly_one() {
+        // kills function-level replacement of the exact-match return
+        let catalog = vec![
+            make_spec("Read", "Read a file"),
+            make_spec("ReadAll", "Read all files"),
+        ];
+        let result = resolve("Read", &catalog, 10);
+        assert_eq!(result.len(), 1, "exact match must return exactly 1 tool");
+        assert_eq!(result[0].name, "Read");
+    }
+
+    #[test]
+    fn is_deferred_returns_false() {
+        // kills `replace is_deferred -> bool with true`
+        let catalog: DeferredCatalog = Arc::new(RwLock::new(vec![]));
+        let tool = ToolSearchTool::new(catalog);
+        assert!(
+            !tool.is_deferred(),
+            "ToolSearchTool must always be eager (not deferred)"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_max_results_clamps_to_min_1() {
+        // kills mutation of `clamp(1, 20)` lower bound (e.g. remove clamp → 0 results)
+        let catalog: DeferredCatalog = Arc::new(RwLock::new(
+            (0..5)
+                .map(|i| make_spec(&format!("T{i}"), "useful thing"))
+                .collect(),
+        ));
+        let tool = ToolSearchTool::new(catalog);
+        let out = tool
+            .execute(json!({"query": "useful", "max_results": 0}))
+            .await
+            .unwrap();
+        let names: Vec<String> = serde_json::from_str(&out).expect("valid JSON array");
+        assert_eq!(names.len(), 1, "max_results=0 must be clamped to 1");
+    }
+
+    #[tokio::test]
+    async fn execute_empty_query_returns_error() {
+        // kills function-level replacement of the empty-query guard
+        let catalog: DeferredCatalog = Arc::new(RwLock::new(vec![make_spec("Read", "file")]));
+        let tool = ToolSearchTool::new(catalog);
+        let result = tool.execute(json!({"query": ""})).await;
+        assert!(result.is_err(), "empty query must return an error");
+    }
 }

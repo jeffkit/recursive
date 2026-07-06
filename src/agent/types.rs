@@ -90,3 +90,46 @@ impl std::fmt::Display for FinishReason {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_reason_display_all_variants() {
+        // kills `replace <impl Display for FinishReason>::fmt with Ok(Default::default())`
+        // and individual match-arm replacements.
+        assert_eq!(FinishReason::NoMoreToolCalls.to_string(), "no_more_tool_calls");
+        assert_eq!(FinishReason::BudgetExceeded.to_string(), "budget_exceeded");
+        assert_eq!(
+            FinishReason::ProviderStop("length".into()).to_string(),
+            "provider_stop:length"
+        );
+        assert_eq!(
+            FinishReason::Stuck {
+                repeated_call: "Read".into(),
+                repeats: 3
+            }
+            .to_string(),
+            "stuck:Read:3"
+        );
+        assert_eq!(
+            FinishReason::TranscriptLimit {
+                chars: 10_000,
+                limit: 8_000
+            }
+            .to_string(),
+            "transcript_limit:10000/8000"
+        );
+        assert_eq!(FinishReason::Cancelled.to_string(), "cancelled");
+        assert_eq!(
+            FinishReason::PermissionDenialLimit.to_string(),
+            "permission_denial_limit"
+        );
+    }
+
+    #[test]
+    fn planning_mode_default_is_immediate() {
+        assert_eq!(PlanningMode::default(), PlanningMode::Immediate);
+    }
+}
