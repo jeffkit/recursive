@@ -119,4 +119,28 @@ mod tests {
             .await;
         assert!(matches!(res, Err(crate::error::Error::NotFound(_))));
     }
+
+    // ── truncate() targeted tests ─────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        // kills function-level replacement of truncate
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_at_exact_boundary_is_not_truncated() {
+        // kills `replace <= with <` in `if s.len() <= max`
+        let s = "abc";
+        assert_eq!(truncate(s, 3), "abc", "string at exact max must not be truncated");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        // kills function-level replacement or `else` branch mutations
+        let s = "Hello World";
+        let out = truncate(s, 5);
+        assert!(out.ends_with('…'), "truncated string must end with ellipsis; got: {out}");
+        assert!(out.len() < s.len(), "truncated string must be shorter than original");
+    }
 }

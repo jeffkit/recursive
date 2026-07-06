@@ -152,4 +152,18 @@ mod tests {
         let res = tool.execute(json!({ "task_id": "task-bogus" })).await;
         assert!(res.is_err());
     }
+
+    #[tokio::test]
+    async fn empty_output_returns_no_new_output_message() {
+        // kills `if lines.is_empty()` guard removal / branch-swap mutations
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await;
+        let tool = TaskOutputTool::new(reg);
+        let out = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert_eq!(out, "(no new output)", "empty task output must return the sentinel string");
+    }
 }

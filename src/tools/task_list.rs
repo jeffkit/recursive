@@ -161,4 +161,25 @@ mod tests {
             .unwrap();
         assert!(alpha_r.contains("2 task(s)"));
     }
+
+    // ── truncate() targeted tests ────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_is_unchanged() {
+        // kills function-level replacement
+        assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_at_exact_max_is_not_truncated() {
+        // kills `replace <= with <` in `if s.len() <= max`
+        assert_eq!(truncate("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_over_max_appends_ellipsis() {
+        // kills else-branch mutations
+        let out = truncate("Hello World", 5);
+        assert!(out.ends_with('…'), "must end with ellipsis; got: {out}");
+    }
 }

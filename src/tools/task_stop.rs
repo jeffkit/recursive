@@ -117,4 +117,23 @@ mod tests {
         assert!(result.contains("already"));
         assert!(result.contains("completed"));
     }
+
+    #[tokio::test]
+    async fn stop_task_without_handle_reports_no_live_handle() {
+        // kills `if stopped { ... } else { ... }` branch-swap mutations:
+        // without a JoinHandle attached, task.stop() returns false, so the
+        // "no live handle" message must be returned instead of "cancellation requested".
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await; // registered but no JoinHandle set
+        let tool = TaskStopTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("no live handle") || result.contains("already finished"),
+            "expected 'no live handle' message, got: {result}"
+        );
+    }
 }

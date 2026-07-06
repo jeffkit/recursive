@@ -198,4 +198,36 @@ mod tests {
             .await;
         assert!(matches!(res, Err(Error::BadToolArgs { .. })));
     }
+
+    #[tokio::test]
+    async fn failed_without_error_field_errors() {
+        // kills `status='failed' requires 'error'` guard removal mutations
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await;
+        let tool = TaskUpdateTool::new(reg);
+        let res = tool
+            .execute(json!({
+                "task_id": id.to_string(),
+                "status": "failed"
+            }))
+            .await;
+        assert!(matches!(res, Err(Error::BadToolArgs { .. })));
+    }
+
+    #[tokio::test]
+    async fn invalid_status_string_errors() {
+        // kills any mutation removing the `other =>` fallthrough arm
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await;
+        let tool = TaskUpdateTool::new(reg);
+        let res = tool
+            .execute(json!({
+                "task_id": id.to_string(),
+                "status": "halted"
+            }))
+            .await;
+        assert!(matches!(res, Err(Error::BadToolArgs { .. })));
+    }
 }
