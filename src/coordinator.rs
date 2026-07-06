@@ -188,6 +188,37 @@ mod tests {
     }
 
     #[test]
+    fn is_coordinator_tool_false_for_unknown_tool() {
+        // kills `replace is_coordinator_tool -> bool with true` mutation
+        assert!(
+            !is_coordinator_tool("NonExistentTool"),
+            "unknown tool must not be in the coordinator tool set"
+        );
+    }
+
+    #[test]
+    fn is_allowed_in_coordinator_mode_false_for_unknown_tool() {
+        // kills `replace is_allowed_in_coordinator_mode -> bool with true` mutation
+        assert!(
+            !is_allowed_in_coordinator_mode("NotATool"),
+            "unknown tool must not be allowed in coordinator mode"
+        );
+    }
+
+    #[test]
+    fn is_allowed_requires_both_allowlist_and_not_denylist() {
+        // specifically kills `replace && with ||` mutation in is_allowed_in_coordinator_mode:
+        // if the `&&` became `||`, deny-listed tools that aren't in the allow-list
+        // might still be blocked, but the real risk is an allowlist-only check.
+        // We verify the combined semantics by checking that "Edit" (in deny list
+        // but possibly in allow list too) is always rejected.
+        assert!(
+            !is_allowed_in_coordinator_mode("Edit"),
+            "Edit must be blocked regardless of allow list membership"
+        );
+    }
+
+    #[test]
     fn cargo_feature_gate_respected() {
         // We can't flip cargo features at test time, but we can verify
         // that the env-var side of the gate works deterministically.
