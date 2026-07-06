@@ -1005,12 +1005,32 @@ impl<'a> RunCore<'a> {
 }
 
 /// Step cap for the agent loop. `0` means unlimited (no `BudgetExceeded`).
+///
+/// If the `RECURSIVE_HARD_STEP_CAP` env var is set to a positive integer,
+/// the cap is clamped to that value regardless of `max_steps`. This lets
+/// operators enforce a production ceiling on `recursive loop` long-running
+/// sessions (which default to `max_steps=0` / unbounded) without changing
+/// the per-session contract. When unset or zero, behaviour is unchanged:
+/// `max_steps=0` still means `usize::MAX`.
 fn effective_step_limit(max_steps: usize) -> usize {
-    if max_steps == 0 {
+    let requested = if max_steps == 0 {
         usize::MAX
     } else {
         max_steps
+    };
+    match hard_step_cap_from_env() {
+        Some(cap) if cap > 0 => requested.min(cap),
+        _ => requested,
     }
+}
+
+/// Read the `RECURSIVE_HARD_STEP_CAP` env var once per call. Returns
+/// `None` when unset or unparseable. A value of `0` is treated as
+/// "unset" (matches the `max_steps=0` unlimited convention).
+fn hard_step_cap_from_env() -> Option<usize> {
+    std::env::var("RECURSIVE_HARD_STEP_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
 }
 
 #[cfg(test)]
@@ -1024,8 +1044,48 @@ mod tests {
 
     #[test]
     fn effective_step_limit_zero_means_unbounded() {
+        // Env var must be unset for this test — its presence would clamp.
+        let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
+        std::env::remove_var("RECURSIVE_HARD_STEP_CAP");
         assert_eq!(effective_step_limit(0), usize::MAX);
         assert_eq!(effective_step_limit(32), 32);
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_HARD_STEP_CAP", v);
+        }
+    }
+
+    #[test]
+    fn effective_step_limit_respects_hard_cap_when_set() {
+        let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
+        std::env::set_var("RECURSIVE_HARD_STEP_CAP", "1000");
+
+        // Unlimited path is clamped to the cap.
+        assert_eq!(effective_step_limit(0), 1000);
+        // Limited path below the cap stays as-is.
+        assert_eq!(effective_step_limit(32), 32);
+        // Limited path above the cap is clamped.
+        assert_eq!(effective_step_limit(5000), 1000);
+
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_HARD_STEP_CAP", v);
+        } else {
+            std::env::remove_var("RECURSIVE_HARD_STEP_CAP");
+        }
+    }
+
+    #[test]
+    fn effective_step_limit_ignores_invalid_hard_cap() {
+        let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
+        std::env::set_var("RECURSIVE_HARD_STEP_CAP", "not-a-number");
+        assert_eq!(effective_step_limit(0), usize::MAX);
+        std::env::set_var("RECURSIVE_HARD_STEP_CAP", "0");
+        // Cap value of 0 is treated as "unset" → unlimited preserved.
+        assert_eq!(effective_step_limit(0), usize::MAX);
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_HARD_STEP_CAP", v);
+        } else {
+            std::env::remove_var("RECURSIVE_HARD_STEP_CAP");
+        }
     }
 
     /// Verify the stuck-detection window/rate math that RunCore uses.

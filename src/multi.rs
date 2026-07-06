@@ -15,21 +15,30 @@ use tokio::sync::{broadcast, RwLock};
 #[derive(Clone)]
 pub struct SharedMemory {
     store: Arc<RwLock<HashMap<String, MemoryEntry>>>,
+    seq: Arc<AtomicU64>,
 }
 
 /// A single entry in the shared memory store.
+///
+/// `seq` is a process-local monotonic counter assigned by `SharedMemory::set`.
+/// It exists so consumers can order entries deterministically even when
+/// wall-clock `timestamp` collides (same-second writes). Older serialised
+/// entries without the field deserialize to `seq: 0`.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MemoryEntry {
     pub key: String,
     pub value: String,
     pub author: String,
     pub timestamp: u64,
+    #[serde(default)]
+    pub seq: u64,
 }
 
 impl SharedMemory {
     pub fn new() -> Self {
         Self {
             store: Arc::new(RwLock::new(HashMap::new())),
+            seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -38,11 +47,13 @@ impl SharedMemory {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = MemoryEntry {
             key: key.clone(),
             value,
             author,
             timestamp,
+            seq,
         };
         self.store.write().await.insert(key, entry);
     }
@@ -538,6 +549,49 @@ mod tests {
             web_search_api_key: None,
             web_search_jina_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_memory_assigns_monotonic_seq_across_writes() {
+        let mem = SharedMemory::new();
+        mem.set("a".into(), "1".into(), "alpha".into()).await;
+        mem.set("b".into(), "2".into(), "alpha".into()).await;
+        let a = mem.get("a").await.unwrap();
+        let b = mem.get("b").await.unwrap();
+        assert!(a.seq > 0, "first write should not have seq 0");
+        assert!(b.seq > a.seq, "second write seq must exceed first");
+    }
+
+    #[tokio::test]
+    async fn shared_memory_seq_advances_on_overwrite() {
+        let mem = SharedMemory::new();
+        mem.set("k".into(), "v1".into(), "alpha".into()).await;
+        let v1 = mem.get("k").await.unwrap().seq;
+        mem.set("k".into(), "v2".into(), "beta".into()).await;
+        let v2 = mem.get("k").await.unwrap().seq;
+        assert!(v2 > v1, "overwriting the same key must advance seq");
+    }
+
+    #[test]
+    fn memory_entry_deserializes_without_seq_field() {
+        // Old serialised entries (pre-seq) must round-trip to seq: 0.
+        let json = r#"{"key":"k","value":"v","author":"a","timestamp":123}"#;
+        let entry: MemoryEntry = serde_json::from_str(json).expect("deserialize legacy entry");
+        assert_eq!(entry.seq, 0);
+    }
+
+    #[test]
+    fn memory_entry_round_trips_with_seq() {
+        let entry = MemoryEntry {
+            key: "k".into(),
+            value: "v".into(),
+            author: "a".into(),
+            timestamp: 123,
+            seq: 42,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: MemoryEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.seq, 42);
     }
 
     #[test]
