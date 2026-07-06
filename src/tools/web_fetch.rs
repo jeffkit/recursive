@@ -659,4 +659,56 @@ mod tests {
         // The result must be valid UTF-8 (would panic at assert if not, catching any regression).
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
+
+    // ── is_private_ip direct tests ───────────────────────────────────────────
+
+    #[test]
+    fn is_private_ip_ipv4_private_ranges() {
+        use std::net::IpAddr;
+        // RFC-1918 private ranges
+        assert!(is_private_ip("10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip("172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip("192.168.1.1".parse::<IpAddr>().unwrap()));
+        // Loopback
+        assert!(is_private_ip("127.0.0.1".parse::<IpAddr>().unwrap()));
+        // Link-local (AWS IMDS)
+        assert!(is_private_ip("169.254.169.254".parse::<IpAddr>().unwrap()));
+        // Public IP should NOT be private
+        assert!(!is_private_ip("8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip("93.184.216.34".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn is_private_ip_ipv6_private_ranges() {
+        use std::net::IpAddr;
+        // IPv6 loopback (::1)
+        assert!(is_private_ip("::1".parse::<IpAddr>().unwrap()));
+        // IPv6 unspecified (::)
+        assert!(is_private_ip("::".parse::<IpAddr>().unwrap()));
+        // fc00::/7 ULA private (kills & → | and & → ^ mutants at segment mask check)
+        assert!(is_private_ip("fc00::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip("fd00::1".parse::<IpAddr>().unwrap())); // fd is also in fc00::/7
+        // fe80::/10 link-local (kills & → | and & → ^ mutants)
+        assert!(is_private_ip("fe80::1".parse::<IpAddr>().unwrap()));
+        // Public IPv6 should NOT be private
+        assert!(!is_private_ip("2001:4860:4860::8888".parse::<IpAddr>().unwrap())); // Google DNS
+        assert!(!is_private_ip("2606:4700:4700::1111".parse::<IpAddr>().unwrap())); // Cloudflare
+    }
+
+    #[test]
+    fn is_private_ip_each_ipv4_condition_independently() {
+        use std::net::IpAddr;
+        // Ensure each individual || branch is tested
+        // (kills || → && mutants)
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let private: IpAddr = "192.168.0.1".parse().unwrap();
+        let link_local: IpAddr = "169.254.0.1".parse().unwrap();
+        let broadcast: IpAddr = "255.255.255.255".parse().unwrap();
+        let unspecified: IpAddr = "0.0.0.0".parse().unwrap();
+        assert!(is_private_ip(loopback), "loopback must be private");
+        assert!(is_private_ip(private), "private RFC1918 must be private");
+        assert!(is_private_ip(link_local), "link-local must be private");
+        assert!(is_private_ip(broadcast), "broadcast must be private");
+        assert!(is_private_ip(unspecified), "unspecified must be private");
+    }
 }
