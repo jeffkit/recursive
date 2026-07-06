@@ -249,4 +249,12 @@ mod tests {
         assert!(result.contains("tokens≈4"));
         assert!(result.contains("chars=13"));
     }
+
+    #[test]
+    fn is_deferred_true() {
+        // kills `replace <impl Tool for EstimateTokens>::is_deferred -> bool with false`
+        use crate::tools::Tool;
+        let tool = EstimateTokens::new("/tmp");
+        assert!(tool.is_deferred(), "EstimateTokens must be deferred (low-frequency tool)");
+    }
 }
