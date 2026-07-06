@@ -856,6 +856,45 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // render_structured — direct unit tests
+    // ========================================================================
+
+    #[test]
+    fn render_structured_with_next_steps_includes_todos_section() {
+        let rendered = Compactor::render_structured(
+            "summary text",
+            &["fact A".into(), "fact B".into()],
+            &["step 1".into()],
+            5,
+        );
+        assert!(rendered.contains("[compacted: structured at step 5]"));
+        assert!(rendered.contains("Summary: summary text"));
+        assert!(rendered.contains("- fact A"));
+        assert!(rendered.contains("- fact B"));
+        assert!(
+            rendered.contains("Outstanding TODOs:"),
+            "non-empty next_steps must show TODOs section"
+        );
+        assert!(rendered.contains("- step 1"));
+    }
+
+    #[test]
+    fn render_structured_without_next_steps_omits_todos_section() {
+        // Kills `delete !` at line 85: if next_steps.is_empty() (mutated from !next_steps.is_empty())
+        // then the TODO block would appear even for empty next_steps.
+        let rendered = Compactor::render_structured(
+            "summary",
+            &["fact".into()],
+            &[], // empty next_steps
+            1,
+        );
+        assert!(
+            !rendered.contains("Outstanding TODOs:"),
+            "empty next_steps must NOT include TODOs section (kills delete-! mutation)"
+        );
+    }
+
     #[tokio::test]
     async fn apply_to_transcript_boundary_plus_not_times() {
         // Kills: `replace + with * in Compactor::apply_to_transcript` at line 225.
