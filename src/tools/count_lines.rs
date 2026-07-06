@@ -133,4 +133,25 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::BadToolArgs { .. }));
     }
+
+    #[tokio::test]
+    async fn count_lines_empty_file_returns_zero() {
+        // kills mutations that replace `content.lines().count()` with a non-zero value
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("empty.txt"), "").unwrap();
+        let tool = CountLines::new(tmp.path());
+        let result = tool.execute(json!({"path": "empty.txt"})).await.unwrap();
+        assert_eq!(result, "0");
+    }
+
+    #[tokio::test]
+    async fn count_lines_no_trailing_newline() {
+        // kills mutations that change line counting semantics;
+        // `str::lines()` treats "a\nb" as 2 lines (no trailing newline does not add an empty line)
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("no_nl.txt"), "a\nb").unwrap();
+        let tool = CountLines::new(tmp.path());
+        let result = tool.execute(json!({"path": "no_nl.txt"})).await.unwrap();
+        assert_eq!(result, "2");
+    }
 }

@@ -415,6 +415,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unix_now_is_positive() {
+        // kills `map(|d| d.as_secs() as i64)` → `map(|_| 0)` or `unwrap_or(0)` mutations
+        let ts = unix_now();
+        // Unix epoch was in 1970; any value < 1_000_000_000 is clearly wrong
+        assert!(ts > 1_000_000_000, "unix_now() returned suspicious value: {ts}");
+    }
+
+    #[tokio::test]
+    async fn list_tool_is_deferred() {
+        // kills `replace CheckpointList::is_deferred -> bool with false`
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let (list, _, _) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
+        assert!(list.is_deferred(), "checkpoint_list must be a deferred tool");
+    }
+
+    #[tokio::test]
+    async fn diff_tool_is_deferred() {
+        // kills `replace CheckpointDiff::is_deferred -> bool with false`
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let (_, diff, _) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
+        assert!(diff.is_deferred(), "checkpoint_diff must be a deferred tool");
+    }
+
+    #[tokio::test]
+    async fn list_tool_empty_session_returns_sentinel() {
+        // kills `if infos.is_empty()` branch-swap mutations
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let (list, _, _) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
+        let out = list.execute(json!({})).await.unwrap();
+        assert_eq!(out, "no checkpoints in this session yet");
+    }
+
     #[tokio::test]
     async fn list_tool_shows_session_checkpoints() {
         if !has_git() {
