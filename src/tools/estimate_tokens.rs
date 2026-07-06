@@ -257,4 +257,15 @@ mod tests {
         let tool = EstimateTokens::new("/tmp");
         assert!(tool.is_deferred(), "EstimateTokens must be deferred (low-frequency tool)");
     }
+
+    #[test]
+    fn estimate_uses_ceil_not_floor() {
+        // kills `floor()` or truncation mutations in `(chars as f64 / 4.0).ceil() as usize`
+        // 5 chars / 4.0 = 1.25 → ceil = 2, floor = 1
+        let tool = EstimateTokens::new("/tmp");
+        let text = "abcde"; // exactly 5 chars
+        let (tokens, chars, _) = tool.estimate(text);
+        assert_eq!(chars, 5);
+        assert_eq!(tokens, 2, "5 chars must round up to 2 tokens (ceil), not 1 (floor)");
+    }
 }
