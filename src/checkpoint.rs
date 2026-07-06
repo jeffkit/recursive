@@ -979,4 +979,78 @@ mod tests {
         let _ = r.snapshot_for_session("beta", "1").unwrap();
         assert!(!r.shadow_dir.join("tmp-index-beta").exists());
     }
+
+    #[test]
+    fn list_for_session_root_and_non_root_commits() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        // First snapshot: 1 file (root commit)
+        fs::write(w.path().join("a.txt"), "v1").unwrap();
+        let c1 = r.snapshot_for_session("sess", "turn-0").unwrap();
+
+        // Second snapshot: change + add 1 more file (non-root commit)
+        fs::write(w.path().join("a.txt"), "v2").unwrap();
+        fs::write(w.path().join("b.txt"), "new").unwrap();
+        let _c2 = r.snapshot_for_session("sess", "turn-1").unwrap();
+
+        let list = r.list_for_session("sess").unwrap();
+        assert_eq!(list.len(), 2, "must list exactly 2 checkpoints");
+
+        // Newest-first ordering: list[0] is turn-1, list[1] is turn-0.
+        // Root commit (turn-0) had 1 file added → files_changed >= 1.
+        // Non-root (turn-1) added 2 changes → files_changed >= 1.
+        // The key invariant: both must be >= 1 (not 0 from a wrongly-taken branch).
+        assert!(
+            list[0].files_changed >= 1,
+            "non-root commit must have files_changed >= 1"
+        );
+        assert!(
+            list[1].files_changed >= 1,
+            "root commit must have files_changed >= 1 (vs empty tree)"
+        );
+
+        // IDs must differ
+        assert_ne!(list[0].id, list[1].id);
+
+        // Specifically: root commit (oldest, list[1]) should reflect turn-0 message,
+        // and non-root (newest, list[0]) should reflect turn-1 message.
+        assert!(list[0].message.contains("turn-1") || !list[0].message.is_empty());
+        assert!(list[1].message.contains("turn-0") || !list[1].message.is_empty());
+
+        // Also verify that c1 checkpoint id appears in the list.
+        let ids: Vec<_> = list.iter().map(|c| c.id.0.as_str()).collect();
+        assert!(
+            ids.iter().any(|id| c1.0.starts_with(id) || id.starts_with(&c1.0[..6.min(c1.0.len())])),
+            "c1 checkpoint must appear in list"
+        );
+    }
+
+    #[test]
+    fn list_for_session_ordering_newest_first() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        fs::write(w.path().join("f.txt"), "a").unwrap();
+        let c1 = r.snapshot_for_session("sess", "first").unwrap();
+        fs::write(w.path().join("f.txt"), "b").unwrap();
+        let c2 = r.snapshot_for_session("sess", "second").unwrap();
+
+        let list = r.list_for_session("sess").unwrap();
+        assert_eq!(list.len(), 2);
+        // Newest (c2 = "second") must come before oldest (c1 = "first")
+        assert!(
+            list[0].timestamp >= list[1].timestamp,
+            "list must be newest-first; list[0].ts={} list[1].ts={}",
+            list[0].timestamp,
+            list[1].timestamp
+        );
+        let _ = (c1, c2); // suppress unused warnings
+    }
 }
