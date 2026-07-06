@@ -400,6 +400,40 @@ mod tests {
     use crate::message::Message;
     use crate::session::{SessionReader, SessionStatus, SessionWriter};
 
+    // -- SentinelInfo unit tests ---------------------------------------------
+
+    #[test]
+    fn sentinel_parse_reads_three_lines() {
+        // kills field-order mutations in SentinelInfo::parse
+        let text = "12345\nmyhostname\n1700000000\n";
+        let rec = SentinelInfo::parse(text).expect("must parse");
+        assert_eq!(rec.pid, 12345);
+        assert_eq!(rec.hostname, "myhostname");
+        assert_eq!(rec.started_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn sentinel_serialise_round_trips() {
+        // kills format-string mutations in SentinelInfo::serialise
+        let rec = SentinelInfo {
+            pid: 99,
+            hostname: "box01".to_string(),
+            started_at_unix: 42,
+        };
+        let text = rec.serialise();
+        let restored = SentinelInfo::parse(&text).expect("round-trip must succeed");
+        assert_eq!(restored.pid, 99);
+        assert_eq!(restored.hostname, "box01");
+        assert_eq!(restored.started_at_unix, 42);
+    }
+
+    #[test]
+    fn current_hostname_is_non_empty() {
+        // kills mutations that replace current_hostname() body with ""
+        let h = current_hostname();
+        assert!(!h.is_empty(), "hostname must be non-empty");
+    }
+
     // -- SessionLock tests --------------------------------------------------
 
     #[test]
