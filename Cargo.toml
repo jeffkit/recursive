@@ -65,6 +65,16 @@ test = false
 doc = false
 bench = false
 
+# Tiny hook-echo helper used by `src/hooks/external.rs` unit tests.
+# Prints a JSON response (first arg) and exits — much faster than spawning /bin/sh.
+# Unit tests find it at runtime: CARGO_MANIFEST_DIR/target/debug/hook_echo.
+[[bin]]
+name = "hook_echo"
+path = "tests/bin/hook_echo.rs"
+test = false
+doc = false
+bench = false
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "io-std", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

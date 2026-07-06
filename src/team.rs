@@ -408,37 +408,8 @@ impl TeamRegistry {
 mod tests {
     use super::*;
 
-    // Serialize tests that touch the global teams dir.
-    static TEAMS_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard: sets RECURSIVE_TEAMS_DIR for the duration of the guard,
-    /// and restores the prior value on drop.  Pairs with `tempfile::tempdir`
-    /// to give each test a fresh, isolated teams directory.
-    struct TeamsDirGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        _tmp: tempfile::TempDir,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    fn with_temp_teams_dir() -> TeamsDirGuard {
-        let lock = TEAMS_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("RECURSIVE_TEAMS_DIR");
-        std::env::set_var("RECURSIVE_TEAMS_DIR", tmp.path());
-        TeamsDirGuard {
-            _lock: lock,
-            _tmp: tmp,
-            prev,
-        }
-    }
-
-    impl Drop for TeamsDirGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("RECURSIVE_TEAMS_DIR", v),
-                None => std::env::remove_var("RECURSIVE_TEAMS_DIR"),
-            }
-        }
+    fn with_temp_teams_dir() -> crate::test_util::PinnedTeamsDir {
+        crate::test_util::PinnedTeamsDir::new()
     }
 
     #[test]
@@ -551,7 +522,7 @@ mod tests {
     #[test]
     fn atomic_write_replaces_existing() {
         let g = with_temp_teams_dir();
-        let dir = g._tmp.path();
+        let dir = g.path();
         let p = dir.join("alpha.json");
         crate::atomic::atomic_write(&p, b"{\"name\":\"alpha\"}").unwrap();
         let s1 = std::fs::read_to_string(&p).unwrap();

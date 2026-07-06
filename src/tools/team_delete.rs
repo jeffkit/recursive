@@ -90,35 +90,9 @@ impl Tool for TeamDeleteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    struct TeamsDirGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        _tmp: tempfile::TempDir,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    fn with_temp_teams_dir() -> TeamsDirGuard {
-        let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("RECURSIVE_TEAMS_DIR");
-        std::env::set_var("RECURSIVE_TEAMS_DIR", tmp.path());
-        TeamsDirGuard {
-            _lock: lock,
-            _tmp: tmp,
-            prev,
-        }
-    }
-
-    impl Drop for TeamsDirGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("RECURSIVE_TEAMS_DIR", v),
-                None => std::env::remove_var("RECURSIVE_TEAMS_DIR"),
-            }
-        }
+    fn with_temp_teams_dir() -> crate::test_util::PinnedTeamsDir {
+        crate::test_util::PinnedTeamsDir::new()
     }
 
     #[tokio::test]

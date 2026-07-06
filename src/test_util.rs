@@ -192,6 +192,62 @@ impl Drop for PinnedHome {
     }
 }
 
+/// RAII guard that pins `RECURSIVE_TEAMS_DIR` to a fresh tempdir for the
+/// guard's lifetime, while holding the global env lock.
+///
+/// All tests that read or write team files must use this guard so they
+/// serialise with every other env-mutating test, not just with sibling
+/// tests in the same module. Using separate per-module `Mutex` statics
+/// does not prevent races between modules compiled into the same test
+/// binary, because each module's static is a *different* lock.
+pub struct PinnedTeamsDir {
+    _guard: MutexGuard<'static, ()>,
+    _tmp: tempfile::TempDir,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl PinnedTeamsDir {
+    pub fn new() -> Self {
+        let guard = env_lock();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let prev = std::env::var_os("RECURSIVE_TEAMS_DIR");
+        // SAFETY: env lock is held.
+        unsafe {
+            std::env::set_var("RECURSIVE_TEAMS_DIR", tmp.path().as_os_str());
+        }
+        Self {
+            _guard: guard,
+            _tmp: tmp,
+            prev,
+        }
+    }
+}
+
+impl Default for PinnedTeamsDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PinnedTeamsDir {
+    /// Return the path to the pinned temporary teams directory.
+    pub fn path(&self) -> &std::path::Path {
+        self._tmp.path()
+    }
+}
+
+impl Drop for PinnedTeamsDir {
+    fn drop(&mut self) {
+        // SAFETY: still hold the env lock until `_guard` drops after this.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("RECURSIVE_TEAMS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_TEAMS_DIR"),
+            }
+        }
+    }
+}
+
 /// One-stop helper: a workspace tempdir paired with a `RECURSIVE_HOME`
 /// pinned at a sibling tempdir, both alive for the bundle's lifetime.
 ///
