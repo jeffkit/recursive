@@ -332,4 +332,118 @@ mod tests {
         let err = tool.execute(json!({"pattern": ""})).await.unwrap_err();
         assert!(matches!(err, crate::error::Error::BadToolArgs { .. }));
     }
+
+    // ── match_segment / match_seg_inner direct tests ─────────────────────────
+
+    #[test]
+    fn match_segment_exact_match_true() {
+        // kills `match_seg_inner -> bool with false`
+        assert!(match_segment("foo", "foo"), "exact match must be true");
+        assert!(match_segment("", ""), "empty vs empty must be true (None,None arm)");
+    }
+
+    #[test]
+    fn match_segment_literal_mismatch_false() {
+        // kills `match_segment -> bool with true`
+        assert!(!match_segment("foo", "bar"), "literal mismatch must be false");
+        assert!(!match_segment("a", "b"), "single-char mismatch must be false");
+    }
+
+    #[test]
+    fn match_segment_star_matches_multi_chars() {
+        // kills `delete match arm (Some(&'*'), _) in match_seg_inner`
+        assert!(match_segment("*", "anything"), "* must match non-empty text");
+        assert!(match_segment("*", ""), "* must match empty text (zero chars)");
+        assert!(match_segment("*.rs", "lib.rs"), "*.rs must match lib.rs");
+        assert!(!match_segment("*.rs", "lib.txt"), "*.rs must not match lib.txt");
+    }
+
+    #[test]
+    fn match_segment_star_consume_chars_delete_not() {
+        // Specifically targets `delete ! in match_seg_inner` line 40.
+        // `*a` must match "ba" — requires * to skip the leading 'b'.
+        // With `delete !`, the `if t.is_empty()` branch never recurses when t
+        // is non-empty, so "ba" would fail to match.
+        assert!(match_segment("*a", "ba"), "*a must match 'ba'");
+        assert!(match_segment("*a", "xxa"), "*a must match 'xxa'");
+        assert!(!match_segment("*a", "bx"), "*a must not match 'bx'");
+    }
+
+    #[test]
+    fn match_segment_question_marks() {
+        // kills `delete match arm (Some(&'?'), Some(_)) in match_seg_inner`
+        assert!(match_segment("?", "a"), "? must match exactly one char");
+        assert!(!match_segment("?", ""), "? must not match empty text");
+        assert!(!match_segment("?", "ab"), "? must not match two chars");
+        assert!(match_segment("a?c", "abc"), "a?c must match 'abc'");
+    }
+
+    #[test]
+    fn match_segment_guard_pc_eq_tc() {
+        // kills `replace match guard pc == tc with true`
+        // and `replace == with != in match_seg_inner`
+        assert!(!match_segment("a", "b"), "non-equal chars must not match");
+        assert!(match_segment("az", "az"), "equal chars must match");
+    }
+
+    // ── match_path / glob_matches direct tests ────────────────────────────────
+
+    #[test]
+    fn glob_matches_exact_literal_path() {
+        // kills `match_path -> bool with false` and `glob_matches -> bool with false`
+        assert!(glob_matches("src/lib.rs", "src/lib.rs"), "exact path must match");
+    }
+
+    #[test]
+    fn glob_matches_literal_mismatch_false() {
+        // kills `match_path -> bool with true` and `glob_matches -> bool with true`
+        assert!(!glob_matches("src/foo.rs", "src/bar.rs"), "different filename must not match");
+    }
+
+    #[test]
+    fn match_path_extra_component_false() {
+        // (None, _) arm: pattern exhausted but path has more components
+        assert!(!glob_matches("src/lib.rs", "src/lib.rs/extra"), "exhausted pattern with trailing component must be false");
+        // (_, None) arm: path exhausted but pattern has more
+        assert!(!glob_matches("src/lib.rs/extra", "src/lib.rs"), "trailing pattern component must be false");
+    }
+
+    #[test]
+    fn glob_matches_double_star_consumes_components() {
+        // kills `delete ! in match_path` line 64
+        // ** must be able to consume one or more path components
+        assert!(glob_matches("**/*.rs", "a/b/c/lib.rs"), "** must consume multiple components");
+        assert!(!glob_matches("**/*.rs", "a/b/c/lib.txt"), "** must not match wrong extension");
+    }
+
+    // ── GlobTool::relativise ──────────────────────────────────────────────────
+
+    #[test]
+    fn relativise_strips_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let tool = GlobTool::new(tmp.path());
+        let abs = tmp.path().join("src/lib.rs");
+        let rel = tool.relativise(&abs);
+        assert_eq!(rel, "src/lib.rs", "relativise must strip workspace root");
+        assert!(
+            !rel.starts_with(tmp.path().to_str().unwrap()),
+            "result must not be absolute for workspace files"
+        );
+    }
+
+    // ── GlobTool::all_roots + scope path via execute ───────────────────────────
+
+    #[tokio::test]
+    async fn scope_path_uses_all_roots_correctly() {
+        let tmp = TempDir::new().unwrap();
+        create_files(&tmp, &["sub/a.rs", "sub/b.txt"]);
+        let tool = GlobTool::new(tmp.path());
+        // with path arg → resolve_within_any(all_roots(), ...) must work
+        let out = tool
+            .execute(json!({"pattern": "**/*.rs", "path": "sub"}))
+            .await
+            .unwrap();
+        assert!(out.contains("a.rs"), "sub/a.rs must appear in results");
+        assert!(!out.contains("b.txt"), "b.txt must be filtered by pattern");
+    }
 }
