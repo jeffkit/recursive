@@ -1719,4 +1719,227 @@ mod tests {
             std::env::remove_var("RECURSIVE_SKILL_INDEX_BUDGET");
         }
     }
+
+    // ── parse_skill_meta unit tests ──────────────────────────────────────────
+
+    fn fake_dir() -> PathBuf {
+        PathBuf::from("/fake/my-skill")
+    }
+
+    #[test]
+    fn parse_skill_meta_no_frontmatter_uses_dir_name_and_first_line() {
+        let content = "First line description\n\nMore body.";
+        let (name, desc, mode, triggers, hint, depends_on, params, globs) =
+            parse_skill_meta(content, &fake_dir());
+        assert_eq!(name, "my-skill");
+        assert_eq!(desc, "First line description");
+        assert_eq!(mode, SkillMode::Manual);
+        assert!(triggers.is_empty());
+        assert!(hint.is_empty());
+        assert!(depends_on.is_empty());
+        assert!(params.is_empty());
+        assert!(globs.is_empty());
+    }
+
+    #[test]
+    fn parse_skill_meta_frontmatter_name_and_description() {
+        let content = "---\nname: my-name\ndescription: My desc\n---\nbody";
+        let (name, desc, mode, triggers, hint, depends_on, params, globs) =
+            parse_skill_meta(content, &fake_dir());
+        assert_eq!(name, "my-name", "frontmatter name must win");
+        assert_eq!(desc, "My desc", "frontmatter description must win");
+        assert_eq!(mode, SkillMode::Manual);
+        assert!(triggers.is_empty());
+        assert!(hint.is_empty());
+        assert!(depends_on.is_empty());
+        assert!(params.is_empty());
+        assert!(globs.is_empty());
+    }
+
+    #[test]
+    fn parse_skill_meta_mode_always() {
+        let content = "---\nname: x\ndescription: d\nmode: always\n---\nbody";
+        let (_n, _d, mode, ..) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(mode, SkillMode::Always);
+    }
+
+    #[test]
+    fn parse_skill_meta_mode_trigger_auto_hint() {
+        let content = "---\nname: my-trigger\ndescription: Trigger desc\nmode: trigger\n---\nbody";
+        let (name, desc, mode, _triggers, hint, ..) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(mode, SkillMode::Trigger);
+        // Auto-generated hint: "name: description"
+        assert_eq!(hint, format!("{name}: {desc}"));
+    }
+
+    #[test]
+    fn parse_skill_meta_mode_trigger_explicit_hint_preserved() {
+        let content =
+            "---\nname: x\ndescription: d\nmode: trigger\nhint: custom hint\n---\nbody";
+        let (_, _, _, _, hint, _, _, _) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(hint, "custom hint");
+    }
+
+    #[test]
+    fn parse_skill_meta_triggers_parsed() {
+        let content = "---\nname: x\ndescription: d\ntriggers: foo, bar, baz\n---\nbody";
+        let (_n, _d, _m, triggers, ..) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(triggers, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn parse_skill_meta_depends_on_parsed() {
+        let content = "---\nname: x\ndescription: d\ndepends_on: base, extra\n---\nbody";
+        let (_n, _d, _m, _t, _h, depends_on, ..) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(depends_on, vec!["base", "extra"]);
+    }
+
+    #[test]
+    fn parse_skill_meta_globs_parsed() {
+        let content =
+            "---\nname: x\ndescription: d\nmode: globs\nglobs:\n- \"**/*.rs\"\n- src/**\n---\nbody";
+        let (_n, _d, mode, _t, _h, _do, _p, globs) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(mode, SkillMode::Globs);
+        assert!(globs.contains(&"**/*.rs".to_string()));
+        assert!(globs.contains(&"src/**".to_string()));
+    }
+
+    #[test]
+    fn parse_skill_meta_globs_mode_no_patterns_becomes_manual() {
+        let content = "---\nname: x\ndescription: d\nmode: globs\n---\nbody";
+        let (_n, _d, mode, ..) = parse_skill_meta(content, &fake_dir());
+        // Globs mode with no patterns must fall back to Manual
+        assert_eq!(mode, SkillMode::Manual);
+    }
+
+    #[test]
+    fn parse_skill_meta_params_parsed() {
+        let content = "---\nname: x\ndescription: d\nparams:\n  - name: myarg\n    description: What it does\n    default: fallback\n---\nbody";
+        let (_n, _d, _m, _t, _h, _do, params, _g) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "myarg");
+        assert_eq!(params[0].description, "What it does");
+        assert_eq!(params[0].default, Some("fallback".to_string()));
+    }
+
+    // ── discover_refs unit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn discover_refs_no_refs_dir_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let refs = discover_refs(tmp.path());
+        assert!(refs.is_empty(), "no refs/ dir must return empty vec");
+    }
+
+    #[test]
+    fn discover_refs_finds_md_and_txt_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let refs_dir = tmp.path().join("refs");
+        fs::create_dir(&refs_dir).unwrap();
+        fs::write(refs_dir.join("guide.md"), "# guide").unwrap();
+        fs::write(refs_dir.join("notes.txt"), "notes").unwrap();
+        fs::write(refs_dir.join("ignore.rs"), "fn main() {}").unwrap();
+
+        let refs = discover_refs(tmp.path());
+        assert_eq!(refs.len(), 2, "must find .md and .txt but not .rs");
+        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"guide"));
+        assert!(names.contains(&"notes"));
+    }
+
+    #[test]
+    fn discover_refs_extension_filter_excludes_non_md_txt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let refs_dir = tmp.path().join("refs");
+        fs::create_dir(&refs_dir).unwrap();
+        fs::write(refs_dir.join("readme.html"), "<h1>").unwrap();
+
+        let refs = discover_refs(tmp.path());
+        assert!(refs.is_empty(), ".html file must not appear in refs");
+    }
+
+    // ── discover_scripts unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn discover_scripts_no_scripts_dir_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scripts = discover_scripts(tmp.path());
+        assert!(scripts.is_empty());
+    }
+
+    #[test]
+    fn discover_scripts_finds_sh_and_py_by_extension() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scripts_dir = tmp.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("run.sh"), "#!/bin/sh\n# Run the thing").unwrap();
+        fs::write(scripts_dir.join("helper.py"), "# Helper script").unwrap();
+        // A file with no script extension and no execute bit should be skipped
+        fs::write(scripts_dir.join("data.bin"), "binary").unwrap();
+
+        let scripts = discover_scripts(tmp.path());
+        assert_eq!(scripts.len(), 2, "must find .sh and .py, not .bin");
+        let names: Vec<&str> = scripts.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"run"), "run.sh → name 'run'");
+        assert!(names.contains(&"helper"), "helper.py → name 'helper'");
+    }
+
+    // ── extract_script_description unit tests ───────────────────────────────
+
+    #[test]
+    fn extract_script_description_hash_comment() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), "# My description\nsome code").unwrap();
+        let desc = extract_script_description(tmp.path());
+        assert_eq!(desc, "My description");
+    }
+
+    #[test]
+    fn extract_script_description_skips_shebang() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), "#!/usr/bin/env python3\n# Script description\ncode").unwrap();
+        let desc = extract_script_description(tmp.path());
+        assert_eq!(desc, "Script description");
+    }
+
+    #[test]
+    fn extract_script_description_slash_comment() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), "// JS description\nconsole.log('hi')").unwrap();
+        let desc = extract_script_description(tmp.path());
+        assert_eq!(desc, "JS description");
+    }
+
+    #[test]
+    fn extract_script_description_no_comment_returns_empty() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), "no comment here").unwrap();
+        let desc = extract_script_description(tmp.path());
+        assert_eq!(desc, "");
+    }
+
+    // ── is_executable unit tests ─────────────────────────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn is_executable_non_executable_file_returns_false() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Default NamedTempFile has no execute bit
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(tmp.path(), perms).unwrap();
+        assert!(!is_executable(tmp.path()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_executable_executable_file_returns_true() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(tmp.path(), perms).unwrap();
+        assert!(is_executable(tmp.path()));
+    }
 }

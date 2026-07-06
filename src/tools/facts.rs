@@ -1362,4 +1362,182 @@ mod tests {
         assert!(summary.contains("First fact"));
         assert!(summary.contains("Second fact"));
     }
+
+    // ── FactStore unit tests (internal API) ──────────────────────────────────
+
+    fn fresh_fact_store() -> FactStore {
+        FactStore::default()
+    }
+
+    // --- Fact::is_active ---
+
+    #[test]
+    fn fact_is_active_when_not_superseded() {
+        let fact = Fact {
+            id: "F1".into(),
+            text: "test".into(),
+            tags: vec![],
+            source: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_accessed: "2026-01-01T00:00:00Z".into(),
+            access_count: 0,
+            superseded_by: None,
+        };
+        assert!(fact.is_active(), "fact without superseded_by must be active");
+    }
+
+    #[test]
+    fn fact_is_not_active_when_superseded() {
+        let fact = Fact {
+            id: "F1".into(),
+            text: "old".into(),
+            tags: vec![],
+            source: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_accessed: "2026-01-01T00:00:00Z".into(),
+            access_count: 0,
+            superseded_by: Some("F2".into()),
+        };
+        assert!(
+            !fact.is_active(),
+            "fact with superseded_by must NOT be active"
+        );
+    }
+
+    // --- FactStore::load ---
+
+    #[test]
+    fn fact_store_load_missing_file_returns_empty() {
+        let store =
+            FactStore::load(std::path::Path::new("/nonexistent/path/facts.jsonl"))
+                .expect("missing file must return empty store");
+        assert!(store.facts.is_empty());
+    }
+
+    #[test]
+    fn fact_store_load_parses_jsonl() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let fact_json = r#"{"id":"F1","text":"hello","tags":["t1"],"created_at":"2026-01-01T00:00:00Z","last_accessed":"2026-01-01T00:00:00Z","access_count":0}"#;
+        std::fs::write(tmp.path(), fact_json).unwrap();
+        let store = FactStore::load(tmp.path()).expect("must parse valid JSONL");
+        assert_eq!(store.facts.len(), 1);
+        assert_eq!(store.facts[0].id, "F1");
+    }
+
+    // --- FactStore::save + load round-trip ---
+
+    #[test]
+    fn fact_store_save_and_reload() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut store = fresh_fact_store();
+        store.add("round-trip text".into(), vec!["tag".into()], None);
+        store.save(tmp.path()).expect("save must succeed");
+
+        let loaded = FactStore::load(tmp.path()).expect("reload must succeed");
+        assert_eq!(loaded.facts.len(), 1);
+        assert_eq!(loaded.facts[0].text, "round-trip text");
+    }
+
+    // --- FactStore::next_id ---
+
+    #[test]
+    fn fact_store_next_id_empty_store_is_f1() {
+        assert_eq!(fresh_fact_store().next_id(), "F1");
+    }
+
+    #[test]
+    fn fact_store_next_id_increments() {
+        let mut store = fresh_fact_store();
+        store.add("a".into(), vec![], None);
+        store.add("b".into(), vec![], None);
+        assert_eq!(store.next_id(), "F3");
+    }
+
+    // --- FactStore::add ---
+
+    #[test]
+    fn fact_store_add_returns_correct_id() {
+        let mut store = fresh_fact_store();
+        let id = store.add("my fact".into(), vec!["tag".into()], Some("agent".into()));
+        assert_eq!(id, "F1");
+        assert_eq!(store.facts[0].id, "F1");
+        assert_eq!(store.facts[0].text, "my fact");
+        assert_eq!(store.facts[0].source, Some("agent".into()));
+    }
+
+    // --- FactStore::get ---
+
+    #[test]
+    fn fact_store_get_finds_by_id() {
+        let mut store = fresh_fact_store();
+        store.add("x".into(), vec![], None);
+        assert!(store.get("F1").is_some(), "must find F1");
+        assert!(store.get("F99").is_none(), "must not find non-existent");
+    }
+
+    // --- FactStore::soft_delete ---
+
+    #[test]
+    fn fact_store_soft_delete_returns_true_when_found() {
+        let mut store = fresh_fact_store();
+        store.add("old".into(), vec![], None);
+        let deleted = store.soft_delete("F1", "F2");
+        assert!(deleted, "soft_delete must return true for existing fact");
+        assert_eq!(store.facts[0].superseded_by.as_deref(), Some("F2"));
+    }
+
+    #[test]
+    fn fact_store_soft_delete_returns_false_when_not_found() {
+        let mut store = fresh_fact_store();
+        assert!(
+            !store.soft_delete("F99", "F100"),
+            "soft_delete must return false for non-existent id"
+        );
+    }
+
+    // --- FactStore::active_facts ---
+
+    #[test]
+    fn fact_store_active_facts_excludes_superseded() {
+        let mut store = fresh_fact_store();
+        store.add("active".into(), vec![], None);
+        store.add("old".into(), vec![], None);
+        store.soft_delete("F2", "F1");
+
+        let active = store.active_facts();
+        assert_eq!(active.len(), 1, "only non-superseded facts must be active");
+        assert_eq!(active[0].id, "F1");
+    }
+
+    #[test]
+    fn fact_store_active_facts_empty_on_all_superseded() {
+        let mut store = fresh_fact_store();
+        store.add("x".into(), vec![], None);
+        store.soft_delete("F1", "F2");
+        assert!(store.active_facts().is_empty());
+    }
+
+    // --- FactStore::evict_to_cap ---
+
+    #[test]
+    fn fact_store_evict_to_cap_removes_excess() {
+        let mut store = fresh_fact_store();
+        for i in 0..5 {
+            store.add(format!("fact {i}"), vec![], None);
+        }
+        assert_eq!(store.active_facts().len(), 5);
+        let evicted = store.evict_to_cap(3);
+        assert_eq!(evicted, 2, "must evict exactly 2 facts to reach cap of 3");
+        assert_eq!(store.active_facts().len(), 3);
+    }
+
+    #[test]
+    fn fact_store_evict_to_cap_noop_when_under_cap() {
+        let mut store = fresh_fact_store();
+        store.add("a".into(), vec![], None);
+        store.add("b".into(), vec![], None);
+        let evicted = store.evict_to_cap(5);
+        assert_eq!(evicted, 0, "must not evict when under cap");
+        assert_eq!(store.active_facts().len(), 2);
+    }
 }

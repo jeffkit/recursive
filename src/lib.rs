@@ -165,3 +165,49 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_str;
+
+    #[test]
+    fn truncate_str_short_string_returns_unchanged() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_exact_length_returns_unchanged() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_over_limit_returns_prefix() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_empty_string() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_str_zero_max_returns_empty() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_multibyte_does_not_split_char() {
+        // "日" is 3 bytes (UTF-8: 0xE6 0x97 0xA5)
+        // "日本語" = 9 bytes; truncating at 4 bytes must not split 0xE6 0x97 (non-boundary)
+        let s = "日本語";
+        let truncated = truncate_str(s, 4);
+        // Valid UTF-8: must be 3 bytes (one full "日") or 0 bytes
+        assert!(s.is_char_boundary(truncated.len()));
+        assert_eq!(truncated, "日");
+    }
+
+    #[test]
+    fn truncate_str_ascii_one_byte_over() {
+        assert_eq!(truncate_str("abcdef", 5), "abcde");
+    }
+}
