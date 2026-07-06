@@ -141,4 +141,25 @@ mod tests {
         assert_eq!(req.delay, Duration::from_secs(20));
         assert_eq!(req.prompt, "b");
     }
+
+    #[test]
+    fn is_deferred_is_true() {
+        // kills `replace ScheduleWakeup::is_deferred -> bool with false`
+        let slot: WakeupSlot = Arc::new(Mutex::new(None));
+        let tool = ScheduleWakeup::new(slot);
+        assert!(tool.is_deferred(), "schedule_wakeup must be a deferred tool");
+    }
+
+    #[tokio::test]
+    async fn result_message_contains_reason_and_delay() {
+        // kills function-level replacement of execute's return value
+        let slot: WakeupSlot = Arc::new(Mutex::new(None));
+        let tool = ScheduleWakeup::new(slot);
+        let result = tool
+            .execute(json!({"delay_secs": 42, "reason": "poll data", "prompt": "check"}))
+            .await
+            .unwrap();
+        assert!(result.contains("poll data"), "message must include reason");
+        assert!(result.contains("42s"), "message must include delay in seconds");
+    }
 }

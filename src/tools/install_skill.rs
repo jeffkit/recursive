@@ -513,4 +513,69 @@ mod tests {
             dir.display()
         );
     }
+
+    /// Build a minimal in-memory zip with the given entries.
+    fn make_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn parse_zip_returns_file_entries() {
+        // kills `is_dir()` guard removal and function-level replacement
+        let data = make_zip(&[("SKILL.md", "# My Skill"), ("README.md", "readme")]);
+        let files = InstallSkill::parse_zip(&data).unwrap();
+        assert_eq!(files.len(), 2, "must parse both files");
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"SKILL.md"));
+        assert!(paths.contains(&"README.md"));
+    }
+
+    #[test]
+    fn parse_zip_sorts_by_path() {
+        // kills mutation of sort_by direction (a.path.cmp vs b.path.cmp)
+        let data = make_zip(&[("Z_tool.md", "z"), ("A_skill.md", "a")]);
+        let files = InstallSkill::parse_zip(&data).unwrap();
+        assert_eq!(files[0].path, "A_skill.md", "files must be sorted ascending by path");
+        assert_eq!(files[1].path, "Z_tool.md");
+    }
+
+    #[test]
+    fn parse_zip_captures_content_and_size() {
+        let data = make_zip(&[("SKILL.md", "hello world")]);
+        let files = InstallSkill::parse_zip(&data).unwrap();
+        assert_eq!(files[0].content, "hello world");
+        assert_eq!(files[0].size, 11);
+    }
+
+    #[test]
+    fn extract_zip_strips_leading_slug_component() {
+        // kills mutation of split_once('/') path stripping logic
+        use std::io::Write;
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // Simulate a zip from skillhub.cn where every file is under "my-skill/"
+        zip.start_file("my-skill/SKILL.md", opts).unwrap();
+        zip.write_all(b"# My Skill content").unwrap();
+        let zip_data = zip.finish().unwrap().into_inner();
+
+        let dest = tempfile::TempDir::new().unwrap();
+        InstallSkill::extract_zip(&zip_data, dest.path()).unwrap();
+
+        // The slug prefix "my-skill/" must be stripped; file lands as SKILL.md
+        let output = std::fs::read_to_string(dest.path().join("SKILL.md")).unwrap();
+        assert_eq!(output, "# My Skill content");
+    }
 }
