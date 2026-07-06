@@ -858,4 +858,124 @@ mod tests {
         assert_eq!(id, job_id);
         assert!(output.contains("shared-test"));
     }
+
+    // ── BackgroundJobManager unit tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn manager_next_id_increments() {
+        let mut mgr = BackgroundJobManager::new();
+        let id0 = mgr.next_id();
+        let id1 = mgr.next_id();
+        let id2 = mgr.next_id();
+        // next_id starts at 1
+        assert_eq!(id0, "bg-1");
+        assert_eq!(id1, "bg-2");
+        assert_eq!(id2, "bg-3");
+    }
+
+    #[tokio::test]
+    async fn manager_insert_returns_id_and_stores_job() {
+        let mut mgr = BackgroundJobManager::new();
+        let job = Job { state: JobState::Running, created_at: Instant::now() };
+        let id = mgr.insert(job);
+        assert_eq!(id, "bg-1");
+        assert!(mgr.get_state("bg-1").is_some());
+        assert!(matches!(mgr.get_state("bg-1"), Some(JobState::Running)));
+    }
+
+    #[tokio::test]
+    async fn manager_get_state_returns_none_for_unknown() {
+        let mgr = BackgroundJobManager::new();
+        assert!(mgr.get_state("bg-99").is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_update_changes_state() {
+        let mut mgr = BackgroundJobManager::new();
+        let job = Job { state: JobState::Running, created_at: Instant::now() };
+        let id = mgr.insert(job);
+        mgr.update(&id, JobState::Completed {
+            stdout: "out".into(),
+            stderr: "".into(),
+            exit_code: 0,
+        });
+        assert!(matches!(
+            mgr.get_state(&id),
+            Some(JobState::Completed { exit_code: 0, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_clear_removes_all_jobs() {
+        let mut mgr = BackgroundJobManager::new();
+        let id0 = mgr.insert(Job { state: JobState::Running, created_at: Instant::now() });
+        let id1 = mgr.insert(Job { state: JobState::Running, created_at: Instant::now() });
+        assert!(mgr.get_state(&id0).is_some());
+        mgr.clear();
+        assert!(mgr.get_state(&id0).is_none());
+        assert!(mgr.get_state(&id1).is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_take_completed_running_job_returns_none() {
+        let mut mgr = BackgroundJobManager::new();
+        mgr.insert(Job { state: JobState::Running, created_at: Instant::now() });
+        assert!(mgr.take_completed().is_none(), "running job must not be taken");
+    }
+
+    #[tokio::test]
+    async fn manager_take_completed_removes_and_returns_job() {
+        let mut mgr = BackgroundJobManager::new();
+        let job = Job {
+            state: JobState::Completed {
+                stdout: "hello".into(),
+                stderr: "".into(),
+                exit_code: 0,
+            },
+            created_at: Instant::now(),
+        };
+        let id = mgr.insert(job);
+
+        let (taken_id, output) = mgr.take_completed().expect("must take completed job");
+        assert_eq!(taken_id, id);
+        assert!(output.contains("hello"), "output must contain stdout");
+        assert!(output.contains("exit code: 0"), "output must contain exit code");
+
+        // After take, job is gone
+        assert!(mgr.get_state(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_take_completed_failed_job() {
+        let mut mgr = BackgroundJobManager::new();
+        let job = Job {
+            state: JobState::Failed { message: "oops".into() },
+            created_at: Instant::now(),
+        };
+        let id = mgr.insert(job);
+        let (_, output) = mgr.take_completed().expect("must take failed job");
+        assert!(output.contains("oops"), "output must contain failure message");
+        assert!(mgr.get_state(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_cleanup_removes_old_jobs() {
+        let mut mgr = BackgroundJobManager::new();
+        // Simulate a very old job by using an instant far in the past.
+        let old_created = Instant::now() - JOB_TTL - Duration::from_secs(1);
+        let old_job = Job {
+            state: JobState::Completed { stdout: "".into(), stderr: "".into(), exit_code: 0 },
+            created_at: old_created,
+        };
+        let old_id = mgr.insert(old_job);
+
+        // A fresh running job should survive cleanup.
+        let fresh_job = Job { state: JobState::Running, created_at: Instant::now() };
+        let fresh_id = mgr.insert(fresh_job);
+
+        mgr.cleanup();
+
+        assert!(mgr.get_state(&old_id).is_none(), "old job must be removed by cleanup");
+        assert!(mgr.get_state(&fresh_id).is_some(), "fresh job must survive cleanup");
+    }
 }
