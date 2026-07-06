@@ -204,4 +204,38 @@ mod tests {
         let paths = extract_paths(&results);
         assert!(paths.is_empty());
     }
+
+    #[test]
+    fn extract_paths_also_ignores_http_urls() {
+        // kills `!token.starts_with("https://")` alone mutation (missing http://)
+        let results = vec!["See http://example.com/docs for details.".to_string()];
+        let paths = extract_paths(&results);
+        assert!(paths.is_empty(), "http:// URLs must be excluded; got {paths:?}");
+    }
+
+    #[test]
+    fn extract_paths_strips_surrounding_quotes_and_punctuation() {
+        // kills `trim_end_matches` or `trim_start_matches` removal mutations
+        let results = vec!["Path: \"src/foo/bar.rs\", done.".to_string()];
+        let paths = extract_paths(&results);
+        assert!(
+            paths.contains(&"src/foo/bar.rs"),
+            "stripped path must be present; got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extract_paths_excludes_tokens_without_slash() {
+        // kills `token.contains('/')` removal mutation
+        let results = vec!["plain-token and src/real/path.rs here".to_string()];
+        let paths = extract_paths(&results);
+        assert!(
+            !paths.contains(&"plain-token"),
+            "token without slash must not be included"
+        );
+        assert!(
+            paths.contains(&"src/real/path.rs"),
+            "token with slash must be included"
+        );
+    }
 }
