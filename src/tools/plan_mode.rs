@@ -783,10 +783,7 @@ mod tests {
         // kills `replace ExitPlanModeTool::is_readonly -> bool with true`
         let gate = make_gate();
         let tool = ExitPlanModeTool::new(gate, Arc::new(NullSink));
-        assert!(
-            tool.is_deferred(),
-            "ExitPlanModeTool must be deferred"
-        );
+        assert!(tool.is_deferred(), "ExitPlanModeTool must be deferred");
         assert!(
             !tool.is_readonly(),
             "ExitPlanModeTool must NOT be readonly (it blocks until the user reviews the plan)"

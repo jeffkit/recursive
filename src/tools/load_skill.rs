@@ -1340,7 +1340,10 @@ mod tests {
             result
         );
         let output = result.unwrap();
-        assert!(output.contains("Body of C"), "must include deepest dep body");
+        assert!(
+            output.contains("Body of C"),
+            "must include deepest dep body"
+        );
     }
 
     #[test]

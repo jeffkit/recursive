@@ -164,7 +164,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert_eq!(out, "(no new output)", "empty task output must return the sentinel string");
+        assert_eq!(
+            out, "(no new output)",
+            "empty task output must return the sentinel string"
+        );
     }
 
     #[tokio::test]
@@ -184,7 +187,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert_eq!(out, "line-A\nline-B", "multiple output lines must be joined with '\\n'");
+        assert_eq!(
+            out, "line-A\nline-B",
+            "multiple output lines must be joined with '\\n'"
+        );
     }
 
     #[tokio::test]
@@ -223,6 +229,9 @@ mod tests {
             .await
             .unwrap();
         // Returns immediately since block defaults to false
-        assert_eq!(out, "(no new output)", "omitting 'block' must default to false (non-blocking)");
+        assert_eq!(
+            out, "(no new output)",
+            "omitting 'block' must default to false (non-blocking)"
+        );
     }
 }

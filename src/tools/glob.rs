@@ -339,23 +339,41 @@ mod tests {
     fn match_segment_exact_match_true() {
         // kills `match_seg_inner -> bool with false`
         assert!(match_segment("foo", "foo"), "exact match must be true");
-        assert!(match_segment("", ""), "empty vs empty must be true (None,None arm)");
+        assert!(
+            match_segment("", ""),
+            "empty vs empty must be true (None,None arm)"
+        );
     }
 
     #[test]
     fn match_segment_literal_mismatch_false() {
         // kills `match_segment -> bool with true`
-        assert!(!match_segment("foo", "bar"), "literal mismatch must be false");
-        assert!(!match_segment("a", "b"), "single-char mismatch must be false");
+        assert!(
+            !match_segment("foo", "bar"),
+            "literal mismatch must be false"
+        );
+        assert!(
+            !match_segment("a", "b"),
+            "single-char mismatch must be false"
+        );
     }
 
     #[test]
     fn match_segment_star_matches_multi_chars() {
         // kills `delete match arm (Some(&'*'), _) in match_seg_inner`
-        assert!(match_segment("*", "anything"), "* must match non-empty text");
-        assert!(match_segment("*", ""), "* must match empty text (zero chars)");
+        assert!(
+            match_segment("*", "anything"),
+            "* must match non-empty text"
+        );
+        assert!(
+            match_segment("*", ""),
+            "* must match empty text (zero chars)"
+        );
         assert!(match_segment("*.rs", "lib.rs"), "*.rs must match lib.rs");
-        assert!(!match_segment("*.rs", "lib.txt"), "*.rs must not match lib.txt");
+        assert!(
+            !match_segment("*.rs", "lib.txt"),
+            "*.rs must not match lib.txt"
+        );
     }
 
     #[test]
@@ -391,29 +409,47 @@ mod tests {
     #[test]
     fn glob_matches_exact_literal_path() {
         // kills `match_path -> bool with false` and `glob_matches -> bool with false`
-        assert!(glob_matches("src/lib.rs", "src/lib.rs"), "exact path must match");
+        assert!(
+            glob_matches("src/lib.rs", "src/lib.rs"),
+            "exact path must match"
+        );
     }
 
     #[test]
     fn glob_matches_literal_mismatch_false() {
         // kills `match_path -> bool with true` and `glob_matches -> bool with true`
-        assert!(!glob_matches("src/foo.rs", "src/bar.rs"), "different filename must not match");
+        assert!(
+            !glob_matches("src/foo.rs", "src/bar.rs"),
+            "different filename must not match"
+        );
     }
 
     #[test]
     fn match_path_extra_component_false() {
         // (None, _) arm: pattern exhausted but path has more components
-        assert!(!glob_matches("src/lib.rs", "src/lib.rs/extra"), "exhausted pattern with trailing component must be false");
+        assert!(
+            !glob_matches("src/lib.rs", "src/lib.rs/extra"),
+            "exhausted pattern with trailing component must be false"
+        );
         // (_, None) arm: path exhausted but pattern has more
-        assert!(!glob_matches("src/lib.rs/extra", "src/lib.rs"), "trailing pattern component must be false");
+        assert!(
+            !glob_matches("src/lib.rs/extra", "src/lib.rs"),
+            "trailing pattern component must be false"
+        );
     }
 
     #[test]
     fn glob_matches_double_star_consumes_components() {
         // kills `delete ! in match_path` line 64
         // ** must be able to consume one or more path components
-        assert!(glob_matches("**/*.rs", "a/b/c/lib.rs"), "** must consume multiple components");
-        assert!(!glob_matches("**/*.rs", "a/b/c/lib.txt"), "** must not match wrong extension");
+        assert!(
+            glob_matches("**/*.rs", "a/b/c/lib.rs"),
+            "** must consume multiple components"
+        );
+        assert!(
+            !glob_matches("**/*.rs", "a/b/c/lib.txt"),
+            "** must not match wrong extension"
+        );
     }
 
     // ── GlobTool::relativise ──────────────────────────────────────────────────

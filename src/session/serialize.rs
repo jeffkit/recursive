@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn entry_to_message_assistant_role() {
-        assert_eq!(entry_to_message(make_entry("assistant")).role, Role::Assistant);
+        assert_eq!(
+            entry_to_message(make_entry("assistant")).role,
+            Role::Assistant
+        );
     }
 
     #[test]

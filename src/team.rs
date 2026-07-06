@@ -594,28 +594,43 @@ mod tests {
 
     #[test]
     fn validate_team_name_rejects_empty() {
-        assert!(validate_team_name("").is_err(), "empty name must be rejected");
+        assert!(
+            validate_team_name("").is_err(),
+            "empty name must be rejected"
+        );
     }
 
     #[test]
     fn validate_team_name_rejects_slash() {
-        assert!(validate_team_name("etc/passwd").is_err(), "/ must be rejected");
+        assert!(
+            validate_team_name("etc/passwd").is_err(),
+            "/ must be rejected"
+        );
     }
 
     #[test]
     fn validate_team_name_rejects_backslash() {
-        assert!(validate_team_name("etc\\passwd").is_err(), r"\ must be rejected");
+        assert!(
+            validate_team_name("etc\\passwd").is_err(),
+            r"\ must be rejected"
+        );
     }
 
     #[test]
     fn validate_team_name_rejects_dotdot() {
         assert!(validate_team_name("..").is_err(), ".. must be rejected");
-        assert!(validate_team_name("../escape").is_err(), "../escape must be rejected");
+        assert!(
+            validate_team_name("../escape").is_err(),
+            "../escape must be rejected"
+        );
     }
 
     #[test]
     fn validate_team_name_rejects_leading_dot() {
-        assert!(validate_team_name(".hidden").is_err(), ".hidden must be rejected");
+        assert!(
+            validate_team_name(".hidden").is_err(),
+            ".hidden must be rejected"
+        );
     }
 
     #[test]

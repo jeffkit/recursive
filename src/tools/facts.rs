@@ -1408,7 +1408,10 @@ mod tests {
         let summary = facts_summary(&ws, 2);
         // Count occurrences of "Fact number" in summary
         let count = summary.matches("Fact number").count();
-        assert_eq!(count, 2, "limit=2 must restrict output to 2 facts, got: {summary}");
+        assert_eq!(
+            count, 2,
+            "limit=2 must restrict output to 2 facts, got: {summary}"
+        );
     }
 
     // ── FactStore unit tests (internal API) ──────────────────────────────────
@@ -1431,7 +1434,10 @@ mod tests {
             access_count: 0,
             superseded_by: None,
         };
-        assert!(fact.is_active(), "fact without superseded_by must be active");
+        assert!(
+            fact.is_active(),
+            "fact without superseded_by must be active"
+        );
     }
 
     #[test]
@@ -1456,9 +1462,8 @@ mod tests {
 
     #[test]
     fn fact_store_load_missing_file_returns_empty() {
-        let store =
-            FactStore::load(std::path::Path::new("/nonexistent/path/facts.jsonl"))
-                .expect("missing file must return empty store");
+        let store = FactStore::load(std::path::Path::new("/nonexistent/path/facts.jsonl"))
+            .expect("missing file must return empty store");
         assert!(store.facts.is_empty());
     }
 
@@ -1601,7 +1606,11 @@ mod tests {
         assert_eq!(store.active_facts().len(), 3);
         let evicted = store.evict_to_cap(3);
         assert_eq!(evicted, 0, "evict_to_cap at exact cap must evict 0 facts");
-        assert_eq!(store.active_facts().len(), 3, "all 3 facts must remain active");
+        assert_eq!(
+            store.active_facts().len(),
+            3,
+            "all 3 facts must remain active"
+        );
     }
 
     #[test]
@@ -1619,6 +1628,9 @@ mod tests {
             .iter()
             .filter(|f| f.superseded_by.as_deref() == Some("__evicted__"))
             .count();
-        assert_eq!(evicted_count, 2, "evicted facts must have superseded_by = __evicted__");
+        assert_eq!(
+            evicted_count, 2,
+            "evicted facts must have superseded_by = __evicted__"
+        );
     }
 }

@@ -227,7 +227,9 @@ mod tests {
         let path = checkpoint_log_path(&workspace, "my-slug", "sess-01");
         assert_eq!(
             path,
-            PathBuf::from("/home/user/project/.recursive/sessions/my-slug/sess-01/checkpoints.jsonl")
+            PathBuf::from(
+                "/home/user/project/.recursive/sessions/my-slug/sess-01/checkpoints.jsonl"
+            )
         );
     }
 
@@ -538,7 +540,10 @@ mod tests {
         // Only turn 3 exists with no pre field.
         write_log(&log_path, &[rec(3, None, "snap-3-id", &["x.txt"])]);
         let err = plan_rewind(&log_path, 3);
-        assert!(err.is_err(), "turn with no pre-snapshot must return an error");
+        assert!(
+            err.is_err(),
+            "turn with no pre-snapshot must return an error"
+        );
         let msg = format!("{}", err.unwrap_err());
         assert!(
             msg.contains("no pre-snapshot") || msg.contains("pre"),
@@ -556,7 +561,10 @@ mod tests {
         let err = plan_rewind(&log_path, 1);
         assert!(err.is_err(), "empty log must return an error");
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("no checkpoints"), "error must mention 'no checkpoints', got: {msg}");
+        assert!(
+            msg.contains("no checkpoints"),
+            "error must mention 'no checkpoints', got: {msg}"
+        );
     }
 
     #[test]
@@ -567,11 +575,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("ck.jsonl");
         // Only turn 5 exists. to_turn=3: no record has turn < 3, and turn 3 is not in the log.
-        write_log(&log_path, &[rec(5, Some("snap-pre"), "snap-post", &["a.txt"])]);
+        write_log(
+            &log_path,
+            &[rec(5, Some("snap-pre"), "snap-post", &["a.txt"])],
+        );
         let err = plan_rewind(&log_path, 3);
         assert!(err.is_err(), "non-existent turn must return an error");
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("3"), "error must mention the missing turn number, got: {msg}");
+        assert!(
+            msg.contains("3"),
+            "error must mention the missing turn number, got: {msg}"
+        );
     }
 
     #[test]

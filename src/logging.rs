@@ -140,7 +140,10 @@ mod tests {
         set_tui_quiet(true);
         assert!(is_tui_quiet(), "must be quiet after set_tui_quiet(true)");
         set_tui_quiet(false);
-        assert!(!is_tui_quiet(), "must not be quiet after set_tui_quiet(false)");
+        assert!(
+            !is_tui_quiet(),
+            "must not be quiet after set_tui_quiet(false)"
+        );
     }
 
     #[test]

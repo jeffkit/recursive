@@ -2348,6 +2348,64 @@ mod tests {
     // ── Goal-201: plan mode tools are registered by the runtime builder ──
 
     #[test]
+    fn runtime_builder_skills_stores_skills_list() {
+        // kills `replace AgentRuntimeBuilder::skills -> Self with Default::default()`:
+        // if skills() discards the argument, the runtime's globs_skills would be empty.
+        use crate::skills::{Skill, SkillMode};
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let skill = Skill {
+            name: "my-skill".to_string(),
+            description: "A test skill".to_string(),
+            path: std::path::PathBuf::from("/tmp/my-skill/SKILL.md"),
+            mode: SkillMode::Always,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+        };
+        let rt = AgentRuntime::builder()
+            .llm(llm)
+            .skills(vec![skill])
+            .build()
+            .unwrap();
+        // `globs_skills` is pub(crate); it must contain the skill we passed.
+        assert_eq!(
+            rt.kernel.globs_skills.len(),
+            1,
+            "skills() must store the provided skills list; len was {}",
+            rt.kernel.globs_skills.len()
+        );
+        assert_eq!(rt.kernel.globs_skills[0].name, "my-skill");
+    }
+
+    #[test]
+    fn reject_plan_appends_rejection_message_to_transcript() {
+        // kills `replace AgentRuntime::reject_plan with ()` mutation.
+        // If reject_plan is a no-op, the transcript won't grow.
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let before = rt.transcript_tail(100).len();
+        rt.reject_plan("too risky");
+        let after = rt.transcript_tail(100).len();
+        assert!(
+            after > before,
+            "reject_plan must append a rejection message to the transcript"
+        );
+        // Verify the message contains the reason
+        let tail = rt.transcript_tail(100);
+        let last = tail.last().expect("at least one message");
+        assert!(
+            last.content.contains("too risky"),
+            "rejection message must contain the provided reason; got: {:?}",
+            last.content
+        );
+    }
+
+    #[test]
     fn runtime_builder_has_plan_mode_tools() {
         // AgentRuntimeBuilder::build() must register enter_plan_mode and
         // exit_plan_mode when with_plan_mode_tools(true) is set.

@@ -256,9 +256,41 @@ mod tests {
     fn zero_timestamps_are_skipped_in_serialization() {
         let r = rec(0, "z");
         let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains("started_at"), "zero started_at should be skipped");
-        assert!(!json.contains("finished_at"), "zero finished_at should be skipped");
-        assert!(!json.contains("saved_at"), "zero saved_at should be skipped");
+        assert!(
+            !json.contains("started_at"),
+            "zero started_at should be skipped"
+        );
+        assert!(
+            !json.contains("finished_at"),
+            "zero finished_at should be skipped"
+        );
+        assert!(
+            !json.contains("saved_at"),
+            "zero saved_at should be skipped"
+        );
+    }
+
+    #[test]
+    fn nonzero_timestamps_are_included_in_serialization() {
+        // kills `replace is_zero_i64 -> bool with true` and `replace == with !=` mutations.
+        // If is_zero_i64 always returns true, non-zero timestamps would be omitted too.
+        let mut r = rec(0, "z");
+        r.started_at = 1_700_000_000;
+        r.finished_at = 1_700_001_000;
+        r.saved_at = 1_700_002_000;
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains("started_at"),
+            "non-zero started_at must appear in serialization; got: {json}"
+        );
+        assert!(
+            json.contains("finished_at"),
+            "non-zero finished_at must appear in serialization; got: {json}"
+        );
+        assert!(
+            json.contains("saved_at"),
+            "non-zero saved_at must appear in serialization; got: {json}"
+        );
     }
 
     #[test]
@@ -271,7 +303,10 @@ mod tests {
 
         // Manually insert a blank line between records
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f).unwrap(); // blank line
         drop(f);
 

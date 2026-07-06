@@ -99,7 +99,10 @@ mod tests {
     fn finish_reason_display_all_variants() {
         // kills `replace <impl Display for FinishReason>::fmt with Ok(Default::default())`
         // and individual match-arm replacements.
-        assert_eq!(FinishReason::NoMoreToolCalls.to_string(), "no_more_tool_calls");
+        assert_eq!(
+            FinishReason::NoMoreToolCalls.to_string(),
+            "no_more_tool_calls"
+        );
         assert_eq!(FinishReason::BudgetExceeded.to_string(), "budget_exceeded");
         assert_eq!(
             FinishReason::ProviderStop("length".into()).to_string(),
@@ -170,16 +173,16 @@ mod tests {
     #[test]
     fn finish_reason_deserializes_from_kind_tag() {
         // kills mutations that swap field names on deserialization
-        let r: FinishReason =
-            serde_json::from_str(r#"{"kind":"no_more_tool_calls"}"#).unwrap();
+        let r: FinishReason = serde_json::from_str(r#"{"kind":"no_more_tool_calls"}"#).unwrap();
         assert!(matches!(r, FinishReason::NoMoreToolCalls));
 
-        let r: FinishReason = serde_json::from_str(
-            r#"{"kind":"stuck","repeated_call":"Read","repeats":3}"#,
-        )
-        .unwrap();
+        let r: FinishReason =
+            serde_json::from_str(r#"{"kind":"stuck","repeated_call":"Read","repeats":3}"#).unwrap();
         match r {
-            FinishReason::Stuck { repeated_call, repeats } => {
+            FinishReason::Stuck {
+                repeated_call,
+                repeats,
+            } => {
                 assert_eq!(repeated_call, "Read");
                 assert_eq!(repeats, 3);
             }
@@ -195,9 +198,16 @@ mod tests {
         // kills variant swap mutations in PermissionDecision serialization
         let deny = serde_json::to_value(PermissionDecision::Deny("blocked".into())).unwrap();
         // snake_case rename_all → key is "deny"
-        assert!(deny.get("deny").is_some(), "Deny must have 'deny' key, got {deny}");
+        assert!(
+            deny.get("deny").is_some(),
+            "Deny must have 'deny' key, got {deny}"
+        );
 
         let allow = serde_json::to_value(&PermissionDecision::Allow).unwrap();
-        assert_eq!(allow, serde_json::json!("allow"), "Allow must serialize to string 'allow'");
+        assert_eq!(
+            allow,
+            serde_json::json!("allow"),
+            "Allow must serialize to string 'allow'"
+        );
     }
 }

@@ -710,12 +710,15 @@ mod tests {
     fn kernel_builder_stuck_window_and_error_rate() {
         // kills mutations to `unwrap_or(10)` and `unwrap_or(0.8)` defaults
         let mock = MockProvider::default();
-        let kernel_defaults = AgentKernel::builder()
-            .llm(Arc::new(mock))
-            .build()
-            .unwrap();
-        assert_eq!(kernel_defaults.stuck_window, 10, "default stuck_window must be 10");
-        assert!((kernel_defaults.stuck_error_rate - 0.8).abs() < 1e-10, "default stuck_error_rate must be 0.8");
+        let kernel_defaults = AgentKernel::builder().llm(Arc::new(mock)).build().unwrap();
+        assert_eq!(
+            kernel_defaults.stuck_window, 10,
+            "default stuck_window must be 10"
+        );
+        assert!(
+            (kernel_defaults.stuck_error_rate - 0.8).abs() < 1e-10,
+            "default stuck_error_rate must be 0.8"
+        );
 
         let mock2 = MockProvider::default();
         let kernel_custom = AgentKernel::builder()
@@ -732,12 +735,12 @@ mod tests {
     fn kernel_accessor_methods() {
         // kills accessor method-replacement mutations
         let mock = Arc::new(MockProvider::default());
-        let kernel = AgentKernel::builder()
-            .llm(mock.clone())
-            .build()
-            .unwrap();
+        let kernel = AgentKernel::builder().llm(mock.clone()).build().unwrap();
         // llm() returns the same Arc
-        assert!(Arc::ptr_eq(&kernel.llm, kernel.llm()), "llm() must return &self.llm");
+        assert!(
+            Arc::ptr_eq(&kernel.llm, kernel.llm()),
+            "llm() must return &self.llm"
+        );
         // tools() returns the registry
         let _ = kernel.tools();
         // hooks() returns hook registry
@@ -747,18 +750,21 @@ mod tests {
         // session_store() returns session store
         let _ = kernel.session_store();
         // shutdown_token is None when not set
-        assert!(kernel.shutdown_token().is_none(), "no token must be set by default");
+        assert!(
+            kernel.shutdown_token().is_none(),
+            "no token must be set by default"
+        );
     }
 
     #[test]
     fn kernel_max_steps_zero_by_default() {
         // kills `self.max_steps.unwrap_or(0)` → `unwrap_or(1)` mutation
         let mock = Arc::new(MockProvider::default());
-        let kernel = AgentKernel::builder()
-            .llm(mock)
-            .build()
-            .unwrap();
-        assert_eq!(kernel.max_steps, 0, "default max_steps must be 0 (unlimited)");
+        let kernel = AgentKernel::builder().llm(mock).build().unwrap();
+        assert_eq!(
+            kernel.max_steps, 0,
+            "default max_steps must be 0 (unlimited)"
+        );
     }
 
     #[test]
@@ -778,16 +784,17 @@ mod tests {
         // kills `fn with_tools` function-replacement mutation
         use crate::tools::transport::LocalTransport;
         let mock = Arc::new(MockProvider::default());
-        let kernel = AgentKernel::builder()
-            .llm(mock.clone())
-            .build()
-            .unwrap();
+        let kernel = AgentKernel::builder().llm(mock.clone()).build().unwrap();
         // The local registry has tools; create an empty one to swap in.
         let empty_reg = ToolRegistry::new(Arc::new(LocalTransport));
         let replaced = kernel.with_tools(empty_reg);
         // The replaced kernel must use the new (empty) registry.
         // ToolRegistry::local() registers many tools; our empty one has none.
-        assert_eq!(replaced.tools().names().len(), 0, "with_tools must swap in the empty registry");
+        assert_eq!(
+            replaced.tools().names().len(),
+            0,
+            "with_tools must swap in the empty registry"
+        );
     }
 
     // -- TurnOutcome tests --------------------------------------------------

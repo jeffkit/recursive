@@ -2216,8 +2216,16 @@ mod tests {
     #[test]
     fn format_timestamp_unix_epoch_is_1970() {
         let ts = format_timestamp(SystemTime::UNIX_EPOCH);
-        assert_eq!(&ts[..10], "1970-01-01", "epoch date must be 1970-01-01; got {ts}");
-        assert_eq!(&ts[11..19], "00:00:00", "epoch time must be 00:00:00; got {ts}");
+        assert_eq!(
+            &ts[..10],
+            "1970-01-01",
+            "epoch date must be 1970-01-01; got {ts}"
+        );
+        assert_eq!(
+            &ts[11..19],
+            "00:00:00",
+            "epoch time must be 00:00:00; got {ts}"
+        );
         assert!(ts.ends_with('Z'), "must end with Z; got {ts}");
     }
 
@@ -2225,8 +2233,7 @@ mod tests {
     fn format_timestamp_known_date() {
         // 2026-07-06T00:00:00Z = 20640 days * 86400 sec = 1_783_296_000 seconds
         let secs = 1_783_296_000u64;
-        let t = SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_secs(secs);
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
         let ts = format_timestamp(t);
         assert_eq!(&ts[..10], "2026-07-06", "expected 2026-07-06; got {ts}");
         assert_eq!(&ts[11..19], "00:00:00", "time part must be zero; got {ts}");
@@ -2261,13 +2268,19 @@ mod tests {
     #[test]
     fn sanitize_thread_id_leading_dot_replaced() {
         let out = sanitize_thread_id_for_session(".hidden");
-        assert!(!out.starts_with('.'), "leading dot must be replaced; got {out}");
+        assert!(
+            !out.starts_with('.'),
+            "leading dot must be replaced; got {out}"
+        );
     }
 
     #[test]
     fn sanitize_thread_id_double_dot_collapsed() {
         let out = sanitize_thread_id_for_session("a..b");
-        assert!(!out.contains(".."), "double dot must be collapsed; got {out}");
+        assert!(
+            !out.contains(".."),
+            "double dot must be collapsed; got {out}"
+        );
     }
 
     #[test]

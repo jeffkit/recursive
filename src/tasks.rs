@@ -504,7 +504,10 @@ mod tests {
         drop(arc);
 
         let count = reg.drain_output(&id).await;
-        assert_eq!(count, 3, "drain must return the exact number of lines drained");
+        assert_eq!(
+            count, 3,
+            "drain must return the exact number of lines drained"
+        );
 
         // A second drain with no new lines returns 0
         assert_eq!(reg.drain_output(&id).await, 0);
@@ -538,7 +541,10 @@ mod tests {
         assert!(reg.is_empty().await, "new registry must be empty");
         let (state, _id) = TaskState::new("t", "", "");
         reg.register(state).await;
-        assert!(!reg.is_empty().await, "registry must not be empty after register");
+        assert!(
+            !reg.is_empty().await,
+            "registry must not be empty after register"
+        );
     }
 
     #[tokio::test]
@@ -559,7 +565,10 @@ mod tests {
         // Give the channel messages time to arrive
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let total = reg.drain_all().await;
-        assert_eq!(total, 2, "drain_all must return total lines drained across tasks");
+        assert_eq!(
+            total, 2,
+            "drain_all must return total lines drained across tasks"
+        );
     }
 
     #[tokio::test]
@@ -567,7 +576,11 @@ mod tests {
         // kills `None => 0` → `None => 1` mutation in drain_output
         let reg = TaskRegistry::new();
         let ghost_id = TaskId::new();
-        assert_eq!(reg.drain_output(&ghost_id).await, 0, "drain_output must return 0 for missing task");
+        assert_eq!(
+            reg.drain_output(&ghost_id).await,
+            0,
+            "drain_output must return 0 for missing task"
+        );
     }
 
     #[tokio::test]

@@ -230,7 +230,10 @@ mod tests {
     #[test]
     fn is_coordinator_tool_true_for_agent_tool() {
         // kills `coordinator_tool_set().contains(&tool_name)` → always-false mutation
-        assert!(is_coordinator_tool("agent"), "'agent' must be in coordinator tool set");
+        assert!(
+            is_coordinator_tool("agent"),
+            "'agent' must be in coordinator tool set"
+        );
     }
 
     #[test]
@@ -247,7 +250,10 @@ mod tests {
         if !cfg!(feature = "coordinator-mode") {
             assert!(!mode, "coordinator mode must be false without feature");
         } else {
-            assert!(!mode, "coordinator mode must be false without the env var even with feature");
+            assert!(
+                !mode,
+                "coordinator mode must be false without the env var even with feature"
+            );
         }
     }
 

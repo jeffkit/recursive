@@ -298,14 +298,20 @@ mod tests {
     fn auth_config_is_valid_rejects_prefix_of_correct_key() {
         // kills length-check removal mutations (constant-time comparison)
         let cfg = AuthConfig::new(vec!["long-key-value".to_string()]);
-        assert!(!cfg.is_valid("long-key"), "prefix of correct key must be rejected");
+        assert!(
+            !cfg.is_valid("long-key"),
+            "prefix of correct key must be rejected"
+        );
     }
 
     #[test]
     fn auth_config_is_valid_returns_false_for_empty_key_set() {
         // kills `if self.keys.is_empty() { return false; }` removal mutation
         let cfg = AuthConfig::new(vec![]);
-        assert!(!cfg.is_valid("anything"), "empty key set must always reject");
+        assert!(
+            !cfg.is_valid("anything"),
+            "empty key set must always reject"
+        );
     }
 
     #[test]

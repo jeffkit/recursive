@@ -216,10 +216,22 @@ mod tests {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(100),
         };
-        assert_eq!(policy.backoff_for(0, None, true).unwrap(), Duration::from_secs(1));
-        assert_eq!(policy.backoff_for(1, None, true).unwrap(), Duration::from_secs(2));
-        assert_eq!(policy.backoff_for(2, None, true).unwrap(), Duration::from_secs(4));
-        assert_eq!(policy.backoff_for(3, None, true).unwrap(), Duration::from_secs(8));
+        assert_eq!(
+            policy.backoff_for(0, None, true).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            policy.backoff_for(1, None, true).unwrap(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            policy.backoff_for(2, None, true).unwrap(),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            policy.backoff_for(3, None, true).unwrap(),
+            Duration::from_secs(8)
+        );
     }
 
     #[test]
@@ -230,7 +242,11 @@ mod tests {
             max_backoff: Duration::from_secs(5),
         };
         let b3 = policy.backoff_for(3, None, true).unwrap(); // would be 8s without cap
-        assert_eq!(b3, Duration::from_secs(5), "backoff must be capped at max_backoff");
+        assert_eq!(
+            b3,
+            Duration::from_secs(5),
+            "backoff must be capped at max_backoff"
+        );
     }
 
     // ── ModelPricing::cost_usd ───────────────────────────────────────────────

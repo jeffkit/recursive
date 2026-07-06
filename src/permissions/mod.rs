@@ -1324,6 +1324,45 @@ mod tests {
         assert_eq!(layered.layers.len(), 0);
     }
 
+    #[test]
+    fn test_old_config_only_allow_produces_layer() {
+        // kills `replace || with && in From<OldPermissionsConfig>`:
+        // with &&, all three lists must be non-empty to create a layer.
+        // Here only `allow` is non-empty; the layer must still be created.
+        let old = OldPermissionsConfig {
+            allow: vec!["Read".into()],
+            deny: vec![],
+            interactive: vec![],
+            plan: vec![],
+            mode: PermissionMode::Default,
+        };
+        let layered: LayeredPermissionsConfig = old.into();
+        assert_eq!(
+            layered.layers.len(),
+            1,
+            "non-empty allow alone must create a layer (|| not &&)"
+        );
+        assert_eq!(layered.layers[0].allow, vec!["Read"]);
+    }
+
+    #[test]
+    fn test_old_config_only_deny_produces_layer() {
+        // kills `replace || with &&`: deny-only old config must still create a layer.
+        let old = OldPermissionsConfig {
+            allow: vec![],
+            deny: vec!["Bash".into()],
+            interactive: vec![],
+            plan: vec![],
+            mode: PermissionMode::Default,
+        };
+        let layered: LayeredPermissionsConfig = old.into();
+        assert_eq!(
+            layered.layers.len(),
+            1,
+            "non-empty deny alone must create a layer"
+        );
+    }
+
     // ── all_deny / all_allow / all_interactive ────────────────────────────
 
     #[test]

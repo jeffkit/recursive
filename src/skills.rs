@@ -1774,8 +1774,7 @@ mod tests {
 
     #[test]
     fn parse_skill_meta_mode_trigger_explicit_hint_preserved() {
-        let content =
-            "---\nname: x\ndescription: d\nmode: trigger\nhint: custom hint\n---\nbody";
+        let content = "---\nname: x\ndescription: d\nmode: trigger\nhint: custom hint\n---\nbody";
         let (_, _, _, _, hint, _, _, _) = parse_skill_meta(content, &fake_dir());
         assert_eq!(hint, "custom hint");
     }
@@ -1897,7 +1896,11 @@ mod tests {
     #[test]
     fn extract_script_description_skips_shebang() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(tmp.path(), "#!/usr/bin/env python3\n# Script description\ncode").unwrap();
+        fs::write(
+            tmp.path(),
+            "#!/usr/bin/env python3\n# Script description\ncode",
+        )
+        .unwrap();
         let desc = extract_script_description(tmp.path());
         assert_eq!(desc, "Script description");
     }

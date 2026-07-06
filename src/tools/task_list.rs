@@ -194,10 +194,7 @@ mod tests {
         arc2.mark_completed("done".into()).await;
 
         let tool = TaskListTool::new(reg);
-        let out = tool
-            .execute(json!({ "status": "running" }))
-            .await
-            .unwrap();
+        let out = tool.execute(json!({ "status": "running" })).await.unwrap();
         assert!(
             out.contains("1 task(s)"),
             "status=running must only return running tasks; got: {out}"

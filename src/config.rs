@@ -1093,7 +1093,11 @@ mod tests {
             !loaded.contains("truncated"),
             "exactly 8 KB file must NOT be truncated"
         );
-        assert_eq!(loaded.len(), MAX_MEMORY_FILE_SIZE, "must return full 8 KB content");
+        assert_eq!(
+            loaded.len(),
+            MAX_MEMORY_FILE_SIZE,
+            "must return full 8 KB content"
+        );
     }
 
     // Consolidated test for all HOME-dependent memory checks.
@@ -1876,12 +1880,21 @@ api_key = "sk-from-file"
         std::env::set_var("RECURSIVE_API_KEY", "sk-test-key-12345");
         let config = Config::from_env().unwrap();
         let key = config.require_api_key().expect("key must be present");
-        assert_eq!(key, "sk-test-key-12345", "must return actual key, not empty string");
+        assert_eq!(
+            key, "sk-test-key-12345",
+            "must return actual key, not empty string"
+        );
         // Restore
-        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
-        else { std::env::remove_var("RECURSIVE_MODEL"); }
-        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
-        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_API_KEY");
+        }
     }
 
     #[test]
@@ -1901,10 +1914,17 @@ api_key = "sk-from-file"
             assert!(config.require_api_key().is_err(), "None key must error");
         }
         // Restore
-        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
-        if let Some(v) = orig_oai { std::env::set_var("OPENAI_API_KEY", v); }
-        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
-        else { std::env::remove_var("RECURSIVE_MODEL"); }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        }
+        if let Some(v) = orig_oai {
+            std::env::set_var("OPENAI_API_KEY", v);
+        }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
     }
 
     // ── allow_bypass_permissions ──────────────────────────────────────────────
@@ -1927,12 +1947,21 @@ api_key = "sk-from-file"
             "RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1 must enable bypass"
         );
         // Restore
-        if let Some(v) = orig { std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", v); }
-        else { std::env::remove_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS"); }
-        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
-        else { std::env::remove_var("RECURSIVE_MODEL"); }
-        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
-        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS");
+        }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_API_KEY");
+        }
     }
 
     #[test]
@@ -1953,12 +1982,21 @@ api_key = "sk-from-file"
             "RECURSIVE_ALLOW_BYPASS_PERMISSIONS=true must enable bypass"
         );
         // Restore
-        if let Some(v) = orig { std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", v); }
-        else { std::env::remove_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS"); }
-        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
-        else { std::env::remove_var("RECURSIVE_MODEL"); }
-        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
-        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+        if let Some(v) = orig {
+            std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS");
+        }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_API_KEY");
+        }
     }
 
     // ── web_search_api_key and jina_key empty filtering ─────────────────────
@@ -1987,14 +2025,26 @@ api_key = "sk-from-file"
             "empty RECURSIVE_WEB_SEARCH_JINA_KEY must become None"
         );
         // Restore
-        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", v); }
-        else { std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY"); }
-        if let Some(v) = orig_jina { std::env::set_var("RECURSIVE_WEB_SEARCH_JINA_KEY", v); }
-        else { std::env::remove_var("RECURSIVE_WEB_SEARCH_JINA_KEY"); }
-        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
-        else { std::env::remove_var("RECURSIVE_MODEL"); }
-        if let Some(v) = orig_api { std::env::set_var("RECURSIVE_API_KEY", v); }
-        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+        if let Some(v) = orig_key {
+            std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY");
+        }
+        if let Some(v) = orig_jina {
+            std::env::set_var("RECURSIVE_WEB_SEARCH_JINA_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_JINA_KEY");
+        }
+        if let Some(v) = orig_model {
+            std::env::set_var("RECURSIVE_MODEL", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MODEL");
+        }
+        if let Some(v) = orig_api {
+            std::env::set_var("RECURSIVE_API_KEY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_API_KEY");
+        }
     }
 
     // ── load_memory_file targeted tests ──────────────────────────────────────
@@ -2045,6 +2095,26 @@ api_key = "sk-from-file"
         );
     }
 
+    #[test]
+    fn load_memory_file_does_not_truncate_at_exact_cap() {
+        // kills `replace > with >=` mutation in load_memory_file.
+        // A file of exactly MAX_MEMORY_FILE_SIZE bytes is NOT over the cap,
+        // so it must be returned as-is WITHOUT a truncation marker.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = "Y".repeat(MAX_MEMORY_FILE_SIZE); // exactly at cap
+        std::fs::write(tmp.path(), &content).unwrap();
+        let result = load_memory_file(tmp.path()).unwrap();
+        assert!(
+            !result.contains("[…truncated"),
+            "file at exact cap must NOT be truncated; got: {result}"
+        );
+        assert_eq!(
+            result.len(),
+            MAX_MEMORY_FILE_SIZE,
+            "file at exact cap must be returned unchanged"
+        );
+    }
+
     // ── load_project_context targeted tests ──────────────────────────────────
 
     #[test]
@@ -2052,7 +2122,10 @@ api_key = "sk-from-file"
         // kills function-level replacement of load_project_context
         let tmp = tempfile::TempDir::new().unwrap();
         let result = load_project_context(tmp.path());
-        assert!(result.is_none(), "must return None when neither AGENTS.md nor CLAUDE.md exist");
+        assert!(
+            result.is_none(),
+            "must return None when neither AGENTS.md nor CLAUDE.md exist"
+        );
     }
 
     #[test]
@@ -2061,9 +2134,15 @@ api_key = "sk-from-file"
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "# Agents content").unwrap();
         let result = load_project_context(tmp.path()).unwrap();
-        assert!(result.contains("AGENTS.md"), "must include AGENTS.md header");
+        assert!(
+            result.contains("AGENTS.md"),
+            "must include AGENTS.md header"
+        );
         assert!(result.contains("Agents content"));
-        assert!(!result.contains("CLAUDE.md"), "must not include CLAUDE.md when absent");
+        assert!(
+            !result.contains("CLAUDE.md"),
+            "must not include CLAUDE.md when absent"
+        );
     }
 
     #[test]
@@ -2072,9 +2151,15 @@ api_key = "sk-from-file"
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "# Claude content").unwrap();
         let result = load_project_context(tmp.path()).unwrap();
-        assert!(result.contains("CLAUDE.md"), "must include CLAUDE.md header");
+        assert!(
+            result.contains("CLAUDE.md"),
+            "must include CLAUDE.md header"
+        );
         assert!(result.contains("Claude content"));
-        assert!(!result.contains("AGENTS.md"), "must not include AGENTS.md when absent");
+        assert!(
+            !result.contains("AGENTS.md"),
+            "must not include AGENTS.md when absent"
+        );
     }
 
     #[test]
@@ -2084,8 +2169,14 @@ api_key = "sk-from-file"
         std::fs::write(tmp.path().join("AGENTS.md"), "# Agents").unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "# Claude").unwrap();
         let result = load_project_context(tmp.path()).unwrap();
-        assert!(result.contains("AGENTS.md"), "must include AGENTS.md section");
-        assert!(result.contains("CLAUDE.md"), "must include CLAUDE.md section");
+        assert!(
+            result.contains("AGENTS.md"),
+            "must include AGENTS.md section"
+        );
+        assert!(
+            result.contains("CLAUDE.md"),
+            "must include CLAUDE.md section"
+        );
         assert!(result.contains("Agents"), "must include AGENTS.md content");
         assert!(result.contains("Claude"), "must include CLAUDE.md content");
     }
@@ -2115,6 +2206,9 @@ api_key = "sk-from-file"
         // kills `None => base.to_string()` arm mutations
         let tmp = tempfile::TempDir::new().unwrap();
         let result = prepend_project_context("my system prompt", tmp.path());
-        assert_eq!(result, "my system prompt", "must return base unchanged when no context files");
+        assert_eq!(
+            result, "my system prompt",
+            "must return base unchanged when no context files"
+        );
     }
 }

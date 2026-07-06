@@ -277,7 +277,11 @@ mod tests {
             cache_miss_tokens: 1,
         };
         let result = big.accumulate(one);
-        assert_eq!(result.reasoning_tokens, u32::MAX, "must saturate, not overflow");
+        assert_eq!(
+            result.reasoning_tokens,
+            u32::MAX,
+            "must saturate, not overflow"
+        );
         assert_eq!(result.prompt_tokens, u32::MAX);
         assert_eq!(result.completion_tokens, u32::MAX);
     }
@@ -288,7 +292,10 @@ mod tests {
         let result = split_think_tags("<think></think>answer");
         assert!(result.is_some(), "empty think block must still parse");
         let (reasoning, cleaned) = result.unwrap();
-        assert!(reasoning.is_empty(), "reasoning must be empty for empty tags; got: {reasoning:?}");
+        assert!(
+            reasoning.is_empty(),
+            "reasoning must be empty for empty tags; got: {reasoning:?}"
+        );
         assert_eq!(cleaned, "answer");
     }
 
@@ -296,7 +303,10 @@ mod tests {
     fn split_think_tags_returns_none_when_no_tag() {
         // kills `content.find(OPEN)?` → always-Some mutations
         let result = split_think_tags("no think tag here");
-        assert!(result.is_none(), "must return None when no <think> tag present");
+        assert!(
+            result.is_none(),
+            "must return None when no <think> tag present"
+        );
     }
 
     #[test]

@@ -426,8 +426,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = RunShell::new(tmp.path()).with_max_output_bytes(MAX_OUTPUT_BYTES_HARD_CAP * 4);
         assert_eq!(
-            tool.max_output_bytes,
-            MAX_OUTPUT_BYTES_HARD_CAP,
+            tool.max_output_bytes, MAX_OUTPUT_BYTES_HARD_CAP,
             "with_max_output_bytes must clamp at the hard cap"
         );
     }

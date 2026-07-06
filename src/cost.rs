@@ -587,8 +587,15 @@ mod tests {
         };
         tracker.record_usage(usage, 250);
         let acc = tracker.accumulated_usage();
-        assert_eq!(acc.total_tokens, 15, "accumulated_usage() must return recorded total");
-        assert_eq!(tracker.accumulated_latency_ms(), 250, "accumulated_latency_ms() must return recorded latency");
+        assert_eq!(
+            acc.total_tokens, 15,
+            "accumulated_usage() must return recorded total"
+        );
+        assert_eq!(
+            tracker.accumulated_latency_ms(),
+            250,
+            "accumulated_latency_ms() must return recorded latency"
+        );
     }
 
     #[test]
@@ -597,8 +604,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tracker = CostTracker::new(dir.path().to_path_buf(), "my-model", "my-provider");
         let data = tracker.cost_data();
-        assert_eq!(data.model, "my-model", "cost_data().model must match constructor arg");
-        assert_eq!(data.provider, "my-provider", "cost_data().provider must match constructor arg");
+        assert_eq!(
+            data.model, "my-model",
+            "cost_data().model must match constructor arg"
+        );
+        assert_eq!(
+            data.provider, "my-provider",
+            "cost_data().provider must match constructor arg"
+        );
         assert_eq!(data.total_usage, TokenUsage::default());
     }
 
@@ -607,14 +620,34 @@ mod tests {
         // kills `= usage` → does not accumulate mutation in record_usage
         let dir = tempfile::tempdir().unwrap();
         let mut tracker = CostTracker::new(dir.path().to_path_buf(), "test-model", "openai");
-        let u1 = TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, ..Default::default() };
-        let u2 = TokenUsage { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30, ..Default::default() };
+        let u1 = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        let u2 = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 10,
+            total_tokens: 30,
+            ..Default::default()
+        };
         tracker.record_usage(u1, 100);
         tracker.record_usage(u2, 200);
         let acc = tracker.accumulated_usage();
-        assert_eq!(acc.prompt_tokens, 30, "prompt_tokens must accumulate across calls");
-        assert_eq!(acc.total_tokens, 45, "total_tokens must accumulate across calls");
-        assert_eq!(tracker.accumulated_latency_ms(), 300, "latency must accumulate");
+        assert_eq!(
+            acc.prompt_tokens, 30,
+            "prompt_tokens must accumulate across calls"
+        );
+        assert_eq!(
+            acc.total_tokens, 45,
+            "total_tokens must accumulate across calls"
+        );
+        assert_eq!(
+            tracker.accumulated_latency_ms(),
+            300,
+            "latency must accumulate"
+        );
     }
 
     #[test]
@@ -622,8 +655,7 @@ mod tests {
         // kills any field-insertion removal mutation in update_meta_with_cost
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".meta.json"), r#"{"goal": "test"}"#).unwrap();
-        let mut tracker =
-            CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "deepseek-chat", "openai");
         let usage = TokenUsage {
             prompt_tokens: 50,
             completion_tokens: 20,
@@ -637,13 +669,34 @@ mod tests {
 
         let meta_raw = std::fs::read_to_string(dir.path().join(".meta.json")).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&meta_raw).unwrap();
-        assert_eq!(meta["total_tokens"], 70, "total_tokens must be written to meta");
-        assert_eq!(meta["prompt_tokens"], 50, "prompt_tokens must be written to meta");
-        assert_eq!(meta["completion_tokens"], 20, "completion_tokens must be written to meta");
-        assert_eq!(meta["cache_hit_tokens"], 5, "cache_hit_tokens must be written to meta");
-        assert_eq!(meta["cache_miss_tokens"], 45, "cache_miss_tokens must be written to meta");
-        assert_eq!(meta["reasoning_tokens"], 10, "reasoning_tokens must be written to meta");
-        assert_eq!(meta["total_llm_latency_ms"], 500, "latency must be written to meta");
+        assert_eq!(
+            meta["total_tokens"], 70,
+            "total_tokens must be written to meta"
+        );
+        assert_eq!(
+            meta["prompt_tokens"], 50,
+            "prompt_tokens must be written to meta"
+        );
+        assert_eq!(
+            meta["completion_tokens"], 20,
+            "completion_tokens must be written to meta"
+        );
+        assert_eq!(
+            meta["cache_hit_tokens"], 5,
+            "cache_hit_tokens must be written to meta"
+        );
+        assert_eq!(
+            meta["cache_miss_tokens"], 45,
+            "cache_miss_tokens must be written to meta"
+        );
+        assert_eq!(
+            meta["reasoning_tokens"], 10,
+            "reasoning_tokens must be written to meta"
+        );
+        assert_eq!(
+            meta["total_llm_latency_ms"], 500,
+            "latency must be written to meta"
+        );
     }
 
     #[test]
@@ -656,7 +709,10 @@ mod tests {
         std::fs::write(dir.path().join(".meta.json"), r#"[1,2,3]"#).unwrap();
         let tracker = CostTracker::new(dir.path().to_path_buf(), "test-model", "openai");
         let res = tracker.update_meta_with_cost();
-        assert!(res.is_ok(), "non-object meta JSON must be handled gracefully");
+        assert!(
+            res.is_ok(),
+            "non-object meta JSON must be handled gracefully"
+        );
         // The file should remain unchanged (still the array)
         let after = std::fs::read_to_string(dir.path().join(".meta.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&after).unwrap();

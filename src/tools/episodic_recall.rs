@@ -441,7 +441,10 @@ mod tests {
         // kills `replace EpisodicRecall::is_deferred -> bool with false`
         let tmp = crate::test_util::IsolatedWorkspace::new();
         let tool = EpisodicRecall::new(tmp.path());
-        assert!(tool.is_deferred(), "episodic_recall must be a deferred tool");
+        assert!(
+            tool.is_deferred(),
+            "episodic_recall must be a deferred tool"
+        );
     }
 
     #[test]

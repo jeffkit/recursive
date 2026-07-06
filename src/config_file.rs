@@ -933,8 +933,7 @@ interactive = ["delete_file"]
         let tmp = tempfile::tempdir().unwrap();
         let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
 
-        set_value("provider.model", "gpt-4o")
-            .expect("set_value with a dotted key must succeed");
+        set_value("provider.model", "gpt-4o").expect("set_value with a dotted key must succeed");
 
         let path = config_file_path().unwrap();
         let content = std::fs::read_to_string(&path).unwrap();

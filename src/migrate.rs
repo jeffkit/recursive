@@ -244,7 +244,11 @@ mod tests {
     #[test]
     fn libc_exdev_is_18() {
         // kills `replace libc_exdev -> i32 with 0` and literal mutations
-        assert_eq!(libc_exdev(), 18, "EXDEV must be 18 (the Linux errno for cross-device link)");
+        assert_eq!(
+            libc_exdev(),
+            18,
+            "EXDEV must be 18 (the Linux errno for cross-device link)"
+        );
     }
 
     #[test]

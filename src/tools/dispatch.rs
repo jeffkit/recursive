@@ -452,7 +452,10 @@ mod tests {
         let preview = args_preview_for_permission(&args);
         assert!(preview.contains("path"), "preview must contain key 'path'");
         assert!(preview.contains("src/lib.rs"), "preview must contain value");
-        assert!(!preview.ends_with('…'), "short preview must not be truncated");
+        assert!(
+            !preview.ends_with('…'),
+            "short preview must not be truncated"
+        );
     }
 
     #[test]
@@ -504,7 +507,10 @@ mod tests {
         // covers the `other => other.to_string()` branch
         let args = serde_json::json!("just a string");
         let preview = args_preview_for_permission(&args);
-        assert!(preview.contains("just a string"), "non-object preview must contain the value");
+        assert!(
+            preview.contains("just a string"),
+            "non-object preview must contain the value"
+        );
     }
 
     // ── normalise targeted tests ──────────────────────────────────────────────

@@ -688,11 +688,15 @@ mod tests {
         // fc00::/7 ULA private (kills & → | and & → ^ mutants at segment mask check)
         assert!(is_private_ip("fc00::1".parse::<IpAddr>().unwrap()));
         assert!(is_private_ip("fd00::1".parse::<IpAddr>().unwrap())); // fd is also in fc00::/7
-        // fe80::/10 link-local (kills & → | and & → ^ mutants)
+                                                                      // fe80::/10 link-local (kills & → | and & → ^ mutants)
         assert!(is_private_ip("fe80::1".parse::<IpAddr>().unwrap()));
         // Public IPv6 should NOT be private
-        assert!(!is_private_ip("2001:4860:4860::8888".parse::<IpAddr>().unwrap())); // Google DNS
-        assert!(!is_private_ip("2606:4700:4700::1111".parse::<IpAddr>().unwrap())); // Cloudflare
+        assert!(!is_private_ip(
+            "2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        )); // Google DNS
+        assert!(!is_private_ip(
+            "2606:4700:4700::1111".parse::<IpAddr>().unwrap()
+        )); // Cloudflare
     }
 
     #[test]

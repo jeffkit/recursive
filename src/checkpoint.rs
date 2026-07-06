@@ -994,7 +994,10 @@ mod tests {
         let c2 = r.snapshot_for_session("s", "v2").unwrap();
 
         let diff = r.diff(&c1, Some(&c2), &[]).expect("diff must succeed");
-        assert!(!diff.is_empty(), "diff between two different snapshots must be non-empty");
+        assert!(
+            !diff.is_empty(),
+            "diff between two different snapshots must be non-empty"
+        );
     }
 
     #[test]
@@ -1015,7 +1018,9 @@ mod tests {
         // Diff with empty paths → shows all changes
         let full_diff = r.diff(&c1, Some(&c2), &[]).expect("full diff");
         // Diff filtered to a.txt → should not contain b.txt changes
-        let filtered = r.diff(&c1, Some(&c2), &["a.txt".into()]).expect("filtered diff");
+        let filtered = r
+            .diff(&c1, Some(&c2), &["a.txt".into()])
+            .expect("filtered diff");
         assert!(
             filtered.contains("a.txt"),
             "filtered diff must mention a.txt"
@@ -1044,8 +1049,13 @@ mod tests {
 
         // diff(c1, None, &[]) compares c1 against current workspace
         // (exercises write_workspace_tree → kills Ok(String::new()) mutation)
-        let diff = r.diff(&c1, None, &[]).expect("diff vs workspace must succeed");
-        assert!(!diff.is_empty(), "diff vs modified workspace must be non-empty");
+        let diff = r
+            .diff(&c1, None, &[])
+            .expect("diff vs workspace must succeed");
+        assert!(
+            !diff.is_empty(),
+            "diff vs modified workspace must be non-empty"
+        );
     }
 
     #[test]
@@ -1139,7 +1149,8 @@ mod tests {
         // Also verify that c1 checkpoint id appears in the list.
         let ids: Vec<_> = list.iter().map(|c| c.id.0.as_str()).collect();
         assert!(
-            ids.iter().any(|id| c1.0.starts_with(id) || id.starts_with(&c1.0[..6.min(c1.0.len())])),
+            ids.iter()
+                .any(|id| c1.0.starts_with(id) || id.starts_with(&c1.0[..6.min(c1.0.len())])),
             "c1 checkpoint must appear in list"
         );
     }

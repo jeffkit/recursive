@@ -753,7 +753,10 @@ mod tests {
         assert!(reg.is_empty(), "fresh registry must be empty");
         assert_eq!(reg.len(), 0, "fresh registry len must be 0");
         reg.register(Arc::new(AlwaysSkipHook));
-        assert!(!reg.is_empty(), "after register, registry must not be empty");
+        assert!(
+            !reg.is_empty(),
+            "after register, registry must not be empty"
+        );
         assert_eq!(reg.len(), 1, "after one register, len must be 1");
     }
 }

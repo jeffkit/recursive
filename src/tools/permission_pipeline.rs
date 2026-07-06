@@ -802,5 +802,4 @@ mod goal_h2_perm_pipeline {
             "Deny outcome must return true from is_deny()"
         );
     }
-
 }

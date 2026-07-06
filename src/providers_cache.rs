@@ -423,7 +423,10 @@ mod tests {
         let _lock = crate::test_util::env_lock();
         std::env::remove_var(PROVIDERS_URL_ENV);
         let url = configured_url();
-        assert_eq!(url, DEFAULT_PROVIDERS_URL, "must return default when env var unset");
+        assert_eq!(
+            url, DEFAULT_PROVIDERS_URL,
+            "must return default when env var unset"
+        );
     }
 
     #[test]
@@ -492,7 +495,10 @@ mod tests {
         // kills `v4.is_link_local()` removal mutation (169.254.0.0/16)
         use std::net::IpAddr;
         let ip: IpAddr = "169.254.1.1".parse().unwrap();
-        assert!(is_non_routable_ip(ip), "link-local 169.254.x.x must be non-routable");
+        assert!(
+            is_non_routable_ip(ip),
+            "link-local 169.254.x.x must be non-routable"
+        );
     }
 
     #[test]
@@ -500,7 +506,10 @@ mod tests {
         // kills `v6.is_multicast()` removal mutation
         use std::net::IpAddr;
         let ip: IpAddr = "ff02::1".parse().unwrap();
-        assert!(is_non_routable_ip(ip), "IPv6 multicast must be non-routable");
+        assert!(
+            is_non_routable_ip(ip),
+            "IPv6 multicast must be non-routable"
+        );
     }
 
     #[test]
@@ -508,7 +517,10 @@ mod tests {
         // kills `(v6.segments()[0] & 0xfe00) == 0xfc00` removal mutation (fc00::/7 ULA)
         use std::net::IpAddr;
         let ip: IpAddr = "fd12:3456:789a::1".parse().unwrap();
-        assert!(is_non_routable_ip(ip), "IPv6 ULA fd::/8 must be non-routable");
+        assert!(
+            is_non_routable_ip(ip),
+            "IPv6 ULA fd::/8 must be non-routable"
+        );
     }
 
     #[test]
@@ -516,7 +528,10 @@ mod tests {
         // kills `(v6.segments()[0] & 0xffc0) == 0xfe80` removal mutation (fe80::/10)
         use std::net::IpAddr;
         let ip: IpAddr = "fe80::1".parse().unwrap();
-        assert!(is_non_routable_ip(ip), "IPv6 link-local fe80::/10 must be non-routable");
+        assert!(
+            is_non_routable_ip(ip),
+            "IPv6 link-local fe80::/10 must be non-routable"
+        );
     }
 
     #[test]
@@ -524,7 +539,10 @@ mod tests {
         // kills function-level replacement of `is_non_routable_ip`
         use std::net::IpAddr;
         let ip: IpAddr = "2607:f8b0:4004:811::200e".parse().unwrap();
-        assert!(!is_non_routable_ip(ip), "global unicast IPv6 must be routable");
+        assert!(
+            !is_non_routable_ip(ip),
+            "global unicast IPv6 must be routable"
+        );
     }
 
     #[test]
@@ -544,7 +562,10 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&cache)?)?;
 
         // File was just written — modification time is NOW → not stale
-        assert!(!needs_update(), "freshly written cache must not need update");
+        assert!(
+            !needs_update(),
+            "freshly written cache must not need update"
+        );
         Ok(())
     }
 }

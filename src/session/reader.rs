@@ -552,8 +552,10 @@ mod tests {
         let tmp = crate::test_util::IsolatedWorkspace::new();
         let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
         // Only user+assistant (no tool_calls) messages — last_assistant returns None
-        w.append(&Message::user("hi".to_string()), None, None).unwrap();
-        w.append(&Message::assistant("hello".to_string()), None, None).unwrap();
+        w.append(&Message::user("hi".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("hello".to_string()), None, None)
+            .unwrap();
         w.finish(SessionStatus::Completed).unwrap();
 
         let reg = crate::tools::ToolRegistry::local();
@@ -590,7 +592,8 @@ mod tests {
             is_compaction_summary: false,
         };
 
-        w.append(&Message::user("do something".to_string()), None, None).unwrap();
+        w.append(&Message::user("do something".to_string()), None, None)
+            .unwrap();
         w.append(&asst, None, None).unwrap();
         w.append(&tool_result, None, None).unwrap();
         w.finish(SessionStatus::Completed).unwrap();
@@ -620,14 +623,19 @@ mod tests {
             arguments: serde_json::json!({"path": "missing.txt"}),
         }];
 
-        w.append(&Message::user("do something".to_string()), None, None).unwrap();
+        w.append(&Message::user("do something".to_string()), None, None)
+            .unwrap();
         w.append(&asst, None, None).unwrap();
         // No tool result appended!
         w.finish(SessionStatus::Completed).unwrap();
 
         let reg = crate::tools::ToolRegistry::local();
         let orphans = SessionReader::scan_orphan_tool_calls(w.session_dir(), &reg).unwrap();
-        assert_eq!(orphans.len(), 1, "one unanswered tool call must be reported as orphan");
+        assert_eq!(
+            orphans.len(),
+            1,
+            "one unanswered tool call must be reported as orphan"
+        );
         assert_eq!(orphans[0].tool_call_id, "tc-orphan");
         assert_eq!(orphans[0].tool_name, "Read");
     }

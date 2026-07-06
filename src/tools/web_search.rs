@@ -929,7 +929,10 @@ mod tests {
     fn format_results_empty_returns_no_results_sentinel() {
         // kills `if results.is_empty()` guard removal mutation
         let out = WebSearch::format_results(&[]);
-        assert_eq!(out, "No results found.", "empty results must return the sentinel string");
+        assert_eq!(
+            out, "No results found.",
+            "empty results must return the sentinel string"
+        );
     }
 
     #[test]
@@ -941,9 +944,18 @@ mod tests {
             snippet: "A systems programming language.".to_string(),
         }];
         let out = WebSearch::format_results(&results);
-        assert!(out.starts_with("1."), "first result must start with '1.'; got: {out:?}");
+        assert!(
+            out.starts_with("1."),
+            "first result must start with '1.'; got: {out:?}"
+        );
         assert!(out.contains("Title: Rust"), "result must include the title");
-        assert!(out.contains("URL: https://www.rust-lang.org"), "result must include the URL");
-        assert!(out.contains("Summary: A systems programming language."), "result must include the snippet");
+        assert!(
+            out.contains("URL: https://www.rust-lang.org"),
+            "result must include the URL"
+        );
+        assert!(
+            out.contains("Summary: A systems programming language."),
+            "result must include the snippet"
+        );
     }
 }

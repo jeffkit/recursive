@@ -147,7 +147,10 @@ mod tests {
         // kills `replace ScheduleWakeup::is_deferred -> bool with false`
         let slot: WakeupSlot = Arc::new(Mutex::new(None));
         let tool = ScheduleWakeup::new(slot);
-        assert!(tool.is_deferred(), "schedule_wakeup must be a deferred tool");
+        assert!(
+            tool.is_deferred(),
+            "schedule_wakeup must be a deferred tool"
+        );
     }
 
     #[tokio::test]
@@ -160,7 +163,10 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("poll data"), "message must include reason");
-        assert!(result.contains("42s"), "message must include delay in seconds");
+        assert!(
+            result.contains("42s"),
+            "message must include delay in seconds"
+        );
     }
 
     #[tokio::test]
@@ -170,9 +176,15 @@ mod tests {
         let tool = ScheduleWakeup::new(slot.clone());
         let result = tool.execute(json!({})).await.unwrap();
         // default delay is 60s
-        assert!(result.contains("60s"), "default delay must be 60s; got: {result}");
+        assert!(
+            result.contains("60s"),
+            "default delay must be 60s; got: {result}"
+        );
         // default reason is "continue"
-        assert!(result.contains("continue"), "default reason must be 'continue'; got: {result}");
+        assert!(
+            result.contains("continue"),
+            "default reason must be 'continue'; got: {result}"
+        );
         // Verify the stored request has the default values
         let req = slot.lock().unwrap().clone().unwrap();
         assert_eq!(req.delay, std::time::Duration::from_secs(60));
@@ -189,6 +201,9 @@ mod tests {
             .await
             .unwrap();
         let req = slot.lock().unwrap().clone().unwrap();
-        assert_eq!(req.prompt, "my prompt", "prompt must be stored in WakeupRequest");
+        assert_eq!(
+            req.prompt, "my prompt",
+            "prompt must be stored in WakeupRequest"
+        );
     }
 }

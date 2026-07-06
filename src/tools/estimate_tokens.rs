@@ -255,7 +255,10 @@ mod tests {
         // kills `replace <impl Tool for EstimateTokens>::is_deferred -> bool with false`
         use crate::tools::Tool;
         let tool = EstimateTokens::new("/tmp");
-        assert!(tool.is_deferred(), "EstimateTokens must be deferred (low-frequency tool)");
+        assert!(
+            tool.is_deferred(),
+            "EstimateTokens must be deferred (low-frequency tool)"
+        );
     }
 
     #[test]
@@ -266,7 +269,10 @@ mod tests {
         let text = "abcde"; // exactly 5 chars
         let (tokens, chars, _) = tool.estimate(text);
         assert_eq!(chars, 5);
-        assert_eq!(tokens, 2, "5 chars must round up to 2 tokens (ceil), not 1 (floor)");
+        assert_eq!(
+            tokens, 2,
+            "5 chars must round up to 2 tokens (ceil), not 1 (floor)"
+        );
     }
 
     #[tokio::test]
@@ -297,10 +303,7 @@ mod tests {
     async fn output_includes_method_field() {
         // kills `method` field removal mutation in the format string
         let tool = EstimateTokens::new("/tmp");
-        let result = tool
-            .execute(json!({ "text": "test" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "text": "test" })).await.unwrap();
         assert!(
             result.contains("method="),
             "output must include method field; got: {result}"

@@ -1990,8 +1990,7 @@ mod tests {
     fn parse_sse_response_error_code_minus_one_when_absent() {
         // Error response missing "code" field → should use -1, not 1
         // (kills delete - mutant at line 1036)
-        let buffer =
-            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"oops\"}}\n\n";
+        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"oops\"}}\n\n";
         let result = parse_sse_response(buffer, 1, "srv");
         assert!(result.is_some(), "must parse error response");
         let err_msg = result.unwrap().unwrap_err().to_string();
@@ -2034,7 +2033,10 @@ mod tests {
         // (kills the && → || mutations at lines 1059-1061)
         let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\"\n: comment ignored\ndata: :{\"v\":7}}\n\n";
         let result = parse_sse_response(buffer, 7, "srv");
-        assert!(result.is_some(), "comment line must not reset data accumulator");
+        assert!(
+            result.is_some(),
+            "comment line must not reset data accumulator"
+        );
     }
 
     #[test]
@@ -2042,7 +2044,8 @@ mod tests {
         // An unrecognised field (not event:, data:, id:, retry:, :) should clear
         // the data accumulator, causing the JSON to not parse.
         // (kills the delete ! mutations at lines 1053-1055)
-        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":8\nunknown: stuff\ndata: ,\"result\":{}}\n\n";
+        let buffer =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":8\nunknown: stuff\ndata: ,\"result\":{}}\n\n";
         // After "unknown: stuff" resets data, the next data: fragment is incomplete JSON
         let result = parse_sse_response(buffer, 8, "srv");
         // Incomplete/invalid JSON after reset → None
@@ -2059,7 +2062,9 @@ mod tests {
         // kills `delete - in JsonRpcResponse::method_not_found` (line 1149)
         // Mutant changes -32601 → 32601; this test catches it.
         let resp = JsonRpcResponse::method_not_found(Some(serde_json::json!(1)), "unknown_method");
-        let err_obj = resp.error.expect("method_not_found must set the error field");
+        let err_obj = resp
+            .error
+            .expect("method_not_found must set the error field");
         assert_eq!(
             err_obj.code, -32601,
             "method_not_found must use the JSON-RPC -32601 error code (negative)"

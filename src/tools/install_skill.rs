@@ -545,7 +545,10 @@ mod tests {
         // kills mutation of sort_by direction (a.path.cmp vs b.path.cmp)
         let data = make_zip(&[("Z_tool.md", "z"), ("A_skill.md", "a")]);
         let files = InstallSkill::parse_zip(&data).unwrap();
-        assert_eq!(files[0].path, "A_skill.md", "files must be sorted ascending by path");
+        assert_eq!(
+            files[0].path, "A_skill.md",
+            "files must be sorted ascending by path"
+        );
         assert_eq!(files[1].path, "Z_tool.md");
     }
 

@@ -1805,7 +1805,11 @@ data: {\"type\":\"message_stop\"}
             Message::user("Hello".to_string()),
         ];
         let filtered = filter_leading_assistant(&msgs);
-        assert_eq!(filtered.len(), 1, "both leading assistant messages must be removed");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "both leading assistant messages must be removed"
+        );
         assert_eq!(filtered[0].role, Role::User);
     }
 
@@ -1817,7 +1821,11 @@ data: {\"type\":\"message_stop\"}
             Message::assistant("Hi".to_string()),
         ];
         let filtered = filter_leading_assistant(&msgs);
-        assert_eq!(filtered.len(), 2, "must not remove messages when first is user");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "must not remove messages when first is user"
+        );
         assert_eq!(filtered[0].role, Role::User);
     }
 

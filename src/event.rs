@@ -570,7 +570,10 @@ mod tests {
             is_error: true,
         };
         let json = serde_json::to_string(&event).expect("serialize");
-        assert!(json.contains("\"is_error\":true"), "is_error=true must be in JSON; got: {json}");
+        assert!(
+            json.contains("\"is_error\":true"),
+            "is_error=true must be in JSON; got: {json}"
+        );
         let restored: AgentEvent = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(restored, event);
     }
@@ -648,6 +651,53 @@ mod tests {
                 .unwrap_or_else(|e| panic!("deserialization failed for {json}: {e}"));
             assert_eq!(*event, back, "round-trip failed for event type");
         }
+    }
+
+    #[test]
+    fn todo_updated_and_message_appended_with_audit_round_trip() {
+        // kills removal mutations for TodoUpdated and MessageAppendedWithAudit variants
+        use crate::tools::todo::{TodoItem, TodoStatus};
+
+        let todos = vec![TodoItem {
+            content: "do something".into(),
+            status: TodoStatus::InProgress,
+            active_form: Some("doing something".into()),
+        }];
+        let event = AgentEvent::TodoUpdated { todos };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back, "TodoUpdated must round-trip");
+
+        // MessageAppendedWithAudit
+        let msg = crate::message::Message::user("hello");
+        let audit = crate::tools::AuditMeta::synthetic_unknown_tool("Read");
+        let event2 = AgentEvent::MessageAppendedWithAudit {
+            message: msg,
+            audit,
+        };
+        let json2 = serde_json::to_string(&event2).unwrap();
+        let back2: AgentEvent = serde_json::from_str(&json2).unwrap();
+        assert_eq!(event2, back2, "MessageAppendedWithAudit must round-trip");
+    }
+
+    #[tokio::test]
+    async fn broadcast_sink_no_subscriber_does_not_panic() {
+        // kills `let _ = self.sender.send(event)` → unconditional panic mutation
+        // When the receiver is dropped, BroadcastSink::emit must silently succeed.
+        let (sink, rx) = BroadcastSink::new(16);
+        drop(rx); // nobody is listening
+                  // Must not panic
+        sink.emit(AgentEvent::PlanConfirmed).await;
+    }
+
+    #[tokio::test]
+    async fn channel_sink_delivers_in_order() {
+        // kills any reordering mutation in ChannelSink::emit
+        let (sink, mut rx) = ChannelSink::new();
+        sink.emit(AgentEvent::PlanConfirmed).await;
+        sink.emit(AgentEvent::PlanModeApproved).await;
+        assert_eq!(rx.recv().await.unwrap(), AgentEvent::PlanConfirmed);
+        assert_eq!(rx.recv().await.unwrap(), AgentEvent::PlanModeApproved);
     }
 
     #[test]

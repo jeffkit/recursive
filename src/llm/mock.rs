@@ -248,16 +248,18 @@ mod tracing_tests {
         // kills `queue.remove(0)` → `Ok(Default::default())` and empty-queue mutations
         use crate::llm::StructuredRequest;
         use crate::message::Message;
-        let provider = MockProvider::new(vec![]).with_structured_responses(vec![
-            Ok(serde_json::json!({"key": "val"})),
-        ]);
+        let provider = MockProvider::new(vec![])
+            .with_structured_responses(vec![Ok(serde_json::json!({"key": "val"}))]);
         let req = StructuredRequest {
             messages: vec![Message::user("q")],
             schema: serde_json::json!({}),
             schema_name: "test".into(),
         };
         let result = provider.complete_structured(req).await.unwrap();
-        assert_eq!(result["key"], "val", "must return the scripted structured value");
+        assert_eq!(
+            result["key"], "val",
+            "must return the scripted structured value"
+        );
     }
 
     #[tokio::test]
@@ -326,8 +328,20 @@ mod tracing_tests {
     async fn calls_records_all_messages() {
         // kills `self.calls.lock().unwrap().push(messages.to_vec())` removal mutation
         let provider = MockProvider::new(vec![
-            Completion { content: "a".into(), tool_calls: vec![], finish_reason: None, usage: None, reasoning_content: None },
-            Completion { content: "b".into(), tool_calls: vec![], finish_reason: None, usage: None, reasoning_content: None },
+            Completion {
+                content: "a".into(),
+                tool_calls: vec![],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "b".into(),
+                tool_calls: vec![],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
         ]);
         let msgs1 = vec![Message::user("first call")];
         let msgs2 = vec![Message::user("second call")];

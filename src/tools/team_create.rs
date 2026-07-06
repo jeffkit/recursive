@@ -267,7 +267,10 @@ mod tests {
         .unwrap();
         let team = reg.get("gamma").await.unwrap();
         let member = team.get_member("x").unwrap();
-        assert_eq!(member.agent_type, "general", "missing agent_type must default to 'general'");
+        assert_eq!(
+            member.agent_type, "general",
+            "missing agent_type must default to 'general'"
+        );
     }
 
     #[tokio::test]

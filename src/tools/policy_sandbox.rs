@@ -246,7 +246,9 @@ mod tests {
         };
         // path starts with allowed prefix but also starts with deny prefix → denied
         assert!(
-            policy.check_fs_path("/allowed/secret/file.txt", false).is_err(),
+            policy
+                .check_fs_path("/allowed/secret/file.txt", false)
+                .is_err(),
             "deny list must override allow list"
         );
     }
@@ -276,9 +278,21 @@ mod tests {
     fn default_restrictive_blocks_dangerous_patterns() {
         // kills mutations that remove specific deny patterns from the default list
         let policy = PolicyConfig::default_restrictive();
-        assert!(policy.check_shell("mkfs.ext4 /dev/sda").is_err(), "mkfs must be blocked");
-        assert!(policy.check_shell("dd if=/dev/zero of=/dev/sda").is_err(), "dd if= must be blocked");
-        assert!(policy.check_shell("chmod 777 /etc").is_err(), "chmod 777 / must be blocked");
-        assert!(policy.check_shell("ls /home").is_ok(), "safe command must be allowed");
+        assert!(
+            policy.check_shell("mkfs.ext4 /dev/sda").is_err(),
+            "mkfs must be blocked"
+        );
+        assert!(
+            policy.check_shell("dd if=/dev/zero of=/dev/sda").is_err(),
+            "dd if= must be blocked"
+        );
+        assert!(
+            policy.check_shell("chmod 777 /etc").is_err(),
+            "chmod 777 / must be blocked"
+        );
+        assert!(
+            policy.check_shell("ls /home").is_ok(),
+            "safe command must be allowed"
+        );
     }
 }

@@ -982,7 +982,10 @@ mod tests {
     #[tokio::test]
     async fn shared_memory_all_empty_returns_empty_vec() {
         let mem = SharedMemory::new();
-        assert!(mem.all().await.is_empty(), "all() on empty store must return empty vec");
+        assert!(
+            mem.all().await.is_empty(),
+            "all() on empty store must return empty vec"
+        );
     }
 
     // --- AgentMode::parse ---
@@ -1020,7 +1023,10 @@ mod tests {
             max_steps: 1,
             allowed_tools: vec![],
         });
-        assert!(pool.remove_role("tmp"), "remove existing role must return true");
+        assert!(
+            pool.remove_role("tmp"),
+            "remove existing role must return true"
+        );
         assert_eq!(pool.role_count(), 0);
     }
 
@@ -1028,7 +1034,10 @@ mod tests {
     fn agent_pool_remove_role_returns_false_when_absent() {
         let provider = Arc::new(MockProvider::new(vec![]));
         let mut pool = AgentPool::new(provider, test_config());
-        assert!(!pool.remove_role("nonexistent"), "remove absent role must return false");
+        assert!(
+            !pool.remove_role("nonexistent"),
+            "remove absent role must return false"
+        );
     }
 
     // --- coordinator_system_prompt ---
@@ -1037,7 +1046,10 @@ mod tests {
     fn coordinator_system_prompt_is_nonempty_and_not_placeholder() {
         let prompt = coordinator_system_prompt();
         assert!(!prompt.is_empty(), "coordinator prompt must not be empty");
-        assert_ne!(prompt, "xyzzy", "coordinator prompt must not be xyzzy placeholder");
+        assert_ne!(
+            prompt, "xyzzy",
+            "coordinator prompt must not be xyzzy placeholder"
+        );
         assert!(
             prompt.contains("coordinator"),
             "coordinator prompt must mention 'coordinator'"
@@ -1051,9 +1063,18 @@ mod tests {
         let roles = default_roles();
         assert!(!roles.is_empty(), "default_roles must return non-empty vec");
 
-        let planner = roles.iter().find(|r| r.name == "planner").expect("planner role");
-        let coder = roles.iter().find(|r| r.name == "coder").expect("coder role");
-        let reviewer = roles.iter().find(|r| r.name == "reviewer").expect("reviewer role");
+        let planner = roles
+            .iter()
+            .find(|r| r.name == "planner")
+            .expect("planner role");
+        let coder = roles
+            .iter()
+            .find(|r| r.name == "coder")
+            .expect("coder role");
+        let reviewer = roles
+            .iter()
+            .find(|r| r.name == "reviewer")
+            .expect("reviewer role");
 
         // Each role must have a positive step limit.
         assert!(planner.max_steps > 0);
@@ -1061,7 +1082,10 @@ mod tests {
         assert!(reviewer.max_steps > 0);
 
         // Reviewer is read-only so it must declare some allowed tools.
-        assert!(!reviewer.allowed_tools.is_empty(), "reviewer must have allowed_tools");
+        assert!(
+            !reviewer.allowed_tools.is_empty(),
+            "reviewer must have allowed_tools"
+        );
 
         // Prompts must be non-empty.
         assert!(!planner.system_prompt.is_empty());

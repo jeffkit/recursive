@@ -288,8 +288,14 @@ mod tests {
             .unwrap();
         assert!(verdict.achieved, "single-line YES must be achieved=true");
         // reason must not be empty — it falls back to the full "YES" text
-        assert!(!verdict.reason.is_empty(), "reason must fall back to the full response");
-        assert_eq!(verdict.reason, "YES", "reason should equal the full response when there is no second line");
+        assert!(
+            !verdict.reason.is_empty(),
+            "reason must fall back to the full response"
+        );
+        assert_eq!(
+            verdict.reason, "YES",
+            "reason should equal the full response when there is no second line"
+        );
     }
 
     /// Goal-301: a transcript with 25 messages must NOT be further

@@ -132,7 +132,11 @@ mod tests {
     fn truncate_at_exact_boundary_is_not_truncated() {
         // kills `replace <= with <` in `if s.len() <= max`
         let s = "abc";
-        assert_eq!(truncate(s, 3), "abc", "string at exact max must not be truncated");
+        assert_eq!(
+            truncate(s, 3),
+            "abc",
+            "string at exact max must not be truncated"
+        );
     }
 
     #[test]
@@ -140,8 +144,14 @@ mod tests {
         // kills function-level replacement or `else` branch mutations
         let s = "Hello World";
         let out = truncate(s, 5);
-        assert!(out.ends_with('…'), "truncated string must end with ellipsis; got: {out}");
-        assert!(out.len() < s.len(), "truncated string must be shorter than original");
+        assert!(
+            out.ends_with('…'),
+            "truncated string must end with ellipsis; got: {out}"
+        );
+        assert!(
+            out.len() < s.len(),
+            "truncated string must be shorter than original"
+        );
     }
 
     #[tokio::test]
@@ -157,7 +167,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert!(result.contains("output_lines: 2"), "must show output line count; got: {result}");
+        assert!(
+            result.contains("output_lines: 2"),
+            "must show output line count; got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -172,7 +185,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert!(result.contains("result: job done"), "completed task must show result; got: {result}");
+        assert!(
+            result.contains("result: job done"),
+            "completed task must show result; got: {result}"
+        );
         assert!(result.contains("completed"), "status must be 'completed'");
     }
 
@@ -188,7 +204,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert!(result.contains("error: something broke"), "failed task must show error; got: {result}");
+        assert!(
+            result.contains("error: something broke"),
+            "failed task must show error; got: {result}"
+        );
         assert!(result.contains("failed"), "status must be 'failed'");
     }
 
@@ -203,7 +222,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert!(result.contains("team: (none)"), "empty team must show (none); got: {result}");
+        assert!(
+            result.contains("team: (none)"),
+            "empty team must show (none); got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -217,7 +239,10 @@ mod tests {
             .execute(json!({ "task_id": id.to_string() }))
             .await
             .unwrap();
-        assert!(result.contains("name: (none)"), "empty name must show (none); got: {result}");
+        assert!(
+            result.contains("name: (none)"),
+            "empty name must show (none); got: {result}"
+        );
     }
 
     #[test]
@@ -225,12 +250,15 @@ mod tests {
         // kills the `while end > 0 && !s.is_char_boundary(end)` loop removal mutation:
         // truncating mid-multibyte character must back up to a valid boundary.
         let s = "aβcd"; // 'β' = 2 bytes; total len = 5 bytes (1 + 2 + 1 + 1)
-        // max=2 splits in the middle of 'β' (offset 1 is not a char boundary → backs up to 1)
+                        // max=2 splits in the middle of 'β' (offset 1 is not a char boundary → backs up to 1)
         let out = truncate(s, 2);
         assert!(out.ends_with('…'), "must end with ellipsis; got: {out}");
         // The output before '…' must be a valid UTF-8 prefix of s.
         let prefix = &out[..out.len() - '…'.len_utf8()];
-        assert!(s.starts_with(prefix), "truncated prefix must be valid; got prefix={prefix:?}");
+        assert!(
+            s.starts_with(prefix),
+            "truncated prefix must be valid; got prefix={prefix:?}"
+        );
     }
 
     #[tokio::test]

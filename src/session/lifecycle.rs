@@ -604,9 +604,12 @@ mod tests {
         // kills `if user_seen >= cutoff_turn` guard mutation (>= → >) or removal
         let dir = crate::test_util::IsolatedWorkspace::new();
         let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
-        w.append(&Message::system("sys".to_string()), None, None).unwrap();
-        w.append(&Message::user("u0".to_string()), None, None).unwrap();
-        w.append(&Message::assistant("a0".to_string()), None, None).unwrap();
+        w.append(&Message::system("sys".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("u0".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None)
+            .unwrap();
         w.finish(SessionStatus::Completed).unwrap();
         let session_dir = w.session_dir().to_path_buf();
 
@@ -622,10 +625,14 @@ mod tests {
         let dir = crate::test_util::IsolatedWorkspace::new();
         let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
         // 2 user turns: turn 0 (u0+a0), turn 1 (u1+a1)
-        w.append(&Message::user("u0".to_string()), None, None).unwrap();
-        w.append(&Message::assistant("a0".to_string()), None, None).unwrap();
-        w.append(&Message::user("u1".to_string()), None, None).unwrap();
-        w.append(&Message::assistant("a1".to_string()), None, None).unwrap();
+        w.append(&Message::user("u0".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("u1".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("a1".to_string()), None, None)
+            .unwrap();
         w.finish(SessionStatus::Completed).unwrap();
         let session_dir = w.session_dir().to_path_buf();
 

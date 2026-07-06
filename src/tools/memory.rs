@@ -928,7 +928,8 @@ mod tests {
     #[test]
     fn load_parses_existing_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let json = r#"{"notes":[{"id":"N1","tags":["rust"],"text":"hello","ts":"2026-01-01T00:00:00Z"}]}"#;
+        let json =
+            r#"{"notes":[{"id":"N1","tags":["rust"],"text":"hello","ts":"2026-01-01T00:00:00Z"}]}"#;
         std::fs::write(tmp.path(), json).unwrap();
         let store = MemoryStore::load(tmp.path()).expect("valid file must load");
         assert_eq!(store.notes.len(), 1);
@@ -1030,7 +1031,11 @@ mod tests {
         store.add("general note".into(), vec!["special-tag".into()]);
         // Search by query that matches the tag string
         let results = store.search(Some("special-tag"), None, 10);
-        assert_eq!(results.len(), 1, "search must find query match in tags via || branch");
+        assert_eq!(
+            results.len(),
+            1,
+            "search must find query match in tags via || branch"
+        );
     }
 
     #[test]
@@ -1073,7 +1078,10 @@ mod tests {
             ts.len() >= 20 && ts.ends_with('Z'),
             "timestamp must end with Z; got: {ts}"
         );
-        assert!(ts.contains('T'), "timestamp must contain T separator; got: {ts}");
+        assert!(
+            ts.contains('T'),
+            "timestamp must contain T separator; got: {ts}"
+        );
     }
 
     #[test]
@@ -1173,8 +1181,16 @@ mod tests {
         let mut pad = fresh_scratchpad();
         pad.set("key".into(), "first".into());
         pad.set("key".into(), "second".into());
-        assert_eq!(pad.get("key"), Some("second"), "set must update existing key");
-        assert_eq!(pad.entries.len(), 1, "update must not add a duplicate entry");
+        assert_eq!(
+            pad.get("key"),
+            Some("second"),
+            "set must update existing key"
+        );
+        assert_eq!(
+            pad.entries.len(),
+            1,
+            "update must not add a duplicate entry"
+        );
     }
 
     #[test]
@@ -1197,7 +1213,10 @@ mod tests {
     fn scratchpad_delete_returns_false_for_missing_key() {
         // kills `!= k` → `== k` retain mutation
         let mut pad = fresh_scratchpad();
-        assert!(!pad.delete("ghost"), "delete must return false for absent key");
+        assert!(
+            !pad.delete("ghost"),
+            "delete must return false for absent key"
+        );
     }
 
     #[test]

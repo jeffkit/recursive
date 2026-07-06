@@ -1362,6 +1362,48 @@ mod tests {
     }
 
     #[test]
+    fn enforce_transcript_budget_returns_none_when_under_limit() {
+        // kills `replace < with == in enforce_transcript_budget` mutation.
+        // If changed to `==`, a core with chars clearly under the limit would
+        // return Some (falsely claiming budget exceeded) instead of None.
+        use crate::llm::TokenUsage;
+        let hooks = crate::hooks::HookRegistry::new();
+        // One short message: "hi" = 2 chars
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        // Set limit to 1000 — far above 2 chars
+        core.max_transcript_chars = Some(1000);
+        let usage = TokenUsage::default();
+        let result = core.enforce_transcript_budget(0, &usage);
+        assert!(
+            result.is_none(),
+            "chars (2) < limit (1000) must return None; got Some(_)"
+        );
+    }
+
+    #[test]
+    fn enforce_transcript_budget_returns_finish_reason_when_over_limit() {
+        // Validates the >-limit path: when chars >= limit, must return Some with TranscriptLimit.
+        use crate::agent::FinishReason;
+        use crate::llm::TokenUsage;
+        let hooks = crate::hooks::HookRegistry::new();
+        // Message with 100 'x' chars — well above a limit of 10
+        let msg = Message::user("x".repeat(100));
+        let mut core = make_test_core(vec![msg], &hooks);
+        core.max_transcript_chars = Some(10);
+        let usage = TokenUsage::default();
+        let result = core.enforce_transcript_budget(0, &usage);
+        assert!(
+            result.is_some(),
+            "chars (100) >= limit (10) must return Some finish reason"
+        );
+        let (finish, _step) = result.unwrap();
+        assert!(
+            matches!(finish, FinishReason::TranscriptLimit { .. }),
+            "finish reason must be TranscriptLimit; got {finish:?}"
+        );
+    }
+
+    #[test]
     fn maybe_trim_replaces_large_tool_result_when_over_limit() {
         let hooks = crate::hooks::HookRegistry::new();
         // A tool result with content > MIN_TRIM_LENGTH (200) bytes
@@ -2062,8 +2104,8 @@ mod tests {
     #[tokio::test]
     async fn run_inner_stuck_rate_uses_division_not_multiplication() {
         use crate::agent::FinishReason;
-        use crate::llm::{Completion, ToolCall};
         use crate::llm::ToolSpec;
+        use crate::llm::{Completion, ToolCall};
         use crate::tools::{Tool, ToolRegistry};
         use async_trait::async_trait;
 

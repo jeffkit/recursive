@@ -237,9 +237,15 @@ mod tests {
     #[test]
     fn unix_millis_is_positive() {
         let ms = unix_millis();
-        assert!(ms > 0, "unix_millis must return a positive timestamp; got {ms}");
+        assert!(
+            ms > 0,
+            "unix_millis must return a positive timestamp; got {ms}"
+        );
         // Sanity: must be after 2024-01-01 (1704067200000 ms)
-        assert!(ms > 1_704_067_200_000, "unix_millis must be after 2024-01-01");
+        assert!(
+            ms > 1_704_067_200_000,
+            "unix_millis must be after 2024-01-01"
+        );
     }
 
     // --- truncate_for_audit ---

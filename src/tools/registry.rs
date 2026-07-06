@@ -790,14 +790,23 @@ mod tests {
     #[test]
     fn is_readonly_true_for_readonly_tool() {
         let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "RO" }));
-        assert!(reg.is_readonly("RO"), "ReadOnly tool must be is_readonly=true");
-        assert!(!reg.is_readonly("Missing"), "unknown tool must be is_readonly=false");
+        assert!(
+            reg.is_readonly("RO"),
+            "ReadOnly tool must be is_readonly=true"
+        );
+        assert!(
+            !reg.is_readonly("Missing"),
+            "unknown tool must be is_readonly=false"
+        );
     }
 
     #[test]
     fn is_readonly_false_for_mutating_tool() {
         let reg = make_registry().register(Arc::new(MutatingTool { name: "Mut" }));
-        assert!(!reg.is_readonly("Mut"), "External tool must be is_readonly=false");
+        assert!(
+            !reg.is_readonly("Mut"),
+            "External tool must be is_readonly=false"
+        );
     }
 
     #[test]
@@ -826,7 +835,10 @@ mod tests {
     fn with_same_transport_returns_empty_registry() {
         let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "Src" }));
         let empty = reg.with_same_transport();
-        assert!(empty.names().is_empty(), "with_same_transport must return empty registry");
+        assert!(
+            empty.names().is_empty(),
+            "with_same_transport must return empty registry"
+        );
     }
 
     // --- fork ---
@@ -882,10 +894,16 @@ mod tests {
             Arc::new(ReadOnlyTool { name: "Primary" }),
             &["alias1", "alias2"],
         );
-        assert!(reg.find_by_name("Primary").is_some(), "primary name must work");
+        assert!(
+            reg.find_by_name("Primary").is_some(),
+            "primary name must work"
+        );
         assert!(reg.find_by_name("alias1").is_some(), "alias1 must resolve");
         assert!(reg.find_by_name("alias2").is_some(), "alias2 must resolve");
-        assert!(reg.find_by_name("unknown").is_none(), "unknown must return None");
+        assert!(
+            reg.find_by_name("unknown").is_none(),
+            "unknown must return None"
+        );
     }
 
     // ── register_mut_with_aliases ─────────────────────────────────────────────
@@ -893,12 +911,12 @@ mod tests {
     #[test]
     fn register_mut_with_aliases_adds_alias() {
         let mut reg = make_registry();
-        reg.register_mut_with_aliases(
-            Arc::new(ReadOnlyTool { name: "MutAliased" }),
-            &["malias"],
-        );
+        reg.register_mut_with_aliases(Arc::new(ReadOnlyTool { name: "MutAliased" }), &["malias"]);
         assert!(reg.find_by_name("MutAliased").is_some());
-        assert!(reg.find_by_name("malias").is_some(), "mutably-registered alias must resolve");
+        assert!(
+            reg.find_by_name("malias").is_some(),
+            "mutably-registered alias must resolve"
+        );
     }
 
     // ── specs_partitioned ─────────────────────────────────────────────────────
@@ -908,7 +926,10 @@ mod tests {
         let reg = make_registry()
             .register(Arc::new(ReadOnlyTool { name: "Eager1" }))
             .register(Arc::new(ReadOnlyTool { name: "Eager2" }))
-            .register(Arc::new(DeferredTool { name: "Defer1", description: "deferred." }));
+            .register(Arc::new(DeferredTool {
+                name: "Defer1",
+                description: "deferred.",
+            }));
         let (eager, deferred) = reg.specs_partitioned();
         assert_eq!(eager.len(), 2, "two eager tools expected");
         assert_eq!(deferred.len(), 1, "one deferred tool expected");
@@ -940,37 +961,53 @@ mod tests {
         assert_eq!(deferred.len(), 1);
         // hint should be first sentence only
         let (_spec, hint) = &deferred[0];
-        assert_eq!(hint.as_deref(), Some("First sentence"), "hint must be first sentence");
+        assert_eq!(
+            hint.as_deref(),
+            Some("First sentence"),
+            "hint must be first sentence"
+        );
     }
 
     #[test]
     fn split_eager_deferred_hint_is_none_for_empty_description() {
-        let reg = make_registry()
-            .register(Arc::new(DeferredTool { name: "NoDesc", description: "." }));
+        let reg = make_registry().register(Arc::new(DeferredTool {
+            name: "NoDesc",
+            description: ".",
+        }));
         let (_eager, deferred) = reg.split_eager_deferred();
         // "." splits to ["", ""], first is empty after trim → hint = None
         let (_spec, hint) = &deferred[0];
-        assert!(hint.is_none(), "empty sentence before '.' → hint must be None");
+        assert!(
+            hint.is_none(),
+            "empty sentence before '.' → hint must be None"
+        );
     }
 
     // ── is_deferred_spec ─────────────────────────────────────────────────────
 
     #[test]
     fn is_deferred_spec_true_for_deferred_tool() {
-        let reg = make_registry()
-            .register(Arc::new(DeferredTool { name: "DS", description: "d." }));
+        let reg = make_registry().register(Arc::new(DeferredTool {
+            name: "DS",
+            description: "d.",
+        }));
         let specs = reg.specs();
         let ds_spec = specs.iter().find(|s| s.name == "DS").unwrap();
-        assert!(reg.is_deferred_spec(ds_spec), "deferred tool spec must be deferred");
+        assert!(
+            reg.is_deferred_spec(ds_spec),
+            "deferred tool spec must be deferred"
+        );
     }
 
     #[test]
     fn is_deferred_spec_false_for_eager_tool() {
-        let reg = make_registry()
-            .register(Arc::new(ReadOnlyTool { name: "EagerSpec" }));
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "EagerSpec" }));
         let specs = reg.specs();
         let spec = &specs[0];
-        assert!(!reg.is_deferred_spec(spec), "eager tool must not be deferred");
+        assert!(
+            !reg.is_deferred_spec(spec),
+            "eager tool must not be deferred"
+        );
     }
 
     #[test]
@@ -981,7 +1018,10 @@ mod tests {
             description: "not registered".to_string(),
             parameters: serde_json::json!({}),
         };
-        assert!(!reg.is_deferred_spec(&fake_spec), "unknown spec must return false");
+        assert!(
+            !reg.is_deferred_spec(&fake_spec),
+            "unknown spec must return false"
+        );
     }
 
     // ── retain_tools – alias cleanup ─────────────────────────────────────────
@@ -993,9 +1033,15 @@ mod tests {
             .register_with_aliases(Arc::new(MutatingTool { name: "Drop2" }), &["d_alias"]);
         reg.retain_tools(&["Keep2".to_string()]);
         assert!(reg.find_by_name("Keep2").is_some());
-        assert!(reg.find_by_name("k_alias").is_some(), "kept tool's alias must survive");
+        assert!(
+            reg.find_by_name("k_alias").is_some(),
+            "kept tool's alias must survive"
+        );
         assert!(reg.find_by_name("Drop2").is_none());
-        assert!(reg.find_by_name("d_alias").is_none(), "dropped tool's alias must be removed");
+        assert!(
+            reg.find_by_name("d_alias").is_none(),
+            "dropped tool's alias must be removed"
+        );
     }
 
     // ── with_touched_files / touched_files / clear_touched_files ────────────
@@ -1005,9 +1051,15 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let slot: Arc<Mutex<TouchedFiles>> = Arc::new(Mutex::new(TouchedFiles::default()));
         let mut reg = make_registry().with_touched_files(slot);
-        assert!(reg.touched_files().is_some(), "slot must be present after with_touched_files");
+        assert!(
+            reg.touched_files().is_some(),
+            "slot must be present after with_touched_files"
+        );
         reg.clear_touched_files();
-        assert!(reg.touched_files().is_none(), "slot must be gone after clear_touched_files");
+        assert!(
+            reg.touched_files().is_none(),
+            "slot must be gone after clear_touched_files"
+        );
     }
 
     // ── with_read_file_state / read_file_state ───────────────────────────────
@@ -1016,9 +1068,15 @@ mod tests {
     fn with_read_file_state_roundtrip() {
         let slot: Arc<Mutex<ReadFileState>> = Arc::new(Mutex::new(ReadFileState::default()));
         let reg = make_registry().with_read_file_state(slot);
-        assert!(reg.read_file_state().is_some(), "read_file_state must be Some after setter");
+        assert!(
+            reg.read_file_state().is_some(),
+            "read_file_state must be Some after setter"
+        );
         let reg2 = make_registry();
-        assert!(reg2.read_file_state().is_none(), "fresh registry has no read_file_state");
+        assert!(
+            reg2.read_file_state().is_none(),
+            "fresh registry has no read_file_state"
+        );
     }
 
     // ── permission_mode ───────────────────────────────────────────────────────
@@ -1050,7 +1108,10 @@ mod tests {
     #[test]
     fn permissions_config_none_on_fresh_registry() {
         let reg = make_registry();
-        assert!(reg.permissions_config().is_none(), "fresh registry has no permissions_config");
+        assert!(
+            reg.permissions_config().is_none(),
+            "fresh registry has no permissions_config"
+        );
     }
 
     #[test]
@@ -1060,7 +1121,10 @@ mod tests {
             ..Default::default()
         };
         let reg = make_registry().with_permissions(config);
-        assert!(reg.permissions_config().is_some(), "permissions_config must be Some");
+        assert!(
+            reg.permissions_config().is_some(),
+            "permissions_config must be Some"
+        );
     }
 
     // ── is_plan_mode ──────────────────────────────────────────────────────────
@@ -1069,7 +1133,10 @@ mod tests {
     fn is_plan_mode_false_for_default_tool_and_no_config() {
         let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "PlanTool" }));
         // Without a plan-mode config, must return false
-        assert!(!reg.is_plan_mode("PlanTool"), "no plan-mode config → must be false");
+        assert!(
+            !reg.is_plan_mode("PlanTool"),
+            "no plan-mode config → must be false"
+        );
         assert!(!reg.is_plan_mode("Unknown"), "unknown tool → must be false");
     }
 
@@ -1105,7 +1172,10 @@ mod tests {
         assert!(reg.policy().is_none(), "fresh registry has no policy");
         let cfg = PolicyConfig::default();
         let reg2 = reg.with_policy(cfg);
-        assert!(reg2.policy().is_some(), "policy must be Some after with_policy");
+        assert!(
+            reg2.policy().is_some(),
+            "policy must be Some after with_policy"
+        );
     }
 
     // ── with_headless ─────────────────────────────────────────────────────────
@@ -1115,7 +1185,10 @@ mod tests {
         let reg = make_registry();
         assert!(!reg.headless, "fresh registry must not be headless");
         let reg2 = reg.with_headless(true);
-        assert!(reg2.headless, "headless must be true after with_headless(true)");
+        assert!(
+            reg2.headless,
+            "headless must be true after with_headless(true)"
+        );
     }
 
     // ── transport roundtrip ───────────────────────────────────────────────────
@@ -1135,22 +1208,32 @@ mod tests {
         let mut forked = reg.fork();
         // Adding to forked doesn't affect original
         forked.register_mut(Arc::new(MutatingTool { name: "ForkedOnly" }));
-        assert!(reg.find_by_name("ForkedOnly").is_none(), "forked-only tool must not appear in original");
+        assert!(
+            reg.find_by_name("ForkedOnly").is_none(),
+            "forked-only tool must not appear in original"
+        );
         // Removing from forked doesn't affect original
         reg.retain_tools(&["ForkOrig".to_string()]);
-        assert!(forked.find_by_name("ForkOrig").is_some(), "original retain must not affect fork");
+        assert!(
+            forked.find_by_name("ForkOrig").is_some(),
+            "original retain must not affect fork"
+        );
     }
 
     // ── names returns expected set ────────────────────────────────────────────
 
     #[test]
     fn names_does_not_include_aliases() {
-        let reg = make_registry().register_with_aliases(
-            Arc::new(ReadOnlyTool { name: "PrimeName" }),
-            &["anAlias"],
-        );
+        let reg = make_registry()
+            .register_with_aliases(Arc::new(ReadOnlyTool { name: "PrimeName" }), &["anAlias"]);
         let names = reg.names();
-        assert!(names.contains(&"PrimeName".to_string()), "primary name must be in names()");
-        assert!(!names.contains(&"anAlias".to_string()), "alias must NOT be in names()");
+        assert!(
+            names.contains(&"PrimeName".to_string()),
+            "primary name must be in names()"
+        );
+        assert!(
+            !names.contains(&"anAlias".to_string()),
+            "alias must NOT be in names()"
+        );
     }
 }

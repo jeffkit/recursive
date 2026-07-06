@@ -238,9 +238,7 @@ mod tests {
         let (state, id) = TaskState::new("t", "alpha", "r");
         reg.register(state).await;
         let tool = TaskUpdateTool::new(reg);
-        let res = tool
-            .execute(json!({ "task_id": id.to_string() }))
-            .await;
+        let res = tool.execute(json!({ "task_id": id.to_string() })).await;
         assert!(
             matches!(res, Err(crate::error::Error::BadToolArgs { .. })),
             "missing 'status' must return BadToolArgs"
@@ -252,7 +250,9 @@ mod tests {
         // kills `lookup_task_id(...)` guard removal mutation
         let reg = Arc::new(TaskRegistry::new());
         let tool = TaskUpdateTool::new(reg);
-        let res = tool.execute(json!({ "status": "completed", "result": "x" })).await;
+        let res = tool
+            .execute(json!({ "status": "completed", "result": "x" }))
+            .await;
         assert!(res.is_err(), "missing task_id must return an error");
     }
 

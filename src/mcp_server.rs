@@ -458,7 +458,10 @@ mod tests {
         // kills field swap mutations in JsonRpcResponse::error()
         let r = JsonRpcResponse::error(Value::from(1i64), -32600, "bad request".to_string());
         assert!(r.error.is_some(), "error response must have error field");
-        assert!(r.result.is_none(), "error response must not have result field");
+        assert!(
+            r.result.is_none(),
+            "error response must not have result field"
+        );
         let err = r.error.unwrap();
         assert_eq!(err.code, -32600);
         assert_eq!(err.message, "bad request");
@@ -476,7 +479,10 @@ mod tests {
             params: Value::Null,
         };
         let result = dispatch_request(&request, &specs, &reg).await;
-        assert!(result.is_none(), "notifications/initialized must return None (no response)");
+        assert!(
+            result.is_none(),
+            "notifications/initialized must return None (no response)"
+        );
     }
 
     #[tokio::test]
@@ -536,7 +542,9 @@ mod tests {
         assert!(result.is_some(), "tools/list must return Some response");
         let r = result.unwrap();
         let res = r.result.expect("tools/list must have result");
-        let tools = res["tools"].as_array().expect("result must have tools array");
+        let tools = res["tools"]
+            .as_array()
+            .expect("result must have tools array");
         assert!(
             !tools.is_empty(),
             "tools/list must return at least one tool"
@@ -560,5 +568,32 @@ mod tests {
         let r = result.expect("tools/call must return Some");
         let err = r.error.expect("missing tool name must return error");
         assert_eq!(err.code, -32602, "missing name must use -32602");
+    }
+
+    #[tokio::test]
+    async fn handle_tools_call_unknown_tool_uses_negative_error_code() {
+        // kills `delete - in handle_tools_call` mutation (changing -32602 → 32602)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reg = crate::tools::build_standard_tools(tmp.path(), &[], 30);
+        let specs = reg.specs();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(4i64)),
+            method: "tools/call".to_string(),
+            params: serde_json::json!({ "name": "no_such_tool_xyz", "arguments": {} }),
+        };
+        let result = dispatch_request(&request, &specs, &reg).await;
+        let r = result.expect("tools/call must return Some for unknown tool");
+        let err = r.error.expect("unknown tool must return an error response");
+        assert_eq!(
+            err.code, -32602,
+            "unknown tool error code must be -32602 (negative); got: {}",
+            err.code
+        );
+        assert!(
+            err.message.contains("no_such_tool_xyz"),
+            "error message must mention the tool name; got: {}",
+            err.message
+        );
     }
 }

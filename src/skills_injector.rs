@@ -210,7 +210,10 @@ mod tests {
         // kills `!token.starts_with("https://")` alone mutation (missing http://)
         let results = vec!["See http://example.com/docs for details.".to_string()];
         let paths = extract_paths(&results);
-        assert!(paths.is_empty(), "http:// URLs must be excluded; got {paths:?}");
+        assert!(
+            paths.is_empty(),
+            "http:// URLs must be excluded; got {paths:?}"
+        );
     }
 
     #[test]
@@ -243,7 +246,10 @@ mod tests {
     fn glob_lone_double_star_matches_everything() {
         // kills `if pat == "**" { return true }` removal mutation
         assert!(glob_matches("**", ""), "** must match empty string");
-        assert!(glob_matches("**", "any/path/at/all"), "** must match any path");
+        assert!(
+            glob_matches("**", "any/path/at/all"),
+            "** must match any path"
+        );
         assert!(glob_matches("**", "src/foo.rs"), "** must match files");
     }
 
@@ -251,7 +257,10 @@ mod tests {
     fn glob_empty_pattern_matches_empty_string_only() {
         // kills `if pat.is_empty() { return s.is_empty() }` guard removal
         assert!(glob_matches("", ""), "empty pattern matches empty string");
-        assert!(!glob_matches("", "non-empty"), "empty pattern must not match non-empty string");
+        assert!(
+            !glob_matches("", "non-empty"),
+            "empty pattern must not match non-empty string"
+        );
     }
 
     #[test]

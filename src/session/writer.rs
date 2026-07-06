@@ -888,8 +888,10 @@ mod tests {
         let tmp = crate::test_util::IsolatedWorkspace::new();
         let session_dir = {
             let mut w = SessionWriter::create(tmp.path(), "goal", "gpt-4o", "openai").unwrap();
-            w.append(&Message::user("first".to_string()), None, None).unwrap();
-            w.append(&Message::assistant("second".to_string()), None, None).unwrap();
+            w.append(&Message::user("first".to_string()), None, None)
+                .unwrap();
+            w.append(&Message::assistant("second".to_string()), None, None)
+                .unwrap();
             let d = w.session_dir().to_path_buf();
             w.finish(SessionStatus::Completed).unwrap();
             d
@@ -897,13 +899,25 @@ mod tests {
 
         // Re-open and check that message_count is recovered from meta
         let mut w2 = SessionWriter::open_existing(&session_dir).unwrap();
-        assert_eq!(w2.message_count(), 2, "open_existing must recover message_count from meta");
+        assert_eq!(
+            w2.message_count(),
+            2,
+            "open_existing must recover message_count from meta"
+        );
         // last_uuid must be non-None (chain continues)
-        assert!(w2.last_uuid().is_some(), "open_existing must recover last_uuid from transcript");
+        assert!(
+            w2.last_uuid().is_some(),
+            "open_existing must recover last_uuid from transcript"
+        );
 
         // Append another message and verify count advances
-        w2.append(&Message::user("third".to_string()), None, None).unwrap();
-        assert_eq!(w2.message_count(), 3, "appending after open_existing must increment count");
+        w2.append(&Message::user("third".to_string()), None, None)
+            .unwrap();
+        assert_eq!(
+            w2.message_count(),
+            3,
+            "appending after open_existing must increment count"
+        );
     }
 
     #[test]
@@ -918,7 +932,8 @@ mod tests {
         // constructing all fields manually.
         let audit = crate::tools::AuditMeta::synthetic_unknown_tool("Read");
         let tool_msg = Message::tool_result("tc-audit-1", "file contents");
-        w.append_with_audit(&tool_msg, Some(audit), None, None).unwrap();
+        w.append_with_audit(&tool_msg, Some(audit), None, None)
+            .unwrap();
         w.finish(SessionStatus::Completed).unwrap();
 
         // Verify the audit data was written to the JSONL

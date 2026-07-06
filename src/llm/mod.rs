@@ -526,11 +526,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChatProvider for MinimalProvider {
-        async fn complete(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolSpec],
-        ) -> Result<Completion> {
+        async fn complete(&self, _messages: &[Message], _tools: &[ToolSpec]) -> Result<Completion> {
             Ok(Completion {
                 content: self.response.clone(),
                 tool_calls: vec![],
@@ -544,7 +540,9 @@ mod tests {
     #[test]
     fn default_supports_deferred_tools_is_false() {
         // kills `replace ChatProvider::supports_deferred_tools -> bool with true`
-        let provider = MinimalProvider { response: "hi".into() };
+        let provider = MinimalProvider {
+            response: "hi".into(),
+        };
         assert!(
             !provider.supports_deferred_tools(),
             "default supports_deferred_tools must be false"
@@ -557,7 +555,9 @@ mod tests {
         // With the mutant, content is only sent when IS empty — so this test
         // would receive no chunk and the assertion would fail.
         use tokio::sync::mpsc;
-        let provider = MinimalProvider { response: "hello from stream".into() };
+        let provider = MinimalProvider {
+            response: "hello from stream".into(),
+        };
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
 
         let completion = provider.stream(&[], &[], Some(tx)).await.unwrap();
@@ -575,7 +575,9 @@ mod tests {
     async fn default_stream_does_not_send_chunk_for_empty_content() {
         // Verifies the positive case: empty content → no Text chunk sent
         use tokio::sync::mpsc;
-        let provider = MinimalProvider { response: String::new() };
+        let provider = MinimalProvider {
+            response: String::new(),
+        };
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
 
         let completion = provider.stream(&[], &[], Some(tx)).await.unwrap();

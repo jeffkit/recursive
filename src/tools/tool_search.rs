@@ -299,7 +299,11 @@ mod tests {
             make_spec("C", "tool C"),
         ];
         let result = resolve("select:A,B,C", &catalog, 2);
-        assert_eq!(result.len(), 2, "select: results must be truncated to max_results");
+        assert_eq!(
+            result.len(),
+            2,
+            "select: results must be truncated to max_results"
+        );
     }
 
     #[test]
@@ -336,7 +340,10 @@ mod tests {
         ];
         let result = resolve("something", &catalog, 10);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].name, "ATool", "equal-score tools must sort by name asc");
+        assert_eq!(
+            result[0].name, "ATool",
+            "equal-score tools must sort by name asc"
+        );
         assert_eq!(result[1].name, "ZTool");
     }
 

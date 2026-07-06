@@ -420,7 +420,10 @@ mod tests {
         // kills `map(|d| d.as_secs() as i64)` → `map(|_| 0)` or `unwrap_or(0)` mutations
         let ts = unix_now();
         // Unix epoch was in 1970; any value < 1_000_000_000 is clearly wrong
-        assert!(ts > 1_000_000_000, "unix_now() returned suspicious value: {ts}");
+        assert!(
+            ts > 1_000_000_000,
+            "unix_now() returned suspicious value: {ts}"
+        );
     }
 
     #[tokio::test]
@@ -431,7 +434,10 @@ mod tests {
         }
         let w = ws();
         let (list, _, _) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
-        assert!(list.is_deferred(), "checkpoint_list must be a deferred tool");
+        assert!(
+            list.is_deferred(),
+            "checkpoint_list must be a deferred tool"
+        );
     }
 
     #[tokio::test]
@@ -442,7 +448,10 @@ mod tests {
         }
         let w = ws();
         let (_, diff, _) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
-        assert!(diff.is_deferred(), "checkpoint_diff must be a deferred tool");
+        assert!(
+            diff.is_deferred(),
+            "checkpoint_diff must be a deferred tool"
+        );
     }
 
     #[tokio::test]
