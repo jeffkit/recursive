@@ -1861,4 +1861,139 @@ api_key = "sk-from-file"
             std::env::remove_var("RECURSIVE_API_KEY");
         }
     }
+
+    // ── require_api_key ───────────────────────────────────────────────────────
+
+    #[test]
+    fn require_api_key_returns_actual_key_value() {
+        // Kills: `replace require_api_key -> Result<&str> with Ok("")`
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "sk-test-key-12345");
+        let config = Config::from_env().unwrap();
+        let key = config.require_api_key().expect("key must be present");
+        assert_eq!(key, "sk-test-key-12345", "must return actual key, not empty string");
+        // Restore
+        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
+        else { std::env::remove_var("RECURSIVE_MODEL"); }
+        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
+        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+    }
+
+    #[test]
+    fn require_api_key_returns_err_when_absent() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        // No RECURSIVE_API_KEY or OPENAI_API_KEY set — expect error from require_api_key.
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        let orig_oai = std::env::var("OPENAI_API_KEY").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        std::env::remove_var("RECURSIVE_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        // Config::from_env() may succeed (api_key = None), but require_api_key() should err
+        if let Ok(config) = Config::from_env() {
+            assert!(config.require_api_key().is_err(), "None key must error");
+        }
+        // Restore
+        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
+        if let Some(v) = orig_oai { std::env::set_var("OPENAI_API_KEY", v); }
+        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
+        else { std::env::remove_var("RECURSIVE_MODEL"); }
+    }
+
+    // ── allow_bypass_permissions ──────────────────────────────────────────────
+
+    #[test]
+    fn allow_bypass_permissions_from_env_one() {
+        // Kills: `replace || with &&` at line 391
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let orig = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", "1");
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.allow_bypass_permissions,
+            "RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1 must enable bypass"
+        );
+        // Restore
+        if let Some(v) = orig { std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", v); }
+        else { std::env::remove_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS"); }
+        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
+        else { std::env::remove_var("RECURSIVE_MODEL"); }
+        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
+        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+    }
+
+    #[test]
+    fn allow_bypass_permissions_from_env_true() {
+        // Also kills: `replace || with &&` — "true" alone is not "1"
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let orig = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", "true");
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.allow_bypass_permissions,
+            "RECURSIVE_ALLOW_BYPASS_PERMISSIONS=true must enable bypass"
+        );
+        // Restore
+        if let Some(v) = orig { std::env::set_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS", v); }
+        else { std::env::remove_var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS"); }
+        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
+        else { std::env::remove_var("RECURSIVE_MODEL"); }
+        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_API_KEY", v); }
+        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+    }
+
+    // ── web_search_api_key and jina_key empty filtering ─────────────────────
+
+    #[test]
+    fn web_search_api_key_empty_string_becomes_none() {
+        // Kills: `delete !` at lines 450 (api_key) and 454 (jina_key)
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let orig_key = std::env::var("RECURSIVE_WEB_SEARCH_API_KEY").ok();
+        let orig_jina = std::env::var("RECURSIVE_WEB_SEARCH_JINA_KEY").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_api = std::env::var("RECURSIVE_API_KEY").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", "");
+        std::env::set_var("RECURSIVE_WEB_SEARCH_JINA_KEY", "");
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.web_search_api_key, None,
+            "empty RECURSIVE_WEB_SEARCH_API_KEY must become None"
+        );
+        assert_eq!(
+            config.web_search_jina_key, None,
+            "empty RECURSIVE_WEB_SEARCH_JINA_KEY must become None"
+        );
+        // Restore
+        if let Some(v) = orig_key { std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", v); }
+        else { std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY"); }
+        if let Some(v) = orig_jina { std::env::set_var("RECURSIVE_WEB_SEARCH_JINA_KEY", v); }
+        else { std::env::remove_var("RECURSIVE_WEB_SEARCH_JINA_KEY"); }
+        if let Some(v) = orig_model { std::env::set_var("RECURSIVE_MODEL", v); }
+        else { std::env::remove_var("RECURSIVE_MODEL"); }
+        if let Some(v) = orig_api { std::env::set_var("RECURSIVE_API_KEY", v); }
+        else { std::env::remove_var("RECURSIVE_API_KEY"); }
+    }
 }
