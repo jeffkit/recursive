@@ -687,6 +687,25 @@ mod tests {
         );
     }
 
+    // -- AgentKernelBuilder Debug fmt test ----------------------------------
+
+    #[test]
+    fn agent_kernel_builder_debug_contains_field_names() {
+        // kills `replace <impl std::fmt::Debug for AgentKernelBuilder>::fmt
+        //         -> std::fmt::Result with Ok(Default::default())`
+        // With the mutant the formatter produces no output; the assertion fails.
+        let builder = AgentKernel::builder().max_steps(42);
+        let dbg = format!("{:?}", builder);
+        assert!(
+            dbg.contains("AgentKernelBuilder"),
+            "Debug output must contain struct name; got: {dbg}"
+        );
+        assert!(
+            dbg.contains("max_steps"),
+            "Debug output must contain max_steps field; got: {dbg}"
+        );
+    }
+
     // -- TurnOutcome tests --------------------------------------------------
 
     #[test]
