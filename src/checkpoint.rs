@@ -1028,6 +1028,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_against_workspace_uses_write_workspace_tree() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        // Snapshot with initial content
+        fs::write(w.path().join("x.txt"), "v1").unwrap();
+        let c1 = r.snapshot_for_session("s", "v1").unwrap();
+
+        // Modify workspace without creating a new snapshot
+        fs::write(w.path().join("x.txt"), "v2-workspace").unwrap();
+
+        // diff(c1, None, &[]) compares c1 against current workspace
+        // (exercises write_workspace_tree → kills Ok(String::new()) mutation)
+        let diff = r.diff(&c1, None, &[]).expect("diff vs workspace must succeed");
+        assert!(!diff.is_empty(), "diff vs modified workspace must be non-empty");
+    }
+
+    #[test]
     fn list_for_session_returns_empty_before_any_snapshot() {
         if !has_git() {
             return;
