@@ -507,6 +507,32 @@ mod tests {
         assert!(preview.contains("just a string"), "non-object preview must contain the value");
     }
 
+    // ── normalise targeted tests ──────────────────────────────────────────────
+
+    #[test]
+    fn normalise_resolves_double_dot() {
+        // kills `out.pop()` → noop mutations in normalise
+        let path = std::path::Path::new("/a/b/../c");
+        let got = normalise(path);
+        assert_eq!(got, std::path::PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn normalise_ignores_single_dot() {
+        // kills `CurDir => {}` → `out.push(".")` mutations
+        let path = std::path::Path::new("/a/./b");
+        let got = normalise(path);
+        assert_eq!(got, std::path::PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn normalise_preserves_absolute_path() {
+        // kills function-level replacement of normalise
+        let path = std::path::Path::new("/usr/local/bin");
+        let got = normalise(path);
+        assert_eq!(got, std::path::PathBuf::from("/usr/local/bin"));
+    }
+
     // ── write tier gate: && vs || and delete ! ────────────────────────────────
 
     #[test]

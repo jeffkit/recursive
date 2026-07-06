@@ -149,4 +149,53 @@ mod tests {
         let res = tool.execute(json!({})).await;
         assert!(matches!(res, Err(Error::BadToolArgs { .. })));
     }
+
+    #[tokio::test]
+    async fn lookup_task_id_missing_argument_errors() {
+        // kills `ok_or_else(|| Error::BadToolArgs {...})` removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let res = lookup_task_id(&reg, &json!({}), "mytool").await;
+        assert!(
+            matches!(res, Err(Error::BadToolArgs { .. })),
+            "missing task_id must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_task_id_not_found_errors() {
+        // kills `if registry.get(&id).await.is_none() { return Err(Error::NotFound) }` removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let res = lookup_task_id(&reg, &json!({"task_id": "task-nonexistent"}), "mytool").await;
+        assert!(
+            matches!(res, Err(Error::NotFound(_))),
+            "nonexistent task_id must return NotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_task_id_succeeds_for_existing_task() {
+        // kills function-level replacement of lookup_task_id
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("some task", "", "");
+        reg.register(state).await;
+        let result = lookup_task_id(&reg, &json!({"task_id": id.to_string()}), "mytool").await;
+        assert!(result.is_ok(), "existing task must return Ok");
+        assert_eq!(result.unwrap(), id, "returned id must match registered id");
+    }
+
+    #[tokio::test]
+    async fn team_and_name_default_to_empty() {
+        // kills `unwrap_or("")` removal mutations for `team` and `name`
+        let reg = Arc::new(TaskRegistry::new());
+        let tool = TaskCreateTool::new(reg.clone());
+        let result = tool
+            .execute(json!({ "description": "no team or name" }))
+            .await
+            .unwrap();
+        let id_str = result.trim_start_matches("Task created: ");
+        let id = TaskId(id_str.to_string());
+        let task = reg.get(&id).await.unwrap();
+        assert_eq!(task.team, "", "team must default to empty string");
+        assert_eq!(task.name, "", "name must default to empty string");
+    }
 }

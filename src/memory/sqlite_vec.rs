@@ -348,6 +348,34 @@ mod tests {
         assert!((cosine_similarity(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-5);
     }
 
+    #[test]
+    fn row_to_entry_with_malformed_tags_json_defaults_to_empty() {
+        // kills `unwrap_or_default()` on serde_json::from_str replacement mutation
+        let entry = SqliteVecStore::row_to_entry(
+            "id1".into(),
+            "text".into(),
+            "not valid json ][".into(), // malformed tags JSON
+            "2026-01-01T00:00:00Z".into(),
+        );
+        assert!(
+            entry.tags.is_empty(),
+            "malformed tags JSON must default to empty vec; got: {:?}",
+            entry.tags
+        );
+    }
+
+    #[test]
+    fn row_to_entry_parses_valid_tags_json() {
+        // kills `serde_json::from_str(&tags_json)` → replacement mutation
+        let entry = SqliteVecStore::row_to_entry(
+            "id1".into(),
+            "text".into(),
+            r#"["alpha","beta"]"#.into(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        assert_eq!(entry.tags, vec!["alpha", "beta"]);
+    }
+
     /// Entries stored with a different embedding dimension than the query vector
     /// must be silently skipped (not ranked as score=0), so the result set only
     /// contains dimension-compatible entries.

@@ -411,6 +411,50 @@ key_url = "https://x"
     }
 
     #[test]
+    fn bundled_presets_is_same_as_all_presets() {
+        // kills `bundled_presets -> []` function-level replacement mutations
+        let bundled = bundled_presets();
+        let all = all_presets();
+        assert_eq!(bundled.len(), all.len());
+    }
+
+    #[test]
+    fn all_presets_dynamic_includes_bundled() {
+        // kills mutations that strip the bundled presets from the combined list
+        let dynamic = all_presets_dynamic();
+        assert!(
+            dynamic.iter().any(|p| p.id == "anthropic"),
+            "anthropic must be in dynamic list, got: {:?}",
+            dynamic.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn find_preset_effective_finds_bundled_anthropic() {
+        // kills `find_preset_effective` → always-None function replacement
+        let p = find_preset_effective("anthropic").expect("anthropic must be found");
+        assert_eq!(p.id, "anthropic");
+    }
+
+    #[test]
+    fn find_preset_effective_returns_none_for_unknown() {
+        // kills mutations that make it always return Some(...)
+        assert!(find_preset_effective("completely-unknown-preset-xyz").is_none());
+    }
+
+    #[test]
+    fn find_model_pricing_returns_none_for_unknown_model() {
+        // kills `find_model_pricing` → always-Some replacement
+        assert!(find_model_pricing("no-such-model-xyz-999").is_none());
+    }
+
+    #[test]
+    fn find_model_pricing_effective_returns_none_for_unknown_model() {
+        // kills `find_model_pricing_effective` → always-Some replacement
+        assert!(find_model_pricing_effective("no-such-model-xyz-999").is_none());
+    }
+
+    #[test]
     fn find_preset_extended_finds_user_override() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
         // PinnedRecursiveHome, not PinnedHome — see the first test in this

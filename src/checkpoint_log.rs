@@ -260,4 +260,52 @@ mod tests {
         assert!(!json.contains("finished_at"), "zero finished_at should be skipped");
         assert!(!json.contains("saved_at"), "zero saved_at should be skipped");
     }
+
+    #[test]
+    fn read_log_skips_blank_lines() {
+        // kills the `if line.trim().is_empty() { continue }` guard removal mutation
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ck.jsonl");
+        let writer = CheckpointLogWriter::open(&path).unwrap();
+        writer.append(&rec(1, "a")).unwrap();
+
+        // Manually insert a blank line between records
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f).unwrap(); // blank line
+        drop(f);
+
+        writer.append(&rec(2, "b")).unwrap();
+
+        let recs = read_log(&path).unwrap();
+        assert_eq!(recs.len(), 2, "blank line must be silently skipped");
+        assert_eq!(recs[0].turn, 1);
+        assert_eq!(recs[1].turn, 2);
+    }
+
+    #[test]
+    fn read_log_returns_error_for_malformed_json() {
+        // kills function-level replacement of the parse error path
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.jsonl");
+        std::fs::write(&path, "not-valid-json\n").unwrap();
+        let result = read_log(&path);
+        assert!(result.is_err(), "malformed JSON must return an Err");
+    }
+
+    #[test]
+    fn truncate_keeps_records_below_cutoff_exactly() {
+        // kills off-by-one mutations in `r.turn < cutoff`
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ck.jsonl");
+        let writer = CheckpointLogWriter::open(&path).unwrap();
+        for turn in 0..5 {
+            writer.append(&rec(turn, "x")).unwrap();
+        }
+        // cutoff=3 => keep turns 0,1,2; drop turns 3,4
+        truncate_to_turn(&path, 3).unwrap();
+        let recs = read_log(&path).unwrap();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[2].turn, 2, "turn 2 must be kept (< 3)");
+    }
 }

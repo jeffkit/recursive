@@ -528,4 +528,63 @@ mod tests {
             "sibling session's file must not be touched"
         );
     }
+
+    #[test]
+    fn plan_rewind_no_prev_and_target_has_no_pre_returns_error() {
+        // kills `ok_or_else(|| "turn {to_turn} has no pre-snapshot recorded")` guard removal
+        // Scenario: only turn=3 exists (no prev with turn < 3), and turn=3 has no `pre` field.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("ck.jsonl");
+        // Only turn 3 exists with no pre field.
+        write_log(&log_path, &[rec(3, None, "snap-3-id", &["x.txt"])]);
+        let err = plan_rewind(&log_path, 3);
+        assert!(err.is_err(), "turn with no pre-snapshot must return an error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("no pre-snapshot") || msg.contains("pre"),
+            "error must mention missing pre-snapshot; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_rewind_returns_error_for_empty_log() {
+        // kills `if recs.is_empty() { return Err(...) }` guard-removal mutation
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("empty.jsonl");
+        // Write an empty file (no records).
+        std::fs::write(&log_path, "").unwrap();
+        let err = plan_rewind(&log_path, 1);
+        assert!(err.is_err(), "empty log must return an error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("no checkpoints"), "error must mention 'no checkpoints', got: {msg}");
+    }
+
+    #[test]
+    fn plan_rewind_returns_error_when_turn_not_in_log_and_no_prev() {
+        // kills the `ok_or_else(|| Error::Tool { "turn {to_turn} is not in this session" })` path.
+        // We need to_turn=3 where all existing records have turn >= 3, so `prev` (turn < 3) is None,
+        // and to_turn=3 itself does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("ck.jsonl");
+        // Only turn 5 exists. to_turn=3: no record has turn < 3, and turn 3 is not in the log.
+        write_log(&log_path, &[rec(5, Some("snap-pre"), "snap-post", &["a.txt"])]);
+        let err = plan_rewind(&log_path, 3);
+        assert!(err.is_err(), "non-existent turn must return an error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("3"), "error must mention the missing turn number, got: {msg}");
+    }
+
+    #[test]
+    fn checkpoint_log_path_omits_workspace_slug_duplication() {
+        // kills literal mutations in the path segments
+        let ws = std::path::Path::new("/home/user/myproject");
+        let path = checkpoint_log_path(ws, "myproject", "sess-abc");
+        let expected = ws
+            .join(".recursive")
+            .join("sessions")
+            .join("myproject")
+            .join("sess-abc")
+            .join("checkpoints.jsonl");
+        assert_eq!(path, expected);
+    }
 }

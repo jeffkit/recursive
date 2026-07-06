@@ -182,4 +182,45 @@ mod tests {
         let out = truncate("Hello World", 5);
         assert!(out.ends_with('…'), "must end with ellipsis; got: {out}");
     }
+
+    #[tokio::test]
+    async fn status_filter_returns_only_matching_status() {
+        // kills `if s != sf { continue }` guard-flip mutation (status filter)
+        let reg = Arc::new(TaskRegistry::new());
+        let (s1, _) = TaskState::new("running task", "", "");
+        let (s2, id2) = TaskState::new("completed task", "", "");
+        reg.register(s1).await;
+        let arc2 = reg.register(s2).await;
+        arc2.mark_completed("done".into()).await;
+
+        let tool = TaskListTool::new(reg);
+        let out = tool
+            .execute(json!({ "status": "running" }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("1 task(s)"),
+            "status=running must only return running tasks; got: {out}"
+        );
+        assert!(
+            !out.contains(id2.to_string().as_str()),
+            "completed task must not appear in running filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_team_and_name_shown_as_dash() {
+        // kills `if team.is_empty() { "-" } else { &team }` guard-flip mutations
+        let reg = Arc::new(TaskRegistry::new());
+        let (s, _) = TaskState::new("task with no team or name", "", "");
+        reg.register(s).await;
+        let tool = TaskListTool::new(reg);
+        let out = tool.execute(json!({})).await.unwrap();
+        // Both team and name are empty → both should appear as "-" in the output
+        let dash_count = out.matches("team=- name=-").count();
+        assert_eq!(
+            dash_count, 1,
+            "empty team and name must display as '-'; got: {out}"
+        );
+    }
 }

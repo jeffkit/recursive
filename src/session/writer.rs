@@ -881,4 +881,51 @@ mod tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].content, "after poison");
     }
+
+    #[test]
+    fn open_existing_resumes_message_count_and_uuid_chain() {
+        // kills `message_count: meta.message_count` and `last_uuid` field removal mutations
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let session_dir = {
+            let mut w = SessionWriter::create(tmp.path(), "goal", "gpt-4o", "openai").unwrap();
+            w.append(&Message::user("first".to_string()), None, None).unwrap();
+            w.append(&Message::assistant("second".to_string()), None, None).unwrap();
+            let d = w.session_dir().to_path_buf();
+            w.finish(SessionStatus::Completed).unwrap();
+            d
+        };
+
+        // Re-open and check that message_count is recovered from meta
+        let mut w2 = SessionWriter::open_existing(&session_dir).unwrap();
+        assert_eq!(w2.message_count(), 2, "open_existing must recover message_count from meta");
+        // last_uuid must be non-None (chain continues)
+        assert!(w2.last_uuid().is_some(), "open_existing must recover last_uuid from transcript");
+
+        // Append another message and verify count advances
+        w2.append(&Message::user("third".to_string()), None, None).unwrap();
+        assert_eq!(w2.message_count(), 3, "appending after open_existing must increment count");
+    }
+
+    #[test]
+    fn append_with_audit_includes_audit_fields_in_jsonl() {
+        // kills `audit: None` → `audit: Some(...)` field mutation in append_with_audit;
+        // specifically tests that the audit field is serialized when provided.
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "goal", "gpt-4o", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        // Use the synthetic factory to build a valid AuditMeta without
+        // constructing all fields manually.
+        let audit = crate::tools::AuditMeta::synthetic_unknown_tool("Read");
+        let tool_msg = Message::tool_result("tc-audit-1", "file contents");
+        w.append_with_audit(&tool_msg, Some(audit), None, None).unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        // Verify the audit data was written to the JSONL
+        let raw = std::fs::read_to_string(session_dir.join("transcript.jsonl")).unwrap();
+        assert!(
+            raw.contains("\"audit\""),
+            "audit field must appear in transcript when provided; raw={raw}"
+        );
+    }
 }

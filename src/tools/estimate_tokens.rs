@@ -268,4 +268,42 @@ mod tests {
         assert_eq!(chars, 5);
         assert_eq!(tokens, 2, "5 chars must round up to 2 tokens (ceil), not 1 (floor)");
     }
+
+    #[tokio::test]
+    async fn non_string_text_arg_errors() {
+        // kills `text_val.as_str().ok_or_else(...)` guard removal mutation
+        let tool = EstimateTokens::new("/tmp");
+        let res = tool.execute(json!({ "text": 42 })).await;
+        assert!(
+            matches!(res, Err(crate::error::Error::BadToolArgs { .. })),
+            "non-string 'text' must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_string_path_arg_errors() {
+        // kills `path_val.as_str().ok_or_else(...)` guard removal mutation
+        let (tmp, ws) = tmp_workspace();
+        let tool = EstimateTokens::new(ws);
+        let res = tool.execute(json!({ "path": 99 })).await;
+        assert!(
+            matches!(res, Err(crate::error::Error::BadToolArgs { .. })),
+            "non-string 'path' must return BadToolArgs"
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn output_includes_method_field() {
+        // kills `method` field removal mutation in the format string
+        let tool = EstimateTokens::new("/tmp");
+        let result = tool
+            .execute(json!({ "text": "test" }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("method="),
+            "output must include method field; got: {result}"
+        );
+    }
 }

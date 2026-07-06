@@ -316,4 +316,48 @@ mod tests {
             "remaining must count only pending+in_progress (not completed/cancelled)"
         );
     }
+
+    #[tokio::test]
+    async fn missing_todos_field_returns_error() {
+        // kills `missing required field 'todos'` guard removal mutation
+        let (tool, _) = make_tool();
+        let res = tool.execute(json!({})).await;
+        assert!(res.is_err(), "missing 'todos' field must return error");
+    }
+
+    #[tokio::test]
+    async fn in_progress_label_uses_active_form_when_present() {
+        // kills `active_form.clone().unwrap_or_else(|| t.content.clone())` removal mutations
+        let (tool, _) = make_tool();
+        let args = json!({
+            "todos": [
+                {"content": "Write tests", "active_form": "Writing tests...", "status": "in_progress"},
+            ]
+        });
+        let result = tool.execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["in_progress"], "Writing tests...",
+            "in_progress label must use active_form when set; got: {}",
+            parsed["in_progress"]
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_label_falls_back_to_content() {
+        // kills `unwrap_or_else(|| t.content.clone())` fallback removal mutation
+        let (tool, _) = make_tool();
+        let args = json!({
+            "todos": [
+                {"content": "Run tests", "status": "in_progress"},
+                // no active_form → must fall back to content
+            ]
+        });
+        let result = tool.execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["in_progress"], "Run tests",
+            "in_progress must fall back to content when active_form absent"
+        );
+    }
 }

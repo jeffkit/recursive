@@ -174,4 +174,55 @@ mod tests {
         store.remove("N1").await.unwrap();
         assert!(store.list_all().await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn noop_store_search_matches_by_tag() {
+        // kills `|| e.tags.iter().any(...)` removal mutation
+        let store = NoopVectorStore::new();
+        let e = MemoryEntry {
+            id: "T1".into(),
+            text: "irrelevant text".into(),
+            tags: vec!["RustLang".into()],
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        store.upsert(&e, vec![]).await.unwrap();
+        // Search by tag substring (case-insensitive)
+        let results = store.search(vec![], "rustlang", 5).await.unwrap();
+        assert_eq!(results.len(), 1, "tag match must be returned");
+        assert_eq!(results[0].id, "T1");
+    }
+
+    #[tokio::test]
+    async fn noop_store_search_respects_limit() {
+        // kills `.take(limit)` removal or `limit + 1` mutation
+        let store = NoopVectorStore::new();
+        for i in 0..5 {
+            let e = MemoryEntry {
+                id: format!("E{i}"),
+                text: "common keyword".into(),
+                tags: vec![],
+                ts: "2026-01-01T00:00:00Z".into(),
+            };
+            store.upsert(&e, vec![]).await.unwrap();
+        }
+        let results = store.search(vec![], "common", 3).await.unwrap();
+        assert_eq!(results.len(), 3, "search must be capped at the limit");
+    }
+
+    #[tokio::test]
+    async fn noop_store_list_all_returns_all_entries() {
+        // kills mutations that drop entries from list_all
+        let store = NoopVectorStore::new();
+        for i in 0..3 {
+            let e = MemoryEntry {
+                id: format!("L{i}"),
+                text: format!("entry {i}"),
+                tags: vec![],
+                ts: "2026-01-01T00:00:00Z".into(),
+            };
+            store.upsert(&e, vec![]).await.unwrap();
+        }
+        let all = store.list_all().await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
 }

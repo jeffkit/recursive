@@ -136,4 +136,32 @@ mod tests {
             "expected 'no live handle' message, got: {result}"
         );
     }
+
+    #[tokio::test]
+    async fn missing_task_id_returns_error() {
+        // kills `lookup_task_id(...)` guard removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let tool = TaskStopTool::new(reg);
+        let res = tool.execute(json!({})).await;
+        assert!(res.is_err(), "missing task_id must return error");
+    }
+
+    #[tokio::test]
+    async fn stop_completed_task_includes_status_in_message() {
+        // kills `s.as_str()` → "" or constant replacement mutation in
+        // `format!("Task {id} is already {}.", s.as_str())`
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        let arc = reg.register(state).await;
+        arc.mark_completed("done".into()).await;
+        let tool = TaskStopTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("completed"),
+            "terminal status string must appear in idempotent-stop message; got: {result}"
+        );
+    }
 }

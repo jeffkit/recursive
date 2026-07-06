@@ -230,4 +230,50 @@ mod tests {
             .await;
         assert!(matches!(res, Err(Error::BadToolArgs { .. })));
     }
+
+    #[tokio::test]
+    async fn missing_status_field_errors() {
+        // kills `ok_or_else(|| Error::BadToolArgs { "missing required parameter: status" })` removal
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await;
+        let tool = TaskUpdateTool::new(reg);
+        let res = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await;
+        assert!(
+            matches!(res, Err(crate::error::Error::BadToolArgs { .. })),
+            "missing 'status' must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_task_id_errors() {
+        // kills `lookup_task_id(...)` guard removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let tool = TaskUpdateTool::new(reg);
+        let res = tool.execute(json!({ "status": "completed", "result": "x" })).await;
+        assert!(res.is_err(), "missing task_id must return an error");
+    }
+
+    #[tokio::test]
+    async fn completed_message_contains_task_id() {
+        // kills `format!("Task {id} marked completed.")` → constant mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await;
+        let tool = TaskUpdateTool::new(reg);
+        let out = tool
+            .execute(json!({
+                "task_id": id.to_string(),
+                "status": "completed",
+                "result": "done"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(&id.to_string()),
+            "completion message must include the task ID; got: {out}"
+        );
+    }
 }

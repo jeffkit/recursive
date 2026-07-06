@@ -162,4 +162,33 @@ mod tests {
         assert!(result.contains("poll data"), "message must include reason");
         assert!(result.contains("42s"), "message must include delay in seconds");
     }
+
+    #[tokio::test]
+    async fn defaults_when_args_missing() {
+        // kills `unwrap_or(60)` and `unwrap_or("continue")` removal mutations
+        let slot: WakeupSlot = Arc::new(Mutex::new(None));
+        let tool = ScheduleWakeup::new(slot.clone());
+        let result = tool.execute(json!({})).await.unwrap();
+        // default delay is 60s
+        assert!(result.contains("60s"), "default delay must be 60s; got: {result}");
+        // default reason is "continue"
+        assert!(result.contains("continue"), "default reason must be 'continue'; got: {result}");
+        // Verify the stored request has the default values
+        let req = slot.lock().unwrap().clone().unwrap();
+        assert_eq!(req.delay, std::time::Duration::from_secs(60));
+        assert_eq!(req.reason, "continue");
+        assert_eq!(req.prompt, "", "default prompt must be empty");
+    }
+
+    #[tokio::test]
+    async fn stores_prompt_correctly() {
+        // kills mutation that drops the `prompt` field
+        let slot: WakeupSlot = Arc::new(Mutex::new(None));
+        let tool = ScheduleWakeup::new(slot.clone());
+        tool.execute(json!({"delay_secs": 10, "reason": "r", "prompt": "my prompt"}))
+            .await
+            .unwrap();
+        let req = slot.lock().unwrap().clone().unwrap();
+        assert_eq!(req.prompt, "my prompt", "prompt must be stored in WakeupRequest");
+    }
 }

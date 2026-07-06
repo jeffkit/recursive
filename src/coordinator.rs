@@ -219,6 +219,39 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_tool_set_is_non_empty() {
+        // kills function-level replacement of coordinator_tool_set with &[]
+        assert!(
+            !coordinator_tool_set().is_empty(),
+            "coordinator tool set must not be empty"
+        );
+    }
+
+    #[test]
+    fn is_coordinator_tool_true_for_agent_tool() {
+        // kills `coordinator_tool_set().contains(&tool_name)` → always-false mutation
+        assert!(is_coordinator_tool("agent"), "'agent' must be in coordinator tool set");
+    }
+
+    #[test]
+    fn is_coordinator_mode_false_without_env_var() {
+        // kills `is_coordinator_mode` → always-true mutation
+        let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
+        std::env::remove_var("RECURSIVE_COORDINATOR_MODE");
+        // Without the env var, coordinator mode must be off (regardless of feature flag)
+        let mode = is_coordinator_mode();
+        if let Some(v) = prev {
+            std::env::set_var("RECURSIVE_COORDINATOR_MODE", v);
+        }
+        // With no feature flag, must always be false; with feature flag but no env var also false
+        if !cfg!(feature = "coordinator-mode") {
+            assert!(!mode, "coordinator mode must be false without feature");
+        } else {
+            assert!(!mode, "coordinator mode must be false without the env var even with feature");
+        }
+    }
+
+    #[test]
     fn cargo_feature_gate_respected() {
         // We can't flip cargo features at test time, but we can verify
         // that the env-var side of the gate works deterministically.

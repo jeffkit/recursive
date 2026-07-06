@@ -293,6 +293,30 @@ mod tests {
     }
 
     #[test]
+    fn split_think_tags_returns_none_when_no_tag() {
+        // kills `content.find(OPEN)?` → always-Some mutations
+        let result = split_think_tags("no think tag here");
+        assert!(result.is_none(), "must return None when no <think> tag present");
+    }
+
+    #[test]
+    fn split_think_tags_preserves_content_before_tag() {
+        // kills mutations to the `content[..open_idx]` slice in split_think_tags
+        let result = split_think_tags("prefix <think>reason</think>suffix");
+        assert!(result.is_some());
+        let (reasoning, cleaned) = result.unwrap();
+        assert_eq!(reasoning, "reason");
+        assert!(
+            cleaned.contains("prefix"),
+            "content before <think> must be preserved in cleaned: {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("suffix"),
+            "content after </think> must be preserved in cleaned: {cleaned:?}"
+        );
+    }
+
+    #[test]
     fn extract_inline_reasoning_preserves_existing_reasoning_field() {
         // True reasoner model: reasoning_content already populated via the
         // dedicated SSE field. Leave content untouched even if it happens

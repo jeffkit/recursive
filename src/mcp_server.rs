@@ -452,4 +452,113 @@ mod tests {
         assert!(!server.command.is_empty());
         assert!(server.url.is_none());
     }
+
+    #[test]
+    fn error_response_has_error_and_no_result() {
+        // kills field swap mutations in JsonRpcResponse::error()
+        let r = JsonRpcResponse::error(Value::from(1i64), -32600, "bad request".to_string());
+        assert!(r.error.is_some(), "error response must have error field");
+        assert!(r.result.is_none(), "error response must not have result field");
+        let err = r.error.unwrap();
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.message, "bad request");
+    }
+
+    #[tokio::test]
+    async fn dispatch_notifications_returns_none() {
+        // kills `=> None` → `=> Some(...)` mutation for notifications/initialized
+        let reg = ToolRegistry::local();
+        let specs = reg.specs();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: "notifications/initialized".to_string(),
+            params: Value::Null,
+        };
+        let result = dispatch_request(&request, &specs, &reg).await;
+        assert!(result.is_none(), "notifications/initialized must return None (no response)");
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_method_returns_method_not_found() {
+        // kills `_ => Some(JsonRpcResponse::method_not_found(...))` mutation
+        let reg = ToolRegistry::local();
+        let specs = reg.specs();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(99i64)),
+            method: "totally/unknown".to_string(),
+            params: Value::Null,
+        };
+        let result = dispatch_request(&request, &specs, &reg).await;
+        assert!(result.is_some(), "unknown method must return Some");
+        let r = result.unwrap();
+        let err = r.error.expect("unknown method must return error");
+        assert_eq!(err.code, -32601, "must use -32601 for method not found");
+    }
+
+    #[tokio::test]
+    async fn dispatch_initialize_returns_protocol_version() {
+        // kills `"initialize" => Some(handle_initialize(...))` removal mutation
+        let reg = ToolRegistry::local();
+        let specs = reg.specs();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(1i64)),
+            method: "initialize".to_string(),
+            params: Value::Null,
+        };
+        let result = dispatch_request(&request, &specs, &reg).await;
+        assert!(result.is_some(), "initialize must return Some response");
+        let r = result.unwrap();
+        assert!(r.error.is_none(), "initialize must not return error");
+        let res = r.result.expect("initialize must have result");
+        assert_eq!(
+            res["protocolVersion"], "2024-11-05",
+            "initialize result must contain protocolVersion"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_list_returns_tool_names() {
+        // kills `"tools/list" => Some(handle_tools_list(...))` removal mutation
+        // ToolRegistry::local() is empty; build a real registry via the standard builder.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reg = crate::tools::build_standard_tools(tmp.path(), &[], 30);
+        let specs = reg.specs();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(2i64)),
+            method: "tools/list".to_string(),
+            params: Value::Null,
+        };
+        let result = dispatch_request(&request, &specs, &reg).await;
+        assert!(result.is_some(), "tools/list must return Some response");
+        let r = result.unwrap();
+        let res = r.result.expect("tools/list must have result");
+        let tools = res["tools"].as_array().expect("result must have tools array");
+        assert!(
+            !tools.is_empty(),
+            "tools/list must return at least one tool"
+        );
+        let has_read = tools.iter().any(|t| t["name"].as_str() == Some("Read"));
+        assert!(has_read, "tools/list must include 'Read' tool");
+    }
+
+    #[tokio::test]
+    async fn handle_tools_call_missing_name_returns_error() {
+        // kills `if tool_name.is_empty()` guard removal mutation
+        let reg = ToolRegistry::local();
+        let specs = reg.specs();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(3i64)),
+            method: "tools/call".to_string(),
+            params: serde_json::json!({ "arguments": {} }), // no "name" field
+        };
+        let result = dispatch_request(&request, &specs, &reg).await;
+        let r = result.expect("tools/call must return Some");
+        let err = r.error.expect("missing tool name must return error");
+        assert_eq!(err.code, -32602, "missing name must use -32602");
+    }
 }

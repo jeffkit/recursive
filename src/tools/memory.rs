@@ -1152,4 +1152,92 @@ mod tests {
         assert!(mm < 60, "minutes out of range: {mm}");
         assert!(ss < 60, "seconds out of range: {ss}");
     }
+
+    // ── Scratchpad unit tests ────────────────────────────────────────────────
+
+    fn fresh_scratchpad() -> Scratchpad {
+        Scratchpad::default()
+    }
+
+    #[test]
+    fn scratchpad_set_inserts_new_entry() {
+        // kills function-level replacement of Scratchpad::set
+        let mut pad = fresh_scratchpad();
+        pad.set("k1".into(), "v1".into());
+        assert_eq!(pad.get("k1"), Some("v1"));
+    }
+
+    #[test]
+    fn scratchpad_set_updates_existing_entry() {
+        // kills the `if let Some(existing)` branch: without update, old value persists
+        let mut pad = fresh_scratchpad();
+        pad.set("key".into(), "first".into());
+        pad.set("key".into(), "second".into());
+        assert_eq!(pad.get("key"), Some("second"), "set must update existing key");
+        assert_eq!(pad.entries.len(), 1, "update must not add a duplicate entry");
+    }
+
+    #[test]
+    fn scratchpad_get_returns_none_for_missing_key() {
+        // kills `_ => Some(...)` mutations in get
+        let pad = fresh_scratchpad();
+        assert!(pad.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn scratchpad_delete_returns_true_for_existing_key() {
+        // kills `entries.len() < before` mutations and function-level replacement
+        let mut pad = fresh_scratchpad();
+        pad.set("k".into(), "v".into());
+        assert!(pad.delete("k"), "delete must return true when key existed");
+        assert!(pad.get("k").is_none(), "key must be gone after delete");
+    }
+
+    #[test]
+    fn scratchpad_delete_returns_false_for_missing_key() {
+        // kills `!= k` → `== k` retain mutation
+        let mut pad = fresh_scratchpad();
+        assert!(!pad.delete("ghost"), "delete must return false for absent key");
+    }
+
+    #[test]
+    fn scratchpad_keys_returns_all_keys_in_order() {
+        // kills function-level replacement of Scratchpad::keys
+        let mut pad = fresh_scratchpad();
+        pad.set("alpha".into(), "1".into());
+        pad.set("beta".into(), "2".into());
+        let keys = pad.keys();
+        assert_eq!(keys, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn scratchpad_summary_returns_empty_for_no_entries() {
+        // kills `if pad.entries.is_empty()` guard removal
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let summary = scratchpad_summary(tmp.path());
+        assert!(
+            summary.is_empty(),
+            "empty scratchpad must produce empty summary, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_summary_truncates_long_values() {
+        // kills `if entry.value.len() > 200` guard removal / off-by-one mutations
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = scratchpad_path(tmp.path());
+        let mut pad = Scratchpad::default();
+        pad.set("long_key".into(), "X".repeat(300));
+        pad.save(&path).unwrap();
+
+        let summary = scratchpad_summary(tmp.path());
+        assert!(
+            !summary.contains(&"X".repeat(300)),
+            "value > 200 chars must be truncated in summary"
+        );
+        assert!(
+            summary.contains("..."),
+            "truncated value must end with '...': {summary}"
+        );
+    }
 }

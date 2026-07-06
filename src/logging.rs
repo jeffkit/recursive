@@ -164,4 +164,41 @@ mod tests {
             "inner guard's drop already cleared the flag (documented)"
         );
     }
+
+    #[test]
+    fn stderr_or_null_write_not_quiet_returns_byte_count() {
+        // kills branch mutation: write path when TUI_QUIET is false must call
+        // the real stderr, not the short-circuit return.
+        set_tui_quiet(false);
+        let mut w = StderrOrNull;
+        // Write empty slice to avoid polluting test output; byte count must still match.
+        let n = w.write(b"").unwrap();
+        assert_eq!(n, 0, "writing 0 bytes while not quiet must return 0");
+    }
+
+    #[test]
+    fn stderr_or_null_flush_not_quiet_succeeds() {
+        // kills `if TUI_QUIET.load(...)` guard removal mutation in flush():
+        // when not quiet, flush must succeed (delegates to real stderr).
+        set_tui_quiet(false);
+        let mut w = StderrOrNull;
+        assert!(w.flush().is_ok(), "flush() when not quiet must succeed");
+    }
+
+    #[test]
+    fn suppress_tracing_sets_quiet_immediately() {
+        // kills `set_tui_quiet(true)` → `set_tui_quiet(false)` mutation
+        // in suppress_tracing_for_tui before the guard is dropped.
+        set_tui_quiet(false);
+        let _g = suppress_tracing_for_tui();
+        assert!(
+            is_tui_quiet(),
+            "suppress_tracing_for_tui must set quiet=true before returning"
+        );
+        drop(_g);
+        assert!(
+            !is_tui_quiet(),
+            "dropping the guard must restore quiet=false"
+        );
+    }
 }

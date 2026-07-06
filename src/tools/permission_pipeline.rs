@@ -654,6 +654,67 @@ mod tests {
             .await;
         assert!(outcome.is_deny());
     }
+
+    // ── safety_content_for_tool targeted tests ────────────────────────────────
+
+    #[test]
+    fn safety_content_read_extracts_path_field() {
+        // kills mutations that swap "path" with "file_path" for Read/Write
+        let args = serde_json::json!({"path": "/tmp/file.txt"});
+        let result = safety_content_for_tool("Read", &args);
+        assert_eq!(result.as_deref(), Some("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn safety_content_write_extracts_path_field() {
+        // kills removal of "Write" from the match arm
+        let args = serde_json::json!({"path": "/tmp/out.txt"});
+        let result = safety_content_for_tool("Write", &args);
+        assert_eq!(result.as_deref(), Some("/tmp/out.txt"));
+    }
+
+    #[test]
+    fn safety_content_edit_extracts_file_path_field() {
+        // kills mutations swapping "file_path" with "path" in the Edit arm
+        let args = serde_json::json!({"file_path": "/src/main.rs"});
+        let result = safety_content_for_tool("Edit", &args);
+        assert_eq!(result.as_deref(), Some("/src/main.rs"));
+    }
+
+    #[test]
+    fn safety_content_other_tool_returns_none() {
+        // kills `_ => Some(...)` mutations and function-level replacements
+        let args = serde_json::json!({"path": "/tmp/x", "command": "ls"});
+        let result = safety_content_for_tool("Bash", &args);
+        assert!(
+            result.is_none(),
+            "non-file tools must return None from safety_content_for_tool"
+        );
+    }
+
+    #[test]
+    fn recheck_policy_treats_str_replace_as_write() {
+        // kills removal of "StrReplace" from the is_write matches! arm.
+        // write_allow=["/allowed/"] means only /allowed/ prefix is allowed for
+        // writes. A non-allowed path must be denied when is_write=true.
+        // If is_write were false, write_allow wouldn't apply and it would pass.
+        let policy = PolicyConfig {
+            shell: ShellPolicy::default(),
+            fs: FsPolicy {
+                write_allow: vec!["/allowed/".into()],
+                ..Default::default()
+            },
+        };
+        let registry = ToolRegistry::local().with_policy(policy);
+        let pipeline = PermissionPipeline::new(&registry);
+        let args = serde_json::json!({"path": "/other/data.json"});
+        // StrReplace must be treated as is_write=true → denied (not in write_allow)
+        let result = pipeline.recheck_policy("StrReplace", &args);
+        assert!(
+            result.is_err(),
+            "StrReplace to a path outside write_allow must be denied"
+        );
+    }
 }
 
 // =====================================================================
@@ -741,4 +802,5 @@ mod goal_h2_perm_pipeline {
             "Deny outcome must return true from is_deny()"
         );
     }
+
 }

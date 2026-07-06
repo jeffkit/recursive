@@ -924,4 +924,26 @@ mod tests {
         assert!(out.contains("truncated"));
         assert!(out.len() < 5000);
     }
+
+    #[test]
+    fn format_results_empty_returns_no_results_sentinel() {
+        // kills `if results.is_empty()` guard removal mutation
+        let out = WebSearch::format_results(&[]);
+        assert_eq!(out, "No results found.", "empty results must return the sentinel string");
+    }
+
+    #[test]
+    fn format_results_includes_numbered_index() {
+        // kills `i + 1` → `i` or `i + 2` mutations
+        let results = vec![SearchResult {
+            title: "Rust".to_string(),
+            url: "https://www.rust-lang.org".to_string(),
+            snippet: "A systems programming language.".to_string(),
+        }];
+        let out = WebSearch::format_results(&results);
+        assert!(out.starts_with("1."), "first result must start with '1.'; got: {out:?}");
+        assert!(out.contains("Title: Rust"), "result must include the title");
+        assert!(out.contains("URL: https://www.rust-lang.org"), "result must include the URL");
+        assert!(out.contains("Summary: A systems programming language."), "result must include the snippet");
+    }
 }

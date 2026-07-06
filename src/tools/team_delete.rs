@@ -155,4 +155,25 @@ mod tests {
             assert!(res.is_err(), "name '{bad}' should be rejected");
         }
     }
+
+    #[tokio::test]
+    async fn delete_missing_name_field_errors() {
+        // kills `ok_or_else(|| Error::BadToolArgs {...})` removal mutation
+        let _g = with_temp_teams_dir();
+        let tool = TeamDeleteTool::new();
+        let res = tool.execute(json!({})).await;
+        assert!(
+            matches!(res, Err(Error::BadToolArgs { .. })),
+            "missing 'name' field must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_backslash_name() {
+        // kills `name.contains('\\')` removal mutation
+        let _g = with_temp_teams_dir();
+        let tool = TeamDeleteTool::new();
+        let res = tool.execute(json!({ "name": "a\\b" })).await;
+        assert!(res.is_err(), "backslash in name must be rejected");
+    }
 }

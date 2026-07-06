@@ -216,6 +216,130 @@ mod tracing_tests {
     use crate::llm::TokenUsage;
     use tracing_test::traced_test;
 
+    #[tokio::test]
+    async fn errors_are_injected_before_scripted_completions() {
+        // kills `if !errors.is_empty()` guard removal mutation
+        use crate::error::Error;
+        let provider = MockProvider::new(vec![Completion {
+            content: "fallback".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }])
+        .with_errors(vec![Error::Llm {
+            provider: "mock".into(),
+            message: "injected error".into(),
+        }]);
+
+        // First call should return the injected error.
+        let r1 = provider.complete(&[], &[]).await;
+        assert!(r1.is_err(), "first call must return injected error");
+        assert!(r1.unwrap_err().to_string().contains("injected error"));
+
+        // Second call should return the scripted completion.
+        let r2 = provider.complete(&[], &[]).await;
+        assert!(r2.is_ok(), "second call must return scripted completion");
+        assert_eq!(r2.unwrap().content, "fallback");
+    }
+
+    #[tokio::test]
+    async fn complete_structured_returns_scripted_value() {
+        // kills `queue.remove(0)` → `Ok(Default::default())` and empty-queue mutations
+        use crate::llm::StructuredRequest;
+        use crate::message::Message;
+        let provider = MockProvider::new(vec![]).with_structured_responses(vec![
+            Ok(serde_json::json!({"key": "val"})),
+        ]);
+        let req = StructuredRequest {
+            messages: vec![Message::user("q")],
+            schema: serde_json::json!({}),
+            schema_name: "test".into(),
+        };
+        let result = provider.complete_structured(req).await.unwrap();
+        assert_eq!(result["key"], "val", "must return the scripted structured value");
+    }
+
+    #[tokio::test]
+    async fn complete_structured_empty_queue_returns_error() {
+        // kills `if queue.is_empty() { return Err(...) }` removal mutation
+        use crate::llm::StructuredRequest;
+        use crate::message::Message;
+        let provider = MockProvider::new(vec![]);
+        // No structured responses configured — must error.
+        let req = StructuredRequest {
+            messages: vec![Message::user("q")],
+            schema: serde_json::json!({}),
+            schema_name: "test".into(),
+        };
+        let result = provider.complete_structured(req).await;
+        assert!(result.is_err(), "empty structured queue must return error");
+    }
+
+    #[tokio::test]
+    async fn stream_sends_content_to_channel() {
+        // kills `if !completion.content.is_empty()` guard removal mutation
+        use crate::llm::StreamChunk;
+        let provider = MockProvider::new(vec![Completion {
+            content: "streamed text".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        provider.stream(&[], &[], Some(tx)).await.unwrap();
+        let chunk = rx.try_recv().expect("must receive a chunk");
+        assert!(
+            matches!(chunk, StreamChunk::Text(t) if t == "streamed text"),
+            "must receive Text chunk with completion content"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_sends_reasoning_before_text() {
+        // kills `if !reasoning.is_empty()` guard removal mutation
+        use crate::llm::StreamChunk;
+        let provider = MockProvider::new(vec![Completion {
+            content: "answer".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: Some("thinking step".into()),
+        }]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        provider.stream(&[], &[], Some(tx)).await.unwrap();
+
+        let first = rx.try_recv().expect("must have first chunk");
+        let second = rx.try_recv().expect("must have second chunk");
+        assert!(
+            matches!(first, StreamChunk::Reasoning(r) if r == "thinking step"),
+            "first chunk must be Reasoning"
+        );
+        assert!(
+            matches!(second, StreamChunk::Text(t) if t == "answer"),
+            "second chunk must be Text"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_records_all_messages() {
+        // kills `self.calls.lock().unwrap().push(messages.to_vec())` removal mutation
+        let provider = MockProvider::new(vec![
+            Completion { content: "a".into(), tool_calls: vec![], finish_reason: None, usage: None, reasoning_content: None },
+            Completion { content: "b".into(), tool_calls: vec![], finish_reason: None, usage: None, reasoning_content: None },
+        ]);
+        let msgs1 = vec![Message::user("first call")];
+        let msgs2 = vec![Message::user("second call")];
+        provider.complete(&msgs1, &[]).await.unwrap();
+        provider.complete(&msgs2, &[]).await.unwrap();
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "must record 2 calls");
+        assert_eq!(calls[0][0].content, "first call");
+        assert_eq!(calls[1][0].content, "second call");
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn llm_complete_records_token_fields() {

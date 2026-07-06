@@ -258,6 +258,40 @@ mod tests {
         );
     }
 
+    /// Provider returning a bare one-liner (no second line) so `reason` falls
+    /// back to the full response text.
+    struct OneLinerProvider;
+    #[async_trait]
+    impl ChatProvider for OneLinerProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> Result<Completion> {
+            Ok(Completion {
+                content: "YES".into(), // single line — no reason line
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_reason_falls_back_to_full_text_when_single_line() {
+        // kills the `if reason.is_empty() { text.clone() }` → `""` mutation
+        let evaluator = GoalEvaluator::new(Arc::new(OneLinerProvider));
+        let verdict = evaluator
+            .evaluate("cond", &[Message::user("ok")])
+            .await
+            .unwrap();
+        assert!(verdict.achieved, "single-line YES must be achieved=true");
+        // reason must not be empty — it falls back to the full "YES" text
+        assert!(!verdict.reason.is_empty(), "reason must fall back to the full response");
+        assert_eq!(verdict.reason, "YES", "reason should equal the full response when there is no second line");
+    }
+
     /// Goal-301: a transcript with 25 messages must NOT be further
     /// truncated inside `evaluate()`.  All 25 messages must contribute
     /// to the user prompt sent to the provider.

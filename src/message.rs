@@ -199,4 +199,27 @@ mod tests {
         assert!(Message::assistant("").tool_calls.is_empty());
         assert!(Message::tool_result("", "").tool_calls.is_empty());
     }
+
+    #[test]
+    fn assistant_with_tool_calls_stores_tool_calls() {
+        // kills `tool_calls: vec![]` mutation in assistant_with_tool_calls
+        use crate::llm::ToolCall;
+        let tc = ToolCall {
+            id: "tc-1".to_string(),
+            name: "Read".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let m = Message::assistant_with_tool_calls("calling", vec![tc]);
+        assert_eq!(m.tool_calls.len(), 1, "tool_calls must be stored");
+        assert_eq!(m.tool_calls[0].id, "tc-1");
+    }
+
+    #[test]
+    fn constructors_store_content() {
+        // kills `content: "".into()` or `content: Default::default()` mutations
+        assert_eq!(Message::system("sys-content").content, "sys-content");
+        assert_eq!(Message::user("user-content").content, "user-content");
+        assert_eq!(Message::assistant("asst-content").content, "asst-content");
+        assert_eq!(Message::tool_result("id", "tool-out").content, "tool-out");
+    }
 }

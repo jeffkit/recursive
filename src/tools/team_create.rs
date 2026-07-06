@@ -252,4 +252,64 @@ mod tests {
             assert!(res.is_err(), "name '{bad}' should be rejected");
         }
     }
+
+    #[tokio::test]
+    async fn member_defaults_agent_type_to_general() {
+        // kills `unwrap_or("general")` mutation → unwrap_or("")
+        let _g = with_temp_teams_dir();
+        let reg = Arc::new(TeamRegistry::new());
+        let tool = TeamCreateTool::new(reg.clone());
+        tool.execute(json!({
+            "name": "gamma",
+            "members": [{ "name": "x" }]   // no agent_type field
+        }))
+        .await
+        .unwrap();
+        let team = reg.get("gamma").await.unwrap();
+        let member = team.get_member("x").unwrap();
+        assert_eq!(member.agent_type, "general", "missing agent_type must default to 'general'");
+    }
+
+    #[tokio::test]
+    async fn create_missing_name_field_errors() {
+        // kills `ok_or_else(|| Error::BadToolArgs)` guard removal mutation
+        let _g = with_temp_teams_dir();
+        let reg = Arc::new(TeamRegistry::new());
+        let tool = TeamCreateTool::new(reg);
+        let res = tool.execute(json!({})).await;
+        assert!(
+            matches!(res, Err(Error::BadToolArgs { .. })),
+            "missing 'name' field must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_backslash_name() {
+        // kills `name.contains('\\')` removal mutation in name validation
+        let _g = with_temp_teams_dir();
+        let reg = Arc::new(TeamRegistry::new());
+        let tool = TeamCreateTool::new(reg);
+        let res = tool.execute(json!({ "name": "a\\b" })).await;
+        assert!(res.is_err(), "backslash in team name must be rejected");
+    }
+
+    #[tokio::test]
+    async fn member_with_model_is_stored() {
+        // kills `member.with_model(model)` removal mutation
+        let _g = with_temp_teams_dir();
+        let reg = Arc::new(TeamRegistry::new());
+        let tool = TeamCreateTool::new(reg.clone());
+        tool.execute(json!({
+            "name": "modelteam",
+            "members": [{ "name": "bot", "model": "gpt-5" }]
+        }))
+        .await
+        .unwrap();
+        let team = reg.get("modelteam").await.unwrap();
+        let member = team.get_member("bot").unwrap();
+        assert_eq!(
+            member.model, "gpt-5",
+            "member model field must be stored from input"
+        );
+    }
 }

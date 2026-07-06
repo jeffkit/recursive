@@ -175,4 +175,43 @@ mod tests {
         assert!(policy.check_shell("ls").is_ok());
         assert!(policy.check_shell("rm -rf /").is_err());
     }
+
+    #[test]
+    fn policy_provider_new_uses_given_policy() {
+        // kills mutation that replaces PolicyToolSetProvider::new() field assignments
+        use crate::tools::policy_sandbox::PolicyConfig;
+        let dir = TempDir::new().unwrap();
+        let policy = PolicyConfig::default();
+        let p = PolicyToolSetProvider::new(dir.path().to_path_buf(), 30, vec![], policy);
+        assert_eq!(p.sandbox_mode(), SandboxMode::Policy);
+        let reg = p.build_registry();
+        // With a permissive policy, rm -rf should be allowed (no deny patterns)
+        let attached_policy = reg.policy().expect("policy should be attached");
+        assert!(
+            attached_policy.check_shell("rm -rf /").is_ok(),
+            "permissive policy should allow all shell commands"
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_default_is_none() {
+        // kills `#[default]` annotation removal mutation on SandboxMode::None
+        assert_eq!(
+            SandboxMode::default(),
+            SandboxMode::None,
+            "SandboxMode default must be None"
+        );
+    }
+
+    #[test]
+    fn local_provider_build_registry_has_read_tool() {
+        // kills `build_registry` function-level replacement mutation
+        let (p, _dir) = provider();
+        let reg = p.build_registry();
+        let names = reg.names();
+        assert!(
+            names.iter().any(|n| n == "Read"),
+            "local registry must contain 'Read' tool; found: {names:?}"
+        );
+    }
 }

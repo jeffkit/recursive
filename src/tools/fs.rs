@@ -727,6 +727,54 @@ line3
     /// Kills: `replace - with /` (263:23).
     ///
     /// `take(end - start + 1)` vs `take(end / start + 1)`.
+    #[tokio::test]
+    async fn read_file_start_line_zero_is_invalid() {
+        // kills `Some(0) =>` guard removal in the start_line match
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\n").unwrap();
+        let r = ReadFile::new(tmp.path());
+        let err = r
+            .execute(json!({"path": "f.txt", "start_line": 0}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadToolArgs { .. }),
+            "start_line=0 must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_end_line_zero_is_invalid() {
+        // kills `Some(0) =>` guard removal in the end_line match
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\n").unwrap();
+        let r = ReadFile::new(tmp.path());
+        let err = r
+            .execute(json!({"path": "f.txt", "end_line": 0}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadToolArgs { .. }),
+            "end_line=0 must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_start_line_beyond_total_is_invalid() {
+        // kills `if start_line.is_some() && start > total_lines` guard removal
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\n").unwrap();
+        let r = ReadFile::new(tmp.path());
+        let err = r
+            .execute(json!({"path": "f.txt", "start_line": 999}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadToolArgs { .. }),
+            "start_line beyond file length must return BadToolArgs"
+        );
+    }
+
     /// For start=2, end=3: take(2) in both cases → equivalent.
     /// For start=2, end=5: original take(4), mutant take(5/2+1)=take(3).
     /// The 4th line ("four") would be missing with the mutant.

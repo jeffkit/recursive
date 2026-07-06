@@ -1996,4 +1996,125 @@ api_key = "sk-from-file"
         if let Some(v) = orig_api { std::env::set_var("RECURSIVE_API_KEY", v); }
         else { std::env::remove_var("RECURSIVE_API_KEY"); }
     }
+
+    // ── load_memory_file targeted tests ──────────────────────────────────────
+
+    #[test]
+    fn load_memory_file_returns_none_for_missing_file() {
+        // kills function-level replacement of load_memory_file
+        let path = std::path::Path::new("/nonexistent/memory.md");
+        assert!(load_memory_file(path).is_none());
+    }
+
+    #[test]
+    fn load_memory_file_returns_none_for_empty_file() {
+        // kills `if content.is_empty()` guard removal
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+        assert!(
+            load_memory_file(tmp.path()).is_none(),
+            "empty file must return None"
+        );
+    }
+
+    #[test]
+    fn load_memory_file_returns_content_under_cap() {
+        // kills `if content.len() > MAX_MEMORY_FILE_SIZE` guard removal
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "hello memory").unwrap();
+        let result = load_memory_file(tmp.path());
+        assert_eq!(result.as_deref(), Some("hello memory"));
+    }
+
+    #[test]
+    fn load_memory_file_truncates_large_files() {
+        // kills `> with >=` and missing truncation marker
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Write slightly over 8KB
+        let content = "X".repeat(MAX_MEMORY_FILE_SIZE + 100);
+        std::fs::write(tmp.path(), &content).unwrap();
+        let result = load_memory_file(tmp.path()).unwrap();
+        assert!(
+            result.contains("[…truncated"),
+            "oversized file must include truncation marker: {result}"
+        );
+        // The returned string must be shorter than the original
+        assert!(
+            result.len() < content.len(),
+            "truncated output must be shorter than original"
+        );
+    }
+
+    // ── load_project_context targeted tests ──────────────────────────────────
+
+    #[test]
+    fn load_project_context_returns_none_when_both_files_absent() {
+        // kills function-level replacement of load_project_context
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = load_project_context(tmp.path());
+        assert!(result.is_none(), "must return None when neither AGENTS.md nor CLAUDE.md exist");
+    }
+
+    #[test]
+    fn load_project_context_returns_agents_only() {
+        // kills mutations swapping (Some(a), None) and (None, Some(c)) arms
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "# Agents content").unwrap();
+        let result = load_project_context(tmp.path()).unwrap();
+        assert!(result.contains("AGENTS.md"), "must include AGENTS.md header");
+        assert!(result.contains("Agents content"));
+        assert!(!result.contains("CLAUDE.md"), "must not include CLAUDE.md when absent");
+    }
+
+    #[test]
+    fn load_project_context_returns_claude_only() {
+        // kills mutations swapping the (None, Some(c)) arm with (Some(a), None)
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "# Claude content").unwrap();
+        let result = load_project_context(tmp.path()).unwrap();
+        assert!(result.contains("CLAUDE.md"), "must include CLAUDE.md header");
+        assert!(result.contains("Claude content"));
+        assert!(!result.contains("AGENTS.md"), "must not include AGENTS.md when absent");
+    }
+
+    #[test]
+    fn load_project_context_combines_both_files() {
+        // kills mutations removing either file from the combined output
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "# Agents").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "# Claude").unwrap();
+        let result = load_project_context(tmp.path()).unwrap();
+        assert!(result.contains("AGENTS.md"), "must include AGENTS.md section");
+        assert!(result.contains("CLAUDE.md"), "must include CLAUDE.md section");
+        assert!(result.contains("Agents"), "must include AGENTS.md content");
+        assert!(result.contains("Claude"), "must include CLAUDE.md content");
+    }
+
+    #[test]
+    fn prepend_project_context_appends_separator_and_base() {
+        // kills format!(...) mutations in prepend_project_context
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "# Agent rules").unwrap();
+        let result = prepend_project_context("base system prompt", tmp.path());
+        assert!(
+            result.contains("base system prompt"),
+            "base must be included"
+        );
+        assert!(
+            result.contains("---"),
+            "separator must be between context and base"
+        );
+        assert!(
+            result.contains("Agent rules"),
+            "project context must be prepended"
+        );
+    }
+
+    #[test]
+    fn prepend_project_context_returns_base_unchanged_when_no_context() {
+        // kills `None => base.to_string()` arm mutations
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = prepend_project_context("my system prompt", tmp.path());
+        assert_eq!(result, "my system prompt", "must return base unchanged when no context files");
+    }
 }

@@ -530,4 +530,52 @@ mod tests {
         let snap = got.output_snapshot().await;
         assert!(snap.is_empty(), "output must be empty before any drain");
     }
+
+    #[tokio::test]
+    async fn registry_is_empty_initially_and_nonempty_after_register() {
+        // kills `is_empty` → always-true / always-false mutations
+        let reg = TaskRegistry::new();
+        assert!(reg.is_empty().await, "new registry must be empty");
+        let (state, _id) = TaskState::new("t", "", "");
+        reg.register(state).await;
+        assert!(!reg.is_empty().await, "registry must not be empty after register");
+    }
+
+    #[tokio::test]
+    async fn drain_all_drains_multiple_tasks() {
+        // kills `drain_all` function-level replacement
+        // Note: drain_output reads from output_tx channel, not the direct buffer,
+        // so we send via output_tx to test drain_all correctly.
+        let reg = TaskRegistry::new();
+        let (s1, _id1) = TaskState::new("t1", "", "");
+        let (s2, _id2) = TaskState::new("t2", "", "");
+        // Send via the channel before registering so we can keep tx
+        let tx1 = s1.output_tx.clone();
+        let tx2 = s2.output_tx.clone();
+        reg.register(s1).await;
+        reg.register(s2).await;
+        tx1.send("a".into()).unwrap();
+        tx2.send("b".into()).unwrap();
+        // Give the channel messages time to arrive
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let total = reg.drain_all().await;
+        assert_eq!(total, 2, "drain_all must return total lines drained across tasks");
+    }
+
+    #[tokio::test]
+    async fn drain_output_returns_zero_for_missing_task() {
+        // kills `None => 0` → `None => 1` mutation in drain_output
+        let reg = TaskRegistry::new();
+        let ghost_id = TaskId::new();
+        assert_eq!(reg.drain_output(&ghost_id).await, 0, "drain_output must return 0 for missing task");
+    }
+
+    #[tokio::test]
+    async fn append_output_returns_false_for_missing_task() {
+        // kills `None => false` → `None => true` mutation in append_output
+        let reg = TaskRegistry::new();
+        let ghost_id = TaskId::new();
+        let ok = reg.append_output(&ghost_id, "line".into()).await;
+        assert!(!ok, "append_output must return false for missing task");
+    }
 }

@@ -1797,6 +1797,40 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[test]
+    fn filter_leading_assistant_removes_multiple_empty_assistants() {
+        // kills the `while` loop in filter_leading_assistant being replaced with `if`
+        let msgs = vec![
+            Message::assistant("first empty".to_string()),
+            Message::assistant("second empty".to_string()),
+            Message::user("Hello".to_string()),
+        ];
+        let filtered = filter_leading_assistant(&msgs);
+        assert_eq!(filtered.len(), 1, "both leading assistant messages must be removed");
+        assert_eq!(filtered[0].role, Role::User);
+    }
+
+    #[test]
+    fn filter_leading_assistant_noop_when_first_is_user() {
+        // kills function-level replacement that always removes messages
+        let msgs = vec![
+            Message::user("Hello".to_string()),
+            Message::assistant("Hi".to_string()),
+        ];
+        let filtered = filter_leading_assistant(&msgs);
+        assert_eq!(filtered.len(), 2, "must not remove messages when first is user");
+        assert_eq!(filtered[0].role, Role::User);
+    }
+
+    #[test]
+    fn serialize_message_plain_user_has_role_user_and_content() {
+        // kills Role::User → "assistant" or "system" swap mutations
+        let msg = Message::user("Hello world".to_string());
+        let v = serialize_message(&msg);
+        assert_eq!(v["role"].as_str(), Some("user"));
+        assert_eq!(v["content"].as_str(), Some("Hello world"));
+    }
+
+    #[test]
     fn handle_text_delta_appends_content_and_skips_empty() {
         let mut acc = SseAccum::default();
         let delta = json!({ "type": "text_delta", "text": "hello" });

@@ -577,6 +577,80 @@ mod tests {
 
     /// Regression test for Goal 278: MessageAppended no longer has parent_uuid field.
     #[test]
+    fn additional_event_variants_round_trip() {
+        // kills mutations to event type tags and field names for variants
+        // not covered by agent_event_serialization_round_trip
+        let events: Vec<AgentEvent> = vec![
+            AgentEvent::PartialReasoning {
+                text: "thinking...".into(),
+                step: 0,
+            },
+            AgentEvent::Reasoning {
+                text: "full reasoning".into(),
+                step: 1,
+            },
+            AgentEvent::PlanModeRequested {
+                reason: "complex task".into(),
+            },
+            AgentEvent::PlanModeApproved,
+            AgentEvent::PlanModeRejected {
+                reason: "too risky".into(),
+            },
+            AgentEvent::CompactionBoundary {
+                turn: 5,
+                compacted_count: 10,
+                summary_uuid: Some("abc-123".into()),
+            },
+            AgentEvent::GoalSet {
+                condition: "all tests pass".into(),
+                max_turns: 20,
+            },
+            AgentEvent::GoalContinuing {
+                reason: "not yet".into(),
+                turns: 3,
+            },
+            AgentEvent::GoalAchieved {
+                condition: "all tests pass".into(),
+                turns: 5,
+            },
+            AgentEvent::GoalCleared,
+            AgentEvent::HookStarted {
+                hook_event: "pre_tool".into(),
+                hook_name: "safety-check".into(),
+                status_message: Some("checking...".into()),
+            },
+            AgentEvent::HookProgress {
+                hook_event: "pre_tool".into(),
+                hook_name: "safety-check".into(),
+                last_line: "progress line".into(),
+            },
+            AgentEvent::HookFinished {
+                hook_event: "pre_tool".into(),
+                hook_name: "safety-check".into(),
+                outcome: "continue".into(),
+                duration_ms: 42,
+            },
+            AgentEvent::HookSystemMessage {
+                text: "hook message".into(),
+            },
+            AgentEvent::LlmRetry {
+                step: 2,
+                attempt: 1,
+                wait_ms: 5000,
+                reason: "rate_limited".into(),
+            },
+        ];
+
+        for event in &events {
+            let json = serde_json::to_string(event)
+                .unwrap_or_else(|e| panic!("serialization failed for {event:?}: {e}"));
+            let back: AgentEvent = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("deserialization failed for {json}: {e}"));
+            assert_eq!(*event, back, "round-trip failed for event type");
+        }
+    }
+
+    #[test]
     fn message_appended_no_longer_has_parent_uuid_field() {
         // Source-grep check that src/event.rs doesn't define
         // parent_uuid inside AgentEvent::MessageAppended.

@@ -232,4 +232,53 @@ mod tests {
         assert!(policy.check_fs_path("/anywhere/file.txt", false).is_ok());
         assert!(policy.check_fs_path("/anywhere/file.txt", true).is_ok());
     }
+
+    #[test]
+    fn check_fs_deny_overrides_allow_list() {
+        // kills `for denied in &self.fs.deny` loop removal mutation
+        let policy = PolicyConfig {
+            fs: FsPolicy {
+                read_allow: vec!["/allowed/".into()],
+                write_allow: vec![],
+                deny: vec!["/allowed/secret".into()],
+            },
+            shell: ShellPolicy::default(),
+        };
+        // path starts with allowed prefix but also starts with deny prefix → denied
+        assert!(
+            policy.check_fs_path("/allowed/secret/file.txt", false).is_err(),
+            "deny list must override allow list"
+        );
+    }
+
+    #[test]
+    fn check_fs_write_uses_write_allow_list() {
+        // kills `if write { &self.fs.write_allow } else { &self.fs.read_allow }` swap mutation
+        let policy = PolicyConfig {
+            fs: FsPolicy {
+                read_allow: vec!["/read-zone/".into()],
+                write_allow: vec!["/write-zone/".into()],
+                deny: vec![],
+            },
+            shell: ShellPolicy::default(),
+        };
+        // Path in read_allow but not write_allow — read OK, write BLOCKED
+        assert!(policy.check_fs_path("/read-zone/file.txt", false).is_ok());
+        assert!(
+            policy.check_fs_path("/read-zone/file.txt", true).is_err(),
+            "write to read-zone must be blocked"
+        );
+        // Path in write_allow — write OK
+        assert!(policy.check_fs_path("/write-zone/file.txt", true).is_ok());
+    }
+
+    #[test]
+    fn default_restrictive_blocks_dangerous_patterns() {
+        // kills mutations that remove specific deny patterns from the default list
+        let policy = PolicyConfig::default_restrictive();
+        assert!(policy.check_shell("mkfs.ext4 /dev/sda").is_err(), "mkfs must be blocked");
+        assert!(policy.check_shell("dd if=/dev/zero of=/dev/sda").is_err(), "dd if= must be blocked");
+        assert!(policy.check_shell("chmod 777 /etc").is_err(), "chmod 777 / must be blocked");
+        assert!(policy.check_shell("ls /home").is_ok(), "safe command must be allowed");
+    }
 }

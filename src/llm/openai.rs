@@ -1635,4 +1635,56 @@ data: [DONE]\n\n";
         assert_eq!(value["kept_facts"][0], "a");
         assert_eq!(value["kept_facts"][1], "b");
     }
+
+    // ── serialize_message targeted tests ──────────────────────────────────────
+
+    #[test]
+    fn serialize_message_system_role() {
+        // kills Role::System → "user" swap mutations
+        let msg = Message::system("You are helpful.".to_string());
+        let v = serialize_message(&msg);
+        assert_eq!(v["role"].as_str(), Some("system"));
+        assert_eq!(v["content"].as_str(), Some("You are helpful."));
+    }
+
+    #[test]
+    fn serialize_message_user_role() {
+        // kills Role::User → "assistant" swap mutations
+        let msg = Message::user("Hello".to_string());
+        let v = serialize_message(&msg);
+        assert_eq!(v["role"].as_str(), Some("user"));
+    }
+
+    #[test]
+    fn serialize_message_tool_role_includes_tool_call_id() {
+        // kills `if let Some(id) = &m.tool_call_id` guard removal
+        let msg = Message::tool_result("tc-abc".to_string(), "result text".to_string());
+        let v = serialize_message(&msg);
+        assert_eq!(v["role"].as_str(), Some("tool"));
+        assert_eq!(v["tool_call_id"].as_str(), Some("tc-abc"));
+    }
+
+    #[test]
+    fn serialize_message_assistant_includes_reasoning_content() {
+        // kills `if matches!(m.role, Role::Assistant)` guard removal
+        // and the reasoning_content insertion
+        let mut msg = Message::assistant("answer".to_string());
+        msg.reasoning_content = Some("thinking step".to_string());
+        let v = serialize_message(&msg);
+        assert_eq!(v["reasoning_content"].as_str(), Some("thinking step"));
+    }
+
+    #[test]
+    fn serialize_message_non_assistant_omits_reasoning_content() {
+        // kills removal of `if matches!(m.role, Role::Assistant)` guard —
+        // without the guard, user messages would also get reasoning_content
+        let mut msg = Message::user("hello".to_string());
+        msg.reasoning_content = Some("should not appear".to_string());
+        let v = serialize_message(&msg);
+        assert!(
+            v.get("reasoning_content").is_none()
+                || v["reasoning_content"] == serde_json::Value::Null,
+            "non-assistant messages must not include reasoning_content"
+        );
+    }
 }

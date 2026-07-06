@@ -238,4 +238,32 @@ mod tests {
             "token with slash must be included"
         );
     }
+
+    #[test]
+    fn glob_lone_double_star_matches_everything() {
+        // kills `if pat == "**" { return true }` removal mutation
+        assert!(glob_matches("**", ""), "** must match empty string");
+        assert!(glob_matches("**", "any/path/at/all"), "** must match any path");
+        assert!(glob_matches("**", "src/foo.rs"), "** must match files");
+    }
+
+    #[test]
+    fn glob_empty_pattern_matches_empty_string_only() {
+        // kills `if pat.is_empty() { return s.is_empty() }` guard removal
+        assert!(glob_matches("", ""), "empty pattern matches empty string");
+        assert!(!glob_matches("", "non-empty"), "empty pattern must not match non-empty string");
+    }
+
+    #[test]
+    fn glob_matches_double_star_in_middle() {
+        // kills mutations in the `**` traversal loop
+        assert!(
+            glob_matches("src/**/mod.rs", "src/a/b/mod.rs"),
+            "** must cross multiple dirs"
+        );
+        assert!(
+            !glob_matches("src/**/mod.rs", "src/a/b/foo.rs"),
+            "** should not match wrong filename"
+        );
+    }
 }

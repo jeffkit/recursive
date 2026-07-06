@@ -578,4 +578,47 @@ mod tests {
         let output = std::fs::read_to_string(dest.path().join("SKILL.md")).unwrap();
         assert_eq!(output, "# My Skill content");
     }
+
+    #[test]
+    fn parse_zip_replaces_binary_content_with_placeholder() {
+        // kills `unwrap_or_else(|_| "<binary>".to_string())` mutations
+        use std::io::Write;
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // Write raw non-UTF8 bytes (invalid UTF-8 sequence)
+        zip.start_file("binary.bin", opts).unwrap();
+        zip.write_all(&[0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        let data = zip.finish().unwrap().into_inner();
+
+        let files = InstallSkill::parse_zip(&data).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].content, "<binary>",
+            "non-UTF8 file content must become '<binary>'"
+        );
+    }
+
+    #[test]
+    fn extract_zip_file_without_slug_prefix_uses_full_name() {
+        // kills mutations of `unwrap_or(&raw_name)` fallback in extract_zip
+        use std::io::Write;
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // File name has no '/' component — no slug to strip
+        zip.start_file("SKILL.md", opts).unwrap();
+        zip.write_all(b"no slug here").unwrap();
+        let data = zip.finish().unwrap().into_inner();
+
+        let dest = tempfile::TempDir::new().unwrap();
+        InstallSkill::extract_zip(&data, dest.path()).unwrap();
+
+        let output = std::fs::read_to_string(dest.path().join("SKILL.md")).unwrap();
+        assert_eq!(output, "no slug here");
+    }
 }

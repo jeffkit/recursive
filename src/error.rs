@@ -279,4 +279,78 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("length"));
     }
+
+    #[test]
+    fn test_tool_rejected_format() {
+        // kills `ToolRejected` match-arm replacement mutations
+        let err = Error::ToolRejected {
+            name: "Bash".into(),
+            reason: "policy violation".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Bash"), "name must appear in ToolRejected display");
+        assert!(msg.contains("policy violation"), "reason must appear in ToolRejected display");
+    }
+
+    #[test]
+    fn test_permission_denied_limit_format() {
+        // kills `PermissionDeniedLimit` match-arm replacement mutations
+        let err = Error::PermissionDeniedLimit { name: "Write".into() };
+        let msg = err.to_string();
+        assert!(msg.contains("Write"), "name must appear in PermissionDeniedLimit display");
+    }
+
+    #[test]
+    fn test_schema_too_new_format() {
+        // kills `SchemaTooNew` match-arm replacement mutations
+        let err = Error::SchemaTooNew {
+            session_id: "sess-123".into(),
+            found: 5,
+            supported: 2,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("sess-123"), "session_id must appear in SchemaTooNew display");
+        assert!(msg.contains("5"), "found version must appear");
+        assert!(msg.contains("2"), "supported version must appear");
+    }
+
+    #[test]
+    fn test_internal_error_format() {
+        // kills `Internal` match-arm replacement mutations
+        let err = Error::Internal {
+            context: "run_inner".into(),
+            message: "unexpected None".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("run_inner"), "context must appear in Internal display");
+        assert!(msg.contains("unexpected None"), "message must appear in Internal display");
+    }
+
+    #[test]
+    fn test_storage_error_format() {
+        let err = Error::Storage { message: "disk full".into() };
+        let msg = err.to_string();
+        assert!(msg.contains("disk full"));
+    }
+
+    #[test]
+    fn test_not_found_format() {
+        let err = Error::NotFound("task-abc".into());
+        let msg = err.to_string();
+        assert!(msg.contains("task-abc"));
+    }
+
+    #[test]
+    fn test_is_retryable_for_non_retryable_variants() {
+        // kills mutations that make non-retryable errors retryable
+        assert!(!Error::UnknownTool("Bash".into()).is_retryable());
+        assert!(!Error::BadToolArgs { name: "r".into(), message: "m".into() }.is_retryable());
+    }
+
+    #[test]
+    fn test_is_transient_for_non_transient_variants() {
+        // kills mutations that expand the is_transient match arms
+        assert!(!Error::UnknownTool("Bash".into()).is_transient());
+        assert!(!Error::Config { message: "bad config".into() }.is_transient());
+    }
 }

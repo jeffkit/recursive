@@ -598,4 +598,40 @@ mod tests {
         assert_eq!(stats.kept, 0);
         assert_eq!(stats.dropped, 0);
     }
+
+    #[test]
+    fn truncate_transcript_cutoff_beyond_end_keeps_all() {
+        // kills `if user_seen >= cutoff_turn` guard mutation (>= → >) or removal
+        let dir = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
+        w.append(&Message::system("sys".to_string()), None, None).unwrap();
+        w.append(&Message::user("u0".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None).unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        // cutoff_turn = 99 is beyond all messages → nothing dropped
+        let stats = truncate_transcript_to_turn(&session_dir, 99).unwrap();
+        assert_eq!(stats.dropped, 0, "cutoff beyond end must drop nothing");
+        assert_eq!(stats.kept, 3, "all 3 messages must be kept");
+    }
+
+    #[test]
+    fn truncate_transcript_exact_boundary_drops_last_turn() {
+        // kills off-by-one mutations: `>=` vs `>` in user_seen comparison
+        let dir = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(dir.path(), "g", "m", "p").unwrap();
+        // 2 user turns: turn 0 (u0+a0), turn 1 (u1+a1)
+        w.append(&Message::user("u0".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a0".to_string()), None, None).unwrap();
+        w.append(&Message::user("u1".to_string()), None, None).unwrap();
+        w.append(&Message::assistant("a1".to_string()), None, None).unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        // cutoff_turn = 1 → keep turn 0 (u0+a0), drop turn 1 (u1+a1)
+        let stats = truncate_transcript_to_turn(&session_dir, 1).unwrap();
+        assert_eq!(stats.kept, 2, "must keep u0+a0");
+        assert_eq!(stats.dropped, 2, "must drop u1+a1");
+    }
 }

@@ -166,4 +166,63 @@ mod tests {
             .unwrap();
         assert_eq!(out, "(no new output)", "empty task output must return the sentinel string");
     }
+
+    #[tokio::test]
+    async fn output_lines_are_joined_by_newline() {
+        // kills `lines.join("\n")` mutation (e.g. join(" ") or join(","))
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        let state_arc = reg.register(state).await;
+        // Insert lines directly into the output snapshot buffer
+        {
+            let mut buf = state_arc.output.lock().await;
+            buf.push("line-A".to_string());
+            buf.push("line-B".to_string());
+        }
+        let tool = TaskOutputTool::new(reg);
+        let out = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert_eq!(out, "line-A\nline-B", "multiple output lines must be joined with '\\n'");
+    }
+
+    #[tokio::test]
+    async fn block_true_returns_immediately_for_terminal_task() {
+        // kills `if block { ... }` removal mutation and `if s.is_terminal() { break }` guard removal
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        let arc = reg.register(state).await;
+        arc.mark_completed("done".into()).await;
+        // Append output after completion
+        reg.append_output(&id, "finished".to_string()).await;
+
+        let tool = TaskOutputTool::new(reg);
+        let out = tool
+            .execute(json!({ "task_id": id.to_string(), "block": true }))
+            .await
+            .unwrap();
+        // Should return output and not hang
+        assert!(
+            out.contains("finished") || out == "(no new output)",
+            "block=true on terminal task must return quickly; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_default_is_false() {
+        // kills `unwrap_or(false)` mutation in `block` argument parsing
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        reg.register(state).await;
+
+        let tool = TaskOutputTool::new(reg);
+        // Without `block` key, must not block (task is Running)
+        let out = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        // Returns immediately since block defaults to false
+        assert_eq!(out, "(no new output)", "omitting 'block' must default to false (non-blocking)");
+    }
 }

@@ -132,4 +132,72 @@ mod tests {
     fn planning_mode_default_is_immediate() {
         assert_eq!(PlanningMode::default(), PlanningMode::Immediate);
     }
+
+    #[test]
+    fn finish_reason_struct_variants_serialize_with_kind_tag() {
+        // kills mutations swapping `kind` tag values for struct/unit variants
+        let json = serde_json::to_value(&FinishReason::NoMoreToolCalls).unwrap();
+        assert_eq!(json["kind"], "no_more_tool_calls");
+
+        let json = serde_json::to_value(&FinishReason::BudgetExceeded).unwrap();
+        assert_eq!(json["kind"], "budget_exceeded");
+
+        let json = serde_json::to_value(&FinishReason::Stuck {
+            repeated_call: "Bash".into(),
+            repeats: 5,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "stuck");
+        assert_eq!(json["repeated_call"], "Bash");
+        assert_eq!(json["repeats"], 5);
+
+        let json = serde_json::to_value(&FinishReason::TranscriptLimit {
+            chars: 1000,
+            limit: 500,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "transcript_limit");
+        assert_eq!(json["chars"], 1000);
+        assert_eq!(json["limit"], 500);
+
+        let json = serde_json::to_value(&FinishReason::Cancelled).unwrap();
+        assert_eq!(json["kind"], "cancelled");
+
+        let json = serde_json::to_value(&FinishReason::PermissionDenialLimit).unwrap();
+        assert_eq!(json["kind"], "permission_denial_limit");
+    }
+
+    #[test]
+    fn finish_reason_deserializes_from_kind_tag() {
+        // kills mutations that swap field names on deserialization
+        let r: FinishReason =
+            serde_json::from_str(r#"{"kind":"no_more_tool_calls"}"#).unwrap();
+        assert!(matches!(r, FinishReason::NoMoreToolCalls));
+
+        let r: FinishReason = serde_json::from_str(
+            r#"{"kind":"stuck","repeated_call":"Read","repeats":3}"#,
+        )
+        .unwrap();
+        match r {
+            FinishReason::Stuck { repeated_call, repeats } => {
+                assert_eq!(repeated_call, "Read");
+                assert_eq!(repeats, 3);
+            }
+            other => panic!("expected Stuck, got {other:?}"),
+        }
+
+        let r: FinishReason = serde_json::from_str(r#"{"kind":"cancelled"}"#).unwrap();
+        assert!(matches!(r, FinishReason::Cancelled));
+    }
+
+    #[test]
+    fn permission_decision_serializes_deny_and_allow() {
+        // kills variant swap mutations in PermissionDecision serialization
+        let deny = serde_json::to_value(PermissionDecision::Deny("blocked".into())).unwrap();
+        // snake_case rename_all → key is "deny"
+        assert!(deny.get("deny").is_some(), "Deny must have 'deny' key, got {deny}");
+
+        let allow = serde_json::to_value(&PermissionDecision::Allow).unwrap();
+        assert_eq!(allow, serde_json::json!("allow"), "Allow must serialize to string 'allow'");
+    }
 }

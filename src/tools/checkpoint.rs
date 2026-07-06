@@ -566,4 +566,53 @@ mod tests {
         assert_eq!(recs[0].touched_files, vec!["a.txt".to_string()]);
         assert_eq!(recs[0].touched_via, TouchedVia::Structured);
     }
+
+    #[tokio::test]
+    async fn diff_tool_missing_a_arg_errors() {
+        // kills "missing `a`" guard removal mutation
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let (_, diff, _) = build_checkpoint_tools_at(w.path(), w.shadow_dir(), "s").unwrap();
+        let res = diff.execute(json!({})).await;
+        assert!(res.is_err(), "diff without 'a' argument must fail");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_defaults_message_to_turn_index() {
+        // kills `unwrap_or_else(|| format!("turn {turn}"))` mutation
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let log_path = w.path().join("checkpoints.jsonl");
+        fs::write(w.path().join("b.txt"), "world").unwrap();
+
+        let repo = Arc::new(Mutex::new(
+            ShadowRepo::open_at(w.path(), w.shadow_dir()).unwrap(),
+        ));
+        let writer = Arc::new(Mutex::new(CheckpointLogWriter::open(&log_path).unwrap()));
+        let turn_index = Arc::new(std::sync::atomic::AtomicUsize::new(7));
+
+        let tool = build_checkpoint_save_tool(
+            repo.clone(),
+            "sess2".into(),
+            None,
+            writer.clone(),
+            turn_index.clone(),
+            log_path.clone(),
+        );
+
+        // No "message" argument — should default to "turn 7"
+        tool.execute(json!({})).await.unwrap();
+
+        let recs = read_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].message.as_deref(),
+            Some("turn 7"),
+            "default message must be 'turn N' where N is the turn index"
+        );
+    }
 }

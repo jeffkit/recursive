@@ -143,4 +143,102 @@ mod tests {
         assert!(out.ends_with('…'), "truncated string must end with ellipsis; got: {out}");
         assert!(out.len() < s.len(), "truncated string must be shorter than original");
     }
+
+    #[tokio::test]
+    async fn get_task_shows_output_lines_when_non_empty() {
+        // kills `if !output.is_empty()` guard removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("task", "", "");
+        let arc = reg.register(state).await;
+        arc.append_output("line1".into()).await;
+        arc.append_output("line2".into()).await;
+        let tool = TaskGetTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(result.contains("output_lines: 2"), "must show output line count; got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_completed_task_shows_result() {
+        // kills `if let Some(result) = last` guard removal and `Ok(text)` arm mutations
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("task", "", "");
+        let arc = reg.register(state).await;
+        arc.mark_completed("job done".into()).await;
+        let tool = TaskGetTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(result.contains("result: job done"), "completed task must show result; got: {result}");
+        assert!(result.contains("completed"), "status must be 'completed'");
+    }
+
+    #[tokio::test]
+    async fn get_failed_task_shows_error() {
+        // kills `Err(e) => s.push_str(...)` arm mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("task", "", "");
+        let arc = reg.register(state).await;
+        arc.mark_failed("something broke".into()).await;
+        let tool = TaskGetTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(result.contains("error: something broke"), "failed task must show error; got: {result}");
+        assert!(result.contains("failed"), "status must be 'failed'");
+    }
+
+    #[tokio::test]
+    async fn get_task_with_no_team_shows_none() {
+        // kills `if task.team.is_empty() { "(none)" }` guard removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("task", "", "");
+        reg.register(state).await;
+        let tool = TaskGetTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(result.contains("team: (none)"), "empty team must show (none); got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_task_with_no_name_shows_none() {
+        // kills `if task.name.is_empty() { "(none)" }` guard removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("task", "myteam", "");
+        reg.register(state).await;
+        let tool = TaskGetTool::new(reg);
+        let result = tool
+            .execute(json!({ "task_id": id.to_string() }))
+            .await
+            .unwrap();
+        assert!(result.contains("name: (none)"), "empty name must show (none); got: {result}");
+    }
+
+    #[test]
+    fn truncate_respects_char_boundary_on_multibyte() {
+        // kills the `while end > 0 && !s.is_char_boundary(end)` loop removal mutation:
+        // truncating mid-multibyte character must back up to a valid boundary.
+        let s = "aβcd"; // 'β' = 2 bytes; total len = 5 bytes (1 + 2 + 1 + 1)
+        // max=2 splits in the middle of 'β' (offset 1 is not a char boundary → backs up to 1)
+        let out = truncate(s, 2);
+        assert!(out.ends_with('…'), "must end with ellipsis; got: {out}");
+        // The output before '…' must be a valid UTF-8 prefix of s.
+        let prefix = &out[..out.len() - '…'.len_utf8()];
+        assert!(s.starts_with(prefix), "truncated prefix must be valid; got prefix={prefix:?}");
+    }
+
+    #[tokio::test]
+    async fn missing_task_id_errors() {
+        // kills `lookup_task_id(...)` guard removal mutation
+        let reg = Arc::new(TaskRegistry::new());
+        let tool = TaskGetTool::new(reg);
+        let res = tool.execute(json!({})).await;
+        assert!(res.is_err(), "missing task_id must return an error");
+    }
 }

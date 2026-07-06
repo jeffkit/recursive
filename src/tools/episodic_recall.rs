@@ -443,4 +443,123 @@ mod tests {
         let tool = EpisodicRecall::new(tmp.path());
         assert!(tool.is_deferred(), "episodic_recall must be a deferred tool");
     }
+
+    #[test]
+    fn no_match_in_existing_session_returns_no_matches_message() {
+        // kills `if results.is_empty()` guard-removal mutations
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        setup_session_with_messages(
+            ws,
+            "some goal",
+            &[("user", "Hello world"), ("assistant", "Hi there")],
+        );
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "xyzzy_unique_never_matches"})))
+            .unwrap();
+
+        assert!(
+            output.contains("no matches found"),
+            "expected 'no matches found' but got: {output}"
+        );
+    }
+
+    #[test]
+    fn limit_truncates_output_when_exceeded() {
+        // kills `if match_count > limit` guard removal and off-by-one mutations
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        // Create a session with many "Rust" references (more than limit=2)
+        setup_session_with_messages(
+            ws,
+            "rust session",
+            &[
+                ("user", "Rust 1"),
+                ("assistant", "Rust 2"),
+                ("user", "Rust 3"),
+                ("assistant", "Rust 4"),
+                ("user", "Rust 5"),
+            ],
+        );
+
+        let tool = EpisodicRecall::new(ws);
+        // limit=2: only 2 matches should be shown, rest truncated
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "Rust", "limit": 2})))
+            .unwrap();
+
+        assert!(
+            output.contains("truncated"),
+            "output with limit=2 for 5 matches should say 'truncated': {output}"
+        );
+    }
+
+    #[test]
+    fn missing_query_returns_error() {
+        // kills `ok_or_else(|| Error::BadToolArgs)` guard removal mutation for missing query
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let tool = EpisodicRecall::new(tmp.path());
+        let res = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({})));
+        assert!(
+            matches!(res, Err(crate::error::Error::BadToolArgs { .. })),
+            "missing 'query' must return BadToolArgs"
+        );
+    }
+
+    #[test]
+    fn session_id_filter_returns_not_found_when_no_match() {
+        // kills `if sessions.is_empty() { return Ok("no sessions found matching ...") }` removal
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        // Create a real session
+        setup_session_with_messages(ws, "goal", &[("user", "hello world")]);
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({
+                "query": "hello",
+                "session_id": "nonexistent-session-xyz"
+            })))
+            .unwrap();
+        assert!(
+            output.contains("no sessions found matching"),
+            "filter to non-existent session must say 'no sessions found matching'; got: {output}"
+        );
+    }
+
+    #[test]
+    fn long_content_is_truncated_to_200_chars() {
+        // kills `if entry.content.len() > 200` guard removal mutations
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let long_content = format!("UNIQUE_PREFIX_{}", "X".repeat(250));
+        setup_session_with_messages(ws, "long content goal", &[("user", &long_content)]);
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "UNIQUE_PREFIX"})))
+            .unwrap();
+
+        // The full 250-char string must NOT appear verbatim
+        assert!(
+            !output.contains(&long_content),
+            "long content must be truncated in output"
+        );
+        // But the prefix must appear
+        assert!(
+            output.contains("UNIQUE_PREFIX"),
+            "truncated content must still contain prefix: {output}"
+        );
+    }
 }

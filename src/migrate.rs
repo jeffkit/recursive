@@ -240,4 +240,45 @@ mod tests {
             assert!(!dotrec.exists());
         });
     }
+
+    #[test]
+    fn libc_exdev_is_18() {
+        // kills `replace libc_exdev -> i32 with 0` and literal mutations
+        assert_eq!(libc_exdev(), 18, "EXDEV must be 18 (the Linux errno for cross-device link)");
+    }
+
+    #[test]
+    fn copy_recursively_copies_file_to_new_path() {
+        // kills `is_dir()` → always-true and function-level replacement mutations
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let dst_dir = tempfile::TempDir::new().unwrap();
+        let src_file = src_dir.path().join("hello.txt");
+        std::fs::write(&src_file, "hello").unwrap();
+
+        let dst_file = dst_dir.path().join("subdir").join("hello.txt");
+        copy_recursively(&src_file, &dst_file).unwrap();
+
+        let content = std::fs::read_to_string(&dst_file).unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn copy_recursively_copies_directory_tree() {
+        // kills mutations in the `is_dir()` branch that handle recursive copies
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let dst_dir = tempfile::TempDir::new().unwrap();
+
+        let sub = src_dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "aaa").unwrap();
+        std::fs::write(src_dir.path().join("b.txt"), "bbb").unwrap();
+
+        let dst = dst_dir.path().join("dest");
+        copy_recursively(src_dir.path(), &dst).unwrap();
+
+        let a = std::fs::read_to_string(dst.join("subdir").join("a.txt")).unwrap();
+        let b = std::fs::read_to_string(dst.join("b.txt")).unwrap();
+        assert_eq!(a, "aaa");
+        assert_eq!(b, "bbb");
+    }
 }

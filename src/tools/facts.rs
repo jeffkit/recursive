@@ -1363,6 +1363,54 @@ mod tests {
         assert!(summary.contains("Second fact"));
     }
 
+    #[test]
+    fn test_o_facts_summary_truncates_long_text() {
+        // kills `if fact.text.chars().count() > 120` guard removal mutations
+        let (_tmp, ws) = tmp_workspace();
+        let remember = RememberFact::new(&ws);
+
+        let long_text = "A".repeat(200); // 200 chars, well above 120 threshold
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": &long_text})))
+            .unwrap();
+
+        let summary = facts_summary(&ws, 5);
+        assert!(
+            !summary.contains(&long_text),
+            "fact text > 120 chars must be truncated in summary"
+        );
+        assert!(
+            summary.contains("..."),
+            "truncated fact must end with '...': {summary}"
+        );
+    }
+
+    #[test]
+    fn test_p_facts_summary_limit_caps_output() {
+        // kills mutations of `.take(limit)` in facts_summary
+        let (_tmp, ws) = tmp_workspace();
+        // Pin HOME to a fresh directory so global facts from other tests
+        // don't leak in (facts_summary merges workspace + global scopes).
+        let fake_home = _tmp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _pin = crate::test_util::PinnedHome::new(&fake_home);
+
+        let remember = RememberFact::new(&ws);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        for i in 1..=5 {
+            rt.block_on(remember.execute(json!({"text": format!("Fact number {i}")})))
+                .unwrap();
+        }
+
+        // limit=2 must show only 2 facts
+        let summary = facts_summary(&ws, 2);
+        // Count occurrences of "Fact number" in summary
+        let count = summary.matches("Fact number").count();
+        assert_eq!(count, 2, "limit=2 must restrict output to 2 facts, got: {summary}");
+    }
+
     // ── FactStore unit tests (internal API) ──────────────────────────────────
 
     fn fresh_fact_store() -> FactStore {

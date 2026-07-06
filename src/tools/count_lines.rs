@@ -154,4 +154,28 @@ mod tests {
         let result = tool.execute(json!({"path": "no_nl.txt"})).await.unwrap();
         assert_eq!(result, "2");
     }
+
+    #[tokio::test]
+    async fn count_lines_missing_path_argument_errors() {
+        // kills `ok_or_else(|| Error::BadToolArgs)` removal mutation
+        let tmp = TempDir::new().unwrap();
+        let tool = CountLines::new(tmp.path());
+        let res = tool.execute(json!({})).await;
+        assert!(
+            matches!(res, Err(Error::BadToolArgs { .. })),
+            "missing 'path' must return BadToolArgs"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_lines_nonexistent_file_errors() {
+        // kills `map_err(|e| Error::Tool {...})` removal mutation
+        let tmp = TempDir::new().unwrap();
+        let tool = CountLines::new(tmp.path());
+        let res = tool.execute(json!({"path": "nonexistent.txt"})).await;
+        assert!(
+            matches!(res, Err(Error::Tool { .. })),
+            "nonexistent file must return Tool error"
+        );
+    }
 }
