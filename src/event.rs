@@ -546,6 +546,35 @@ mod tests {
         assert_eq!(rx2.recv().await.unwrap(), AgentEvent::PlanConfirmed);
     }
 
+    #[test]
+    fn tool_result_is_error_defaults_to_false_when_absent() {
+        // kills `#[serde(default)]` removal mutation on is_error field
+        let json = r#"{"type":"tool_result","id":"x","name":"y","output":"ok","step":0}"#;
+        let event: AgentEvent = serde_json::from_str(json).expect("must deserialize");
+        match event {
+            AgentEvent::ToolResult { is_error, .. } => {
+                assert!(!is_error, "is_error must default to false when absent");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_is_error_true_round_trips() {
+        // kills `is_error: false` mutation in the serialization of ToolResult
+        let event = AgentEvent::ToolResult {
+            id: "c1".into(),
+            name: "Bash".into(),
+            output: "ERROR: oops".into(),
+            step: 3,
+            is_error: true,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("\"is_error\":true"), "is_error=true must be in JSON; got: {json}");
+        let restored: AgentEvent = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(restored, event);
+    }
+
     /// Regression test for Goal 278: MessageAppended no longer has parent_uuid field.
     #[test]
     fn message_appended_no_longer_has_parent_uuid_field() {
