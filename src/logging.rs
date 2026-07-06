@@ -135,6 +135,15 @@ mod tests {
     }
 
     #[test]
+    fn set_tui_quiet_stores_given_value() {
+        // kills `store(!quiet, ...)` or `store(true, ...)` mutations in set_tui_quiet
+        set_tui_quiet(true);
+        assert!(is_tui_quiet(), "must be quiet after set_tui_quiet(true)");
+        set_tui_quiet(false);
+        assert!(!is_tui_quiet(), "must not be quiet after set_tui_quiet(false)");
+    }
+
+    #[test]
     fn guard_restores_even_if_another_guard_already_dropped() {
         // Two nested guards; the inner drop will flip the flag to
         // false even though the outer is still alive. The guard is

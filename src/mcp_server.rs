@@ -376,6 +376,33 @@ mod tests {
     use super::*;
     use crate::mcp::McpServer;
 
+    #[test]
+    fn success_response_has_result_and_no_error() {
+        // kills function-level replacement of success() or field swaps
+        use serde_json::{json, Value};
+        let r = JsonRpcResponse::success(Value::from(1i64), json!({"ok": true}));
+        assert!(r.result.is_some(), "success must have a result");
+        assert!(r.error.is_none(), "success must not have an error");
+        assert_eq!(r.jsonrpc, "2.0");
+    }
+
+    #[test]
+    fn parse_error_uses_negative_code() {
+        // kills `delete -` mutation in -32700
+        let r = JsonRpcResponse::parse_error();
+        let err = r.error.expect("parse_error must have an error");
+        assert_eq!(err.code, -32700, "parse error code must be -32700");
+    }
+
+    #[test]
+    fn method_not_found_uses_correct_negative_code() {
+        // kills `delete -` mutation in -32601
+        use serde_json::Value;
+        let r = JsonRpcResponse::method_not_found(Value::from(42i64));
+        let err = r.error.expect("method_not_found must have an error");
+        assert_eq!(err.code, -32601, "method not found code must be -32601");
+    }
+
     /// Test that an empty server list produces no registrations.
     #[tokio::test]
     async fn empty_servers_registers_nothing() {
