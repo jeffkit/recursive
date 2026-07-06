@@ -141,3 +141,207 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
             .unwrap_or(spec.input_per_million),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::TokenUsage;
+
+    fn default_usage() -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        }
+    }
+
+    // ── RetryPolicy::backoff_for ─────────────────────────────────────────────
+
+    #[test]
+    fn retry_policy_returns_none_when_attempt_exceeds_max() {
+        let policy = RetryPolicy::default(); // max_retries: 2
+        assert!(
+            policy.backoff_for(2, None, true).is_none(),
+            "attempt == max_retries must return None"
+        );
+        assert!(
+            policy.backoff_for(5, None, true).is_none(),
+            "attempt > max_retries must return None"
+        );
+    }
+
+    #[test]
+    fn retry_policy_network_error_returns_some_backoff() {
+        let policy = RetryPolicy::default();
+        let result = policy.backoff_for(0, None, true);
+        assert!(result.is_some(), "network error must trigger retry");
+        assert_eq!(result.unwrap(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retry_policy_status_429_returns_some_backoff() {
+        let policy = RetryPolicy::default();
+        let result = policy.backoff_for(0, Some(429), false);
+        assert!(result.is_some(), "429 must trigger retry");
+    }
+
+    #[test]
+    fn retry_policy_status_503_returns_some_backoff() {
+        let policy = RetryPolicy::default();
+        let result = policy.backoff_for(0, Some(503), false);
+        assert!(result.is_some(), "503 (5xx) must trigger retry");
+    }
+
+    #[test]
+    fn retry_policy_status_200_returns_none() {
+        let policy = RetryPolicy::default();
+        let result = policy.backoff_for(0, Some(200), false);
+        assert!(result.is_none(), "200 OK must not trigger retry");
+    }
+
+    #[test]
+    fn retry_policy_status_400_returns_none() {
+        let policy = RetryPolicy::default();
+        let result = policy.backoff_for(0, Some(400), false);
+        assert!(result.is_none(), "400 client error must not trigger retry");
+    }
+
+    #[test]
+    fn retry_policy_backoff_doubles_per_attempt() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(100),
+        };
+        assert_eq!(policy.backoff_for(0, None, true).unwrap(), Duration::from_secs(1));
+        assert_eq!(policy.backoff_for(1, None, true).unwrap(), Duration::from_secs(2));
+        assert_eq!(policy.backoff_for(2, None, true).unwrap(), Duration::from_secs(4));
+        assert_eq!(policy.backoff_for(3, None, true).unwrap(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn retry_policy_backoff_capped_at_max() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(5),
+        };
+        let b3 = policy.backoff_for(3, None, true).unwrap(); // would be 8s without cap
+        assert_eq!(b3, Duration::from_secs(5), "backoff must be capped at max_backoff");
+    }
+
+    // ── ModelPricing::cost_usd ───────────────────────────────────────────────
+
+    #[test]
+    fn model_pricing_cost_no_tokens_is_zero() {
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_hit_input_per_million: 0.5,
+        };
+        let cost = pricing.cost_usd(default_usage());
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn model_pricing_cost_prompt_only() {
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_hit_input_per_million: 0.5,
+        };
+        let usage = TokenUsage {
+            prompt_tokens: 1_000_000,
+            ..default_usage()
+        };
+        let cost = pricing.cost_usd(usage);
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "1M input tokens at $1/M must cost $1, got {cost}"
+        );
+    }
+
+    #[test]
+    fn model_pricing_cost_completion_only() {
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 3.0,
+            cache_hit_input_per_million: 0.5,
+        };
+        let usage = TokenUsage {
+            completion_tokens: 1_000_000,
+            ..default_usage()
+        };
+        let cost = pricing.cost_usd(usage);
+        assert!(
+            (cost - 3.0).abs() < 1e-9,
+            "1M completion tokens at $3/M must cost $3, got {cost}"
+        );
+    }
+
+    #[test]
+    fn model_pricing_cost_reasoning_tokens_add_to_output() {
+        let pricing = ModelPricing {
+            input_per_million: 0.0,
+            output_per_million: 1.0,
+            cache_hit_input_per_million: 0.0,
+        };
+        let usage = TokenUsage {
+            completion_tokens: 500_000,
+            reasoning_tokens: 500_000,
+            ..default_usage()
+        };
+        let cost = pricing.cost_usd(usage);
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "completion + reasoning = 1M output tokens at $1/M must cost $1, got {cost}"
+        );
+    }
+
+    #[test]
+    fn model_pricing_cost_cache_hit_applies_discounted_rate() {
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 0.0,
+            cache_hit_input_per_million: 0.1,
+        };
+        // 500K cache hits + 500K cache miss = $0.05 + $0.50 = $0.55
+        let usage = TokenUsage {
+            cache_hit_tokens: 500_000,
+            cache_miss_tokens: 500_000,
+            ..default_usage()
+        };
+        let cost = pricing.cost_usd(usage);
+        let expected = 0.5 * 0.1 + 0.5 * 1.0; // 0.05 + 0.50
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "cache-hit tokens use discounted rate, got {cost} vs {expected}"
+        );
+    }
+
+    // ── context_window_tokens_for_model ─────────────────────────────────────
+
+    #[test]
+    fn context_window_unknown_model_returns_fallback() {
+        let w = context_window_tokens_for_model("totally-unknown-model-xyz");
+        assert_eq!(w, 128_000, "unknown models must fall back to 128K");
+    }
+
+    // ── default_compact_threshold_chars ─────────────────────────────────────
+
+    #[test]
+    fn compact_threshold_unknown_model_uses_fallback_128k() {
+        let threshold = default_compact_threshold_chars("unknown-xyz");
+        // 128_000 - min(20_000, 32_000)=20_000 → 108_000 * 0.8 * 4 = 345_600
+        assert_eq!(threshold, 345_600);
+    }
+
+    #[test]
+    fn compact_threshold_is_positive() {
+        let t = default_compact_threshold_chars("gpt-4o");
+        assert!(t > 0, "compact threshold must be positive for any model");
+    }
+}
