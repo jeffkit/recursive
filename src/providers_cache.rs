@@ -409,4 +409,94 @@ mod tests {
         assert_eq!(loaded.providers[0].id, "roundtrip");
         Ok(())
     }
+
+    // ── Additional gap-filling tests ─────────────────────────────────────────
+
+    #[test]
+    fn cache_ttl_is_seven_days() {
+        let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(CACHE_TTL, seven_days, "CACHE_TTL must be exactly 7 days");
+    }
+
+    #[test]
+    fn configured_url_returns_default_when_env_unset() {
+        let _lock = crate::test_util::env_lock();
+        std::env::remove_var(PROVIDERS_URL_ENV);
+        let url = configured_url();
+        assert_eq!(url, DEFAULT_PROVIDERS_URL, "must return default when env var unset");
+    }
+
+    #[test]
+    fn configured_url_honors_env_override() {
+        let _lock = crate::test_util::env_lock();
+        let custom = "https://custom.example.com/providers.json";
+        std::env::set_var(PROVIDERS_URL_ENV, custom);
+        let url = configured_url();
+        std::env::remove_var(PROVIDERS_URL_ENV);
+        assert_eq!(url, custom);
+    }
+
+    #[test]
+    fn validate_url_rejects_192_168_private() {
+        assert!(validate_providers_url("http://192.168.1.1/x").is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_172_16_private() {
+        assert!(validate_providers_url("http://172.16.0.1/x").is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_ipv6_loopback() {
+        assert!(validate_providers_url("http://[::1]/x").is_err());
+    }
+
+    #[test]
+    fn validate_url_accepts_http_public() {
+        assert!(validate_providers_url("http://example.com/providers.json").is_ok());
+    }
+
+    #[test]
+    fn is_non_routable_ip_loopback_true() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(is_non_routable_ip(ip));
+    }
+
+    #[test]
+    fn is_non_routable_ip_private_true() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(is_non_routable_ip(ip));
+        let ip2: IpAddr = "192.168.0.1".parse().unwrap();
+        assert!(is_non_routable_ip(ip2));
+    }
+
+    #[test]
+    fn is_non_routable_ip_public_false() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!is_non_routable_ip(ip));
+    }
+
+    #[test]
+    fn needs_update_false_when_fresh_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let _pin = PinnedRecursiveHome::new(tmp.path());
+
+        // Write a fresh cache file
+        let path = cache_path();
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let cache = ProvidersCache {
+            schema_version: 1,
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            source_url: "https://example.com/providers.json".to_string(),
+            providers: vec![],
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&cache)?)?;
+
+        // File was just written — modification time is NOW → not stale
+        assert!(!needs_update(), "freshly written cache must not need update");
+        Ok(())
+    }
 }
