@@ -710,4 +710,35 @@ mod goal_h2_perm_pipeline {
              runs even when `permissions` is None)"
         );
     }
+
+    // ── CheckOutcome::is_deny targeted tests ─────────────────────────────────
+
+    #[test]
+    fn check_outcome_is_deny_false_for_allow_outcome() {
+        // kills `replace CheckOutcome::is_deny -> bool with true`
+        use crate::tools::permission_pipeline::CheckOutcome;
+        let outcome = CheckOutcome::Allow {
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        assert!(
+            !outcome.is_deny(),
+            "Allow outcome must NOT be a deny (is_deny must return false)"
+        );
+    }
+
+    #[test]
+    fn check_outcome_is_deny_true_for_deny_outcome() {
+        // complementary: Deny variant must return true
+        use crate::tools::permission_pipeline::CheckOutcome;
+        let err = crate::error::Error::BadToolArgs {
+            name: "test".into(),
+            message: "blocked".into(),
+        };
+        let audit = crate::tools::AuditMeta::synthetic_unknown_tool("test");
+        let outcome = CheckOutcome::Deny { error: err, audit };
+        assert!(
+            outcome.is_deny(),
+            "Deny outcome must return true from is_deny()"
+        );
+    }
 }
