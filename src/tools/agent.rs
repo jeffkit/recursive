@@ -941,6 +941,34 @@ mod tests {
         assert_eq!(AgentMode::parse("unknown"), None);
     }
 
+    #[test]
+    fn parse_manifest_empty_object_is_error() {
+        // kills `if obj.is_empty() { return Err(...) }` guard removal mutation
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+        let err = agent.parse_manifest(&json!({})).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("at least one entry"),
+            "empty manifest must error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_manifest_non_object_is_error() {
+        // kills `value.as_object().ok_or_else(...)` mutation
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+        let err = agent.parse_manifest(&json!("not an object")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must be a JSON object"),
+            "non-object manifest must error; got: {msg}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Definition resolution tests
     // ------------------------------------------------------------------
