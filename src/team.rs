@@ -582,4 +582,76 @@ mod tests {
         let m: TeamMember = serde_json::from_str(j).unwrap();
         assert_eq!(m.status, TeammateStatus::Idle);
     }
+
+    // ── Gap-filling tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_team_name_accepts_valid_names() {
+        assert!(validate_team_name("alpha").is_ok());
+        assert!(validate_team_name("my-team-123").is_ok());
+        assert!(validate_team_name("team_v2").is_ok());
+    }
+
+    #[test]
+    fn validate_team_name_rejects_empty() {
+        assert!(validate_team_name("").is_err(), "empty name must be rejected");
+    }
+
+    #[test]
+    fn validate_team_name_rejects_slash() {
+        assert!(validate_team_name("etc/passwd").is_err(), "/ must be rejected");
+    }
+
+    #[test]
+    fn validate_team_name_rejects_backslash() {
+        assert!(validate_team_name("etc\\passwd").is_err(), r"\ must be rejected");
+    }
+
+    #[test]
+    fn validate_team_name_rejects_dotdot() {
+        assert!(validate_team_name("..").is_err(), ".. must be rejected");
+        assert!(validate_team_name("../escape").is_err(), "../escape must be rejected");
+    }
+
+    #[test]
+    fn validate_team_name_rejects_leading_dot() {
+        assert!(validate_team_name(".hidden").is_err(), ".hidden must be rejected");
+    }
+
+    #[test]
+    fn team_file_get_member_mut_modifies_in_place() {
+        let mut tf = TeamFile::new("test");
+        tf.add_member(TeamMember::new("dev", "general"));
+        {
+            let m = tf.get_member_mut("dev").expect("must find 'dev'");
+            m.model = "gpt-4o".to_string();
+        }
+        assert_eq!(tf.get_member("dev").unwrap().model, "gpt-4o");
+    }
+
+    #[test]
+    fn team_file_get_member_mut_returns_none_for_unknown() {
+        let mut tf = TeamFile::new("test");
+        assert!(tf.get_member_mut("ghost").is_none());
+    }
+
+    #[test]
+    fn team_file_path_contains_team_name() {
+        let _g = with_temp_teams_dir();
+        let path = team_file_path("my-team");
+        assert!(
+            path.to_string_lossy().contains("my-team.json"),
+            "path must contain 'my-team.json', got: {path:?}"
+        );
+    }
+
+    #[test]
+    fn teams_dir_honors_env_var() {
+        let _lock = crate::test_util::env_lock();
+        let custom = "/tmp/custom-teams-dir";
+        std::env::set_var("RECURSIVE_TEAMS_DIR", custom);
+        let dir = teams_dir();
+        std::env::remove_var("RECURSIVE_TEAMS_DIR");
+        assert_eq!(dir, std::path::PathBuf::from(custom));
+    }
 }
