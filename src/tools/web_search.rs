@@ -706,6 +706,35 @@ mod tests {
     }
 
     #[test]
+    fn num_results_clamped_to_min() {
+        // kills `clamp(1, ...)` lower-bound mutation: 0 must become 1
+        let clamped = 0u64.clamp(1, MAX_NUM_RESULTS);
+        assert_eq!(clamped, 1, "0 must clamp to minimum 1");
+    }
+
+    #[test]
+    fn format_results_uses_double_newline_separator() {
+        // kills `join("\n")` vs `join("\n\n")` mutations
+        let results = vec![
+            SearchResult {
+                title: "A".to_string(),
+                url: "http://a.com".to_string(),
+                snippet: "snippet-a".to_string(),
+            },
+            SearchResult {
+                title: "B".to_string(),
+                url: "http://b.com".to_string(),
+                snippet: "snippet-b".to_string(),
+            },
+        ];
+        let out = WebSearch::format_results(&results);
+        assert!(
+            out.contains("\n\n"),
+            "results must be separated by double newline; got: {out:?}"
+        );
+    }
+
+    #[test]
     fn spec_name_and_description() {
         let spec = WebSearch::new().spec();
         assert_eq!(spec.name, "WebSearch");
