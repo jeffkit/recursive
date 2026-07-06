@@ -473,4 +473,61 @@ mod tests {
         assert_eq!(reg.len().await, 0);
         assert!(!reg.forget(&id).await);
     }
+
+    // ── Gap-filling tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn task_status_as_str_returns_correct_strings() {
+        assert_eq!(TaskStatus::Running.as_str(), "running");
+        assert_eq!(TaskStatus::Completed.as_str(), "completed");
+        assert_eq!(TaskStatus::Failed.as_str(), "failed");
+        assert_eq!(TaskStatus::Stopped.as_str(), "stopped");
+    }
+
+    #[test]
+    fn task_id_display_format() {
+        let id = TaskId("task-abc123".into());
+        assert_eq!(id.to_string(), "task-abc123");
+        assert_eq!(format!("{id}"), "task-abc123");
+    }
+
+    #[tokio::test]
+    async fn drain_output_returns_correct_count() {
+        let reg = TaskRegistry::new();
+        let (state, id) = TaskState::new("t", "", "");
+        let arc = reg.register(state).await;
+
+        // Append 3 lines via channel
+        arc.output_tx.send("a".into()).unwrap();
+        arc.output_tx.send("b".into()).unwrap();
+        arc.output_tx.send("c".into()).unwrap();
+        drop(arc);
+
+        let count = reg.drain_output(&id).await;
+        assert_eq!(count, 3, "drain must return the exact number of lines drained");
+
+        // A second drain with no new lines returns 0
+        assert_eq!(reg.drain_output(&id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_without_handle_returns_false() {
+        let reg = TaskRegistry::new();
+        let (state, id) = TaskState::new("t", "", "");
+        let _ = reg.register(state).await;
+
+        // No handle set — stop returns false (nothing to cancel)
+        let stopped = reg.stop(&id).await;
+        assert!(!stopped, "stop without handle must return false");
+    }
+
+    #[tokio::test]
+    async fn task_state_output_snapshot_empty_initially() {
+        let reg = TaskRegistry::new();
+        let (state, id) = TaskState::new("task", "team", "name");
+        let _ = reg.register(state).await;
+        let got = reg.get(&id).await.unwrap();
+        let snap = got.output_snapshot().await;
+        assert!(snap.is_empty(), "output must be empty before any drain");
+    }
 }
