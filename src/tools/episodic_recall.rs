@@ -413,4 +413,34 @@ mod tests {
         );
         assert!(summary.contains("1 msgs"), "summary: {summary}");
     }
+
+    #[test]
+    fn episodic_recall_summary_truncates_long_goals() {
+        // kills `replace > with >=` or `delete if meta.goal.len() > 80` truncation check
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let long_goal = "A".repeat(100); // 100 chars, well above the 80-char threshold
+        setup_session_with_messages(ws, &long_goal, &[("user", "hello")]);
+
+        let summary = episodic_recall_summary(ws, 5);
+        // Long goal must be truncated: summary should end with "..."
+        assert!(
+            summary.contains("..."),
+            "goal > 80 chars must be truncated with '...': {summary}"
+        );
+        // The truncated version must NOT contain the full 100-char string
+        assert!(
+            !summary.contains(&long_goal),
+            "full long goal must not appear verbatim: {summary}"
+        );
+    }
+
+    #[test]
+    fn is_deferred_is_true() {
+        // kills `replace EpisodicRecall::is_deferred -> bool with false`
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let tool = EpisodicRecall::new(tmp.path());
+        assert!(tool.is_deferred(), "episodic_recall must be a deferred tool");
+    }
 }
