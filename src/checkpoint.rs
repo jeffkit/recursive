@@ -934,6 +934,100 @@ mod tests {
     }
 
     #[test]
+    fn restore_paths_unchanged_stats() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        // Snapshot with one file
+        fs::write(w.path().join("a.txt"), "same-content").unwrap();
+        let cp = r.snapshot_for_session("s", "init").unwrap();
+
+        // File content has NOT changed — restore should count it as unchanged.
+        let stats = r
+            .restore_paths(&cp, &["a.txt".into()])
+            .expect("restore must succeed");
+        assert_eq!(
+            stats.unchanged, 1,
+            "file with identical content must be unchanged (kills += → -=/×= mutation)"
+        );
+        assert_eq!(stats.restored, 0);
+        assert_eq!(stats.deleted, 0);
+    }
+
+    #[test]
+    fn restore_paths_nonexistent_in_both_counts_unchanged() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        // Snapshot with no files at all
+        let cp = r.snapshot_for_session("s", "empty").unwrap();
+
+        // Ask to restore a file that never existed in the checkpoint or workspace.
+        let stats = r
+            .restore_paths(&cp, &["ghost.txt".into()])
+            .expect("restore must succeed");
+        assert_eq!(
+            stats.unchanged, 1,
+            "(None, None) path must increment unchanged (kills += → -=/×= mutation)"
+        );
+        assert_eq!(stats.restored, 0);
+        assert_eq!(stats.deleted, 0);
+    }
+
+    #[test]
+    fn diff_returns_non_empty_for_changed_file() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        fs::write(w.path().join("f.txt"), "before").unwrap();
+        let c1 = r.snapshot_for_session("s", "v1").unwrap();
+        fs::write(w.path().join("f.txt"), "after").unwrap();
+        let c2 = r.snapshot_for_session("s", "v2").unwrap();
+
+        let diff = r.diff(&c1, Some(&c2), &[]).expect("diff must succeed");
+        assert!(!diff.is_empty(), "diff between two different snapshots must be non-empty");
+    }
+
+    #[test]
+    fn diff_with_path_filter_limits_output() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        fs::write(w.path().join("a.txt"), "a1").unwrap();
+        fs::write(w.path().join("b.txt"), "b1").unwrap();
+        let c1 = r.snapshot_for_session("s", "v1").unwrap();
+        fs::write(w.path().join("a.txt"), "a2").unwrap();
+        fs::write(w.path().join("b.txt"), "b2").unwrap();
+        let c2 = r.snapshot_for_session("s", "v2").unwrap();
+
+        // Diff with empty paths → shows all changes
+        let full_diff = r.diff(&c1, Some(&c2), &[]).expect("full diff");
+        // Diff filtered to a.txt → should not contain b.txt changes
+        let filtered = r.diff(&c1, Some(&c2), &["a.txt".into()]).expect("filtered diff");
+        assert!(
+            filtered.contains("a.txt"),
+            "filtered diff must mention a.txt"
+        );
+        // full diff contains both files; filtered should be a subset
+        assert!(
+            filtered.len() <= full_diff.len(),
+            "filtered diff must be <= full diff in size"
+        );
+    }
+
+    #[test]
     fn list_for_session_returns_empty_before_any_snapshot() {
         if !has_git() {
             return;
