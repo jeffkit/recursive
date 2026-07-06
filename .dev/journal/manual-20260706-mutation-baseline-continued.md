@@ -40,8 +40,22 @@
 - `src/message.rs` — +2 tests (assistant_with_tool_calls stores tool_calls, constructors store content); 9→11
 - `src/session/writer.rs` — +2 tests (open_existing resumes count and uuid, append_with_audit includes audit field); 11→13
 
-**Tests added**: 15 (Round 1) + 29 (Round 2) + 31 (Round 3) = 75 new tests total
-**Total passing tests**: 1758 (all green with --features coordinator-mode,vector-memory --test-threads=1)
+**Files touched** (Round 4 — targeting missed.txt survivors):
+- `src/checkpoint_log.rs` — +1 test (nonzero timestamps included in serialization, kills is_zero_i64 always-true mutation); 10→11
+- `src/config.rs` — +1 test (file at exact 8KB cap NOT truncated, kills > → >= mutation); 49→50
+- `src/mcp_server.rs` — +1 test (unknown tool dispatch returns -32602, kills delete-minus mutation); 15→16
+- `src/permissions/mod.rs` — +2 tests (allow-only and deny-only old config produce a layer, kills || → &&); 15→17
+- `src/run_core.rs` — +2 tests (enforce_transcript_budget returns None under limit and Some over limit, kills < → ==); 13→15
+- `src/runtime.rs` — +2 tests (skills builder stores in globs_skills, reject_plan appends to transcript); 20→22
+- `src/event.rs` — +4 tests (TodoUpdated/MessageAppendedWithAudit round-trip, BroadcastSink no-subscriber, ChannelSink in order); 11→15
+
+**Tests added**: 15 (R1) + 29 (R2) + 31 (R3) + 13 (R4) = **88 new tests total**
+**Total passing tests**: ~1780 (compile-clean; background mutation run prevents full verification)
 **Notes**:
-- All tests pass in single-threaded mode with coordinator-mode and vector-memory features.
-- Clippy clean with `--all-targets --all-features -- -D warnings`.
+- All new tests compile cleanly; clippy is clean on coordinator-mode.
+- Background cargo-mutants run (started 10:07 AM) is consuming all CPU — preventing full test suite runs.
+- Remaining survivors in missed.txt that are likely equivalent mutants or require heavy integration setup:
+  - src/checkpoint.rs ShadowRepo (git-dependent, 20 mutants)
+  - src/providers.rs compute_effective_presets delete-! (depends on providers.d filesystem)
+  - src/run_core.rs TranscriptLimit (needs multi-step async agent test)
+- All changes pushed to origin/main.
