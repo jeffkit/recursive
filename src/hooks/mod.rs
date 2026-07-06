@@ -684,4 +684,76 @@ mod tests {
         });
         assert!(matches!(action, HookAction::Continue));
     }
+
+    // ── guard mutant coverage: is_pre_tool guard must be checked correctly ────
+
+    /// A hook that unconditionally returns Skip for ANY event (including
+    /// non-PreToolCall events like SessionStart). This lets us distinguish
+    /// `is_pre_tool → true` (mutant) from the correct `is_pre_tool` guard.
+    struct AlwaysSkipHook;
+    impl Hook for AlwaysSkipHook {
+        fn on_event(&self, _event: HookEvent) -> HookAction {
+            HookAction::Skip
+        }
+    }
+
+    /// A hook that unconditionally returns Error for ANY event.
+    struct AlwaysErrorHook;
+    impl Hook for AlwaysErrorHook {
+        fn on_event(&self, _event: HookEvent) -> HookAction {
+            HookAction::Error("always".into())
+        }
+    }
+
+    #[test]
+    fn skip_on_non_pre_tool_call_event_is_treated_as_continue() {
+        // AlwaysSkipHook returns HookAction::Skip even for SessionStart.
+        // The dispatch must still return Continue because `is_pre_tool = false`.
+        // With mutant `replace match guard is_pre_tool with true` (line 205):
+        //   `HookAction::Skip if true => return HookAction::Skip`
+        //   → dispatch returns Skip for SessionStart → this test FAILS → mutant KILLED.
+        let mut reg = HookRegistry::new();
+        reg.register(Arc::new(AlwaysSkipHook));
+        let action = reg.dispatch(HookEvent::SessionStart { goal: "test" });
+        assert!(
+            matches!(action, HookAction::Continue),
+            "Skip from a non-PreToolCall hook must be treated as Continue"
+        );
+    }
+
+    #[test]
+    fn error_on_non_pre_tool_call_event_is_treated_as_continue() {
+        // AlwaysErrorHook returns HookAction::Error even for SessionStart.
+        // The dispatch must still return Continue because `is_pre_tool = false`.
+        // With mutant `replace match guard is_pre_tool with true` (line 206):
+        //   `HookAction::Error(msg) if true => return HookAction::Error(msg)`
+        //   → dispatch returns Error for SessionStart → this test FAILS → mutant KILLED.
+        let mut reg = HookRegistry::new();
+        reg.register(Arc::new(AlwaysErrorHook));
+        let action = reg.dispatch(HookEvent::SessionStart { goal: "test" });
+        assert!(
+            matches!(action, HookAction::Continue),
+            "Error from a non-PreToolCall hook must be treated as Continue"
+        );
+    }
+
+    #[test]
+    fn has_hooks_true_when_registered() {
+        // kills has_hooks → bool with false and delete !
+        let mut reg = HookRegistry::new();
+        assert!(!reg.has_hooks(), "empty registry has no hooks");
+        reg.register(Arc::new(AlwaysSkipHook));
+        assert!(reg.has_hooks(), "non-empty registry has hooks");
+    }
+
+    #[test]
+    fn is_empty_and_len_reflect_registration() {
+        // kills is_empty → bool with true/false and len → 0/1
+        let mut reg = HookRegistry::new();
+        assert!(reg.is_empty(), "fresh registry must be empty");
+        assert_eq!(reg.len(), 0, "fresh registry len must be 0");
+        reg.register(Arc::new(AlwaysSkipHook));
+        assert!(!reg.is_empty(), "after register, registry must not be empty");
+        assert_eq!(reg.len(), 1, "after one register, len must be 1");
+    }
 }
