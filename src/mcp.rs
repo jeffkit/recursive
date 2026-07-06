@@ -2051,4 +2051,34 @@ mod tests {
             "unknown SSE field must reset accumulator; incomplete JSON should yield None"
         );
     }
+
+    // ── JsonRpcResponse builder tests ─────────────────────────────────────────
+
+    #[test]
+    fn method_not_found_uses_negative_error_code() {
+        // kills `delete - in JsonRpcResponse::method_not_found` (line 1149)
+        // Mutant changes -32601 → 32601; this test catches it.
+        let resp = JsonRpcResponse::method_not_found(Some(serde_json::json!(1)), "unknown_method");
+        let err_obj = resp.error.expect("method_not_found must set the error field");
+        assert_eq!(
+            err_obj.code, -32601,
+            "method_not_found must use the JSON-RPC -32601 error code (negative)"
+        );
+        assert!(
+            err_obj.message.contains("unknown_method"),
+            "error message must include the method name: {}",
+            err_obj.message
+        );
+    }
+
+    #[test]
+    fn internal_error_uses_negative_error_code() {
+        // kills `delete - in JsonRpcResponse::internal_error` (analogous to line 1149)
+        let resp = JsonRpcResponse::internal_error(None, "something failed");
+        let err_obj = resp.error.expect("internal_error must set the error field");
+        assert_eq!(
+            err_obj.code, -32603,
+            "internal_error must use the JSON-RPC -32603 error code (negative)"
+        );
+    }
 }
