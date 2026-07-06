@@ -1168,4 +1168,49 @@ mod tests {
         );
         let _ = (c1, c2); // suppress unused warnings
     }
+
+    #[test]
+    fn count_diff_files_reflects_multiple_changed_files() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        // First snapshot: 1 file
+        fs::write(w.path().join("x.txt"), "first").unwrap();
+        let _c1 = r.snapshot_for_session("sess", "t0").unwrap();
+
+        // Second snapshot: change 3 distinct files
+        fs::write(w.path().join("x.txt"), "changed").unwrap();
+        fs::write(w.path().join("y.txt"), "new-y").unwrap();
+        fs::write(w.path().join("z.txt"), "new-z").unwrap();
+        let _c2 = r.snapshot_for_session("sess", "t1").unwrap();
+
+        let list = r.list_for_session("sess").unwrap();
+        assert_eq!(list.len(), 2);
+        // list[0] is newest (t1), which touched 3 files
+        assert!(
+            list[0].files_changed >= 2,
+            "3 changed files must yield files_changed >= 2, got {}",
+            list[0].files_changed
+        );
+    }
+
+    #[test]
+    fn validate_session_id_rejects_backslash_alone() {
+        // backslash alone must be rejected (not just slash+backslash together)
+        assert!(validate_session_id("a\\b").is_err());
+        // ensure a plain slash is still rejected independently
+        assert!(validate_session_id("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_invalid_chars() {
+        // Characters like '!' and '@' are not alphanumeric/-/_/.
+        assert!(validate_session_id("a!b").is_err());
+        assert!(validate_session_id("a@b").is_err());
+        // Valid
+        assert!(validate_session_id("a_b-c.d1").is_ok());
+    }
 }

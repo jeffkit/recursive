@@ -219,4 +219,45 @@ mod tests {
         truncate_to_turn(&path, 0).unwrap();
         assert!(read_log(&path).unwrap().is_empty());
     }
+
+    #[test]
+    fn is_zero_i64_returns_true_for_zero() {
+        assert!(is_zero_i64(&0_i64));
+    }
+
+    #[test]
+    fn is_zero_i64_returns_false_for_positive() {
+        assert!(!is_zero_i64(&1_i64));
+        assert!(!is_zero_i64(&1000_i64));
+    }
+
+    #[test]
+    fn is_zero_i64_returns_false_for_negative() {
+        assert!(!is_zero_i64(&-1_i64));
+    }
+
+    #[test]
+    fn nonzero_timestamps_survive_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ts.jsonl");
+        let w = CheckpointLogWriter::open(&path).unwrap();
+        let mut r = rec(0, "ts-test");
+        r.started_at = 1_700_000_000;
+        r.finished_at = 1_700_000_001;
+        r.saved_at = 1_700_000_002;
+        w.append(&r).unwrap();
+        let rows = read_log(&path).unwrap();
+        assert_eq!(rows[0].started_at, 1_700_000_000);
+        assert_eq!(rows[0].finished_at, 1_700_000_001);
+        assert_eq!(rows[0].saved_at, 1_700_000_002);
+    }
+
+    #[test]
+    fn zero_timestamps_are_skipped_in_serialization() {
+        let r = rec(0, "z");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("started_at"), "zero started_at should be skipped");
+        assert!(!json.contains("finished_at"), "zero finished_at should be skipped");
+        assert!(!json.contains("saved_at"), "zero saved_at should be skipped");
+    }
 }
