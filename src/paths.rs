@@ -220,4 +220,71 @@ mod tests {
         // from the migrator's perspective.
         assert!(legacy_paths_in_workspace(workspace.path()).is_empty());
     }
+
+    // ── user_sessions_dir creates dir even when it doesn't exist ─────────────
+
+    #[test]
+    fn user_sessions_dir_creates_dir_when_absent() {
+        // kills `delete ! in user_sessions_dir` line 67
+        let home = tempfile::tempdir().unwrap();
+        let _g = PinnedRecursiveHome::new(home.path());
+        // Ensure RECURSIVE_SESSIONS_DIR is not set
+        let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = user_sessions_dir(workspace.path()).unwrap();
+        assert!(
+            sessions.exists(),
+            "user_sessions_dir must create the directory if absent, got: {sessions:?}"
+        );
+        assert!(
+            sessions.ends_with("sessions"),
+            "path must end with 'sessions', got: {sessions:?}"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+            None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+        }
+    }
+
+    // ── user_shadow_git_dir / user_scratchpad_path path components ───────────
+
+    #[test]
+    fn user_shadow_git_dir_ends_with_shadow_git() {
+        // kills `replace user_shadow_git_dir -> Result<PathBuf> with Ok(Default::default())`
+        let home = tempfile::tempdir().unwrap();
+        let _g = PinnedRecursiveHome::new(home.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let p = user_shadow_git_dir(workspace.path()).unwrap();
+        assert!(
+            p.ends_with("shadow-git"),
+            "user_shadow_git_dir must end with 'shadow-git', got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn user_scratchpad_path_ends_with_scratchpad_json() {
+        // kills `replace user_scratchpad_path -> Result<PathBuf> with Ok(Default::default())`
+        let home = tempfile::tempdir().unwrap();
+        let _g = PinnedRecursiveHome::new(home.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let p = user_scratchpad_path(workspace.path()).unwrap();
+        assert!(
+            p.ends_with("scratchpad.json"),
+            "user_scratchpad_path must end with 'scratchpad.json', got: {p:?}"
+        );
+    }
+
+    // ── workspace_hash properties ─────────────────────────────────────────────
+
+    #[test]
+    fn workspace_hash_is_non_empty_and_12_chars() {
+        // kills `replace workspace_hash_from_canonical -> String with String::new()`
+        let h = workspace_hash(Path::new("/tmp/workspace-hash-test"));
+        assert_eq!(h.len(), 12, "hash must be exactly 12 chars");
+        assert!(!h.is_empty(), "hash must not be empty");
+        assert_ne!(h, "xyzzy", "hash must not be placeholder");
+    }
 }
