@@ -905,3 +905,209 @@ impl Tool for ScratchpadList {
         Ok(keys.join("\n"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── MemoryStore helpers ──────────────────────────────────────────────────
+
+    fn fresh_store() -> MemoryStore {
+        MemoryStore::default()
+    }
+
+    // --- load ---
+
+    #[test]
+    fn load_returns_empty_store_when_file_missing() {
+        let store = MemoryStore::load(std::path::Path::new("/nonexistent/path/memory.json"))
+            .expect("missing file should return empty store, not an error");
+        assert!(store.notes.is_empty());
+    }
+
+    #[test]
+    fn load_parses_existing_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let json = r#"{"notes":[{"id":"N1","tags":["rust"],"text":"hello","ts":"2026-01-01T00:00:00Z"}]}"#;
+        std::fs::write(tmp.path(), json).unwrap();
+        let store = MemoryStore::load(tmp.path()).expect("valid file must load");
+        assert_eq!(store.notes.len(), 1);
+        assert_eq!(store.notes[0].id, "N1");
+        assert_eq!(store.notes[0].text, "hello");
+    }
+
+    // --- save + load round-trip ---
+
+    #[test]
+    fn save_and_reload_round_trip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut store = fresh_store();
+        store.add("round-trip text".into(), vec!["rt".into()]);
+        store.save(tmp.path()).expect("save must succeed");
+
+        let loaded = MemoryStore::load(tmp.path()).expect("reload must succeed");
+        assert_eq!(loaded.notes.len(), 1);
+        assert_eq!(loaded.notes[0].text, "round-trip text");
+    }
+
+    // --- next_id ---
+
+    #[test]
+    fn next_id_on_empty_store_is_n1() {
+        assert_eq!(fresh_store().next_id(), "N1");
+    }
+
+    #[test]
+    fn next_id_increments_past_existing_notes() {
+        let mut store = fresh_store();
+        store.add("first".into(), vec![]);
+        store.add("second".into(), vec![]);
+        assert_eq!(store.next_id(), "N3");
+    }
+
+    // --- add ---
+
+    #[test]
+    fn add_returns_the_assigned_id() {
+        let mut store = fresh_store();
+        let id = store.add("my note".into(), vec!["tag1".into()]);
+        assert_eq!(id, "N1", "first add must return N1");
+        assert_eq!(store.notes[0].id, "N1");
+        assert_eq!(store.notes[0].text, "my note");
+    }
+
+    #[test]
+    fn add_second_note_gets_n2() {
+        let mut store = fresh_store();
+        store.add("a".into(), vec![]);
+        let id2 = store.add("b".into(), vec![]);
+        assert_eq!(id2, "N2");
+        assert_eq!(store.notes.len(), 2);
+    }
+
+    // --- remove ---
+
+    #[test]
+    fn remove_existing_note_returns_true() {
+        let mut store = fresh_store();
+        let id = store.add("to remove".into(), vec![]);
+        assert!(store.remove(&id), "remove existing must return true");
+        assert!(store.notes.is_empty(), "note must actually be gone");
+    }
+
+    #[test]
+    fn remove_absent_note_returns_false() {
+        let mut store = fresh_store();
+        assert!(!store.remove("N999"), "remove absent must return false");
+    }
+
+    #[test]
+    fn remove_only_removes_target_note() {
+        let mut store = fresh_store();
+        let id1 = store.add("keep".into(), vec![]);
+        let id2 = store.add("remove me".into(), vec![]);
+        assert!(store.remove(&id2));
+        assert_eq!(store.notes.len(), 1);
+        assert_eq!(store.notes[0].id, id1);
+    }
+
+    // --- search ---
+
+    #[test]
+    fn search_finds_by_text_substring() {
+        let mut store = fresh_store();
+        store.add("hello world".into(), vec![]);
+        store.add("goodbye".into(), vec![]);
+        let results = store.search(Some("hello"), None, 10);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].text.contains("hello"));
+    }
+
+    #[test]
+    fn search_finds_by_tag_in_text_or_tag_field() {
+        let mut store = fresh_store();
+        // Note with keyword only in the tags field (not text)
+        store.add("general note".into(), vec!["special-tag".into()]);
+        // Search by query that matches the tag string
+        let results = store.search(Some("special-tag"), None, 10);
+        assert_eq!(results.len(), 1, "search must find query match in tags via || branch");
+    }
+
+    #[test]
+    fn search_exact_tag_filter() {
+        let mut store = fresh_store();
+        store.add("rust note".into(), vec!["rust".into()]);
+        store.add("go note".into(), vec!["go".into()]);
+        let results = store.search(None, Some("rust"), 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tags[0], "rust");
+    }
+
+    #[test]
+    fn search_limit_applies() {
+        let mut store = fresh_store();
+        for i in 0..5 {
+            store.add(format!("note {i}"), vec![]);
+        }
+        let results = store.search(None, None, 3);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_no_match_returns_empty() {
+        let mut store = fresh_store();
+        store.add("hello".into(), vec![]);
+        let results = store.search(Some("zzz_no_match"), None, 10);
+        assert!(results.is_empty());
+    }
+
+    // --- chrono_now_rfc3339 ---
+
+    #[test]
+    fn chrono_now_rfc3339_is_nonempty_and_not_placeholder() {
+        let ts = chrono_now_rfc3339();
+        assert!(!ts.is_empty(), "timestamp must not be empty");
+        assert_ne!(ts, "xyzzy", "timestamp must not be placeholder");
+        // Must match RFC 3339 pattern: YYYY-MM-DDTHH:MM:SSZ
+        assert!(
+            ts.len() >= 20 && ts.ends_with('Z'),
+            "timestamp must end with Z; got: {ts}"
+        );
+        assert!(ts.contains('T'), "timestamp must contain T separator; got: {ts}");
+    }
+
+    #[test]
+    fn chrono_now_rfc3339_year_is_plausible() {
+        let ts = chrono_now_rfc3339();
+        let year: u32 = ts[..4].parse().expect("first 4 chars must be a year");
+        assert!(year >= 2024, "year must be >= 2024; got {year}");
+    }
+
+    // --- days_to_date ---
+
+    #[test]
+    fn days_to_date_day_zero_is_unix_epoch() {
+        assert_eq!(days_to_date(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_date_day_365_is_1971_01_01() {
+        assert_eq!(days_to_date(365), (1971, 1, 1));
+    }
+
+    #[test]
+    fn days_to_date_leap_year_day_60_is_feb_29() {
+        // 1972 is a leap year. Day 365 (1971-01-01) + 365 (1971) = 730 → 1972-01-01.
+        // Day 730 + 31 (Jan) + 29 (Feb leap) - 1 = 759 → 1972-02-29
+        assert_eq!(days_to_date(730 + 59), (1972, 2, 29));
+    }
+
+    #[test]
+    fn days_to_date_known_date_2026_07_06() {
+        // 2026-07-06T00:00:00Z is exactly 20640 days since Unix epoch.
+        let (y, m, d) = days_to_date(20640);
+        assert_eq!(y, 2026);
+        assert_eq!(m, 7);
+        assert_eq!(d, 6);
+    }
+}

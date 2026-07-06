@@ -685,3 +685,168 @@ pub fn build_standard_tools_with_roots(
 
     registry
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// Minimal read-only test tool.
+    struct ReadOnlyTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for ReadOnlyTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.to_string(),
+                description: "read-only test tool".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
+        }
+        fn side_effect_class(&self) -> super::super::audit::ToolSideEffect {
+            super::super::audit::ToolSideEffect::ReadOnly
+        }
+        async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+            Ok("read-result".into())
+        }
+    }
+
+    /// Minimal mutating (external side-effect) test tool.
+    struct MutatingTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for MutatingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.to_string(),
+                description: "mutating test tool".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
+        }
+        async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+            Ok("mutated".into())
+        }
+    }
+
+    fn make_registry() -> ToolRegistry {
+        ToolRegistry::local()
+    }
+
+    // --- register / find_by_name / names / specs / get ---
+
+    #[test]
+    fn register_and_find_by_name() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "Alpha" }));
+        let found = reg.find_by_name("Alpha");
+        assert!(found.is_some(), "registered tool must be findable by name");
+        assert!(reg.find_by_name("NoSuch").is_none());
+    }
+
+    #[test]
+    fn names_returns_registered_tool_names() {
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "T1" }))
+            .register(Arc::new(MutatingTool { name: "T2" }));
+        let mut names = reg.names();
+        names.sort();
+        assert_eq!(names, vec!["T1", "T2"]);
+    }
+
+    #[test]
+    fn names_empty_on_fresh_registry() {
+        assert!(make_registry().names().is_empty());
+    }
+
+    #[test]
+    fn specs_returns_tool_specs() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "SpecTool" }));
+        let specs = reg.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "SpecTool");
+    }
+
+    #[test]
+    fn get_returns_tool_by_name() {
+        let reg = make_registry().register(Arc::new(MutatingTool { name: "Getter" }));
+        assert!(reg.get("Getter").is_some());
+        assert!(reg.get("Missing").is_none());
+    }
+
+    // --- register_mut ---
+
+    #[test]
+    fn register_mut_adds_tool() {
+        let mut reg = make_registry();
+        reg.register_mut(Arc::new(ReadOnlyTool { name: "MutReg" }));
+        assert!(reg.find_by_name("MutReg").is_some());
+    }
+
+    // --- is_readonly / is_readonly_for_call ---
+
+    #[test]
+    fn is_readonly_true_for_readonly_tool() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "RO" }));
+        assert!(reg.is_readonly("RO"), "ReadOnly tool must be is_readonly=true");
+        assert!(!reg.is_readonly("Missing"), "unknown tool must be is_readonly=false");
+    }
+
+    #[test]
+    fn is_readonly_false_for_mutating_tool() {
+        let reg = make_registry().register(Arc::new(MutatingTool { name: "Mut" }));
+        assert!(!reg.is_readonly("Mut"), "External tool must be is_readonly=false");
+    }
+
+    #[test]
+    fn is_readonly_for_call_delegates_to_tool() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "Ro2" }));
+        let args = serde_json::json!({});
+        assert!(reg.is_readonly_for_call("Ro2", &args));
+        assert!(!reg.is_readonly_for_call("Missing", &args));
+    }
+
+    // --- retain_tools ---
+
+    #[test]
+    fn retain_tools_keeps_only_allowed() {
+        let mut reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "Keep" }))
+            .register(Arc::new(MutatingTool { name: "Drop" }));
+        reg.retain_tools(&["Keep".to_string()]);
+        assert!(reg.find_by_name("Keep").is_some());
+        assert!(reg.find_by_name("Drop").is_none());
+    }
+
+    // --- with_same_transport ---
+
+    #[test]
+    fn with_same_transport_returns_empty_registry() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "Src" }));
+        let empty = reg.with_same_transport();
+        assert!(empty.names().is_empty(), "with_same_transport must return empty registry");
+    }
+
+    // --- fork ---
+
+    #[test]
+    fn fork_clones_tools() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "ForkMe" }));
+        let forked = reg.fork();
+        assert!(forked.find_by_name("ForkMe").is_some());
+    }
+
+    // --- build_standard_tools produces a non-empty registry ---
+
+    #[test]
+    fn build_standard_tools_is_nonempty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = build_standard_tools(tmp.path(), &[], 30);
+        assert!(
+            !registry.names().is_empty(),
+            "build_standard_tools must register at least one tool"
+        );
+    }
+}
