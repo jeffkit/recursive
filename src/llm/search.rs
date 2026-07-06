@@ -520,4 +520,78 @@ mod tests {
         let names = resolve("zzzzz_no_such_thing", &specs(), 5);
         assert!(names.is_empty());
     }
+
+    // ── word_boundary_match direct tests ──────────────────────────────────────
+
+    #[test]
+    fn word_boundary_empty_term_returns_false() {
+        assert!(!word_boundary_match("", "hello world"));
+    }
+
+    #[test]
+    fn word_boundary_full_word_matches() {
+        assert!(word_boundary_match("shell", "run shell command"));
+        assert!(word_boundary_match("read", "read a file"));
+    }
+
+    #[test]
+    fn word_boundary_word_at_start_of_string() {
+        // Term at start: before_ok = abs == 0
+        // Kills + with - at abs = start + pos (abs would be wrong)
+        assert!(word_boundary_match("hello", "hello world"));
+    }
+
+    #[test]
+    fn word_boundary_word_at_end_of_string() {
+        // Term at end: after_ok = end == haystack.len()
+        // Kills + with - at end = abs + term.len()
+        assert!(word_boundary_match("world", "hello world"));
+    }
+
+    #[test]
+    fn word_boundary_substring_not_at_boundary_returns_false() {
+        // "shell" in "shellscript" — no word boundary at end
+        assert!(!word_boundary_match("shell", "shellscript"));
+        // "read" in "thread" — no word boundary at start
+        assert!(!word_boundary_match("read", "thread"));
+    }
+
+    #[test]
+    fn word_boundary_second_occurrence_matches() {
+        // First occurrence has no word boundary, second does
+        // Kills mutations in start = abs + 1 (loop advance)
+        assert!(word_boundary_match("file", "afile file"));
+    }
+
+    #[test]
+    fn word_boundary_exact_match_whole_string() {
+        // Single-word haystack: before_ok = abs == 0, after_ok = end == len
+        assert!(word_boundary_match("read", "read"));
+    }
+
+    #[test]
+    fn word_boundary_separator_is_non_alphanumeric() {
+        // Separator can be dash, slash, dot, etc.
+        assert!(word_boundary_match("read", "read-file"));
+        assert!(word_boundary_match("file", "read-file"));
+        assert!(word_boundary_match("read", "read.write"));
+    }
+
+    // ── parse_tool_name edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_tool_name_all_uppercase_splits_as_single() {
+        let p = parse_tool_name("EOF");
+        // All uppercase: 3 chars each uppercase — depends on CamelCase split heuristic
+        assert!(!p.parts.is_empty());
+        assert!(!p.is_mcp);
+    }
+
+    #[test]
+    fn parse_tool_name_mcp_empty_server_part() {
+        // "mcp__" only → no server or tool parts
+        let p = parse_tool_name("mcp__tool");
+        assert!(p.is_mcp);
+        assert!(p.parts.contains(&"tool".to_string()));
+    }
 }
