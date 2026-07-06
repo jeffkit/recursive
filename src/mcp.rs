@@ -1938,4 +1938,117 @@ mod tests {
         assert_eq!(servers[1].command, "");
         assert_eq!(servers[1].url.as_deref(), Some("http://localhost:3000/sse"));
     }
+
+    // ── parse_sse_endpoint edge cases ───────────────────────────────────────
+
+    #[test]
+    fn parse_sse_endpoint_data_before_event_header_returns_none() {
+        // data: line before event: endpoint must NOT return Some
+        // (kills && → || mutant at line 1000)
+        let buffer = "data: http://localhost:3000/message\nevent: endpoint\n\n";
+        // The data: line arrived before event: endpoint was seen → should not match
+        // (endpoint event must precede its data:)
+        // Note: SSE spec says event type applies to the whole event block; our parser
+        // sets current_event before the data: check. So this test verifies the
+        // "event before data" invariant within a single event block.
+        let result = parse_sse_endpoint(buffer);
+        // With && → || mutant: data before event triggers match → Some("http://...")
+        // With correct &&: current_event is None when data: is seen → no match
+        assert!(
+            result.is_none(),
+            "data: before event: endpoint must not match; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_sse_endpoint_non_endpoint_event_ignored() {
+        // event: other should NOT trigger data: as endpoint
+        // (kills == → != mutant at line 1000)
+        let buffer = "event: message\ndata: http://localhost:3000/endpoint-data\n\n";
+        assert_eq!(
+            parse_sse_endpoint(buffer),
+            None,
+            "event: message must not expose data: as endpoint"
+        );
+    }
+
+    #[test]
+    fn parse_sse_endpoint_event_then_empty_data_returns_none() {
+        // data: with whitespace-only content must not return Some
+        // (kills delete ! in is_empty check)
+        let buffer = "event: endpoint\ndata:    \n\n";
+        assert_eq!(
+            parse_sse_endpoint(buffer),
+            None,
+            "empty data after endpoint event must return None"
+        );
+    }
+
+    // ── parse_sse_response edge cases ──────────────────────────────────────
+
+    #[test]
+    fn parse_sse_response_error_code_minus_one_when_absent() {
+        // Error response missing "code" field → should use -1, not 1
+        // (kills delete - mutant at line 1036)
+        let buffer =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"oops\"}}\n\n";
+        let result = parse_sse_response(buffer, 1, "srv");
+        assert!(result.is_some(), "must parse error response");
+        let err_msg = result.unwrap().unwrap_err().to_string();
+        assert!(
+            err_msg.contains("-1"),
+            "missing code should default to -1; got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn parse_sse_response_no_trailing_newline_still_parses() {
+        // Buffer without trailing \n — uses the fallback path (line 1069)
+        // (kills delete ! in the if !current_data.is_empty() at 1069)
+        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"v\":42}}";
+        let result = parse_sse_response(buffer, 5, "srv");
+        assert!(result.is_some(), "no trailing newline must still parse");
+        let val = result.unwrap().unwrap();
+        assert_eq!(val.get("v").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    #[test]
+    fn parse_sse_response_id_field_mismatch_returns_none() {
+        // id in response != expected_id → None
+        // (kills == → != mutant at line 1030 and 1072)
+        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
+        assert!(
+            parse_sse_response(buffer, 99, "srv").is_none(),
+            "wrong id must return None"
+        );
+        // Right id must return Some
+        assert!(
+            parse_sse_response(buffer, 3, "srv").is_some(),
+            "correct id must return Some"
+        );
+    }
+
+    #[test]
+    fn parse_sse_response_sse_field_prefix_lines_do_not_reset_data() {
+        // Lines starting with ':', id:, retry: must NOT clear data accumulator
+        // (kills the && → || mutations at lines 1059-1061)
+        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\"\n: comment ignored\ndata: :{\"v\":7}}\n\n";
+        let result = parse_sse_response(buffer, 7, "srv");
+        assert!(result.is_some(), "comment line must not reset data accumulator");
+    }
+
+    #[test]
+    fn parse_sse_response_unknown_line_resets_data_accumulator() {
+        // An unrecognised field (not event:, data:, id:, retry:, :) should clear
+        // the data accumulator, causing the JSON to not parse.
+        // (kills the delete ! mutations at lines 1053-1055)
+        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":8\nunknown: stuff\ndata: ,\"result\":{}}\n\n";
+        // After "unknown: stuff" resets data, the next data: fragment is incomplete JSON
+        let result = parse_sse_response(buffer, 8, "srv");
+        // Incomplete/invalid JSON after reset → None
+        assert!(
+            result.is_none(),
+            "unknown SSE field must reset accumulator; incomplete JSON should yield None"
+        );
+    }
 }
