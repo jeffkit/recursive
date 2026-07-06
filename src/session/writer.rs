@@ -750,6 +750,51 @@ mod tests {
 
     // -- SessionPersistenceSink tests --------------------------------------
 
+    #[test]
+    fn session_writer_accessor_methods_return_correct_values() {
+        // kills function-level replacements for session_id(), session_dir(),
+        // message_count(), and last_uuid()
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let writer = SessionWriter::create(tmp.path(), "goal", "gpt-4o", "openai").unwrap();
+
+        // session_id must be non-empty
+        assert!(
+            !writer.session_id().is_empty(),
+            "session_id must be non-empty"
+        );
+        // session_dir must end with the session_id directory
+        assert!(writer.session_dir().exists());
+        assert!(writer.session_dir().ends_with(writer.session_id()));
+        // initial message_count must be 0
+        assert_eq!(writer.message_count(), 0, "initial message_count must be 0");
+        // initial last_uuid must be None
+        assert!(
+            writer.last_uuid().is_none(),
+            "last_uuid must be None initially"
+        );
+    }
+
+    #[test]
+    fn write_compact_boundary_appends_line_to_transcript() {
+        // kills function-level replacement of write_compact_boundary
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut writer = SessionWriter::create(tmp.path(), "g", "gpt-4o", "openai").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        writer
+            .write_compact_boundary(5, 10, Some("uuid-summary-1"))
+            .unwrap();
+        let transcript_path = session_dir.join("transcript.jsonl");
+        let content = std::fs::read_to_string(&transcript_path).unwrap();
+        assert!(
+            content.contains("compact_boundary"),
+            "transcript must contain 'compact_boundary' marker"
+        );
+        assert!(
+            content.contains("uuid-summary-1"),
+            "transcript must contain the summary UUID"
+        );
+    }
+
     fn make_isolated_writer() -> (
         crate::test_util::IsolatedWorkspace,
         Arc<std::sync::Mutex<SessionWriter>>,
