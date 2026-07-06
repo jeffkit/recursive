@@ -759,6 +759,40 @@ mod tests {
         );
     }
 
+    // -- is_deferred / is_readonly for both tools ---------------------------
+
+    #[test]
+    fn enter_plan_mode_tool_is_deferred_and_not_readonly() {
+        // kills `replace EnterPlanModeTool::is_deferred -> bool with false`
+        // kills `replace EnterPlanModeTool::is_readonly -> bool with true`
+        let gate = make_gate();
+        let tool = EnterPlanModeTool::new(gate);
+        assert!(
+            tool.is_deferred(),
+            "EnterPlanModeTool must be deferred (not eagerly loaded)"
+        );
+        assert!(
+            !tool.is_readonly(),
+            "EnterPlanModeTool must NOT be readonly (it sets exploring_plan_mode)"
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_tool_is_deferred_and_not_readonly() {
+        // kills `replace ExitPlanModeTool::is_deferred -> bool with false`
+        // kills `replace ExitPlanModeTool::is_readonly -> bool with true`
+        let gate = make_gate();
+        let tool = ExitPlanModeTool::new(gate, Arc::new(NullSink));
+        assert!(
+            tool.is_deferred(),
+            "ExitPlanModeTool must be deferred"
+        );
+        assert!(
+            !tool.is_readonly(),
+            "ExitPlanModeTool must NOT be readonly (it blocks until the user reviews the plan)"
+        );
+    }
+
     #[test]
     fn begin_approval_called_twice_no_ghost_approval() {
         let gate = PlanApprovalGate::new();
