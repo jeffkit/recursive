@@ -409,6 +409,41 @@ mod tests {
         assert!(out.contains("hello"));
     }
 
+    // ── Builder method tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn with_timeout_stores_value() {
+        // kills `replace RunShell::with_timeout -> RunShell with Default::default()`
+        let tmp = TempDir::new().unwrap();
+        let d = Duration::from_millis(777);
+        let tool = RunShell::new(tmp.path()).with_timeout(d);
+        assert_eq!(tool.timeout, d, "with_timeout must persist the duration");
+    }
+
+    #[test]
+    fn with_max_output_bytes_clamps_to_hard_cap() {
+        // kills `n.min(MAX_OUTPUT_BYTES_HARD_CAP)` → `n` mutant
+        let tmp = TempDir::new().unwrap();
+        let tool = RunShell::new(tmp.path()).with_max_output_bytes(MAX_OUTPUT_BYTES_HARD_CAP * 4);
+        assert_eq!(
+            tool.max_output_bytes,
+            MAX_OUTPUT_BYTES_HARD_CAP,
+            "with_max_output_bytes must clamp at the hard cap"
+        );
+    }
+
+    #[test]
+    fn with_max_output_bytes_within_cap_is_preserved() {
+        // complementary: values within the hard cap are stored as-is
+        let tmp = TempDir::new().unwrap();
+        let tool = RunShell::new(tmp.path()).with_max_output_bytes(64 * 1024);
+        assert_eq!(
+            tool.max_output_bytes,
+            64 * 1024,
+            "with_max_output_bytes must store values within the hard cap unchanged"
+        );
+    }
+
     // Tests for env-vars passthrough (goal-27)
     #[tokio::test]
     async fn env_overrides_and_errors() {
