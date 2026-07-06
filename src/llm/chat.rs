@@ -227,6 +227,71 @@ mod tests {
         assert_eq!(c.content, "just a plain answer");
     }
 
+    // ── TokenUsage::accumulate tests ─────────────────────────────────────────
+
+    #[test]
+    fn token_usage_accumulate_sums_all_fields() {
+        // kills function-level replacement and any single-field mutation in accumulate()
+        let a = TokenUsage {
+            reasoning_tokens: 10,
+            prompt_tokens: 20,
+            completion_tokens: 30,
+            total_tokens: 60,
+            cache_hit_tokens: 5,
+            cache_miss_tokens: 15,
+        };
+        let b = TokenUsage {
+            reasoning_tokens: 1,
+            prompt_tokens: 2,
+            completion_tokens: 3,
+            total_tokens: 6,
+            cache_hit_tokens: 4,
+            cache_miss_tokens: 9,
+        };
+        let c = a.accumulate(b);
+        assert_eq!(c.reasoning_tokens, 11);
+        assert_eq!(c.prompt_tokens, 22);
+        assert_eq!(c.completion_tokens, 33);
+        assert_eq!(c.total_tokens, 66);
+        assert_eq!(c.cache_hit_tokens, 9);
+        assert_eq!(c.cache_miss_tokens, 24);
+    }
+
+    #[test]
+    fn token_usage_accumulate_saturates_on_overflow() {
+        // kills `saturating_add` → wrapping_add or `+` mutations
+        let big = TokenUsage {
+            reasoning_tokens: u32::MAX,
+            prompt_tokens: u32::MAX,
+            completion_tokens: u32::MAX,
+            total_tokens: u32::MAX,
+            cache_hit_tokens: u32::MAX,
+            cache_miss_tokens: u32::MAX,
+        };
+        let one = TokenUsage {
+            reasoning_tokens: 1,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 1,
+            cache_hit_tokens: 1,
+            cache_miss_tokens: 1,
+        };
+        let result = big.accumulate(one);
+        assert_eq!(result.reasoning_tokens, u32::MAX, "must saturate, not overflow");
+        assert_eq!(result.prompt_tokens, u32::MAX);
+        assert_eq!(result.completion_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn split_think_tags_empty_block_returns_empty_reasoning() {
+        // kills mutations in the trimming / boundary logic for empty think blocks
+        let result = split_think_tags("<think></think>answer");
+        assert!(result.is_some(), "empty think block must still parse");
+        let (reasoning, cleaned) = result.unwrap();
+        assert!(reasoning.is_empty(), "reasoning must be empty for empty tags; got: {reasoning:?}");
+        assert_eq!(cleaned, "answer");
+    }
+
     #[test]
     fn extract_inline_reasoning_preserves_existing_reasoning_field() {
         // True reasoner model: reasoning_content already populated via the
