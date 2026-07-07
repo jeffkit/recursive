@@ -8,9 +8,13 @@
  *     → 构建 system prompt（注入 AGENTS.md 契约 + 最近 journal + 上次失败上下文）
  *     → 跑 recursive 二进制
  *     → BudgetExceeded 自动 resume（一次）
- *     → 质量门（test / clippy / fmt / e2e，各带一次 resume-fix）
- *     → 跨 provider self-review
- *     → verdict（committed / rolled-back / skip-commit / panic-preserved）
+ *     → 质量门（test / clippy / fmt / e2e，各带 N 轮 resume-fix 循环，喂最新 stderr）
+ *     → 跨 provider self-review（NEEDS_FIX 也走 N 轮 resume-fix，不再直接回滚）
+ *     → verdict（committed / failed-preserved / skip-commit / panic-preserved）
+ *
+ * 失败不再硬回滚：门禁/评审循环耗尽后 verdict=failed-preserved，保留 worktree +
+ * refs/preserve/<run-id> 分支 + preserved.diff + <gate>-failure.log，供人或更强 agent
+ * 经 --resume-preserve / --land-preserve / --prune-preserve 消费。回滚动作基本被消灭。
  *
  * 不改 recursive 的 Rust kernel 一行；recursive 二进制仅作为被调度的执行器。
  *
@@ -23,7 +27,7 @@
  */
 
 import { parseArgs } from 'util'
-import { readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs'
+import { readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'fs'
 import { join, relative } from 'path'
 import { execFileSync } from 'child_process'
 
@@ -59,6 +63,13 @@ const { values: opts } = parseArgs({
     'no-commit':{ type: 'boolean', default: false },
     list:       { type: 'boolean', default: false },
     'commit-pending': { type: 'boolean', default: false }, // 快速补提交：跳过 agent/质量门，直接提交当前工作树改动
+    // ── 失败保留与消费（g325：把"程序化回滚"改成"agentic 修复 loop + preserve 后盾"）──
+    timeout:        { type: 'string' },              // agent 单次 run 硬超时 ms（默认 2h）
+    'max-fix-rounds': { type: 'string' },            // 门禁/评审 resume-fix 循环上限（默认 3）
+    'fixer-provider': { type: 'string' },            // resume-fix 轮用的 provider（默认同主 agent）
+    'resume-preserve': { type: 'string' },           // 从 refs/preserve/<run-id> 接着修
+    'prune-preserve':  { type: 'string' },           // 清掉一个 preserve 现场（run-id）
+    'land-preserve':   { type: 'string' },           // 把 preserve 现场跑门后落地
   },
 })
 
@@ -66,6 +77,15 @@ if (opts.list) { listRuns(); process.exit(0) }
 
 const runId = opts['run-id'] ?? `selfimprove-${Date.now()}`
 const repo = opts.repo
+
+// ── 失败保留相关常量（g325）─────────────────────────────────────
+// agent 单次 run 硬超时：默认 2h（旧值 30min 对真实 goal 太短，曾导致 agent 被杀在半路、
+// 半成品过门必红、1 轮 resume-fix 救不回 → 回滚丢成果）。--timeout ms 覆盖。
+const RUN_TIMEOUT_MS = Number(opts.timeout) || 7_200_000
+// 门禁 / 评审 resume-fix 循环上限：旧实现只 1 轮就回滚；改成 N 轮，每轮喂最新 stderr/评审意见。
+const MAX_FIX_ROUNDS = Number(opts['max-fix-rounds']) || 3
+// 失败现场保留目录：与活跃 self-improve worktree 分开命名空间，不污染新 run。
+const PRESERVE_DIR = join(repo, '.worktrees', 'preserve')
 
 // Batch-run constraint prepended to every system prompt:
 // plan mode tools block indefinitely when no interactive channel is present.
@@ -106,6 +126,20 @@ console.log(`  goal: ${goal.slice(0, 80)}${goal.length > 80 ? '…' : ''}\n`)
 // 用法：node self-improve.flow.js --run-id <old-id> --commit-pending
 if (opts['commit-pending']) {
   await commitPending()
+  process.exit(process.exitCode ?? 0)
+}
+
+// ── preserve 消费模式（g325）：从失败现场接着修 / 落地 / 清理 ──────────
+if (opts['resume-preserve']) {
+  await resumePreserve(opts['resume-preserve'])
+  process.exit(process.exitCode ?? 0)
+}
+if (opts['land-preserve']) {
+  await landPreserve(opts['land-preserve'])
+  process.exit(process.exitCode ?? 0)
+}
+if (opts['prune-preserve']) {
+  await prunePreserve(opts['prune-preserve'])
   process.exit(process.exitCode ?? 0)
 }
 
@@ -152,6 +186,188 @@ async function commitPending() {
   const sha = execFileSync('git', ['-C', repo, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim()
   console.log(`[commit-pending] ✅ 已提交 ${sha}`)
   await notify(`✅ recursive self-improve commit-pending 落地\n仓库: ${repo}\n提交: ${sha}\ngoal: ${goal.slice(0, 80)}`)
+}
+
+// ── 失败现场保留（g325）──────────────────────────────────────────
+//
+// 把失败时的 worktree 现场保留下来，供人 / 更强 agent 经 --resume-preserve / --land-preserve
+// 消费。代替旧实现的「硬回滚丢 worktree」。保留三样：
+//   1. refs/preserve/<run-id> 分支      —— 完整代码状态（哪怕测试红也先 commit）
+//   2. <run-dir>/preserved.diff          —— baseline..HEAD 的可读 diff（grep 友好）
+//   3. <run-dir>/<tag>-failure.log       —— 完整失败输出（门禁 stderr / 评审意见 / panic tail）
+// worktree 本体能挪就挪到 .worktrees/preserve/<run-id>/（保留热构建缓存）；挪不动（被锁）
+// 就原地保留，main() 的 finally 对 *-preserved verdict 跳过 cleanupWt。
+
+function preserveScene({ worktreeDir, baseline, reason, failureOutput, tag = 'fail', verdict = 'failed-preserved' }) {
+  writeFailureContext(cp.dir, 'recursive', {
+    reason, tailLog: (failureOutput ?? '').slice(-2000), provider: opts.provider, model: opts.model,
+  })
+  // ① worktree 内提交 WIP（哪怕测试红）——拿到完整代码状态
+  try { git(['add', '-A'], worktreeDir) } catch { /* 无改动也能 commit 下一行会失败，忽略后用 HEAD */ }
+  let wtSha
+  try {
+    git(['commit', '-m', `preserve: ${reason}`], worktreeDir)
+    wtSha = git(['rev-parse', 'HEAD'], worktreeDir)
+  } catch { wtSha = git(['rev-parse', 'HEAD'], worktreeDir) }
+  // ② 打 preserve 分支（ref，不占 worktree slot，可被多处引用）
+  const ref = `refs/preserve/${runId}`
+  try { git(['update-ref', ref, wtSha], repo) } catch (e) { console.warn(`  [preserve] update-ref failed: ${e.message}`) }
+  // ③ 导出 diff + 完整失败日志到 run 目录（持久，即使 worktree 被手动删也还在）
+  try { writeFileSync(join(cp.dir, 'preserved.diff'), git(['diff', `${baseline}..${wtSha}`], repo) || '') } catch { /* baseline 不可达时忽略 */ }
+  try { writeFileSync(join(cp.dir, `${tag}-failure.log`), String(failureOutput ?? '')) } catch { /* best-effort */ }
+  // ④ worktree 挪到 preserve 命名空间（与活跃 self-improve worktree 分开，不污染新 run）
+  let preserveWt = worktreeDir
+  const target = join(PRESERVE_DIR, runId)
+  try {
+    execFileSync('mkdir', ['-p', PRESERVE_DIR], { encoding: 'utf8' })
+    git(['worktree', 'move', worktreeDir, target], repo)
+    preserveWt = target
+  } catch (e) {
+    // 挪不动（子进程锁文件 / worktree 脏）：原地保留，ref+diff+log 仍是后盾
+    console.warn(`  [preserve] worktree move failed, kept in place: ${e.message}`)
+  }
+  const detail = `${reason}\n  ref: ${ref}\n  worktree: ${preserveWt}\n  diff: ${join(cp.dir, 'preserved.diff')}\n  failure: ${join(cp.dir, `${tag}-failure.log`)}`
+  return { verdict, detail, preserve: { ref, worktree: preserveWt } }
+}
+
+// ── preserve 消费命令 ─────────────────────────────────────────────
+
+/** 从 refs/preserve/<run-id> 接着修：用该现场做 worktree，注入失败上下文，跑 fixer + 门禁 + 评审。 */
+async function resumePreserve(preserveRunId) {
+  const ref = `refs/preserve/${preserveRunId}`
+  let sha
+  try { sha = git(['rev-parse', ref], repo) } catch { throw new Error(`preserve ref 不存在: ${ref}`) }
+  const runDir = join(FC_DIR, 'runs', preserveRunId)
+  const origGoal = readRunGoal(preserveRunId) ?? goal
+  const failureLog = readFailureLog(runDir)
+  const resumeGoal =
+    `A previous self-improve attempt was preserved at this state (it did NOT pass gates/review).\n` +
+    `Continue from the current worktree state — do NOT start over. The prior code is already on disk.\n\n` +
+    `--- original goal ---\n${origGoal}\n\n--- prior failure context ---\n${failureLog ?? '(see <run-dir>/*-failure.log)'}\n\n` +
+    `Finish the goal, fix the prior failure, run \`cargo test --workspace\` / \`cargo clippy --all-targets --all-features -- -D warnings\` / \`cargo fmt --all -- --check\` yourself and ensure they pass before stopping.`
+  const newRunId = `resume-${preserveRunId}-${Date.now()}`
+  const wtDir = join(repo, '.worktrees', newRunId)
+  await cp.step('resume.worktree', () => {
+    execFileSync('mkdir', ['-p', join(repo, '.worktrees')], { encoding: 'utf8' })
+    gitWorktreeAdd(repo, wtDir, { ref: sha })
+  })
+  const baseline = git(['rev-parse', 'HEAD'], repo)
+  const sysPromptFile = buildSystemPrompt()
+  const transcriptOut = join(cp.dir, 'transcript.json')
+  let result
+  try {
+    result = await runAttemptWithGoal({ sysPromptFile, transcriptOut, baseline, worktreeDir: wtDir, goalOverride: resumeGoal })
+  } catch (err) {
+    result = preserveScene({ worktreeDir: wtDir, baseline, reason: `resume attempt error: ${err.message}`, failureOutput: String(err.stack ?? err), tag: 'resume-error' })
+  } finally {
+    if (result?.verdict !== 'failed-preserved' && result?.verdict !== 'panic-preserved') {
+      try { gitWorktreeRemove(repo, wtDir) } catch { /* already gone */ }
+    }
+  }
+  await announce(result, baseline)
+  console.log(`\n✓ resume-preserve 结束  verdict=${result.verdict}`)
+}
+
+/** 把 preserve 现场跑门后落地到 main：对 refs/preserve/<run-id> 的树跑完整门，全绿则提交。 */
+async function landPreserve(preserveRunId) {
+  const ref = `refs/preserve/${preserveRunId}`
+  let sha
+  try { sha = git(['rev-parse', ref], repo) } catch { throw new Error(`preserve ref 不存在: ${ref}`) }
+  console.log(`[land-preserve] ${ref} -> ${sha.slice(0, 8)}，跑完整质量门验证…`)
+  const wtDir = join(repo, '.worktrees', `land-${preserveRunId}`)
+  try {
+    gitWorktreeAdd(repo, wtDir, { ref: sha })
+    const builtin = qualityGatesFor(wtDir)
+    const projectGates = await loadGates({ repo })
+    const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: wtDir, onFail: 'rollback', ...g }))
+    for (const g of gates) {
+      await cp.step(`land.gate.${g.name}`, () => runGate(g, { resumeFix: null }))
+    }
+    // 全绿 → cherry-pick 到 main
+    const mainHead = git(['rev-parse', 'HEAD'], repo)
+    try { git(['cherry-pick', '--no-commit', sha], repo) } catch (err) {
+      try { git(['cherry-pick', '--abort'], repo) } catch { /* 未进入 cherry-pick */ }
+      throw new Error(`cherry-pick conflict landing ${sha.slice(0, 8)}: ${err.message}`)
+    }
+    git(['commit', '-m', `self-improve: ${goalSubject()} [land-preserve ${preserveRunId.slice(-6)}]`], repo)
+    const landed = git(['rev-parse', '--short', 'HEAD'], repo)
+    console.log(`[land-preserve] ✅ 已落地 ${landed}`)
+    await notify(`✅ land-preserve 落地\n仓库: ${repo}\n提交: ${landed}\n来源: ${ref}`)
+  } finally {
+    try { gitWorktreeRemove(repo, wtDir) } catch { /* already gone */ }
+  }
+}
+
+/** 清掉一个 preserve 现场：删 ref + 移除 preserve worktree（若有）。 */
+async function prunePreserve(preserveRunId) {
+  const ref = `refs/preserve/${preserveRunId}`
+  let removed = []
+  try { git(['update-ref', '-d', ref], repo); removed.push(ref) } catch { /* ref 不存在 */ }
+  const wtDir = join(PRESERVE_DIR, preserveRunId)
+  if (existsSync(wtDir)) {
+    try { git(['worktree', 'remove', '--force', wtDir], repo); removed.push(wtDir) }
+    catch (e) { console.warn(`  [prune-preserve] worktree remove failed: ${e.message}`) }
+  }
+  console.log(`[prune-preserve] 已清理: ${removed.join(', ') || '(无)'}`)
+}
+
+function readRunGoal(preserveRunId) {
+  try {
+    const s = JSON.parse(readFileSync(join(FC_DIR, 'runs', preserveRunId, 'state.json'), 'utf8'))
+    return s.summary?.goal ?? null
+  } catch { return null }
+}
+
+function readFailureLog(runDir) {
+  if (!existsSync(runDir)) return null
+  for (const f of readdirSync(runDir)) {
+    if (f.endsWith('-failure.log')) {
+      try { return readFileSync(join(runDir, f), 'utf8') } catch { /* skip */ }
+    }
+  }
+  return null
+}
+
+/** runAttempt 的 resume 变体：允许覆盖 goal（--resume-preserve 注入失败上下文用）。 */
+async function runAttemptWithGoal({ sysPromptFile, transcriptOut, baseline, worktreeDir, goalOverride }) {
+  const env = buildEnv()
+  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
+  const base = () => ({ cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile, pricingFile: pricingFileOf(repo), env, onData: tee, timeout: RUN_TIMEOUT_MS })
+  const g = goalOverride ?? goal
+  const runMeta = await cp.step('run.recursive', async () => (await recursive(g, { ...base(), transcriptOut }))._meta)
+  if (runMeta.panicked) return preserveScene({ worktreeDir, baseline, reason: `resume panic exit ${runMeta.exitCode}`, failureOutput: tailOf(transcriptOut), tag: 'resume-panic', verdict: 'panic-preserved' })
+  if (gitClean(worktreeDir)) return { verdict: 'skip-commit', detail: 'no changes produced (resume)' }
+  let latestTranscript = transcriptOut
+  try {
+    await runQualityGates({ sysPromptFile, transcriptOut: latestTranscript, env, worktreeDir, baseline })
+  } catch (err) {
+    return preserveScene({ worktreeDir, baseline, reason: `resume gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`, failureOutput: err.output ?? '', tag: `resume-gate-${err.gate}` })
+  }
+  if (!opts['no-review']) {
+    for (let round = 0; round <= MAX_FIX_ROUNDS; round++) {
+      const r = await cp.step(round === 0 ? 'review' : `review.fix-${round}`, () => reviewWithRetry(worktreeDir))
+      if (r.decision === 'PASS' || r.decision === 'UNAVAILABLE') break
+      if (round === MAX_FIX_ROUNDS) return preserveScene({ worktreeDir, baseline, reason: `resume self-review NEEDS_FIX after ${MAX_FIX_ROUNDS} fix rounds`, failureOutput: r.text, tag: 'resume-review' })
+      latestTranscript = await runFixRound({ transcriptOut: latestTranscript, sysPromptFile, env, worktreeDir, fixGoal: `Reviewer feedback (resume):\n${r.text}\n\nAddress every issue.`, tag: 'review' })
+    }
+  }
+  // 全绿 → cherry-pick 到 main
+  await cp.step('commit', () => {
+    git(['add', '-A'], worktreeDir)
+    git(['commit', '-m', `wt: ${goalSubject()}`], worktreeDir)
+    const wtSha = git(['rev-parse', 'HEAD'], worktreeDir)
+    const mainHead = git(['rev-parse', 'HEAD'], repo)
+    if (mainHead !== baseline) {
+      throw new Error(`main checkout moved since baseline (baseline=${baseline.slice(0, 8)} HEAD=${mainHead.slice(0, 8)}); refusing to cherry-pick. Worktree commit: ${wtSha.slice(0, 8)}`)
+    }
+    try { git(['cherry-pick', '--no-commit', wtSha], repo) } catch (err) {
+      try { git(['cherry-pick', '--abort'], repo) } catch { /* */ }
+      throw new Error(`cherry-pick conflict landing ${wtSha.slice(0, 8)}: ${err.message}`)
+    }
+    git(['commit', '-m', `self-improve: ${goalSubject()} [resume-preserve]`], repo)
+    return git(['rev-parse', 'HEAD'], repo)
+  })
+  return { verdict: 'committed' }
 }
 
 // ── 主流程 ───────────────────────────────────────────────────────
@@ -222,24 +438,32 @@ async function main() {
   await cp.step('preflight.provider-ping', () => pingProvider(buildEnv()))
 
   // ── 自改安全沙箱：整个尝试在 worktree 内执行，通过后 cherry-pick 回 main ──
-  // 不再用 withSelfModGuard 包裹：worktree 本身就是沙箱，agent 改动隔离在 worktreeDir，
-  // 非 committed verdict 时直接丢弃 worktree 即「回滚」，main checkout 全程不被触碰
-  // （cherry-pick 只在 committed 路径发生）。这避免了旧设计里 guard 的 reset --hard
-  // 在 .worktrees/ 仍注册时抛「回滚后工作树仍脏」、以及在 main 被并发推进时吃掉
-  // 无关提交的两个破坏性问题。cherry-pick 前显式校验 main 未移动、冲突时 abort 而非 reset。
+  // worktree 本身就是沙箱，agent 改动隔离在 worktreeDir，main checkout 全程不被触碰
+  // （cherry-pick 只在 committed 路径发生）。失败不再硬回滚丢 worktree：failed-preserved
+  // 时 preserveScene 把 worktree 挪到 .worktrees/preserve/<run-id>/ 并打 refs/preserve/<run-id>
+  // 分支 + 导出 diff/failure.log，供 --resume-preserve / --land-preserve 消费。
+  // cherry-pick 前显式校验 main 未移动、冲突时 abort 而非 reset（绝不吃掉别人的提交）。
   const transcriptOut = join(cp.dir, 'transcript.json')
   let result
   try {
     result = await runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir })
   } catch (err) {
-    // 基础设施级失败（spawn 崩、gate 脚手架异常等）：丢弃 worktree，记录上下文，按回滚处理
-    writeFailureContext(cp.dir, 'recursive', {
-      reason: `attempt error: ${err.message}`, tailLog: String(err.stack ?? err).slice(-2000),
-      provider: opts.provider, model: opts.model,
-    })
-    result = { verdict: 'rolled-back', detail: err.message }
+    // 基础设施级失败（spawn 崩、gate 脚手架异常等）：尽力保留现场，退而求其次才回滚
+    try {
+      result = preserveScene({ worktreeDir, baseline, reason: `attempt error: ${err.message}`, failureOutput: String(err.stack ?? err) })
+    } catch (pErr) {
+      writeFailureContext(cp.dir, 'recursive', {
+        reason: `attempt error + preserve failed: ${err.message} / ${pErr.message}`, tailLog: String(err.stack ?? err).slice(-2000),
+        provider: opts.provider, model: opts.model,
+      })
+      result = { verdict: 'rolled-back', detail: `${err.message} (preserve failed: ${pErr.message})` }
+    }
   } finally {
-    cleanupWt()
+    // 只对「不留现场」的 verdict 清 worktree；failed-preserved / panic-preserved 的 worktree
+    // 已由 preserveScene 挪到 .worktrees/preserve/<run-id>/，这里不能再删。
+    if (result?.verdict !== 'failed-preserved' && result?.verdict !== 'panic-preserved') {
+      cleanupWt()
+    }
     unregisterCleanup()
   }
 
@@ -252,23 +476,23 @@ async function main() {
 }
 
 /**
- * 单次尝试：跑 recursive → budget resume → 质量门 → review → 产出 verdict。
+ * 单次尝试：跑 recursive → budget resume → 质量门（N 轮 fix loop）→ review（N 轮 fix loop）→ verdict。
  * 注意：本函数不在 withSelfModGuard 内（worktree 即沙箱）。返回 verdict 对象，
- * main() 据此收尾——非 committed 时丢弃 worktree 即「回滚」，main checkout 全程不动。
+ * main() 据此收尾——非 committed 且非 *-preserved 时丢弃 worktree；preserved 时 worktree
+ * 已由 preserveScene 挪到 .worktrees/preserve/<run-id>/，main() 不再清。
  *
- * agent 改动全部发生在 worktreeDir（隔离）；质量门也在 worktreeDir 内跑；
- * 最终 cherry-pick 回 repo（main checkout）再提交，保持 main 始终干净。
- * cherry-pick 前校验 main 未被推进，冲突时 abort 而非 reset（绝不吃掉别人的提交）。
+ * 失败不再硬回滚：门禁/评审循环耗尽 → failed-preserved（保留 worktree+分支+diff+stderr）。
+ * panic → panic-preserved（同样保留现场，升级旧实现：不只保 transcript，也保代码）。
  */
 async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir }) {
   const env = buildEnv() // provider 配置经 env 注入（RECURSIVE_PROVIDER_TYPE/API_BASE/MODEL/API_KEY）
   // recursive 二进制固定用 main repo 编译的产物（preflight.build 已确保最新）
   const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
-  // recursive 调用的公共选项（pricing / system-prompt / 流式输出）
+  // recursive 调用的公共选项（pricing / system-prompt / 流式输出 / 硬超时）
   // cwd 指向 worktreeDir，让 agent 在隔离目录内读写文件
   const base = () => ({
     cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
-    pricingFile: pricingFileOf(repo), env, onData: tee,
+    pricingFile: pricingFileOf(repo), env, onData: tee, timeout: RUN_TIMEOUT_MS,
   })
 
   // ① 跑 recursive 二进制
@@ -277,37 +501,48 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
     return out._meta
   })
 
-  // panic：保留现场不回滚，留作诊断
+  // panic：保留现场（代码 + transcript）不回滚，留作诊断 / 接续修
   if (runMeta.panicked) {
     writeFailureContext(cp.dir, 'recursive', {
       reason: 'panic', tailLog: tailOf(transcriptOut), provider: opts.provider, model: opts.model,
     })
-    return { verdict: 'panic-preserved', detail: `exit ${runMeta.exitCode}` }
+    return preserveScene({ worktreeDir, baseline, reason: `panic exit ${runMeta.exitCode}`, failureOutput: tailOf(transcriptOut), tag: 'panic' })
   }
 
   // ② BudgetExceeded → 自动 resume 一次（写独立 transcript，避免覆盖被 replay 的源）
   // latestTranscript 跟踪「最近一次成功的 transcript 路径」，后续质量门的 resume-fix
   // 必须从它 replay——否则发生过 budget resume 后，resume-fix 会从 resume 之前的 transcript
   // 重放，丢失 resume 阶段全部 tool call，agent 在「忘了刚做啥」的状态下修 bug 必败。
+  // 超时（timedOut）也走这条路径：agent 被杀在半路，但半成品已在 worktree 落盘，
+  // resume-fix 轮会从 on-disk diff 接着修（transcript 为空时降级走 diff 上下文，见 runFixRound）。
   let lastMeta = runMeta
   let latestTranscript = transcriptOut
-  if (runMeta.budgetExceeded) {
+  if (runMeta.budgetExceeded || runMeta.timedOut) {
     const resumedTranscript = transcriptOut.replace(/\.json$/, '-resumed.json')
     lastMeta = await cp.step('run.recursive.resume', async () => {
+      // transcript 为空（超时未 flush）时不能 replay 空 transcript——replayFrom 传 0
+      // 会让 recursive 从空状态起步；此时走 fresh run，靠 worktree on-disk 状态续修。
+      const replayFrom = runMeta.transcriptMessages > 0
+        ? { transcript: transcriptOut, resumeFrom: runMeta.transcriptMessages }
+        : undefined
       const out = await recursive(goal, {
         ...base(), transcriptOut: resumedTranscript,
-        replayFrom: { transcript: transcriptOut, resumeFrom: runMeta.transcriptMessages },
+        ...(replayFrom ? { replayFrom } : {}),
       })
       return out._meta
     })
     latestTranscript = resumedTranscript
-    // resume 自己 panic：同样保留现场，不进质量门（旧代码只查 budgetExceeded，漏了 panic）
     if (lastMeta.panicked) {
       writeFailureContext(cp.dir, 'recursive', {
         reason: 'panic (after resume)', tailLog: tailOf(resumedTranscript),
         provider: opts.provider, model: opts.model,
       })
-      return { verdict: 'panic-preserved', detail: `resume exit ${lastMeta.exitCode}` }
+      return preserveScene({ worktreeDir, baseline, reason: `panic (after resume) exit ${lastMeta.exitCode}`, failureOutput: tailOf(resumedTranscript), tag: 'panic' })
+    }
+    if (lastMeta.timedOut) {
+      // resume 仍超时：不再无限续，保留现场给人/更强 agent 接手
+      writeFailureContext(cp.dir, 'recursive', { reason: 'timeout (after resume)', tailLog: tailOf(resumedTranscript) })
+      return preserveScene({ worktreeDir, baseline, reason: 'timeout (after resume)', failureOutput: tailOf(resumedTranscript), tag: 'timeout' })
     }
     if (lastMeta.budgetExceeded) {
       writeFailureContext(cp.dir, 'recursive', { reason: 'BudgetExceeded (after resume)', tailLog: tailOf(resumedTranscript) })
@@ -320,36 +555,70 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
     return { verdict: 'skip-commit', detail: 'no changes produced' }
   }
 
-  // ③ 质量门：test / clippy / fmt（+ 可选 e2e），各带一次 resume-fix
+  // ③ 质量门：test / clippy / fmt（+ 可选 e2e），每个门带 N 轮 resume-fix 循环。
   // 所有门在 worktreeDir 内执行，保证测试的是 agent 实际修改的代码。
-  // resume-fix 从 latestTranscript replay（见上），保留 budget-resume 后的全部上下文。
+  // resume-fix 链式 replay 上一轮 fix-transcript（见 runFixRound），保留全部上下文。
+  // N 轮仍红 → failed-preserved（不回滚，保留现场）。
   try {
-    await runQualityGates({ sysPromptFile, transcriptOut: latestTranscript, env, worktreeDir })
+    await runQualityGates({ sysPromptFile, transcriptOut: latestTranscript, env, worktreeDir, baseline })
   } catch (err) {
-    // 任意门红灯 → 记录失败上下文，回滚（worktree 由 main() 清理）
     writeFailureContext(cp.dir, 'recursive', {
-      reason: `quality gate '${err.gate}' failed`, tailLog: (err.output ?? '').slice(-2000),
+      reason: `quality gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`,
+      tailLog: (err.output ?? '').slice(-2000),
       provider: opts.provider, model: opts.model,
     })
-    return { verdict: 'rolled-back', detail: err.message }
+    return preserveScene({
+      worktreeDir, baseline, reason: `quality gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`,
+      failureOutput: err.output ?? '', tag: `gate-${err.gate}`,
+    })
   }
 
   // ④ 跨 provider self-review（区分「明确 NEEDS_FIX」与「reviewer 不可用 / 未配置」）
+  // NEEDS_FIX 不再直接回滚：把评审意见喂回 agent 修，N 轮循环；仍 NEEDS_FIX 才 preserve。
+  let reviewFixRan = false
   if (!opts['no-review']) {
-    const { decision, text, misconfig } = await cp.step('review', () => reviewWithRetry(worktreeDir))
-    if (decision === 'NEEDS_FIX') {
-      writeFailureContext(cp.dir, 'recursive', { reason: 'self-review NEEDS_FIX', tailLog: text.slice(-2000) })
-      return { verdict: 'rolled-back', detail: 'self-review NEEDS_FIX' }
+    let reviewText = ''
+    let reviewDecision = 'PASS'
+    let reviewMisconfig = false
+    for (let round = 0; round <= MAX_FIX_ROUNDS; round++) {
+      const r = await cp.step(round === 0 ? 'review' : `review.fix-${round}`, () => reviewWithRetry(worktreeDir))
+      reviewText = r.text; reviewMisconfig = r.misconfig
+      if (r.decision === 'PASS' || r.decision === 'UNAVAILABLE') { reviewDecision = r.decision; break }
+      // NEEDS_FIX：还有轮次就喂回 agent 修，否则 preserve
+      if (round === MAX_FIX_ROUNDS) { reviewDecision = 'NEEDS_FIX'; break }
+      latestTranscript = await runFixRound({
+        transcriptOut: latestTranscript, sysPromptFile, env, worktreeDir,
+        fixGoal: `An independent reviewer rejected this change with NEEDS_FIX. Address every issue below. Do not regress passing checks.\n\n--- reviewer feedback ---\n${r.text}`,
+      })
+      reviewFixRan = true
     }
-    if (decision === 'UNAVAILABLE') {
+    if (reviewDecision === 'NEEDS_FIX') {
+      writeFailureContext(cp.dir, 'recursive', { reason: `self-review NEEDS_FIX after ${MAX_FIX_ROUNDS} fix rounds`, tailLog: reviewText.slice(-2000) })
+      return preserveScene({ worktreeDir, baseline, reason: `self-review NEEDS_FIX after ${MAX_FIX_ROUNDS} fix rounds`, failureOutput: reviewText, tag: 'review' })
+    }
+    if (reviewDecision === 'UNAVAILABLE') {
       // reviewer 多次报错（网络/quota）或未配置：质量门已全绿，直接提交并通知。
       // 理由：所有质量门（cargo test/clippy/fmt + 项目门）均已通过，代码可靠性已验证，
       //       reviewer 仅是可选的二次确认层，其不可用不应让成果丢失。
       // 区分「未配置」（建议加 --reviewer-provider 或 --no-review）与「网络 down」，便于排查。
-      const tag = misconfig
+      const tag = reviewMisconfig
         ? 'reviewer 未配置（建议加 --reviewer-provider 或 --no-review 显式跳过）'
         : 'reviewer 不可用（网络/quota）'
       await notify(`ℹ️ self-review ${tag}但质量门全绿，自动提交改动。\nrun: ${cp.dir}`)
+    }
+  }
+
+  // ④b 评审修过代码 → 重跑门禁确认没回归（评审 fix 可能动了测试涉及的代码）。
+  // 没跑过评审 fix（round 0 即 PASS/UNAVAILABLE）则跳过，避免无谓的二次 cargo test。
+  if (reviewFixRan) {
+    try {
+      await runQualityGates({ sysPromptFile, transcriptOut: latestTranscript, env, worktreeDir, baseline })
+    } catch (err) {
+      writeFailureContext(cp.dir, 'recursive', {
+        reason: `quality gate '${err.gate}' regressed after review fix`,
+        tailLog: (err.output ?? '').slice(-2000), provider: opts.provider, model: opts.model,
+      })
+      return preserveScene({ worktreeDir, baseline, reason: `quality gate '${err.gate}' regressed after review fix`, failureOutput: err.output ?? '', tag: `gate-after-review-${err.gate}` })
     }
   }
 
@@ -384,40 +653,83 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
   return { verdict: 'committed' }
 }
 
-// ── 质量门 ───────────────────────────────────────────────────────
+// ── 质量门（N 轮 resume-fix 循环）─────────────────────────────────
 
-async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir }) {
-  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
-  // resume-fix：把失败输出喂回 recursive 修一次（在原 transcript 上续跑，仍在 worktree 内）
-  const resumeFix = async (output, gate) => {
-    const fixGoal = `The "${gate.name}" check failed. Fix it.\n\n--- check output (tail) ---\n${(output ?? '').slice(-2000)}`
-    const fixTranscript = transcriptOut.replace(/\.json$/, `-fix-${gate.name}.json`)
-    await recursive(fixGoal, {
-      cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
-      transcriptOut: fixTranscript, pricingFile: pricingFileOf(repo), env, onData: tee,
-      replayFrom: { transcript: transcriptOut, resumeFrom: transcriptMessagesOf(transcriptOut) },
-    })
-    return true
-  }
-
-  // 内置默认门（语言相关：cargo test/clippy/fmt）+ 项目自定义门。
-  // 项目门来自 <repo>/.flowcast/gates.json（committed），与 provider/agent 配置对称——
-  // recursive 的 argusai E2E 门即在那里声明，不再靠 flow 里硬编码探测脚本路径。
-  // 所有门的 cwd 默认为 worktreeDir，保证测试的是 agent 实际修改的代码。
+/**
+ * 跑每个门，红灯就走 resume-fix 循环：喂最新 stderr → agent 修 → 重跑门，最多 MAX_FIX_ROUNDS 轮。
+ * 旧实现靠 flowcast runGate 内置的「1 轮 resume-fix」——1 轮修不过就抛错回滚，丢全部成果。
+ * 现在改成 flow 自己控循环：runGate 用 onFail='rollback'（纯检查，红灯即抛），catch 后跑 runFixRound，
+ * 链式 replay 上一轮 fix-transcript，再重跑。N 轮仍红 → 抛带 .exhausted 的错，让 runAttempt preserve。
+ *
+ * 关键：每轮喂「最新」stderr（不是首轮的）——agent 上一轮可能修了一部分，新一轮错误已变。
+ * 链式 replay：第 k 轮 fix 从第 k-1 轮的 fix-transcript replay，agent 记得自己上轮试过啥，不重复踩。
+ */
+async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir, baseline }) {
+  let curTranscript = transcriptOut
   const builtin = qualityGatesFor(worktreeDir)
   const projectGates = await loadGates({ repo })
   // 项目门未显式写 cwd 时默认在 worktreeDir 跑；写了则尊重项目声明。
-  const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: worktreeDir, ...g }))
+  // onFail 统一 'rollback'：runGate 只做「跑 + 红灯抛错」，循环由本函数控。
+  const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: worktreeDir, onFail: 'rollback', ...g }))
+
   for (const g of gates) {
-    await cp.step(`gate.${g.name}`, () => runGate(g, { resumeFix }))
+    let lastOutput = ''
+    for (let attempt = 0; attempt <= MAX_FIX_ROUNDS; attempt++) {
+      try {
+        await cp.step(attempt === 0 ? `gate.${g.name}` : `gate.${g.name}.fix-${attempt}`, () =>
+          runGate(g, { resumeFix: null }),
+        )
+        break // 本门绿 → 下一道门
+      } catch (err) {
+        if (err.configError) throw err // autofix 缺 autofixCmd 等配置错，不修，直接抛
+        lastOutput = err.output ?? ''
+        if (attempt === MAX_FIX_ROUNDS) {
+          // N 轮仍红：带上最新 stderr 上抛，由 runAttempt 转 failed-preserved
+          err.exhausted = true
+          err.output = lastOutput
+          throw err
+        }
+        // 红灯 → 喂最新 stderr 让 agent 修一轮，链式 replay，再回到 for 顶端重跑本门
+        curTranscript = await runFixRound({
+          transcriptOut: curTranscript, sysPromptFile, env, worktreeDir,
+          fixGoal: `The "${g.name}" check failed. Fix it, then re-run \`${g.cmd}\` to verify before stopping.\n\n--- latest check output (tail) ---\n${lastOutput.slice(-3000)}`,
+          tag: g.name,
+        })
+      }
+    }
   }
+}
+
+/**
+ * 跑一轮 resume-fix：把失败上下文喂回 recursive 修，在 worktree 内续跑。
+ * 链式 replay：从传入的 transcriptOut replay（它可能是上一轮 fix 的 transcript），
+ * agent 记得自己上轮做过啥。transcript 为空（超时未 flush 等场景）时降级走 fresh run，
+ * 靠 worktree on-disk 状态续修——返回新 fix-transcript 路径供下一轮链式 replay。
+ *
+ * fixer-provider 可覆盖（--fixer-provider）：用更强 model 修主 agent 留下的烂摊子。
+ */
+async function runFixRound({ transcriptOut, sysPromptFile, env, worktreeDir, fixGoal, tag = 'fix' }) {
+  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
+  const fixTranscript = transcriptOut.replace(/\.json$/, `-${tag}.json`)
+  const fixEnv = opts['fixer-provider'] ? buildEnv(opts['fixer-provider']) : env
+  const msgCount = transcriptMessagesOf(transcriptOut)
+  const replayFrom = msgCount > 0
+    ? { transcript: transcriptOut, resumeFrom: msgCount }
+    : undefined
+  await recursive(fixGoal, {
+    cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
+    transcriptOut: fixTranscript, pricingFile: pricingFileOf(repo), env: fixEnv, onData: tee,
+    timeout: RUN_TIMEOUT_MS,
+    ...(replayFrom ? { replayFrom } : {}),
+  })
+  return fixTranscript
 }
 
 /** recursive（Rust）内置默认质量门。项目特定门（含 E2E）走 <repo>/.flowcast/gates.json。 */
 function qualityGatesFor(repoPath) {
   return [
-    { name: 'test',   cmd: 'cargo test --quiet',                                       cwd: repoPath, onFail: 'resume-fix', timeout: 1_200_000 },
-    { name: 'clippy', cmd: 'cargo clippy --all-targets --all-features -- -D warnings', cwd: repoPath, onFail: 'resume-fix', timeout: 600_000 },
+    { name: 'test',   cmd: 'cargo test --quiet',                                       cwd: repoPath, timeout: 1_200_000 },
+    { name: 'clippy', cmd: 'cargo clippy --all-targets --all-features -- -D warnings', cwd: repoPath, timeout: 600_000 },
     { name: 'fmt',    cmd: 'cargo fmt --all -- --check',                               cwd: repoPath, onFail: 'autofix', autofixCmd: 'cargo fmt --all' },
   ]
 }
@@ -453,21 +765,33 @@ async function reviewWithRetry(worktreeDir, maxAttempts = 2) {
 }
 
 async function selfReview(worktreeDir) {
-  // diff 取自 worktree（agent 的实际改动），reviewer 在 worktree 内读文件做上下文
-  const diff = gitDiff(worktreeDir).slice(0, 20_000)
-  const prompt =
-    `You are an independent reviewer (different provider). Review the following diff for correctness, ` +
-    `regressions and contract violations. Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".\n\n${diff}`
+  // 给 reviewer 完整 diff + 改动文件清单，避免旧实现 gitDiff(...).slice(0, 20_000) 截断 diff
+  // 导致 reviewer 看不到关键文件 → 假阴性 NEEDS_FIX（g324 deepseek-pro 那次的根因：reviewer
+  // 因 diff 截断看不到 src/http/handlers.rs 等改动，保守判 NEEDS_FIX，全绿成果被回滚）。
+  // 完整 diff 写到 worktree 内 .review-diff.patch（reviewer 沙箱限在 worktree 内，只能读这里），
+  // 评审完即删并撤销可能的 intent-to-add，不污染提交。reviewer 另有 Read/Glob/Grep 可读源文件交叉验证。
+  const fullDiff = gitDiff(worktreeDir)
+  const stat = git(['diff', '--stat', 'HEAD'], worktreeDir)
+  const diffPath = join(worktreeDir, '.review-diff.patch')
+  writeFileSync(diffPath, fullDiff)
+  try {
+    const prompt =
+      `You are an independent reviewer (different provider). Review the change for correctness, ` +
+      `regressions and contract violations.\n\n` +
+      `The FULL diff is at \`.review-diff.patch\` in the workspace root — Read it first (it is NOT truncated). ` +
+      `You may also Read any source file in the workspace to cross-check claims in the journal/diff.\n\n` +
+      `--- changed files (git diff --stat HEAD) ---\n${stat}\n\n` +
+      `Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".`
 
-  // --reviewer-agent claude：用 claude CLI 做 review（自管鉴权，不需要外部 provider）
-  if (opts['reviewer-agent'] === 'claude') {
-    try {
-      const text = await claude(prompt, { cwd: worktreeDir, timeout: 120_000 })
-      return { text: String(text), ok: true }
-    } catch (err) {
-      return { text: String(err), ok: false }
+    // --reviewer-agent claude：用 claude CLI 做 review（自管鉴权，不需要外部 provider）
+    if (opts['reviewer-agent'] === 'claude') {
+      try {
+        const text = await claude(prompt, { cwd: worktreeDir, timeout: 120_000 })
+        return { text: String(text), ok: true }
+      } catch (err) {
+        return { text: String(err), ok: false }
+      }
     }
-  }
 
   // 默认：recursive executor + reviewer-provider（在 worktree 内可 Read/Glob/Grep 查上下文）
   const revEnv = buildEnv(opts['reviewer-provider'])
@@ -492,6 +816,11 @@ async function selfReview(worktreeDir) {
   const m = out._meta ?? {}
   const ok = m.exitCode === 0 && !m.spawnError && !m.timedOut
   return { text: String(out), ok }
+  } finally {
+    // 评审完清掉 diff 文件 + 撤销 gitDiff 可能给它打的 intent-to-add，避免污染后续 diff / 提交
+    try { rmSync(diffPath, { force: true }) } catch { /* 已不在 */ }
+    try { git(['reset', '-q', 'HEAD', '--', '.review-diff.patch'], worktreeDir) } catch { /* 未 staged */ }
+  }
 }
 
 // ── system prompt 构建 ───────────────────────────────────────────
@@ -553,8 +882,13 @@ async function announce(result, baseline) {
       `已通过 worktree cherry-pick 直接落在 main checkout 当前分支（${branch}），无需额外 merge：\n` +
       `  git -C ${repo} log --oneline ${baseline}..HEAD\n  git -C ${repo} push origin ${branch}`,
     )
-  } else if (result.verdict === 'panic-preserved') {
-    await notify(`⚠️ recursive panic，已保留现场待诊断\n仓库: ${repo}\n详情: ${result.detail}\nrun: ${cp.dir}`)
+  } else if (result.verdict === 'failed-preserved' || result.verdict === 'panic-preserved') {
+    const resumeHint = result.preserve
+      ? `  接手: node .dev/flows/self-improve.flow.js --resume-preserve ${runId} --provider <更强>\n` +
+        `  落地: node .dev/flows/self-improve.flow.js --land-preserve ${runId}\n` +
+        `  清理: node .dev/flows/self-improve.flow.js --prune-preserve ${runId}`
+      : ''
+    await notify(`⚠️ recursive self-improve ${result.verdict}（现场已保留，未回滚）\n仓库: ${repo}\n原因: ${result.detail}\n${resumeHint}\nrun: ${cp.dir}`)
   } else if (result.verdict === 'rolled-back') {
     await notify(`🔁 本次自改未通过（已回滚到 baseline）\n仓库: ${repo}\n原因: ${result.detail}\nrun: ${cp.dir}`)
   } else {
