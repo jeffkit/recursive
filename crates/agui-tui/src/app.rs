@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use agui_protocol::{Custom, Event, Resume};
+use agui_protocol::{Custom, Event, Resume, ResumeStatus};
 use serde_json::{json, Value};
 
 /// Which pane currently consumes keyboard input.
@@ -408,8 +408,9 @@ impl App {
 /// Build the AG-UI `resume` payload for a permission decision.
 pub fn resume_payload(interrupt_id: String, approve: bool) -> Vec<Resume> {
     vec![Resume {
-        id: interrupt_id,
-        value: json!({ "value": if approve { "approve" } else { "reject" } }),
+        interrupt_id,
+        status: ResumeStatus::Resolved,
+        payload: Some(json!({ "approved": approve })),
     }]
 }
 
@@ -701,10 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn resume_payload_serializes_with_value() {
+    fn resume_payload_serializes_with_interrupt_id_and_approved() {
         let payload = resume_payload("i-9".into(), true);
         assert_eq!(payload.len(), 1);
-        assert_eq!(payload[0].id, "i-9");
-        assert_eq!(payload[0].value["value"], "approve");
+        assert_eq!(payload[0].interrupt_id, "i-9");
+        assert_eq!(payload[0].status, ResumeStatus::Resolved);
+        assert_eq!(payload[0].payload.as_ref().and_then(|v| v.get("approved")), Some(&json!(true)));
     }
 }

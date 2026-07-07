@@ -12,11 +12,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Common metadata fields that may appear on any AG-UI event.
-///
-/// AG-UI servers may attach a `timestamp` (unix ms) and a `rawEvent`
-/// echo of the upstream provider's raw payload. We carry these via
-/// `#[serde(flatten)]` on every variant so they serialise/deserialise
-/// at the same level as the variant's own fields.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaseEvent {
@@ -26,10 +21,7 @@ pub struct BaseEvent {
     pub raw_event: Option<Value>,
 }
 
-/// AG-UI event.
-///
-/// Discriminated by the JSON `type` field. PascalCase to match the
-/// JSON examples in the AG-UI concepts/events documentation.
+/// AG-UI event, discriminated by JSON `type` field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -64,13 +56,39 @@ pub struct RunStarted {
     pub base: BaseEvent,
 }
 
+/// Discriminated outcome for a finished run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum RunFinishedOutcome {
+    Success,
+    Interrupt { interrupts: Vec<Interrupt> },
+}
+
+/// One open interrupt that the client must resolve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Interrupt {
+    pub id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunFinished {
     pub thread_id: String,
     pub run_id: String,
-    /// Optional terminal payload — e.g. `{ "type": "interrupt", ... }`
-    /// when the run is paused waiting for user resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunFinishedOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(flatten)]
@@ -109,8 +127,6 @@ pub struct StepFinished {
 #[serde(rename_all = "camelCase")]
 pub struct TextMessageStart {
     pub message_id: String,
-    /// AG-UI uses `"assistant"` for streamed assistant text. Optional
-    /// because some servers omit it on continuations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(flatten)]
@@ -134,9 +150,6 @@ pub struct TextMessageEnd {
     pub base: BaseEvent,
 }
 
-/// Convenience event for servers that don't want to bracket every
-/// chunk with `Start` / `End`. The chunk is treated as
-/// `Start (if first) -> Content -> End (if final)` by the consumer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextMessageChunk {
@@ -166,8 +179,6 @@ pub struct ToolCallStart {
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallArgs {
     pub tool_call_id: String,
-    /// Argument JSON, streamed as a string delta (AG-UI convention —
-    /// the server is mid-emitting an LLM tool call's argument JSON).
     pub delta: String,
     #[serde(flatten)]
     pub base: BaseEvent,
@@ -186,7 +197,6 @@ pub struct ToolCallEnd {
 pub struct ToolCallResult {
     pub tool_call_id: String,
     pub message_id: String,
-    /// Tool output. Free-form string per the AG-UI spec.
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -207,8 +217,6 @@ pub struct StateSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateDelta {
-    /// JSON Patch (RFC 6902) array. Kept as `Value` because callers
-    /// often want to apply with `json-patch` or similar.
     pub delta: Value,
     #[serde(flatten)]
     pub base: BaseEvent,
@@ -224,9 +232,6 @@ pub struct MessagesSnapshot {
 
 // ---------- Open extensibility ----------
 
-/// Server-defined event. AG-UI uses this for any payload that isn't
-/// part of the 16 standard variants. The recursive `agui-tui` track
-/// uses names prefixed with `agui-tui/` (e.g. `agui-tui/permission_request`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Custom {
@@ -236,8 +241,6 @@ pub struct Custom {
     pub base: BaseEvent,
 }
 
-/// Pass-through of an upstream provider's raw event (e.g. an OpenAI
-/// chunk a server wants to forward verbatim).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Raw {

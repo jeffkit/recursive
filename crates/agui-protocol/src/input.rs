@@ -25,17 +25,14 @@ pub struct RunAgentInput {
     pub resume: Option<Vec<Resume>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
-    /// Forward-compatible escape hatch. Servers may attach extra
-    /// per-run config; clients that don't care can pass `None`.
+    /// Test-only trigger: interrupt the run before executing any tool
+    /// whose name appears in this list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_before: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_props: Option<Value>,
 }
 
-/// A chat message. The AG-UI spec defers to the OpenAI message shape;
-/// we keep the canonical fields named and stuff anything else into
-/// `extra`. Tool-call attachments are kept as `Value` for the same
-/// reason — we don't want to enforce a schema we'd then have to keep
-/// in lockstep with multiple providers.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -51,8 +48,6 @@ pub struct Message {
     pub tool_calls: Option<Value>,
 }
 
-/// A tool the agent may call. Schema is `Value` because tool schemas
-/// are themselves JSON Schema objects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tool {
@@ -61,7 +56,6 @@ pub struct Tool {
     pub parameters: Value,
 }
 
-/// A piece of context the client wants the agent to consider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextItem {
@@ -69,11 +63,21 @@ pub struct ContextItem {
     pub value: String,
 }
 
-/// One resumed interaction — typically an answer to an interrupt
-/// (e.g. permission Y/N) the server raised on a prior run.
+/// One resumed interaction — an answer to an interrupt the server
+/// raised on a prior run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Resume {
-    pub id: String,
-    pub value: Value,
+    pub interrupt_id: String,
+    pub status: ResumeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+/// Status of a resolved interrupt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeStatus {
+    Resolved,
+    Cancelled,
 }

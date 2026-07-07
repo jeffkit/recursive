@@ -183,6 +183,7 @@ async fn handle_command(
                 context: vec![],
                 resume: None,
                 state: None,
+                interrupt_before: None,
                 forwarded_props: None,
             };
             start_run(client, app, current_rx, input).await;
@@ -201,6 +202,7 @@ async fn handle_command(
                 context: vec![],
                 resume: Some(resume_payload(interrupt_id, approve)),
                 state: None,
+                interrupt_before: None,
                 forwarded_props: None,
             };
             start_run(client, app, current_rx, input).await;

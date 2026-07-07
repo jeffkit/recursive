@@ -140,6 +140,7 @@ fn input_with(thread: &str, run: &str, messages: Vec<Message>) -> RunAgentInput 
         context: vec![],
         resume: None,
         state: None,
+        interrupt_before: None,
         forwarded_props: None,
     }
 }

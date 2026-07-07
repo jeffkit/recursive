@@ -8,11 +8,12 @@ pub mod input;
 pub mod sse;
 
 pub use events::{
-    BaseEvent, Custom, Event, MessagesSnapshot, Raw, RunError, RunFinished, RunStarted, StateDelta,
-    StateSnapshot, StepFinished, StepStarted, TextMessageChunk, TextMessageContent, TextMessageEnd,
-    TextMessageStart, ToolCallArgs, ToolCallEnd, ToolCallResult, ToolCallStart,
+    BaseEvent, Custom, Event, Interrupt, MessagesSnapshot, Raw, RunError, RunFinished,
+    RunFinishedOutcome, RunStarted, StateDelta, StateSnapshot, StepFinished, StepStarted,
+    TextMessageChunk, TextMessageContent, TextMessageEnd, TextMessageStart, ToolCallArgs,
+    ToolCallEnd, ToolCallResult, ToolCallStart,
 };
-pub use input::{ContextItem, Message, Resume, RunAgentInput, Tool};
+pub use input::{ContextItem, Message, Resume, ResumeStatus, RunAgentInput, Tool};
 pub use sse::SseParser;
 
 #[cfg(test)]
@@ -20,8 +21,6 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    /// Parse a JSON literal into our Event, then re-serialize, and
-    /// assert the round-trip is value-equal (key order tolerant).
     fn assert_round_trip(literal: Value) -> Event {
         let ev: Event = serde_json::from_value(literal.clone())
             .unwrap_or_else(|e| panic!("deserialise failed for {literal}: {e}"));
@@ -49,13 +48,19 @@ mod tests {
 
     #[test]
     fn every_variant_round_trips() {
-        // One literal per variant. Each variant's required fields are
-        // present; optionals are omitted to keep the JSON minimal so
-        // `assert_round_trip` (which compares the re-serialised output
-        // to the literal) works without `null` noise.
         let cases = vec![
             json!({"type":"RunStarted","threadId":"t","runId":"r"}),
             json!({"type":"RunFinished","threadId":"t","runId":"r"}),
+            json!({
+                "type":"RunFinished",
+                "threadId":"t","runId":"r",
+                "outcome":{"type":"interrupt","interrupts":[{"id":"i1","reason":"tool_call","toolCallId":"tc-1"}]},
+            }),
+            json!({
+                "type":"RunFinished",
+                "threadId":"t","runId":"r",
+                "outcome":{"type":"success"},
+            }),
             json!({"type":"RunError","message":"boom"}),
             json!({"type":"StepStarted","stepName":"plan"}),
             json!({"type":"StepFinished","stepName":"plan"}),
@@ -66,20 +71,11 @@ mod tests {
             json!({"type":"ToolCallStart","toolCallId":"c","toolCallName":"shell"}),
             json!({"type":"ToolCallArgs","toolCallId":"c","delta":"{\"x\":1}"}),
             json!({"type":"ToolCallEnd","toolCallId":"c"}),
-            json!({
-                "type":"ToolCallResult",
-                "toolCallId":"c",
-                "messageId":"m",
-                "content":"ok",
-            }),
+            json!({"type":"ToolCallResult","toolCallId":"c","messageId":"m","content":"ok"}),
             json!({"type":"StateSnapshot","snapshot":{"k":"v"}}),
             json!({"type":"StateDelta","delta":[{"op":"add","path":"/k","value":"v"}]}),
             json!({"type":"MessagesSnapshot","messages":[]}),
-            json!({
-                "type":"Custom",
-                "name":"agui-tui/permission_request",
-                "value":{"tool":"shell","args":"ls"},
-            }),
+            json!({"type":"Custom","name":"agui-tui/permission_request","value":{"tool":"shell","args":"ls"}}),
             json!({"type":"Raw","event":{"foo":"bar"}}),
         ];
         for literal in cases {
@@ -100,24 +96,15 @@ mod tests {
 
     #[test]
     fn sse_parser_handles_partial_chunks_across_reads() {
-        // Same payload, but include a multi-byte UTF-8 char ("é" =
-        // 0xC3 0xA9) inside one of the JSON strings, then split the
-        // stream right between those two bytes plus mid-frame and
-        // mid-line. We must not lose any bytes.
-        let frame_a = "data: {\"type\":\"RunStarted\",\"threadId\":\"café\",\"runId\":\"r\"}\n\n";
+        let frame_a = "data: {\"type\":\"RunStarted\",\"threadId\":\"caf\u{00e9}\",\"runId\":\"r\"}\n\n";
         let frame_b = "data: {\"type\":\"RunFinished\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n";
         let combined: Vec<u8> = frame_a.bytes().chain(frame_b.bytes()).collect();
-
-        // Locate the index of the 0xA9 (continuation byte of `é`)
-        // and split right before it so the first chunk ends mid-codepoint.
         let split_in_codepoint = combined.iter().position(|&b| b == 0xA9).unwrap();
-
         let chunk1 = &combined[..split_in_codepoint];
-        let chunk2 = &combined[split_in_codepoint..split_in_codepoint + 5]; // mid-line
-        let chunk3 = &combined[split_in_codepoint + 5..frame_a.len()]; // up through frame_a's `\n\n`
-        let chunk4 = &combined[frame_a.len()..frame_a.len() + 10]; // mid frame_b
-        let chunk5 = &combined[frame_a.len() + 10..]; // remainder
-
+        let chunk2 = &combined[split_in_codepoint..split_in_codepoint + 5];
+        let chunk3 = &combined[split_in_codepoint + 5..frame_a.len()];
+        let chunk4 = &combined[frame_a.len()..frame_a.len() + 10];
+        let chunk5 = &combined[frame_a.len() + 10..];
         let mut p = SseParser::new();
         let mut all = Vec::new();
         for chunk in [chunk1, chunk2, chunk3, chunk4, chunk5] {
@@ -125,7 +112,7 @@ mod tests {
         }
         assert_eq!(all.len(), 2, "got {all:?}");
         match &all[0] {
-            Event::RunStarted(rs) => assert_eq!(rs.thread_id, "café"),
+            Event::RunStarted(rs) => assert_eq!(rs.thread_id, "caf\u{00e9}"),
             other => panic!("first event wrong: {other:?}"),
         }
         assert!(matches!(all[1], Event::RunFinished(_)));
@@ -133,7 +120,6 @@ mod tests {
 
     #[test]
     fn sse_parser_skips_comments_and_keepalives() {
-        // Comment-only frame, blank-only frame, then a real event.
         let payload =
             b": this is a comment\n: another\n\n\n\ndata: {\"type\":\"RunStarted\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n";
         let mut p = SseParser::new();
@@ -144,13 +130,7 @@ mod tests {
 
     #[test]
     fn sse_parser_supports_multi_line_data() {
-        // A single frame whose payload is split across two `data:` lines.
-        // Per SSE, those are joined with `\n` between them, so the
-        // resulting JSON parses as one Custom event with a multi-line
-        // string value.
         let frame = "data: {\"type\":\"Custom\",\"name\":\"x\",\"value\":\"line1\\nline2\"}\n\n";
-        // Now split the JSON across two `data:` lines (still one frame,
-        // i.e. one blank-line terminator).
         let split = "data: {\"type\":\"Custom\",\"name\":\"x\",\n\
                      data: \"value\":\"line1\\nline2\"}\n\n";
         let mut p = SseParser::new();
@@ -163,7 +143,6 @@ mod tests {
             }
             other => panic!("expected Custom, got {other:?}"),
         }
-        // Sanity: the single-line equivalent parses to the same thing.
         let mut p2 = SseParser::new();
         let single = p2.feed(frame.as_bytes());
         assert_eq!(single, events);
@@ -181,8 +160,6 @@ mod tests {
 
     #[test]
     fn custom_event_preserves_unknown_fields() {
-        // A Custom value with nested unknown keys must round-trip
-        // verbatim, otherwise our `agui-tui/*` extensions lose data.
         let literal = json!({
             "type": "Custom",
             "name": "agui-tui/permission_request",
@@ -204,46 +181,158 @@ mod tests {
         }
     }
 
+    // ── Resume v2 round-trip tests ───────────────────────────────────
+
+    #[test]
+    fn resume_resolved_with_payload_round_trips() {
+        let resume = Resume {
+            interrupt_id: "i-1".into(),
+            status: ResumeStatus::Resolved,
+            payload: Some(json!({"approved": true})),
+        };
+        let v = serde_json::to_value(&resume).unwrap();
+        assert_eq!(v["interruptId"], "i-1");
+        assert_eq!(v["status"], "resolved");
+        assert_eq!(v["payload"]["approved"], true);
+        let back: Resume = serde_json::from_value(v).unwrap();
+        assert_eq!(back.interrupt_id, "i-1");
+        assert_eq!(back.status, ResumeStatus::Resolved);
+        assert_eq!(back.payload, Some(json!({"approved": true})));
+    }
+
+    #[test]
+    fn resume_cancelled_round_trips() {
+        let resume = Resume {
+            interrupt_id: "i-2".into(),
+            status: ResumeStatus::Cancelled,
+            payload: None,
+        };
+        let v = serde_json::to_value(&resume).unwrap();
+        assert_eq!(v["status"], "cancelled");
+        let back: Resume = serde_json::from_value(v).unwrap();
+        assert_eq!(back.status, ResumeStatus::Cancelled);
+        assert!(back.payload.is_none());
+    }
+
+    // ── RunFinishedOutcome round-trip tests ──────────────────────────
+
+    #[test]
+    fn run_finished_outcome_success_round_trips() {
+        let ev = Event::RunFinished(RunFinished {
+            thread_id: "t".into(),
+            run_id: "r".into(),
+            outcome: Some(RunFinishedOutcome::Success),
+            result: None,
+            base: BaseEvent::default(),
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["outcome"]["type"], "success");
+        let back: Event = serde_json::from_value(v).unwrap();
+        match back {
+            Event::RunFinished(rf) => {
+                assert_eq!(rf.outcome, Some(RunFinishedOutcome::Success));
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_finished_outcome_interrupt_with_tool_call_id_round_trips() {
+        let ev = Event::RunFinished(RunFinished {
+            thread_id: "t".into(),
+            run_id: "r".into(),
+            outcome: Some(RunFinishedOutcome::Interrupt {
+                interrupts: vec![Interrupt {
+                    id: "i-1".into(),
+                    reason: "tool_call".into(),
+                    message: Some("Approve this tool call?".into()),
+                    tool_call_id: Some("tc-001".into()),
+                    response_schema: Some(json!({"type":"object","properties":{"approved":{"type":"boolean"}}})),
+                    expires_at: Some("2026-07-08T12:00:00Z".into()),
+                    metadata: Some(json!({"toolName": "Bash"})),
+                }],
+            }),
+            result: None,
+            base: BaseEvent::default(),
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["outcome"]["type"], "interrupt");
+        assert_eq!(v["outcome"]["interrupts"][0]["toolCallId"], "tc-001");
+        let back: Event = serde_json::from_value(v).unwrap();
+        match back {
+            Event::RunFinished(rf) => {
+                let outcome = rf.outcome.expect("outcome must be present");
+                match outcome {
+                    RunFinishedOutcome::Interrupt { interrupts } => {
+                        assert_eq!(interrupts[0].tool_call_id.as_deref(), Some("tc-001"));
+                    }
+                    other => panic!("expected Interrupt, got {other:?}"),
+                }
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_finished_with_legacy_result_still_parses() {
+        let v = json!({"type":"RunFinished","threadId":"t","runId":"r","result":{"legacy":"data"}});
+        let ev: Event = serde_json::from_value(v).unwrap();
+        match ev {
+            Event::RunFinished(rf) => {
+                assert!(rf.outcome.is_none());
+                assert_eq!(rf.result, Some(json!({"legacy": "data"})));
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
     #[test]
     fn run_agent_input_serializes_camel_case() {
         let input = RunAgentInput {
             thread_id: "t".into(),
             run_id: "r".into(),
-            messages: vec![Message {
-                id: "msg-1".into(),
-                role: "user".into(),
-                content: Some("hello".into()),
-                ..Default::default()
-            }],
-            tools: vec![Tool {
-                name: "read_file".into(),
-                description: "Read a file".into(),
-                parameters: json!({"type": "object"}),
-            }],
-            context: vec![ContextItem {
-                description: "cwd".into(),
-                value: "/tmp".into(),
-            }],
+            messages: vec![Message { id: "msg-1".into(), role: "user".into(), content: Some("hello".into()), ..Default::default() }],
+            tools: vec![Tool { name: "read_file".into(), description: "Read a file".into(), parameters: json!({"type":"object"}) }],
+            context: vec![ContextItem { description: "cwd".into(), value: "/tmp".into() }],
             resume: None,
             state: None,
+            interrupt_before: None,
             forwarded_props: None,
         };
         let v = serde_json::to_value(&input).unwrap();
         assert_eq!(v["threadId"], "t");
         assert_eq!(v["runId"], "r");
-        // Optional `None` fields must be omitted, not serialised as null.
         assert!(v.get("resume").is_none(), "resume should be omitted: {v}");
-        assert!(v.get("state").is_none(), "state should be omitted: {v}");
-        assert!(
-            v.get("forwardedProps").is_none(),
-            "forwardedProps should be omitted: {v}"
-        );
-        // And nested message keeps its optional fields tidy too.
-        assert_eq!(v["messages"][0]["id"], "msg-1");
-        assert!(v["messages"][0].get("toolCallId").is_none());
-
-        // Round-trip: deserialising the serialised form yields the same value.
+        assert!(v.get("interruptBefore").is_none(), "interruptBefore should be omitted: {v}");
         let back: RunAgentInput = serde_json::from_value(v).unwrap();
         assert_eq!(back, input);
+    }
+
+    #[test]
+    fn run_agent_input_with_resume_v2_and_interrupt_before_round_trips() {
+        let input = RunAgentInput {
+            thread_id: "t-1".into(),
+            run_id: "r-1".into(),
+            messages: vec![],
+            tools: vec![],
+            context: vec![],
+            resume: Some(vec![
+                Resume { interrupt_id: "i-1".into(), status: ResumeStatus::Resolved, payload: Some(json!({"approved": true})) },
+                Resume { interrupt_id: "i-2".into(), status: ResumeStatus::Cancelled, payload: None },
+            ]),
+            state: None,
+            interrupt_before: Some(vec!["Bash".into(), "Write".into()]),
+            forwarded_props: None,
+        };
+        let v = serde_json::to_value(&input).unwrap();
+        assert_eq!(v["resume"][0]["interruptId"], "i-1");
+        assert_eq!(v["resume"][0]["status"], "resolved");
+        assert_eq!(v["interruptBefore"][0], "Bash");
+
+        // Old payload without resume/interruptBefore still parses
+        let old = json!({"threadId":"t-old","runId":"r-old","messages":[],"tools":[],"context":[]});
+        let parsed: RunAgentInput = serde_json::from_value(old).unwrap();
+        assert!(parsed.resume.is_none());
+        assert!(parsed.interrupt_before.is_none());
     }
 }
