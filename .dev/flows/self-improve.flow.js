@@ -53,7 +53,7 @@ const { values: opts } = parseArgs({
     'reviewer-provider': { type: 'string' },         // 跨 provider self-review（用 recursive 执行器）
     'reviewer-agent':   { type: 'string' },          // 跨 agent self-review（如 claude，自管鉴权）
     'reviewer-max-steps': { type: 'string' },        // reviewer 步数上限（防止只读 reviewer 空转）
-    hitl:       { type: 'string', default: 'terminal' }, // terminal | wecom
+    hitl:       { type: 'string', default: 'terminal' }, // terminal | wecom | ilink
     'project-name': { type: 'string', default: 'recursive' },
     'no-review':{ type: 'boolean', default: false },
     'no-commit':{ type: 'boolean', default: false },
@@ -610,8 +610,71 @@ function buildEnv(providerOverride) {
 function configureHitl() {
   if (opts.hitl === 'wecom') {
     setHitlBackend('wecom', { projectName: opts['project-name'] })
+  } else if (opts.hitl === 'ilink') {
+    setHitlBackend(makeIlinkBackend({
+      serviceUrl: opts['ilink-service-url'] || process.env.ILINK_HITL_URL || 'http://localhost:8081',
+      botKey:     opts['ilink-bot-key']     || process.env.ILINK_HITL_BOT_KEY || '',
+      projectName: opts['project-name'],
+      waitTimeoutSec: Number(opts['ilink-wait-timeout'] || process.env.ILINK_HITL_WAIT_TIMEOUT || 86400),
+      pollIntervalSec: 2,
+    }))
   } else {
     setHitlBackend('terminal')
+  }
+}
+
+// ── ilink HITL backend ────────────────────────────────────────────
+// 走 hil-mcp 的 HITL Server HTTP API（与 cursor 的 user-hitl MCP 同一后端）：
+//   POST /api/send { message, wait_reply, timeout, bot_key, upstream:'ilink' } → { success, session_id, error? }
+//   GET  /api/poll/{session_id} → { has_reply, replies:[{content|text}], status? }
+//   POST /api/session/{session_id}/timeout   （超时收尾，best-effort）
+// 契约源：infra4agent/hil-mcp/packages/mcp-server-ts/src/engines/ilink.ts
+function makeIlinkBackend(cfg) {
+  const base = cfg.serviceUrl.replace(/\/$/, '')
+  const sleep = ms => new Promise(r => setTimeout(r, ms))
+  async function apiFetch(path, init) {
+    const res = await fetch(`${base}${path}`, { ...init, signal: AbortSignal.timeout(30_000) })
+    if (!res.ok) throw new Error(`ilink HITL HTTP ${res.status} ${path}`)
+    return res.json()
+  }
+  async function send(message, { waitReply }) {
+    return apiFetch('/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message,
+        wait_reply: waitReply,
+        timeout: cfg.waitTimeoutSec,
+        bot_key: cfg.botKey,
+        upstream: 'ilink',
+      }),
+    })
+  }
+  return {
+    async waitForInput(prompt) {
+      const tag = cfg.projectName ? `[${cfg.projectName}] ` : ''
+      const r = await send(`${tag}${prompt}`, { waitReply: true })
+      if (!r.success) throw new Error(`ilink HITL 发送失败: ${r.error ?? '未知'}`)
+      const sid = r.session_id
+      if (!sid) throw new Error('ilink HITL: 发送成功但无 session_id')
+      const deadline = Date.now() + cfg.waitTimeoutSec * 1000
+      while (Date.now() < deadline) {
+        const poll = await apiFetch(`/api/poll/${sid}`).catch(e => ({ error: String(e) }))
+        if (poll.has_reply) {
+          const replies = (poll.replies ?? []).map(x => x.content ?? x.text ?? '').filter(Boolean)
+          return replies[0] ?? ''
+        }
+        if (poll.status === 'not_found') throw new Error('ilink HITL: 会话不存在或已过期')
+        await sleep(cfg.pollIntervalSec * 1000)
+      }
+      await apiFetch(`/api/session/${sid}/timeout`, { method: 'POST' }).catch(() => {})
+      throw new Error(`ilink HITL: 等待 ${cfg.waitTimeoutSec}s 超时`)
+    },
+    async notify(message) {
+      const tag = cfg.projectName ? `[${cfg.projectName}] ` : ''
+      const r = await send(`${tag}${message}`, { waitReply: false })
+      if (!r.success) throw new Error(`ilink HITL notify 失败: ${r.error ?? '未知'}`)
+    },
   }
 }
 
