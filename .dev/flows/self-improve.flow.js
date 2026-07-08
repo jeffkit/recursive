@@ -97,7 +97,38 @@ You are running non-interactively (no human in the loop).
 forever waiting for a human to approve the plan — in batch mode there is no
 approval channel, so calling them causes an unrecoverable deadlock.
 
-Implement directly: read → think → patch → test. No plan-mode ceremony needed.`
+Implement directly: read → think → patch → test. No plan-mode ceremony needed.
+
+# Mandatory self-verification before stopping (do NOT skip)
+
+Before you declare the goal done and stop calling tools, you MUST run all
+three quality gates yourself in the worktree and make them green:
+
+1. \`cargo fmt --all\`                       (format — run, don't just --check)
+2. \`cargo clippy --all-targets --all-features -- -D warnings\`
+3. \`cargo test --workspace\`
+
+The flow runs these again after you stop, but they are a *backstop*, not the
+first check. If you stop with clippy lints or failing tests still in the tree,
+your work gets preserved as \`failed-preserved\` instead of landed, and a
+weaker model may not get a second chance to fix it. So:
+
+- Run clippy yourself, read every \`error:\` line, fix the underlying source,
+  re-run clippy until it is clean. Do NOT silence lints with \`#[allow]\` to
+  make the noise go away — fix the code.
+- Common clippy fixes for this repo:
+  - \`clippy::unwrap_used\` on \`Mutex::lock()\`: replace \`.lock().unwrap()\`
+    with \`.lock().unwrap_or_else(|e| e.into_inner())\` (poison-recovery;
+    also satisfies invariant #5 — no \`unwrap()\` in product code).
+  - \`clippy::expect_used\`: same idea — recover or propagate via \`?\`/\`match\`.
+  - \`clippy::empty_line_after_doc_comments\`: remove the blank line, or change
+    the section-divider \`///\` to a plain \`//\` comment.
+  - \`clippy::cloned_ref_to_slice_refs\`: \`&[x.clone()]\` → \`std::slice::from_ref(&x)\`.
+- Run \`cargo test --workspace\` yourself and fix every \`FAILED\` / compile
+  error before stopping. If a test is genuinely flaky, document it in the
+  journal; do not leave a red test tree.
+
+Only stop once fmt + clippy + test are all green by your own hand.`
 
 // provider 定义不再硬编码在 flow 里：从 ~/.flowcast/providers.* + <repo>/.flowcast/providers.* 加载（向后兼容 .flowx/）。
 // 顶层 await（在 main() 前）拿到 map，buildEnv 同步消费。
@@ -341,7 +372,7 @@ async function runAttemptWithGoal({ sysPromptFile, transcriptOut, baseline, work
   try {
     await runQualityGates({ sysPromptFile, transcriptOut: latestTranscript, env, worktreeDir, baseline })
   } catch (err) {
-    return preserveScene({ worktreeDir, baseline, reason: `resume gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`, failureOutput: err.output ?? '', tag: `resume-gate-${err.gate}` })
+    return preserveScene({ worktreeDir, baseline, reason: err.reason ?? `resume gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`, failureOutput: err.output ?? '', tag: `resume-gate-${err.gate}` })
   }
   if (!opts['no-review']) {
     for (let round = 0; round <= MAX_FIX_ROUNDS; round++) {
@@ -562,13 +593,16 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
   try {
     await runQualityGates({ sysPromptFile, transcriptOut: latestTranscript, env, worktreeDir, baseline })
   } catch (err) {
+    // 优先用 runQualityGates 给的细粒度原因（如 "agent made no edits in fix round N"），
+    // 否则退回通用 "N 轮仍红"。让 preserve 现场更有诊断价值。
+    const reason = err.reason ?? `quality gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`
     writeFailureContext(cp.dir, 'recursive', {
-      reason: `quality gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`,
+      reason,
       tailLog: (err.output ?? '').slice(-2000),
       provider: opts.provider, model: opts.model,
     })
     return preserveScene({
-      worktreeDir, baseline, reason: `quality gate '${err.gate}' failed after ${MAX_FIX_ROUNDS} fix rounds`,
+      worktreeDir, baseline, reason,
       failureOutput: err.output ?? '', tag: `gate-${err.gate}`,
     })
   }
@@ -689,15 +723,81 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
           err.output = lastOutput
           throw err
         }
-        // 红灯 → 喂最新 stderr 让 agent 修一轮，链式 replay，再回到 for 顶端重跑本门
+        // 红灯 → 喂「可操作的错误清单」让 agent 修一轮，链式 replay，再回到 for 顶端重跑本门
+        const fixGoal = buildFixGoal({ gate: g, output: lastOutput, attempt, worktreeDir })
         curTranscript = await runFixRound({
           transcriptOut: curTranscript, sysPromptFile, env, worktreeDir,
-          fixGoal: `The "${g.name}" check failed. Fix it, then re-run \`${g.cmd}\` to verify before stopping.\n\n--- latest check output (tail) ---\n${lastOutput.slice(-3000)}`,
-          tag: g.name,
+          fixGoal, tag: g.name,
         })
+        // 防空转：agent 跑了一轮但工作树没任何改动 → 多半是没真去编辑（弱模型常见），
+        // 再喂同样的 stderr 也修不动。提前 break 并标注原因，让 preserve 现场更有诊断价值。
+        if (worktreeDirty(worktreeDir) === false) {
+          err.exhausted = true
+          err.output = lastOutput
+          err.reason = `agent made no edits in fix round ${attempt + 1} (likely could not act on ${g.name} output)`
+          throw err
+        }
       }
     }
   }
+}
+
+/**
+ * 构造喂给 fixer agent 的 fix goal：把门禁失败输出变成「可操作的错误清单」。
+ *
+ * 旧实现只 `slice(-3000)` 喂尾部，但 cargo/clippy 的 `error:` 行往往在**头部**，
+ * 靠前的 lint（doc-comment、from_ref 等）会被截掉，agent 看不全 → 修不掉。
+ * 现在双管齐下：
+ *   1. 把完整输出写到 worktree 内的 `.gate-<name>-output.log`，让 agent 用 Read 工具按需看全文；
+ *   2. 内联抽取 `error:`/`warning:` + `--> file:line:col` 行（编译器/clippy 的可操作信号），
+ *      截到 ~6KB，确保 agent 第一眼就拿到全部出错点；
+ *   3. 附门禁专属修复提示（clippy 的 unwrap/空行/from_ref 套路），降低弱模型翻车率。
+ */
+function buildFixGoal({ gate, output, attempt, worktreeDir }) {
+  const logPath = join(worktreeDir, `.gate-${gate.name}-output.log`)
+  try { writeFileSync(logPath, output) } catch { /* 只读 worktree 等场景兜底，内联仍有 */ }
+
+  const lines = output.split('\n')
+  const actionable = lines
+    .filter(l => /^\s*(error|warning)(\[|:)/.test(l) || /^\s*-->\s/.test(l) || /^error:/.test(l))
+    .join('\n')
+    .slice(0, 6000)
+
+  const hint = GATE_FIX_HINTS[gate.name] ?? ''
+
+  return [
+    `The "${gate.name}" check failed (fix round ${attempt + 1}/${MAX_FIX_ROUNDS}).`,
+    `Edit the source files to fix every error below, then re-run \`${gate.cmd}\` yourself to verify before stopping.`,
+    hint ? `\n${hint}` : '',
+    `\n--- actionable error lines ---\n${actionable || '(see full log)'}`,
+    `\n--- full check output ---`,
+    `Read the file \`.gate-${gate.name}-output.log\` in the worktree for the complete output (incl. notes/help).`,
+  ].join('\n')
+}
+
+/** 门禁专属修复提示，给弱模型一条明确路径。 */
+const GATE_FIX_HINTS = {
+  clippy: [
+    'These are clippy lints. Fix the SOURCE, never silence with `#[allow]`.',
+    '- `clippy::unwrap_used` on `Mutex::lock()`: `.lock().unwrap()` → `.lock().unwrap_or_else(|e| e.into_inner())` (poison recovery; also satisfies invariant #5 — no unwrap in product code).',
+    '- `clippy::expect_used`: same — recover or propagate via `?`/`match`.',
+    '- `clippy::empty_line_after_doc_comments`: remove the blank line, or change the section-divider `///` to a plain `//` comment.',
+    '- `clippy::cloned_ref_to_slice_refs`: `&[x.clone()]` → `std::slice::from_ref(&x)`.',
+    'Each `--> file:line:col` above is one lint site. Fix them all in one pass, then re-run clippy.',
+  ].join('\n'),
+  test: [
+    'These are compile/test failures. Read each `error[...]` / `--> file:line` and the `note:` below it.',
+    'If a doctest fails to compile (e.g. `missing field`), a struct gained a field — update the doctest example to include it.',
+    'Fix the source (or the test if it is wrong), then re-run `cargo test --workspace`.',
+  ].join('\n'),
+}
+
+/** worktree 是否有未提交改动（fix 轮防空转用）。fileNotFound / git 出错时返回 true（保守不 break）。 */
+function worktreeDirty(worktreeDir) {
+  try {
+    const out = git(['status', '--porcelain'], worktreeDir)
+    return out.trim().length > 0
+  } catch { return true }
 }
 
 /**
