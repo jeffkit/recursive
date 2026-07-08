@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -149,6 +150,10 @@ impl Tool for ReadFile {
 
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
@@ -343,6 +348,10 @@ impl Tool for WriteFile {
 
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::Mutating
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Write
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

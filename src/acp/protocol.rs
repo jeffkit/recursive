@@ -110,8 +110,8 @@ pub use v1::ToolCallStatus;
 pub use v1::ToolCallUpdate;
 /// Fields that can be updated in a tool call update.
 pub use v1::ToolCallUpdateFields;
-/// The category of tool being invoked.
-pub use v1::ToolKind;
+// `ToolKind` is defined locally in `src/acp/tool_kind.rs` (Sprint 3).
+// The upstream `v1::ToolKind` is missing `Write` and `WebSearch` variants.
 
 // ── Content blocks ──────────────────────────────────────────────────────
 
@@ -330,6 +330,11 @@ pub use v1::ExtRequest;
 /// Extension response.
 pub use v1::ExtResponse;
 
+// ── Version ─────────────────────────────────────────────────────────────
+
+/// Protocol version identifier (v0, v1, v2).
+pub use agent_client_protocol_schema::ProtocolVersion;
+
 // ── JSON-RPC primitives ─────────────────────────────────────────────────
 
 /// A JSON-RPC response envelope.
@@ -376,11 +381,14 @@ mod tests {
     #[test]
     fn tool_kind_variants_roundtrip() {
         for kind in [
-            ToolKind::Read,
-            ToolKind::Edit,
-            ToolKind::Search,
-            ToolKind::Execute,
-            ToolKind::Other,
+            crate::acp::ToolKind::Read,
+            crate::acp::ToolKind::Edit,
+            crate::acp::ToolKind::Write,
+            crate::acp::ToolKind::Execute,
+            crate::acp::ToolKind::Search,
+            crate::acp::ToolKind::Fetch,
+            crate::acp::ToolKind::WebSearch,
+            crate::acp::ToolKind::Other,
         ] {
             assert_roundtrip(&kind);
         }
@@ -865,8 +873,8 @@ mod tests {
     #[test]
     fn enum_non_default_variant_roundtrip() {
         // ToolKind non-default (default is Other)
-        assert_roundtrip(&ToolKind::Read);
-        assert_roundtrip(&ToolKind::Edit);
+        assert_roundtrip(&crate::acp::ToolKind::Read);
+        assert_roundtrip(&crate::acp::ToolKind::Edit);
         // ToolCallStatus non-default (default is Pending)
         assert_roundtrip(&ToolCallStatus::Completed);
         assert_roundtrip(&ToolCallStatus::Failed);

@@ -296,6 +296,7 @@ impl ChatProvider for OpenAiProvider {
         eager_tools: &[SpecWithHint],
         deferred_tools: &[SpecWithHint],
         stream_tx: Option<StreamSender>,
+        _cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         if deferred_tools.is_empty() {
             let specs: Vec<ToolSpec> = eager_tools.iter().map(|(s, _)| s.clone()).collect();
@@ -311,6 +312,7 @@ impl ChatProvider for OpenAiProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        _cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         // If no stream_tx provided, fall back to the instance-level one
         let tx = stream_tx.or_else(|| self.stream_tx.clone());
@@ -1435,7 +1437,7 @@ data: [DONE]\n\n";
         let provider =
             OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-stream-model").unwrap();
         let completion = provider
-            .stream(&[Message::user("hi")], &[], None)
+            .stream(&[Message::user("hi")], &[], None, None)
             .await
             .unwrap();
         assert_eq!(completion.content, "Hello World");
@@ -1456,7 +1458,7 @@ data: [DONE]\n\n";
         }]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
-            .stream(&[Message::user("hi")], &[], Some(tx))
+            .stream(&[Message::user("hi")], &[], Some(tx), None)
             .await
             .unwrap();
         assert_eq!(completion.content, "fallback works");

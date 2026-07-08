@@ -13,6 +13,7 @@ use tokio::process::Command;
 
 use super::resolve_within;
 use super::Tool;
+use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -88,6 +89,10 @@ impl Tool for RunShell {
                 "required": ["command"]
             }),
         }
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

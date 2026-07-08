@@ -9,6 +9,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use super::Tool;
+use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -274,6 +275,10 @@ impl Tool for WebFetch {
 
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Fetch
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

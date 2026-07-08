@@ -116,12 +116,19 @@ pub trait ChatProvider: Send + Sync {
     ///
     /// The `stream_tx` channel receives partial-token deltas as they are
     /// parsed. The returned `Completion` is the fully accumulated result.
+    ///
+    /// The optional `cancel_token`, when set, enables cooperative
+    /// cancellation of the underlying SSE read loop via `tokio::select!`.
+    /// When the token fires, the provider drops the HTTP response (closing
+    /// the TCP connection) and returns `Err(Error::Cancelled)`.
     async fn stream(
         &self,
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
+        let _ = cancel_token; // used by providers that override this
         let completion = self.complete(messages, tools).await?;
         if let Some(tx) = stream_tx {
             if let Some(reasoning) = &completion.reasoning_content {
@@ -150,13 +157,14 @@ pub trait ChatProvider: Send + Sync {
         eager_tools: &[(ToolSpec, Option<String>)],
         deferred_tools: &[(ToolSpec, Option<String>)],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         let all: Vec<ToolSpec> = eager_tools
             .iter()
             .chain(deferred_tools.iter())
             .map(|(spec, _)| spec.clone())
             .collect();
-        self.stream(messages, &all, stream_tx).await
+        self.stream(messages, &all, stream_tx, cancel_token).await
     }
 
     /// Simple completion with a single user prompt.
@@ -560,7 +568,7 @@ mod tests {
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
 
-        let completion = provider.stream(&[], &[], Some(tx)).await.unwrap();
+        let completion = provider.stream(&[], &[], Some(tx), None).await.unwrap();
         assert_eq!(completion.content, "hello from stream");
 
         // The channel should have received a Text chunk with the content.
@@ -580,7 +588,7 @@ mod tests {
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
 
-        let completion = provider.stream(&[], &[], Some(tx)).await.unwrap();
+        let completion = provider.stream(&[], &[], Some(tx), None).await.unwrap();
         assert!(completion.content.is_empty());
 
         // No Text chunk should have been sent for empty content.

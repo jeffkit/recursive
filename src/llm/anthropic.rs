@@ -200,6 +200,7 @@ impl ChatProvider for AnthropicProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        _cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         self.stream_inner(messages, tools, stream_tx).await
     }
@@ -1324,7 +1325,7 @@ mod tests {
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let _ = provider
-            .stream(&[Message::user("hi".to_string())], &[], None)
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
             .await;
 
         let body_str = captured.lock().unwrap().clone();
@@ -1378,7 +1379,7 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], None)
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
             .await
             .unwrap();
         assert_eq!(completion.content, "Hello World");
@@ -1443,7 +1444,7 @@ data: {\"type\":\"message_stop\"}
                 .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], Some(tx))
+            .stream(&[Message::user("hi".to_string())], &[], Some(tx), None)
             .await
             .unwrap();
 
@@ -1515,7 +1516,12 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
-            .stream(&[Message::user("read the file".to_string())], &[], None)
+            .stream(
+                &[Message::user("read the file".to_string())],
+                &[],
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(completion.tool_calls.len(), 1);
@@ -1573,7 +1579,7 @@ data: {\"type\":\"message_stop\"}
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], Some(tx))
+            .stream(&[Message::user("hi".to_string())], &[], Some(tx), None)
             .await
             .unwrap();
         assert_eq!(completion.content, "ABC");
@@ -1636,7 +1642,7 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], None)
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
             .await
             .unwrap();
         assert_eq!(completion.content, "Hello");

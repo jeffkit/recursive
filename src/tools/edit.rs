@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::fs::ReadFileState;
@@ -395,6 +396,10 @@ useful if you want to rename a variable for instance."
 
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::Mutating
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

@@ -1,5 +1,20 @@
 # Goal: 为 Recursive agent 实现 ACP（Agent Client Protocol）协议支持
 
+## ⚠️ 已完成的 sprint（不要重做）
+
+**Sprint 0 (P0) — ACP 协议类型层：已完成并 commit。**
+
+- `src/acp/mod.rs` 已创建（声明 `pub mod protocol`）
+- `src/acp/protocol.rs` 已创建（916 行，re-export 自 `agent-client-protocol-schema` crate，64 个 round-trip test 全过）
+- `Cargo.toml` 已加 `agent-client-protocol-schema = "1.4"` 依赖
+- `src/lib.rs` 已加 `pub mod acp;`
+- 全 workspace test 661 个全过；clippy 0 warning；fmt clean
+- Commits：`a9522f9` + `4fb3ea2`
+
+**planner 重新拆 sprint 时，sprint 1 应该从 P1（stdio JSON-RPC loop + initialize）开始**，不要再做协议类型层。
+
+---
+
 ## 一句话需求
 
 让 Recursive 编码 agent 支持 Zed 的 **Agent Client Protocol (ACP) v1**，作为 ACP server 通过 stdio JSON-RPC 与编辑器（Zed / JetBrains / 其他）通信，使其可被任何 ACP client 当作 coding agent 调用。

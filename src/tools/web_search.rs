@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::Tool;
+use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -1033,6 +1034,10 @@ impl Tool for WebSearch {
 
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::WebSearch
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
