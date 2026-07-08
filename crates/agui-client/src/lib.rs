@@ -18,6 +18,7 @@
 //!     resume: None,
 //!     state: None,
 //!     forwarded_props: None,
+//!     interrupt_before: None,
 //! };
 //! let mut rx = client.run(input).await?;
 //! while let Some(ev) = rx.recv().await {

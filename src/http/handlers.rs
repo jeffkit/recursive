@@ -1390,8 +1390,8 @@ pub(super) async fn agui_run(
     let mut seed_transcript: Option<Vec<crate::message::Message>> = None;
 
     if !resume_items.is_empty() {
-        let session_dir = agui_session_dir(&state.config.workspace, &input.thread_id)
-            .ok_or_else(|| {
+        let session_dir =
+            agui_session_dir(&state.config.workspace, &input.thread_id).ok_or_else(|| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -1430,8 +1430,10 @@ pub(super) async fn agui_run(
         }
 
         // Spec rule 3: a single resume must address EVERY open interrupt.
-        let resume_ids: std::collections::HashSet<String> =
-            resume_items.iter().map(|r| r.interrupt_id.clone()).collect();
+        let resume_ids: std::collections::HashSet<String> = resume_items
+            .iter()
+            .map(|r| r.interrupt_id.clone())
+            .collect();
         for open_int in &open_interrupts {
             if !resume_ids.contains(&open_int.interrupt_id) {
                 return Err((
@@ -1448,8 +1450,8 @@ pub(super) async fn agui_run(
         }
 
         // Load the transcript from the session.
-        let loaded_messages = crate::session::SessionReader::load_messages(&session_dir)
-            .map_err(|e| {
+        let loaded_messages =
+            crate::session::SessionReader::load_messages(&session_dir).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -1593,14 +1595,14 @@ pub(super) async fn agui_run(
     }
 
     let mut runtime = runtime_builder.build().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: format!("failed to build runtime: {e}"),
-                }),
-            )
-        })?;
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: format!("failed to build runtime: {e}"),
+            }),
+        )
+    })?;
 
     // Wire per-turn workspace checkpoints. The AG-UI thread is the
     // natural session boundary, so we use a sanitised version of the
@@ -1674,7 +1676,12 @@ pub(super) async fn agui_run(
         // Scan transcript after run for test interrupt markers.
         let was_interrupted = drv_interrupt_hook
             .as_ref()
-            .and_then(|hook| hook.interrupted_tool_name.lock().unwrap().clone())
+            .and_then(|hook| {
+                hook.interrupted_tool_name
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
             .is_some();
 
         let outcome = runtime.run(&goal).await;
@@ -1700,9 +1707,12 @@ pub(super) async fn agui_run(
         // call in the transcript to extract the tool_call_id.
         let interrupt_details: Option<(String, String)> = if was_interrupted {
             let transcript = runtime.transcript();
-            let denied_tool_name = drv_interrupt_hook
-                .as_ref()
-                .and_then(|h| h.interrupted_tool_name.lock().unwrap().clone());
+            let denied_tool_name = drv_interrupt_hook.as_ref().and_then(|h| {
+                h.interrupted_tool_name
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            });
             transcript
                 .iter()
                 .rev()
@@ -1711,9 +1721,9 @@ pub(super) async fn agui_run(
                         && msg.content.contains("test interrupt trigger")
                 })
                 .and_then(|msg| {
-                    msg.tool_call_id.clone().map(|tc_id| {
-                        (tc_id, denied_tool_name.unwrap_or_else(|| "unknown".into()))
-                    })
+                    msg.tool_call_id
+                        .clone()
+                        .map(|tc_id| (tc_id, denied_tool_name.unwrap_or_else(|| "unknown".into())))
                 })
         } else {
             None
@@ -1752,7 +1762,7 @@ pub(super) async fn agui_run(
             // Persist before emitting (crash safety).
             if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
                 let _ = std::fs::create_dir_all(&session_dir);
-                save_open_interrupts(&session_dir, &[open_interrupt.clone()]);
+                save_open_interrupts(&session_dir, std::slice::from_ref(&open_interrupt));
 
                 // Emit StateSnapshot and MessagesSnapshot before RunFinished
                 // per spec requirement (snapshots must precede the interrupting
@@ -1857,7 +1867,7 @@ fn sanitize_thread_id_for_session(thread: &str) -> String {
     out
 }
 
-/// ── AG-UI Interrupt/Resume helpers ──────────────────────────────────────
+// ── AG-UI Interrupt/Resume helpers ──────────────────────────────────────
 
 /// Path to the JSONL session directory for an AG-UI thread.
 fn agui_session_dir(workspace: &std::path::Path, thread_id: &str) -> Option<std::path::PathBuf> {
@@ -1925,7 +1935,12 @@ impl crate::tools::PermissionHook for TestInterruptHook {
         name: &str,
         args: &serde_json::Value,
     ) -> crate::agent::PermissionDecision {
-        if self.interrupted_tool_call_id.lock().unwrap().is_some() {
+        if self
+            .interrupted_tool_call_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             // Already interrupted — don't deny further tools.
             return crate::agent::PermissionDecision::Allow;
         }
@@ -1933,8 +1948,14 @@ impl crate::tools::PermissionHook for TestInterruptHook {
             // Record the interrupt — the tool_call_id is synthetic because
             // the actual tool_call hasn't been assigned an id yet at this
             // point. The drive task will capture the real id from the stream.
-            *self.interrupted_tool_name.lock().unwrap() = Some(name.to_string());
-            *self.interrupted_arguments.lock().unwrap() = Some(args.clone());
+            *self
+                .interrupted_tool_name
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+            *self
+                .interrupted_arguments
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(args.clone());
             return crate::agent::PermissionDecision::Deny(
                 "test interrupt trigger — tool blocked by interrupt_before".into(),
             );

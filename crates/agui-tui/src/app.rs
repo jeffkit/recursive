@@ -707,6 +707,9 @@ mod tests {
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0].interrupt_id, "i-9");
         assert_eq!(payload[0].status, ResumeStatus::Resolved);
-        assert_eq!(payload[0].payload.as_ref().and_then(|v| v.get("approved")), Some(&json!(true)));
+        assert_eq!(
+            payload[0].payload.as_ref().and_then(|v| v.get("approved")),
+            Some(&json!(true))
+        );
     }
 }

@@ -96,7 +96,8 @@ mod tests {
 
     #[test]
     fn sse_parser_handles_partial_chunks_across_reads() {
-        let frame_a = "data: {\"type\":\"RunStarted\",\"threadId\":\"caf\u{00e9}\",\"runId\":\"r\"}\n\n";
+        let frame_a =
+            "data: {\"type\":\"RunStarted\",\"threadId\":\"caf\u{00e9}\",\"runId\":\"r\"}\n\n";
         let frame_b = "data: {\"type\":\"RunFinished\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n";
         let combined: Vec<u8> = frame_a.bytes().chain(frame_b.bytes()).collect();
         let split_in_codepoint = combined.iter().position(|&b| b == 0xA9).unwrap();
@@ -247,7 +248,9 @@ mod tests {
                     reason: "tool_call".into(),
                     message: Some("Approve this tool call?".into()),
                     tool_call_id: Some("tc-001".into()),
-                    response_schema: Some(json!({"type":"object","properties":{"approved":{"type":"boolean"}}})),
+                    response_schema: Some(
+                        json!({"type":"object","properties":{"approved":{"type":"boolean"}}}),
+                    ),
                     expires_at: Some("2026-07-08T12:00:00Z".into()),
                     metadata: Some(json!({"toolName": "Bash"})),
                 }],
@@ -291,9 +294,21 @@ mod tests {
         let input = RunAgentInput {
             thread_id: "t".into(),
             run_id: "r".into(),
-            messages: vec![Message { id: "msg-1".into(), role: "user".into(), content: Some("hello".into()), ..Default::default() }],
-            tools: vec![Tool { name: "read_file".into(), description: "Read a file".into(), parameters: json!({"type":"object"}) }],
-            context: vec![ContextItem { description: "cwd".into(), value: "/tmp".into() }],
+            messages: vec![Message {
+                id: "msg-1".into(),
+                role: "user".into(),
+                content: Some("hello".into()),
+                ..Default::default()
+            }],
+            tools: vec![Tool {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            context: vec![ContextItem {
+                description: "cwd".into(),
+                value: "/tmp".into(),
+            }],
             resume: None,
             state: None,
             interrupt_before: None,
@@ -303,7 +318,10 @@ mod tests {
         assert_eq!(v["threadId"], "t");
         assert_eq!(v["runId"], "r");
         assert!(v.get("resume").is_none(), "resume should be omitted: {v}");
-        assert!(v.get("interruptBefore").is_none(), "interruptBefore should be omitted: {v}");
+        assert!(
+            v.get("interruptBefore").is_none(),
+            "interruptBefore should be omitted: {v}"
+        );
         let back: RunAgentInput = serde_json::from_value(v).unwrap();
         assert_eq!(back, input);
     }
@@ -317,8 +335,16 @@ mod tests {
             tools: vec![],
             context: vec![],
             resume: Some(vec![
-                Resume { interrupt_id: "i-1".into(), status: ResumeStatus::Resolved, payload: Some(json!({"approved": true})) },
-                Resume { interrupt_id: "i-2".into(), status: ResumeStatus::Cancelled, payload: None },
+                Resume {
+                    interrupt_id: "i-1".into(),
+                    status: ResumeStatus::Resolved,
+                    payload: Some(json!({"approved": true})),
+                },
+                Resume {
+                    interrupt_id: "i-2".into(),
+                    status: ResumeStatus::Cancelled,
+                    payload: None,
+                },
             ]),
             state: None,
             interrupt_before: Some(vec!["Bash".into(), "Write".into()]),
