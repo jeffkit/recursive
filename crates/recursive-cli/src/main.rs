@@ -229,6 +229,8 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    /// Start as an ACP (Agent Client Protocol) server (stdio transport).
+    Acp,
     /// Start the HTTP API server.
     #[cfg(feature = "http")]
     Http {
@@ -666,6 +668,13 @@ async fn main() -> anyhow::Result<()> {
             let workspace = std::fs::canonicalize(&workspace)?;
             config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
+        }
+        Cmd::Acp => {
+            // ACP server: stdio JSON-RPC transport for Agent Client Protocol.
+            // No LLM provider needed — only `initialize` is wired in Sprint 1.
+            eprintln!("acp: starting ACP v1 server on stdio");
+            recursive::acp::server::AcpServer::run().await;
+            Ok(())
         }
         #[cfg(feature = "http")]
         Cmd::Http { addr } => {

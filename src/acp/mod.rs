@@ -6,3 +6,4 @@
 //! `.dev/goals/325-acp-protocol-support.md`).
 
 pub mod protocol;
+pub mod server;

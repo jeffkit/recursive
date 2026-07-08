@@ -66,7 +66,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-set -- "${ARGS[@]}"
+# bash 3.2 (macOS default) triggers "unbound variable" on "${ARGS[@]}" when the
+# array is empty even with set -u; ${ARGS[@]:0} is the safe form across versions.
+set -- ${ARGS[@]:0}
 
 # Resolve the worktree root (this script lives in <root>/.dev/scripts/).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
