@@ -3214,6 +3214,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
+ "base64",
  "blake3",
  "bollard",
  "chrono",

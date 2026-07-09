@@ -3,7 +3,7 @@ type: Architecture
 title: Web Tools — web_fetch, web_search
 description: HTTP fetch and web search tools. Feature-gated by web_fetch and web_search Cargo features. Not available in sandboxed runs.
 tags: [tools, web, feature-gated]
-timestamp: 2026-06-18T10:00:00Z
+timestamp: 2026-07-09T15:00:00Z
 ---
 
 # Web Tools
@@ -23,6 +23,21 @@ Both tools are **feature-gated** and not available in all builds.
 - **Feature flag**: `web_search`
 - **Args**: `query`, optional `num_results`
 - **Returns**: Ranked results with title, url, snippet
+
+### Providers
+
+When `RECURSIVE_WEB_SEARCH_PROVIDER` + `RECURSIVE_WEB_SEARCH_API_KEY` (or
+`~/.recursive/config.toml` `[search]`) are set, results come from the chosen
+API backend: `brave` | `tavily` | `serper` | `bocha` | `bing` (Bing Web Search
+API, not HTML scrape).
+
+### Zero-config fallback (no API key)
+
+1. **DuckDuckGo HTML** scrape (`html.duckduckgo.com`)
+2. **Bing HTML** scrape (`www.bing.com/search`) if DDG is challenged / empty
+3. **Jina AI Search** (`s.jina.ai`) Markdown fallback if both scrapes fail
+
+Optional: `RECURSIVE_WEB_SEARCH_JINA_KEY` raises the Jina quota.
 
 ## Usage Note
 

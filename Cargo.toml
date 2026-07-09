@@ -90,6 +90,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 walkdir = "2"
 regex = "1"
+base64 = "0.22"
 blake3 = "1"
 futures-util = { version = "0.3.32" }
 axum = { version = "0.8", optional = true }

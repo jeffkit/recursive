@@ -4,14 +4,19 @@
 //!   `RECURSIVE_WEB_SEARCH_PROVIDER` — one of `brave`, `tavily`, `serper`, `bocha`, `bing`.
 //!   `RECURSIVE_WEB_SEARCH_API_KEY`  — API key for the chosen provider.
 //!
-//! When neither variable is set the tool returns a friendly "not configured" message
-//! rather than an error, so the agent can explain the situation to the user.
+//! When no provider/API key is configured, the tool falls back in order:
+//!   1. DuckDuckGo HTML scrape (zero-config)
+//!   2. Bing HTML scrape (if DDG is challenged / empty)
+//!   3. Jina AI Search (`s.jina.ai`, optional `RECURSIVE_WEB_SEARCH_JINA_KEY`)
 //!
 //! Result format (lightweight): numbered list of `title / url / snippet` entries.
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
+use regex::Regex;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::Tool;
@@ -29,6 +34,10 @@ const TAVILY_BASE: &str = "https://api.tavily.com";
 const SERPER_BASE: &str = "https://google.serper.dev";
 const BOCHA_BASE: &str = "https://api.bochaai.com";
 const BING_BASE: &str = "https://api.bing.microsoft.com";
+const DUCKDUCKGO_HTML_BASE: &str = "https://html.duckduckgo.com";
+const BING_HTML_BASE: &str = "https://www.bing.com";
+/// Browser-like UA for HTML SERP scraping (bot-detection sensitive endpoints).
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
 /// Supported search providers.
 #[derive(Debug, Clone, PartialEq)]
@@ -460,6 +469,112 @@ impl WebSearch {
             .collect())
     }
 
+    /// Zero-config HTML fallback: DuckDuckGo scrape, then Bing scrape.
+    ///
+    /// Used when no API provider/key is configured. Returns structured
+    /// `title / url / snippet` results when either engine yields parseable
+    /// hits; callers should fall through to Jina when this returns empty.
+    async fn search_html_fallback(&self, query: &str, num: u64) -> Result<Vec<SearchResult>> {
+        match self.search_duckduckgo_html(query, num).await {
+            Ok(results) if !results.is_empty() => return Ok(results),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(error = %err, "DuckDuckGo HTML search failed; trying Bing");
+            }
+        }
+
+        match self.search_bing_html(query, num).await {
+            Ok(results) if !results.is_empty() => Ok(results),
+            Ok(_) => Ok(Vec::new()),
+            Err(err) => {
+                tracing::debug!(error = %err, "Bing HTML search failed");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn search_duckduckgo_html(&self, query: &str, num: u64) -> Result<Vec<SearchResult>> {
+        let base = self.base_url(DUCKDUCKGO_HTML_BASE);
+        let url = format!("{base}/html/");
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("q", query)])
+            .header("User-Agent", BROWSER_USER_AGENT)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .send()
+            .await
+            .map_err(|e| Error::Tool {
+                name: "WebSearch".into(),
+                call_id: None,
+                message: format!("DuckDuckGo HTML request failed: {e}"),
+            })?;
+
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("DuckDuckGo HTML response read failed: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(Error::Tool {
+                name: "WebSearch".into(),
+                call_id: None,
+                message: format!("DuckDuckGo HTML HTTP {status}"),
+            });
+        }
+
+        if is_duckduckgo_challenge(&body) {
+            return Ok(Vec::new());
+        }
+
+        Ok(parse_duckduckgo_results(&body, num as usize))
+    }
+
+    async fn search_bing_html(&self, query: &str, num: u64) -> Result<Vec<SearchResult>> {
+        let base = self.base_url(BING_HTML_BASE);
+        let url = format!("{base}/search");
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("q", query)])
+            .header("User-Agent", BROWSER_USER_AGENT)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .send()
+            .await
+            .map_err(|e| Error::Tool {
+                name: "WebSearch".into(),
+                call_id: None,
+                message: format!("Bing HTML request failed: {e}"),
+            })?;
+
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| Error::Tool {
+            name: "WebSearch".into(),
+            call_id: None,
+            message: format!("Bing HTML response read failed: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(Error::Tool {
+                name: "WebSearch".into(),
+                call_id: None,
+                message: format!("Bing HTML HTTP {status}"),
+            });
+        }
+
+        Ok(parse_bing_results(&body, num as usize))
+    }
+
     /// Zero-config fallback using Jina AI Search (`s.jina.ai`).
     ///
     /// Does not require an API key — Jina provides a free anonymous tier.
@@ -573,6 +688,318 @@ struct SearchResult {
     snippet: String,
 }
 
+// ── HTML SERP parsing (DuckDuckGo / Bing zero-config fallback) ───────────────
+
+static DDG_TITLE_RE: OnceLock<Regex> = OnceLock::new();
+static DDG_SNIPPET_RE: OnceLock<Regex> = OnceLock::new();
+static TAG_RE: OnceLock<Regex> = OnceLock::new();
+static BING_RESULT_RE: OnceLock<Regex> = OnceLock::new();
+static BING_TITLE_RE: OnceLock<Regex> = OnceLock::new();
+static BING_SNIPPET_RE: OnceLock<Regex> = OnceLock::new();
+
+fn ddg_title_re() -> &'static Regex {
+    DDG_TITLE_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(r#"<a[^>]*class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>"#)
+            .expect("ddg title regex")
+    })
+}
+
+fn ddg_snippet_re() -> &'static Regex {
+    DDG_SNIPPET_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(
+            r#"<a[^>]*class=\"result__snippet\"[^>]*>(.*?)</a>|<div[^>]*class=\"result__snippet\"[^>]*>(.*?)</div>"#,
+        )
+        .expect("ddg snippet regex")
+    })
+}
+
+fn tag_re() -> &'static Regex {
+    TAG_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(r"<[^>]+>").expect("tag regex")
+    })
+}
+
+fn bing_result_re() -> &'static Regex {
+    BING_RESULT_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(r#"(?is)<li[^>]*class=\"[^\"]*\bb_algo\b[^\"]*\"[^>]*>(.*?)</li>"#)
+            .expect("bing result regex")
+    })
+}
+
+fn bing_title_re() -> &'static Regex {
+    BING_TITLE_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(r#"(?is)<h2[^>]*>.*?<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>"#)
+            .expect("bing title regex")
+    })
+}
+
+fn bing_snippet_re() -> &'static Regex {
+    BING_SNIPPET_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(r#"(?is)<div[^>]*class=\"[^\"]*\bb_caption\b[^\"]*\"[^>]*>.*?<p[^>]*>(.*?)</p>"#)
+            .expect("bing snippet regex")
+    })
+}
+
+fn is_duckduckgo_challenge(html: &str) -> bool {
+    html.contains("anomaly-modal") || html.contains("Unfortunately, bots use DuckDuckGo too")
+}
+
+fn parse_duckduckgo_results(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let snippets: Vec<String> = ddg_snippet_re()
+        .captures_iter(html)
+        .filter_map(|cap| cap.get(1).or_else(|| cap.get(2)))
+        .map(|m| normalize_text(m.as_str()))
+        .collect();
+
+    let mut results = Vec::new();
+    for (idx, cap) in ddg_title_re().captures_iter(html).enumerate() {
+        if results.len() >= max_results {
+            break;
+        }
+        let href = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let title = normalize_text(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = snippets
+            .get(idx)
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        results.push(SearchResult {
+            title,
+            url: normalize_ddg_url(href),
+            snippet,
+        });
+    }
+
+    if is_likely_spam_results(&results) {
+        return Vec::new();
+    }
+    results
+}
+
+fn parse_bing_results(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    for cap in bing_result_re().captures_iter(html) {
+        if results.len() >= max_results {
+            break;
+        }
+        let Some(block) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(title_cap) = bing_title_re().captures(block) else {
+            continue;
+        };
+        let href = title_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let title = normalize_text(title_cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = bing_snippet_re()
+            .captures(block)
+            .and_then(|c| c.get(1))
+            .map(|m| normalize_text(m.as_str()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        results.push(SearchResult {
+            title,
+            url: normalize_bing_url(href),
+            snippet,
+        });
+    }
+
+    if is_likely_spam_results(&results) {
+        return Vec::new();
+    }
+    results
+}
+
+/// Drop SERP batches dominated by a single root domain (SEO spam / stuffed pages).
+fn is_likely_spam_results(results: &[SearchResult]) -> bool {
+    if results.len() < 3 {
+        return false;
+    }
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for r in results {
+        if let Some(host) = root_domain(&r.url) {
+            *counts.entry(host).or_insert(0) += 1;
+        }
+    }
+    let Some(&max) = counts.values().max() else {
+        return false;
+    };
+    max * 5 >= results.len() * 3
+}
+
+fn root_domain(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host = after_scheme.split(['/', '?', '#']).next()?;
+    let host = host.split('@').next_back()?;
+    let host = host.split(':').next()?.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() <= 2 {
+        return Some(host);
+    }
+    Some(labels[labels.len().saturating_sub(2)..].join("."))
+}
+
+fn normalize_text(text: &str) -> String {
+    let stripped = tag_re().replace_all(text, "").to_string();
+    let decoded = decode_html_entities(&stripped);
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_html_entities(text: &str) -> String {
+    static ENTITY_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ENTITY_RE.get_or_init(|| {
+        #[allow(
+            clippy::expect_used,
+            reason = "static regex pattern is a compile-time constant"
+        )]
+        Regex::new(r"&(?:#(\d+)|#x([0-9A-Fa-f]+)|([a-zA-Z]+));").expect("HTML entity regex")
+    });
+
+    re.replace_all(text, |caps: &regex::Captures| {
+        if let Some(dec) = caps.get(1) {
+            return dec
+                .as_str()
+                .parse::<u32>()
+                .ok()
+                .and_then(std::char::from_u32)
+                .unwrap_or('\u{FFFD}')
+                .to_string();
+        }
+        if let Some(hex) = caps.get(2) {
+            return u32::from_str_radix(hex.as_str(), 16)
+                .ok()
+                .and_then(std::char::from_u32)
+                .unwrap_or('\u{FFFD}')
+                .to_string();
+        }
+        match caps.get(3).map(|m| m.as_str()) {
+            Some("amp") => "&".to_string(),
+            Some("lt") => "<".to_string(),
+            Some("gt") => ">".to_string(),
+            Some("quot") => "\"".to_string(),
+            Some("apos") => "'".to_string(),
+            Some("nbsp") => " ".to_string(),
+            Some("mdash") => "\u{2014}".to_string(),
+            Some("ndash") => "\u{2013}".to_string(),
+            Some("hellip") => "\u{2026}".to_string(),
+            _ => caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string(),
+        }
+    })
+    .to_string()
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &input[i + 1..i + 3];
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+            }
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn extract_query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for part in query.split('&') {
+        let mut iter = part.splitn(2, '=');
+        let name = iter.next().unwrap_or("");
+        if name == key {
+            return iter.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+fn normalize_ddg_url(href: &str) -> String {
+    if let Some(uddg) = extract_query_param(href, "uddg") {
+        let decoded = percent_decode(&uddg);
+        if !decoded.is_empty() {
+            return decoded;
+        }
+    }
+    if href.starts_with("//") {
+        return format!("https:{href}");
+    }
+    if href.starts_with('/') {
+        return format!("https://duckduckgo.com{href}");
+    }
+    href.to_string()
+}
+
+fn normalize_bing_url(href: &str) -> String {
+    // Bing wraps SERP links in `/ck/a?...&u=<base64>` redirects; HTML often
+    // encodes separators as `&amp;`, so decode entities before parsing `u=`.
+    let href = decode_html_entities(href);
+    let href = href.as_str();
+    if let Some(encoded) = extract_query_param(href, "u") {
+        let decoded = percent_decode(&encoded);
+        let token = decoded.strip_prefix("a1").unwrap_or(&decoded);
+        let mut padded = token.replace('-', "+").replace('_', "/");
+        while padded.len() % 4 != 0 {
+            padded.push('=');
+        }
+        if let Ok(bytes) = general_purpose::STANDARD.decode(padded) {
+            if let Ok(url) = String::from_utf8(bytes) {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    return url;
+                }
+            }
+        }
+    }
+    if href.starts_with("//") {
+        return format!("https:{href}");
+    }
+    if href.starts_with('/') {
+        return format!("https://www.bing.com{href}");
+    }
+    href.to_string()
+}
+
 #[async_trait]
 impl Tool for WebSearch {
     fn spec(&self) -> ToolSpec {
@@ -582,9 +1009,10 @@ impl Tool for WebSearch {
                            RECURSIVE_WEB_SEARCH_PROVIDER and RECURSIVE_WEB_SEARCH_API_KEY are \
                            set, returns a structured list (title, URL, summary) via the \
                            configured provider (brave | tavily | serper | bocha | bing). \
-                           When no provider is configured, falls back to Jina AI Search \
-                           (zero-config, free) which returns Markdown-formatted results. \
-                           Optionally set RECURSIVE_WEB_SEARCH_JINA_KEY for a higher Jina quota."
+                           When no provider is configured, tries DuckDuckGo HTML then Bing \
+                           HTML (zero-config scrape), then falls back to Jina AI Search \
+                           (Markdown). Optionally set RECURSIVE_WEB_SEARCH_JINA_KEY for a \
+                           higher Jina quota."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -626,8 +1054,12 @@ impl Tool for WebSearch {
             .unwrap_or(DEFAULT_NUM_RESULTS)
             .clamp(1, MAX_NUM_RESULTS);
 
-        // If no provider is configured, fall back to Jina AI Search (zero-config).
+        // If no provider is configured, try HTML scrape (DDG → Bing), then Jina.
         let Some((provider, api_key)) = self.load_config() else {
+            let html_results = self.search_html_fallback(query, num).await?;
+            if !html_results.is_empty() {
+                return Ok(Self::format_results(&html_results));
+            }
             return self.search_jina_fallback(query).await;
         };
 
@@ -739,6 +1171,7 @@ mod tests {
         let spec = WebSearch::new().spec();
         assert_eq!(spec.name, "WebSearch");
         assert!(spec.description.contains("RECURSIVE_WEB_SEARCH_PROVIDER"));
+        assert!(spec.description.contains("DuckDuckGo"));
         assert!(spec.description.contains("Jina"));
     }
 
@@ -746,6 +1179,129 @@ mod tests {
     fn web_search_construction_smoke() {
         let tool = WebSearch::new();
         assert_eq!(tool.spec().name, "WebSearch");
+    }
+
+    #[test]
+    fn parse_duckduckgo_html_extracts_title_url_snippet() {
+        let html = r#"
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org">Rust</a>
+            <a class="result__snippet">A systems programming language</a>
+            <a class="result__a" href="https://doc.rust-lang.org/book/">The Book</a>
+            <div class="result__snippet">Official Rust book</div>
+        "#;
+        let results = parse_duckduckgo_results(html, 5);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust");
+        assert_eq!(results[0].url, "https://rust-lang.org");
+        assert_eq!(results[0].snippet, "A systems programming language");
+        assert_eq!(results[1].title, "The Book");
+        assert_eq!(results[1].url, "https://doc.rust-lang.org/book/");
+    }
+
+    #[test]
+    fn parse_duckduckgo_respects_max_results() {
+        let html = r#"
+            <a class="result__a" href="https://a.example">A</a>
+            <a class="result__snippet">sa</a>
+            <a class="result__a" href="https://b.example">B</a>
+            <a class="result__snippet">sb</a>
+            <a class="result__a" href="https://c.example">C</a>
+            <a class="result__snippet">sc</a>
+        "#;
+        let results = parse_duckduckgo_results(html, 2);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn duckduckgo_challenge_page_detected() {
+        assert!(is_duckduckgo_challenge(
+            r#"<div class="anomaly-modal">Unfortunately, bots use DuckDuckGo too</div>"#
+        ));
+        assert!(!is_duckduckgo_challenge(
+            r#"<a class="result__a" href="https://example.com">Ok</a>"#
+        ));
+    }
+
+    #[test]
+    fn parse_bing_html_extracts_results_and_decodes_ck_url() {
+        // Bing `u=` is often `a1` + base64(url). Decode strips the prefix first.
+        let real = b"https://example.com/page";
+        let encoded = general_purpose::STANDARD.encode(real);
+        let encoded = format!("a1{}", encoded.replace('+', "-").replace('/', "_"));
+        let href = format!("/ck/a?&amp;u={encoded}");
+        let html = format!(
+            r#"<li class="b_algo"><h2><a href="{href}">Example Page</a></h2>
+               <div class="b_caption"><p>An example snippet</p></div></li>"#
+        );
+        let results = parse_bing_results(&html, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Example Page");
+        assert_eq!(results[0].url, "https://example.com/page");
+        assert_eq!(results[0].snippet, "An example snippet");
+    }
+
+    #[test]
+    fn spam_heuristic_drops_single_domain_stuffed_results() {
+        let results = vec![
+            SearchResult {
+                title: "1".into(),
+                url: "https://spam.example/a".into(),
+                snippet: "a".into(),
+            },
+            SearchResult {
+                title: "2".into(),
+                url: "https://spam.example/b".into(),
+                snippet: "b".into(),
+            },
+            SearchResult {
+                title: "3".into(),
+                url: "https://spam.example/c".into(),
+                snippet: "c".into(),
+            },
+            SearchResult {
+                title: "4".into(),
+                url: "https://spam.example/d".into(),
+                snippet: "d".into(),
+            },
+            SearchResult {
+                title: "5".into(),
+                url: "https://other.org/e".into(),
+                snippet: "e".into(),
+            },
+        ];
+        assert!(is_likely_spam_results(&results));
+    }
+
+    #[test]
+    fn spam_heuristic_keeps_mixed_domains() {
+        let results = vec![
+            SearchResult {
+                title: "1".into(),
+                url: "https://a.example/x".into(),
+                snippet: "a".into(),
+            },
+            SearchResult {
+                title: "2".into(),
+                url: "https://b.example/x".into(),
+                snippet: "b".into(),
+            },
+            SearchResult {
+                title: "3".into(),
+                url: "https://c.example/x".into(),
+                snippet: "c".into(),
+            },
+            SearchResult {
+                title: "4".into(),
+                url: "https://d.example/x".into(),
+                snippet: "d".into(),
+            },
+            SearchResult {
+                title: "5".into(),
+                url: "https://e.example/x".into(),
+                snippet: "e".into(),
+            },
+        ];
+        assert!(!is_likely_spam_results(&results));
     }
 
     // ── Integration tests with mockito (no real API key needed) ─────────────
@@ -923,6 +1479,121 @@ mod tests {
             .expect("jina truncation mock");
         assert!(out.contains("truncated"));
         assert!(out.len() < 5000);
+    }
+
+    #[tokio::test]
+    async fn html_fallback_uses_duckduckgo_when_available() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let ddg_body = r#"
+            <a class="result__a" href="https://rust-lang.org">Rust</a>
+            <a class="result__snippet">Systems language</a>
+        "#;
+        let ddg_mock = server
+            .mock("GET", "/html/")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body(ddg_body)
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .search_html_fallback("rust", 5)
+            .await
+            .expect("html fallback");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Rust");
+        assert_eq!(out[0].url, "https://rust-lang.org");
+        ddg_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn html_fallback_uses_bing_when_duckduckgo_challenged() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let _ddg = server
+            .mock("GET", "/html/")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body(r#"<div class="anomaly-modal">Unfortunately, bots use DuckDuckGo too</div>"#)
+            .create_async()
+            .await;
+
+        let bing_body = r#"
+            <li class="b_algo"><h2><a href="https://bing-result.example">Bing Hit</a></h2>
+            <div class="b_caption"><p>From Bing HTML</p></div></li>
+        "#;
+        let bing_mock = server
+            .mock("GET", "/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body(bing_body)
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .search_html_fallback("rust", 5)
+            .await
+            .expect("bing html fallback");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Bing Hit");
+        assert_eq!(out[0].snippet, "From Bing HTML");
+        bing_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_without_config_prefers_html_over_jina() {
+        use mockito::Server;
+
+        // Ensure env vars from other tests don't leak into this path.
+        // Per AGENTS.md: keep env mutation inside a single test body.
+        let previous_provider = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok();
+        let previous_key = std::env::var("RECURSIVE_WEB_SEARCH_API_KEY").ok();
+        // SAFETY: test-only env mutation, restored before return.
+        unsafe {
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_PROVIDER");
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY");
+        }
+
+        let mut server = Server::new_async().await;
+        let ddg_body = r#"
+            <a class="result__a" href="https://example.com/html-hit">HTML Hit</a>
+            <a class="result__snippet">from duckduckgo</a>
+        "#;
+        let _ddg = server
+            .mock("GET", "/html/")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(ddg_body)
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .execute(json!({"query": "html fallback"}))
+            .await
+            .expect("execute html path");
+        assert!(out.contains("HTML Hit"), "got: {out}");
+        assert!(out.contains("https://example.com/html-hit"));
+
+        // SAFETY: restore prior env if any.
+        unsafe {
+            match previous_provider {
+                Some(v) => std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", v),
+                None => std::env::remove_var("RECURSIVE_WEB_SEARCH_PROVIDER"),
+            }
+            match previous_key {
+                Some(v) => std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", v),
+                None => std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY"),
+            }
+        }
     }
 
     #[test]
