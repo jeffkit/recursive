@@ -274,4 +274,22 @@ mod tests {
         // Just ensure the test doesn't blow up regardless of the build cfg.
         let _ = on_with_feature;
     }
+
+    #[test]
+    fn is_coordinator_mode_rejects_non_one_env_value() {
+        // Kills: `replace == with !=` on `as_deref() == Ok("1")`.
+        // With the mutant, any value other than "1" (including "0" / "true")
+        // would incorrectly enable coordinator mode when the feature is on.
+        let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
+        std::env::set_var("RECURSIVE_COORDINATOR_MODE", "0");
+        let mode = is_coordinator_mode();
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_COORDINATOR_MODE", v),
+            None => std::env::remove_var("RECURSIVE_COORDINATOR_MODE"),
+        }
+        assert!(
+            !mode,
+            "RECURSIVE_COORDINATOR_MODE=0 must not enable coordinator mode"
+        );
+    }
 }

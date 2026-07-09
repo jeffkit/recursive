@@ -35,9 +35,11 @@ Cargo.lock.bak
 
 # Cargo config: ignore per-user overrides but track the shared config.toml
 # which contains project-level aliases (cargo tui, cargo cli) and NO_PROXY
-# settings that apply to all contributors.
+# settings that apply to all contributors. Also track mutants.toml so the
+# project's mutation-testing excludes/cadence travel with the repo.
 .cargo/*
 !.cargo/config.toml
+!.cargo/mutants.toml
 
 # Python
 __pycache__/

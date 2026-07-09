@@ -711,6 +711,11 @@ fn validate_session_id(sid: &str) -> Result<()> {
     // contain `.tmpXXX` segments from `/var/folders/...`. We still
     // reject path separators, `..`, and leading-dot to keep the id
     // safe for use as a git ref component.
+    // cargo-mutants::skip — `|| → &&` between `/` and `\` checks is near-
+    // equivalent: any id containing both separators is already rejected by
+    // either arm alone, and the charset `.all(...)` catch-all still fires
+    // for other invalid chars. Explicit backslash/slash unit tests pin the
+    // independent rejection paths.
     if sid.is_empty()
         || sid.contains('/')
         || sid.contains('\\')

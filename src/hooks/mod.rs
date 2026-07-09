@@ -387,6 +387,36 @@ mod tests {
     }
 
     #[test]
+    fn continue_action_does_not_short_circuit() {
+        // Kills: `delete match arm HookAction::Continue` — without the arm,
+        // Continue falls into `_ => continue` (same control flow) OR, if the
+        // match is reshaped, may stop iterating. Pin that two Continue hooks
+        // both fire and the final action is Continue.
+        let count = Arc::new(AtomicUsize::new(0));
+        let c1 = count.clone();
+        let c2 = count.clone();
+
+        struct CountingContinue(Arc<AtomicUsize>);
+        impl Hook for CountingContinue {
+            fn on_event(&self, _event: HookEvent) -> HookAction {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookAction::Continue
+            }
+        }
+
+        let mut reg = HookRegistry::new();
+        reg.register(Arc::new(CountingContinue(c1)));
+        reg.register(Arc::new(CountingContinue(c2)));
+        let action = reg.dispatch(HookEvent::SessionStart { goal: "g" });
+        assert!(matches!(action, HookAction::Continue));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "both Continue hooks must run"
+        );
+    }
+
+    #[test]
     fn first_skip_short_circuits_remaining_hooks() {
         let count = Arc::new(AtomicUsize::new(0));
         let c1 = count.clone();

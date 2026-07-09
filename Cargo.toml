@@ -126,6 +126,10 @@ agui-client = { path = "crates/agui-client" }
 agui-protocol = { version = "0.1", path = "crates/agui-protocol" }
 url = "2"
 mockito = "1.7.2"
+# Inert attribute crate recognized by cargo-mutants. Used to tag
+# structurally untestable / behavior-equivalent mutants so scoped gates
+# don't count them as missed. Zero production-binary impact.
+mutants = "0.0.3"
 
 [profile.dev]
 opt-level = 0

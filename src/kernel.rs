@@ -687,6 +687,40 @@ mod tests {
         );
     }
 
+    /// Kills: `delete !` on the compaction-summary prepend guard — when the
+    /// first message is NOT a compaction summary, it must not be prepended.
+    #[tokio::test]
+    async fn kernel_run_does_not_prepend_non_summary_first_message() {
+        use crate::llm::Completion;
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "reply".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let kernel = AgentKernel::builder()
+            .llm(provider)
+            .max_steps(1)
+            .build()
+            .expect("build");
+
+        let system = Message::system("sys".to_string());
+        assert!(
+            !system.is_compaction_summary,
+            "fixture must not be a compaction summary"
+        );
+        let ctx = make_minimal_ctx(vec![system, Message::user("q".to_string())]);
+        let outcome = kernel.run(ctx).await.expect("run");
+        assert_eq!(outcome.new_messages.len(), 1);
+        assert_eq!(outcome.new_messages[0].content, "reply");
+        assert!(
+            outcome.new_messages.iter().all(|m| m.content != "sys"),
+            "non-summary first message must not be prepended; got {:?}",
+            outcome.new_messages
+        );
+    }
+
     // -- AgentKernelBuilder Debug fmt test ----------------------------------
 
     #[test]
