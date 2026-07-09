@@ -1384,6 +1384,11 @@ mod tests {
         assert_eq!(rfc3339_to_secs("1970-01-01T00:00:00Z"), Some(0.0));
         // 1970-01-01T01:00:00Z = 3600s — kills `hour * 3600` → `hour + 3600`
         assert_eq!(rfc3339_to_secs("1970-01-01T01:00:00Z"), Some(3600.0));
+        // 1970-01-01T00:01:00Z = 60s — kills `+ min*60` → `- min*60` and `*60` → `/60`
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:01:00Z"), Some(60.0));
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:02:00Z"), Some(120.0));
+        // 1970-01-01T00:00:05Z = 5s — kills `+ sec` → `* sec`
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:00:05Z"), Some(5.0));
         // 1970-01-02T00:00:00Z = 86400s — kills `days * 86400` → `days + 86400`
         assert_eq!(rfc3339_to_secs("1970-01-02T00:00:00Z"), Some(86400.0));
     }
@@ -1407,6 +1412,10 @@ mod tests {
         assert_eq!(days_to_date(0), (1970, 1, 1));
         assert_eq!(days_to_date(364), (1970, 12, 31));
         assert_eq!(days_to_date(365), (1971, 1, 1));
+        // Month loop: day index 31 is 1970-02-01. With `days <= md` the
+        // January (31) boundary would break early → bogus day 32.
+        assert_eq!(days_to_date(30), (1970, 1, 31));
+        assert_eq!(days_to_date(31), (1970, 2, 1));
     }
 
     #[test]
