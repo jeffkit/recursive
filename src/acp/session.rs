@@ -104,6 +104,16 @@ impl AcpSessionManager {
     pub fn remove(&mut self, sid: &str) -> Option<AcpSession> {
         self.sessions.remove(sid)
     }
+
+    /// Return the id and turn of every session (immutable snapshot).
+    /// Used by `session/cancel` (empty-params mode) to find the most recently
+    /// active session.
+    pub fn all_turns(&self) -> Vec<(String, u64)> {
+        self.sessions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.turn))
+            .collect()
+    }
 }
 
 #[cfg(test)]

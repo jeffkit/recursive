@@ -2,16 +2,17 @@
 
 ## ⚠️ 已完成的 sprint（不要重做）
 
-**Sprint 0 (P0) — ACP 协议类型层：已完成并 commit。**
+**全部 P0~P3 + sprint-1 CLI fix 已完成并 commit。**
 
-- `src/acp/mod.rs` 已创建（声明 `pub mod protocol`）
-- `src/acp/protocol.rs` 已创建（916 行，re-export 自 `agent-client-protocol-schema` crate，64 个 round-trip test 全过）
-- `Cargo.toml` 已加 `agent-client-protocol-schema = "1.4"` 依赖
-- `src/lib.rs` 已加 `pub mod acp;`
-- 全 workspace test 661 个全过；clippy 0 warning；fmt clean
-- Commits：`a9522f9` + `4fb3ea2`
+- ✅ **P0** ACP 协议类型层 — `src/acp/protocol.rs`（re-export `agent-client-protocol-schema`，64 个 round-trip test）— commit `4fb3ea2`
+- ✅ **P1** stdio JSON-RPC loop + initialize handshake — `src/acp/server.rs`（init / handshake / error 码 / state machine）— commit `257feba`
+- ✅ **P2+P3** session lifecycle + tool_call 通知 + ToolKind — `src/acp/{session,bridge,tool_kind}.rs`，`src/tools/*::kind()` 方法，4b SSE abort 部分 wiring — commits `23f96fc` + `71012b3`
+- ✅ **Sprint-1 CLI fix**：`recursive acp` 接 LLM provider（`AcpServer::run(Some(provider))`）— commit `f02feb1`
+- AC-2.1 sandbox check 用 `RECURSIVE_ACP_SANDBOX_STRICT=1` 控制（默认 warn 模式）
 
-**planner 重新拆 sprint 时，sprint 1 应该从 P1（stdio JSON-RPC loop + initialize）开始**，不要再做协议类型层。
+**planner 重新拆 sprint 时，sprint 1 应该从 P4（session/cancel + permission）开始**，不要再做 P0~P3。Sprint 1 失败根因（CLI 没接 LLM provider）已修。
+
+**`RECURSIVE_ACP_SANDBOX_STRICT=1` 在生产部署时记得设**——`recursive acp` 启动时设为强沙箱模式（dev/test 默认 off，TempDir cwd 才能跑通）。
 
 ---
 

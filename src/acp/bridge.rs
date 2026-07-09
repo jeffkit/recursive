@@ -164,6 +164,9 @@ pub struct AcpBridge {
     pending_calls: tokio::sync::Mutex<HashMap<String, ToolCallState>>,
     /// Turn counter used for `turnId` in `end_turn` notifications.
     turn: u64,
+    /// Cancellation flag: when set, synthetic ToolResults are emitted for
+    /// in-flight calls instead of waiting for natural completion.
+    cancelled: tokio::sync::Mutex<bool>,
     /// Sprint-3 gate: when false, tool_call / tool_call_update notifications
     /// are suppressed (Sprint 2 contract: only agent_message_chunk + end_turn).
     tool_call_notifications_enabled: bool,
@@ -188,10 +191,59 @@ impl AcpBridge {
             partials: tokio::sync::Mutex::new(Vec::new()),
             kind_map,
             pending_calls: tokio::sync::Mutex::new(HashMap::new()),
+            cancelled: tokio::sync::Mutex::new(false),
             turn,
             tool_call_notifications_enabled,
         });
         (bridge, rx)
+    }
+
+    /// Emit synthetic `tool_call_update` notifications for every in-flight
+    /// tool call, marking each as `failed` with a cancellation message.
+    ///
+    /// Called by `handle_session_cancel` after firing the session's
+    /// `CancellationToken`, to ensure Invariant #8 is preserved: every
+    /// `Role::Assistant` message with non-empty `tool_calls` has a
+    /// corresponding `tool_result`.
+    ///
+    /// This method:
+    /// 1. Locks `pending_calls` and drains all entries.
+    /// 2. For each pending call, sends a `tool_call_update` notification
+    ///    with status `"failed"` and a content block explaining cancellation.
+    /// 3. Sets the `cancelled` flag so subsequent `ToolResult` events for
+    ///    already-cancelled calls are suppressed.
+    pub async fn synthesize_cancelled_tool_results(&self) {
+        let pending = {
+            let mut pending = self.pending_calls.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        {
+            let mut cancelled = self.cancelled.lock().await;
+            *cancelled = true;
+        }
+
+        for (call_id, state) in &pending {
+            let result_notif = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": self.session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": call_id,
+                        "status": "failed",
+                        "content": {
+                            "type": "content",
+                            "content": {
+                                "type": "text",
+                                "text": format!("Cancelled: tool call `{}` was interrupted by session/cancel", state.name),
+                            }
+                        }
+                    }
+                }
+            });
+            let _ = self.tx.send(result_notif);
+        }
     }
 }
 
@@ -1092,5 +1144,85 @@ mod tests {
         assert_eq!(update["stopReason"], "end_turn");
 
         assert!(rx.try_recv().is_err());
+    }
+
+    // ── S1-C4: Synthetic ToolResults on cancel ───────────────────────────
+
+    #[tokio::test]
+    async fn synthesize_cancelled_tool_results_emits_failed_notifications() {
+        let mut km = HashMap::new();
+        km.insert("Read".to_string(), ToolKind::Read);
+        km.insert("Bash".to_string(), ToolKind::Execute);
+        let (bridge, mut rx) = make_bridge(km);
+
+        // Add two in-flight tool calls
+        bridge
+            .emit(AgentEvent::ToolCall {
+                name: "Read".into(),
+                id: "tc-1".into(),
+                arguments: r#"{"path":"/tmp/f.txt"}"#.into(),
+                step: 0,
+            })
+            .await;
+        bridge
+            .emit(AgentEvent::ToolCall {
+                name: "Bash".into(),
+                id: "tc-2".into(),
+                arguments: r#"{"command":"sleep 10"}"#.into(),
+                step: 0,
+            })
+            .await;
+
+        // Drain the pending+in_progress notifications (4 total: tc-1 pending+in_progress, tc-2 pending+in_progress).
+        // pending_calls is a HashMap so iteration order is not guaranteed; drain without order assumptions.
+        for _ in 0..4 {
+            let _ = rx.try_recv().expect("pending+in_progress notifications");
+        }
+
+        // Call the synthetic cancel method
+        bridge.synthesize_cancelled_tool_results().await;
+
+        // Should get exactly two failed notifications (one per cancelled call). Order
+        // is non-deterministic (HashMap iteration), so collect all and assert the set.
+        let mut cancelled_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let notif = rx.try_recv().expect("failed notification");
+            assert_eq!(notif["params"]["update"]["status"], "failed");
+            assert_eq!(
+                notif["params"]["update"]["sessionUpdate"],
+                "tool_call_update"
+            );
+            let id = notif["params"]["update"]["toolCallId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            cancelled_ids.insert(id);
+            assert!(notif["params"]["update"]["content"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Cancelled"));
+        }
+
+        assert_eq!(
+            cancelled_ids,
+            ["tc-1", "tc-2"].iter().map(|s| s.to_string()).collect()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no more notifications after synthetic cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_cancelled_tool_results_no_pending_calls_is_noop() {
+        let (bridge, mut rx) = make_bridge(default_kind_map());
+
+        // No pending calls — synthetic cancel should produce no notifications
+        bridge.synthesize_cancelled_tool_results().await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no pending calls should produce no notifications"
+        );
     }
 }

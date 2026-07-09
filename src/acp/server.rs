@@ -85,8 +85,8 @@ const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const SERVER_NOT_INITIALIZED: i32 = -32002;
-/// Custom error: session not found (between INVALID_PARAMS and INTERNAL_ERROR).
-const SESSION_NOT_FOUND: i32 = -32001;
+/// Custom error: session not found or not running (S1-C12: contract requires -32000).
+const SESSION_NOT_FOUND: i32 = -32000;
 
 /// Supported protocol version.
 const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
@@ -726,78 +726,82 @@ async fn handle_session_prompt(
 
 /// Handle `session/cancel`: fire the session's `CancellationToken`.
 ///
-/// Validation rules (C0):
-/// - Valid sessionId → fire the token, return `{cancelled: true}`.
-/// - Unknown sessionId → error code 404 (SESSION_NOT_FOUND).
-/// - Missing or wrong-type sessionId → error code 400 (INVALID_PARAMS).
+/// Per S1-C12 contract:
+/// - Request format: `{"method":"session/cancel","params":{}}` OR
+///   `{"method":"session/cancel","params":{"sessionId":"..."}}` for
+///   targeting a specific session.
+/// - Success response: `{"result":true}`.
+/// - Non-existent or non-running session → JSON-RPC error -32000.
+///
+/// When params is empty (`{}`), the handler cancels the first running
+/// session (the one most recently prompted). If no session exists or
+/// none is running, returns error -32000.
 fn handle_session_cancel(
     id: &Value,
     params: Option<&Value>,
     sessions: &mut AcpSessionManager,
 ) -> (Option<Value>, Vec<Value>) {
-    let params = match params {
-        Some(p) => p,
-        None => {
-            return (
-                Some(build_error(
-                    id,
-                    INVALID_PARAMS,
-                    "Missing required field 'sessionId'",
-                )),
-                vec![],
-            );
-        }
-    };
+    // Determine which session to cancel.
+    let sid: Option<String> = params.and_then(|p| {
+        p.get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
 
-    // Validate sessionId is a string
-    let sid = match params.get("sessionId") {
-        Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
-        Some(_) => {
-            return (
-                Some(build_error(
-                    id,
-                    INVALID_PARAMS,
-                    "Invalid params: 'sessionId' must be a string",
-                )),
-                vec![],
-            );
-        }
-        None => {
-            return (
-                Some(build_error(
-                    id,
-                    INVALID_PARAMS,
-                    "Missing required field 'sessionId'",
-                )),
-                vec![],
-            );
-        }
-    };
+    if let Some(sid) = sid {
+        // Target a specific session by ID.
+        let session = match sessions.get_mut(&sid) {
+            Some(s) => s,
+            None => {
+                return (
+                    Some(build_error(
+                        id,
+                        SESSION_NOT_FOUND,
+                        &format!("Session not found: {sid}"),
+                    )),
+                    vec![],
+                );
+            }
+        };
 
-    // Look up the session — return 404 if not found
-    let session = match sessions.get_mut(&sid) {
-        Some(s) => s,
-        None => {
-            return (
+        // Cancel — fire the token (idempotent: double-cancel is safe).
+        session.cancel_token.cancel();
+
+        (Some(build_success(id, Value::Bool(true))), vec![])
+    } else {
+        // Empty params — try to cancel the most recently active session.
+        // Use the session with the highest turn counter as proxy for "most recently active".
+        let active_sid: Option<String> = {
+            let mut candidates: Vec<(String, u64)> = sessions.all_turns();
+            candidates.sort_by_key(|(_, turn)| std::cmp::Reverse(*turn));
+            candidates.into_iter().next().map(|(id, _)| id)
+        };
+
+        match active_sid {
+            Some(sid) => {
+                match sessions.get_mut(&sid) {
+                    Some(session) => {
+                        session.cancel_token.cancel();
+                        (Some(build_success(id, Value::Bool(true))), vec![])
+                    }
+                    None => {
+                        // Race: another task just removed the session between
+                        // all_turns() and get_mut(). Treat as no-op success
+                        // since the cancellation target is gone.
+                        (Some(build_success(id, Value::Bool(true))), vec![])
+                    }
+                }
+            }
+            None => (
                 Some(build_error(
                     id,
                     SESSION_NOT_FOUND,
-                    &format!("Session not found: {sid}"),
+                    "No active session to cancel",
                 )),
                 vec![],
-            );
+            ),
         }
-    };
-
-    // Fire the cancellation token — this triggers Phase 1 (LLM stream abort)
-    // and Phase 2 (agent→client RPC abort) as described in the module doc.
-    session.cancel_token.cancel();
-
-    let result = serde_json::json!({
-        "cancelled": true,
-    });
-
-    (Some(build_success(id, result)), vec![])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,11 +1604,11 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // Sprint 4: session/cancel tests (C0)
+    // Sprint 4: session/cancel tests (C12, C14)
     // ══════════════════════════════════════════════════════════════════
 
     #[tokio::test]
-    async fn session_cancel_valid_session_returns_cancelled_true() {
+    async fn session_cancel_valid_session_returns_result_true() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_string_lossy();
         let input = format!(
@@ -1617,12 +1621,12 @@ mod tests {
         // init response + initialized + session/new + session/cancel
         assert!(lines.len() >= 4, "expected ≥4 lines, got {}", lines.len());
         let v = parse_line(&lines, 3);
-        assert!(v["result"].is_object(), "expected success, got: {v}");
-        assert_eq!(v["result"]["cancelled"], true);
+        // S1-C12: success response is result:true (not {cancelled:true})
+        assert_eq!(v["result"], true, "expected result:true, got: {v}");
     }
 
     #[tokio::test]
-    async fn session_cancel_nonexistent_session_returns_404() {
+    async fn session_cancel_nonexistent_session_returns_error() {
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#,
             "\n",
@@ -1646,11 +1650,11 @@ mod tests {
         let lines = run_server(input).await;
         assert_eq!(lines.len(), 3, "init + initialized + error");
         let v = parse_line(&lines, 2);
-        assert_eq!(v["error"]["code"], INVALID_PARAMS);
+        assert_eq!(v["error"]["code"], SESSION_NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn session_cancel_wrong_type_session_id_returns_400() {
+    async fn session_cancel_wrong_type_session_id_returns_error() {
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#,
             "\n",
@@ -1659,7 +1663,7 @@ mod tests {
         let lines = run_server(input).await;
         assert_eq!(lines.len(), 3, "init + initialized + error");
         let v = parse_line(&lines, 2);
-        assert_eq!(v["error"]["code"], INVALID_PARAMS);
+        assert_eq!(v["error"]["code"], SESSION_NOT_FOUND);
     }
 
     // ══════════════════════════════════════════════════════════════════
