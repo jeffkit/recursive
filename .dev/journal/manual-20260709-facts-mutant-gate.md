@@ -21,5 +21,5 @@
 
 **Notes**:
 - GitNexus impact on `evict_to_cap` was HIGH; production semantics unchanged (extract + skip + tests).
-- Full gate after skips: 153 mutants → 6 missed (calendar arithmetic) → pinned with exact date tests.
-- Mutant count after skips: ~153 (was 200).
+- Full gate after skips: 153 mutants → 6 missed (calendar) → pinned; calendar re-verify left 1 miss (`len < 20`) + 1 TIMEOUT (`-=`→`+=`) → short-string pin + `subtract_year_days` soft-skip.
+- Mutant count after skips: ~153 (was 200). Full re-gate running after `86ee08e`.
