@@ -1,0 +1,85 @@
+{
+  "overall": "fail",
+  "findings": [
+    {
+      "criterion": "S3-C1",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 145,
+      "note": "Bridge has zero tool_call notification logic. The `_ => {}` catch-all on line ~145 silently discards `AgentEvent::ToolCall`. No `sessionUpdate: \"tool_call\"` notification with status `pending` is ever emitted. The test `bridge_silences_non_token_events` (line ~322) even explicitly asserts that ToolCall produces NO notification — directly contradicting the S3-C1 requirement.",
+      "repro": "Read src/acp/bridge.rs lines 83-145; the match only handles PartialToken/AssistantText/TurnFinished. grep -n 'tool_call\\|ToolCall' src/acp/bridge.rs returns zero matches."
+    },
+    {
+      "criterion": "S3-C2",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 83,
+      "note": "No in_progress synthesis (no internal tool_call_update emission after pending). No ToolResult handling — the `_ => {}` arm discards AgentEvent::ToolResult. The pending→in_progress→completed/failed lifecycle is entirely absent.",
+      "repro": "Grep for 'in_progress', 'completed', 'failed', 'ToolResult', 'tool_call_update' in src/acp/bridge.rs — all return zero matches."
+    },
+    {
+      "criterion": "S3-C3",
+      "status": "fail",
+      "file": "src/tools",
+      "line": 1,
+      "note": "ToolKind enum IS defined in src/acp/tool_kind.rs with correct variants and serde snake_case. Default `fn kind() -> ToolKind { ToolKind::Other }` IS present on the Tool trait in registry.rs:52. However, only ReadFile (fs.rs:155) overrides kind(). The following tools FAIL to override: Edit (edit.rs, no kind), WriteFile (fs.rs:333, no kind), RunShell (shell.rs, no kind), Glob (glob.rs, no kind), WebFetch (web_fetch.rs, no kind), WebSearch (web_search.rs, no kind). All currently inherit ToolKind::Other instead of their contract-specified values. Additionally, ToolKind lacks `Deserialize` derive, causing compile failure in protocol.rs roundtrip tests (3 errors).",
+      "repro": "grep -rn 'fn kind' src/tools/ — only fs.rs:155 has a real override. Run `cargo test --lib` — fails to compile with `tool_kind::ToolKind: serde::de::DeserializeOwned` not satisfied."
+    },
+    {
+      "criterion": "S3-C4",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 68,
+      "note": "AcpBridge::new() accepts only `session_id: String`. No `HashMap<String, ToolKind>` parameter. The bridge stores no kind_map and has no mechanism to look up tool→kind mappings. `ToolRegistry::build_kind_map()` exists (registry.rs ~line 385) but is never called by the bridge.",
+      "repro": "Read AcpBridge::new() signature at bridge.rs:68 — only takes session_id. grep -rn 'kind_map' src/acp/ returns zero matches."
+    },
+    {
+      "criterion": "S3-C5",
+      "status": "fail",
+      "file": "src/acp",
+      "line": 1,
+      "note": "No `extract_locations` function exists anywhere in the codebase. Grep across all of src/ returns zero matches. The function is not defined in any file under src/acp/ or src/tools/.",
+      "repro": "grep -rn 'extract_locations' src/ — zero matches. grep -rn 'ToolCallLocation' src/acp/ — only in protocol.rs re-exports, zero usage."
+    },
+    {
+      "criterion": "S3-C6",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 83,
+      "note": "No tool_call notifications exist, so locations are never attached to any notification. Cannot verify the 'locations only on pending' rule when no locations are ever emitted.",
+      "repro": "Dependent on S3-C1/S3-C5 failures — no tool_call notifications means locations are a no-op."
+    },
+    {
+      "criterion": "S3-C7",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 68,
+      "note": "Bridge has no per-call state tracking. The struct only has `session_id`, `tx`, and `partials`. No HashMap/ToolCallState tracking for concurrent tool calls. No logic to handle out-of-order ToolResult arrivals or synthesize in_progress for multiple parallel ToolCall events.",
+      "repro": "Read AcpBridge struct definition at bridge.rs:62-66 — only three fields, none related to tool call state. grep -rn 'ToolCallState\\|tool_state\\|pending_calls' src/acp/ returns zero matches."
+    },
+    {
+      "criterion": "S3-C8",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 145,
+      "note": "The `emit()` method uses `_ => {}` as a catch-all (line ~145 in the match block). There are NO dedicated `AgentEvent::ToolCall { .. }` or `AgentEvent::ToolResult { .. }` arms. The test `bridge_silences_non_token_events` (line ~315) asserts that ToolCall, Latency, and Usage all produce zero notifications — this test directly contradicts the S3-C1/S3-C8 requirement that ToolCall must produce a notification.",
+      "repro": "Read bridge.rs lines 83-145; the match has arms for PartialToken, AssistantText, TurnFinished, and `_ => {}`. grep -n 'AgentEvent::ToolCall\\|AgentEvent::ToolResult' src/acp/bridge.rs — only in the silencing test, not in the emit() match."
+    },
+    {
+      "criterion": "S3-C9",
+      "status": "fail",
+      "file": "src/acp/protocol.rs",
+      "line": 393,
+      "note": "Sprint 2 tests cannot run because the library test target fails to compile. Three compilation errors in protocol.rs: `tool_kind::ToolKind` lacks `Deserialize`, causing `assert_roundtrip` calls in `tool_kind_variants_roundtrip` (line ~365) and `enum_non_default_variant_roundtrip` (line ~877) to fail. Without Deserialize, no ACP tests execute at all.",
+      "repro": "`cargo test --lib` → compile error: `the trait bound tool_kind::ToolKind: serde::de::DeserializeOwned is not satisfied` (3 occurrences)."
+    },
+    {
+      "criterion": "S3-C10",
+      "status": "fail",
+      "file": "src/acp",
+      "line": 1,
+      "note": "All three quality gates fail: (1) `cargo test --lib` — compile error (ToolKind lacks Deserialize). (2) `cargo clippy --all-targets --all-features -- -D warnings` — fails with `clippy::new-without-default` on AcpSessionManager (session.rs:49). (3) `cargo fmt --all -- --check` — fails with formatting diffs in bridge.rs (lines 284, 312, 411, 438) and tool_kind.rs (line 77).",
+      "repro": "Run each of the three commands from workspace root; all three exit non-zero."
+    }
+  ]
+}

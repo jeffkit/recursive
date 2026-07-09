@@ -1,0 +1,67 @@
+{
+  "overall": "fail",
+  "findings": [
+    {
+      "criterion": "C1",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 176,
+      "note": "initialize response: protocolVersion=1, agentInfo.name='recursive', agentInfo.version='0.7.0' (valid semver), agentCapabilities has session/fs/mcp keys with correct methods. Verified via echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",...}' | cargo run --bin recursive -p recursive-cli -- acp"
+    },
+    {
+      "criterion": "C2",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 114,
+      "note": "Ordering verified: line1=initialize response(id=1), line2=initialized notification(no id, method='initialized'), line3=ping error(id=2). The dispatch function returns (response, notifications) tuple; run_io writes response first then notifications, guaranteeing 'initialized' appears after response and before any subsequent response.",
+      "repro": "printf '...initialize...\\n...ping...\\n' | cargo run --bin recursive -p recursive-cli -- acp"
+    },
+    {
+      "criterion": "C3",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 253,
+      "note": "5 lines output: line1 init(id=1), line2 initialized, line3/4/5 error id=10/20/30 with code=-32601, strict FIFO order maintained. Server processes lines sequentially in a while-let loop."
+    },
+    {
+      "criterion": "C4",
+      "status": "fail",
+      "file": "src/acp/protocol.rs",
+      "line": 579,
+      "note": "Contract requires #[test] fn test_initialize_roundtrip and fn test_initialize_response_roundtrip. Actual test names are 'initialize_request_roundtrip' (line 579) and 'initialize_response_roundtrip' (line 586). Neither matches the contract's specified names. Functionally, both roundtrip tests exist and pass (InitializeRequest→JSON→deserialize roundtrip on line 579, InitializeResponse on line 586, AgentCapabilities on line 601), but naming does not match contract. Running `cargo test -- test_initialize_roundtrip` would find zero tests.",
+      "repro": "grep -n 'fn.*initialize.*roundtrip' src/acp/protocol.rs"
+    },
+    {
+      "criterion": "C5",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 282,
+      "note": "garbage → line1:{\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error: invalid JSON\"}}; then valid initialize → line2 with protocolVersion=1. Server does not panic, continues processing after parse error. Verified via printf 'garbage\\n...initialize...\\n' | cargo run."
+    },
+    {
+      "criterion": "C6",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 105,
+      "note": "Contract 'how' sends 'session/new' without prior 'initialize': echo '...session/new...' | cargo run -- acp. Result: {\"id\":42,\"error\":{\"code\":-32002,\"message\":\"Server not initialized\"}}. Expected: code=-32601 (Method not found). The server's state machine correctly returns -32002 for any method before initialize is complete, but the contract's test command omits the prerequisite initialize. The unit test 'session_new_returns_method_not_found' (line ~385) does correctly return -32601 when initialize is done first, confirming the dispatch is correct — the contract's repro is incomplete.",
+      "repro": "echo '{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"session/new\",\"params\":{}}' | cargo run --bin recursive -p recursive-cli -- acp 2>/dev/null"
+    },
+    {
+      "criterion": "C7",
+      "status": "pass",
+      "note": "Notification produces no stdout output, exit code 0. Verified via echo '{\"jsonrpc\":\"2.0\",\"method\":\"someNotification\",\"params\":{}}' | cargo run. In dispatch(), when envelope.id is None, the function returns (None, vec![]) — no response, no panic."
+    },
+    {
+      "criterion": "C8",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 87,
+      "note": "Missing jsonrpc/method fields: {\"foo\":\"bar\"} → {\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request: missing 'jsonrpc' field\"}}. Verified via echo '{\"foo\":\"bar\"}' | cargo run."
+    },
+    {
+      "criterion": "C9",
+      "status": "pass",
+      "note": "cargo test --workspace: all tests pass (98 ACP tests + others). cargo clippy --all-targets --all-features -- -D warnings: clean, no warnings, exit 0."
+    }
+  ]
+}

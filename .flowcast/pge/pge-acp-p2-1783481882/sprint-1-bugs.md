@@ -1,0 +1,7 @@
+- [C4] Contract requires #[test] fn test_initialize_roundtrip and fn test_initialize_response_roundtrip. Actual test names are 'initialize_request_roundtrip' (line 579) and 'initialize_response_roundtrip' (line 586). Neither matches the contract's specified names. Functionally, both roundtrip tests exist and pass (InitializeRequest→JSON→deserialize roundtrip on line 579, InitializeResponse on line 586, AgentCapabilities on line 601), but naming does not match contract. Running `cargo test -- test_initialize_roundtrip` would find zero tests.
+  - file: src/acp/protocol.rs:579
+  - repro: grep -n 'fn.*initialize.*roundtrip' src/acp/protocol.rs
+
+- [C6] Contract 'how' sends 'session/new' without prior 'initialize': echo '...session/new...' | cargo run -- acp. Result: {"id":42,"error":{"code":-32002,"message":"Server not initialized"}}. Expected: code=-32601 (Method not found). The server's state machine correctly returns -32002 for any method before initialize is complete, but the contract's test command omits the prerequisite initialize. The unit test 'session_new_returns_method_not_found' (line ~385) does correctly return -32601 when initialize is done first, confirming the dispatch is correct — the contract's repro is incomplete.
+  - file: src/acp/server.rs:105
+  - repro: echo '{"jsonrpc":"2.0","id":42,"method":"session/new","params":{}}' | cargo run --bin recursive -p recursive-cli -- acp 2>/dev/null

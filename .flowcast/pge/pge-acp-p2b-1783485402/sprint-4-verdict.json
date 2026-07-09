@@ -1,0 +1,63 @@
+{
+  "overall": "fail",
+  "findings": [
+    {
+      "criterion": "C0",
+      "status": "pass",
+      "note": "session/cancel is registered as an ACP JSON-RPC method (src/acp/server.rs:dispatch match arm). Handler validates all four cases: valid sessionId → {cancelled:true}, unknown sessionId → error code SESSION_NOT_FOUND (-32001), missing params → INVALID_PARAMS (-32602), wrong type (int) → INVALID_PARAMS. Four unit tests exist (session_cancel_valid_session_returns_cancelled_true, session_cancel_nonexistent_session_returns_404, session_cancel_missing_session_id_returns_400, session_cancel_wrong_type_session_id_returns_400) — all pass."
+    },
+    {
+      "criterion": "C1",
+      "status": "fail",
+      "file": "src/acp/session.rs",
+      "line": 53,
+      "note": "CancellationToken lifecycle pipeline exists — token is materialized in session/new (server.rs ~line 665: `let cancel_token = CancellationToken::new()`), stored on AcpSession, fired by session/cancel via `session.cancel_token.cancel()`, and refreshed per turn via refresh_cancel_token() called from handle_session_prompt. However, the token is NEVER consumed by the provider stream functions: neither src/llm/openai.rs nor src/llm/anthropic.rs accepts or checks a CancellationToken. The kernel stores it as `shutdown_token` (src/kernel.rs:169) but there is zero code that calls `.is_cancelled()` on it during the step loop — grep confirms no match for `is_cancelled|cancelled` in src/kernel.rs. The plumbing exists as data storage but is dead code — no observable effect when the token fires. Sub-point 2 of the contract ('assert set_interrupt_token was called with a token that, when cancelled, causes the provider stream's select! branch to fire') is impossible to verify because no select! exists.",
+      "repro": "grep -rn 'tokio::select!' src/llm/ && echo 'FOUND' || echo 'NOT FOUND'; grep -rn 'is_cancelled' src/kernel.rs && echo 'FOUND' || echo 'NOT FOUND'"
+    },
+    {
+      "criterion": "C2",
+      "status": "fail",
+      "file": "src/llm/openai.rs",
+      "line": 604,
+      "note": "Depends on C7 (no tokio::select! on CancellationToken). The SSE parse loop in parse_sse_stream() uses a plain `while let Some(chunk) = byte_stream.next().await` loop (line 604). When session/cancel fires the token, the stream is NOT aborted at transport level — the reqwest::Response is NOT dropped, the TCP connection stays open, and chunks continue to be processed until the stream naturally ends. The contract requires <1s wall-clock from cancel-send to TurnFinished with stopReason='cancelled' — this cannot happen with the current implementation. No E2E test exists (glob e2e/tests/*cancel* returns empty).",
+      "repro": "grep -n 'while let Some' src/llm/openai.rs src/llm/anthropic.rs | grep -A0 'byte_stream\\|chunk'"
+    },
+    {
+      "criterion": "C3",
+      "status": "fail",
+      "file": "src/acp/bridge.rs",
+      "line": 170,
+      "note": "No transcript repair logic exists anywhere in the codebase. When TurnFinished arrives with reason 'cancelled' (bridge.rs line ~240: `\"cancelled\" => \"cancelled\"`), the bridge emits a final stopReason='cancelled' notification but does NOT inject synthetic tool_result messages for any in-flight tool calls still tracked in `pending_calls`. The pending_calls HashMap (bridge.rs line 161) is simply leaked — those tool calls never receive matching tool_call_update notifications with status 'failed'. grep for 'orphan|repair|synthetic.*tool' across src/ returns zero matches. The contract requires: 'for every notification with a tool_call, there exists a subsequent tool_call_update with status=failed' — this cannot pass.",
+      "repro": "grep -rni 'orphan\\|repair\\|synthetic' src/ && echo 'FOUND' || echo 'NOT FOUND'; grep -rn 'pending_calls' src/acp/bridge.rs | grep -v 'pending_calls:' | grep -v '//'"
+    },
+    {
+      "criterion": "C4",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 1,
+      "note": "session/request_permission is NOT implemented. grep for 'request_permission|PermissionHook|permission_hook|PermissionDenied|Always Allow' in src/acp/ returns zero matches. The only references to request_permission are in the Cooperative Cancel doc comment (describing it as planned) and two protocol roundtrip tests in src/acp/protocol.rs:693,701. There is no notification schema, no RPC handler in the dispatch loop, no PermissionHook→ACP bridge, no Allow/Deny/Always Allow decision routing, and no in-memory exemption hash set on AcpSession for the Always Allow persistence across turns. This is a complete gap.",
+      "repro": "grep -rn 'request_permission\\|PermissionHook\\|Always Allow' src/acp/ --include='*.rs' | grep -v 'protocol.rs' | grep -v '//!'"
+    },
+    {
+      "criterion": "C5",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 1,
+      "note": "Zero agent→client RPCs exist — C4 is not implemented, so there's nothing to timeout. grep for 'timeout|Timeout|30.*second|tokio::time::timeout' in src/acp/ returns no matches. No 30s deadline wrapper exists. No cancel-preemption-of-RPC logic exists. The contract's sub-tests ('RPC resolves with timeout error in 30s ± 2s', 'cancel-during-permission edge case resolves with Error::Cancelled within 200ms') are impossible to execute. This entire criterion is blocked on C4 being implemented first.",
+      "repro": "grep -rn 'timeout\\|Timeout\\|30.*second' src/acp/ && echo 'FOUND' || echo 'NOT FOUND'; grep -rn 'rpc_methods' src/ && echo 'RPC methods exist' || echo 'NO RPC methods found'"
+    },
+    {
+      "criterion": "C6",
+      "status": "pass",
+      "note": "Module-level doc comment (//!) exists at top of src/acp/server.rs (lines 1-59), before any use statements/fns/structs. Section heading '# Cooperative Cancel' (line 30). All 5 sub-points present: (a) two-phase abort: Phase 1 'LLM stream abort' and Phase 2 'ACP client RPC abort', (b) mentions 'tokio::select!' and 'CancellationToken', (c) describes both SSE read loop level and agent→client RPC level, (d) references transcript repair / tool_call-tool_result pairing guarantee, (e) single-token-per-turn lifecycle with fresh token each turn. Documentation gate passed."
+    },
+    {
+      "criterion": "C7",
+      "status": "fail",
+      "file": "src/llm/openai.rs",
+      "line": 604,
+      "note": "Neither src/llm/openai.rs nor src/llm/anthropic.rs uses tokio::select! on a CancellationToken. grep for 'tokio::select!' and 'CancellationToken' in src/llm/ returns zero matches. Both parse_sse_stream methods (openai.rs:606, anthropic.rs:338) use `while let Some(chunk) = byte_stream.next().await` — a blocking loop with no cancellation branch. The CancellationToken from AgentRuntime context is never passed to these functions. Additionally, there is no `Error::Cancelled` variant in src/error.rs (grep confirms zero matches for 'Cancelled|Cancel'), so the contract's requirement that the stream returns 'Err(Error::Cancelled)' cannot be satisfied without adding both the error variant and the select! pattern. The ChatProvider::stream trait method (src/llm/mod.rs:119) takes no CancellationToken parameter.",
+      "repro": "grep -rn 'tokio::select!\\|CancellationToken' src/llm/openai.rs src/llm/anthropic.rs; grep -n 'Error::Cancelled\\|Cancelled' src/error.rs"
+    }
+  ]
+}

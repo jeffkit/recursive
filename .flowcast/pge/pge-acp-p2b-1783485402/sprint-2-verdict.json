@@ -1,0 +1,108 @@
+{
+  "overall": "fail",
+  "findings": [
+    {
+      "criterion": "S2-C1",
+      "status": "pass",
+      "note": "session/new with valid cwd returns { sessionId, capabilities }. Verified by test `session_new_returns_session_id`."
+    },
+    {
+      "criterion": "S2-C2",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 557,
+      "note": "handle_session_new stores `cwd` in AcpSession but never configures the AgentRuntime's tool sandbox roots. No call to `new_shared_sandbox_roots()` or `.with_session_roots()`. Tools operate with default (unscoped) roots. The agent can read/write anywhere on disk — sandbox is not enforced.",
+      "repro": "Create a session with cwd=/tmp/sandbox. Send a prompt asking to read /etc/passwd. The agent WILL succeed because no resolve_within guard is applied based on the session cwd."
+    },
+    {
+      "criterion": "S2-C3",
+      "status": "pass",
+      "note": "session/new rejects nonexistent cwd with INVALID_PARAMS error containing 'cwd does not exist'. Verified by test `session_new_nonexistent_cwd_returns_error`."
+    },
+    {
+      "criterion": "S2-C4",
+      "status": "pass",
+      "note": "session/prompt returns success response with stopReason, and agent begins processing (notifications follow). Verified by test `session_prompt_emits_agent_message_chunk_and_stop_reason`."
+    },
+    {
+      "criterion": "S2-C5",
+      "status": "pass",
+      "note": "AcpBridge buffers PartialToken deltas and emits one agent_message_chunk per delta on TurnFinished. Bridge test `bridge_buffers_partial_tokens_and_emits_on_turn_finished` verifies chunk-by-chunk emission and concatenation producing full text."
+    },
+    {
+      "criterion": "S2-C6",
+      "status": "pass",
+      "note": "All agent_message_chunk notifications for the same turn share a single messageId. Bridge tests verify this (e.g., `bridge_buffers_partial_tokens_and_emits_on_turn_finished` asserts mid1 == mid2)."
+    },
+    {
+      "criterion": "S2-C7",
+      "status": "pass",
+      "note": "After streaming completes, a final session/update notification carries stopReason (end_turn), messageId, and the fully assembled content. Bridge test `bridge_buffers_partial_tokens_and_emits_on_turn_finished` verifies all three fields."
+    },
+    {
+      "criterion": "S2-C8",
+      "status": "pass",
+      "note": "messageId = sha256_first_12(full_text). Bridge test `bridge_message_id_stable_across_sessions_same_content` verifies identical content → identical messageId across different sessions."
+    },
+    {
+      "criterion": "S2-C9",
+      "status": "pass",
+      "note": "AcpBridge implements EventSink trait, converting PartialToken→agent_message_chunk and TurnFinished→session/update. Grep confirms zero imports of run_core or RunCore in src/acp/."
+    },
+    {
+      "criterion": "S2-C10",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 574,
+      "note": "handle_session_prompt manually iterates ContentBlock[] and concatenates text into a String, then passes it to `runtime.run(concatenated)`. There is no unit-testable ContentBlock[] → Message conversion function. No proper Message struct is built from blocks. The contract requires a conversion function that produces Message with role='user' and correct content.",
+      "repro": "Search src/acp/ for any function that takes ContentBlock[] (or Vec<Value> representing ContentBlock[]) and returns a Message. None exists."
+    },
+    {
+      "criterion": "S2-C11",
+      "status": "fail",
+      "file": "src/acp/session.rs",
+      "line": 16,
+      "note": "src/acp/session.rs defines `pub struct AcpSession` containing a `runtime: AgentRuntime`, `cwd`, `turn`, `session_id`, and `transcript`. Lines 42-104 define `pub struct AcpSessionManager` with a private `HashMap<SessionId, AcpSession>`. The contract requires NO session struct or session map in src/acp/ — all session state should go through existing infrastructure from src/session/. There is no SessionStore in src/session/ (it manages persistence, not live sessions), so the ACP code currently has no existing registry to delegate to, but it should at minimum delegate to AgentRuntime for lifecycle and not maintain its own HashMap.",
+      "repro": "grep 'struct AcpSession\\|struct Session\\|HashMap.*Session' src/acp/ → both found."
+    },
+    {
+      "criterion": "S2-C12",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 527,
+      "note": "handle_session_new reads only `cwd` from params. It does NOT extract `tools`, `systemPrompt`, or `system_prompt_override`. The contract requires programmatic verification that (a) the tool registry contains exactly the tools passed in session/new, and (b) the stored system prompt equals what was passed. Neither is implemented.",
+      "repro": "Send session/new with params: {cwd:\"/tmp\", tools:[\"read_file\"], system_prompt_override:\"You are a Python expert.\"}. Both fields are silently ignored."
+    },
+    {
+      "criterion": "S2-C13",
+      "status": "pass",
+      "note": "session/prompt with nonexistent sessionId returns SESSION_NOT_FOUND (-32001) error with message 'Session not found'. Verified by test `session_prompt_invalid_session_returns_error`."
+    },
+    {
+      "criterion": "S2-C14",
+      "status": "pass",
+      "note": "Product code correctly handles both cases: (a) missing `prompt` field → INVALID_PARAMS with 'Missing required field prompt', (b) empty `prompt: []` → falls through concatenation loop to produce 'prompt array is empty or contains no text blocks'. The failing test `session_prompt_missing_prompt_field_returns_error` has an off-by-one bug (expects lines[4] but only 4 lines exist; should be lines[3]). Product logic is correct."
+    },
+    {
+      "criterion": "S2-C15",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 554,
+      "note": "No `session/close`, `session/delete`, or session termination mechanism is implemented. There is no handler for closing a session, no terminal state tracked in AcpSession, and no check in handle_session_prompt that the session might be closed. The dispatch method only handles 'initialize', 'notifications/initialized', 'session/new', and 'session/prompt' — anything else returns METHOD_NOT_FOUND.",
+      "repro": "Send session/close on a valid sessionId → returns METHOD_NOT_FOUND (-32601)."
+    },
+    {
+      "criterion": "S2-C16",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 554,
+      "note": "No close/delete/dispose mechanism exists. AcpSessionManager::remove exists as a method but is never called from the dispatch loop. No session/close handler, no TTL/expiry mechanism, no automatic cleanup. Sessions live forever until server shutdown.",
+      "repro": "Create a session, attempt to close it — not possible from the wire protocol."
+    },
+    {
+      "criterion": "S2-C17",
+      "status": "pass",
+      "note": "All notifications from the bridge follow the ACP spec format: {\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":...,\"update\":{...}}}. No `id` key present. jsonrpc=\"2.0\". method=\"session/update\" (the ACP spec uses session/update as the method with a sessionUpdate discriminator inside params.update; agent_message_chunk is the sessionUpdate value, not the JSON-RPC method). params is always an object. Verified by inspecting bridge emit code and tests."
+    }
+  ]
+}

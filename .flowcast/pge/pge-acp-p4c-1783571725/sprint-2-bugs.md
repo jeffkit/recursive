@@ -1,0 +1,3 @@
+- [AC-2.1] Sandbox check `resolve_within(&cwd, ".")` is a no-op — `.` is always within any directory. Path traversal (e.g. `cwd='/tmp/xxx/../../../etc'`) canonicalizes to `/etc` and the agent escapes the workspace. The only protection is `canonicalize()` failing for nonexistent paths; existing directories outside the workspace are accepted. The contract requires the agent must not escape the workspace root, but `canonicalize()` normalizes rather than rejects.
+  - file: src/acp/server.rs:399
+  - repro: mkdir -p /tmp/sbx && cargo test --lib acp::server::tests::ac21_session_new_path_traversal_rejected_or_normalized -- --nocapture 2>&1 | grep 'accepted'  # On macOS/Linux where /etc exists, the traversal succeeds and the agent runs in /etc

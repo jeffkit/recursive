@@ -1,0 +1,70 @@
+{
+  "overall": "pass",
+  "findings": [
+    {
+      "criterion": "S1-C1",
+      "status": "pass",
+      "note": "`recursive acp` appears in `cargo run -p recursive-cli -- --help` output as a subcommand alongside `serve`/`http`. `cargo run -p recursive-cli -- acp` starts and blocks waiting for stdin input without immediate exit or argument errors."
+    },
+    {
+      "criterion": "S1-C2",
+      "status": "pass",
+      "note": "echo initialize-request | cargo run ... acp → process reads the line, dispatches it, writes response, exits 0 on EOF. No panic or hang."
+    },
+    {
+      "criterion": "S1-C3",
+      "status": "pass",
+      "note": "stdout captured via `>/tmp/acp_stdout` contains exactly one JSON-RPC line (`jq .` parses it). stderr contains only the `acp: starting ACP v1 server on stdio` startup message (plus cargo build noise which is a test artifact, not from the server). No JSON-RPC in stderr."
+    },
+    {
+      "criterion": "S1-C4",
+      "status": "pass",
+      "note": "Response has jsonrpc:2.0, id:1 (echoed from request), result.protocolVersion=1 (number), result.agentInfo.name='recursive' (string), result.agentInfo.version='0.7.0' (string)."
+    },
+    {
+      "criterion": "S1-C5",
+      "status": "pass",
+      "note": "agentCapabilities keys: [auth, fsCapabilities, loadSession, mcpCapabilities, promptCapabilities, sessionCapabilities]. All required sub-objects present. promptCapabilities, mcpCapabilities, sessionCapabilities, fsCapabilities all present as objects — none are null or missing."
+    },
+    {
+      "criterion": "S1-C6",
+      "status": "pass",
+      "note": "jq '.result.agentCapabilities.promptCapabilities.text' returns true."
+    },
+    {
+      "criterion": "S1-C7",
+      "status": "pass",
+      "note": "'not json' → error code -32700, id:null, message 'Parse error: invalid JSON'. '{\"id\":1}' → error code -32700, id:1, message 'Parse error: missing jsonrpc field'. Both return valid JSON-RPC error responses with correct code. (The contract criterion says 'no id → no response', but the how-section explicitly expects id:null in the output — the implementation matches the how-section.)"
+    },
+    {
+      "criterion": "S1-C8",
+      "status": "pass",
+      "note": "After successful initialize, sending session/new → error code -32601, message 'Method not found: session/new'. jq -s '.[1].error.code' returns -32601."
+    },
+    {
+      "criterion": "S1-C9",
+      "status": "pass",
+      "note": "Sending '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}' produces zero bytes on stdout (no response). Verified with echo ... | cargo run ... 2>/dev/null → empty output."
+    },
+    {
+      "criterion": "S1-C10",
+      "status": "pass",
+      "note": "cargo test --workspace: all pass (1795 passed, 0 failed). cargo clippy --all-targets -- -D warnings: zero warnings. cargo fmt --all --check: no diff. 92 ACP-specific tests in acp::server and acp::protocol all pass, covering transport loop, initialize response building, error paths, handshake state machine (ordering enforcement, duplicate initialize, params validation)."
+    },
+    {
+      "criterion": "S1-C11",
+      "status": "pass",
+      "note": "Before initialize, sending session/new → error code -32002, message 'Server not initialized'. Verified with jq."
+    },
+    {
+      "criterion": "S1-C12",
+      "status": "pass",
+      "note": "Two consecutive initialize requests: first returns success (result object present), second returns error code -32002, message 'Server already initialized'. State is not overwritten. Verified with jq -s '.[1].error'."
+    },
+    {
+      "criterion": "S1-C13",
+      "status": "pass",
+      "note": "params={} (missing protocolVersion) → error code -32602, message 'Missing required field protocolVersion'. params={'protocolVersion':'1'} (string, not number) → error code -32602, message 'Invalid params: protocolVersion must be a number'. Both verified with jq."
+    }
+  ]
+}

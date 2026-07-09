@@ -1,0 +1,83 @@
+{
+  "overall": "fail",
+  "findings": [
+    {
+      "criterion": "AC-2.1",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 399,
+      "note": "Sandbox check `resolve_within(&cwd, \".\")` is a no-op — `.` is always within any directory. Path traversal (e.g. `cwd='/tmp/xxx/../../../etc'`) canonicalizes to `/etc` and the agent escapes the workspace. The only protection is `canonicalize()` failing for nonexistent paths; existing directories outside the workspace are accepted. The contract requires the agent must not escape the workspace root, but `canonicalize()` normalizes rather than rejects.",
+      "repro": "mkdir -p /tmp/sbx && cargo test --lib acp::server::tests::ac21_session_new_path_traversal_rejected_or_normalized -- --nocapture 2>&1 | grep 'accepted'  # On macOS/Linux where /etc exists, the traversal succeeds and the agent runs in /etc"
+    },
+    {
+      "criterion": "AC-2.1",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 319,
+      "note": "session/new returns stable non-empty sessionId; session/prompt with that sessionId succeeds (no 'session not found' error). Verified by `ac21_session_new_stable_id_valid_for_prompt`."
+    },
+    {
+      "criterion": "AC-2.1",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 354,
+      "note": "Nonexistent cwd returns proper INVALID_PARAMS error with descriptive message mentioning cwd. Verified by `ac21_nonexistent_cwd_returns_error`."
+    },
+    {
+      "criterion": "AC-2.2",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 492,
+      "note": "session/prompt streams agent_message_chunk with non-empty content delta; final notification is end_turn with valid stopReason (end_turn). Verified by `ac22_session_prompt_streams_chunks_and_end_turn` and `ac22_end_turn_is_last_notification`. Bridge at `src/acp/bridge.rs:225-275` emits buffered partial tokens then end_turn."
+    },
+    {
+      "criterion": "AC-2.3",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 527,
+      "note": "Non-text ContentBlock types (resource_link, image) are silently filtered; only text blocks are concatenated and processed. All-non-text prompt returns graceful end_turn with 'Unsupported content types' message (line ~570-585). Server does not crash or hang. Verified by `ac23_mixed_text_and_non_text_no_crash` and `ac23_only_non_text_blocks_returns_graceful`. Minor: user_message_chunk notification for all-non-text path is missing `content` field (line ~567-573)."
+    },
+    {
+      "criterion": "AC-2.4",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 492,
+      "note": "Sequential session/prompt calls maintain context: second turn response contains 'Alice' and 'stellar' from first turn. stopReason is end_turn. Verified by `ac24_multi_turn_context_preserved`."
+    },
+    {
+      "criterion": "AC-2.5",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 671,
+      "note": "stopReason mapping at `handle_session_prompt` line ~670-680: NoMoreToolCalls→\"end_turn\", Cancelled→\"cancelled\", BudgetExceeded→\"max_turns\", Stuck/TranscriptLimit/ProviderStop/PermissionDenialLimit→\"error\". Bridge at `src/acp/bridge.rs:245-260` has consistent mapping. Case (a) normal completion → end_turn verified. Cases (b) tool-call-finish and (c) max_turns are not testable with current MockProvider (no tool_calls), but the mapping code covers all defined values correctly."
+    },
+    {
+      "criterion": "AC-2.6",
+      "status": "pass",
+      "file": "src/acp/bridge.rs",
+      "line": 47,
+      "note": "SHA-256 first 12 hex chars (lowercase). Same content ('Hello world') produces identical messageId across two separate sessions. messageId is exactly 12 chars, all lowercase hex [0-9a-f]. Different prompts produce different messageIds. Verified by `ac26_message_id_deterministic_across_sessions` and bridge tests. Known value: 'Hello, world!' → '315f5bdb76d0'."
+    },
+    {
+      "criterion": "AC-2.7",
+      "status": "pass",
+      "file": "src/acp/bridge.rs",
+      "line": 168,
+      "note": "EventSink in Sprint 2 mode (`tool_call_notifications_enabled: false`) emits only user_message_chunk, agent_message_chunk, and end_turn notifications. No tool_call or tool_call_update emissions. All notifications carry correct sessionId; end_turn has stopReason and turnId. Every notification is well-formed JSON-RPC 2.0 with method='session/update'. Verified by `ac27_event_sink_only_allowed_notifications`."
+    },
+    {
+      "criterion": "AC-2.9",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 520,
+      "note": "session/prompt with nonexistent sessionId returns SESSION_NOT_FOUND (-32001) error with descriptive message. Server remains responsive — subsequent session/new succeeds. Verified by `ac29_stale_session_returns_error_not_crash`."
+    },
+    {
+      "criterion": "AC-2.10",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 551,
+      "note": "Empty prompt array `[]` returns INVALID_PARAMS error: 'prompt array is empty or contains no text blocks'. Server does not crash, hang, or emit malformed JSON. Verified by `ac210_empty_prompt_array_returns_error_or_helpful`."
+    }
+  ]
+}

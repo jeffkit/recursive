@@ -672,7 +672,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Acp => {
             // ACP server: stdio JSON-RPC transport for Agent Client Protocol.
             // No LLM provider needed — only `initialize` is wired in Sprint 1.
-            eprintln!("acp: starting ACP v1 server on stdio");
+            tracing::info!("starting ACP v1 server on stdio");
             recursive::acp::server::AcpServer::run().await;
             Ok(())
         }

@@ -1,0 +1,124 @@
+# S1-C12: ACP initialize handshake E2E test
+#
+# Verifies the full initialize response shape per Sprint 1 contract:
+#   - protocolVersion is the integer 1
+#   - agentInfo.name is "recursive"
+#   - agentCapabilities has all 8 required keys (S1-C2)
+#   - terminalCapabilities is explicitly false
+#   - initial stdout contains only valid JSON-RPC lines
+name: "ACP Initialize Handshake (Sprint 1)"
+description: >
+  Pipes an initialize request to `recursive acp` via stdin,
+  captures the first two stdout lines (response + initialized notification),
+  and asserts the full response shape. Exits 0 only if all checks pass.
+sequential: true
+
+setup:
+  - name: "Send initialize and capture response"
+    exec:
+      container: recursive-e2e
+      command: |
+        # Start `recursive acp` in background, pipe the initialize request,
+        # capture two lines, then kill the process.
+        # Uses timeout to ensure the process doesn't hang.
+        echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"test","version":"0"},"clientCapabilities":{}}}' | \
+          timeout 5 recursive acp 2>/tmp/acp-stderr.log >/tmp/acp-stdout.log &
+        ACP_PID=$!
+
+        # Wait for the process to produce output or timeout
+        sleep 1
+
+        # Read the first 3 lines from stdout
+        head -3 /tmp/acp-stdout.log > /tmp/acp-response.jsonl
+
+        # Kill the server
+        kill $ACP_PID 2>/dev/null || true
+        wait $ACP_PID 2>/dev/null || true
+
+        echo "stdout captured"
+        echo "--- STDOUT ---"
+        cat /tmp/acp-stdout.log
+        echo "--- STDERR ---"
+        cat /tmp/acp-stderr.log
+        echo "--- END ---"
+
+assert:
+  - name: "Response line 1: protocolVersion, agentInfo, agentCapabilities"
+    exec:
+      container: recursive-e2e
+      command: |
+        RESP=$(head -1 /tmp/acp-response.jsonl)
+
+        # S1-C1: jsonrpc and id must match
+        echo "$RESP" | jq -e '.jsonrpc == "2.0"' || { echo "FAIL: missing jsonrpc"; exit 1; }
+        echo "$RESP" | jq -e '.id == 1' || { echo "FAIL: wrong id"; exit 1; }
+
+        # protocolVersion must be the integer 1
+        echo "$RESP" | jq -e '.result.protocolVersion == 1' || { echo "FAIL: wrong protocolVersion"; exit 1; }
+
+        # agentInfo.name must be "recursive"
+        echo "$RESP" | jq -e '.result.agentInfo.name == "recursive"' || { echo "FAIL: wrong agent name"; exit 1; }
+
+        # agentCapabilities must be a non-null object with at least 5 keys
+        KEY_COUNT=$(echo "$RESP" | jq '.result.agentCapabilities | keys | length')
+        if [ "$KEY_COUNT" -lt 5 ]; then
+          echo "FAIL: agentCapabilities has only $KEY_COUNT keys (need >=5)"
+          exit 1
+        fi
+
+        # S1-C2: All 8 required forward-capability keys must exist
+        for KEY in promptCapabilities toolCallNotifications loadSession resume fs.readTextFile fs.writeTextFile mcpCapabilities; do
+          echo "$RESP" | jq -e ".result.agentCapabilities.$KEY != null and .result.agentCapabilities.$KEY != false" \
+            || { echo "FAIL: missing or falsy agentCapabilities.$KEY"; exit 1; }
+        done
+
+        # terminalCapabilities must be explicitly false
+        echo "$RESP" | jq -e '.result.agentCapabilities.terminalCapabilities == false' \
+          || { echo "FAIL: terminalCapabilities is not false"; exit 1; }
+
+        echo "PASS: initialize response shape correct"
+
+  - name: "Response line 2: initialized notification"
+    exec:
+      container: recursive-e2e
+      command: |
+        NOTIF=$(sed -n '2p' /tmp/acp-response.jsonl)
+
+        # Must be a valid JSON line
+        echo "$NOTIF" | jq -e '.jsonrpc == "2.0"' || { echo "FAIL: notification missing jsonrpc"; exit 1; }
+
+        # Method must be "initialized"
+        echo "$NOTIF" | jq -e '.method == "initialized"' || { echo "FAIL: not an initialized notification"; exit 1; }
+
+        echo "PASS: initialized notification correct"
+
+  - name: "Stdout has no non-JSON lines"
+    exec:
+      container: recursive-e2e
+      command: |
+        LINE_COUNT=$(wc -l < /tmp/acp-stdout.log)
+        if [ "$LINE_COUNT" -eq 0 ]; then
+          echo "FAIL: stdout is empty"
+          exit 1
+        fi
+
+        # Every line must be valid JSON with jsonrpc == "2.0"
+        LINE_NUM=0
+        while IFS= read -r line; do
+          LINE_NUM=$((LINE_NUM + 1))
+          if [ -z "$line" ]; then continue; fi
+          echo "$line" | jq -e '.jsonrpc == "2.0"' >/dev/null 2>&1 \
+            || { echo "FAIL: line $LINE_NUM is not valid JSON-RPC: $line"; exit 1; }
+        done < /tmp/acp-stdout.log
+
+        echo "PASS: all stdout lines are valid JSON-RPC"
+
+  - name: "Stderr contains server logs"
+    exec:
+      container: recursive-e2e
+      command: |
+        if [ ! -s /tmp/acp-stderr.log ]; then
+          echo "FAIL: stderr is empty (should contain log messages)"
+          exit 1
+        fi
+        echo "PASS: stderr has log output"

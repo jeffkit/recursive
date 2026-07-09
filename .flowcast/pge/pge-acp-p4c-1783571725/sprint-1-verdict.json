@@ -1,0 +1,89 @@
+{
+  "overall": "pass",
+  "findings": [
+    {
+      "criterion": "S1-C1",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 260,
+      "note": "handle_initialize returns protocolVersion=1 (integer), agentInfo.name='recursive', agentCapabilities with 8 keys. Unit test initialize_has_protocol_version_and_agent_info and agent_capabilities_has_flat_keys confirm shape. agentCapabilities keys ≥5 (8 actual)."
+    },
+    {
+      "criterion": "S1-C2",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 276,
+      "note": "All 8 forward-capability keys declared: promptCapabilities, toolCallNotifications, loadSession, resume, fs.readTextFile, fs.writeTextFile, mcpCapabilities (all truthy objects {}), terminalCapabilities (explicitly false). Unit test agent_capabilities_has_flat_keys asserts all 8 with correct truthy/falsy values."
+    },
+    {
+      "criterion": "S1-C3",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 728,
+      "note": "run_stdio loop processes lines sequentially via BufReader::new(reader).lines(). Unit test three_initialize_requests_fifo sends 3 sequential initialize requests (ids 1,2,3), verifies 4 lines: success(id:1) + initialized notification + error(id:2) + error(id:3). All have .jsonrpc=='2.0', matching ids, no extra lines."
+    },
+    {
+      "criterion": "S1-C4",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 14,
+      "note": "Module doc (lines 14-17) explicitly declares stdout/stderr contract. write_line writes JSON-RPC only to writer (stdout). eprintln! used for ServerShutdown. Unit test every_stdout_line_is_valid_jsonrpc verifies all stdout lines parse as valid JSON with .jsonrpc=='2.0'. E2E test 01-acp-initialize.yaml separately asserts stderr is non-empty."
+    },
+    {
+      "criterion": "S1-C5",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 786,
+      "note": "Malformed JSON triggers serde_json::from_str error → build_error(Value::Null, PARSE_ERROR=-32700, 'Parse error: invalid JSON'). Unit test unclosed_brace_returns_parse_error sends '{bad json', verifies id=null, error.code=-32700, non-empty message. parse_error_then_valid_request_process_survives verifies server stays alive and accepts next valid initialize."
+    },
+    {
+      "criterion": "S1-C6",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 907,
+      "note": "Unknown method: sync dispatch HashMap misses → falls to dispatch_async → '_' arm returns build_error(id, METHOD_NOT_FOUND=-32601). Unit tests before_init_unknown_method_returns_method_not_found and unknown_method_then_initialize_still_works confirm: (1) unknown method before init returns -32601, not -32002; (2) process survives and accepts valid initialize after."
+    },
+    {
+      "criterion": "S1-C7",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 852,
+      "note": "dispatch_one validates jsonrpc field first (line 856: None → INVALID_REQUEST=-32600), then method field (line 874: None → INVALID_REQUEST). Unit tests json_without_jsonrpc_returns_invalid_request and missing_method_returns_invalid_request confirm both cases produce error.code=-32600. Process stays alive by design (loop continues reading lines after error)."
+    },
+    {
+      "criterion": "S1-C8",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 900,
+      "note": "dispatch_one line 900: env.id is None → returns (None, vec![]). process_line line 819: if response is None, write_line is skipped. Unit test notification_produces_no_response: send notification + valid request, verify only 2 lines (init response + initialized), no spurious id=null response. notification_alone_produces_nothing confirms zero output for solo notification."
+    },
+    {
+      "criterion": "S1-C9",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 730,
+      "note": "run_stdio wraps lines.next_line() in tokio::time::timeout(60s). On elapsed: eprintln!('ServerShutdown') → break. Unit test idle_timeout_shuts_down_server_after_60s uses tokio::time::pause/advance(61s) and verifies function returns cleanly. idle_timeout_does_not_fire_before_60s confirms timeout does not fire at 30s. Test output shows 'ServerShutdown' on stderr."
+    },
+    {
+      "criterion": "S1-C10",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 713,
+      "note": "No explicit SIGTERM handler in AcpServer. On SIGTERM, the OS default signal handler terminates the process with exit code 143 (128+15). Since no cleanup writes to stdout, no stale/truncated JSON is emitted. Contract accepts exit code 143. Gap: no unit or E2E test explicitly verifies SIGTERM behavior; relies on OS default semantics. Recommend adding an integration test that sends SIGTERM and verifies exit code ∈ {0,143}."
+    },
+    {
+      "criterion": "S1-C11",
+      "status": "pass",
+      "file": "src/acp/server.rs",
+      "line": 718,
+      "note": "Code review: BufReader::new(reader).lines() at line 725; HashMap dispatch table at lines 169-172 (build_sync_dispatch_table, only 'initialize' mapped); loop body in run_stdio (lines 728-761, ~33 lines) delegates to process_line → dispatch_one. Zero references to AgentRuntime/run_inner/Provider/Session inside run_stdio loop body — those appear only in handle_session_new (line 395) and dispatch_async (line 180 comment), outside the loop. Sync dispatch table is a clean HashMap<&str, fn>. No explicit .lock() on stdout (tokio::io::stdout() is internally synchronized; equivalent async pattern)."
+    },
+    {
+      "criterion": "S1-C12",
+      "status": "pass",
+      "file": "e2e/tests/01-acp-initialize.yaml",
+      "line": 1,
+      "note": "E2E test exists at e2e/tests/01-acp-initialize.yaml, listed in e2e/e2e.yaml line 58 as 'ACP Initialize Handshake (Sprint 1)'. Test: (1) starts recursive acp via timeout wrapper, (2) pipes initialize JSON, (3) captures stdout lines, (4) runs jq assertions on protocolVersion, agentInfo.name, all 8 agentCapabilities keys, (5) verifies initialized notification, (6) verifies all stdout lines are valid JSON-RPC, (7) verifies stderr non-empty. Run via: argusai -c e2e.yaml -s acp-init."
+    }
+  ]
+}
