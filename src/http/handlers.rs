@@ -2271,6 +2271,146 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
     }
 
+    /// Helper: build a minimal AppState with one session for handler unit tests.
+    fn test_app_state_with_session(
+        session_id: &str,
+    ) -> (
+        Arc<AppState>,
+        Arc<tokio::sync::Mutex<crate::runtime::AgentRuntime>>,
+    ) {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tokio::sync::Semaphore;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        let session = SessionState {
+            id: session_id.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: Some("old".into()),
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Default::default(),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            prompt_tokens: Arc::new(AtomicU64::new(0)),
+            completion_tokens: Arc::new(AtomicU64::new(0)),
+        };
+        let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
+        let state = Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            session_ttl_secs: 3600,
+            run_semaphore: Arc::new(Semaphore::new(8)),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+        });
+        (state, runtime_arc)
+    }
+
+    #[tokio::test]
+    async fn get_session_status_idle_vs_plan_pending() {
+        let sid = "test-plan-status";
+        let (state, _) = test_app_state_with_session(sid);
+
+        let idle = match get_session(State(state.clone()), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("get_session idle"),
+        };
+        assert_eq!(idle.status, "idle");
+        assert!(idle.pending_plan.is_none());
+
+        // Set pending plan via the gate.
+        {
+            let sessions = state.sessions.read().await;
+            let session = sessions.get(sid).unwrap();
+            *session.plan_approval_gate.pending_plan.write().unwrap() = Some("do the thing".into());
+        }
+        let pending = match get_session(State(state), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("get_session pending"),
+        };
+        assert_eq!(pending.status, "plan_pending_approval");
+        assert_eq!(pending.pending_plan.as_deref(), Some("do the thing"));
+    }
+
+    #[tokio::test]
+    async fn get_session_busy_runtime_returns_empty_messages() {
+        let sid = "test-busy-get";
+        let (state, runtime_arc) = test_app_state_with_session(sid);
+        let _guard = runtime_arc.lock().await;
+        let detail = match get_session(State(state), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("busy get_session must still 200"),
+        };
+        assert!(
+            detail.messages.is_empty(),
+            "busy runtime must fall back to empty messages"
+        );
+        assert_eq!(detail.status, "idle");
+    }
+
+    #[tokio::test]
+    async fn patch_session_empty_title_clears() {
+        let sid = "test-patch-title";
+        let (state, _) = test_app_state_with_session(sid);
+
+        let cleared = match patch_session(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest {
+                title: Some("".into()),
+            }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch empty title"),
+        };
+        assert!(cleared.title.is_none(), "empty title must clear to None");
+
+        let set = match patch_session(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest {
+                title: Some("new".into()),
+            }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch new title"),
+        };
+        assert_eq!(set.title.as_deref(), Some("new"));
+
+        // Omitting title must leave existing value unchanged.
+        let keep = match patch_session(
+            State(state),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest { title: None }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch omit title"),
+        };
+        assert_eq!(keep.title.as_deref(), Some("new"));
+    }
+
     /// Goal-292: metrics_handler output includes sessions_active and
     /// rate_limits_rejected.
     #[tokio::test]
