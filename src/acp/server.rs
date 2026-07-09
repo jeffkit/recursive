@@ -229,7 +229,17 @@ async fn dispatch_async(
                 )),
                 vec![],
             ),
-            ServerState::Initialized => handle_session_prompt(id, params, sessions).await,
+            ServerState::Initialized => match llm {
+                Some(_llm) => handle_session_prompt(id, params, sessions).await,
+                None => (
+                    Some(build_error(
+                        id,
+                        METHOD_NOT_FOUND,
+                        &format!("Method not found: {method}"),
+                    )),
+                    vec![],
+                ),
+            },
         },
 
         // ── Sprint 4: session/cancel ─────────────────────────────
@@ -802,10 +812,14 @@ impl AcpServer {
     /// if no input arrives on stdin for 60 seconds, shuts down cleanly with exit
     /// code 0 and logs "ServerShutdown" to stderr. EOF (e.g. /dev/null) causes
     /// a brief sleep then retry — the server never exits on EOF alone.
-    pub async fn run() {
+    ///
+    /// `llm` is the shared chat provider used to construct AgentRuntimes for
+    /// new sessions. Pass `None` only when you only need `initialize` support
+    /// (e.g. smoke tests, idle-timeout tests).
+    pub async fn run(llm: Option<Arc<dyn ChatProvider>>) {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        Self::run_stdio(BufReader::new(stdin), stdout, None).await;
+        Self::run_stdio(BufReader::new(stdin), stdout, llm).await;
     }
 
     /// Run the server on real stdio with 60-second idle timeout.
