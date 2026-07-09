@@ -434,7 +434,10 @@ fn days_to_date(mut days: u64) -> (u64, u64, u64) {
         if days < days_in_year {
             break;
         }
-        days -= days_in_year;
+        // Soft-skip the subtract: `-=` → `+=` infinite-loops the year walk
+        // (cargo-mutants TIMEOUT). Boundary behaviour is pinned by
+        // `days_to_date_year_boundary_uses_strict_less`.
+        days = subtract_year_days(days, days_in_year);
         year += 1;
     }
     let months_days: [u64; 12] = if is_leap(year) {
@@ -456,6 +459,15 @@ fn days_to_date(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Subtract one year's day count while walking the epoch calendar.
+///
+/// Soft-skipped: `-=` → `+=` never terminates, so cargo-mutants reports
+/// TIMEOUT rather than a catchable failure.
+#[cfg_attr(test, mutants::skip)]
+fn subtract_year_days(days: u64, days_in_year: u64) -> u64 {
+    days - days_in_year
 }
 
 /// Parse an RFC 3339 timestamp to seconds since Unix epoch.
@@ -1378,6 +1390,12 @@ mod tests {
 
     #[test]
     fn test_l_rfc3339_to_secs() {
+        // kills `s.len() < 20` → `>` (short strings must be None, not Some)
+        assert!(
+            rfc3339_to_secs("1970-01-01").is_none(),
+            "too-short timestamp must be None"
+        );
+        assert!(rfc3339_to_secs("").is_none());
         let secs = rfc3339_to_secs("2026-05-25T12:00:00Z").unwrap();
         assert!(secs > 0.0, "should parse to positive seconds");
         // Exact known epoch: 1970-01-01T00:00:00Z
