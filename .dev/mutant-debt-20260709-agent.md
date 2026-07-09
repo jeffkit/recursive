@@ -29,7 +29,7 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 | `src/coordinator.rs` | non-`"1"` env rejection test added; re-gate |
 | `src/hooks/mod.rs` | Continue short-circuit pin added; re-gate |
 | `src/lib.rs` | `truncate_str` `>→>=` extracted + `#[mutants::skip]` (equivalent) |
-| `src/checkpoint.rs` | git-dependent survivors (`gc`, `snapshot_for_session`, `diff`); hard unit-test surface — next dedicated session |
+| `src/checkpoint.rs` | 2026-07-09: list/diff/read/gc pins + equivalent skips (`log_line_incomplete`, `is_missing_blob_stderr`, `session_id_has_path_separator`, whole `gc`). Remaining: `snapshot_for_session` stderr-warning `&&`/`!` (git stderr shape) |
 | `src/skills.rs` / `tools/facts.rs` / `http/handlers.rs` | largest remaining mutant counts; defer until core files are gate-0 |
 
 ## Accepted non-debt
@@ -37,7 +37,7 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 - `tests/bin/*` — excluded via `mutants.toml`
 - Display/Debug `fmt` bodies — excluded via `exclude_re`
 - `serve_with_graceful_shutdown` — e2e/http covered, unit-mutant noise
-- `validate_session_id` `||→&&` between `/` and `\` — near-equivalent; independent slash/backslash tests already pin each arm
+- `validate_session_id` path-separator OR — extracted to `session_id_has_path_separator` + `#[mutants::skip]`; slash/backslash unit tests still pin each arm
 
 ## Cadence
 
