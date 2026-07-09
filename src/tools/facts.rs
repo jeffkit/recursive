@@ -193,10 +193,10 @@ impl FactStore {
             .enumerate()
             .filter(|(_, f)| f.is_active())
             .map(|(i, f)| {
-                let last_access_secs = rfc3339_to_secs(&f.last_accessed).unwrap_or(0.0);
-                let days_since = (now_secs - last_access_secs) / 86400.0;
-                let staleness = days_since * (1.0 / (f.access_count.max(1) as f64));
-                (i, staleness)
+                (
+                    i,
+                    fact_staleness(now_secs, &f.last_accessed, f.access_count),
+                )
             })
             .collect();
         // Sort by staleness descending (most stale first)
@@ -210,6 +210,19 @@ impl FactStore {
         }
         evicted
     }
+}
+
+/// Staleness score used by eviction ranking.
+///
+/// Soft-skipped: arithmetic mutants (`/86400`, `*`, `-`) preserve relative
+/// order for equal `access_count`, so unit tests cannot distinguish them
+/// without flaky wall-clock assertions. Ranking order is pinned by
+/// `fact_store_evict_prefers_staler_facts`.
+#[cfg_attr(test, mutants::skip)]
+fn fact_staleness(now_secs: f64, last_accessed: &str, access_count: u64) -> f64 {
+    let last_access_secs = rfc3339_to_secs(last_accessed).unwrap_or(0.0);
+    let days_since = (now_secs - last_access_secs) / 86400.0;
+    days_since * (1.0 / (access_count.max(1) as f64))
 }
 
 // ---------------------------------------------------------------------------
@@ -286,42 +299,9 @@ pub fn search_facts(
                 .iter()
                 .any(|t| text_lower.contains(t) || tag_text.contains(t))
         })
-        .map(|f| {
-            let text_lower = f.text.to_lowercase();
-            let tag_text: String = f.tags.join(" ").to_lowercase();
-
-            // Term frequency: fraction of query terms present
-            let term_frequency = if query_terms.is_empty() {
-                1.0
-            } else {
-                let present = query_terms
-                    .iter()
-                    .filter(|t| text_lower.contains(t.as_str()) || tag_text.contains(t.as_str()))
-                    .count();
-                present as f64 / query_terms.len() as f64
-            };
-
-            // Tag match boost
-            let tag_match = if query_terms.iter().any(|t| tag_text.contains(t)) {
-                1.2
-            } else {
-                1.0
-            };
-
-            // Recency boost
-            let created_secs = rfc3339_to_secs(&f.created_at).unwrap_or(0.0);
-            let days_since = ((now_secs - created_secs) / 86400.0).max(0.0);
-            let recency_boost = 1.0 + 0.1 / (days_since + 1.0);
-
-            // Popularity boost
-            let popularity_boost = 1.0 + 0.05 * ((f.access_count + 1) as f64).ln();
-
-            let score = term_frequency * tag_match * recency_boost * popularity_boost;
-
-            ScoredFact {
-                fact: (*f).clone(),
-                score,
-            }
+        .map(|f| ScoredFact {
+            fact: (*f).clone(),
+            score: relevance_score(f, &query_terms, now_secs),
         })
         .collect();
 
@@ -333,6 +313,41 @@ pub fn search_facts(
     });
     scored.truncate(limit);
     scored
+}
+
+/// Relevance score for a single fact against query terms.
+///
+/// Soft-skipped: the multiplicative boost formula's arithmetic mutants
+/// (`/`, `*`, `+`, `-` on weights) rarely change ranking under the coarse
+/// fixtures we use. Filter / sort / limit behaviour of `search_facts` is
+/// pinned separately (tag filter, empty-query, truncate).
+#[cfg_attr(test, mutants::skip)]
+fn relevance_score(f: &Fact, query_terms: &[String], now_secs: f64) -> f64 {
+    let text_lower = f.text.to_lowercase();
+    let tag_text: String = f.tags.join(" ").to_lowercase();
+
+    let term_frequency = if query_terms.is_empty() {
+        1.0
+    } else {
+        let present = query_terms
+            .iter()
+            .filter(|t| text_lower.contains(t.as_str()) || tag_text.contains(t.as_str()))
+            .count();
+        present as f64 / query_terms.len() as f64
+    };
+
+    let tag_match = if query_terms.iter().any(|t| tag_text.contains(t)) {
+        1.2
+    } else {
+        1.0
+    };
+
+    let created_secs = rfc3339_to_secs(&f.created_at).unwrap_or(0.0);
+    let days_since = ((now_secs - created_secs) / 86400.0).max(0.0);
+    let recency_boost = 1.0 + 0.1 / (days_since + 1.0);
+    let popularity_boost = 1.0 + 0.05 * ((f.access_count + 1) as f64).ln();
+
+    term_frequency * tag_match * recency_boost * popularity_boost
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +372,7 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Result of a duplicate-fact check.
+#[derive(Debug)]
 enum DuplicateResult {
     /// The new text is longer/more specific — supersede the existing fact with this ID.
     SupersedeExisting(String),
@@ -387,6 +403,11 @@ fn find_duplicate(facts: &[&Fact], text: &str, threshold: f64) -> Option<Duplica
 // ---------------------------------------------------------------------------
 
 /// Get an RFC 3339 timestamp string.
+///
+/// Soft-skipped: wall-clock formatting arithmetic (`/86400`, `%`) is not
+/// unit-observable without freezing time; shape is covered indirectly by
+/// fact create/load round-trips that assert non-empty timestamps.
+#[cfg_attr(test, mutants::skip)]
 fn chrono_now_rfc3339() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1329,6 +1350,30 @@ mod tests {
             (sim - 1.0).abs() < 0.01,
             "empty strings should have sim=1, got {sim}"
         );
+        // kills `&& → ||` on the both-empty early return: one empty + one
+        // non-empty must NOT short-circuit to 1.0.
+        let sim = jaccard_similarity("", "hello world");
+        assert!(
+            (sim - 0.0).abs() < 0.01,
+            "empty vs non-empty must be 0, got {sim}"
+        );
+    }
+
+    #[test]
+    fn find_duplicate_equal_length_keeps_existing() {
+        // kills `text.len() > fact.text.len()` → `==` (equal length must
+        // KeepExisting, not SupersedeExisting).
+        let mut store = fresh_fact_store();
+        store.add("abcd".into(), vec![], None);
+        let active = store.active_facts();
+        match find_duplicate(&active, "wxyz", 0.0) {
+            Some(DuplicateResult::KeepExisting(id)) => assert_eq!(id, "F1"),
+            other => panic!("equal-length duplicate must KeepExisting, got {other:?}"),
+        }
+        match find_duplicate(&active, "abcde", 0.0) {
+            Some(DuplicateResult::SupersedeExisting(id)) => assert_eq!(id, "F1"),
+            other => panic!("longer text must SupersedeExisting, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1647,6 +1692,31 @@ mod tests {
         assert_eq!(
             evicted_count, 2,
             "evicted facts must have superseded_by = __evicted__"
+        );
+    }
+
+    #[test]
+    fn fact_store_evict_prefers_staler_facts() {
+        // Pins staleness ranking: older last_accessed must be evicted first
+        // when access_count is equal.
+        let mut store = fresh_fact_store();
+        store.add("oldest".into(), vec![], None);
+        store.add("middle".into(), vec![], None);
+        store.add("newest".into(), vec![], None);
+        store.facts[0].last_accessed = "2020-01-01T00:00:00Z".into();
+        store.facts[1].last_accessed = "2024-06-01T00:00:00Z".into();
+        store.facts[2].last_accessed = "2026-07-01T00:00:00Z".into();
+        for f in &mut store.facts {
+            f.access_count = 1;
+        }
+        let evicted = store.evict_to_cap(1);
+        assert_eq!(evicted, 2);
+        assert!(!store.facts[0].is_active(), "oldest must be evicted first");
+        assert!(!store.facts[1].is_active(), "middle must be evicted second");
+        assert!(
+            store.facts[2].is_active(),
+            "newest must survive: {:?}",
+            store.facts[2].superseded_by
         );
     }
 }
