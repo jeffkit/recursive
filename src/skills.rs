@@ -1945,4 +1945,155 @@ mod tests {
         fs::set_permissions(tmp.path(), perms).unwrap();
         assert!(is_executable(tmp.path()));
     }
+
+    // ── mutant-debt pins (2026-07-09) ────────────────────────────────────────
+
+    #[test]
+    fn discover_skills_skips_invalid_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // File at search-path root (not a skill dir) — must be skipped.
+        fs::write(tmp.path().join("README.md"), "noise").unwrap();
+        // Subdir without SKILL.md — must be skipped.
+        fs::create_dir(tmp.path().join("empty-dir")).unwrap();
+        // Valid skill.
+        let good = tmp.path().join("good-skill");
+        fs::create_dir(&good).unwrap();
+        fs::write(
+            good.join("SKILL.md"),
+            "---\nname: good-skill\ndescription: ok\n---\n\nBody",
+        )
+        .unwrap();
+        // Non-directory search path — must be skipped entirely.
+        let not_a_dir = tmp.path().join("not-a-dir.txt");
+        fs::write(&not_a_dir, "x").unwrap();
+
+        let skills = discover_skills(&[tmp.path().to_path_buf(), not_a_dir]);
+        assert_eq!(skills.len(), 1, "only the valid skill must be discovered");
+        assert_eq!(skills[0].name, "good-skill");
+    }
+
+    #[test]
+    fn extract_body_strips_frontmatter_and_trims() {
+        assert_eq!(
+            extract_skill_body("---\nname: x\n---\n  body text  "),
+            "body text"
+        );
+        assert_eq!(
+            extract_body("no frontmatter\n"),
+            "no frontmatter",
+            "content without --- must still be trimmed"
+        );
+        // Unclosed frontmatter falls through to full trim.
+        assert_eq!(extract_body("---\nname: x\nbody"), "---\nname: x\nbody");
+    }
+
+    #[test]
+    fn skills_for_injection_trigger_case_insensitive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("rust-skill");
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: rust-skill\ndescription: Rust helper\nmode: trigger\ntriggers: Rust\n---\n\nBody",
+        )
+        .unwrap();
+        let skills = discover_skills(&[tmp.path().to_path_buf()]);
+        let hit = skills_for_injection(&skills, "need RUST help");
+        assert_eq!(hit.len(), 1, "trigger match must be case-insensitive");
+        let miss = skills_for_injection(&skills, "need python help");
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn parse_skill_meta_unknown_mode_and_empty_triggers() {
+        let content =
+            "---\nname: x\ndescription: d\nmode: bogus\ntriggers: rust, , trait\n---\nbody";
+        let (_n, _d, mode, triggers, ..) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(
+            mode,
+            SkillMode::Manual,
+            "unknown mode must fall back to Manual"
+        );
+        assert_eq!(
+            triggers,
+            vec!["rust", "trait"],
+            "empty trigger tokens must be filtered"
+        );
+    }
+
+    #[test]
+    fn parse_skill_meta_globs_strips_quotes_skips_empty() {
+        let content =
+            "---\nname: x\ndescription: d\nmode: globs\nglobs:\n  - \"\"\n  - 'src/**'\n  - \"lib/**\"\n---\nbody";
+        let (_n, _d, mode, _t, _h, _dep, _p, globs) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(mode, SkillMode::Globs);
+        assert_eq!(globs, vec!["src/**", "lib/**"]);
+    }
+
+    #[test]
+    fn skill_index_shows_depends_on_and_globs_tag() {
+        let skills = vec![Skill {
+            name: "arch-sync".into(),
+            description: "sync docs".into(),
+            path: PathBuf::from("/fake/arch-sync/SKILL.md"),
+            mode: SkillMode::Globs,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec!["base".into()],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: Some(vec!["src/**".into()]),
+        }];
+        let idx = skill_index(&skills);
+        assert!(idx.contains("[globs]"), "globs mode tag missing: {idx}");
+        assert!(
+            idx.contains("depends_on: base"),
+            "depends_on suffix missing: {idx}"
+        );
+    }
+
+    #[test]
+    fn discover_scripts_rb_js_extensions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scripts = tmp.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        fs::write(scripts.join("lint.rb"), "# ruby lint\nputs 1").unwrap();
+        fs::write(scripts.join("build.js"), "// js build\nconsole.log(1)").unwrap();
+        fs::write(scripts.join("noise.bin"), "binary").unwrap();
+        let found = discover_scripts(tmp.path());
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"lint"),
+            "lint.rb must be discovered: {names:?}"
+        );
+        assert!(
+            names.contains(&"build"),
+            "build.js must be discovered: {names:?}"
+        );
+        assert!(
+            !names.contains(&"noise"),
+            ".bin without exec bit must be skipped: {names:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_scripts_includes_executable_without_ext() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scripts = tmp.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        let bin = scripts.join("runme");
+        fs::write(&bin, "#!/bin/sh\necho hi").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+        let found = discover_scripts(tmp.path());
+        assert!(
+            found.iter().any(|s| s.name == "runme"),
+            "chmod+x file without script ext must be included: {found:?}"
+        );
+    }
 }

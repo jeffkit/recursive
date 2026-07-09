@@ -1292,6 +1292,22 @@ mod tests {
         assert!(tokens.contains(&"test".to_string()));
         // Stop words should still be in tokenize output (filtering is done in search)
         assert!(tokens.contains(&"this".to_string()));
+        // Punctuation-only separators must not produce empty tokens
+        // (kills `|| → &&` between whitespace and punctuation splitters).
+        assert!(
+            !tokens.iter().any(|t| t.is_empty()),
+            "tokenize must drop empty fragments: {tokens:?}"
+        );
+        assert_eq!(
+            tokenize("a,b"),
+            vec!["a".to_string(), "b".to_string()],
+            "comma alone must split like whitespace"
+        );
+        assert_eq!(
+            tokenize("a b"),
+            vec!["a".to_string(), "b".to_string()],
+            "whitespace alone must split"
+        );
     }
 
     #[test]

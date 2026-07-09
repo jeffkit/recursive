@@ -27,6 +27,8 @@ use super::{
     SseContentBlock, SseEvent, ToolInfo, UsageInfo,
 };
 
+// Constant body — no branching worth scoring.
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn health() -> &'static str {
     "ok"
 }
@@ -52,6 +54,8 @@ fn record_run_failed(metrics: &super::Metrics) {
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
 }
 
+// Thin wrapper around `build_openapi_spec` (schema covered elsewhere).
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn openapi_spec() -> Json<serde_json::Value> {
     Json(build_openapi_spec())
 }
@@ -163,6 +167,8 @@ fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMode {
 // ── Session endpoints ──────────────────────────────────────────────────────
 
 /// Generate a session ID using UUID v7 (time-ordered, globally unique).
+// Non-deterministic UUID — not unit-observable for mutation scoring.
+#[cfg_attr(test, mutants::skip)]
 fn generate_session_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
@@ -785,6 +791,8 @@ pub(super) async fn session_interrupt(
 // ── Goal-169: slash commands endpoint ─────────────────────────────────────
 
 /// GET /slash-commands — list all registered slash commands.
+// Pure clone of AppState field — no branching worth scoring.
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn list_slash_commands(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<SlashCommandInfo>> {
@@ -2592,6 +2600,120 @@ mod tests {
         }
         // The prompt should be unchanged.
         assert_eq!(sp, base_prompt);
+    }
+
+    // ── parse_permission_mode ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_permission_mode_all_variants() {
+        assert_eq!(parse_permission_mode("auto", false), PermissionMode::Auto);
+        assert_eq!(parse_permission_mode("AUTO", true), PermissionMode::Auto);
+        assert_eq!(
+            parse_permission_mode("strict", false),
+            PermissionMode::Strict
+        );
+        assert_eq!(
+            parse_permission_mode("bypass", true),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            parse_permission_mode("bypass_permissions", true),
+            PermissionMode::BypassPermissions
+        );
+        // Bypass rejected when allow_bypass=false → Default (kills match-guard mutant).
+        assert_eq!(
+            parse_permission_mode("bypass", false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("bypass_permissions", false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("default", true),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("unknown", true),
+            PermissionMode::Default
+        );
+    }
+
+    // ── map_agent_event / sse_message_from_canonical ────────────────────────
+
+    #[test]
+    fn map_agent_event_tool_result_success_flag() {
+        let ok = AgentEvent::ToolResult {
+            id: "tc-1".into(),
+            name: "Bash".into(),
+            output: "ok".into(),
+            step: 0,
+            is_error: false,
+        };
+        let err = AgentEvent::ToolResult {
+            id: "tc-2".into(),
+            name: "Bash".into(),
+            output: "fail".into(),
+            step: 0,
+            is_error: true,
+        };
+        match map_agent_event(&ok) {
+            Some(SseEvent::ToolResult { success, .. }) => assert!(success),
+            other => panic!("expected ToolResult success=true, got {other:?}"),
+        }
+        match map_agent_event(&err) {
+            Some(SseEvent::ToolResult { success, .. }) => assert!(!success),
+            other => panic!("expected ToolResult success=false, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_suppresses_non_sse_variants() {
+        // Latency / Usage / AssistantText have no SSE equivalent.
+        assert!(map_agent_event(&AgentEvent::Latency { step: 0, llm_ms: 1 }).is_none());
+        assert!(map_agent_event(&AgentEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            step: 0,
+        })
+        .is_none());
+        assert!(map_agent_event(&AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 0
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn sse_message_from_canonical_filters_system_tool_and_empty() {
+        assert!(
+            sse_message_from_canonical(&crate::message::Message::system("seed")).is_none(),
+            "system messages must be filtered"
+        );
+        let mut tool = crate::message::Message::user("unused");
+        tool.role = crate::message::Role::Tool;
+        tool.tool_call_id = Some("tc-1".into());
+        assert!(
+            sse_message_from_canonical(&tool).is_none(),
+            "tool messages must be filtered"
+        );
+        assert!(
+            sse_message_from_canonical(&crate::message::Message::assistant("")).is_none(),
+            "empty assistant with no tool_calls must be None"
+        );
+        match sse_message_from_canonical(&crate::message::Message::assistant("hello")) {
+            Some(SseEvent::Message { role, content }) => {
+                assert_eq!(role, "assistant");
+                assert!(!content.is_empty());
+            }
+            other => panic!("expected Message event, got {other:?}"),
+        }
+        match sse_message_from_canonical(&crate::message::Message::user("hi")) {
+            Some(SseEvent::Message { role, .. }) => assert_eq!(role, "user"),
+            other => panic!("expected user Message, got {other:?}"),
+        }
     }
 
     // ── format_timestamp ────────────────────────────────────────────────────

@@ -30,7 +30,9 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 | `src/hooks/mod.rs` | Continue short-circuit pin added; re-gate |
 | `src/lib.rs` | `truncate_str` `>→>=` extracted + `#[mutants::skip]` (equivalent) |
 | `src/checkpoint.rs` | 2026-07-09: list/diff/read/gc pins + equivalent skips (`log_line_incomplete`, `is_missing_blob_stderr`, `session_id_has_path_separator`, whole `gc`). Remaining: `snapshot_for_session` stderr-warning `&&`/`!` (git stderr shape) |
-| `src/skills.rs` / `tools/facts.rs` / `http/handlers.rs` | largest remaining mutant counts; defer until core files are gate-0 |
+| `src/skills.rs` | 2026-07-09 ROI pins: skip invalid discover entries, extract_body, trigger case-insensitivity, unknown mode / empty triggers, globs quote-strip, depends_on+[globs] index, rb/js + chmod+x scripts. Remaining: full-file gate (~554 mutants) — continue weekly |
+| `src/tools/facts.rs` | 2026-07-09: strengthened tokenize whitespace/punct split pin. Full-file scan (~200) still in progress for remaining survivors |
+| `src/http/handlers.rs` | 2026-07-09 ROI pins: `parse_permission_mode`, `map_agent_event` success/`_` arms, `sse_message_from_canonical` filters; soft-skip `health` / `generate_session_id` / `openapi_spec` / `list_slash_commands`. Remaining: async handlers (`get_session`, `agui_run`, …) |
 
 ## Accepted non-debt
 
@@ -38,6 +40,7 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 - Display/Debug `fmt` bodies — excluded via `exclude_re`
 - `serve_with_graceful_shutdown` — e2e/http covered, unit-mutant noise
 - `validate_session_id` path-separator OR — extracted to `session_id_has_path_separator` + `#[mutants::skip]`; slash/backslash unit tests still pin each arm
+- `health` / `generate_session_id` / `openapi_spec` / `list_slash_commands` — constant / UUID / thin-wrapper / pure clone; soft-skipped
 
 ## Cadence
 
