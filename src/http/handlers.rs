@@ -60,6 +60,8 @@ pub(super) async fn openapi_spec() -> Json<serde_json::Value> {
     Json(build_openapi_spec())
 }
 
+// Pure clone of AppState field — no branching worth scoring.
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<ToolInfo>> {
     Json(state.tools.clone())
 }
@@ -2712,6 +2714,53 @@ mod tests {
     }
 
     #[test]
+    fn map_agent_event_forwards_core_sse_arms() {
+        // kills delete-match-arm on PartialToken / ToolCall / TurnFinished / PlanProposed
+        match map_agent_event(&AgentEvent::PartialToken {
+            text: "tok".into(),
+            step: 2,
+        }) {
+            Some(SseEvent::PartialMessage { text, step }) => {
+                assert_eq!(text, "tok");
+                assert_eq!(step, 2);
+            }
+            other => panic!("expected PartialMessage, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::ToolCall {
+            name: "Bash".into(),
+            id: "tc-1".into(),
+            arguments: "{}".into(),
+            step: 1,
+        }) {
+            Some(SseEvent::ToolCall { name, step }) => {
+                assert_eq!(name, "Bash");
+                assert_eq!(step, 1);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::TurnFinished {
+            reason: "no_more_tool_calls".into(),
+            steps: 4,
+        }) {
+            Some(SseEvent::Done {
+                finish_reason,
+                total_steps,
+            }) => {
+                assert_eq!(finish_reason, "no_more_tool_calls");
+                assert_eq!(total_steps, 4);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::PlanProposed {
+            plan_text: "do X".into(),
+            tool_calls: vec![],
+        }) {
+            Some(SseEvent::PlanProposed { plan }) => assert_eq!(plan, "do X"),
+            other => panic!("expected PlanProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sse_message_from_canonical_filters_system_tool_and_empty() {
         assert!(
             sse_message_from_canonical(&crate::message::Message::system("seed")).is_none(),
@@ -2739,6 +2788,75 @@ mod tests {
             Some(SseEvent::Message { role, .. }) => assert_eq!(role, "user"),
             other => panic!("expected user Message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sse_message_from_canonical_emits_tool_use_without_text() {
+        // kills early-empty return before tool_calls loop / ToolUse arm delete
+        let msg = crate::message::Message::assistant_with_tool_calls(
+            "",
+            vec![crate::llm::ToolCall {
+                id: "tc-9".into(),
+                name: "Read".into(),
+                arguments: serde_json::json!({"path":"a.rs"}),
+            }],
+        );
+        match sse_message_from_canonical(&msg) {
+            Some(SseEvent::Message { role, content }) => {
+                assert_eq!(role, "assistant");
+                assert!(
+                    content.iter().any(|b| matches!(
+                        b,
+                        SseContentBlock::ToolUse { id, name, .. }
+                            if id == "tc-9" && name == "Read"
+                    )),
+                    "expected ToolUse block, got {content:?}"
+                );
+            }
+            other => panic!("expected Message with ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agui_events_for_partial_token_then_tool_call_closes_stream() {
+        use agui_protocol as ag;
+        // Use AguiConverter directly so open_message_id state spans events.
+        let mut conv = AguiConverter::new();
+        let t1 = conv.convert(&AgentEvent::PartialToken {
+            text: "a".into(),
+            step: 0,
+        });
+        assert_eq!(t1.len(), 2, "Start+Content expected: {t1:?}");
+        assert!(matches!(t1[0], ag::Event::TextMessageStart(_)));
+        assert!(matches!(t1[1], ag::Event::TextMessageContent(_)));
+        let t2 = conv.convert(&AgentEvent::PartialToken {
+            text: "b".into(),
+            step: 0,
+        });
+        assert_eq!(t2.len(), 1, "Content-only expected: {t2:?}");
+        assert!(matches!(t2[0], ag::Event::TextMessageContent(_)));
+        let t3 = conv.convert(&AgentEvent::ToolCall {
+            id: "tc-1".into(),
+            name: "Bash".into(),
+            arguments: "{}".into(),
+            step: 0,
+        });
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::TextMessageEnd(_))),
+            "ToolCall must close open text stream: {t3:?}"
+        );
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::ToolCallStart(_))),
+            "ToolCall must emit ToolCallStart: {t3:?}"
+        );
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::ToolCallArgs(_))),
+            "ToolCall must emit ToolCallArgs: {t3:?}"
+        );
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::ToolCallEnd(_))),
+            "ToolCall must emit ToolCallEnd: {t3:?}"
+        );
     }
 
     // ── format_timestamp ────────────────────────────────────────────────────
