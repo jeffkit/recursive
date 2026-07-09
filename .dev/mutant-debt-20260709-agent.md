@@ -30,9 +30,9 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 | `src/hooks/mod.rs` | Continue short-circuit pin added; re-gate |
 | `src/lib.rs` | `truncate_str` `>→>=` extracted + `#[mutants::skip]` (equivalent) |
 | `src/checkpoint.rs` | 2026-07-09: list/diff/read/gc pins + equivalent skips (`log_line_incomplete`, `is_missing_blob_stderr`, `session_id_has_path_separator`, whole `gc`). Remaining: `snapshot_for_session` stderr-warning `&&`/`!` (git stderr shape) |
-| `src/skills.rs` | 2026-07-09 ROI pins: skip invalid discover entries, extract_body, trigger case-insensitivity, unknown mode / empty triggers, globs quote-strip, depends_on+[globs] index, rb/js + chmod+x scripts. Remaining: full-file gate (~554 mutants) — continue weekly |
-| `src/tools/facts.rs` | 2026-07-09: strengthened tokenize whitespace/punct split pin. Full-file scan (~200) still in progress for remaining survivors |
-| `src/http/handlers.rs` | 2026-07-09 ROI pins: `parse_permission_mode`, `map_agent_event` success/`_` arms, `sse_message_from_canonical` filters; soft-skip `health` / `generate_session_id` / `openapi_spec` / `list_slash_commands`. Remaining: async handlers (`get_session`, `agui_run`, …) |
+| `src/skills.rs` | 2026-07-09 ROI pins: skip invalid discover entries, extract_body, trigger case-insensitivity, unknown mode / empty triggers, globs quote-strip, depends_on+[globs] index, rb/js + chmod+x scripts. ROI re-verify (extract_body/discover_scripts/discover_skills `!`) **15 caught / 0 missed**. Remaining: full-file gate (~554 mutants) |
+| `src/tools/facts.rs` | 2026-07-09: strengthened tokenize whitespace/punct split pin. ROI re-verify (tokenize/load/is_active) **9/9 caught**. Remaining: full-file scan (~200) |
+| `src/http/handlers.rs` | 2026-07-09 ROI pins: `parse_permission_mode`, `map_agent_event` (incl. goal-loop arms), `sse_message_from_canonical`; soft-skip `health` / `generate_session_id` / `openapi_spec` / `list_slash_commands`. ROI re-verify **16/16 caught**. Remaining: async handlers (`get_session`, `agui_run`, …) |
 
 ## Accepted non-debt
 

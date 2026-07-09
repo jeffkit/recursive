@@ -2687,6 +2687,31 @@ mod tests {
     }
 
     #[test]
+    fn map_agent_event_forwards_goal_loop_events() {
+        // kills delete-match-arm on GoalContinuing / GoalAchieved
+        match map_agent_event(&AgentEvent::GoalContinuing {
+            reason: "still working".into(),
+            turns: 3,
+        }) {
+            Some(SseEvent::GoalContinuing { reason, turns }) => {
+                assert_eq!(reason, "still working");
+                assert_eq!(turns, 3);
+            }
+            other => panic!("expected GoalContinuing, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::GoalAchieved {
+            condition: "tests pass".into(),
+            turns: 5,
+        }) {
+            Some(SseEvent::GoalAchieved { condition, turns }) => {
+                assert_eq!(condition, "tests pass");
+                assert_eq!(turns, 5);
+            }
+            other => panic!("expected GoalAchieved, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sse_message_from_canonical_filters_system_tool_and_empty() {
         assert!(
             sse_message_from_canonical(&crate::message::Message::system("seed")).is_none(),

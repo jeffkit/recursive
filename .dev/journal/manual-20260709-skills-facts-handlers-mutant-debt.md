@@ -17,4 +17,8 @@
 **Notes**:
 - GitNexus: `discover_skills` CRITICAL / `tokenize` HIGH — changes are tests (+ soft-skip on non-logic wrappers) only; production semantics unchanged.
 - Full-file `agent-mutants.sh` on facts (~200) / skills (~554) is too slow for one session; ROI-scoped re-verify is the gate for this commit.
+- Re-verify (2026-07-09 evening):
+  - handlers ROI (`parse_permission_mode` / `map_agent_event` / `sse_message_from_canonical`): **16 caught / 0 missed** (after GoalContinuing/GoalAchieved pin)
+  - facts tokenize/load/is_active: **9/9 caught**
+  - skills extract_body / discover_scripts / discover_skills `!` guards: **15 caught / 0 missed**
 - Remaining debt: async HTTP handlers, full skills/facts gate-0 sweeps.
