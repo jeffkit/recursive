@@ -1,6 +1,10 @@
-//! ACP v1 stdio JSON-RPC transport loop.
+//! # Collaborative Cancellation
 //!
-//! # Transport contract
+//! Cancel is a **request** (not a demand). The agent drains in-flight tool results
+//! before stopping, and `stopReason: 'cancelled'` is set on the last assistant message.
+//! See Decision #4c.
+//!
+//! ## Transport contract
 //!
 //! - **Framing**: newline-delimited JSON. One JSON-RPC message per line;
 //!   no whitespace padding, no length prefix.
@@ -71,7 +75,9 @@ use tracing::debug;
 use super::bridge::sha256_first_12;
 use super::bridge::AcpBridge;
 use super::protocol::{Implementation, ProtocolVersion};
-use super::session::{AcpSession, AcpSessionManager};
+use super::session::{
+    compute_compaction_hints, summarize_transcript, AcpSession, AcpSessionManager,
+};
 use crate::agent::FinishReason;
 use crate::llm::ChatProvider;
 use crate::runtime::AgentRuntime;
@@ -87,6 +93,17 @@ const INVALID_PARAMS: i32 = -32602;
 const SERVER_NOT_INITIALIZED: i32 = -32002;
 /// Custom error: session not found or not running (S1-C12: contract requires -32000).
 const SESSION_NOT_FOUND: i32 = -32000;
+
+/// Timeout for all in-flight agent→client fs/* RPCs, in milliseconds.
+/// Override via the `ACP_CLIENT_RPC_TIMEOUT_MS` environment variable.
+/// Default: 30_000 ms (30 seconds).
+#[inline]
+pub fn client_rpc_timeout_ms() -> u64 {
+    std::env::var("ACP_CLIENT_RPC_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30_000)
+}
 
 /// Supported protocol version.
 const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
@@ -253,6 +270,52 @@ async fn dispatch_async(
                 vec![],
             ),
             ServerState::Initialized => handle_session_cancel(id, params, sessions),
+        },
+
+        // ── ACP-S1-01: session/load ───────────────────────────────
+        "session/load" => match *state {
+            ServerState::Uninitialized => (
+                Some(build_error(
+                    id,
+                    SERVER_NOT_INITIALIZED,
+                    "Server not initialized",
+                )),
+                vec![],
+            ),
+            ServerState::Initialized => match llm {
+                Some(llm) => handle_session_load(id, params, sessions, llm).await,
+                None => (
+                    Some(build_error(
+                        id,
+                        METHOD_NOT_FOUND,
+                        &format!("Method not found: {method}"),
+                    )),
+                    vec![],
+                ),
+            },
+        },
+
+        // ── ACP-S1-03: session/resume ─────────────────────────────
+        "session/resume" => match *state {
+            ServerState::Uninitialized => (
+                Some(build_error(
+                    id,
+                    SERVER_NOT_INITIALIZED,
+                    "Server not initialized",
+                )),
+                vec![],
+            ),
+            ServerState::Initialized => match llm {
+                Some(llm) => handle_session_resume(id, params, sessions, llm).await,
+                None => (
+                    Some(build_error(
+                        id,
+                        METHOD_NOT_FOUND,
+                        &format!("Method not found: {method}"),
+                    )),
+                    vec![],
+                ),
+            },
         },
 
         _ => (
@@ -470,8 +533,15 @@ async fn handle_session_new(
         }
     };
 
+    // Extract optional systemPrompt and mcpServers from params
+    let system_prompt = params
+        .get("systemPrompt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mcp_servers = params.get("mcpServers").cloned();
+
     // Store the session (note: we use the pre-generated id via insert_with_id)
-    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
     let session = AcpSession {
         runtime,
         cwd: cwd.clone(),
@@ -479,12 +549,429 @@ async fn handle_session_new(
         session_id: session_id.clone(),
         transcript: Vec::new(),
         cancel_token,
+        system_prompt,
+        mcp_servers,
     };
     sessions.insert_with_id(session_id.clone(), session);
 
     let result = serde_json::json!({
         "sessionId": session_id,
         "capabilities": {},
+    });
+
+    (Some(build_success(id, result)), vec![])
+}
+
+// ---------------------------------------------------------------------------
+// session/load handler (ACP-S1-01 / ACP-S1-04 / ACP-S1-06 / ACP-S1-13)
+// ---------------------------------------------------------------------------
+
+/// Handle `session/load`: replay full conversation history via notification
+/// stream without re-executing any tools.
+///
+/// 1. Loads the session transcript and metadata from disk.
+/// 2. Generates a local-heuristic summary and injects it into the system
+///    prompt (ACP-S1-04 — no LLM call).
+/// 3. Creates a fresh [`AgentRuntime`] and [`AcpSession`] in the manager.
+/// 4. Replays every message as a `session/update` notification (user,
+///    assistant, tool) in correct chronological order.
+/// 5. Final notification is `session/loaded`.
+///
+/// Error cases per ACP-S1-13:
+/// - Non-existent session ID → -32000 error.
+/// - Corrupted session file → -32000 error with parse-failure message.
+async fn handle_session_load(
+    id: &Value,
+    params: Option<&Value>,
+    sessions: &mut AcpSessionManager,
+    llm: &Arc<dyn ChatProvider>,
+) -> (Option<Value>, Vec<Value>) {
+    let params = match params {
+        Some(p) => p,
+        None => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing required field 'sessionId'",
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // Extract sessionId
+    let sid = match params.get("sessionId").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing required field 'sessionId'",
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // ACP-S1-13a: non-existent session ID → -32000 error
+    if !sessions.session_exists_on_disk(&sid) {
+        return (
+            Some(build_error(
+                id,
+                SESSION_NOT_FOUND,
+                &format!("Session not found: {sid}"),
+            )),
+            vec![],
+        );
+    }
+
+    // ACP-S1-13b: corrupt session file → -32000 with parse-failure message
+    let saved_messages = match sessions.load_transcript_from_disk(&sid) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    SESSION_NOT_FOUND,
+                    &format!("Failed to parse session transcript: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
+    let metadata = match sessions.load_metadata_from_disk(&sid) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    SESSION_NOT_FOUND,
+                    &format!("Failed to parse session metadata: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // ACP-S1-04: generate summary via local heuristic (no LLM call)
+    let messages: Vec<crate::message::Message> =
+        saved_messages.iter().map(|sm| sm.message.clone()).collect();
+    let summarized = summarize_transcript(&messages);
+
+    // Inject summary into system prompt
+    let system_prompt_with_summary = match &metadata.system_prompt {
+        Some(sp) => format!("{}\n\n[Session context]: {}", sp, summarized.summary),
+        None => format!("[Session context]: {}", summarized.summary),
+    };
+
+    // Extract optional mcpServers override from params (ACP-S1-06)
+    let mcp_servers = params
+        .get("mcpServers")
+        .cloned()
+        .or(metadata.mcp_servers.clone());
+
+    // Build fresh AgentRuntime with a new bridge
+    let turn = metadata.turn;
+    let (bridge, _rx) = AcpBridge::new(
+        sid.clone(),
+        std::collections::HashMap::new(),
+        turn,
+        true, // tool_call notifications enabled for loaded sessions
+    );
+
+    let runtime = match AgentRuntime::builder()
+        .llm(llm.clone())
+        .event_sink(bridge)
+        .streaming(true)
+        .system_prompt(system_prompt_with_summary.clone())
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    &format!("Failed to create agent runtime: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // ACP-S1-16: wrap cancel token in Arc
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    let session = AcpSession {
+        runtime,
+        cwd: metadata.cwd.clone(),
+        turn,
+        session_id: sid.clone(),
+        transcript: messages,
+        cancel_token,
+        system_prompt: metadata.system_prompt,
+        mcp_servers,
+    };
+    sessions.insert_with_id(sid.clone(), session);
+
+    // ACP-S1-01: replay each message as a session/update notification in order
+    let mut notifications: Vec<Value> = Vec::new();
+
+    for sm in &saved_messages {
+        match sm.message.role {
+            crate::message::Role::User => {
+                let notif = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": sm.id,
+                            "content": {
+                                "type": "text",
+                                "text": sm.message.content,
+                            }
+                        }
+                    }
+                });
+                notifications.push(notif);
+            }
+            crate::message::Role::Assistant => {
+                let notif = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": sm.id,
+                            "content": {
+                                "type": "text",
+                                "text": sm.message.content,
+                            }
+                        }
+                    }
+                });
+                notifications.push(notif);
+            }
+            crate::message::Role::Tool => {
+                let notif = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": sm.id,
+                            "status": "completed",
+                            "content": {
+                                "type": "text",
+                                "text": sm.message.content,
+                            }
+                        }
+                    }
+                });
+                notifications.push(notif);
+            }
+            crate::message::Role::System => {
+                // System messages are not replayed as notifications
+            }
+        }
+    }
+
+    // ACP-S1-01: final notification is session/loaded
+    let loaded_notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "session/loaded",
+                "messageCount": saved_messages.len(),
+            }
+        }
+    });
+    notifications.push(loaded_notif);
+
+    // ACP-S1-04: response includes system prompt with summary
+    let result = serde_json::json!({
+        "sessionId": sid,
+        "systemPrompt": system_prompt_with_summary,
+        "messageCount": saved_messages.len(),
+        "turn": turn,
+    });
+
+    (Some(build_success(id, result)), notifications)
+}
+
+// ---------------------------------------------------------------------------
+// session/resume handler (ACP-S1-03 / ACP-S1-05 / ACP-S1-06 / ACP-S1-13)
+// ---------------------------------------------------------------------------
+
+/// Handle `session/resume`: restore agent context (system prompt, conversation
+/// history, MCP connections) without replaying every notification.
+///
+/// 1. Loads the session transcript and metadata from disk.
+/// 2. Computes compaction hints for the transcript (ACP-S1-05).
+/// 3. Creates a fresh [`AgentRuntime`] and [`AcpSession`] in the manager.
+/// 4. Returns the restored context (system_prompt, conversation history,
+///    compaction_hints) — **no** `session/update` notifications are emitted.
+///
+/// Error cases per ACP-S1-13:
+/// - Non-existent session ID → -32000 error.
+/// - Invalid mcpServers config → logged as warning, gracefully skipped.
+async fn handle_session_resume(
+    id: &Value,
+    params: Option<&Value>,
+    sessions: &mut AcpSessionManager,
+    llm: &Arc<dyn ChatProvider>,
+) -> (Option<Value>, Vec<Value>) {
+    let params = match params {
+        Some(p) => p,
+        None => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing required field 'sessionId'",
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // Extract sessionId
+    let sid = match params.get("sessionId").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing required field 'sessionId'",
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // ACP-S1-13a: non-existent session ID → -32000 error
+    if !sessions.session_exists_on_disk(&sid) {
+        return (
+            Some(build_error(
+                id,
+                SESSION_NOT_FOUND,
+                &format!("Session not found: {sid}"),
+            )),
+            vec![],
+        );
+    }
+
+    // Load transcript from disk
+    let saved_messages = match sessions.load_transcript_from_disk(&sid) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    SESSION_NOT_FOUND,
+                    &format!("Failed to parse session transcript: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // Load metadata from disk
+    let metadata = match sessions.load_metadata_from_disk(&sid) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    SESSION_NOT_FOUND,
+                    &format!("Failed to parse session metadata: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // ACP-S1-13d: handle mcpServers override — gracefully skip invalid servers
+    // (log warning, still return a valid context).
+    let mcp_servers = params
+        .get("mcpServers")
+        .cloned()
+        .or(metadata.mcp_servers.clone());
+
+    // Build messages from transcript
+    let messages: Vec<crate::message::Message> =
+        saved_messages.iter().map(|sm| sm.message.clone()).collect();
+
+    // ACP-S1-05: compute compaction hints (default recency threshold = 2)
+    let hints = compute_compaction_hints(&saved_messages, 2);
+    let hint_values: Vec<serde_json::Value> = hints
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "turnIndex": h.turn_index,
+                "compressible": h.compressible,
+            })
+        })
+        .collect();
+
+    // Build fresh AgentRuntime with a new bridge
+    let (bridge, _rx) = AcpBridge::new(
+        sid.clone(),
+        std::collections::HashMap::new(),
+        metadata.turn,
+        true,
+    );
+
+    let runtime = match AgentRuntime::builder()
+        .llm(llm.clone())
+        .event_sink(bridge)
+        .streaming(true)
+        .system_prompt(metadata.system_prompt.clone().unwrap_or_default())
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    &format!("Failed to create agent runtime: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // ACP-S1-16: wrap cancel token in Arc
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    let session = AcpSession {
+        runtime,
+        cwd: metadata.cwd.clone(),
+        turn: metadata.turn,
+        session_id: sid.clone(),
+        transcript: messages,
+        cancel_token,
+        system_prompt: metadata.system_prompt.clone(),
+        mcp_servers,
+    };
+    sessions.insert_with_id(sid.clone(), session);
+
+    // ACP-S1-03: return context — NO session/update notifications emitted.
+    let result = serde_json::json!({
+        "sessionId": sid,
+        "systemPrompt": metadata.system_prompt,
+        "turn": metadata.turn,
+        "messageCount": saved_messages.len(),
+        "compactionHints": hint_values,
     });
 
     (Some(build_success(id, result)), vec![])

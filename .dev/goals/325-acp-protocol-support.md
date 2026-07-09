@@ -2,17 +2,18 @@
 
 ## ⚠️ 已完成的 sprint（不要重做）
 
-**全部 P0~P3 + sprint-1 CLI fix 已完成并 commit。**
+**全部 P0~P4 + sprint-1 CLI fix 已完成并 commit。**
 
-- ✅ **P0** ACP 协议类型层 — `src/acp/protocol.rs`（re-export `agent-client-protocol-schema`，64 个 round-trip test）— commit `4fb3ea2`
-- ✅ **P1** stdio JSON-RPC loop + initialize handshake — `src/acp/server.rs`（init / handshake / error 码 / state machine）— commit `257feba`
-- ✅ **P2+P3** session lifecycle + tool_call 通知 + ToolKind — `src/acp/{session,bridge,tool_kind}.rs`，`src/tools/*::kind()` 方法，4b SSE abort 部分 wiring — commits `23f96fc` + `71012b3`
-- ✅ **Sprint-1 CLI fix**：`recursive acp` 接 LLM provider（`AcpServer::run(Some(provider))`）— commit `f02feb1`
-- AC-2.1 sandbox check 用 `RECURSIVE_ACP_SANDBOX_STRICT=1` 控制（默认 warn 模式）
+- ✅ **P0** ACP 协议类型层 — commit `4fb3ea2`
+- ✅ **P1** stdio JSON-RPC loop + initialize handshake — commit `257feba`
+- ✅ **P2+P3** session lifecycle + tool_call 通知 + ToolKind + 4b SSE abort wiring — commits `23f96fc` + `71012b3`
+- ✅ **Sprint-1 CLI fix**：`recursive acp` 接 LLM provider — commit `f02feb1`
+- ✅ **P4 (partial)** `session/cancel` handler + `synthesize_cancelled_tool_results` 桥方法 + AC-2.1 sandbox check 强化 — commit `0e5a1d4`
+  - **P4 剩余**：permission bridge (`session/request_permission` → `PermissionHook`) + AgentRuntime 把 cancel_token 传到 LLM stream 的实际端到端测试
 
-**planner 重新拆 sprint 时，sprint 1 应该从 P4（session/cancel + permission）开始**，不要再做 P0~P3。Sprint 1 失败根因（CLI 没接 LLM provider）已修。
+**planner 重新拆 sprint 时，sprint 1 应该从 P5（load/resume）开始**，不要再做 P0~P4。P4 剩余（permission bridge）已知的活可放进 P5/P6 一起做。
 
-**`RECURSIVE_ACP_SANDBOX_STRICT=1` 在生产部署时记得设**——`recursive acp` 启动时设为强沙箱模式（dev/test 默认 off，TempDir cwd 才能跑通）。
+**`RECURSIVE_ACP_SANDBOX_STRICT=1` 在生产部署时记得设**。
 
 ---
 
