@@ -1512,6 +1512,67 @@ mod tests {
     }
 
     #[test]
+    fn facts_summary_exact_120_chars_not_truncated() {
+        // kills `> 120` → `>= 120`: exactly 120 chars must pass through uncut.
+        let (_tmp, ws) = tmp_workspace();
+        let remember = RememberFact::new(&ws);
+        let exact = "B".repeat(120);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": &exact})))
+            .unwrap();
+        let summary = facts_summary(&ws, 5);
+        assert!(
+            summary.contains(&exact),
+            "exactly 120 chars must not be truncated: {summary}"
+        );
+        assert!(
+            !summary.contains("BBB..."),
+            "exact-120 text must not gain ellipsis"
+        );
+    }
+
+    #[test]
+    fn fact_tools_are_deferred() {
+        let (_tmp, ws) = tmp_workspace();
+        assert!(RememberFact::new(&ws).is_deferred());
+        assert!(RecallFact::new(&ws).is_deferred());
+        assert!(ForgetFact::new(&ws).is_deferred());
+        assert!(UpdateFact::new(&ws).is_deferred());
+    }
+
+    #[test]
+    fn remember_duplicate_keep_increments_access_count() {
+        // kills `access_count += 1` → `*= 1` on KeepExisting path
+        let (_tmp, ws) = tmp_workspace();
+        let remember = RememberFact::new(&ws);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(remember.execute(json!({"text": "same fact text"})))
+            .unwrap();
+        // Identical text → KeepExisting (Jaccard = 1.0)
+        let msg = rt
+            .block_on(remember.execute(json!({"text": "same fact text"})))
+            .unwrap();
+        assert!(
+            msg.contains("duplicate of F1"),
+            "identical text must KeepExisting: {msg}"
+        );
+        let path = facts_path(&ws, "workspace");
+        let store = FactStore::load(&path).unwrap();
+        let fact = store.get("F1").expect("F1");
+        assert_eq!(
+            fact.access_count, 1,
+            "KeepExisting must bump access_count by 1, got {}",
+            fact.access_count
+        );
+        // Second duplicate → access_count 2 (kills *= which would stay 1)
+        rt.block_on(remember.execute(json!({"text": "same fact text"})))
+            .unwrap();
+        let store = FactStore::load(&path).unwrap();
+        assert_eq!(store.get("F1").unwrap().access_count, 2);
+    }
+
+    #[test]
     fn test_p_facts_summary_limit_caps_output() {
         // kills mutations of `.take(limit)` in facts_summary
         let (_tmp, ws) = tmp_workspace();

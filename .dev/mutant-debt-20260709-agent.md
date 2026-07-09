@@ -31,7 +31,7 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 | `src/lib.rs` | `truncate_str` `>→>=` extracted + `#[mutants::skip]` (equivalent) |
 | `src/checkpoint.rs` | 2026-07-09: list/diff/read/gc pins + equivalent skips (`log_line_incomplete`, `is_missing_blob_stderr`, `session_id_has_path_separator`, whole `gc`). Remaining: `snapshot_for_session` stderr-warning `&&`/`!` (git stderr shape) |
 | `src/skills.rs` | 2026-07-09 ROI pins: skip invalid discover entries, extract_body, trigger case-insensitivity, unknown mode / empty triggers, globs quote-strip, depends_on+[globs] index, rb/js + chmod+x scripts. ROI re-verify (extract_body/discover_scripts/discover_skills `!`) **15 caught / 0 missed**. Remaining: full-file gate (~554 mutants) |
-| `src/tools/facts.rs` | 2026-07-09: soft-skip `fact_staleness`/`relevance_score`/`chrono_now_rfc3339`/`subtract_year_days`; pin eviction/jaccard/dedup/calendar. Full re-gate in flight after final calendar pins |
+| `src/tools/facts.rs` | 2026-07-09: soft-skip scoring/timestamp/year-subtract; pin eviction/jaccard/dedup/calendar/summary-120/deferred/access_count. Full re-gate after final pins |
 | `src/http/handlers.rs` | 2026-07-09 ROI pins: permission/SSE/goal/core arms, tool_use-without-text, AguiConverter stream close, `get_session` idle/pending/busy, `patch_session` empty title; soft-skip thin wrappers. Remaining: `agui_run` resume/interrupt paths |
 
 ## Accepted non-debt
