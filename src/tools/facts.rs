@@ -1380,6 +1380,43 @@ mod tests {
     fn test_l_rfc3339_to_secs() {
         let secs = rfc3339_to_secs("2026-05-25T12:00:00Z").unwrap();
         assert!(secs > 0.0, "should parse to positive seconds");
+        // Exact known epoch: 1970-01-01T00:00:00Z
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:00:00Z"), Some(0.0));
+        // 1970-01-01T01:00:00Z = 3600s — kills `hour * 3600` → `hour + 3600`
+        assert_eq!(rfc3339_to_secs("1970-01-01T01:00:00Z"), Some(3600.0));
+        // 1970-01-02T00:00:00Z = 86400s — kills `days * 86400` → `days + 86400`
+        assert_eq!(rfc3339_to_secs("1970-01-02T00:00:00Z"), Some(86400.0));
+    }
+
+    #[test]
+    fn is_leap_known_years() {
+        assert!(is_leap(1972), "1972 is leap");
+        assert!(!is_leap(1970), "1970 is not leap");
+        assert!(!is_leap(1900), "1900 is century non-leap");
+        assert!(is_leap(2000), "2000 is 400-year leap");
+        // kills `year % 4` → `year / 4` (1972/4==493, not 0)
+        assert!(is_leap(2024));
+        assert!(!is_leap(2023));
+    }
+
+    #[test]
+    fn days_to_date_year_boundary_uses_strict_less() {
+        // Day 0 = 1970-01-01. Non-leap 1970 has 365 days, so day index 365
+        // is 1971-01-01. With `<=` the year loop would incorrectly consume
+        // the boundary day into 1970.
+        assert_eq!(days_to_date(0), (1970, 1, 1));
+        assert_eq!(days_to_date(364), (1970, 12, 31));
+        assert_eq!(days_to_date(365), (1971, 1, 1));
+    }
+
+    #[test]
+    fn days_since_epoch_accumulates_months() {
+        // 1970-01-01 → 0; 1970-02-01 → 31. kills `+=` → `-=` on month loop.
+        assert_eq!(days_since_epoch(1970, 1, 1), 0);
+        assert_eq!(days_since_epoch(1970, 2, 1), 31);
+        assert_eq!(days_since_epoch(1971, 1, 1), 365);
+        // Leap year Feb 29: 1972-03-01 = 365+365+31+29 = 790
+        assert_eq!(days_since_epoch(1972, 3, 1), 365 + 365 + 31 + 29);
     }
 
     #[test]
