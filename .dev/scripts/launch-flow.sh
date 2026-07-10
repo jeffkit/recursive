@@ -49,17 +49,33 @@ TIMESTAMP="$(date +%Y%m%dT%H%M%S)"
 LOG_FILE="$LOGS_DIR/flow-${TIMESTAMP}.log"
 TMUX_SESSION="recursive-flow-${TIMESTAMP}"
 
-# ── 3. 默认追加 --reviewer-agent claude ───────────────────────────
+# ── 3. 默认追加跨 provider review（deepseek ↔ deepseek-pro）────────
+# Claude API 已不可用，不再自动挂 --reviewer-agent claude。
+# 未显式指定 reviewer 时：provider=deepseek → reviewer=deepseek-pro，
+# 其它 provider → reviewer=deepseek（与实现 agent 错开）。
 EXTRA_ARGS=()
 HAS_REVIEWER=0
+PROVIDER_NAME=""
 for arg in "$@"; do
   if [[ "$arg" == "--reviewer-agent" || "$arg" == "--reviewer-provider" || "$arg" == "--no-review" ]]; then
-    HAS_REVIEWER=1; break
+    HAS_REVIEWER=1
   fi
 done
-if [ "$HAS_REVIEWER" = "0" ] && command -v claude &>/dev/null; then
-  EXTRA_ARGS=("--reviewer-agent" "claude")
-  echo "[launch-flow] 自动附加 --reviewer-agent claude（claude CLI 可用）"
+# 提取 --provider 值（简单扫一遍；值紧跟在 flag 后）
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--provider" ]]; then
+    PROVIDER_NAME="$arg"
+  fi
+  prev="$arg"
+done
+if [ "$HAS_REVIEWER" = "0" ]; then
+  if [[ "$PROVIDER_NAME" == "deepseek" || "$PROVIDER_NAME" == "deepseek-flash" ]]; then
+    EXTRA_ARGS=("--reviewer-provider" "deepseek-pro")
+  else
+    EXTRA_ARGS=("--reviewer-provider" "deepseek")
+  fi
+  echo "[launch-flow] 自动附加 ${EXTRA_ARGS[*]}（claude reviewer 已停用；deepseek/deepseek-pro 轮换）"
 fi
 
 # ── 4. stdbuf 行缓冲（日志实时写入）──────────────────────────────
