@@ -20,7 +20,7 @@ class _AgentSession:
 
     Use as a context manager::
 
-        with Agent.create(base_url="http://localhost:3000") as agent:
+        with Agent.create() as agent:  # CLI subprocess by default
             run = agent.send("do something")
             run.wait()
     """
@@ -28,13 +28,17 @@ class _AgentSession:
     def __init__(
         self,
         session_id: str,
-        http: _HttpClient,
+        http: Optional[_HttpClient],
         *,
         _owns_session: bool = True,
+        _transport: str = "http",
+        _opts: Optional[dict] = None,
     ) -> None:
         self._session_id = session_id
         self._http = http
         self._owns_session = _owns_session
+        self._transport = _transport
+        self._opts = _opts or {}
         self._closed = False
 
     @property
@@ -48,23 +52,45 @@ class _AgentSession:
         """
         Send *message* to the agent and return a :class:`~recursive_sdk.run.Run`.
 
-        The POST is dispatched in a background thread so the returned ``Run``
-        can subscribe to SSE *before* the server starts emitting events —
-        the broadcast channel does not replay missed events. Errors from the
-        POST surface either through the SSE ``error`` event (HTTP 5xx,
-        runtime failures) or through ``run.wait()`` returning the failure
-        captured during dispatch.
-
-        Example::
-
-            run = agent.send("refactor src/main.rs")
-            for msg in run.messages():
-                if msg.type == "assistant":
-                    print(msg.text(), end="")
-            result = run.wait()
+        CLI transport: spawns ``recursive -p …`` (or ``-r <id> -p …``).
+        HTTP transport: POSTs to ``/sessions/:id/messages`` and streams SSE.
         """
         if self._closed:
             raise RecursiveAgentError("Agent session is already closed.")
+
+        if self._transport == "cli":
+            from .cli import spawn_cli_process
+
+            resume = self._session_id or None
+            handle = spawn_cli_process(
+                prompt=message,
+                resume_session_id=resume,
+                **{
+                    k: v
+                    for k, v in self._opts.items()
+                    if k
+                    in {
+                        "cwd",
+                        "cli_path",
+                        "model",
+                        "system_prompt",
+                        "append_system_prompt",
+                        "session_name",
+                        "max_steps",
+                        "max_budget_usd",
+                        "planning_mode",
+                        "permission_mode",
+                    }
+                },
+            )
+
+            def _on_sid(sid: str) -> None:
+                self._session_id = sid
+
+            return Run._from_cli(self._session_id, handle, _on_sid)
+
+        if self._http is None:
+            raise RecursiveAgentError("HTTP transport requires a client.")
 
         run = Run(session_id=self._session_id, http=self._http)
 
@@ -74,7 +100,7 @@ class _AgentSession:
                     f"/sessions/{self._session_id}/messages",
                     {"content": message},
                 )
-            except Exception as err:  # noqa: BLE001 — bubble via Run.wait()
+            except Exception as err:  # noqa: BLE001
                 run._fail(str(err))
 
         import threading
@@ -92,20 +118,9 @@ class _AgentSession:
         *,
         max_turns: int = 20,
     ) -> GoalState:
-        """
-        Start a condition-based autonomous loop for this session.
-
-        The server evaluates *condition* after every agent turn and keeps
-        looping until the condition is met or *max_turns* is exhausted.
-
-        Returns a :class:`~recursive_sdk.models.GoalState` with
-        ``status == "pursuing"``.
-
-        Example::
-
-            state = agent.set_goal("all tests pass", max_turns=10)
-            print(state.status)  # "pursuing"
-        """
+        """Start a condition-based autonomous loop (HTTP only)."""
+        self._require_http("set_goal")
+        assert self._http is not None
         if self._closed:
             raise RecursiveAgentError("Agent session is already closed.")
         resp = self._http.post(
@@ -121,12 +136,9 @@ class _AgentSession:
         )
 
     def clear_goal(self) -> GoalState:
-        """
-        Clear the active goal for this session.
-
-        Returns a :class:`~recursive_sdk.models.GoalState` with
-        ``status == "cleared"``.
-        """
+        """Clear the active goal (HTTP only)."""
+        self._require_http("clear_goal")
+        assert self._http is not None
         if self._closed:
             raise RecursiveAgentError("Agent session is already closed.")
         data = self._http.delete_json(f"/sessions/{self._session_id}/goal")
@@ -136,11 +148,9 @@ class _AgentSession:
         )
 
     def get_goal(self) -> Optional[GoalState]:
-        """
-        Return the current goal state, or ``None`` if no goal is active.
-
-        Calls ``GET /sessions/:id`` and extracts the ``goal`` field.
-        """
+        """Return the current goal state (HTTP only)."""
+        self._require_http("get_goal")
+        assert self._http is not None
         if self._closed:
             raise RecursiveAgentError("Agent session is already closed.")
         data = self._http.get(f"/sessions/{self._session_id}").json()
@@ -155,18 +165,25 @@ class _AgentSession:
             last_reason=raw.get("last_reason"),
         )
 
+    def _require_http(self, method: str) -> None:
+        if self._transport != "http" or self._http is None:
+            raise RecursiveAgentError(
+                f"{method}() requires HTTP transport. Pass base_url or set RECURSIVE_BASE_URL."
+            )
+
     # ── context manager ───────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Close the session (deletes it on the server if we own it)."""
+        """Close the session (deletes it on the server if we own an HTTP session)."""
         if not self._closed:
             self._closed = True
-            if self._owns_session:
+            if self._owns_session and self._http and self._session_id:
                 try:
                     self._http.delete(f"/sessions/{self._session_id}")
                 except RecursiveAgentError:
-                    pass  # best-effort
-            self._http.close()
+                    pass
+            if self._http is not None:
+                self._http.close()
 
     def __enter__(self) -> "_AgentSession":
         return self
@@ -218,62 +235,64 @@ class Agent:
         permission_mode: Optional[str] = None,
         max_budget_usd: Optional[float] = None,
         timeout: float = 120.0,
+        cli_path: Optional[str] = None,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> _AgentSession:
         """
         Create a new agent session.
 
-        Parameters
-        ----------
-        base_url:
-            URL of the Recursive server (default: ``RECURSIVE_BASE_URL`` env var
-            or ``http://127.0.0.1:3000``).
-        api_key:
-            Optional API key (default: ``RECURSIVE_API_KEY`` env var).
-        system_prompt:
-            Replace the server's default system prompt entirely.
-        append_system_prompt:
-            Append additional instructions to the server's default system prompt.
-            Ignored when *system_prompt* is also provided.
-        session_name:
-            Human-readable display name for the session (shown in session list /
-            resume picker).
-        max_steps:
-            Maximum number of agent steps allowed for this session.
-        planning_mode:
-            ``"immediate"`` (default) or ``"plan_first"`` — controls whether the
-            agent executes tool calls immediately or presents a plan first.
-        thinking_budget:
-            Extended-thinking token budget for models that support it (e.g.
-            Anthropic claude-3-7). Pass ``0`` to disable thinking.
-        permission_mode:
-            ``"default"``, ``"auto"``, ``"strict"``, or ``"bypass"`` — controls
-            tool-call permission enforcement.
-        max_budget_usd:
-            Maximum total API spend in USD for this session.
-        timeout:
-            HTTP / SSE timeout in seconds.
+        Default transport is the local ``recursive`` CLI. Pass *base_url*
+        (or set ``RECURSIVE_BASE_URL``) to use HTTP instead.
         """
-        http = _make_client(base_url, api_key, timeout)
-        body: dict = {}
-        if system_prompt:
-            body["system_prompt"] = system_prompt
-        if append_system_prompt:
-            body["append_system_prompt"] = append_system_prompt
-        if session_name:
-            body["session_name"] = session_name
-        if max_steps is not None:
-            body["max_steps"] = max_steps
-        if planning_mode:
-            body["planning_mode"] = planning_mode
-        if thinking_budget is not None:
-            body["thinking_budget"] = thinking_budget
-        if permission_mode:
-            body["permission_mode"] = permission_mode
-        if max_budget_usd is not None:
-            body["max_budget_usd"] = max_budget_usd
-        resp = http.post("/sessions", body)
-        session_id = resp.json()["id"]
-        return _AgentSession(session_id, http, _owns_session=True)
+        opts = {
+            "system_prompt": system_prompt,
+            "append_system_prompt": append_system_prompt,
+            "session_name": session_name,
+            "max_steps": max_steps,
+            "planning_mode": planning_mode,
+            "permission_mode": permission_mode,
+            "max_budget_usd": max_budget_usd,
+            "cli_path": cli_path,
+            "cwd": cwd,
+            "model": model,
+        }
+        if _uses_http(base_url):
+            http = _make_client(base_url, api_key, timeout)
+            body: dict = {}
+            if system_prompt:
+                body["system_prompt"] = system_prompt
+            if append_system_prompt:
+                body["append_system_prompt"] = append_system_prompt
+            if session_name:
+                body["session_name"] = session_name
+            if max_steps is not None:
+                body["max_steps"] = max_steps
+            if planning_mode:
+                body["planning_mode"] = planning_mode
+            if thinking_budget is not None:
+                body["thinking_budget"] = thinking_budget
+            if permission_mode:
+                body["permission_mode"] = permission_mode
+            if max_budget_usd is not None:
+                body["max_budget_usd"] = max_budget_usd
+            resp = http.post("/sessions", body)
+            session_id = resp.json()["id"]
+            return _AgentSession(
+                session_id,
+                http,
+                _owns_session=True,
+                _transport="http",
+                _opts=opts,
+            )
+
+        return _AgentSession(
+            "",
+            None,
+            _owns_session=True,
+            _transport="cli",
+            _opts=opts,
+        )
 
     @staticmethod
     def resume(
@@ -282,17 +301,37 @@ class Agent:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: float = 120.0,
+        cli_path: Optional[str] = None,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
+        max_steps: Optional[int] = None,
     ) -> _AgentSession:
-        """
-        Resume an existing session by ID.
-
-        The session is **not deleted** when the context manager exits (since we
-        don't own it).
-        """
-        http = _make_client(base_url, api_key, timeout)
-        # Verify the session exists
-        http.get(f"/sessions/{session_id}")
-        return _AgentSession(session_id, http, _owns_session=False)
+        """Resume an existing session by ID."""
+        opts = {
+            "cli_path": cli_path,
+            "cwd": cwd,
+            "model": model,
+            "permission_mode": permission_mode,
+            "max_steps": max_steps,
+        }
+        if _uses_http(base_url):
+            http = _make_client(base_url, api_key, timeout)
+            http.get(f"/sessions/{session_id}")
+            return _AgentSession(
+                session_id,
+                http,
+                _owns_session=False,
+                _transport="http",
+                _opts=opts,
+            )
+        return _AgentSession(
+            session_id,
+            None,
+            _owns_session=False,
+            _transport="cli",
+            _opts=opts,
+        )
 
     @staticmethod
     def prompt(
@@ -308,69 +347,66 @@ class Agent:
         permission_mode: Optional[str] = None,
         max_budget_usd: Optional[float] = None,
         timeout: float = 120.0,
+        cli_path: Optional[str] = None,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> RunResult:
         """
-        One-shot convenience: create a session, send *message*, wait, delete.
+        One-shot convenience: run *message* to completion.
 
-        Returns a :class:`~recursive_sdk.models.RunResult`.
-
-        Parameters
-        ----------
-        message:
-            The goal / task to run.
-        system_prompt:
-            Replace the server's default system prompt entirely.
-        append_system_prompt:
-            Append additional instructions to the server's default system prompt.
-            Ignored when *system_prompt* is also provided.
-        max_steps:
-            Maximum number of agent steps.
-        planning_mode:
-            ``"immediate"`` (default) or ``"plan_first"``.
-        thinking_budget:
-            Extended-thinking token budget. Pass ``0`` to disable.
-        permission_mode:
-            ``"default"``, ``"auto"``, ``"strict"``, or ``"bypass"``.
-        max_budget_usd:
-            Maximum total API spend in USD for this run.
-
-        Example::
-
-            result = Agent.prompt("list files", base_url="http://localhost:3000")
-            if result.status == "finished":
-                print("done!")
+        CLI (default): ``recursive -p … --output-format stream-json``.
+        HTTP: ``POST /run``.
         """
-        http = _make_client(base_url, api_key, timeout)
-        body: dict = {"goal": message}
-        if system_prompt:
-            body["system_prompt"] = system_prompt
-        if append_system_prompt:
-            body["append_system_prompt"] = append_system_prompt
-        if max_steps is not None:
-            body["max_steps"] = max_steps
-        if planning_mode:
-            body["planning_mode"] = planning_mode
-        if thinking_budget is not None:
-            body["thinking_budget"] = thinking_budget
-        if permission_mode:
-            body["permission_mode"] = permission_mode
-        if max_budget_usd is not None:
-            body["max_budget_usd"] = max_budget_usd
+        if _uses_http(base_url):
+            http = _make_client(base_url, api_key, timeout)
+            body: dict = {"goal": message}
+            if system_prompt:
+                body["system_prompt"] = system_prompt
+            if append_system_prompt:
+                body["append_system_prompt"] = append_system_prompt
+            if max_steps is not None:
+                body["max_steps"] = max_steps
+            if planning_mode:
+                body["planning_mode"] = planning_mode
+            if thinking_budget is not None:
+                body["thinking_budget"] = thinking_budget
+            if permission_mode:
+                body["permission_mode"] = permission_mode
+            if max_budget_usd is not None:
+                body["max_budget_usd"] = max_budget_usd
 
-        resp = http.post("/run", body)
-        data = resp.json()
-        usage = None
-        if "usage" in data:
-            from .run import _parse_usage
+            resp = http.post("/run", body)
+            data = resp.json()
+            usage = None
+            if "usage" in data:
+                from .run import _parse_usage
 
-            usage = _parse_usage(data["usage"])
-        return RunResult(
-            id=data.get("session_id", ""),
-            status=data.get("status", "finished"),
-            finish_reason=data.get("finish_reason"),
-            usage=usage,
-            error=data.get("error"),
+                usage = _parse_usage(data["usage"])
+            result = RunResult(
+                id=data.get("session_id", ""),
+                status=data.get("status", "finished"),
+                finish_reason=data.get("finish_reason"),
+                usage=usage,
+                error=data.get("error"),
+            )
+            http.close()
+            return result
+
+        from .cli import spawn_cli_process
+
+        handle = spawn_cli_process(
+            prompt=message,
+            cli_path=cli_path,
+            cwd=cwd,
+            model=model,
+            system_prompt=system_prompt,
+            append_system_prompt=append_system_prompt,
+            max_steps=max_steps,
+            max_budget_usd=max_budget_usd,
+            planning_mode=planning_mode,
+            permission_mode=permission_mode,
         )
+        return Run._from_cli("", handle).wait()
 
     # ── session management helpers ────────────────────────────────────────────
 
@@ -506,6 +542,10 @@ class Agent:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
+
+
+def _uses_http(base_url: Optional[str]) -> bool:
+    return bool(base_url or os.environ.get("RECURSIVE_BASE_URL"))
 
 
 def _make_client(

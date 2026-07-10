@@ -272,9 +272,10 @@ describe("Agent.listSessions", () => {
       },
     ]);
 
-    const sessions = await Agent.listSessions({
-      baseUrl: "http://localhost:3000",
-    });
+    const sessions = await Agent.listSessions(
+      {},
+      { baseUrl: "http://localhost:3000" },
+    );
 
     expect(sessions.length).toBe(1);
     expect(sessions[0]!.id).toBe("s1");

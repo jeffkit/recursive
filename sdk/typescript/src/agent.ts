@@ -1,5 +1,11 @@
 /**
  * Agent — main entrypoint for the Recursive Agent TypeScript SDK.
+ *
+ * Default transport: spawn the local `recursive` CLI with
+ * `--output-format stream-json` (Claude Agent SDK–style).
+ *
+ * HTTP transport: pass `baseUrl` (or set `RECURSIVE_BASE_URL`) to talk to a
+ * running `recursive http` server instead.
  */
 
 import { RecursiveAgentError } from "./exceptions.js";
@@ -7,6 +13,7 @@ import { HttpClient } from "./http.js";
 import { mapFinishReasonToSubtype } from "./models.js";
 import type { RunResult, SessionInfo } from "./models.js";
 import { Run } from "./run.js";
+import { spawnCliProcess } from "./subprocess.js";
 
 // ── AgentSession ──────────────────────────────────────────────────────────
 
@@ -15,70 +22,68 @@ import { Run } from "./run.js";
  *
  * Do not instantiate directly — use `Agent.create()` or `Agent.resume()`.
  *
- * Use `await using` (TypeScript 5.2+) or a `try/finally` block for cleanup:
- *
- * ```ts
- * await using agent = await Agent.create({ baseUrl: "http://localhost:3000" });
- * const run = await agent.send("do something");
- * await run.wait();
- * ```
+ * Use `await using` (TypeScript 5.2+) or a `try/finally` block for cleanup.
  */
 export class AgentSession {
-  readonly sessionId: string;
-
-  private readonly _http: HttpClient;
+  private _sessionId: string;
+  private readonly _http: HttpClient | null;
+  private readonly _opts: AgentOptions;
   private readonly _ownsSession: boolean;
+  private readonly _transport: "http" | "cli";
   private _closed = false;
 
   constructor(
     sessionId: string,
-    http: HttpClient,
-    options: { ownsSession: boolean },
+    http: HttpClient | null,
+    options: {
+      ownsSession: boolean;
+      transport: "http" | "cli";
+      agentOptions: AgentOptions;
+    },
   ) {
-    this.sessionId = sessionId;
+    this._sessionId = sessionId;
     this._http = http;
     this._ownsSession = options.ownsSession;
+    this._transport = options.transport;
+    this._opts = options.agentOptions;
   }
 
-  // ── send ─────────────────────────────────────────────────────────────────
+  get sessionId(): string {
+    return this._sessionId;
+  }
 
   /**
    * Send *message* to the agent and return a `Run`.
    *
-   * The POST is dispatched in the background — `send()` returns as soon
-   * as the request is on the wire. The returned `Run` is lazy: the SSE
-   * subscription opens when you iterate `run.stream()` or call
-   * `run.wait()`. This avoids a race where the server-side run completes
-   * (and broadcasts its events) before a subscriber attaches.
-   *
-   * ```ts
-   * const run = await agent.send("Fix the failing tests");
-   * for await (const msg of run.stream()) {
-   *   if (msg.type === "assistant") {
-   *     for (const block of msg.content) {
-   *       if (block.type === "text") process.stdout.write(block.text);
-   *     }
-   *   }
-   * }
-   * const result = await run.wait();
-   * ```
+   * CLI transport: spawns `recursive -p …` (or `-r <id> -p …` for follow-ups).
+   * HTTP transport: POSTs to `/sessions/:id/messages` and streams SSE.
    */
   async send(message: string): Promise<Run> {
     if (this._closed) {
       throw new RecursiveAgentError("Agent session is already closed.");
     }
-    // Fire-and-forget the POST so the SSE subscription in Run.stream()
-    // can attach before the agent run starts emitting events. The server
-    // creates the per-session broadcast channel inside the POST handler
-    // before kicking off the runtime, so subscribers that connect within
-    // the time it takes to issue this fetch will see every event.
-    //
-    // Errors from the POST surface either through the SSE `error` event
-    // (HTTP 5xx, runtime failures) or through `wait()` returning the
-    // failure stashed on the Run via `_fail()`.
-    const run = new Run(this.sessionId, this._http);
+
+    if (this._transport === "cli") {
+      const resume =
+        this._sessionId.length > 0 ? this._sessionId : undefined;
+      const handle = spawnCliProcess({
+        ...this._opts,
+        prompt: message,
+        resumeSessionId: resume,
+        cwd: this._opts.cwd,
+      });
+      return Run._fromCli(this._sessionId, handle, (id) => {
+        this._sessionId = id;
+      });
+    }
+
+    if (!this._http) {
+      throw new RecursiveAgentError("HTTP transport requires a client.");
+    }
+
+    const run = new Run(this._sessionId, this._http);
     const sendPromise = this._http
-      .post(`/sessions/${this.sessionId}/messages`, { content: message })
+      .post(`/sessions/${this._sessionId}/messages`, { content: message })
       .catch((err) => {
         run._fail(err);
       });
@@ -86,14 +91,12 @@ export class AgentSession {
     return run;
   }
 
-  // ── disposal ─────────────────────────────────────────────────────────────
-
   async close(): Promise<void> {
     if (!this._closed) {
       this._closed = true;
-      if (this._ownsSession) {
+      if (this._ownsSession && this._http && this._sessionId) {
         try {
-          await this._http.delete(`/sessions/${this.sessionId}`);
+          await this._http.delete(`/sessions/${this._sessionId}`);
         } catch {
           // best-effort
         }
@@ -110,25 +113,33 @@ export class AgentSession {
 // ── Agent (static factory) ────────────────────────────────────────────────
 
 export interface AgentOptions {
-  /** URL of the Recursive server. Default: `RECURSIVE_BASE_URL` env or `http://127.0.0.1:3000`. */
+  /**
+   * URL of a Recursive HTTP server.
+   *
+   * When set (or when `RECURSIVE_BASE_URL` is set), the SDK uses HTTP+SSE.
+   * When omitted, the SDK spawns the local `recursive` CLI (default).
+   */
   baseUrl?: string;
-  /** API key. Default: `RECURSIVE_API_KEY` env var. */
+  /** API key for HTTP auth. Default: `RECURSIVE_API_KEY` env var. */
   apiKey?: string;
   /** HTTP timeout in milliseconds. Default: 120_000. */
   timeout?: number;
-  /** Replace the server's default system prompt entirely. */
+  /** Path to the `recursive` binary. Default: `RECURSIVE_BIN` or PATH. */
+  cliPath?: string;
+  /** Working directory / workspace for the CLI subprocess. Default: `process.cwd()`. */
+  cwd?: string;
+  /** Model id passed to the CLI (`-m`). */
+  model?: string;
+  /** Replace the default system prompt entirely. */
   systemPrompt?: string;
   /**
-   * Append additional instructions to the server's default system prompt.
+   * Append additional instructions to the default system prompt.
    * Ignored when `systemPrompt` is also provided.
    */
   appendSystemPrompt?: string;
-  /**
-   * Human-readable display name for the session (shown in session list /
-   * resume picker).
-   */
+  /** Human-readable display name for the session. */
   sessionName?: string;
-  /** Maximum number of agent steps allowed for this session. */
+  /** Maximum number of agent steps allowed. */
   maxSteps?: number;
   /**
    * Planning mode. `"immediate"` (default) executes tool calls right away;
@@ -136,147 +147,172 @@ export interface AgentOptions {
    */
   planningMode?: "immediate" | "plan_first";
   /**
-   * Extended-thinking token budget for models that support it (e.g. Anthropic
-   * claude-3-7). Pass `0` to disable thinking.
+   * Extended-thinking token budget for models that support it.
+   * Pass `0` to disable thinking. (HTTP transport only today.)
    */
   thinkingBudget?: number;
   /**
    * Permission mode. Controls tool-call enforcement:
    * - `"default"` — standard rules (default)
-   * - `"auto"` — LLM-classifier decides each tool call
+   * - `"auto"` — auto-approve (CLI: `--permission-mode auto`)
    * - `"strict"` — unknown tools are denied
-   * - `"bypass"` — skip all permission rules
+   * - `"bypass"` — skip all permission rules (CLI maps to `auto`)
    */
   permissionMode?: "default" | "auto" | "strict" | "bypass";
   /** Maximum total API spend in USD for this session / run. */
   maxBudgetUsd?: number;
 }
 
-export interface PromptOptions extends AgentOptions {
-  // maxSteps is already inherited from AgentOptions
-}
+export interface PromptOptions extends AgentOptions {}
 
 /**
  * Static factory for creating, resuming, and running agent sessions.
  *
- * ### Three invocation patterns
+ * ### Default (CLI subprocess)
  *
- * **One-shot** (`Agent.prompt`):
  * ```ts
- * const result = await Agent.prompt("List all TODO comments", {
- *   baseUrl: "http://localhost:3000",
- * });
- * console.log(result.status, result.finishReason);
+ * const result = await Agent.prompt("List all TODO comments");
+ * await using agent = await Agent.create();
+ * const run = await agent.send("Fix the failing tests");
+ * await run.wait();
  * ```
  *
- * **Multi-turn** (`Agent.create` + `agent.send`):
+ * ### HTTP (remote / shared server)
+ *
  * ```ts
  * await using agent = await Agent.create({ baseUrl: "http://localhost:3000" });
- * const run = await agent.send("Fix the test failures");
- * await run.wait();
- * const run2 = await agent.send("Update the docs");
- * await run2.wait();
- * ```
- *
- * **Resume** (`Agent.resume`):
- * ```ts
- * await using agent = await Agent.resume(sessionId, { baseUrl: "http://localhost:3000" });
- * const run = await agent.send("Continue where we left off");
- * await run.wait();
  * ```
  */
 export class Agent {
   /** Create a new agent session. */
   static async create(options: AgentOptions = {}): Promise<AgentSession> {
-    const http = makeClient(options);
-    const body: Record<string, unknown> = {};
-    if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
-    if (options.appendSystemPrompt)
-      body["append_system_prompt"] = options.appendSystemPrompt;
-    if (options.sessionName) body["session_name"] = options.sessionName;
-    if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
-    if (options.planningMode) body["planning_mode"] = options.planningMode;
-    if (options.thinkingBudget != null)
-      body["thinking_budget"] = options.thinkingBudget;
-    if (options.permissionMode) body["permission_mode"] = options.permissionMode;
-    if (options.maxBudgetUsd != null)
-      body["max_budget_usd"] = options.maxBudgetUsd;
+    if (usesHttp(options)) {
+      const http = makeClient(options);
+      const body: Record<string, unknown> = {};
+      if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
+      if (options.appendSystemPrompt)
+        body["append_system_prompt"] = options.appendSystemPrompt;
+      if (options.sessionName) body["session_name"] = options.sessionName;
+      if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
+      if (options.planningMode) body["planning_mode"] = options.planningMode;
+      if (options.thinkingBudget != null)
+        body["thinking_budget"] = options.thinkingBudget;
+      if (options.permissionMode)
+        body["permission_mode"] = options.permissionMode;
+      if (options.maxBudgetUsd != null)
+        body["max_budget_usd"] = options.maxBudgetUsd;
 
-    const data = (await http.post("/sessions", body)) as { id: string };
-    return new AgentSession(data.id, http, { ownsSession: true });
+      const data = (await http.post("/sessions", body)) as { id: string };
+      return new AgentSession(data.id, http, {
+        ownsSession: true,
+        transport: "http",
+        agentOptions: options,
+      });
+    }
+
+    // CLI: session id is assigned on the first `send()` via system/init.
+    return new AgentSession("", null, {
+      ownsSession: true,
+      transport: "cli",
+      agentOptions: options,
+    });
   }
 
   /**
    * Resume an existing session by ID.
    *
-   * The session is **not deleted** on close (since we don't own it).
+   * CLI: subsequent `send()` calls use `recursive -r <id> -p …`.
+   * HTTP: verifies the session exists via GET.
    */
   static async resume(
     sessionId: string,
     options: AgentOptions = {},
   ): Promise<AgentSession> {
-    const http = makeClient(options);
-    await http.get(`/sessions/${sessionId}`); // verify exists
-    return new AgentSession(sessionId, http, { ownsSession: false });
+    if (usesHttp(options)) {
+      const http = makeClient(options);
+      await http.get(`/sessions/${sessionId}`);
+      return new AgentSession(sessionId, http, {
+        ownsSession: false,
+        transport: "http",
+        agentOptions: options,
+      });
+    }
+
+    return new AgentSession(sessionId, null, {
+      ownsSession: false,
+      transport: "cli",
+      agentOptions: options,
+    });
   }
 
   /**
-   * One-shot convenience: create a session, send *message*, wait, clean up.
+   * One-shot convenience: run *message* to completion and return `RunResult`.
    *
-   * Returns a `RunResult`.
+   * CLI (default): `recursive -p … --output-format stream-json`.
+   * HTTP: `POST /run`.
    */
   static async prompt(
     message: string,
     options: PromptOptions = {},
   ): Promise<RunResult> {
-    const http = makeClient(options);
-    const body: Record<string, unknown> = { goal: message };
-    if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
-    if (options.appendSystemPrompt)
-      body["append_system_prompt"] = options.appendSystemPrompt;
-    if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
-    if (options.planningMode) body["planning_mode"] = options.planningMode;
-    if (options.thinkingBudget != null)
-      body["thinking_budget"] = options.thinkingBudget;
-    if (options.permissionMode) body["permission_mode"] = options.permissionMode;
-    if (options.maxBudgetUsd != null)
-      body["max_budget_usd"] = options.maxBudgetUsd;
+    if (usesHttp(options)) {
+      const http = makeClient(options);
+      const body: Record<string, unknown> = { goal: message };
+      if (options.systemPrompt) body["system_prompt"] = options.systemPrompt;
+      if (options.appendSystemPrompt)
+        body["append_system_prompt"] = options.appendSystemPrompt;
+      if (options.maxSteps != null) body["max_steps"] = options.maxSteps;
+      if (options.planningMode) body["planning_mode"] = options.planningMode;
+      if (options.thinkingBudget != null)
+        body["thinking_budget"] = options.thinkingBudget;
+      if (options.permissionMode)
+        body["permission_mode"] = options.permissionMode;
+      if (options.maxBudgetUsd != null)
+        body["max_budget_usd"] = options.maxBudgetUsd;
 
-    const data = (await http.post("/run", body)) as Record<string, unknown>;
-    const usageRaw = data["usage"] as Record<string, unknown> | undefined;
+      const data = (await http.post("/run", body)) as Record<string, unknown>;
+      const usageRaw = data["usage"] as Record<string, unknown> | undefined;
 
-    const status = (data["status"] as RunResult["status"]) ?? "finished";
-    const finishReason = data["finish_reason"] as string | undefined;
-    return {
-      id: String(data["session_id"] ?? ""),
-      status,
-      subtype: mapFinishReasonToSubtype(finishReason, status),
-      finishReason,
-      error: data["error"] as string | undefined,
-      usage: usageRaw
-        ? {
-            inputTokens: Number(usageRaw["input_tokens"] ?? 0),
-            outputTokens: Number(usageRaw["output_tokens"] ?? 0),
-          }
-        : undefined,
-      ok: status === "finished",
-    };
+      const status = (data["status"] as RunResult["status"]) ?? "finished";
+      const finishReason = data["finish_reason"] as string | undefined;
+      return {
+        id: String(data["session_id"] ?? ""),
+        status,
+        subtype: mapFinishReasonToSubtype(finishReason, status),
+        finishReason,
+        error: data["error"] as string | undefined,
+        usage: usageRaw
+          ? {
+              inputTokens: Number(usageRaw["input_tokens"] ?? 0),
+              outputTokens: Number(usageRaw["output_tokens"] ?? 0),
+            }
+          : undefined,
+        ok: status === "finished",
+      };
+    }
+
+    const handle = spawnCliProcess({
+      ...options,
+      prompt: message,
+      cwd: options.cwd,
+    });
+    const run = Run._fromCli("", handle);
+    return run.wait();
   }
 
   /**
-   * List active sessions, with optional pagination.
-   *
-   * @param pagination - Optional `limit` and `offset` query params.
-   * @param options - Connection options.
+   * List active sessions (HTTP only).
    */
   static async listSessions(
     pagination: { limit?: number; offset?: number } = {},
     options: AgentOptions = {},
   ): Promise<SessionInfo[]> {
+    requireHttp(options, "listSessions");
     const http = makeClient(options);
     const params = new URLSearchParams();
     if (pagination.limit != null) params.set("limit", String(pagination.limit));
-    if (pagination.offset != null) params.set("offset", String(pagination.offset));
+    if (pagination.offset != null)
+      params.set("offset", String(pagination.offset));
     const url = params.size > 0 ? `/sessions?${params}` : "/sessions";
     const data = (await http.get(url)) as Array<Record<string, unknown>>;
     return data.map((s) => ({
@@ -290,38 +326,23 @@ export class Agent {
     }));
   }
 
-  /**
-   * Set a human-readable title for a session.
-   *
-   * Calls `PATCH /sessions/:id` with `{"title": title}`.
-   * Pass an empty string to clear the title.
-   */
+  /** Set a human-readable title for a session (HTTP only). */
   static async renameSession(
     sessionId: string,
     title: string,
     options: AgentOptions = {},
   ): Promise<void> {
+    requireHttp(options, "renameSession");
     const http = makeClient(options);
     await http.patch(`/sessions/${sessionId}`, { title });
   }
 
-  /**
-   * Return the transcript messages for a session.
-   *
-   * Fetches `GET /sessions/:id` and returns the `messages` array.
-   * Each message is a raw object with at minimum `role` and `content` fields.
-   *
-   * ```ts
-   * const msgs = await Agent.getSessionMessages(sessionId);
-   * for (const m of msgs) {
-   *   console.log(m["role"], String(m["content"]).slice(0, 60));
-   * }
-   * ```
-   */
+  /** Return transcript messages for a session (HTTP only). */
   static async getSessionMessages(
     sessionId: string,
     options: AgentOptions = {},
   ): Promise<Record<string, unknown>[]> {
+    requireHttp(options, "getSessionMessages");
     const http = makeClient(options);
     const data = (await http.get(`/sessions/${sessionId}`)) as Record<
       string,
@@ -330,21 +351,12 @@ export class Agent {
     return (data["messages"] as Record<string, unknown>[] | undefined) ?? [];
   }
 
-  /**
-   * Fork a session, copying its transcript to a new independent session.
-   *
-   * Calls `POST /sessions/:id/fork` and returns a `SessionInfo` for the
-   * newly created session.
-   *
-   * ```ts
-   * const forked = await Agent.forkSession(sessionId);
-   * console.log(forked.id, forked.messageCount);
-   * ```
-   */
+  /** Fork a session (HTTP only). */
   static async forkSession(
     sessionId: string,
     options: AgentOptions = {},
   ): Promise<SessionInfo> {
+    requireHttp(options, "forkSession");
     const http = makeClient(options);
     const data = (await http.post(`/sessions/${sessionId}/fork`, {})) as Record<
       string,
@@ -357,17 +369,30 @@ export class Agent {
     };
   }
 
-  /** Delete a session by ID. */
+  /** Delete a session by ID (HTTP only). */
   static async deleteSession(
     sessionId: string,
     options: AgentOptions = {},
   ): Promise<void> {
+    requireHttp(options, "deleteSession");
     const http = makeClient(options);
     await http.delete(`/sessions/${sessionId}`);
   }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+function usesHttp(options: AgentOptions): boolean {
+  return Boolean(options.baseUrl ?? process.env["RECURSIVE_BASE_URL"]);
+}
+
+function requireHttp(options: AgentOptions, method: string): void {
+  if (!usesHttp(options)) {
+    throw new RecursiveAgentError(
+      `Agent.${method}() requires HTTP transport. Pass baseUrl or set RECURSIVE_BASE_URL.`,
+    );
+  }
+}
 
 function makeClient(options: AgentOptions): HttpClient {
   const baseUrl =

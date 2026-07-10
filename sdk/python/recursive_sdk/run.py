@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Generator, Iterator, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 from ._http import _HttpClient
 from .models import (
@@ -13,7 +13,6 @@ from .models import (
     SystemMessage,
     TextContent,
     ToolProgressMessage,
-    ToolResultBlock,
     ToolUseBlock,
     UsageMeta,
     UserMessage,
@@ -24,39 +23,40 @@ class Run:
     """
     Represents a single agent turn (one ``agent.send(...)`` call).
 
-    Usage::
-
-        run = agent.send("Fix the bug")
-
-        # Option A: stream tokens as they arrive
-        for msg in run.messages():
-            if msg.type == "assistant":
-                print(msg.text(), end="", flush=True)
-
-        # Option B: just wait for completion
-        result = run.wait()
-        print(result.status)
-
-    ``messages()`` and ``stream()`` are aliases. ``wait()`` blocks until the
-    run finishes and returns a :class:`RunResult`.
+    Backed by either HTTP SSE or a local ``recursive`` CLI subprocess.
     """
 
-    def __init__(self, session_id: str, http: _HttpClient) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        http: Optional[_HttpClient] = None,
+        *,
+        _cli_handle: Any = None,
+        _on_session_id: Any = None,
+    ) -> None:
         self._session_id = session_id
         self._http = http
+        self._cli_handle = _cli_handle
+        self._on_session_id = _on_session_id
         self._result: Optional[RunResult] = None
-        # Reference to the dispatch thread set by `Agent.send()`. ``wait()``
-        # joins this so callers don't need to track it themselves. Set
-        # externally; ``None`` for runs constructed without a dispatcher
-        # (e.g. tests).
         self._send_thread: Optional[Any] = None
 
-    def _fail(self, err: str) -> None:
-        """Record a dispatch failure. Surfaces through ``wait()``.
+    @classmethod
+    def _from_cli(
+        cls,
+        session_id: str,
+        handle: Any,
+        on_session_id: Any = None,
+    ) -> "Run":
+        return cls(
+            session_id,
+            http=None,
+            _cli_handle=handle,
+            _on_session_id=on_session_id,
+        )
 
-        Used by :meth:`Agent.send` to capture HTTP errors from the
-        background POST so they propagate to the caller.
-        """
+    def _fail(self, err: str) -> None:
+        """Record a dispatch failure. Surfaces through ``wait()``."""
         if self._result is None:
             self._result = RunResult(
                 id=self._session_id,
@@ -72,17 +72,45 @@ class Run:
     # ── streaming ────────────────────────────────────────────────────────────
 
     def messages(self) -> Generator[Any, None, None]:
-        """
-        Yield typed messages as they arrive from the server.
+        """Yield typed messages as they arrive from the transport."""
+        if self._cli_handle is not None:
+            yield from self._messages_cli()
+            return
+        yield from self._messages_http()
 
-        Yields :class:`~recursive_sdk.models.AssistantMessage`,
-        :class:`~recursive_sdk.models.UserMessage`, or
-        :class:`~recursive_sdk.models.SystemMessage`.
+    def _messages_cli(self) -> Generator[Any, None, None]:
+        saw_result = False
+        for item in self._cli_handle.items():
+            if item["kind"] == "message":
+                msg = item["message"]
+                if (
+                    isinstance(msg, SystemMessage)
+                    and msg.subtype == "init"
+                    and isinstance(msg.data.get("session_id"), str)
+                ):
+                    self._session_id = str(msg.data["session_id"])
+                    if self._on_session_id is not None:
+                        self._on_session_id(self._session_id)
+                yield msg
+            elif item["kind"] == "result":
+                saw_result = True
+                result: RunResult = item["result"]
+                sid = self._cli_handle.get_session_id()
+                if sid:
+                    self._session_id = sid
+                    if self._on_session_id is not None:
+                        self._on_session_id(sid)
+                    result.id = sid
+                self._result = result
+        if not saw_result and self._result is None:
+            self._result = RunResult(
+                id=self._session_id,
+                status="error",
+                error="CLI stream ended without a result",
+            )
 
-        Calling ``messages()`` also populates ``self._result`` so that
-        a subsequent ``wait()`` returns immediately without a second
-        round-trip.
-        """
+    def _messages_http(self) -> Generator[Any, None, None]:
+        assert self._http is not None
         finish_reason: Optional[str] = None
         usage_data: Optional[Dict[str, Any]] = None
         run_status = "finished"
@@ -105,10 +133,6 @@ class Run:
                     yield msg
 
             elif ev_type == "partial_message":
-                # SDK Phase C: streaming token deltas — surface as a typed
-                # PartialAssistantMessage (type="stream_event") so callers
-                # that want typewriter-effect rendering can filter on
-                # ``msg.type == "stream_event"`` and read ``msg.text``.
                 yield PartialAssistantMessage(
                     type="stream_event",
                     text=data.get("text", ""),
@@ -117,7 +141,6 @@ class Run:
                 )
 
             elif ev_type == "tool_progress":
-                # SDK Phase B: tool execution timing event.
                 yield ToolProgressMessage(
                     type="tool_progress",
                     tool_use_id=data.get("tool_use_id", ""),
@@ -133,7 +156,6 @@ class Run:
                 break
 
             elif ev_type == "error":
-                run_status = "error"
                 self._result = RunResult(
                     id=self._session_id,
                     status="error",
@@ -155,7 +177,6 @@ class Run:
             duration_ms=duration_ms,
         )
 
-    # ``stream()`` is an alias for ``messages()``
     stream = messages
 
     def iter_text(self) -> Generator[str, None, None]:
@@ -170,19 +191,11 @@ class Run:
         """Block until done, return all assistant text concatenated."""
         return "".join(self.iter_text())
 
-    # ── wait ─────────────────────────────────────────────────────────────────
-
     def wait(self) -> RunResult:
-        """
-        Block until the run completes (drains the message stream if not already
-        consumed) and return the terminal :class:`RunResult`.
-        """
+        """Block until the run completes and return the terminal RunResult."""
         if self._result is None:
-            # Drain without exposing messages to the caller
             for _ in self.messages():
                 pass
-        # Make sure the dispatcher thread (if any) finished so a failed POST
-        # has had a chance to call ``_fail()`` before we return.
         if self._send_thread is not None:
             try:
                 self._send_thread.join(timeout=5.0)
@@ -191,35 +204,30 @@ class Run:
         assert self._result is not None
         return self._result
 
-    # ── cancel ────────────────────────────────────────────────────────────────
-
     def cancel(self) -> None:
-        """
-        Request cancellation of the current run.
-
-        Sends ``POST /sessions/:id/interrupt`` to ask the server to stop the
-        active agent turn as soon as possible.  The run's stream will
-        eventually close with ``status == "cancelled"``.
-        """
+        """Request cancellation of the current run."""
+        if self._cli_handle is not None:
+            self._cli_handle.cancel()
+            return
+        if self._http is None:
+            return
         try:
             self._http.post(
                 f"/sessions/{self._session_id}/interrupt",
                 {},
             )
         except Exception:
-            pass  # best-effort; the stream will time out naturally
-
-    # ── supports ─────────────────────────────────────────────────────────────
+            pass
 
     def supports(self, operation: str) -> bool:
-        """
-        Check whether *operation* is supported for this run.
-        Currently supported: ``"messages"``, ``"stream"``, ``"wait"``, ``"cancel"``.
-        """
-        return operation in {"messages", "stream", "wait", "iter_text", "text", "cancel"}
-
-
-# ── helpers ───────────────────────────────────────────────────────────────
+        return operation in {
+            "messages",
+            "stream",
+            "wait",
+            "iter_text",
+            "text",
+            "cancel",
+        }
 
 
 def _parse_message(data: Dict[str, Any], session_id: str) -> Any:
@@ -244,13 +252,15 @@ def _parse_message(data: Dict[str, Any], session_id: str) -> Any:
                                 input=item.get("input", {}),
                             )
                         )
-        return AssistantMessage(type="assistant", content=content, session_id=session_id)
+        return AssistantMessage(
+            type="assistant", content=content, session_id=session_id
+        )
 
-    elif role == "user":
+    if role == "user":
         text = content_raw if isinstance(content_raw, str) else str(content_raw)
         return UserMessage(type="user", content=text, session_id=session_id)
 
-    elif role == "system":
+    if role == "system":
         return SystemMessage(
             type="system",
             subtype=data.get("subtype", ""),
