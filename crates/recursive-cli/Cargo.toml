@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 recursive = { package = "recursive-agent", path = "../..", default-features = false, features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
 clap = { version = "4", features = ["derive", "env"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +25,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
 default = ["web_search", "http"]
@@ -39,6 +43,12 @@ default = ["web_search", "http"]
 web_search = ["recursive/web_search"]
 http = ["recursive/http"]
 weixin = ["recursive/weixin"]
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry",
+]
 
 [dev-dependencies]
 tempfile = "3"

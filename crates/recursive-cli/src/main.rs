@@ -7,6 +7,9 @@
 
 mod cli;
 
+#[cfg(feature = "otel")]
+mod otel;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +18,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Level;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Registry;
 
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::SessionFile;
@@ -499,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli.log.clone()
     };
-    init_logging(&early_log)?;
+    let _logging_guard = init_logging(&early_log)?;
     tracing::trace!("recursive main starting");
 
     if cli.session_out.is_some() {
@@ -1678,7 +1684,18 @@ fn mask_key(key: Option<&str>) -> String {
     }
 }
 
-fn init_logging(level: &str) -> anyhow::Result<()> {
+/// Guard returned by `init_logging`. When the `otel` feature is active
+/// and `RECURSIVE_OTEL_ENDPOINT` is set, this guard shuts down the
+/// tracer provider (flushing pending spans) on drop.
+///
+/// Held for the lifetime of `main` via `let _guard = init_logging(...)?;`.
+#[must_use]
+pub struct LoggingGuard {
+    #[cfg(feature = "otel")]
+    _inner: Option<otel::OtelGuard>,
+}
+
+fn init_logging(level: &str) -> anyhow::Result<LoggingGuard> {
     let lvl: Level = level.parse().context("invalid log level")?;
     let trace_spans = std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1");
     // When span timings are requested, the user-provided `--log warn`
@@ -1693,16 +1710,55 @@ fn init_logging(level: &str) -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::new(base)
         }
     });
-    let mut layer = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+
+    let mut fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(recursive::logging::StderrOrNullMaker)
         .compact();
     if trace_spans {
-        layer = layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+        fmt_layer = fmt_layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
     }
-    layer.init();
-    Ok(())
+
+    let subscriber = Registry::default().with(filter).with(fmt_layer);
+
+    #[cfg(feature = "otel")]
+    let guard = {
+        if otel::otel_endpoint().is_some() {
+            match otel::init_global_tracer() {
+                Ok((tracer, g)) => {
+                    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+                    let subscriber = subscriber.with(otel_layer);
+                    subscriber.init();
+                    LoggingGuard { _inner: Some(g) }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to initialise OTEL exporter: {e}; \
+                         continuing with fmt-only logging"
+                    );
+                    subscriber.init();
+                    LoggingGuard { _inner: None }
+                }
+            }
+        } else {
+            subscriber.init();
+            LoggingGuard { _inner: None }
+        }
+    };
+
+    #[cfg(not(feature = "otel"))]
+    let guard = {
+        if std::env::var("RECURSIVE_OTEL_ENDPOINT").is_ok() {
+            eprintln!(
+                "warning: RECURSIVE_OTEL_ENDPOINT set but `otel` feature not enabled; \
+                 ignoring. Rebuild with --features otel to enable the OTLP exporter."
+            );
+        }
+        subscriber.init();
+        LoggingGuard {}
+    };
+
+    Ok(guard)
 }
 
 /// Run the agent in loop mode: agent self-schedules wakeups until it stops.
