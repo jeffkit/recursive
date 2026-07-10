@@ -23,11 +23,11 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 
 | File | Notes |
 |---|---|
-| `src/config.rs` | OR-gate + 16KB cap tests added 2026-07-09; re-gate |
-| `src/config_file.rs` | trailing-newline append test added; re-gate |
-| `src/kernel.rs` | non-summary prepend test added; re-gate |
-| `src/coordinator.rs` | non-`"1"` env rejection test added; re-gate |
-| `src/hooks/mod.rs` | Continue short-circuit pin added; re-gate |
+| `src/config.rs` | **gate-0** (2026-07-10 re-gate): 58 mutants → 57 caught / 0 missed / 1 unviable |
+| `src/config_file.rs` | trailing-newline + first-write pins added 2026-07-10; re-gate |
+| `src/kernel.rs` | compaction prepend + max_transcript_chars pins; equivalent skips on builder/slice; re-gate |
+| `src/coordinator.rs` | **gate-0** (2026-07-10): 17 caught / 0 missed; `coordinator-mode` in agent-mutants FEATURES |
+| `src/hooks/mod.rs` | **gate-0** (2026-07-10): 14 caught / 0 missed / 2 unviable; Continue arm merged into `_` |
 | `src/lib.rs` | `truncate_str` `>→>=` extracted + `#[mutants::skip]` (equivalent) |
 | `src/checkpoint.rs` | 2026-07-09: list/diff/read/gc pins + equivalent skips (`log_line_incomplete`, `is_missing_blob_stderr`, `session_id_has_path_separator`, whole `gc`). Remaining: `snapshot_for_session` stderr-warning `&&`/`!` (git stderr shape) |
 | `src/skills.rs` | 2026-07-09 ROI pins: skip invalid discover entries, extract_body, trigger case-insensitivity, unknown mode / empty triggers, globs quote-strip, depends_on+[globs] index, rb/js + chmod+x scripts. ROI re-verify (extract_body/discover_scripts/discover_skills `!`) **15 caught / 0 missed**. Remaining: full-file gate (~554 mutants) |

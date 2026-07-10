@@ -200,8 +200,8 @@ impl std::fmt::Debug for AgentKernel {
 
 impl AgentKernel {
     /// Create a new builder for `AgentKernel`.
+    #[cfg_attr(test, mutants::skip)]
     pub fn builder() -> AgentKernelBuilder {
-        // cargo-mutants::skip — `Default::default()` is equivalent for this type.
         AgentKernelBuilder::default()
     }
 
@@ -300,9 +300,7 @@ impl AgentKernel {
         // (marked with `is_compaction_summary`) is inserted at position 0.
         // `inner.messages[input_len..]` would miss that summary, so detect
         // it and prepend.
-        let mut new_messages = if inner.messages.len() > input_len {
-            // cargo-mutants::skip — `>=` is equivalent here: an empty suffix slice
-            // matches the `else` branch when lengths are equal.
+        let mut new_messages = if inner.messages.len() > input_len { // cargo-mutants::skip
             inner.messages[input_len..].to_vec()
         } else {
             Vec::new()
