@@ -40,7 +40,9 @@ pub mod config;
 pub mod external;
 
 pub use config::{load_hooks_config, HookCommand, HookCommandType, HookMatcher, HooksConfig};
-pub use external::{ExternalHookRunner, HookResult, PermissionDecision};
+pub use external::{
+    ExternalHookRunner, HookInput, HookResult, PermissionDecision, SdkHookForwarder,
+};
 
 use std::sync::Arc;
 

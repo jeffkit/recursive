@@ -10,9 +10,10 @@ use recursive::{
 };
 
 use crate::cli::builder::{build_runtime, build_tools};
+use crate::cli::claude_json::{ClaudeJsonContext, JsonOutputMode};
 use crate::cli::output::{
     exit_for_finish, finalize_cost_tracker, finalize_session_writer, print_finish_note,
-    print_usage, save_session, save_transcript, stream_events, stream_events_json,
+    print_usage, save_session, save_transcript, stream_events, JsonEventTask,
 };
 use crate::cli::session::resolve_session_path;
 
@@ -166,10 +167,11 @@ pub(crate) async fn cmd_resume(
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
-    json_mode: bool,
+    json_output: Option<JsonOutputMode>,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     session_recording: bool,
+    accept_user_messages: bool,
 ) -> anyhow::Result<()> {
     let session_dir = resolve_resume_target(&config.workspace, session, from_file)?;
     eprintln!("session: resuming from {}", session_dir.display());
@@ -320,12 +322,13 @@ pub(crate) async fn cmd_resume(
         max_transcript_chars,
         transcript_out,
         session_out,
-        json_mode,
+        json_output,
         mcp_config,
         hook_timing,
         false, // session_recording — we already opened the writer below
         shutdown,
         writer,
+        accept_user_messages,
     )
     .await
 }
@@ -338,7 +341,7 @@ pub(crate) async fn run_resumed(
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
-    json_mode: bool,
+    json_output: Option<JsonOutputMode>,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     session: bool,
@@ -350,6 +353,7 @@ pub(crate) async fn run_resumed(
     // `None` means "create a new session writer if `session` is
     // true" (the legacy `--resume-from <transcript.json>` path).
     existing_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
+    accept_user_messages: bool,
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
 
@@ -441,33 +445,150 @@ pub(crate) async fn run_resumed(
     }
 
     let tool_specs = runtime.kernel().tools().specs();
+    let json_mode = json_output.is_some();
 
     if !json_mode {
         eprintln!("resuming from {seed_len} seeded message(s)");
     }
-    let printer = if json_mode {
-        tokio::spawn(stream_events_json(event_rx))
+
+    let (control_bridge, control_session) = if json_mode && !config.headless {
+        let bridge = crate::cli::control::ControlBridge::new();
+        let perm_mode = if config.headless {
+            recursive::permissions::PermissionMode::DontAsk
+        } else {
+            recursive::permissions::PermissionMode::Default
+        };
+        let session = crate::cli::control::ControlSession::new(
+            bridge.clone(),
+            shutdown.clone(),
+            config.workspace.clone(),
+            config.model.clone(),
+            perm_mode,
+            runtime.kernel().tools().shared_permissions(),
+            session_writer.clone(),
+            runtime.kernel().tools().read_file_state(),
+            runtime.kernel().tools().session_roots(),
+            tool_specs.iter().map(|s| s.name.clone()).collect(),
+            accept_user_messages,
+            Some(runtime.plan_approval_gate()),
+        );
+        runtime.set_permission_hook(std::sync::Arc::new(
+            crate::cli::control::StdioPermissionHook::new(bridge.clone()),
+        ));
+        runtime.set_sdk_hook_forwarder(Some(std::sync::Arc::new(
+            crate::cli::control::ControlSdkHookForwarder::new(session.clone()),
+        )));
+        if let Some(slot) = runtime.kernel().tools().elicitation_slot() {
+            let mut g = slot.write().await;
+            *g = Some(std::sync::Arc::new(
+                crate::cli::control::ControlElicitationHandler::new(bridge.clone()),
+            ));
+        }
+        tokio::spawn(crate::cli::control::stdin_control_loop(session.clone()));
+        tokio::spawn(crate::cli::control::plan_dialog_loop(session.clone()));
+        (Some(bridge), Some(session))
     } else {
-        tokio::spawn(stream_events(event_rx))
+        (None, None)
     };
 
-    let outcome = runtime.run(message.clone()).await?;
+    let session_id = session_writer
+        .as_ref()
+        .map(|w| {
+            w.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .session_id()
+                .to_string()
+        })
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let claude_ctx = ClaudeJsonContext {
+        session_id,
+        model: config.model.clone(),
+        cwd: config.workspace.display().to_string(),
+        tools: tool_specs.iter().map(|s| s.name.clone()).collect(),
+        permission_mode: if config.headless {
+            "dontAsk".into()
+        } else {
+            "default".into()
+        },
+        include_partial_messages: false,
+    };
+
+    enum RunPrinter {
+        Json(Box<JsonEventTask>),
+        Text(tokio::task::JoinHandle<()>),
+    }
+    let printer = match json_output {
+        Some(mode) => RunPrinter::Json(Box::new(JsonEventTask::spawn(
+            mode,
+            event_rx,
+            claude_ctx,
+            control_bridge.clone(),
+        ))),
+        None => RunPrinter::Text(tokio::spawn(stream_events(event_rx))),
+    };
+
+    let mut outcome = runtime.run(message.clone()).await?;
+
+    if let Some(ref cs) = control_session {
+        cs.record_usage(outcome.total_usage, outcome.llm_latency_ms);
+    }
+
+    if accept_user_messages {
+        if let Some(ref cs) = control_session {
+            loop {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                if let Some(msg) = cs.pop_inbound_user() {
+                    let turn = runtime.run(msg).await?;
+                    cs.record_usage(turn.total_usage, turn.llm_latency_ms);
+                    outcome.steps = outcome.steps.saturating_add(turn.steps);
+                    outcome.total_usage = outcome.total_usage.accumulate(turn.total_usage);
+                    outcome.llm_latency_ms =
+                        outcome.llm_latency_ms.saturating_add(turn.llm_latency_ms);
+                    outcome.finish_reason = turn.finish_reason;
+                    outcome.final_text = turn.final_text;
+                    continue;
+                }
+                if cs.is_stdin_closed() {
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+        }
+    }
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
-    printer.await.ok();
 
-    if !json_mode {
-        if let Some(ref msg) = outcome.final_text {
-            println!("\n=== final ===\n{msg}");
+    match printer {
+        RunPrinter::Json(task) => {
+            task.finish(
+                &outcome.finish_reason,
+                outcome.final_text.as_deref(),
+                outcome.total_usage,
+                outcome.llm_latency_ms,
+                outcome.steps,
+                control_bridge.as_deref(),
+            )
+            .await;
         }
-        print_usage(
-            outcome.total_usage,
-            &config.model,
-            outcome.llm_latency_ms,
-            outcome.steps,
-        );
-        print_finish_note(&outcome.finish_reason);
+        RunPrinter::Text(handle) => {
+            handle.await.ok();
+            if let Some(ref msg) = outcome.final_text {
+                println!("\n=== final ===\n{msg}");
+            }
+            print_usage(
+                outcome.total_usage,
+                &config.model,
+                outcome.llm_latency_ms,
+                outcome.steps,
+            );
+            print_finish_note(&outcome.finish_reason);
+        }
     }
 
     let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {

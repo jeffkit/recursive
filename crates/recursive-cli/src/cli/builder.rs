@@ -50,34 +50,49 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
                 .map(|p| (p, recursive::AccessTier::ReadOnly)),
         )
         .collect();
+    // Shared mutable sandbox roots so control `register_repo_root` can expand
+    // the sandbox mid-run (Claude Code parity).
+    let session_roots = recursive::new_shared_sandbox_roots();
     let mut registry = ToolRegistry::new(transport)
         .with_read_file_state(read_state.clone())
         .register_with_aliases(
             Arc::new(
                 ReadFile::new(root)
                     .with_extra_roots(extra_roots.clone())
+                    .with_session_roots(session_roots.clone())
                     .with_read_state(read_state.clone()),
             ),
             &["read_file"],
         )
         .register_with_aliases(
-            Arc::new(WriteFile::new(root).with_extra_roots(extra_roots.clone())),
+            Arc::new(
+                WriteFile::new(root)
+                    .with_extra_roots(extra_roots.clone())
+                    .with_session_roots(session_roots.clone()),
+            ),
             &["write_file"],
         )
         .register(Arc::new(
             EditTool::new(root)
                 .with_extra_roots(extra_roots.clone())
+                .with_session_roots(session_roots.clone())
                 .with_read_state(read_state.clone()),
         ))
         .register_with_aliases(
-            Arc::new(GlobTool::new(root).with_extra_roots(extra_roots.clone())),
+            Arc::new(
+                GlobTool::new(root)
+                    .with_extra_roots(extra_roots.clone())
+                    .with_session_roots(session_roots.clone()),
+            ),
             &["list_dir", "glob"],
         )
         .register(Arc::new(
             RunShell::new(root).with_timeout(Duration::from_secs(config.shell_timeout_secs)),
         ))
         .register(Arc::new(
-            SearchFiles::new(root).with_extra_roots(extra_roots.clone()),
+            SearchFiles::new(root)
+                .with_extra_roots(extra_roots.clone())
+                .with_session_roots(session_roots.clone()),
         ))
         .register(Arc::new(WebFetch::new()))
         .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
@@ -92,11 +107,16 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
         registry = registry.register(Arc::new(search));
     }
     registry = registry.register(Arc::new(
-        EstimateTokens::new(root).with_extra_roots(extra_roots.clone()),
+        EstimateTokens::new(root)
+            .with_extra_roots(extra_roots.clone())
+            .with_session_roots(session_roots.clone()),
     ));
     registry = registry.register(Arc::new(
-        CountLines::new(root).with_extra_roots(extra_roots),
+        CountLines::new(root)
+            .with_extra_roots(extra_roots)
+            .with_session_roots(session_roots.clone()),
     ));
+    registry = registry.with_session_roots(session_roots);
     registry = registry
         .register(Arc::new(Remember::new(root)))
         .register(Arc::new(Recall::new(root)))
@@ -197,6 +217,7 @@ pub(crate) async fn register_mcp_tools(
     registry: &mut ToolRegistry,
     workspace: &Path,
     mcp_config_path: Option<PathBuf>,
+    elicitation: Option<recursive::mcp::SharedElicitationHandler>,
 ) {
     let servers: Vec<McpServer> = if let Some(path) = &mcp_config_path {
         // Explicit config file provided
@@ -237,7 +258,7 @@ pub(crate) async fn register_mcp_tools(
         return;
     }
     for server in &servers {
-        match register_mcp_server_tools(registry, server).await {
+        match register_mcp_server_tools(registry, server, elicitation.clone()).await {
             Ok(count) => {
                 eprintln!(
                     "mcp: registered {} tool(s) from server `{}`",
@@ -258,8 +279,12 @@ pub(crate) async fn register_mcp_tools(
 async fn register_mcp_server_tools(
     registry: &mut ToolRegistry,
     server: &McpServer,
+    elicitation: Option<recursive::mcp::SharedElicitationHandler>,
 ) -> anyhow::Result<usize> {
     let mut client = McpClient::spawn(server).await?;
+    if let Some(slot) = elicitation {
+        client = client.with_elicitation(slot);
+    }
     let tool_specs = client.list_tools().await?;
     let count = tool_specs.len();
     let client = Arc::new(tokio::sync::Mutex::new(client));
@@ -335,7 +360,9 @@ pub(crate) async fn build_runtime(
         }
     };
     let mut tools = build_tools(config).await;
-    register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
+    let elicitation = recursive::mcp::new_elicitation_slot();
+    tools = tools.with_elicitation_slot(elicitation.clone());
+    register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation)).await;
 
     // Always attach a TouchedFiles collector so AgentRuntime can record
     // per-turn file touches when checkpoints are enabled later via

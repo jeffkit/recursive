@@ -99,7 +99,7 @@ pub use facts::{
     facts_path, facts_summary, load_facts, search_facts, Fact, FactStore, ForgetFact, RecallFact,
     RememberFact, ScoredFact, UpdateFact,
 };
-pub use fs::{ReadFile, WriteFile};
+pub use fs::{ReadFile, ReadFileState, WriteFile};
 pub use glob::GlobTool;
 #[cfg(feature = "skill-hub")]
 pub use install_skill::InstallSkill;

@@ -100,6 +100,13 @@ pub struct ToolRegistry {
     /// Partial-read guard: shared state written by `ReadFile` and checked by
     /// `EditTool`. `None` disables the guard (backward-compatible).
     read_file_state: Option<Arc<Mutex<ReadFileState>>>,
+    /// Runtime-mutable extra sandbox roots (Claude `register_repo_root`).
+    /// Tools hold clones of the same Arc; this field lets control code
+    /// recover the shared slot after the registry is built.
+    session_roots: Option<super::dispatch::SharedSandboxRoots>,
+    /// Shared MCP elicitation handler slot (Claude control `elicitation`).
+    #[cfg(feature = "mcp")]
+    elicitation: Option<crate::mcp::SharedElicitationHandler>,
     /// Goal-161: optional runtime permission hook. When `Some`, called
     /// before every tool invocation. `None` means allow all (backward-
     /// compatible default).
@@ -138,6 +145,9 @@ impl ToolRegistry {
             permission_mode: PermissionMode::Default,
             touched: None,
             read_file_state: None,
+            session_roots: None,
+            #[cfg(feature = "mcp")]
+            elicitation: None,
             permission_hook: None,
             policy: None,
             headless: false,
@@ -166,6 +176,9 @@ impl ToolRegistry {
             permission_mode: self.permission_mode.clone(),
             touched: self.touched.clone(),
             read_file_state: self.read_file_state.clone(),
+            session_roots: self.session_roots.clone(),
+            #[cfg(feature = "mcp")]
+            elicitation: self.elicitation.clone(),
             permission_hook: self.permission_hook.clone(),
             policy: self.policy.clone(),
             headless: self.headless,
@@ -288,6 +301,35 @@ impl ToolRegistry {
         self.permission_mode.clone()
     }
 
+    /// Update the permission mode at runtime (Claude `set_permission_mode`).
+    ///
+    /// Writes through to the shared [`LayeredPermissionsConfig`] so
+    /// `invoke_with_audit` sees the new mode. If no shared config is attached
+    /// yet, one is created with the given mode and empty rule layers.
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.permission_mode = mode.clone();
+        match &self.permissions {
+            Some(sp) => {
+                if let Ok(mut guard) = sp.try_write() {
+                    guard.mode = mode;
+                }
+            }
+            None => {
+                self.permissions = Some(Arc::new(RwLock::new(
+                    crate::permissions::LayeredPermissionsConfig {
+                        mode,
+                        layers: Vec::new(),
+                    },
+                )));
+            }
+        }
+    }
+
+    /// Shared permissions handle for mid-run control updates, if any.
+    pub fn shared_permissions(&self) -> Option<SharedPermissions> {
+        self.permissions.clone()
+    }
+
     /// Return a reference to the current permissions config, if any.
     /// Return a cloned snapshot of the current permissions config.
     ///
@@ -340,6 +382,30 @@ impl ToolRegistry {
     /// Return the currently attached read-file state, if any.
     pub fn read_file_state(&self) -> Option<Arc<Mutex<ReadFileState>>> {
         self.read_file_state.clone()
+    }
+
+    /// Attach a shared sandbox-roots slot for mid-run expansion.
+    pub fn with_session_roots(mut self, roots: super::dispatch::SharedSandboxRoots) -> Self {
+        self.session_roots = Some(roots);
+        self
+    }
+
+    /// Return the shared sandbox-roots slot, if any.
+    pub fn session_roots(&self) -> Option<super::dispatch::SharedSandboxRoots> {
+        self.session_roots.clone()
+    }
+
+    /// Attach a shared MCP elicitation-handler slot.
+    #[cfg(feature = "mcp")]
+    pub fn with_elicitation_slot(mut self, slot: crate::mcp::SharedElicitationHandler) -> Self {
+        self.elicitation = Some(slot);
+        self
+    }
+
+    /// Return the shared elicitation-handler slot, if any.
+    #[cfg(feature = "mcp")]
+    pub fn elicitation_slot(&self) -> Option<crate::mcp::SharedElicitationHandler> {
+        self.elicitation.clone()
     }
 
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {

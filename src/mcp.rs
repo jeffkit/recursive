@@ -212,6 +212,35 @@ impl fmt::Debug for McpTransport {
     }
 }
 
+/// MCP elicitation request forwarded to a host (Claude `elicitation` control).
+#[derive(Debug, Clone)]
+pub struct ElicitationRequest {
+    pub mcp_server_name: String,
+    pub message: String,
+    pub mode: Option<String>,
+    pub url: Option<String>,
+    pub elicitation_id: Option<String>,
+    pub requested_schema: Option<Value>,
+    pub title: Option<String>,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Handles MCP `-32042` UrlElicitationRequired by asking the host.
+#[async_trait]
+pub trait ElicitationHandler: Send + Sync {
+    async fn elicit(&self, request: ElicitationRequest) -> Option<Value>;
+}
+
+/// Shared slot so the CLI control channel can install a handler after MCP
+/// clients are constructed.
+pub type SharedElicitationHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn ElicitationHandler>>>>;
+
+/// Create an empty elicitation-handler slot.
+pub fn new_elicitation_slot() -> SharedElicitationHandler {
+    Arc::new(tokio::sync::RwLock::new(None))
+}
+
 /// An MCP client owns a transport and manages JSON-RPC communication.
 pub struct McpClient {
     transport: McpTransport,
@@ -225,6 +254,8 @@ pub struct McpClient {
     /// [`DEFAULT_STDIO_READ_TIMEOUT`]; tests use a shorter value to
     /// keep the suite fast.
     read_timeout: Duration,
+    /// Optional host elicitation handler (Claude control channel).
+    elicitation: Option<SharedElicitationHandler>,
 }
 
 /// Default timeout for reading a single JSON-RPC line from a stdio
@@ -317,6 +348,7 @@ impl McpClient {
             capabilities: ServerCapabilities::default(),
             server_name: server.name.clone(),
             read_timeout,
+            elicitation: None,
         };
 
         client.do_initialize(&server.name).await?;
@@ -416,6 +448,7 @@ impl McpClient {
             // SSE transport reads its own stream with internal timeouts;
             // this field is unused for HTTP+SSE but must be set.
             read_timeout: DEFAULT_STDIO_READ_TIMEOUT,
+            elicitation: None,
         };
 
         client.do_initialize(&server.name).await?;
@@ -517,11 +550,21 @@ impl McpClient {
         Ok(specs)
     }
 
+    /// Attach a shared elicitation-handler slot (Claude control channel).
+    pub fn with_elicitation(mut self, slot: SharedElicitationHandler) -> Self {
+        self.elicitation = Some(slot);
+        self
+    }
+
     /// Call a tool by name with the given arguments.
     /// Returns the textual content of the first `content[].text` block.
     /// Errors if `isError` is true in the response.
+    ///
+    /// When the server returns JSON-RPC `-32042` (UrlElicitationRequired) and
+    /// an [`ElicitationHandler`] is installed, the host is asked via the
+    /// Claude control channel before the error is returned to the caller.
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<String> {
-        let result: Value = self
+        let result: Value = match self
             .send_request(
                 "tools/call",
                 serde_json::json!({
@@ -529,7 +572,23 @@ impl McpClient {
                     "arguments": arguments,
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(Error::Mcp { server, message }) if message.contains("code -32042") => {
+                // UrlElicitationRequired — ask the host, then surface a clear error
+                // (retry is host-driven via mcp_call / re-invoke).
+                if let Some(slot) = &self.elicitation {
+                    let handler = slot.read().await.clone();
+                    if let Some(h) = handler {
+                        let req = parse_elicitation_from_error(&server, &message);
+                        let _ = h.elicit(req).await;
+                    }
+                }
+                return Err(Error::Mcp { server, message });
+            }
+            Err(e) => return Err(e),
+        };
 
         // Check for error
         if result
@@ -1344,6 +1403,25 @@ pub async fn dispatch_request(
             }
         }
         _ => Some(JsonRpcResponse::method_not_found(id, &request.method)),
+    }
+}
+
+fn parse_elicitation_from_error(server: &str, message: &str) -> ElicitationRequest {
+    // message format: "error (code -32042): <msg>" — optional JSON data suffix
+    let human = message
+        .split_once(": ")
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| message.to_string());
+    ElicitationRequest {
+        mcp_server_name: server.to_string(),
+        message: human,
+        mode: Some("url".into()),
+        url: None,
+        elicitation_id: None,
+        requested_schema: None,
+        title: None,
+        display_name: None,
+        description: None,
     }
 }
 

@@ -1,0 +1,183 @@
+name: "Claude-compatible JSON stream + control channel"
+description: |
+  Verify the Claude Code CLI JSON alignment end-to-end against the aimock
+  fixture in e2e/fixtures/40-claude-json.json.
+
+  Pattern (mirrors suite 09-repl): the three `recursive run` invocations are
+  performed in `setup` steps that capture stdout to files under /workspace,
+  then `cases` assert on those files via `exec` + `expect.exitCode` (grep).
+  One run per scenario — no re-runs.
+
+  Covers:
+    1. `--output-format stream-json` emits the Claude SDK wire shape —
+       `system/init`, an `assistant` tool_use, a `user` tool_result, and a
+       terminal `result` event as NDJSON.
+    2. `--output-format json` emits a single `result` object (no stream
+       events).
+    3. `--input-format stream-json` accepts a follow-up `type: user` message
+       on stdin that drives a second turn (the bidirectional control
+       channel's inbound-user-message path). The follow-up is proven
+       consumed by the result's `num_turns` rising from 2 (single turn) to
+       3 (goal turn + follow-up turn).
+
+  The `Write` tool is auto-allowed in the e2e container (no `can_use_tool`
+  prompt fires), so stdin can be closed immediately. NOT an HTTP suite — no
+  port from the registry is claimed.
+sequential: true
+
+setup:
+  - name: "Prepare workspace and clear stale sessions"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-cj /workspace/sessions /workspace/cj-*.jsonl
+        mkdir -p /workspace/test-cj
+        echo prepared
+
+  - name: "Run stream-json single turn (capture stdout)"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf ''
+        | recursive --workspace /workspace/test-cj
+        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --max-steps 5 --output-format stream-json
+        run "Create greet.txt with content hi" > /workspace/cj-stream.jsonl 2>/workspace/cj-stream.err
+        echo "stream exit=$? lines=$(wc -l < /workspace/cj-stream.jsonl)"
+
+  - name: "Run json single-object mode (capture stdout)"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf ''
+        | recursive --workspace /workspace/test-cj
+        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --max-steps 5 --output-format json
+        run "Create greet.txt with content hi" > /workspace/cj-json.jsonl 2>/workspace/cj-json.err
+        echo "json exit=$? lines=$(wc -l < /workspace/cj-json.jsonl)"
+
+  - name: "Run multi-turn: pipe a follow-up user message then close stdin"
+    exec:
+      container: recursive-e2e
+      command: |
+        printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"What file did you just create? Answer briefly."}]}}' \
+          | recursive --workspace /workspace/test-cj \
+            --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+            --max-steps 8 --output-format stream-json --input-format stream-json \
+            run "Create greet.txt with content hi" > /workspace/cj-multi.jsonl 2>/workspace/cj-multi.err
+        echo "multi exit=$? lines=$(wc -l < /workspace/cj-multi.jsonl) turns=$(grep -o '"num_turns":[0-9]*' /workspace/cj-multi.jsonl)"
+
+  - name: "Run stream-json with a goal that matches no fixture (LLM 404 mid-stream)"
+    exec:
+      container: recursive-e2e
+      command: >
+        printf ''
+        | recursive --workspace /workspace/test-cj
+        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --max-steps 5 --output-format stream-json
+        run "Tell me a joke about oysters" > /workspace/cj-err.jsonl 2>/workspace/cj-err.err
+        echo "err exit=$? lines=$(wc -l < /workspace/cj-err.jsonl)"
+
+cases:
+  # ── stream-json output shape ──────────────────────────────────────────────
+  - name: "stream-json: emits a system/init event"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"subtype":"init"' /workspace/cj-stream.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "stream-json: emits an assistant tool_use event"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"type":"tool_use"' /workspace/cj-stream.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "stream-json: emits a tool_result as a type:user event"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"type":"tool_result"' /workspace/cj-stream.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "stream-json: emits a terminal result event"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"type":"result"' /workspace/cj-stream.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "stream-json: the Write tool actually executed (greet.txt written)"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-cj/greet.txt
+      exists: true
+      contains: "hi"
+
+  # ── json output mode (single object) ──────────────────────────────────────
+  - name: "json: emits no stream events (single result object only)"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"subtype":"init"' /workspace/cj-json.jsonl && exit 1 || exit 0
+    expect:
+      exitCode: 0
+
+  - name: "json: the output is a result object"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"type":"result"' /workspace/cj-json.jsonl
+    expect:
+      exitCode: 0
+
+  # ── multi-turn stdin user consumption ─────────────────────────────────────
+  # The follow-up user frame's text contains "just create", which aimock
+  # matches (latest-user-message) to the third fixture — returning a
+  # distinct answer ("I just created greet.txt...") that proves the inbound
+  # stdin user message was consumed and drove a second turn.
+  - name: "multiturn: follow-up user frame drove a second turn with a distinct answer"
+    exec:
+      container: recursive-e2e
+      command: grep -q 'I just created greet.txt' /workspace/cj-multi.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "multiturn: result num_turns rose to 3 (goal turn + follow-up turn)"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"num_turns":3' /workspace/cj-multi.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "multiturn: emits a terminal result event"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"type":"result"' /workspace/cj-multi.jsonl
+    expect:
+      exitCode: 0
+
+  # ── error path: stream must still close with a `result` envelope ───────────
+  # A goal that matches no aimock fixture makes the first LLM call 404. The
+  # Claude SDK contract requires the stream to end with a `result` regardless,
+  # so the CLI must emit a terminal error result instead of dying mid-stream.
+  - name: "error: stream-json still emits a terminal result on mid-run LLM failure"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"type":"result"' /workspace/cj-err.jsonl
+    expect:
+      exitCode: 0
+
+  - name: "error: the terminal result is marked is_error with error_during_execution"
+    exec:
+      container: recursive-e2e
+      command: grep -q '"is_error":true' /workspace/cj-err.jsonl && grep -q '"subtype":"error_during_execution"' /workspace/cj-err.jsonl
+    expect:
+      exitCode: 0
+
+teardown:
+  - name: "Clean workspace and captured artifacts"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-cj /workspace/sessions /workspace/cj-*.jsonl /workspace/cj-*.err

@@ -3258,6 +3258,7 @@ name = "recursive-cli"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "futures-util",
  "recursive-agent",
@@ -3270,6 +3271,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

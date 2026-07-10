@@ -252,10 +252,120 @@ pub(crate) async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEven
     }
 }
 
+/// Legacy Recursive wire: raw [`AgentEvent`] as NDJSON.
 pub(crate) async fn stream_events_json(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         if let Ok(line) = serde_json::to_string(&ev) {
             println!("{line}");
+        }
+    }
+}
+
+/// Claude Code–compatible stream-json: translate events and print NDJSON.
+///
+/// The terminal `result` object is **not** emitted here — the caller prints
+/// it via [`crate::cli::claude_json::ClaudeJsonEmitter::build_result`] after
+/// the run finishes (so cost / finish reason are accurate).
+///
+/// When `bridge` is `Some`, stdout writes go through
+/// [`crate::cli::control::ControlBridge::println_locked`] so they cannot
+/// interleave with `control_request` frames.
+pub(crate) async fn stream_events_claude_json(
+    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    mut emitter: crate::cli::claude_json::ClaudeJsonEmitter,
+    bridge: Option<std::sync::Arc<crate::cli::control::ControlBridge>>,
+) -> crate::cli::claude_json::ClaudeJsonEmitter {
+    if let Some(init) = emitter.take_init() {
+        emit_json_line(&init, bridge.as_deref()).await;
+    }
+    while let Some(ev) = rx.recv().await {
+        for obj in emitter.on_event(ev) {
+            emit_json_line(&obj, bridge.as_deref()).await;
+        }
+    }
+    emitter
+}
+
+async fn emit_json_line(
+    value: &serde_json::Value,
+    bridge: Option<&crate::cli::control::ControlBridge>,
+) {
+    if let Some(b) = bridge {
+        b.println_locked(value).await;
+    } else {
+        crate::cli::claude_json::println_json(value);
+    }
+}
+
+/// Drain the event channel without printing (used by Claude `--output-format json`
+/// which only emits the terminal result object).
+async fn drain_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
+    while rx.recv().await.is_some() {}
+}
+
+/// Background task that owns the event receiver for a JSON-mode run.
+pub(crate) enum JsonEventTask {
+    Legacy(tokio::task::JoinHandle<()>),
+    /// Drain only; result printed after the run.
+    Single {
+        drain: tokio::task::JoinHandle<()>,
+        emitter: Box<crate::cli::claude_json::ClaudeJsonEmitter>,
+    },
+    Stream {
+        handle: tokio::task::JoinHandle<crate::cli::claude_json::ClaudeJsonEmitter>,
+    },
+}
+
+impl JsonEventTask {
+    pub(crate) fn spawn(
+        mode: crate::cli::claude_json::JsonOutputMode,
+        rx: mpsc::UnboundedReceiver<AgentEvent>,
+        ctx: crate::cli::claude_json::ClaudeJsonContext,
+        bridge: Option<std::sync::Arc<crate::cli::control::ControlBridge>>,
+    ) -> Self {
+        use crate::cli::claude_json::{ClaudeJsonEmitter, JsonOutputMode};
+        match mode {
+            JsonOutputMode::Legacy => Self::Legacy(tokio::spawn(stream_events_json(rx))),
+            JsonOutputMode::Single => Self::Single {
+                drain: tokio::spawn(drain_events(rx)),
+                emitter: Box::new(ClaudeJsonEmitter::new(ctx)),
+            },
+            JsonOutputMode::Stream => {
+                let emitter = ClaudeJsonEmitter::new(ctx);
+                Self::Stream {
+                    handle: tokio::spawn(stream_events_claude_json(rx, emitter, bridge)),
+                }
+            }
+        }
+    }
+
+    /// Await the background task and print the Claude `result` envelope when
+    /// applicable. Legacy mode prints nothing extra.
+    pub(crate) async fn finish(
+        self,
+        finish: &FinishReason,
+        final_text: Option<&str>,
+        usage: TokenUsage,
+        llm_latency_ms: u64,
+        steps: usize,
+        bridge: Option<&crate::cli::control::ControlBridge>,
+    ) {
+        match self {
+            Self::Legacy(h) => {
+                h.await.ok();
+            }
+            Self::Single { drain, emitter } => {
+                drain.await.ok();
+                let result = emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
+                emit_json_line(&result, bridge).await;
+            }
+            Self::Stream { handle } => {
+                if let Ok(emitter) = handle.await {
+                    let result =
+                        emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
+                    emit_json_line(&result, bridge).await;
+                }
+            }
         }
     }
 }

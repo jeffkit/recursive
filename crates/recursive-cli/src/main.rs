@@ -144,10 +144,18 @@ struct Cli {
 
     /// Output format for non-interactive (`-p`) mode.
     /// - text: human-readable trace (default)
-    /// - json: emit StepEvents as newline-delimited JSON (supersedes --json)
-    /// - stream-json: same as json but also enables token streaming (supersedes --stream)
-    #[arg(long = "output-format", value_parser = ["text", "json", "stream-json"])]
+    /// - json: Claude-compatible single result object at end (supersedes --json)
+    /// - stream-json: Claude-compatible NDJSON events + terminal result
+    /// - recursive-json: legacy raw AgentEvent NDJSON
+    #[arg(long = "output-format", value_parser = ["text", "json", "stream-json", "recursive-json"])]
     output_format: Option<String>,
+
+    /// Input format for non-interactive (`-p`) mode.
+    /// - text: prompt from argv / piped plain text (default)
+    /// - stream-json: accept Claude-compatible NDJSON on stdin (`user` messages
+    ///   and `control_request` / `control_response` frames)
+    #[arg(long = "input-format", value_parser = ["text", "stream-json"])]
+    input_format: Option<String>,
 
     /// Maximum total API spend in USD for this run. The run aborts once the
     /// cumulative cost exceeds this limit. Only checked after each completed turn.
@@ -570,14 +578,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref allow) = cli.allow_tools {
         config.allow_tools = allow.split(',').map(|s| s.trim().to_string()).collect();
     }
-    // --output-format: supersedes --json and --stream.
-    let effective_json = cli.json
-        || matches!(
-            cli.output_format.as_deref(),
-            Some("json") | Some("stream-json")
-        );
-    let effective_stream =
-        cli.stream || matches!(cli.output_format.as_deref(), Some("stream-json"));
+    // --output-format: supersedes --json and --stream. Default JSON shapes
+    // match Claude Code (`json` = one result object, `stream-json` = NDJSON).
+    let json_output = cli::claude_json::JsonOutputMode::resolve(
+        cli.output_format.as_deref(),
+        cli.json,
+        cli.stream,
+    );
+    let effective_json = json_output.is_some();
+    let effective_stream = cli.stream
+        || json_output.is_some_and(|m| m.enables_token_streaming())
+        || matches!(cli.output_format.as_deref(), Some("stream-json"));
     // Log level was already resolved and applied at startup (early_log above).
 
     // Determine effective command:
@@ -782,12 +793,13 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,
-                effective_json,
+                json_output,
                 effective_stream,
                 cli.mcp_config,
                 cli.hook_timing,
                 !cli.no_session,
                 shutdown,
+                matches!(cli.input_format.as_deref(), Some("stream-json")),
             )
             .await
         }
@@ -860,12 +872,13 @@ async fn main() -> anyhow::Result<()> {
                         cli.max_transcript_chars,
                         cli.transcript_out,
                         cli.session_out,
-                        effective_json,
+                        json_output,
                         cli.mcp_config,
                         cli.hook_timing,
                         !cli.no_session,
                         shutdown,
                         None, // existing_writer — legacy --resume-from creates a fresh session
+                        matches!(cli.input_format.as_deref(), Some("stream-json")),
                     )
                     .await
                 }
@@ -886,10 +899,11 @@ async fn main() -> anyhow::Result<()> {
                 cli.max_transcript_chars,
                 cli.transcript_out,
                 cli.session_out,
-                effective_json,
+                json_output,
                 cli.mcp_config,
                 cli.hook_timing,
                 !cli.no_session,
+                matches!(cli.input_format.as_deref(), Some("stream-json")),
             )
             .await
         }
@@ -1677,7 +1691,10 @@ async fn run_loop(
     // Build tools with ScheduleWakeup registered; must happen before build_runtime
     // so the slot is shared between the tool and the runtime loop.
     let mut tools = cli::builder::build_tools(&config).await;
-    cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config).await;
+    let elicitation = recursive::mcp::new_elicitation_slot();
+    tools = tools.with_elicitation_slot(elicitation.clone());
+    cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation))
+        .await;
     tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot.clone())));
     if !config.allow_tools.is_empty() {
         tools.retain_tools(&config.allow_tools);
@@ -1775,17 +1792,19 @@ async fn run_once(
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
     session_out: Option<PathBuf>,
-    json_mode: bool,
+    json_output: Option<cli::claude_json::JsonOutputMode>,
     stream: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
     session: bool,
     shutdown: tokio_util::sync::CancellationToken,
+    accept_user_messages: bool,
 ) -> anyhow::Result<()> {
     if let Err(msg) = config.validate_for_agent() {
         eprintln!("{msg}");
         std::process::exit(1);
     }
+    let json_mode = json_output.is_some();
 
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
         match SessionWriter::create_with_tools(
@@ -1800,7 +1819,9 @@ async fn run_once(
                 if let Some(ref name) = config.session_name {
                     writer.set_name(name.as_str());
                 }
-                eprintln!("session: recording to {}", writer.session_dir().display());
+                if !json_mode {
+                    eprintln!("session: recording to {}", writer.session_dir().display());
+                }
                 Some(Arc::new(std::sync::Mutex::new(writer)))
             }
             Err(e) => {
@@ -1887,13 +1908,162 @@ async fn run_once(
 
     let tool_specs = runtime.kernel().tools().specs();
 
-    let printer = if json_mode {
-        tokio::spawn(cli::output::stream_events_json(event_rx))
+    // Claude-compatible JSON modes (non-headless): open the bidirectional
+    // control channel so hosts can answer `can_use_tool` and other control
+    // subtypes on stdin.
+    let (control_bridge, control_session) = if json_output.is_some() && !config.headless {
+        let bridge = cli::control::ControlBridge::new();
+        let perm_mode = if config.headless {
+            recursive::permissions::PermissionMode::DontAsk
+        } else {
+            recursive::permissions::PermissionMode::Default
+        };
+        let session = cli::control::ControlSession::new(
+            bridge.clone(),
+            shutdown.clone(),
+            config.workspace.clone(),
+            config.model.clone(),
+            perm_mode,
+            runtime.kernel().tools().shared_permissions(),
+            session_writer.clone(),
+            runtime.kernel().tools().read_file_state(),
+            runtime.kernel().tools().session_roots(),
+            tool_specs.iter().map(|s| s.name.clone()).collect(),
+            accept_user_messages,
+            Some(runtime.plan_approval_gate()),
+        );
+        runtime.set_permission_hook(std::sync::Arc::new(cli::control::StdioPermissionHook::new(
+            bridge.clone(),
+        )));
+        runtime.set_sdk_hook_forwarder(Some(std::sync::Arc::new(
+            cli::control::ControlSdkHookForwarder::new(session.clone()),
+        )));
+        // Install elicitation handler into the shared MCP slot (if present).
+        if let Some(slot) = runtime.kernel().tools().elicitation_slot() {
+            let mut g = slot.write().await;
+            *g = Some(std::sync::Arc::new(
+                cli::control::ControlElicitationHandler::new(bridge.clone()),
+            ));
+        }
+        tokio::spawn(cli::control::stdin_control_loop(session.clone()));
+        tokio::spawn(cli::control::plan_dialog_loop(session.clone()));
+        (Some(bridge), Some(session))
     } else {
-        tokio::spawn(cli::output::stream_events(event_rx))
+        (None, None)
     };
 
-    let outcome = runtime.run(goal.clone()).await?;
+    let session_id = session_writer
+        .as_ref()
+        .map(|w| {
+            w.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .session_id()
+                .to_string()
+        })
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let permission_mode = match config.headless {
+        true => "dontAsk",
+        false => "default",
+    }
+    .to_string();
+    let claude_ctx = cli::claude_json::ClaudeJsonContext {
+        session_id,
+        model: config.model.clone(),
+        cwd: config.workspace.display().to_string(),
+        tools: tool_specs.iter().map(|s| s.name.clone()).collect(),
+        permission_mode,
+        include_partial_messages: stream,
+    };
+
+    enum RunPrinter {
+        Json(Box<cli::output::JsonEventTask>),
+        Text(tokio::task::JoinHandle<()>),
+    }
+    let printer = match json_output {
+        Some(mode) => RunPrinter::Json(Box::new(cli::output::JsonEventTask::spawn(
+            mode,
+            event_rx,
+            claude_ctx,
+            control_bridge.clone(),
+        ))),
+        None => RunPrinter::Text(tokio::spawn(cli::output::stream_events(event_rx))),
+    };
+
+    // Drive the goal turn (and any `--input-format stream-json` follow-up
+    // `type:user` turns) inside a block whose error we capture rather than
+    // `?`-propagate. The Claude SDK contract requires every stream-json run
+    // to end with a terminal `result` envelope — including mid-run LLM /
+    // provider failures. Propagating via `?` would skip `task.finish()` and
+    // leave the host with an unterminated stream.
+    let run_result: anyhow::Result<recursive::RuntimeOutcome> = async {
+        let mut outcome = runtime.run(goal.clone()).await?;
+
+        if let Some(ref cs) = control_session {
+            cs.record_usage(outcome.total_usage, outcome.llm_latency_ms);
+        }
+
+        // `--input-format stream-json`: consume follow-up `type:user` messages
+        // from the control demux until stdin EOF or interrupt.
+        if accept_user_messages {
+            if let Some(ref cs) = control_session {
+                loop {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                    if let Some(msg) = cs.pop_inbound_user() {
+                        let turn = runtime.run(msg).await?;
+                        cs.record_usage(turn.total_usage, turn.llm_latency_ms);
+                        outcome.steps = outcome.steps.saturating_add(turn.steps);
+                        outcome.total_usage = outcome.total_usage.accumulate(turn.total_usage);
+                        outcome.llm_latency_ms =
+                            outcome.llm_latency_ms.saturating_add(turn.llm_latency_ms);
+                        outcome.finish_reason = turn.finish_reason;
+                        outcome.final_text = turn.final_text;
+                        continue;
+                    }
+                    if cs.is_stdin_closed() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    }
+                }
+            }
+        }
+        Ok(outcome)
+    }
+    .await;
+
+    let outcome = match run_result {
+        Ok(o) => o,
+        Err(err) => {
+            // Drop the runtime first so its event-sink sender releases the
+            // stream task's `rx` — otherwise `task.finish()` would await a
+            // handle that never completes. Then emit a terminal error
+            // `result` so the stream closes per the Claude SDK contract
+            // before propagating the error for exit-code handling.
+            drop(runtime);
+            let reason = recursive::FinishReason::ProviderStop(err.to_string());
+            match printer {
+                RunPrinter::Json(task) => {
+                    task.finish(
+                        &reason,
+                        None,
+                        recursive::llm::TokenUsage::default(),
+                        0,
+                        0,
+                        control_bridge.as_deref(),
+                    )
+                    .await;
+                }
+                RunPrinter::Text(handle) => {
+                    handle.await.ok();
+                }
+            }
+            return Err(err);
+        }
+    };
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
@@ -1904,19 +2074,31 @@ async fn run_once(
     // here was redundant once g137 wired the token into the kernel.
     let _ = &shutdown;
 
-    printer.await.ok();
-
-    if !json_mode {
-        if let Some(ref msg) = outcome.final_text {
-            println!("\n=== final ===\n{msg}");
+    match printer {
+        RunPrinter::Json(task) => {
+            task.finish(
+                &outcome.finish_reason,
+                outcome.final_text.as_deref(),
+                outcome.total_usage,
+                outcome.llm_latency_ms,
+                outcome.steps,
+                control_bridge.as_deref(),
+            )
+            .await;
         }
-        cli::output::print_usage(
-            outcome.total_usage,
-            &config.model,
-            outcome.llm_latency_ms,
-            outcome.steps,
-        );
-        cli::output::print_finish_note(&outcome.finish_reason);
+        RunPrinter::Text(handle) => {
+            handle.await.ok();
+            if let Some(ref msg) = outcome.final_text {
+                println!("\n=== final ===\n{msg}");
+            }
+            cli::output::print_usage(
+                outcome.total_usage,
+                &config.model,
+                outcome.llm_latency_ms,
+                outcome.steps,
+            );
+            cli::output::print_finish_note(&outcome.finish_reason);
+        }
     }
 
     let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {

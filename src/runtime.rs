@@ -675,6 +675,18 @@ impl AgentRuntime {
         self.kernel.tools_mut().set_permission_hook(hook);
     }
 
+    /// Install a Claude SDK hook forwarder on the registry's
+    /// [`ExternalHookRunner`] (control-channel `hook_callback`).
+    pub fn set_sdk_hook_forwarder(
+        &mut self,
+        forwarder: Option<Arc<dyn crate::hooks::SdkHookForwarder>>,
+    ) {
+        self.kernel
+            .tools_mut()
+            .hook_runner
+            .set_sdk_forwarder(forwarder);
+    }
+
     /// Return a shared reference to the plan-approval gate.
     ///
     /// Callers (e.g. HTTP handlers) that need to inspect `pending_plan` or

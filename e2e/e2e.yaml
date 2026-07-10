@@ -198,3 +198,7 @@ tests:
     - name: "HTTP API Authentication (RECURSIVE_HTTP_AUTH_KEYS)"
       id: http-auth
       file: tests/39-http-auth.yaml
+
+    - name: "Claude JSON stream + control channel"
+      id: claude-json-stream
+      file: tests/40-claude-json-stream.yaml

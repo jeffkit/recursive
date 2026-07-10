@@ -75,7 +75,7 @@ pub use error::{Error, Result};
 pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
 pub use hooks::ExternalHookRunner;
 pub use hooks::ToolTimingHook;
-pub use hooks::{Hook, HookAction, HookEvent, HookRegistry};
+pub use hooks::{Hook, HookAction, HookEvent, HookRegistry, SdkHookForwarder};
 pub use kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 pub use llm::{
     context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, ChatProvider,
@@ -83,9 +83,10 @@ pub use llm::{
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{
-    discover_mcp_servers, load_mcp_config, McpClient, McpPrompt, McpPromptArgument,
-    McpPromptMessage, McpResource, McpResourceContent, McpServer, McpServerConfig, McpTool,
-    McpToolSpec, ServerCapabilities,
+    discover_mcp_servers, load_mcp_config, new_elicitation_slot, ElicitationHandler,
+    ElicitationRequest, McpClient, McpPrompt, McpPromptArgument, McpPromptMessage, McpResource,
+    McpResourceContent, McpServer, McpServerConfig, McpTool, McpToolSpec, ServerCapabilities,
+    SharedElicitationHandler,
 };
 #[cfg(feature = "mcp")]
 pub use mcp_server::{McpServerManager, McpServerRunner};
@@ -142,9 +143,9 @@ pub use tools::PermissionHook;
 pub use tools::{
     build_standard_tools, build_standard_tools_with_roots, new_shared_sandbox_roots, AccessTier,
     AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus, PlanApprovalGate,
-    PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult, RequestPlanModeTool,
-    SharedSandboxRoots, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch, ToolRegistry,
-    ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
+    PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult, ReadFileState,
+    RequestPlanModeTool, SharedSandboxRoots, TodoItem, TodoStatus, TodoWriteTool, Tool,
+    ToolDispatch, ToolRegistry, ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
 };
 pub use transcript::{TranscriptFile, TranscriptMeta};
 

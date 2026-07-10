@@ -1,0 +1,27 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "greet.txt", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Write",
+            "arguments": { "path": "greet.txt", "contents": "hi" }
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": "greet.txt", "hasToolResult": true },
+      "response": {
+        "content": "Done! I created greet.txt with the content 'hi'."
+      }
+    },
+    {
+      "match": { "userMessage": "just create", "hasToolResult": true },
+      "response": {
+        "content": "I just created greet.txt with the content 'hi'."
+      }
+    }
+  ]
+}

@@ -317,6 +317,15 @@ struct ResolvedHook {
 /// the runner sends the event to each hook in order and returns the
 /// first non-`Continue` decision. Hooks that timeout or return
 /// invalid output are treated as `Continue` (fail-open).
+/// Forwards a lifecycle hook to a Claude-compatible host via
+/// `control_request` / `hook_callback`. Implemented by the CLI control bridge.
+#[async_trait::async_trait]
+pub trait SdkHookForwarder: Send + Sync {
+    /// Ask the host to run registered SDK callbacks for this event.
+    /// Return `None` to fall through to local external hooks.
+    async fn forward(&self, input: &HookInput) -> Option<HookResult>;
+}
+
 #[derive(Clone)]
 pub struct ExternalHookRunner {
     hooks: Vec<ResolvedHook>,
@@ -336,6 +345,8 @@ pub struct ExternalHookRunner {
     pub cancel_token: Option<CancellationToken>,
     /// Optional event channel for TUI progress events.
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    /// Optional Claude SDK hook forwarder (CLI control channel).
+    sdk_forwarder: Option<Arc<dyn SdkHookForwarder>>,
 }
 
 impl ExternalHookRunner {
@@ -371,6 +382,7 @@ impl ExternalHookRunner {
             executed_once: Arc::new(Mutex::new(HashSet::new())),
             cancel_token: None,
             event_tx: None,
+            sdk_forwarder: None,
         };
         #[cfg(test)]
         Self {
@@ -379,6 +391,7 @@ impl ExternalHookRunner {
             executed_once: Arc::new(Mutex::new(HashSet::new())),
             cancel_token: None,
             event_tx: None,
+            sdk_forwarder: None,
             mock_results: vec![],
             mock_exit_codes: vec![],
         }
@@ -416,6 +429,7 @@ impl ExternalHookRunner {
             executed_once: Arc::new(Mutex::new(HashSet::new())),
             cancel_token: None,
             event_tx: None,
+            sdk_forwarder: None,
         };
         #[cfg(test)]
         Self {
@@ -424,6 +438,7 @@ impl ExternalHookRunner {
             executed_once: Arc::new(Mutex::new(HashSet::new())),
             cancel_token: None,
             event_tx: None,
+            sdk_forwarder: None,
             mock_results: vec![],
             mock_exit_codes: vec![],
         }
@@ -439,6 +454,17 @@ impl ExternalHookRunner {
     pub fn with_event_tx(mut self, tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    /// Attach a Claude SDK hook forwarder (control-channel `hook_callback`).
+    pub fn with_sdk_forwarder(mut self, forwarder: Arc<dyn SdkHookForwarder>) -> Self {
+        self.sdk_forwarder = Some(forwarder);
+        self
+    }
+
+    /// Replace the SDK hook forwarder at runtime.
+    pub fn set_sdk_forwarder(&mut self, forwarder: Option<Arc<dyn SdkHookForwarder>>) {
+        self.sdk_forwarder = forwarder;
     }
 
     /// Inject canned `HookResult`s for tests that must not spawn real processes.
@@ -535,6 +561,12 @@ impl ExternalHookRunner {
     /// Returns the first non-`Continue` `HookResult`. Hooks that fail,
     /// timeout, or return unparseable output are silently skipped (fail-open).
     pub async fn dispatch(&self, input: &HookInput) -> HookResult {
+        // Claude SDK host callbacks take precedence when registered.
+        if let Some(fwd) = &self.sdk_forwarder {
+            if let Some(result) = fwd.forward(input).await {
+                return result;
+            }
+        }
         let event_str = serde_json::to_string(&input.event)
             .unwrap_or_default()
             .trim_matches('"')
