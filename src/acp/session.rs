@@ -22,11 +22,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::acp::protocol::ClientCapabilities;
+use crate::tools::AcpClientFsState;
+use tokio::sync::Mutex;
+
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
 use crate::acp::bridge::sha256_first_12;
+use crate::acp::permission::PendingPermissionStore;
 use crate::message::Message;
 use crate::runtime::AgentRuntime;
 
@@ -137,8 +142,14 @@ pub struct AcpSession {
     /// The original system prompt for this session (used for session/resume).
     pub system_prompt: Option<String>,
     /// MCP server configurations (used for session/resume).
-    #[allow(dead_code)]
     pub mcp_servers: Option<serde_json::Value>,
+    /// Client capabilities declared during initialize (S2-E1/E3).
+    /// Controls conditional registration of ClientReadFile/ClientWriteFile.
+    pub client_capabilities: Option<ClientCapabilities>,
+    /// Shared ACP client FS state for conditional tool visibility and routing.
+    pub acp_state: Arc<Mutex<AcpClientFsState>>,
+    /// MCP child processes managed by this session (for cleanup on close/load/resume).
+    pub mcp_child_pids: Vec<u32>,
 }
 
 impl AcpSession {
@@ -153,6 +164,79 @@ impl AcpSession {
         self.runtime.set_interrupt_token((*token).clone());
         self.cancel_token = token.clone();
         token
+    }
+
+    /// Kill all tracked MCP child processes using the graceful shutdown
+    /// protocol (SIGTERM → timeout → SIGKILL). Called during session/close,
+    /// session/load, session/resume, and client disconnect cleanup.
+    pub async fn kill_mcp_children(&mut self) {
+        for pid in std::mem::take(&mut self.mcp_child_pids) {
+            #[cfg(unix)]
+            {
+                use tokio::time::timeout;
+
+                let grace = crate::mcp::DEFAULT_KILL_GRACE_PERIOD;
+                tracing::info!(server_pid = pid, "AcpSession: killing MCP child process");
+
+                // Send SIGTERM via std::process::Command::new("kill").
+                tracing::info!(server_pid = pid, "kill-gracefully: sending SIGTERM");
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+
+                // Wait for grace period
+                let waited = timeout(grace, async {
+                    loop {
+                        // Check if process is alive
+                        let status = std::process::Command::new("kill")
+                            .args(["-0", &pid.to_string()])
+                            .status()
+                            .ok();
+                        match status {
+                            Some(s) if s.success() => {
+                                // Process still alive, keep waiting
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            _ => {
+                                // Process has exited
+                                break;
+                            }
+                        }
+                    }
+                })
+                .await;
+
+                if waited.is_err() {
+                    // Timeout — send SIGKILL
+                    tracing::warn!(
+                        server_pid = pid,
+                        grace_ms = grace.as_millis(),
+                        "kill-gracefully: SIGTERM timeout, sending SIGKILL"
+                    );
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .status();
+                } else {
+                    tracing::info!(
+                        server_pid = pid,
+                        "kill-gracefully: process exited gracefully"
+                    );
+                }
+
+                // Reap zombie
+                let _ = std::process::Command::new("wait")
+                    .args([&pid.to_string()])
+                    .status();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+                tracing::info!("AcpSession: killing MCP child (non-Unix)");
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .status();
+            }
+        }
     }
 }
 
@@ -170,6 +254,11 @@ pub struct AcpSessionManager {
     /// Each session gets `<persistence_dir>/<session_id>/`.
     /// Defaults to a temp directory if not set.
     persistence_dir: Option<PathBuf>,
+    /// Shared store of pending permission requests (ACP permission bridge).
+    permission_store: PendingPermissionStore,
+    /// Client capabilities declared during the `initialize` handshake (S2-E1/E3).
+    /// Stored here so `session/new` can conditionally register reverse-fs tools.
+    client_capabilities: Option<ClientCapabilities>,
 }
 
 impl Default for AcpSessionManager {
@@ -185,7 +274,20 @@ impl AcpSessionManager {
             sessions: HashMap::new(),
             next_id: AtomicU64::new(1),
             persistence_dir: None,
+            permission_store: PendingPermissionStore::new(),
+            client_capabilities: None,
         }
+    }
+
+    /// Set the client capabilities declared during `initialize`.
+    /// These are used by `session/new` to conditionally register reverse-fs tools.
+    pub fn set_client_capabilities(&mut self, caps: Option<ClientCapabilities>) {
+        self.client_capabilities = caps;
+    }
+
+    /// Get the client capabilities (if any) declared during `initialize`.
+    pub fn get_client_capabilities(&self) -> Option<&ClientCapabilities> {
+        self.client_capabilities.as_ref()
     }
 
     /// Set the persistence directory for session storage.
@@ -249,6 +351,11 @@ impl AcpSessionManager {
     /// Check if a session exists.
     pub fn contains(&self, sid: &str) -> bool {
         self.sessions.contains_key(sid)
+    }
+
+    /// Get the shared permission store for ACP permission bridge.
+    pub fn permission_store(&mut self) -> &mut PendingPermissionStore {
+        &mut self.permission_store
     }
 
     // ── Session persistence (ACP-S1-02) ──────────────────────────
@@ -869,6 +976,9 @@ mod tests {
                 cancel_token: clone_for_drop,
                 system_prompt: None,
                 mcp_servers: None,
+                client_capabilities: None,
+                acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
+                mcp_child_pids: Vec::new(),
             };
             // Session drops here — but shared_token should NOT be cancelled
         }

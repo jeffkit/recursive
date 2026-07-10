@@ -88,6 +88,19 @@ pub trait PermissionHook: Send + Sync {
     async fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision;
 }
 
+/// No-op permission hook that allows every tool call.
+///
+/// Used as the default when no ACP permission bridge is configured.
+/// Always returns [`PermissionDecision::Allow`] without any side effects.
+pub struct PermissionHookDisabled;
+
+#[async_trait]
+impl PermissionHook for PermissionHookDisabled {
+    async fn check(&self, _tool_name: &str, _args: &serde_json::Value) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+}
+
 /// NOTE: Clone shares Arc state with all tools. Use fork() for isolation.
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -766,6 +779,22 @@ pub fn build_standard_tools_with_roots(
     if !skills.is_empty() {
         registry = registry.register(Arc::new(super::load_skill::LoadSkill::new(skills.to_vec())));
     }
+
+    // Register ACP client FS tools (S2-E20).
+    // These are always registered so they appear in tools/list.
+    // execute() checks AcpClientFsState to determine if the capability
+    // has been declared — it returns an error when not in an ACP session
+    // or when the client hasn't declared the capability.
+    registry = registry.register(Arc::new(
+        super::client_fs::ClientReadFile::new(workspace)
+            .with_extra_roots(extra_roots.iter().cloned())
+            .with_session_roots_opt(session_roots.clone()),
+    ));
+    registry = registry.register(Arc::new(
+        super::client_fs::ClientWriteFile::new(workspace)
+            .with_extra_roots(extra_roots.iter().cloned())
+            .with_session_roots_opt(session_roots.clone()),
+    ));
 
     registry
 }

@@ -1,29 +1,35 @@
 //! ACP Sprint-1 permission bridge.
 //!
 //! Defines [`PermissionOutcome`], [`PermissionDecision`], and
-//! [`PermissionBridge`] for the session/request_permission flow.
+//! a complete permission flow connecting the ACP `session/request_permission`
+//! notification/response protocol to the agent's [`PermissionHook`].
 //!
 //! # Architecture
 //!
-//! The permission bridge owns a oneshot channel per in-flight permission
-//! request. When a tool call requires permission, the runtime emits a
-//! `session/request_permission` notification (fire-and-forget). The
-//! client responds over the same channel. A 30-second timeout defaults
-//! to [`PermissionDecision::Deny`].
-//!
-//! # Debouncing (S1-C14)
-//!
-//! Multiple tool calls within the same `tool_calls` array within 500ms
-//! are consolidated into a single notification with a `tools` array.
-//!
-//! # Deduplication (S1-C15)
-//!
-//! Identical tool+path pairs within the debounce window are aggregated
-//! with a `count: N` field.
+//! 1. When a tool call requires permission, [`AcpPermissionHook::check`]
+//!    sends a `session/request_permission` JSON-RPC notification to the
+//!    client with `permission_id`, `tool_name`, and argument details.
+//! 2. The client receives the notification (as a `session/update` with
+//!    `sessionUpdate: "request_permission"`) and sends back a
+//!    `session/request_permission` JSON-RPC request with the outcome.
+//! 3. The ACP server's dispatch loop routes this to
+//!    [`handle_request_permission`] which resolves the pending
+//!    oneshot channel.
+//! 4. [`AcpPermissionHook::check`] receives the outcome and returns
+//!    `Allow` or `Deny`.
+//! 5. A 30-second timeout defaults to `Deny`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+use async_trait::async_trait;
+use serde_json::Value;
+
+use crate::agent::PermissionDecision;
+use crate::tools::PermissionHook;
 
 /// The outcome of a client permission decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,346 +42,347 @@ pub enum PermissionOutcome {
     Timeout,
 }
 
-/// The permission decision translated from an outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionDecision {
-    /// Agent may proceed with the tool call.
-    Allow,
-    /// Agent must skip the tool call.
-    Deny,
-}
-
-/// Translate a [`PermissionOutcome`] to a [`PermissionDecision`].
-///
-/// Must be exhaustive: every variant of `PermissionOutcome` maps to
-/// exactly one variant of `PermissionDecision`. Adding a new variant
-/// to `PermissionOutcome` will cause a compile error here.
+/// Translate a [`PermissionOutcome`] to [`PermissionDecision`].
 pub fn translate(outcome: PermissionOutcome) -> PermissionDecision {
     match outcome {
         PermissionOutcome::Allowed => PermissionDecision::Allow,
-        PermissionOutcome::Denied => PermissionDecision::Deny,
-        PermissionOutcome::Timeout => PermissionDecision::Deny,
+        PermissionOutcome::Denied | PermissionOutcome::Timeout => {
+            PermissionDecision::Deny("permission denied".to_string())
+        }
     }
 }
 
-/// A bridge for managing in-flight permission requests.
+// ---------------------------------------------------------------------------
+// PendingPermissionStore
+// ---------------------------------------------------------------------------
+
+/// Thread-safe store of pending permission requests, keyed by permission ID.
 ///
-/// Created per `session/prompt` turn and dropped when the turn ends.
-/// Each in-flight request has a oneshot channel.
-pub struct PermissionBridge {
-    /// Sender half for the current permission request.
-    tx: Option<oneshot::Sender<PermissionOutcome>>,
-    /// Whether the bridge has been resolved (allowed or denied).
-    resolved: bool,
+/// Shared between the [`AcpPermissionHook`] (which inserts entries when it
+/// sends a notification) and the ACP server's dispatch loop (which resolves
+/// entries when the client responds via `session/request_permission`).
+#[derive(Clone, Default)]
+pub struct PendingPermissionStore {
+    inner: Arc<StdMutex<HashMap<String, oneshot::Sender<PermissionOutcome>>>>,
 }
 
-impl PermissionBridge {
-    /// Create a new permission bridge.
+impl PendingPermissionStore {
+    /// Create a new empty store.
     pub fn new() -> Self {
         Self {
-            tx: None,
-            resolved: false,
+            inner: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
-    /// Open a new permission request channel.
-    ///
-    /// Returns a oneshot receiver that the client should use to send their
-    /// decision, and a unique permission ID for the notification.
-    pub fn open_request(&mut self) -> (oneshot::Receiver<PermissionOutcome>, String) {
-        let (tx, rx) = oneshot::channel();
+    /// Insert a pending permission request.
+    pub fn insert(&self, id: String, tx: oneshot::Sender<PermissionOutcome>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.insert(id, tx);
+        }
+    }
+
+    /// Remove and return the sender for a given permission ID.
+    pub fn remove(&self, id: &str) -> Option<oneshot::Sender<PermissionOutcome>> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(id))
+    }
+
+    /// Check if a permission ID is pending.
+    #[allow(dead_code)]
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.contains_key(id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AcpPermissionHook
+// ---------------------------------------------------------------------------
+
+/// A [`PermissionHook`] that communicates permission requests to the ACP client.
+///
+/// When `check()` is called:
+/// 1. Sends a `session/update` notification with `sessionUpdate: "request_permission"`
+///    via the provided notification sender.
+/// 2. Stores the oneshot sender in the shared [`PendingPermissionStore`].
+/// 3. Waits for the client's response (or 30-second timeout).
+/// 4. Returns `Allow` or `Deny` based on the outcome.
+pub struct AcpPermissionHook {
+    /// Shared store of pending requests.
+    store: PendingPermissionStore,
+    /// Session ID for ACP notification routing.
+    session_id: String,
+    /// Sender for JSON-RPC notifications to the client.
+    notif_tx: tokio::sync::mpsc::UnboundedSender<Value>,
+}
+
+impl AcpPermissionHook {
+    /// Create a new ACP permission hook.
+    pub fn new(
+        store: PendingPermissionStore,
+        session_id: String,
+        notif_tx: tokio::sync::mpsc::UnboundedSender<Value>,
+    ) -> Self {
+        Self {
+            store,
+            session_id,
+            notif_tx,
+        }
+    }
+}
+
+#[async_trait]
+impl PermissionHook for AcpPermissionHook {
+    async fn check(&self, tool_name: &str, args: &Value) -> PermissionDecision {
         let perm_id = uuid::Uuid::new_v4().to_string();
-        self.tx = Some(tx);
-        self.resolved = false;
-        (rx, perm_id)
-    }
+        let (tx, rx) = oneshot::channel();
 
-    /// Resolve the pending request with an outcome.
-    ///
-    /// Returns `true` if the outcome was sent successfully.
-    pub fn resolve(&mut self, outcome: PermissionOutcome) -> bool {
-        if let Some(tx) = self.tx.take() {
-            self.resolved = true;
-            tx.send(outcome).is_ok()
-        } else {
-            false
-        }
-    }
+        self.store.insert(perm_id.clone(), tx);
 
-    /// Whether the bridge has been resolved.
-    pub fn is_resolved(&self) -> bool {
-        self.resolved
-    }
+        // Build the request_permission notification
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "request_permission",
+                    "permissionId": perm_id,
+                    "toolName": tool_name,
+                    "arguments": args,
+                }
+            }
+        });
 
-    /// Wait for a permission decision with a 30-second timeout.
-    ///
-    /// Returns `PermissionDecision::Deny` on timeout.
-    pub async fn wait_for_decision(
-        mut rx: oneshot::Receiver<PermissionOutcome>,
-    ) -> PermissionDecision {
-        tokio::time::timeout(Duration::from_secs(30), &mut rx)
+        let _ = self.notif_tx.send(notif);
+
+        // Wait for client response with 30-second timeout
+        tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .ok()
-            .flatten()
+            .and_then(|r| r.ok())
             .map(translate)
-            .unwrap_or(PermissionDecision::Deny)
+            .unwrap_or(PermissionDecision::Deny("permission timeout".to_string()))
     }
 }
 
-impl Default for PermissionBridge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------
+// Handle session/request_permission response from client
+// ---------------------------------------------------------------------------
 
-/// A debounced permission request entry.
-#[derive(Debug, Clone)]
-pub struct DebouncedPermissionEntry {
-    pub tool_name: String,
-    pub path: Option<String>,
-    pub command: Option<String>,
-    pub count: usize,
-    /// Unique dedup key: "toolName:path" or "toolName" (no path)
-    pub dedup_key: String,
-}
+/// Handle a `session/request_permission` request from the client.
+///
+/// The client sends back the outcome (granted=true/false) for a specific
+/// permission_id. We look up the pending request in the store and resolve it.
+///
+/// Returns a JSON-RPC response indicating success or an error if the
+/// permission_id was not found.
+pub fn handle_request_permission(
+    id: &Value,
+    params: Option<&Value>,
+    store: &PendingPermissionStore,
+) -> Value {
+    let params = match params {
+        Some(p) => p,
+        None => {
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "Missing params",
+                },
+            });
+        }
+    };
 
-impl DebouncedPermissionEntry {
-    pub fn new(tool_name: String, path: Option<String>, command: Option<String>) -> Self {
-        let dedup_key = match &path {
-            Some(p) => format!("{}:{}", tool_name, p),
-            None => tool_name.clone(),
-        };
-        Self {
-            tool_name,
-            path,
-            command,
-            count: 1,
-            dedup_key,
+    let perm_id = match params.get("permissionId").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "Missing required field 'permissionId'",
+                },
+            });
+        }
+    };
+
+    let outcome = match params.get("outcome").and_then(|v| v.as_str()) {
+        Some("allowed") => PermissionOutcome::Allowed,
+        Some("denied") | Some("rejected") => PermissionOutcome::Denied,
+        _ => {
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid or missing 'outcome' field (expected 'allowed' or 'denied')",
+                },
+            });
+        }
+    };
+
+    match store.remove(perm_id) {
+        Some(tx) => {
+            let _ = tx.send(outcome);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {},
+            })
+        }
+        None => {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32000,
+                    "message": format!("Permission request not found: {perm_id}"),
+                },
+            })
         }
     }
 }
 
-/// Manages debouncing of permission requests within a window.
-pub struct PermissionDebouncer {
-    /// Pending entries within the current debounce window.
-    entries: Vec<DebouncedPermissionEntry>,
-    /// When the debounce window started (Instant::now).
-    window_start: Option<std::time::Instant>,
-    /// Debounce window in milliseconds (default 500).
-    window_ms: u64,
-}
-
-impl PermissionDebouncer {
-    /// Create a new debouncer with the default 500ms window.
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            window_start: None,
-            window_ms: 500,
-        }
-    }
-
-    /// Create a new debouncer with a custom window.
-    pub fn with_window(window_ms: u64) -> Self {
-        Self {
-            entries: Vec::new(),
-            window_start: None,
-            window_ms,
-        }
-    }
-
-    /// Add a tool call to the current debounce batch.
-    ///
-    /// If the same tool+path pair already exists, increment its count.
-    /// Returns `true` if this entry was a dedup (count incremented).
-    pub fn add(&mut self, tool_name: &str, path: Option<&str>, command: Option<&str>) -> bool {
-        let dedup_key = match path {
-            Some(p) => format!("{}:{}", tool_name, p),
-            None => tool_name.to_string(),
-        };
-
-        // Start the window timer on first entry
-        if self.window_start.is_none() {
-            self.window_start = Some(std::time::Instant::now());
-        }
-
-        // Check for dedup
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.dedup_key == dedup_key) {
-            entry.count += 1;
-            return true; // was dedup
-        }
-
-        self.entries.push(DebouncedPermissionEntry::new(
-            tool_name.to_string(),
-            path.map(|s| s.to_string()),
-            command.map(|s| s.to_string()),
-        ));
-        false
-    }
-
-    /// Flush the current batch if the window has expired or if forced.
-    ///
-    /// Returns the consolidated entries (empty if window not yet expired).
-    pub fn flush(&mut self) -> Vec<DebouncedPermissionEntry> {
-        let should_flush = match self.window_start {
-            Some(start) => start.elapsed() >= std::time::Duration::from_millis(self.window_ms),
-            None => true,
-        };
-
-        if should_flush {
-            let entries = std::mem::take(&mut self.entries);
-            self.window_start = None;
-            entries
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Force flush, returning all pending entries regardless of window.
-    pub fn force_flush(&mut self) -> Vec<DebouncedPermissionEntry> {
-        let entries = std::mem::take(&mut self.entries);
-        self.window_start = None;
-        entries
-    }
-}
-
-impl Default for PermissionDebouncer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── translate exhaustiveness test ─────────────────────────────────────
+    // ── translate ─────────────────────────────────────────────────────────
 
     #[test]
     fn translate_allowed_to_allow() {
-        assert_eq!(translate(PermissionOutcome::Allowed), PermissionDecision::Allow);
+        assert_eq!(
+            translate(PermissionOutcome::Allowed),
+            PermissionDecision::Allow
+        );
     }
 
     #[test]
     fn translate_denied_to_deny() {
-        assert_eq!(translate(PermissionOutcome::Denied), PermissionDecision::Deny);
+        assert_eq!(
+            translate(PermissionOutcome::Denied),
+            PermissionDecision::Deny("permission denied".to_string())
+        );
     }
 
     #[test]
     fn translate_timeout_to_deny() {
-        assert_eq!(translate(PermissionOutcome::Timeout), PermissionDecision::Deny);
+        assert_eq!(
+            translate(PermissionOutcome::Timeout),
+            PermissionDecision::Deny("permission denied".to_string())
+        );
     }
 
-    // ── bridge tests ─────────────────────────────────────────────────────
+    // ── PendingPermissionStore ────────────────────────────────────────────
 
     #[test]
-    fn fresh_bridge_not_resolved() {
-        let b = PermissionBridge::new();
-        assert!(!b.is_resolved());
-    }
-
-    #[tokio::test]
-    async fn bridge_open_and_resolve() {
-        let mut bridge = PermissionBridge::new();
-        let (rx, _perm_id) = bridge.open_request();
-        assert!(bridge.resolve(PermissionOutcome::Allowed));
-        assert!(bridge.is_resolved());
-        let decision = PermissionBridge::wait_for_decision(rx).await;
-        assert_eq!(decision, PermissionDecision::Allow);
-    }
-
-    #[tokio::test]
-    async fn bridge_timeout_denies() {
-        let mut bridge = PermissionBridge::new();
-        // Test timeout by never sending on the oneshot
-        let (rx, _perm_id) = bridge.open_request();
-        // Don't resolve — the wait_for_decision should timeout after 30 seconds.
-        // We can't actually wait 30s in a unit test, so we test the logic:
-        // the timeout is handled by tokio::time::timeout inside wait_for_decision.
-        drop(rx); // Drop receiver so the recv fails immediately
-        // Since we can't easily test 30s timeout, test the drop case:
-        let (tx, rx) = oneshot::channel();
-        drop(tx);
-        let decision = PermissionBridge::wait_for_decision(rx).await;
-        assert_eq!(decision, PermissionDecision::Deny);
-    }
-
-    #[tokio::test]
-    async fn bridge_reject_denies() {
-        let mut bridge = PermissionBridge::new();
-        let (rx, _perm_id) = bridge.open_request();
-        assert!(bridge.resolve(PermissionOutcome::Denied));
-        let decision = PermissionBridge::wait_for_decision(rx).await;
-        assert_eq!(decision, PermissionDecision::Deny);
-    }
-
-    // ── Debouncer tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn fresh_debouncer_flushes_empty() {
-        let mut d = PermissionDebouncer::new();
-        let entries = d.flush();
-        assert!(entries.is_empty());
+    fn store_insert_and_remove() {
+        let store = PendingPermissionStore::new();
+        let (tx, _rx) = oneshot::channel();
+        store.insert("perm-1".into(), tx);
+        assert!(store.contains("perm-1"));
+        let removed = store.remove("perm-1");
+        assert!(removed.is_some());
+        assert!(!store.contains("perm-1"));
     }
 
     #[test]
-    fn debouncer_add_flush_single() {
-        let mut d = PermissionDebouncer::with_window(0); // instant flush
-        d.add("write_file", Some("/tmp/f.txt"), None);
-        let entries = d.flush();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool_name, "write_file");
-        assert_eq!(entries[0].path.as_deref(), Some("/tmp/f.txt"));
-        assert_eq!(entries[0].count, 1);
+    fn store_remove_nonexistent_returns_none() {
+        let store = PendingPermissionStore::new();
+        assert!(store.remove("nonexistent").is_none());
     }
 
     #[test]
-    fn debouncer_dedup_identical_tool_path() {
-        let mut d = PermissionDebouncer::with_window(0);
-        d.add("write_file", Some("/tmp/f.txt"), None);
-        let dedup = d.add("write_file", Some("/tmp/f.txt"), None);
-        assert!(dedup, "should be deduped");
-        let entries = d.force_flush();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].count, 2);
+    fn store_default_is_empty() {
+        let store = PendingPermissionStore::default();
+        assert!(!store.contains("anything"));
+    }
+
+    // ── handle_request_permission ─────────────────────────────────────────
+
+    #[test]
+    fn handle_permission_missing_params() {
+        let store = PendingPermissionStore::new();
+        let result = handle_request_permission(&Value::from(1), None, &store);
+        assert!(result["error"].is_object());
+        assert_eq!(result["error"]["code"], -32602);
     }
 
     #[test]
-    fn debouncer_separate_entries_for_different_paths() {
-        let mut d = PermissionDebouncer::with_window(0);
-        d.add("write_file", Some("/tmp/a.txt"), None);
-        d.add("write_file", Some("/tmp/b.txt"), None);
-        let entries = d.force_flush();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].count, 1);
-        assert_eq!(entries[1].count, 1);
+    fn handle_permission_missing_permission_id() {
+        let store = PendingPermissionStore::new();
+        let params = serde_json::json!({"outcome": "allowed"});
+        let result = handle_request_permission(&Value::from(1), Some(&params), &store);
+        assert!(result["error"].is_object());
+        assert_eq!(result["error"]["code"], -32602);
     }
 
     #[test]
-    fn debouncer_separate_entries_for_different_tools() {
-        let mut d = PermissionDebouncer::with_window(0);
-        d.add("write_file", Some("/tmp/f.txt"), None);
-        d.add("read_file", None, None);
-        let entries = d.force_flush();
-        assert_eq!(entries.len(), 2);
+    fn handle_permission_invalid_outcome() {
+        let store = PendingPermissionStore::new();
+        let params = serde_json::json!({
+            "permissionId": "p1",
+            "outcome": "maybe"
+        });
+        let result = handle_request_permission(&Value::from(1), Some(&params), &store);
+        assert!(result["error"].is_object());
+        assert_eq!(result["error"]["code"], -32602);
     }
 
     #[test]
-    fn debouncer_force_flush_clears() {
-        let mut d = PermissionDebouncer::with_window(5000);
-        d.add("write_file", None, None);
-        let entries = d.force_flush();
-        assert_eq!(entries.len(), 1);
-        // After force flush, should be empty
-        assert!(d.force_flush().is_empty());
+    fn handle_permission_nonexistent_id() {
+        let store = PendingPermissionStore::new();
+        let params = serde_json::json!({
+            "permissionId": "nonexistent",
+            "outcome": "allowed"
+        });
+        let result = handle_request_permission(&Value::from(1), Some(&params), &store);
+        assert!(result["error"].is_object());
+        assert_eq!(result["error"]["code"], -32000);
     }
 
     #[test]
-    fn debouncer_expires_after_window() {
-        let mut d = PermissionDebouncer::with_window(1); // 1ms window
-        d.add("write_file", None, None);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let entries = d.flush();
-        assert_eq!(entries.len(), 1, "window should have expired");
+    fn handle_permission_allowed_resolves() {
+        let store = PendingPermissionStore::new();
+        let (tx, mut rx) = oneshot::channel();
+        store.insert("p1".into(), tx);
+
+        let params = serde_json::json!({
+            "permissionId": "p1",
+            "outcome": "allowed"
+        });
+        let result = handle_request_permission(&Value::from(1), Some(&params), &store);
+        assert!(result["result"].is_object());
+        // The oneshot should have been resolved
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome, PermissionOutcome::Allowed);
+    }
+
+    #[test]
+    fn handle_permission_denied_resolves() {
+        let store = PendingPermissionStore::new();
+        let (tx, mut rx) = oneshot::channel();
+        store.insert("p2".into(), tx);
+
+        let params = serde_json::json!({
+            "permissionId": "p2",
+            "outcome": "denied"
+        });
+        let result = handle_request_permission(&Value::from(1), Some(&params), &store);
+        assert!(result["result"].is_object());
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome, PermissionOutcome::Denied);
     }
 }

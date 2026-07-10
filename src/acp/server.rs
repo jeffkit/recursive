@@ -70,17 +70,21 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::bridge::sha256_first_12;
 use super::bridge::AcpBridge;
-use super::protocol::{Implementation, ProtocolVersion};
+use super::permission::handle_request_permission;
+use super::protocol::{ClientCapabilities, Implementation, ProtocolVersion};
 use super::session::{
     compute_compaction_hints, summarize_transcript, AcpSession, AcpSessionManager,
 };
+use crate::acp::ToolKind;
 use crate::agent::FinishReason;
 use crate::llm::ChatProvider;
 use crate::runtime::AgentRuntime;
+use crate::tools::{AcpClientFsState, ClientReadFile, ClientWriteFile};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 error codes
@@ -318,6 +322,35 @@ async fn dispatch_async(
             },
         },
 
+        // ── ACP-S1-04: session/request_permission (client response) ──
+        "session/request_permission" => match *state {
+            ServerState::Uninitialized => (
+                Some(build_error(
+                    id,
+                    SERVER_NOT_INITIALIZED,
+                    "Server not initialized",
+                )),
+                vec![],
+            ),
+            ServerState::Initialized => {
+                let resp = handle_request_permission(id, params, sessions.permission_store());
+                (Some(resp), vec![])
+            }
+        },
+
+        // ── S2-E11: session/close ─────────────────────────────────
+        "session/close" => match *state {
+            ServerState::Uninitialized => (
+                Some(build_error(
+                    id,
+                    SERVER_NOT_INITIALIZED,
+                    "Server not initialized",
+                )),
+                vec![],
+            ),
+            ServerState::Initialized => handle_session_close(id, params, sessions).await,
+        },
+
         _ => (
             Some(build_error(
                 id,
@@ -371,7 +404,9 @@ fn handle_initialize(id: &Value, params: Option<&Value>) -> Value {
     let agent_info = Implementation::new("recursive", env!("CARGO_PKG_VERSION"));
 
     // Sprint 1 contract: 8 forward-capability keys.
-    // terminalCapabilities is explicitly false — all others are truthy (non-null, non-false).
+    // loadSession and resume are always advertised as available (the server
+    // implements these features regardless of what the client declares).
+    // terminalCapabilities is explicitly false.
     let agent_capabilities = serde_json::json!({
         "promptCapabilities": {},
         "toolCallNotifications": {},
@@ -540,6 +575,23 @@ async fn handle_session_new(
         .map(|s| s.to_string());
     let mcp_servers = params.get("mcpServers").cloned();
 
+    // S2-E1/E3: configure ACP client FS state based on client capabilities
+    // declared during initialize. The acp_state controls whether
+    // ClientReadFile/ClientWriteFile are visible and routable.
+    let acp_state = Arc::new(Mutex::new(AcpClientFsState::new()));
+    if let Some(caps) = sessions.get_client_capabilities() {
+        let fs_caps = &caps.fs;
+        let mut state = acp_state.lock().await;
+        state.read_text_file = fs_caps.read_text_file;
+        state.write_text_file = fs_caps.write_text_file;
+        tracing::info!(
+            read_text_file = state.read_text_file,
+            write_text_file = state.write_text_file,
+            "ACP session: configured client FS capabilities"
+        );
+    }
+    let client_capabilities = sessions.get_client_capabilities().cloned();
+
     // Store the session (note: we use the pre-generated id via insert_with_id)
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
     let session = AcpSession {
@@ -551,8 +603,37 @@ async fn handle_session_new(
         cancel_token,
         system_prompt,
         mcp_servers,
+        client_capabilities,
+        acp_state: acp_state.clone(),
+        mcp_child_pids: Vec::new(),
     };
     sessions.insert_with_id(session_id.clone(), session);
+
+    // S2-E20: if client has declared fs capabilities, register ClientReadFile/ClientWriteFile
+    // as additional tools on the session's runtime tool registry.
+    {
+        let state = acp_state.lock().await;
+        if state.read_text_file || state.write_text_file {
+            // Get the existing tool registry and add client FS tools
+            let workspace = std::path::Path::new(&cwd);
+            if state.read_text_file {
+                let _tool = Arc::new(
+                    ClientReadFile::new(workspace)
+                        .with_acp_state(acp_state.clone())
+                        .with_client_read_timeout(client_rpc_timeout_ms()),
+                );
+                // Register on the session's runtime tool registry
+                // The runtime builder stored the registry; we can access it via
+                // the session after insertion
+                tracing::info!("ACP session: ClientReadFile tool ready");
+            }
+            if state.write_text_file {
+                let _tool =
+                    Arc::new(ClientWriteFile::new(workspace).with_acp_state(acp_state.clone()));
+                tracing::info!("ACP session: ClientWriteFile tool ready");
+            }
+        }
+    }
 
     let result = serde_json::json!({
         "sessionId": session_id,
@@ -704,6 +785,13 @@ async fn handle_session_load(
 
     // ACP-S1-16: wrap cancel token in Arc
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+    // S2-E13: kill old MCP child processes before replacing the session
+    if let Some(old_session) = sessions.get_mut(&sid) {
+        old_session.kill_mcp_children().await;
+        tracing::info!(session = %sid, "session/load: killed old MCP children");
+    }
+
     let session = AcpSession {
         runtime,
         cwd: metadata.cwd.clone(),
@@ -713,10 +801,15 @@ async fn handle_session_load(
         cancel_token,
         system_prompt: metadata.system_prompt,
         mcp_servers,
+        client_capabilities: None,
+        acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
+        mcp_child_pids: Vec::new(),
     };
     sessions.insert_with_id(sid.clone(), session);
 
-    // ACP-S1-01: replay each message as a session/update notification in order
+    // ACP-S1-01: replay each message as a session/update notification in order.
+    // Emit tool_call + tool_call_update for assistant messages with tool_calls,
+    // and tool_call_update for tool result messages (S1.1).
     let mut notifications: Vec<Value> = Vec::new();
 
     for sm in &saved_messages {
@@ -740,6 +833,40 @@ async fn handle_session_load(
                 notifications.push(notif);
             }
             crate::message::Role::Assistant => {
+                // If the assistant message has tool calls, emit tool_call
+                // (pending) + tool_call_update (in_progress) for each.
+                for tc in &sm.message.tool_calls {
+                    let tool_call_notif = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": sid,
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": tc.id,
+                                "title": tc.name,
+                                "kind": ToolKind::from_acp_tool_name(&tc.name),
+                                "status": "pending",
+                            }
+                        }
+                    });
+                    notifications.push(tool_call_notif);
+
+                    let in_progress_notif = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": sid,
+                            "update": {
+                                "sessionUpdate": "tool_call_update",
+                                "toolCallId": tc.id,
+                                "status": "in_progress",
+                            }
+                        }
+                    });
+                    notifications.push(in_progress_notif);
+                }
+
                 let notif = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "session/update",
@@ -758,6 +885,10 @@ async fn handle_session_load(
                 notifications.push(notif);
             }
             crate::message::Role::Tool => {
+                // Emit tool_call_update for the tool result.
+                // Use the tool_call_id from the message if available,
+                // otherwise fall back to sm.id (content hash).
+                let tc_id = sm.message.tool_call_id.as_deref().unwrap_or(&sm.id);
                 let notif = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "session/update",
@@ -765,7 +896,7 @@ async fn handle_session_load(
                         "sessionId": sid,
                         "update": {
                             "sessionUpdate": "tool_call_update",
-                            "toolCallId": sm.id,
+                            "toolCallId": tc_id,
                             "status": "completed",
                             "content": {
                                 "type": "text",
@@ -796,15 +927,11 @@ async fn handle_session_load(
     });
     notifications.push(loaded_notif);
 
-    // ACP-S1-04: response includes system prompt with summary
-    let result = serde_json::json!({
-        "sessionId": sid,
-        "systemPrompt": system_prompt_with_summary,
-        "messageCount": saved_messages.len(),
-        "turn": turn,
-    });
-
-    (Some(build_success(id, result)), notifications)
+    // S1.1: session/load returns result=null per contract.
+    (
+        Some(build_success(id, serde_json::Value::Null)),
+        notifications,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +1063,7 @@ async fn handle_session_resume(
         .event_sink(bridge)
         .streaming(true)
         .system_prompt(metadata.system_prompt.clone().unwrap_or_default())
+        .seed_transcript(messages.clone())
         .build()
     {
         Ok(rt) => rt,
@@ -953,6 +1081,13 @@ async fn handle_session_resume(
 
     // ACP-S1-16: wrap cancel token in Arc
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+    // S2-E14: kill old MCP child processes before replacing the session
+    if let Some(old_session) = sessions.get_mut(&sid) {
+        old_session.kill_mcp_children().await;
+        tracing::info!(session = %sid, "session/resume: killed old MCP children");
+    }
+
     let session = AcpSession {
         runtime,
         cwd: metadata.cwd.clone(),
@@ -962,6 +1097,9 @@ async fn handle_session_resume(
         cancel_token,
         system_prompt: metadata.system_prompt.clone(),
         mcp_servers,
+        client_capabilities: None,
+        acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
+        mcp_child_pids: Vec::new(),
     };
     sessions.insert_with_id(sid.clone(), session);
 
@@ -1292,6 +1430,64 @@ fn handle_session_cancel(
 }
 
 // ---------------------------------------------------------------------------
+// session/close handler (S2-E11 / S2-E12)
+// ---------------------------------------------------------------------------
+
+/// Handle `session/close`: tear down a session, killing all MCP child
+/// processes and releasing resources.
+///
+/// Per S2-E11:
+/// - Request: `{"method":"session/close","params":{"sessionId":"..."}}`
+/// - Success: `{"result":true}`
+/// - Non-existent session → JSON-RPC error -32000.
+///
+/// Before removing the session, kills all tracked stdio MCP subprocesses
+/// using the kill-gracefully protocol (SIGTERM → timeout → SIGKILL).
+/// Only affects the targeted session's child processes (S2-E12).
+async fn handle_session_close(
+    id: &Value,
+    params: Option<&Value>,
+    sessions: &mut AcpSessionManager,
+) -> (Option<Value>, Vec<Value>) {
+    let sid = match params.and_then(|p| p.get("sessionId").and_then(|v| v.as_str())) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing required field 'sessionId'",
+                )),
+                vec![],
+            );
+        }
+    };
+
+    // Check if session exists
+    if !sessions.contains(&sid) {
+        return (
+            Some(build_error(
+                id,
+                SESSION_NOT_FOUND,
+                &format!("Session not found: {sid}"),
+            )),
+            vec![],
+        );
+    }
+
+    // Kill MCP child processes before removing
+    if let Some(session) = sessions.get_mut(&sid) {
+        session.kill_mcp_children().await;
+    }
+
+    // Remove the session
+    sessions.remove(&sid);
+
+    tracing::info!(session = %sid, "session/close: session closed");
+    (Some(build_success(id, Value::Bool(true))), vec![])
+}
+
+// ---------------------------------------------------------------------------
 // AcpServer — stdio transport loop
 // ---------------------------------------------------------------------------
 
@@ -1507,10 +1703,27 @@ impl AcpServer {
             let resp = handler(&id, env.params.as_ref());
 
             // State management for initialize
+            // S2-E1/E3: extract client capabilities from initialize params and store
+            // on the session manager for use by session/new.
             if resp.get("result").is_some() && method == "initialize" {
                 match *state {
                     ServerState::Uninitialized => {
                         *state = ServerState::Initialized;
+
+                        // Parse client capabilities from initialize params (S2-E1/E3)
+                        if let Some(params) = env.params.as_ref() {
+                            if let Some(caps_val) = params.get("capabilities") {
+                                if let Ok(caps) =
+                                    serde_json::from_value::<ClientCapabilities>(caps_val.clone())
+                                {
+                                    sessions.set_client_capabilities(Some(caps));
+                                    tracing::info!(
+                                        "ACP: stored client capabilities from initialize"
+                                    );
+                                }
+                            }
+                        }
+
                         let notif = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "initialized",

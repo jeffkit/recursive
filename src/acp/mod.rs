@@ -7,6 +7,7 @@
 //! [`AgentRuntime`] state, cwd, turn counter, and transcript.
 
 pub mod bridge;
+pub mod permission;
 pub mod protocol;
 pub mod server;
 pub mod session;

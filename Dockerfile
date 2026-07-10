@@ -22,8 +22,11 @@
 #
 # Note: Docker Hub's `rust:stable-slim` tag does NOT exist (the official
 # image only ships `slim-bookworm` → `latest`, plus `1.x-slim` and `1-slim`
-# that track stable). `1-slim` is the right tag for "always stable".
-FROM rust:1-slim AS builder
+# that track stable). `1-slim` recently started tracking Debian 13 (trixie)
+# with GLIBC 2.41, but the runtime stage uses debian:bookworm-slim (GLIBC 2.36).
+# Pinning to `1-slim-bookworm` keeps the same Rust stable tracking while matching
+# the runtime's GLIBC, avoiding a "version `GLIBC_2.39` not found" crash at startup.
+FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build
 
