@@ -34,10 +34,8 @@ use crate::tools::ToolRegistry;
 /// is intentional: it means the feature can be turned off at build
 /// time for deployments that don't want coordinator semantics at all.
 pub fn is_coordinator_mode() -> bool {
-    if !cfg!(feature = "coordinator-mode") {
-        return false;
-    }
-    std::env::var("RECURSIVE_COORDINATOR_MODE").as_deref() == Ok("1")
+    cfg!(feature = "coordinator-mode")
+        && std::env::var("RECURSIVE_COORDINATOR_MODE").as_deref() == Ok("1")
 }
 
 /// The set of tool names available in coordinator mode.
@@ -115,16 +113,15 @@ pub fn is_allowed_in_coordinator_mode(tool_name: &str) -> bool {
 /// the wiring point that the kernel calls right after
 /// `build_tools()` — see `src/cli/builder.rs`.
 pub fn filter_registry(registry: &mut ToolRegistry) {
-    if !is_coordinator_mode() {
-        return;
+    if is_coordinator_mode() {
+        let allow: Vec<String> = coordinator_tool_set()
+            .iter()
+            .copied()
+            .filter(|name| is_allowed_in_coordinator_mode(name))
+            .map(str::to_string)
+            .collect();
+        registry.retain_tools(&allow);
     }
-    let allow: Vec<String> = coordinator_tool_set()
-        .iter()
-        .copied()
-        .filter(|name| is_allowed_in_coordinator_mode(name))
-        .map(str::to_string)
-        .collect();
-    registry.retain_tools(&allow);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +131,7 @@ pub fn filter_registry(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::build_standard_tools;
 
     #[test]
     fn allow_list_excludes_mutating_tools() {
@@ -238,6 +236,7 @@ mod tests {
 
     #[test]
     fn is_coordinator_mode_false_without_env_var() {
+        let _env_lock = crate::test_util::env_lock();
         // kills `is_coordinator_mode` → always-true mutation
         let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
         std::env::remove_var("RECURSIVE_COORDINATOR_MODE");
@@ -259,6 +258,7 @@ mod tests {
 
     #[test]
     fn cargo_feature_gate_respected() {
+        let _env_lock = crate::test_util::env_lock();
         // We can't flip cargo features at test time, but we can verify
         // that the env-var side of the gate works deterministically.
         // (The cargo side is checked by `cfg!(feature = "coordinator-mode")`.)
@@ -277,6 +277,7 @@ mod tests {
 
     #[test]
     fn is_coordinator_mode_rejects_non_one_env_value() {
+        let _env_lock = crate::test_util::env_lock();
         // Kills: `replace == with !=` on `as_deref() == Ok("1")`.
         // With the mutant, any value other than "1" (including "0" / "true")
         // would incorrectly enable coordinator mode when the feature is on.
@@ -291,5 +292,90 @@ mod tests {
             !mode,
             "RECURSIVE_COORDINATOR_MODE=0 must not enable coordinator mode"
         );
+    }
+
+    #[test]
+    fn is_coordinator_mode_false_when_env_one_without_cargo_feature() {
+        let _env_lock = crate::test_util::env_lock();
+        // Kills: `delete &&` / feature-gate mutants when coordinator-mode is
+        // not compiled in — env=1 alone must not enable coordinator mode.
+        if cfg!(feature = "coordinator-mode") {
+            return;
+        }
+        let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
+        std::env::set_var("RECURSIVE_COORDINATOR_MODE", "1");
+        assert!(
+            !is_coordinator_mode(),
+            "env=1 must not enable coordinator mode without the cargo feature"
+        );
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_COORDINATOR_MODE", v),
+            None => std::env::remove_var("RECURSIVE_COORDINATOR_MODE"),
+        }
+    }
+
+    #[cfg(feature = "coordinator-mode")]
+    #[test]
+    fn is_coordinator_mode_true_when_feature_and_env_one() {
+        let _env_lock = crate::test_util::env_lock();
+        // Kills: feature-gate mutants that drop the cargo `cfg!` check.
+        let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
+        std::env::set_var("RECURSIVE_COORDINATOR_MODE", "1");
+        assert!(
+            is_coordinator_mode(),
+            "coordinator mode must be on when feature and env=1"
+        );
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_COORDINATOR_MODE", v),
+            None => std::env::remove_var("RECURSIVE_COORDINATOR_MODE"),
+        }
+    }
+
+    #[test]
+    fn filter_registry_noop_outside_coordinator_mode() {
+        let _env_lock = crate::test_util::env_lock();
+        // Kills: `replace filter_registry with ()` and inverted `if` guards
+        // that would prune tools when coordinator mode is off.
+        let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
+        std::env::remove_var("RECURSIVE_COORDINATOR_MODE");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut reg = build_standard_tools(tmp.path(), &[], 30);
+        assert!(
+            reg.find_by_name("Edit").is_some(),
+            "fixture must include Edit before filter"
+        );
+        filter_registry(&mut reg);
+        assert!(
+            reg.find_by_name("Edit").is_some(),
+            "filter_registry must be a no-op outside coordinator mode"
+        );
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_COORDINATOR_MODE", v),
+            None => std::env::remove_var("RECURSIVE_COORDINATOR_MODE"),
+        }
+    }
+
+    #[cfg(feature = "coordinator-mode")]
+    #[test]
+    fn filter_registry_prunes_mutating_tools_in_coordinator_mode() {
+        let _env_lock = crate::test_util::env_lock();
+        // Kills: `replace filter_registry with ()` and delete `if` guard.
+        let prev = std::env::var("RECURSIVE_COORDINATOR_MODE").ok();
+        std::env::set_var("RECURSIVE_COORDINATOR_MODE", "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut reg = build_standard_tools(tmp.path(), &[], 30);
+        filter_registry(&mut reg);
+        assert!(
+            reg.find_by_name("Edit").is_none(),
+            "Edit must be pruned in coordinator mode"
+        );
+        assert!(
+            reg.find_by_name("Read").is_some(),
+            "Read must remain in coordinator mode"
+        );
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_COORDINATOR_MODE", v),
+            None => std::env::remove_var("RECURSIVE_COORDINATOR_MODE"),
+        }
     }
 }

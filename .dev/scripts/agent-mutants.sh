@@ -29,7 +29,7 @@ CRATE="recursive-agent"
 # Feature set: enable test-utils so test helpers compile, plus common
 # optional features that unlock more code paths / mutant candidates.
 # weixin is excluded here (UI-only, no agent-kernel logic under test).
-FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub"
+FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,coordinator-mode"
 
 JOBS=1
 

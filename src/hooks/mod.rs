@@ -202,11 +202,13 @@ impl HookRegistry {
     pub fn dispatch(&self, event: HookEvent) -> HookAction {
         let is_pre_tool = matches!(event, HookEvent::PreToolCall { .. });
         for hook in &self.hooks {
+            // Continue (and non-PreToolCall Skip/Error) share one arm: a
+            // dedicated `Continue => continue` is behavior-equivalent to
+            // falling through `_`, so cargo-mutants' "delete Continue arm"
+            // is not meaningful debt.
             match hook.on_event(event.clone()) {
-                HookAction::Continue => continue,
                 HookAction::Skip if is_pre_tool => return HookAction::Skip,
                 HookAction::Error(msg) if is_pre_tool => return HookAction::Error(msg),
-                // Non-PreToolCall events: Skip/Error treated as Continue
                 _ => continue,
             }
         }
@@ -244,6 +246,13 @@ impl ToolTimingHook {
             start_times: std::sync::Mutex::new(HashMap::new()),
         }
     }
+
+    /// Test-only: whether a PreToolCall recorded a start for `name`.
+    #[cfg(test)]
+    fn has_start(&self, name: &str) -> bool {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
+        self.start_times.lock().unwrap().contains_key(name)
+    }
 }
 
 impl Default for ToolTimingHook {
@@ -264,6 +273,13 @@ impl Hook for ToolTimingHook {
             HookEvent::PostToolCall {
                 name, duration_ms, ..
             } => {
+                // Clear the matching Pre start so Post is observable without
+                // relying on stderr (eprintln alone is untestable in unit tests).
+                #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
+                {
+                    let mut map = self.start_times.lock().unwrap();
+                    map.remove(name);
+                }
                 eprintln!("[hook] {name} took {duration_ms}ms");
                 HookAction::Continue
             }
@@ -715,6 +731,33 @@ mod tests {
             args: &serde_json::json!({"path": "foo.txt"}),
         });
         assert!(matches!(action, HookAction::Continue));
+        // Pins PreToolCall arm: deleting it falls through `_` without insert.
+        assert!(
+            hook.has_start("Write"),
+            "PreToolCall must record a start time for the tool name"
+        );
+    }
+
+    #[test]
+    fn tool_timing_hook_post_clears_recorded_start() {
+        let hook = ToolTimingHook::new();
+        let _ = hook.on_event(HookEvent::PreToolCall {
+            name: "Read",
+            args: &serde_json::json!({}),
+        });
+        assert!(hook.has_start("Read"));
+        let action = hook.on_event(HookEvent::PostToolCall {
+            name: "Read",
+            args: &serde_json::json!({}),
+            result: "ok",
+            duration_ms: 12,
+        });
+        assert!(matches!(action, HookAction::Continue));
+        // Pins PostToolCall arm: deleting it leaves the Pre start in the map.
+        assert!(
+            !hook.has_start("Read"),
+            "PostToolCall must clear the matching Pre start"
+        );
     }
 
     // ── guard mutant coverage: is_pre_tool guard must be checked correctly ────
