@@ -1,39 +1,33 @@
 /**
  * @recursive/sdk — TypeScript SDK for the Recursive Agent.
  *
- * Quick start:
+ * Claude Agent SDK–compatible `query()` (recommended):
+ * ```ts
+ * import { query } from "@recursive/sdk";
+ *
+ * for await (const message of query({
+ *   prompt: "List all TODO comments",
+ *   options: { maxTurns: 10 },
+ * })) {
+ *   if (message.type === "result") console.log(message.result);
+ * }
+ * ```
+ *
+ * Session-style API (also available):
  * ```ts
  * import { Agent } from "@recursive/sdk";
- *
- * // One-shot
- * const result = await Agent.prompt("List all TODO comments", {
- *   baseUrl: "http://localhost:3000",
- * });
- *
- * // Multi-turn with streaming
- * await using agent = await Agent.create({ baseUrl: "http://localhost:3000" });
- * const run = await agent.send("Fix the failing tests");
- * for await (const msg of run.stream()) {
- *   if (msg.type === "assistant") {
- *     for (const b of msg.content) {
- *       if (b.type === "text") process.stdout.write(b.text);
- *     }
- *   }
- * }
- * await run.wait();
- *
- * // Resume
- * await using agent2 = await Agent.resume(sessionId, { baseUrl: "..." });
- * await (await agent2.send("Continue")).wait();
+ * const result = await Agent.prompt("List all TODO comments");
  * ```
  *
  * Environment variables:
- * - `RECURSIVE_BASE_URL` — server URL (default: `http://127.0.0.1:3000`)
- * - `RECURSIVE_API_KEY`  — API key (if auth is enabled)
+ * - `RECURSIVE_BIN` — path to the `recursive` binary (CLI transport)
+ * - `RECURSIVE_BASE_URL` — when set, `Agent.*` uses HTTP instead of CLI
+ * - `RECURSIVE_API_KEY` — API key for authenticated HTTP servers
  */
 
 export { Agent, AgentSession } from "./agent.js";
 export type { AgentOptions, PromptOptions } from "./agent.js";
+export { findRecursiveBinary } from "./binary.js";
 export { RecursiveClient } from "./client.js";
 export type { RecursiveClientOptions } from "./client.js";
 export { RecursiveAgentError } from "./exceptions.js";
@@ -60,4 +54,16 @@ export type {
   UsageMeta,
   UserMessage,
 } from "./models.js";
+export { query } from "./query.js";
+export type {
+  CanUseTool,
+  HookCallback,
+  Options,
+  PermissionResult,
+  Query,
+  QueryMessage,
+} from "./query.js";
 export { Run } from "./run.js";
+export { buildControlCliArgs } from "./controlSession.js";
+export { buildCliArgs } from "./subprocess.js";
+export { parseWireObject } from "./wire.js";

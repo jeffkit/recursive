@@ -505,6 +505,19 @@ impl ClaudeJsonEmitter {
     }
 }
 
+/// Build a Claude `result` envelope for a completed turn without needing a
+/// live event-stream emitter (used by streaming-input multi-turn mode).
+pub(crate) fn build_turn_result(
+    ctx: ClaudeJsonContext,
+    finish: &FinishReason,
+    final_text: Option<&str>,
+    usage: TokenUsage,
+    llm_latency_ms: u64,
+    steps: usize,
+) -> Value {
+    ClaudeJsonEmitter::new(ctx).build_result(finish, final_text, usage, llm_latency_ms, steps)
+}
+
 /// Print a JSON value as a single stdout line (NDJSON).
 pub(crate) fn println_json(value: &Value) {
     match serde_json::to_string(value) {
@@ -649,5 +662,26 @@ mod tests {
         assert_eq!(outs[0]["subtype"], "api_retry");
         assert_eq!(outs[0]["error"], "rate_limit");
         assert_eq!(outs[0]["retry_delay_ms"], 1500);
+    }
+
+    #[test]
+    fn build_turn_result_matches_emitter() {
+        let r = build_turn_result(
+            ctx(),
+            &FinishReason::NoMoreToolCalls,
+            Some("done"),
+            TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                ..Default::default()
+            },
+            42,
+            3,
+        );
+        assert_eq!(r["type"], "result");
+        assert_eq!(r["subtype"], "success");
+        assert_eq!(r["result"], "done");
+        assert_eq!(r["num_turns"], 3);
+        assert_eq!(r["session_id"], "sess_test");
     }
 }

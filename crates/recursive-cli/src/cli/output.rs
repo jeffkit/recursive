@@ -356,7 +356,8 @@ impl JsonEventTask {
             }
             Self::Single { drain, emitter } => {
                 drain.await.ok();
-                let result = emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
+                let result =
+                    emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
                 emit_json_line(&result, bridge).await;
             }
             Self::Stream { handle } => {
@@ -365,6 +366,25 @@ impl JsonEventTask {
                         emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
                     emit_json_line(&result, bridge).await;
                 }
+            }
+        }
+    }
+
+    /// Like [`finish`](Self::finish) but skips the terminal `result` line.
+    ///
+    /// Used by `--input-format stream-json` multi-turn mode, where each turn
+    /// already emitted its own Claude `result` envelope (matching the Claude
+    /// Agent SDK streaming-input contract).
+    pub(crate) async fn finish_without_result(self) {
+        match self {
+            Self::Legacy(h) => {
+                h.await.ok();
+            }
+            Self::Single { drain, .. } => {
+                drain.await.ok();
+            }
+            Self::Stream { handle } => {
+                handle.await.ok();
             }
         }
     }

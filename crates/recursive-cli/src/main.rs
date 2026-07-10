@@ -1967,11 +1967,11 @@ async fn run_once(
     }
     .to_string();
     let claude_ctx = cli::claude_json::ClaudeJsonContext {
-        session_id,
+        session_id: session_id.clone(),
         model: config.model.clone(),
         cwd: config.workspace.display().to_string(),
         tools: tool_specs.iter().map(|s| s.name.clone()).collect(),
-        permission_mode,
+        permission_mode: permission_mode.clone(),
         include_partial_messages: stream,
     };
 
@@ -1995,17 +1995,45 @@ async fn run_once(
     // to end with a terminal `result` envelope — including mid-run LLM /
     // provider failures. Propagating via `?` would skip `task.finish()` and
     // leave the host with an unterminated stream.
-    let run_result: anyhow::Result<recursive::RuntimeOutcome> = async {
+    // When streaming-input multi-turn is active, each completed turn emits its
+    // own Claude `result` envelope (SDK contract). The final JsonEventTask
+    // finish then skips a duplicate terminal result.
+    let run_result: anyhow::Result<(recursive::RuntimeOutcome, bool)> = async {
         let mut outcome = runtime.run(goal.clone()).await?;
+        let mut emitted_streaming_turn_results = false;
 
         if let Some(ref cs) = control_session {
             cs.record_usage(outcome.total_usage, outcome.llm_latency_ms);
         }
 
-        // `--input-format stream-json`: consume follow-up `type:user` messages
-        // from the control demux until stdin EOF or interrupt.
+        // `--input-format stream-json`: after each turn emit a Claude `result`,
+        // then wait for the next `type:user` until stdin EOF or interrupt.
         if accept_user_messages {
             if let Some(ref cs) = control_session {
+                let emit_turn = |turn: &recursive::RuntimeOutcome| {
+                    let ctx = cli::claude_json::ClaudeJsonContext {
+                        session_id: session_id.clone(),
+                        model: config.model.clone(),
+                        cwd: config.workspace.display().to_string(),
+                        tools: tool_specs.iter().map(|s| s.name.clone()).collect(),
+                        permission_mode: permission_mode.clone(),
+                        include_partial_messages: false,
+                    };
+                    cli::claude_json::build_turn_result(
+                        ctx,
+                        &turn.finish_reason,
+                        turn.final_text.as_deref(),
+                        turn.total_usage,
+                        turn.llm_latency_ms,
+                        turn.steps,
+                    )
+                };
+
+                if let Some(ref bridge) = control_bridge {
+                    bridge.println_locked(&emit_turn(&outcome)).await;
+                    emitted_streaming_turn_results = true;
+                }
+
                 loop {
                     if shutdown.is_cancelled() {
                         break;
@@ -2013,6 +2041,10 @@ async fn run_once(
                     if let Some(msg) = cs.pop_inbound_user() {
                         let turn = runtime.run(msg).await?;
                         cs.record_usage(turn.total_usage, turn.llm_latency_ms);
+                        if let Some(ref bridge) = control_bridge {
+                            bridge.println_locked(&emit_turn(&turn)).await;
+                            emitted_streaming_turn_results = true;
+                        }
                         outcome.steps = outcome.steps.saturating_add(turn.steps);
                         outcome.total_usage = outcome.total_usage.accumulate(turn.total_usage);
                         outcome.llm_latency_ms =
@@ -2031,12 +2063,12 @@ async fn run_once(
                 }
             }
         }
-        Ok(outcome)
+        Ok((outcome, emitted_streaming_turn_results))
     }
     .await;
 
-    let outcome = match run_result {
-        Ok(o) => o,
+    let (outcome, emitted_streaming_turn_results) = match run_result {
+        Ok(pair) => pair,
         Err(err) => {
             // Drop the runtime first so its event-sink sender releases the
             // stream task's `rx` — otherwise `task.finish()` would await a
@@ -2076,15 +2108,19 @@ async fn run_once(
 
     match printer {
         RunPrinter::Json(task) => {
-            task.finish(
-                &outcome.finish_reason,
-                outcome.final_text.as_deref(),
-                outcome.total_usage,
-                outcome.llm_latency_ms,
-                outcome.steps,
-                control_bridge.as_deref(),
-            )
-            .await;
+            if emitted_streaming_turn_results {
+                task.finish_without_result().await;
+            } else {
+                task.finish(
+                    &outcome.finish_reason,
+                    outcome.final_text.as_deref(),
+                    outcome.total_usage,
+                    outcome.llm_latency_ms,
+                    outcome.steps,
+                    control_bridge.as_deref(),
+                )
+                .await;
+            }
         }
         RunPrinter::Text(handle) => {
             handle.await.ok();

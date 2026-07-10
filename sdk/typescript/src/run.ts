@@ -1,11 +1,13 @@
 /**
  * Run — represents a single agent turn in a session.
+ *
+ * Backed by either the HTTP SSE transport or a local `recursive` CLI
+ * subprocess (`--output-format stream-json`).
  */
 
 import type { HttpClient } from "./http.js";
 import { mapFinishReasonToSubtype } from "./models.js";
 import type {
-  AssistantMessage,
   ContentBlock,
   PartialAssistantMessage,
   RunResult,
@@ -13,29 +15,52 @@ import type {
   ToolProgressMessage,
   UsageMeta,
 } from "./models.js";
+import type { CliProcessHandle } from "./subprocess.js";
 
 export type { SDKMessage };
 
-export class Run {
-  /**
-   * Session ID for this run.
-   */
-  readonly id: string;
+type RunBackend =
+  | { kind: "http"; http: HttpClient }
+  | {
+      kind: "cli";
+      handle: CliProcessHandle;
+      /** Called when `system/init` reveals the session id. */
+      onSessionId?: (sessionId: string) => void;
+    };
 
-  private readonly _http: HttpClient;
+export class Run {
+  private _id: string;
+  private _backend: RunBackend;
   private _result: RunResult | null = null;
 
   /**
-   * Pending send POST issued by `Agent.send()`. Set by the Agent factory
-   * after construction; awaited inside `wait()` so callers don't have to
-   * separately await the dispatch.
+   * Pending send POST issued by HTTP `Agent.send()`. Set by the Agent
+   * factory after construction; awaited inside `wait()`.
    * @internal
    */
   _sendPromise: Promise<unknown> | null = null;
 
   constructor(sessionId: string, http: HttpClient) {
-    this.id = sessionId;
-    this._http = http;
+    this._id = sessionId;
+    this._backend = { kind: "http", http };
+  }
+
+  /** @internal Construct a CLI-backed run. */
+  static _fromCli(
+    sessionId: string,
+    handle: CliProcessHandle,
+    onSessionId?: (sessionId: string) => void,
+  ): Run {
+    const run = new Run(sessionId, /* unused */ undefined as unknown as HttpClient);
+    run._backend = { kind: "cli", handle, onSessionId };
+    run._result = null;
+    run._sendPromise = null;
+    return run;
+  }
+
+  /** Session ID for this run (may be empty until CLI `system/init`). */
+  get id(): string {
+    return this._id;
   }
 
   /**
@@ -48,7 +73,7 @@ export class Run {
       const msg =
         err instanceof Error ? err.message : `failed to send message: ${err}`;
       this._result = {
-        id: this.id,
+        id: this._id,
         status: "error",
         subtype: "error_during_execution",
         error: msg,
@@ -60,22 +85,64 @@ export class Run {
   // ── streaming ────────────────────────────────────────────────────────────
 
   /**
-   * Async iterable of typed messages as they arrive from the server.
+   * Async iterable of typed messages as they arrive.
    *
-   * Drains the SSE stream and caches the terminal `RunResult` so that
-   * a subsequent `wait()` returns immediately.
-   *
-   * ```ts
-   * for await (const msg of run.stream()) {
-   *   if (msg.type === "assistant") {
-   *     for (const block of msg.content) {
-   *       if (block.type === "text") process.stdout.write(block.text);
-   *     }
-   *   }
-   * }
-   * ```
+   * Drains the underlying transport and caches the terminal `RunResult`
+   * so a subsequent `wait()` returns immediately.
    */
   async *stream(): AsyncGenerator<SDKMessage> {
+    if (this._backend.kind === "cli") {
+      yield* this._streamCli();
+      return;
+    }
+    yield* this._streamHttp();
+  }
+
+  private async *_streamCli(): AsyncGenerator<SDKMessage> {
+    if (this._backend.kind !== "cli") return;
+    const { handle, onSessionId } = this._backend;
+    let sawResult = false;
+
+    for await (const item of handle.items()) {
+      if (item.kind === "message") {
+        if (
+          item.message.type === "system" &&
+          item.message.subtype === "init" &&
+          typeof item.message.data["session_id"] === "string"
+        ) {
+          this._id = String(item.message.data["session_id"]);
+          onSessionId?.(this._id);
+        }
+        yield item.message;
+      } else if (item.kind === "result") {
+        sawResult = true;
+        if (!item.result.id && this._id) item.result.id = this._id;
+        this._result = item.result;
+        // Capture session id from the handle if init was only seen as session.
+        const sid = handle.getSessionId();
+        if (sid) {
+          this._id = sid;
+          onSessionId?.(sid);
+          this._result.id = sid;
+        }
+      }
+    }
+
+    if (!sawResult && this._result === null) {
+      this._result = {
+        id: this._id,
+        status: "error",
+        subtype: "error_during_execution",
+        error: "CLI stream ended without a result",
+        ok: false,
+      };
+    }
+  }
+
+  private async *_streamHttp(): AsyncGenerator<SDKMessage> {
+    if (this._backend.kind !== "http") return;
+    const http = this._backend.http;
+
     let finishReason: string | undefined;
     let usageData: Record<string, unknown> | undefined;
     let runStatus: "finished" | "error" | "cancelled" = "finished";
@@ -83,14 +150,14 @@ export class Run {
     let numTurns = 0;
     const startMs = Date.now();
 
-    for await (const event of this._http.streamEvents(
-      `/sessions/${this.id}/events`,
+    for await (const event of http.streamEvents(
+      `/sessions/${this._id}/events`,
     )) {
       const evType = event.type;
       const data = event.data as Record<string, unknown>;
 
       if (evType === "message" || evType === "") {
-        const msg = parseMessage(data, this.id);
+        const msg = parseMessage(data, this._id);
         if (msg) {
           if (msg.type === "assistant") {
             numTurns++;
@@ -101,24 +168,20 @@ export class Run {
           yield msg;
         }
       } else if (evType === "partial_message") {
-        // SDK Phase C: streaming token deltas — surface as a typed
-        // PartialAssistantMessage (type="stream_event") aligned with
-        // SDKPartialAssistantMessage in the Claude Agent SDK.
         const pm: PartialAssistantMessage = {
           type: "stream_event",
           text: String(data["text"] ?? ""),
           step: Number(data["step"] ?? 0),
-          sessionId: this.id,
+          sessionId: this._id,
         };
         yield pm;
       } else if (evType === "tool_progress") {
-        // SDK Phase B: tool execution timing event.
         const tp: ToolProgressMessage = {
           type: "tool_progress",
           toolUseId: String(data["tool_use_id"] ?? ""),
           toolName: String(data["tool_name"] ?? ""),
           elapsedMs: Number(data["elapsed_ms"] ?? 0),
-          sessionId: this.id,
+          sessionId: this._id,
         };
         yield tp;
       } else if (evType === "done") {
@@ -129,7 +192,7 @@ export class Run {
       } else if (evType === "error") {
         runStatus = "error";
         this._result = {
-          id: this.id,
+          id: this._id,
           status: "error",
           subtype: "error_during_execution",
           error: String(data["message"] ?? data),
@@ -143,7 +206,7 @@ export class Run {
 
     const usage = usageData ? parseUsage(usageData) : undefined;
     this._result = {
-      id: this.id,
+      id: this._id,
       status: runStatus,
       subtype: mapFinishReasonToSubtype(finishReason, runStatus),
       finishReason,
@@ -155,16 +218,12 @@ export class Run {
     };
   }
 
-  /**
-   * Alias for `stream()` — matches the Claude Agent SDK naming.
-   */
+  /** Alias for `stream()` — matches the Claude Agent SDK naming. */
   messages(): AsyncGenerator<SDKMessage> {
     return this.stream();
   }
 
-  /**
-   * Async generator that yields only text chunks from assistant messages.
-   */
+  /** Async generator that yields only text chunks from assistant messages. */
   async *iterText(): AsyncGenerator<string> {
     for await (const msg of this.stream()) {
       if (msg.type === "assistant") {
@@ -175,9 +234,7 @@ export class Run {
     }
   }
 
-  /**
-   * Block until the run completes and return all assistant text concatenated.
-   */
+  /** Block until the run completes and return all assistant text concatenated. */
   async text(): Promise<string> {
     const chunks: string[] = [];
     for await (const chunk of this.iterText()) {
@@ -189,24 +246,14 @@ export class Run {
   // ── wait ─────────────────────────────────────────────────────────────────
 
   /**
-   * Block until the run finishes (drains the stream if not already consumed)
-   * and return the terminal `RunResult`.
-   *
-   * ```ts
-   * const result = await run.wait();
-   * if (result.status === "error") console.error(result.error);
-   * ```
+   * Block until the run finishes and return the terminal `RunResult`.
    */
   async wait(): Promise<RunResult> {
     if (this._result === null) {
-      // Drain without exposing messages to the caller
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       for await (const _ of this.stream()) {
         // discard
       }
     }
-    // Ensure any background POST has settled — surfaces _fail() results
-    // even if the SSE stream never produced a terminal `done` event.
     if (this._sendPromise) {
       await this._sendPromise;
     }
@@ -218,23 +265,22 @@ export class Run {
   /**
    * Request cancellation of the current run.
    *
-   * Sends `POST /sessions/:id/interrupt` to ask the server to stop the active
-   * agent turn as soon as possible.  The stream will eventually close with
-   * `status === "cancelled"`.  Best-effort — does not throw on network errors.
+   * HTTP: `POST /sessions/:id/interrupt`.
+   * CLI: SIGTERM the child process.
    */
   async cancel(): Promise<void> {
+    if (this._backend.kind === "cli") {
+      this._backend.handle.cancel();
+      return;
+    }
     try {
-      await this._http.post(`/sessions/${this.id}/interrupt`, {});
+      await this._backend.http.post(`/sessions/${this._id}/interrupt`, {});
     } catch {
-      // best-effort; stream will eventually time out or close naturally
+      // best-effort
     }
   }
 
-  // ── supports ─────────────────────────────────────────────────────────────
-
-  /**
-   * Check whether *operation* is supported for this run.
-   */
+  /** Check whether *operation* is supported for this run. */
   supports(operation: string): boolean {
     return ["stream", "messages", "iterText", "text", "wait", "cancel"].includes(
       operation,
@@ -278,7 +324,10 @@ function parseMessage(
   if (role === "user") {
     return {
       type: "user",
-      content: typeof contentRaw === "string" ? contentRaw : String(contentRaw ?? ""),
+      content:
+        typeof contentRaw === "string"
+          ? contentRaw
+          : String(contentRaw ?? ""),
       sessionId,
     };
   }

@@ -1,31 +1,31 @@
 """
 Recursive Agent SDK — Python client.
 
-Quick start::
+Claude Agent SDK–compatible ``query()`` (recommended)::
+
+    import asyncio
+    from recursive_sdk import query, ClaudeAgentOptions
+
+    async def main():
+        async for message in query(
+            prompt="list files in the project",
+            options=ClaudeAgentOptions(max_turns=5),
+        ):
+            if message.get("type") == "result":
+                print(message.get("result"))
+
+    asyncio.run(main())
+
+Session-style API (also available)::
 
     from recursive_sdk import Agent
-
-    # One-shot
-    result = Agent.prompt("list files in the project", base_url="http://localhost:3000")
-    print(result.status, result.finish_reason)
-
-    # Multi-turn with streaming
-    with Agent.create(base_url="http://localhost:3000") as agent:
-        run = agent.send("Fix test failures in src/")
-        for msg in run.messages():
-            if msg.type == "assistant":
-                print(msg.text(), end="", flush=True)
-        result = run.wait()
-
-    # Resume an existing session
-    with Agent.resume(session_id, base_url="http://localhost:3000") as agent:
-        run = agent.send("Continue from where you left off")
-        run.wait()
+    result = Agent.prompt("list files in the project")
 
 Environment variables:
 
-- ``RECURSIVE_BASE_URL`` — server URL (default: ``http://127.0.0.1:3000``)
-- ``RECURSIVE_API_KEY``  — API key (if the server has auth enabled)
+- ``RECURSIVE_BIN`` — path to the ``recursive`` binary (CLI transport)
+- ``RECURSIVE_BASE_URL`` — when set, ``Agent.*`` uses HTTP instead of CLI
+- ``RECURSIVE_API_KEY`` — API key (if the HTTP server has auth enabled)
 """
 
 from .agent import Agent
@@ -44,30 +44,27 @@ from .models import (
     UsageMeta,
     UserMessage,
 )
+from .query import ClaudeAgentOptions, Query, query
 from .run import Run
 
 __version__ = "0.6.0"
 
 __all__ = [
-    # Main entrypoint
+    "query",
+    "Query",
+    "ClaudeAgentOptions",
     "Agent",
-    # Run
     "Run",
     "RunResult",
-    # Message types
     "AssistantMessage",
     "UserMessage",
     "SystemMessage",
     "TextContent",
     "ToolUseBlock",
     "ToolResultBlock",
-    # SDK Phase B: tool execution progress
     "ToolProgressMessage",
-    # SDK Phase C: streaming token deltas
     "PartialAssistantMessage",
-    # Goal-168
     "GoalState",
-    # Misc
     "UsageMeta",
     "SessionInfo",
     "RecursiveAgentError",
