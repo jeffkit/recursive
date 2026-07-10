@@ -1,19 +1,35 @@
 # Goal: 为 Recursive agent 实现 ACP（Agent Client Protocol）协议支持
 
-## ⚠️ 已完成的 sprint（不要重做）
+## ⚠️ 已完成（不要重做）
 
-**全部 P0~P4 + sprint-1 CLI fix 已完成并 commit。**
+**全部 P0~P6 已完成并 commit，P7 收尾验证通过。**
 
-- ✅ **P0** ACP 协议类型层 — commit `4fb3ea2`
-- ✅ **P1** stdio JSON-RPC loop + initialize handshake — commit `257feba`
-- ✅ **P2+P3** session lifecycle + tool_call 通知 + ToolKind + 4b SSE abort wiring — commits `23f96fc` + `71012b3`
-- ✅ **Sprint-1 CLI fix**：`recursive acp` 接 LLM provider — commit `f02feb1`
-- ✅ **P4 (partial)** `session/cancel` handler + `synthesize_cancelled_tool_results` 桥方法 + AC-2.1 sandbox check 强化 — commit `0e5a1d4`
-  - **P4 剩余**：permission bridge (`session/request_permission` → `PermissionHook`) + AgentRuntime 把 cancel_token 传到 LLM stream 的实际端到端测试
+| Stage | Commit | 内容 |
+|------|------|------|
+| P0 | `4fb3ea2` | ACP 协议类型层（re-export `agent-client-protocol-schema`）|
+| P1 | `257feba` | stdio JSON-RPC loop + initialize handshake |
+| P2+P3 | `23f96fc` + `71012b3` | session lifecycle + tool_call 通知 + ToolKind + 4b SSE abort + AC-2.1 sandbox |
+| Sprint-1 CLI fix | `f02feb1` | `recursive acp` 接 LLM provider |
+| P4 partial | `0e5a1d4` | session/cancel + bridge synth failed notif |
+| P4+P5 | `28608fa` | permission bridge + session persistence |
+| **P5+P6** | **`56d63e7`** | **load/resume + editor fs + MCP multi-transport** |
 
-**planner 重新拆 sprint 时，sprint 1 应该从 P5（load/resume）开始**，不要再做 P0~P4。P4 剩余（permission bridge）已知的活可放进 P5/P6 一起做。
+**P7 收尾验证**（2026-07-10）：
 
-**`RECURSIVE_ACP_SANDBOX_STRICT=1` 在生产部署时记得设**。
+- ✅ `recursive acp` binary 能跑：`echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}' | recursive acp` 返回合法 7-key capabilities + `initialized` notification
+- ✅ invariants 35/35 test 全过（覆盖 AC-7.1「ACP 代码不往 run_inner 加分支」、AC-7.2「host fs 走 resolve_within」等）
+- ✅ e2e tests：01-acp-initialize.yaml + 02-session-persistence.yaml 存在
+- ✅ cargo test --workspace 1909 lib + 其他 crate 全过
+- ✅ cargo build / clippy / fmt 全干净
+
+**仍未验证**（需运行环境支持）：
+- e2e 实际跑通（需要 argusai + Docker + e2e.yaml 环境，本地无 setup）
+- TCP RST 集成测试（需要 mock HTTP server 跑 e2e 流程）
+
+**部署注意**：
+
+- `RECURSIVE_ACP_SANDBOX_STRICT=1` 生产必设——dev/test 默认 off（TempDir cwd 才能跑通）
+- `recursive acp` 启动需要 API key（`--api-key` 或 `RECURSIVE_API_KEY` env）
 
 ---
 
