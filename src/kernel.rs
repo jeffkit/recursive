@@ -300,11 +300,7 @@ impl AgentKernel {
         // (marked with `is_compaction_summary`) is inserted at position 0.
         // `inner.messages[input_len..]` would miss that summary, so detect
         // it and prepend.
-        let mut new_messages = if inner.messages.len() > input_len { // cargo-mutants::skip
-            inner.messages[input_len..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut new_messages = turn_delta_messages(&inner.messages, input_len);
         if !inner.messages.is_empty() && inner.messages[0].is_compaction_summary {
             new_messages.insert(0, inner.messages[0].clone());
         }
@@ -319,6 +315,17 @@ impl AgentKernel {
             tool_audits: inner.tool_audits,
             turn: ctx.turn,
         })
+    }
+}
+
+/// Messages produced after `input_len` in this turn. Soft-skipped: `>` vs `>=`
+/// is equivalent when lengths are equal (empty suffix slice).
+#[cfg_attr(test, mutants::skip)]
+fn turn_delta_messages(inner: &[crate::message::Message], input_len: usize) -> Vec<crate::message::Message> {
+    if inner.len() > input_len {
+        inner[input_len..].to_vec()
+    } else {
+        Vec::new()
     }
 }
 
