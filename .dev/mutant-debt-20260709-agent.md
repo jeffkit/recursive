@@ -24,8 +24,8 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 | File | Notes |
 |---|---|
 | `src/config.rs` | **gate-0** (2026-07-10 re-gate): 58 mutants → 57 caught / 0 missed / 1 unviable |
-| `src/config_file.rs` | trailing-newline + first-write pins added 2026-07-10; re-gate |
-| `src/kernel.rs` | compaction prepend + max_transcript_chars pins; equivalent skips on builder/slice; re-gate |
+| `src/config_file.rs` | **gate-0** (2026-07-10): 30 caught / 0 missed / 1 unviable |
+| `src/kernel.rs` | **gate-0** (2026-07-10): 20 caught / 0 missed / 6 unviable; `turn_delta_messages` + builder soft-skips |
 | `src/coordinator.rs` | **gate-0** (2026-07-10): 17 caught / 0 missed; `coordinator-mode` in agent-mutants FEATURES |
 | `src/hooks/mod.rs` | **gate-0** (2026-07-10): 14 caught / 0 missed / 2 unviable; Continue arm merged into `_` |
 | `src/lib.rs` | `truncate_str` `>→>=` extracted + `#[mutants::skip]` (equivalent) |
