@@ -30,6 +30,7 @@ cases:
     exec:
       container: recursive-e2e
       command: |
+        unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/rh-patch \
           recursive --workspace /workspace/test-patch \
             --api-base http://aimock:4010/v1 \

@@ -23,6 +23,7 @@ setup:
       command: |
         rm -rf /tmp/rh-search /tmp/sessions-search
         mkdir -p /tmp/rh-search /tmp/sessions-search
+        unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/rh-search \
           recursive --workspace /workspace/test-search \
             --api-base http://aimock:4010/v1 \

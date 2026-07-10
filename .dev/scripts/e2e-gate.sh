@@ -112,15 +112,37 @@ if ! _argus "$SESSION" argus-init --project-path "$E2E_PROJECT" >"$INIT_LOG" 2>&
   "$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
   exit 5
 fi
+# 0.14.1 生命周期为 init→build→setup→run→clean。`argus-build` 构建 service
+# 镜像，必须在 setup 之前；否则 setup 已把 session 推进到 running，build 会
+# 报 INVALID_STATE。build 失败不致命——既有镜像仍可用于 setup/run。
+_argus "$SESSION" argus-build --project-path "$E2E_PROJECT" 2>&1 | tail -3 || true
+
 _argus "$SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
 
+# 成功判定：必须 status=passed 且 totals.total>0 且 failed==0。
+# 单独 `grep '"passed"'` 不够——argusai 在「case 事件被丢弃」时会返回
+# status=passed / total=0 的假绿灯（曾因 e2e.yaml 套件 name 与 yaml 文件
+# name 不一致、事件按 name 归属被全丢而中招）。total>0 强制要求至少跑出
+# 一个 case，把假绿灯变成红灯。见 journal manual-20260710-argusai-0.14-upgrade。
+RUN_LOG="$(pwd)/.flowcast/runs/e2e-run-${SESSION}.log"
+mkdir -p "$(dirname "$RUN_LOG")"
+_argus "$SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" >"$RUN_LOG" 2>&1
 RC=1
-if _argus "$SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | grep -q '"passed"'; then
+if python3 -c '
+import sys, json
+raw = open(sys.argv[1]).read()
+i = raw.find("{")
+d = json.loads(raw[i:])
+data = d.get("data", {}) or {}
+t = data.get("totals", {}) or {}
+ok = data.get("status") == "passed" and t.get("total", 0) > 0 and t.get("failed", 0) == 0
+sys.exit(0 if ok else 1)
+' "$RUN_LOG" 2>/dev/null; then
   echo "[e2e-gate] smoke PASSED ✓"
   RC=0
 else
-  echo "[e2e-gate] smoke FAILED ✗" >&2
-  _argus "$SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" 2>&1 | tail -30 >&2
+  echo "[e2e-gate] smoke FAILED ✗ — see $RUN_LOG" >&2
+  tail -30 "$RUN_LOG" >&2
 fi
 
 _argus "$SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true

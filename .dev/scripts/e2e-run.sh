@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# e2e-run.sh — run a single argusai E2E suite in the current worktree,
-# encapsulating the setup → run → clean lifecycle so the caller never has
-# to remember the two traps that bite manual `argusai` CLI use:
+# e2e-run.sh — run a single argusai E2E suite via the MCP path
+# (mcp2cli → argusai-mcp), mirroring e2e-gate.sh's lifecycle.
 #
-#   1. `argusai run` does NOT auto-create the service container — it must be
-#      preceded by `argusai setup`. Running `argusai run` alone fails every
-#      case with "No such container: recursive-e2e".
-#   2. Setting WORKTREE_ID triggers namespace isolation (container renamed
-#      to `recursive-e2e-<ns>`), but suite YAMLs reference `container:
-#      recursive-e2e` — the CLI does not resolve the namespaced name, so
-#      cases 404. (The MCP path used by e2e-gate.sh DOES resolve it; this
-#      CLI wrapper deliberately leaves WORKTREE_ID unset for single-worktree
-#      dev use. For parallel worktree runs, use e2e-gate.sh / the flowcast
-#      flow instead.)
+# Why the MCP path and not the `argusai` CLI:
+#   The `argusai-cli` umbrella package is frozen at 0.12.3, which has a
+#   regression where `argusai run` does NOT execute setup `exec` commands
+#   (verified: a `sleep 8` in setup yields a 3s wall clock). The 0.14.1
+#   release — which carries the issue fixes — only ships `argusai-mcp` /
+#   `argusai-core` (no `argusai` CLI bin). So the working entry point is the
+#   MCP server, invoked here through mcp2cli.
+#
+# Lifecycle (argusai 0.14.1, 5 steps): init → build → setup → run → clean.
+#
+# Success = status:passed AND totals.total > 0 AND totals.failed == 0.
+# The total>0 guard rejects the false-green where argusai drops all case
+# events (e.g. when a suite's `name` in e2e.yaml doesn't match the `name`
+# in its yaml file — 0.14.1 attributes events by name, not id). Suite names
+# are kept aligned in e2e.yaml; see journal manual-20260710-argusai-0.14-upgrade.
 #
 # Usage:
 #   .dev/scripts/e2e-run.sh <suite-id> [--no-build]
 #
-# Exit code: 0 iff every case in the suite passed. `argusai run` always
-# exits 0 even on case failures, so the pass/fail is parsed from the
-# summary line.
+# Exit code: 0 iff the suite ran at least one case and every case passed.
 #
-# Prereqs: Docker + the `argusai` CLI on PATH.
+# Prereqs: Docker, mcp2cli on PATH, argusai-mcp installed (npm i -g argusai-mcp).
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-E2E_DIR="$REPO_ROOT/e2e"
+E2E_PROJECT="$REPO_ROOT/e2e"
 
 SUITE="${1:-}"
 NO_BUILD=0
@@ -34,49 +36,111 @@ NO_BUILD=0
 
 if [[ -z "$SUITE" ]]; then
   echo "usage: $0 <suite-id> [--no-build]" >&2
-  echo "e.g.   $0 claude-json-stream" >&2
+  echo "e.g.    $0 claude-json-stream" >&2
   exit 2
 fi
 
-if ! command -v argusai >/dev/null 2>&1; then
-  echo "[e2e-run] argusai CLI not found on PATH" >&2
-  exit 3
+# ---- resolve mcp2cli -------------------------------------------------------
+MCP2CLI=""
+for _c in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/homebrew/bin/mcp2cli"; do
+  [[ -x "$_c" ]] && { MCP2CLI="$_c"; break; }
+done
+[[ -n "$MCP2CLI" ]] || { echo "[e2e-run] mcp2cli not found (uv tool install mcp2cli)" >&2; exit 3; }
+
+# ---- resolve argusai-mcp entry (standalone → bundled → npx) ----------------
+ARGUSAI_MCP_BIN=""
+for _root in "$(npm root -g 2>/dev/null)" \
+    "$HOME/.local/share/fnm/node-versions"/*/installation/lib/node_modules; do
+  if [[ -f "$_root/argusai-mcp/dist/index.js" ]]; then
+    ARGUSAI_MCP_BIN="$_root/argusai-mcp/dist/index.js"; break
+  fi
+  if [[ -f "$_root/argusai-cli/node_modules/argusai-mcp/dist/index.js" ]]; then
+    ARGUSAI_MCP_BIN="$_root/argusai-cli/node_modules/argusai-mcp/dist/index.js"; break
+  fi
+done
+if [[ -n "$ARGUSAI_MCP_BIN" ]]; then
+  _MCP_STDIO_CMD="node $ARGUSAI_MCP_BIN"
+elif command -v npx >/dev/null 2>&1; then
+  _MCP_STDIO_CMD="npx argusai-mcp"
+else
+  echo "[e2e-run] argusai-mcp not found (npm i -g argusai-mcp)" >&2; exit 3
 fi
 
-# Never let a namespaced WORKTREE_ID leak in from the caller's env and break
-# the `container: recursive-e2e` references in suite YAMLs.
+# Single-worktree dev use: leave WORKTREE_ID unset so containers are named
+# `recursive-e2e` / `aimock` (matching the `container:` refs in suite YAMLs).
 unset WORKTREE_ID
 
-cd "$E2E_DIR"
+SESSION="e2e-run-$$"
 
-# Always clean any leftover environment first so a stale container from a
-# previous aborted run does not shadow a fresh one.
-argusai clean -c e2e.yaml >/dev/null 2>&1 || true
+# _argus: invoke an argusai MCP tool; return non-zero on tool-level failure
+# (mcp2cli returns exit 0 even when the JSON carries success:false).
+_argus() {
+  local out
+  out="$("$MCP2CLI" --session "$SESSION" "$@" 2>&1)"
+  local rc=$?
+  echo "$out"
+  if echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('success',True) else 1)" 2>/dev/null; then
+    return $rc
+  else
+    return 1
+  fi
+}
+
+cleanup() {
+  _argus argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+  "$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ---- lifecycle: init → build → setup → run → clean ------------------------
+"$MCP2CLI" --mcp-stdio "$_MCP_STDIO_CMD" --session-start "$SESSION" >/dev/null 2>&1
+
+if ! _argus argus-init --project-path "$E2E_PROJECT" >/dev/null 2>&1; then
+  echo "[e2e-run] argus-init failed" >&2; exit 5
+fi
 
 if [[ "$NO_BUILD" -eq 0 ]]; then
-  echo "[e2e-run] building image..."
-  argusai build -c e2e.yaml 2>&1 | tail -2 || { echo "[e2e-run] build failed" >&2; exit 4; }
+  echo "[e2e-run] build..."
+  _argus argus-build --project-path "$E2E_PROJECT" >/dev/null 2>&1 || echo "[e2e-run] build warned (continuing with existing image)" >&2
 fi
 
 echo "[e2e-run] setup..."
-argusai setup -c e2e.yaml 2>&1 | tail -2 || { echo "[e2e-run] setup failed" >&2; argusai clean -c e2e.yaml >/dev/null 2>&1 || true; exit 5; }
+if ! _argus argus-setup --project-path "$E2E_PROJECT" >/dev/null 2>&1; then
+  echo "[e2e-run] setup failed" >&2; exit 5
+fi
 
-# Run the suite and capture stdout for summary parsing (`argusai run` exits 0
-# even when cases fail).
-RUN_OUT="$(argusai run -c e2e.yaml -s "$SUITE" --timeout 180000 2>&1)"
-echo "$RUN_OUT" | tail -25
+echo "[e2e-run] run $SUITE..."
+RUN_OUT="$(_argus argus-run --project-path "$E2E_PROJECT" --filter "$SUITE" 2>&1)"
+echo "$RUN_OUT" | python3 -c '
+import sys, json
+raw = sys.stdin.read()
+i = raw.find("{")
+try:
+    d = json.loads(raw[i:])
+except Exception:
+    print("  (no JSON parsed)")
+    sys.exit(0)
+data = d.get("data", {}) or {}
+t = data.get("totals", {}) or {}
+status = data.get("status")
+print("  status=%s totals=%s" % (status, t))
+for s in data.get("suites", []):
+    print("  suite %s: passed=%s failed=%s skipped=%s" % (s.get("id"), s.get("passed"), s.get("failed"), s.get("skipped")))
+' 2>&1 || true
 
-# Always tear down so no container lingers to collide with the next run.
-argusai clean -c e2e.yaml >/dev/null 2>&1 || true
-
-# Parse the summary line: "Summary: N passed, M failed, K skipped".
-SUMMARY="$(echo "$RUN_OUT" | rg '^Summary:' | tail -1)"
-FAILED="$(echo "$SUMMARY" | rg -o '[0-9]+ failed' | head -1 | rg -o '^[0-9]+' || echo 0)"
-
-if [[ "$FAILED" -eq 0 ]]; then
+# Success: ran at least one case (total>0) with zero failures.
+if echo "$RUN_OUT" | python3 -c '
+import sys, json
+raw = sys.stdin.read()
+i = raw.find("{")
+d = json.loads(raw[i:])
+data = d.get("data", {}) or {}
+t = data.get("totals", {}) or {}
+sys.exit(0 if (data.get("status") == "passed" and t.get("total", 0) > 0 and t.get("failed", 0) == 0) else 1)
+' 2>/dev/null; then
   echo "[e2e-run] $SUITE PASSED ✓"
   exit 0
 else
-  echo "[e2e-run] $SUITE FAILED ✗ ($FAILED case(s))" >&2
+  echo "[e2e-run] $SUITE FAILED ✗" >&2
   exit 1
 fi

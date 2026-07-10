@@ -49,15 +49,15 @@ mocks:
 
 tests:
   suites:
-    - name: "Smoke Gate (self-improve)"
+    - name: "Self-Improve Smoke Gate"
       id: smoke
       file: tests/00-smoke.yaml
 
-    - name: "Basic Agent Tools"
+    - name: "Basic Agent Tool Usage"
       id: basic
       file: tests/01-basic-tools.yaml
 
-    - name: "Session Persistence"
+    - name: "Session JSONL Persistence"
       id: session
       file: tests/02-session-persistence.yaml
 
@@ -77,15 +77,15 @@ tests:
       id: live
       file: tests/06-live-integration.yaml
 
-    - name: "LLM-as-Judge"
+    - name: "LLM-as-Judge (Mock Agent + Real Judge)"
       id: judge
       file: tests/07-llm-judge.yaml
 
-    - name: "HTTP API Server (AgentRuntime)"
+    - name: "HTTP API Server (AgentRuntime, port 9090)"
       id: http-api
       file: tests/08-http-api.yaml
 
-    - name: "HTTP API Rate Limit"
+    - name: "HTTP API Server — Rate Limit (port 9091)"
       id: http-rate-limit
       file: tests/08b-http-rate-limit.yaml
 
@@ -97,39 +97,39 @@ tests:
       id: loop
       file: tests/10-loop-mode.yaml
 
-    - name: "Session Resume"
+    - name: "Session Resume (continue interrupted runs)"
       id: resume
       file: tests/11-session-resume.yaml
 
-    - name: "Hooks Lifecycle"
+    - name: "Hooks Lifecycle (PreToolCall / PostToolCall)"
       id: hooks
       file: tests/12-hooks.yaml
 
-    - name: "apply_patch Tool"
+    - name: "In-place file modification (read then write)"
       id: apply-patch
       file: tests/13-apply-patch.yaml
 
-    - name: "MCP Stdio Server"
+    - name: "MCP Stdio Server (recursive serve)"
       id: mcp-serve
       file: tests/14-mcp-serve.yaml
 
-    - name: "search_files Tool"
+    - name: "search_files tool (pattern search across workspace)"
       id: search-files
       file: tests/15-search-files.yaml
 
-    - name: "Skill Lazy Load"
+    - name: "Skill lazy loading via load_skill tool"
       id: skill-lazy-load
       file: tests/16-skill-lazy-load.yaml
 
-    - name: "Loop Mode — schedule_wakeup multi-turn"
+    - name: "Loop mode — schedule_wakeup triggers a second turn"
       id: loop-schedule
       file: tests/17-loop-mode.yaml
 
-    - name: "Goal Loop API (Goal-168)"
+    - name: "Goal loop API — set / get / clear goal on a session"
       id: goal-loop
       file: tests/18-goal-loop.yaml
 
-    - name: "HTTP Interrupt endpoint (Goal-170)"
+    - name: "HTTP API Interrupt endpoint"
       id: http-interrupt
       file: tests/19-http-interrupt.yaml
 
@@ -141,11 +141,11 @@ tests:
       id: typescript-sdk
       file: tests/21-typescript-sdk.yaml
 
-    - name: "Context compaction multi-turn"
+    - name: "Context compaction e2e test"
       id: compaction
       file: tests/22-compaction.yaml
 
-    - name: "Deferred Tool Loading (Real LLM)"
+    - name: "Deferred Tool Loading — Real LLM Validation"
       id: deferred-tool-loading
       file: tests/23-deferred-tool-loading.yaml
 
@@ -163,11 +163,11 @@ tests:
       id: facts-memory
       file: tests/26-facts-memory.yaml
 
-    - name: "TodoWrite Tool (agent task list)"
+    - name: "TodoWrite Tool (agent task list management)"
       id: todo-tool
       file: tests/27-todo-tool.yaml
 
-    - name: "Episodic Recall (cross-session search)"
+    - name: "Episodic Recall Tool (cross-session transcript search)"
       id: episodic-recall
       file: tests/28-episodic-recall.yaml
 
@@ -191,7 +191,7 @@ tests:
       id: permissions
       file: tests/35-permissions.yaml
 
-    - name: "Session Rewind (sessions rewind CLI)"
+    - name: "Session Rewind CLI"
       id: session-rewind
       file: tests/36-session-rewind.yaml
 
@@ -199,6 +199,6 @@ tests:
       id: http-auth
       file: tests/39-http-auth.yaml
 
-    - name: "Claude JSON stream + control channel"
+    - name: "Claude-compatible JSON stream + control channel"
       id: claude-json-stream
       file: tests/40-claude-json-stream.yaml

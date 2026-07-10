@@ -19,6 +19,7 @@ setup:
     exec:
       container: recursive-e2e
       command: |
+        unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/rh-hooks \
           recursive --workspace /workspace/test-hooks \
             --api-base http://aimock:4010/v1 \
