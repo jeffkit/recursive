@@ -120,10 +120,13 @@ _argus "$SESSION" argus-build --project-path "$E2E_PROJECT" 2>&1 | tail -3 || tr
 _argus "$SESSION" argus-setup --project-path "$E2E_PROJECT" 2>&1 | tail -3
 
 # 成功判定：必须 status=passed 且 totals.total>0 且 failed==0。
-# 单独 `grep '"passed"'` 不够——argusai 在「case 事件被丢弃」时会返回
+# 单独 `grep '"passed"'` 不够——argusai 0.14.1 在「case 事件被丢弃」时会返回
 # status=passed / total=0 的假绿灯（曾因 e2e.yaml 套件 name 与 yaml 文件
-# name 不一致、事件按 name 归属被全丢而中招）。total>0 强制要求至少跑出
-# 一个 case，把假绿灯变成红灯。见 journal manual-20260710-argusai-0.14-upgrade。
+# name 不一致、事件按 name 归属被全丢而中招；issue #8）。
+# 0.14.2 已修复：事件打稳定 suiteId、按 id 归集、空归集记失败，name 不再
+# 需要一致（e2e.yaml 仍保持与文件 name 对齐，作为约定）。total>0 guard 保留
+# 作 defense-in-depth——上游的「空归集=失败」与本地 guard 双保险。
+# 见 journal manual-20260710-argusai-0.14-upgrade、manual-20260710-argusai-0142-followup。
 RUN_LOG="$(pwd)/.flowcast/runs/e2e-run-${SESSION}.log"
 mkdir -p "$(dirname "$RUN_LOG")"
 _argus "$SESSION" argus-run --project-path "$E2E_PROJECT" --filter "smoke" >"$RUN_LOG" 2>&1

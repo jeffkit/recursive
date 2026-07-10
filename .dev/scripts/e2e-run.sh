@@ -10,13 +10,17 @@
 #   `argusai-core` (no `argusai` CLI bin). So the working entry point is the
 #   MCP server, invoked here through mcp2cli.
 #
-# Lifecycle (argusai 0.14.1, 5 steps): init → build → setup → run → clean.
+# Lifecycle (argusai 0.14.2, 5 steps): init → build → setup → run → clean.
 #
 # Success = status:passed AND totals.total > 0 AND totals.failed == 0.
 # The total>0 guard rejects the false-green where argusai drops all case
-# events (e.g. when a suite's `name` in e2e.yaml doesn't match the `name`
-# in its yaml file — 0.14.1 attributes events by name, not id). Suite names
-# are kept aligned in e2e.yaml; see journal manual-20260710-argusai-0.14-upgrade.
+# events. 0.14.1 attributed case events by suite `name` (issue #8), so a
+# mismatch between e2e.yaml `name` and the suite yaml `name` silently dropped
+# every case → status=passed/total=0. 0.14.2 fixes this: events carry a stable
+# `suiteId` (from e2e.yaml `id`) and empty aggregation is recorded as failure.
+# e2e.yaml names are still kept aligned with their files as a convention, but
+# it is no longer load-bearing. The total>0 guard stays as defense-in-depth.
+# See journal manual-20260710-argusai-0.14-upgrade + -0142-followup.
 #
 # Usage:
 #   .dev/scripts/e2e-run.sh <suite-id> [--no-build]

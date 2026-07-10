@@ -17,8 +17,12 @@ description: |
     3. `--input-format stream-json` accepts a follow-up `type: user` message
        on stdin that drives a second turn (the bidirectional control
        channel's inbound-user-message path). The follow-up is proven
-       consumed by the result's `num_turns` rising from 2 (single turn) to
-       3 (goal turn + follow-up turn).
+       consumed by (a) a distinct assistant answer ("I just created
+       greet.txt...") and (b) the stream emitting a second `result` event
+       for the follow-up turn. NOTE: in stream-json mode each turn ends
+       with its own `result` event whose `num_turns` reports THAT turn's
+       step count (not a cumulative run-wide turn count), so multi-turn
+       is detected by counting `result` events, not by a rising num_turns.
 
   The `Write` tool is auto-allowed in the e2e container (no `can_use_tool`
   prompt fires), so stdin can be closed immediately. NOT an HTTP suite — no
@@ -142,10 +146,12 @@ cases:
     expect:
       exitCode: 0
 
-  - name: "multiturn: result num_turns rose to 3 (goal turn + follow-up turn)"
+  - name: "multiturn: a second result event proves the follow-up turn ran"
     exec:
       container: recursive-e2e
-      command: grep -q '"num_turns":3' /workspace/cj-multi.jsonl
+      command: |
+        n=$(grep -c '"type":"result"' /workspace/cj-multi.jsonl)
+        [ "$n" -ge 2 ] && echo "result events=$n"
     expect:
       exitCode: 0
 
