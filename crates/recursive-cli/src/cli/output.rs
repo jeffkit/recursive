@@ -356,8 +356,7 @@ impl JsonEventTask {
             }
             Self::Single { drain, emitter } => {
                 drain.await.ok();
-                let result =
-                    emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
+                let result = emitter.build_result(finish, final_text, usage, llm_latency_ms, steps);
                 emit_json_line(&result, bridge).await;
             }
             Self::Stream { handle } => {
