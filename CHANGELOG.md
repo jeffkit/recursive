@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.8.0
+
+190 commits since 0.7.0. Highlights:
+
+### Features
+- **AG-UI interrupt/resume** (Pattern 2 HITL): pause agent runs for human
+  approval and resume from the same session state.
+- **CLI Claude Code JSON alignment**: `--output-format json` with
+  bidirectional control channel for programmatic embedding.
+- **SDK `query()` alignment**: subprocess CLI turn results match the
+  control-channel protocol.
+- **`config.toml`**: file-based config for search, stuck-detection, and
+  limits sections (alongside existing env vars).
+- **WebSearch zero-config fallback**: DuckDuckGo/Bing HTML scrape when no
+  API key is configured.
+- **TUI loop driver**: event-driven `/loop` with enforced `max_turns` cap;
+  slash menu loads real skills from disk.
+
+### Architecture & reliability
+- Run-inner refactor: extracted step helpers from `RunCore::run_inner`
+  (check_shutdown, enforce_transcript_budget, drain_mailbox, etc.).
+- `SessionLifecycle` + documented lock hierarchy in runtime.
+- Hard step cap (P3-1) and monotonic sequence numbers (P3-2) for
+  multi-agent runs.
+- Self-improve flow: agentic fix-loop replaces hard rollback; optional
+  `--hitl ilink` backend for human-in-the-loop gates.
+- Eliminated 6 flaky test failures; expanded mutation-test baseline
+  across core, TUI, and tools.
+
+### TUI & platform
+- Windows CI fixes for recursive-tui tests; symlink handling in skill
+  command tests.
+- Mutation-test debt cleared across command_menu, markdown, modal, chat,
+  completion, and related modules.
+
+### Dev & E2E
+- ArgusAI 0.14.x adoption with hardened E2E gate and MCP run path.
+- Clippy lints surfaced to the self-improve agent for in-run fixes.
+
 ## 0.7.0
 
 The "workspace split" release — 805 commits since 0.6.0. Highlights:
