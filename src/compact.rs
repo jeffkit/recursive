@@ -17,7 +17,20 @@ use crate::message::Message;
 pub struct Compactor {
     /// Character-count threshold above which compaction is triggered.
     /// Defaults to `usize::MAX` (disabled).
+    ///
+    /// This estimate is reliable for English content (~4 chars/token) but
+    /// underestimates token density in CJK languages. When actual
+    /// `prompt_tokens` from the API are available, `threshold_prompt_tokens`
+    /// is checked first and takes priority.
     pub threshold_chars: usize,
+    /// Token-count threshold: if the last turn's `prompt_tokens` from the
+    /// API response meets or exceeds this value, compaction is triggered.
+    ///
+    /// When `Some` and the last prompt_tokens is non-zero, this check takes
+    /// priority over `threshold_chars`. This eliminates the 4-char/token
+    /// assumption that fails for CJK content. Set to `None` to rely solely
+    /// on the char-based heuristic.
+    pub threshold_prompt_tokens: Option<u32>,
     /// Number of most-recent messages to keep verbatim during compaction.
     pub keep_recent_n: usize,
 }
@@ -26,6 +39,7 @@ impl Default for Compactor {
     fn default() -> Self {
         Self {
             threshold_chars: usize::MAX,
+            threshold_prompt_tokens: None,
             keep_recent_n: 8,
         }
     }
@@ -36,8 +50,19 @@ impl Compactor {
     pub fn new(threshold_chars: usize) -> Self {
         Self {
             threshold_chars,
+            threshold_prompt_tokens: None,
             keep_recent_n: 8,
         }
+    }
+
+    /// Set the token-count threshold for compaction.
+    ///
+    /// When the last turn's `prompt_tokens` (from the API response) meets or
+    /// exceeds this value, compaction is triggered instead of relying on the
+    /// character-count estimate. Prefer this for non-English workloads.
+    pub fn threshold_prompt_tokens(mut self, n: u32) -> Self {
+        self.threshold_prompt_tokens = Some(n);
+        self
     }
 
     /// Set the number of recent messages to preserve verbatim.
@@ -421,6 +446,7 @@ mod tests {
     fn default_threshold_is_max() {
         let c = Compactor::default();
         assert_eq!(c.threshold_chars, usize::MAX);
+        assert_eq!(c.threshold_prompt_tokens, None);
         assert_eq!(c.keep_recent_n, 8);
     }
 
@@ -428,7 +454,16 @@ mod tests {
     fn builder_methods_work() {
         let c = Compactor::new(500).keep_recent_n(4);
         assert_eq!(c.threshold_chars, 500);
+        assert_eq!(c.threshold_prompt_tokens, None);
         assert_eq!(c.keep_recent_n, 4);
+    }
+
+    #[test]
+    fn threshold_prompt_tokens_setter_works() {
+        let c = Compactor::new(500_000).threshold_prompt_tokens(144_000);
+        assert_eq!(c.threshold_chars, 500_000);
+        assert_eq!(c.threshold_prompt_tokens, Some(144_000));
+        assert_eq!(c.keep_recent_n, 8);
     }
 
     // ========================================================================

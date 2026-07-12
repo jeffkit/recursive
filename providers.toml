@@ -79,6 +79,10 @@ provider_type = "openai"
 api_base = "https://open.bigmodel.cn/api/paas/v4"
 default_model = "glm-4.7"
 models = [
+  {name = "glm-5.2",        context_window = 200000, pricing = {input_per_million = 1.00, output_per_million = 3.20}},
+  {name = "z-ai/glm-5.2",  context_window = 200000, pricing = {input_per_million = 1.00, output_per_million = 3.20}},
+  {name = "glm-5.2[1m]",           context_window = 1000000, pricing = {input_per_million = 1.00, output_per_million = 3.20}},
+  {name = "z-ai/glm-5.2[1m]",      context_window = 1000000, pricing = {input_per_million = 1.00, output_per_million = 3.20}},
   {name = "glm-5",       context_window = 200000, pricing = {input_per_million = 1.00, output_per_million = 3.20}},
   {name = "glm-4.7",     context_window = 200000, pricing = {input_per_million = 0.60, output_per_million = 2.20}},
   {name = "glm-4.7-flash", context_window = 203000, pricing = {input_per_million = 0.00, output_per_million = 0.00}},

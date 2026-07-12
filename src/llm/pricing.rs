@@ -118,12 +118,35 @@ pub fn context_window_tokens_for_model(model: &str) -> usize {
 /// 3. Take 80 % of the remainder as the trigger point (leaves a comfortable
 ///    20 % buffer before the hard limit is hit).
 /// 4. Convert tokens → characters using a conservative 4 chars/token ratio.
+///
+/// **Limitation**: the 4 chars/token ratio works well for English but
+/// significantly underestimates token density in CJK languages (~1 char ≈
+/// 2-3 tokens). Prefer [`default_compact_threshold_tokens`] when actual
+/// prompt-token counts are available from the API response.
 pub fn default_compact_threshold_chars(model: &str) -> usize {
     let context_tokens = context_window_tokens_for_model(model);
     let reserved_for_summary = 20_000_usize.min(context_tokens / 4);
     let effective_tokens = context_tokens.saturating_sub(reserved_for_summary);
     // 80 % of effective window, then 4 chars per token.
     (effective_tokens as f64 * 0.8 * 4.0) as usize
+}
+
+/// Compute the default compaction token threshold for a model.
+///
+/// Uses the same 80 % / reserve-for-summary strategy as
+/// [`default_compact_threshold_chars`] but returns the raw token count
+/// instead of converting to characters. This threshold is more reliable
+/// than the character-based one for non-English content where the
+/// 4-char/token assumption breaks down (e.g. CJK text uses ~1 char/token).
+///
+/// When actual `prompt_tokens` data is available from the API response,
+/// comparing against this threshold is preferred over the char estimate.
+pub fn default_compact_threshold_tokens(model: &str) -> u32 {
+    let context_tokens = context_window_tokens_for_model(model);
+    let reserved_for_summary = 20_000_usize.min(context_tokens / 4);
+    let effective_tokens = context_tokens.saturating_sub(reserved_for_summary);
+    // 80 % of effective window.
+    (effective_tokens as f64 * 0.8) as u32
 }
 
 /// Returns pricing for a model by looking it up in the **effective** preset
@@ -359,5 +382,40 @@ mod tests {
     fn compact_threshold_is_positive() {
         let t = default_compact_threshold_chars("gpt-4o");
         assert!(t > 0, "compact threshold must be positive for any model");
+    }
+
+    // ── default_compact_threshold_tokens ────────────────────────────────────
+
+    #[test]
+    fn compact_threshold_tokens_unknown_model_uses_fallback_128k() {
+        let threshold = default_compact_threshold_tokens("unknown-xyz");
+        // 128_000 - min(20_000, 32_000)=20_000 → 108_000 * 0.8 = 86_400
+        assert_eq!(threshold, 86_400);
+    }
+
+    #[test]
+    fn compact_threshold_tokens_glm5_2_uses_200k_window() {
+        let threshold = default_compact_threshold_tokens("z-ai/glm-5.2");
+        // 200_000 - min(20_000, 50_000)=20_000 → 180_000 * 0.8 = 144_000
+        assert_eq!(threshold, 144_000);
+    }
+
+    #[test]
+    fn compact_threshold_tokens_glm5_2_1m_uses_1m_window() {
+        let threshold = default_compact_threshold_tokens("z-ai/glm-5.2[1m]");
+        // 1_000_000 - min(20_000, 250_000)=20_000 → 980_000 * 0.8 = 784_000
+        assert_eq!(threshold, 784_000);
+    }
+
+    #[test]
+    fn compact_threshold_tokens_is_less_than_context_window() {
+        for model in &["gpt-4o", "z-ai/glm-5.2", "deepseek-chat", "unknown-xyz"] {
+            let window = context_window_tokens_for_model(model);
+            let threshold = default_compact_threshold_tokens(model) as usize;
+            assert!(
+                threshold < window,
+                "token threshold {threshold} must be below context window {window} for {model}"
+            );
+        }
     }
 }

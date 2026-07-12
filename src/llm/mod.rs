@@ -35,8 +35,8 @@ pub use chat::{
 // ── Re-exports: pricing ───────────────────────────────────────────────────────
 
 pub use pricing::{
-    context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, ModelPricing,
-    RetryPolicy,
+    context_window_tokens_for_model, default_compact_threshold_chars,
+    default_compact_threshold_tokens, pricing_for, ModelPricing, RetryPolicy,
 };
 
 // ── Re-exports: provider implementations ─────────────────────────────────────

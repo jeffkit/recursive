@@ -271,14 +271,39 @@ impl AgentRuntime {
         });
         self.append_user_message(&user_text).await;
 
-        let turn_outcome = self.execute_kernel_turn().await?;
+        let turn_outcome = match self.execute_kernel_turn().await {
+            Ok(outcome) => outcome,
+            Err(e) if is_context_window_exceeded(&e) => {
+                // The LLM rejected the request because the transcript exceeded its
+                // context window.  Try to compact in-place (bypassing the normal
+                // threshold gate) and retry the turn once before propagating.
+                // The user message is already at the tail of `self.transcript`, so
+                // after compaction the shorter transcript still ends with it.
+                tracing::warn!(
+                    target: "recursive::agent",
+                    error = %e,
+                    "context window exceeded; attempting emergency compaction before retry"
+                );
+                if self.compact_on_overflow().await? {
+                    self.execute_kernel_turn().await?
+                } else {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        };
         self.emit_turn_messages(&turn_outcome).await;
         // Goal 289: cross-turn compaction runs AFTER the turn so the
         // threshold check sees the full turn's growth (user + assistant +
         // tool messages) rather than the pessimistic pre-turn size. One
         // pass per turn covers the entire growth instead of firing
         // reactively at the start of every turn.
-        self.maybe_compact_cross_turn().await?;
+        //
+        // Pass the actual prompt_tokens from the API response so the
+        // token-based threshold check (more accurate than the char estimate
+        // for CJK content) can be used when data is available.
+        self.maybe_compact_cross_turn(turn_outcome.usage.prompt_tokens)
+            .await?;
 
         let outcome: RuntimeOutcome = turn_outcome.into();
 
@@ -338,14 +363,26 @@ impl AgentRuntime {
     /// The compaction summary is emitted as `MessageAppended` so it lands in the
     /// on-disk jsonl. A `CompactionBoundary` event (g157) lets the reader skip
     /// pre-compaction messages on resume.
-    async fn maybe_compact_cross_turn(&mut self) -> Result<()> {
+    ///
+    /// `last_prompt_tokens` is the actual prompt token count reported by the API
+    /// for the turn that just completed. When non-zero and
+    /// `compactor.threshold_prompt_tokens` is set, the token-based check takes
+    /// priority over the character estimate (more reliable for CJK content where
+    /// the 4-char/token assumption significantly underestimates token density).
+    async fn maybe_compact_cross_turn(&mut self, last_prompt_tokens: u32) -> Result<()> {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        let chars = Compactor::estimate_chars(&self.transcript);
-        if chars < compactor.threshold_chars {
+        // Prefer the token-based threshold when actual API usage data is
+        // available; fall back to the character estimate otherwise.
+        let should_compact = match (compactor.threshold_prompt_tokens, last_prompt_tokens) {
+            (Some(token_threshold), actual) if actual > 0 => actual >= token_threshold,
+            _ => Compactor::estimate_chars(&self.transcript) >= compactor.threshold_chars,
+        };
+        if !should_compact {
             return Ok(());
         }
+        let chars = Compactor::estimate_chars(&self.transcript);
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: chars,
         });
@@ -381,6 +418,66 @@ impl AgentRuntime {
                 .await;
         }
         Ok(())
+    }
+
+    /// Force compact the transcript regardless of the configured threshold.
+    ///
+    /// Called when the LLM returns a context-window-exceeded error. Because
+    /// the turn already failed we have no `prompt_tokens` reading; we bypass
+    /// the threshold check entirely and compact immediately.
+    ///
+    /// Returns `true` when compaction succeeded (the transcript was long enough),
+    /// `false` when the transcript was too short to compact or no compactor is
+    /// configured. A `false` return means the caller should propagate the
+    /// original error rather than retrying.
+    async fn compact_on_overflow(&mut self) -> Result<bool> {
+        let Some(ref compactor) = self.compactor else {
+            return Ok(false);
+        };
+        let chars = Compactor::estimate_chars(&self.transcript);
+        self.kernel.hooks().dispatch(HookEvent::PreCompact {
+            transcript_len: chars,
+        });
+        let turn = self
+            .checkpoints
+            .turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let Some((removed, summary_chars)) = compactor
+            .apply_to_transcript(
+                self.kernel.llm().as_ref(),
+                Arc::make_mut(&mut self.transcript),
+                turn,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.kernel.hooks().dispatch(HookEvent::PostCompact {
+            removed,
+            summary_chars,
+        });
+        self.event_sink
+            .emit(AgentEvent::CompactionBoundary {
+                turn: turn as u32,
+                compacted_count: removed,
+                summary_uuid: None,
+            })
+            .await;
+        if let Some(summary) = self.transcript.first().cloned() {
+            self.event_sink
+                .emit(AgentEvent::MessageAppended {
+                    message: summary,
+                    usage: None,
+                })
+                .await;
+        }
+        tracing::info!(
+            target: "recursive::agent",
+            removed,
+            summary_chars,
+            "emergency compaction complete; retrying turn"
+        );
+        Ok(true)
     }
 
     /// Build a `TurnContext`, run the kernel, and return the outcome.
@@ -1337,6 +1434,40 @@ impl AgentRuntimeBuilder {
             session: SessionLifecycle::open(),
             goal_eval_transcript_tail: self.goal_eval_transcript_tail,
         })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Context-window overflow detection
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Return `true` when `err` looks like an LLM context-window-exceeded error.
+///
+/// OpenAI-compatible providers (GLM, DeepSeek, …) return HTTP 400 whose body
+/// contains an error code or human-readable message indicating the prompt is
+/// too long. We match several common patterns across providers:
+///
+/// | Provider | Typical signal |
+/// |---|---|
+/// | OpenAI / NIM | `"context_length_exceeded"` (error `code`) |
+/// | OpenAI / NIM | `"maximum context length"` (human message) |
+/// | Some providers | `"context window"` |
+/// | DeepSeek | `"prompt is too long"` |
+/// | Some providers | `"tokens exceeds"` |
+///
+/// The function intentionally casts to lowercase before matching so it is
+/// resilient to capitalisation differences across providers.
+fn is_context_window_exceeded(err: &crate::error::Error) -> bool {
+    if let crate::error::Error::Llm { message, .. } = err {
+        let msg = message.to_lowercase();
+        msg.contains("context_length_exceeded")
+            || msg.contains("maximum context length")
+            || msg.contains("context window")
+            || msg.contains("prompt is too long")
+            || msg.contains("tokens exceeds")
+            || msg.contains("exceeds the model")
+    } else {
+        false
     }
 }
 
@@ -2913,6 +3044,194 @@ mod tests {
             "set_event_sink MUST re-register TodoWriteTool — this side effect is \
              load-bearing for the TUI/CLI/HTTP sink-swap flows; removing it would \
              silently drop TodoUpdated events on the new sink."
+        );
+    }
+
+    // ── is_context_window_exceeded ──────────────────────────────────────────
+
+    #[test]
+    fn context_overflow_detector_matches_known_patterns() {
+        let cases = [
+            // OpenAI / NVIDIA NIM error code
+            "HTTP 400: {\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}",
+            // OpenAI human message
+            "HTTP 400: This model's maximum context length is 200000 tokens, however you requested 201234",
+            // Generic phrasing
+            "HTTP 400: prompt is too long for the model",
+            "HTTP 400: tokens exceeds model limit",
+            "HTTP 400: exceeds the model context window",
+        ];
+        for msg in &cases {
+            let err = crate::error::Error::Llm {
+                provider: "test".into(),
+                message: msg.to_string(),
+            };
+            assert!(
+                is_context_window_exceeded(&err),
+                "should detect context overflow in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_overflow_detector_ignores_unrelated_errors() {
+        let cases = [
+            "HTTP 400: invalid request body",
+            "HTTP 401: unauthorized",
+            "HTTP 429: rate limit exceeded",
+            "network error: connection refused",
+        ];
+        for msg in &cases {
+            let err = crate::error::Error::Llm {
+                provider: "test".into(),
+                message: msg.to_string(),
+            };
+            assert!(
+                !is_context_window_exceeded(&err),
+                "should NOT detect context overflow in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_overflow_detector_ignores_non_llm_errors() {
+        let err = crate::error::Error::Timeout {
+            duration_ms: 30_000,
+        };
+        assert!(!is_context_window_exceeded(&err));
+        let err = crate::error::Error::Config {
+            message: "context_length_exceeded".into(),
+        };
+        assert!(
+            !is_context_window_exceeded(&err),
+            "Config errors must not be detected even if they contain the keyword"
+        );
+    }
+
+    // ── compact_on_overflow ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn compact_on_overflow_compacts_long_transcript() {
+        let summary_resp = Completion {
+            content: "Summary of prior conversation.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        };
+        let llm = Arc::new(MockProvider::new(vec![summary_resp]));
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .compactor(crate::Compactor::new(usize::MAX))
+            .build()
+            .unwrap();
+
+        // Populate a transcript long enough for compaction (> keep_recent_n + 2).
+        let msgs: Vec<crate::message::Message> = (0..14)
+            .map(|i| {
+                if i % 2 == 0 {
+                    crate::message::Message::user(format!("msg {i}"))
+                } else {
+                    crate::message::Message::assistant(format!("reply {i}"))
+                }
+            })
+            .collect();
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+        let before = rt.transcript.len();
+
+        let compacted = rt.compact_on_overflow().await.unwrap();
+        assert!(compacted, "should return true when compaction ran");
+        assert!(
+            rt.transcript.len() < before,
+            "transcript must shrink after compaction"
+        );
+        assert_eq!(
+            rt.transcript[0].role,
+            crate::message::Role::System,
+            "first message after compaction is the summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_on_overflow_returns_false_without_compactor() {
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+        let ok = rt.compact_on_overflow().await.unwrap();
+        assert!(!ok, "no compactor → must return false");
+    }
+
+    /// Context-overflow error recovery integration test.
+    ///
+    /// Scenario:
+    ///   1. Agent transcript is long (14 msgs, enough to compact).
+    ///   2. First LLM call fails with a `context_length_exceeded` error.
+    ///   3. `compact_on_overflow` fires: summarises older messages (uses
+    ///      scripted completion [0] for the summary).
+    ///   4. Retry uses scripted completion [1] and succeeds.
+    #[tokio::test]
+    async fn context_overflow_triggers_compact_and_retry() {
+        let overflow_err = crate::error::Error::Llm {
+            provider: "test-model".into(),
+            message: "HTTP 400: {\"error\":{\"code\":\"context_length_exceeded\",\
+                      \"message\":\"maximum context length is 200000 tokens\"}}"
+                .into(),
+        };
+        let llm = Arc::new(
+            MockProvider::new(vec![
+                // [0] compaction summary
+                Completion {
+                    content: "Prior conversation summary for test.".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                // [1] agent reply after successful retry
+                Completion {
+                    content: "Reply after emergency compaction.".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ])
+            .with_errors(vec![overflow_err]),
+        );
+
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .compactor(crate::Compactor::new(usize::MAX))
+            .build()
+            .unwrap();
+
+        // Pre-populate transcript (> keep_recent_n + 2 = 10) so compaction can run.
+        let msgs: Vec<Message> = (0..14)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("prior msg {i}"))
+                } else {
+                    Message::assistant(format!("prior reply {i}"))
+                }
+            })
+            .collect();
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+
+        let outcome = rt.run("test: overflow recovery").await.unwrap();
+        assert_eq!(
+            outcome.final_text.as_deref(),
+            Some("Reply after emergency compaction."),
+            "run() must return the retry's reply"
+        );
+
+        // After recovery, the transcript's first message should be the compaction summary.
+        assert_eq!(
+            rt.transcript[0].role,
+            crate::message::Role::System,
+            "transcript must start with compaction summary after overflow recovery"
+        );
+        assert!(
+            rt.transcript[0].is_compaction_summary,
+            "summary message must be flagged as compaction_summary"
         );
     }
 }

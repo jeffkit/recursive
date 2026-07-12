@@ -471,7 +471,14 @@ pub(crate) async fn build_runtime(
             }
         };
     if let Some(n) = compact_threshold {
-        builder = builder.compactor(recursive::Compactor::new(n));
+        // Also set the token-based threshold derived from the model's context
+        // window. This threshold takes priority over the char estimate when
+        // actual prompt_tokens are available from the API response, which is
+        // more reliable for CJK content where the 4-char/token assumption
+        // significantly underestimates actual token density.
+        let token_threshold = recursive::llm::default_compact_threshold_tokens(&config.model);
+        builder = builder
+            .compactor(recursive::Compactor::new(n).threshold_prompt_tokens(token_threshold));
     }
     if hook_timing {
         use recursive::hooks::HookRegistry;
