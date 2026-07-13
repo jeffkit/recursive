@@ -1,24 +1,32 @@
 {
-  "_comment": "Fixtures for 17-loop-mode.yaml — schedule_wakeup multi-turn loop. Turn 0 schedules a wakeup; wakeup turn writes the output file.",
+  "_comment": "Fixtures for 17-loop-mode.yaml — schedule_wakeup multi-turn loop. Turn 1 ONLY schedules a wakeup and ends; the wakeup turn (turn 2) writes the output file and ends. Three authoring rules that bite here: (1) arg names must match the schedule_wakeup tool spec — delay_secs/reason/prompt, NOT the legacy seconds/message. A mismatch silently defaults delay_secs to the tool's unwrap_or(60), making the suite sleep 60s. (2) userMessage keys off the LATEST user message, so the wakeup turn (whose latest user msg is the schedule_wakeup prompt, not the goal) needs its own substring ('Continue') absent from the goal. (3) the loop shares the transcript across turns, so turn 2's first call already has hasToolResult=true from turn 1's schedule_wakeup result.",
   "fixtures": [
     {
-      "_comment": "Wakeup turn 0: agent decides it needs more data, schedules an immediate wakeup",
+      "_comment": "Turn 1, LLM call 0: agent schedules an immediate wakeup (goal is latest user msg, no tool result yet)",
       "match": { "userMessage": "multi-loop.txt", "turnIndex": 0, "hasToolResult": false },
       "response": {
         "toolCalls": [
           {
             "name": "schedule_wakeup",
             "arguments": {
-              "seconds": 0,
-              "message": "Continue: now write multi-loop.txt with content 'wakeup-done'"
+              "delay_secs": 1,
+              "reason": "continue to write the output file next turn",
+              "prompt": "Continue: now write multi-loop.txt with content 'wakeup-done'"
             }
           }
         ]
       }
     },
     {
-      "_comment": "After first schedule_wakeup result (loop rescheduled), agent creates the output file",
+      "_comment": "Turn 1, LLM call 1 (after schedule_wakeup result): agent ends turn 1 with a closing message (NoMoreToolCalls) so the loop can reschedule",
       "match": { "userMessage": "multi-loop.txt", "turnIndex": 1, "hasToolResult": true },
+      "response": {
+        "content": "Scheduled a wakeup; I'll write the file on the next turn."
+      }
+    },
+    {
+      "_comment": "Turn 2 (wakeup), LLM call 2: latest user msg is the wakeup prompt ('Continue…'), transcript already has turn 1's tool result, so hasToolResult=true",
+      "match": { "userMessage": "Continue", "turnIndex": 2, "hasToolResult": true },
       "response": {
         "toolCalls": [
           {
@@ -29,8 +37,8 @@
       }
     },
     {
-      "_comment": "After write_file result, agent finishes without another wakeup",
-      "match": { "userMessage": "multi-loop.txt", "turnIndex": 2, "hasToolResult": true },
+      "_comment": "Turn 2, LLM call 3 (after write_file result): agent finishes without another wakeup, so the loop ends cleanly",
+      "match": { "userMessage": "Continue", "turnIndex": 3, "hasToolResult": true },
       "response": {
         "content": "Done! Wrote multi-loop.txt. No further wakeup needed."
       }

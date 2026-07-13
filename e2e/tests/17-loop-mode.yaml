@@ -2,40 +2,46 @@ name: "Loop mode — schedule_wakeup triggers a second turn"
 description: |
   Verify that when the agent calls schedule_wakeup during a loop run, the loop
   actually reschedules and invokes the agent again. This is the multi-turn loop
-  scenario: first turn schedules an immediate wakeup; second turn writes the
-  output file.
+  scenario: turn 1 only schedules an immediate wakeup and ends; the wakeup
+  turn (turn 2) writes the output file and ends, so the loop exits cleanly.
 
-  This complements 10-loop-mode (which tests the single-turn no-wakeup case)
-  by exercising the actual wakeup/reschedule path.
+  This complements 10-loop-mode (single-turn, no wakeup) by exercising the
+  actual wakeup/reschedule path AND asserting that both turns land in ONE
+  persisted session (transcript.jsonl) — the multi-turn-same-session property
+  of Goal 327. The session must be `completed` (loop exits 0) and contain both
+  the `schedule_wakeup` (turn 1) and `write_file` (turn 2) tool calls.
 
-  Session persistence for `recursive loop` is asserted in 10-loop-mode (single
-  turn → completed session). The multi-turn-same-session property (both turns
-  land in ONE transcript.jsonl) is verified manually — see journal
-  manual-20260713-loop-session-persistence — because this suite's turn-2 wakeup
-  404s by fixture design (only 3 fixtures), which collides with an argusai
-  setup-exec limitation on non-zero-exiting commands and makes an in-suite
-  recursive-session assertion unreliable here.
+  Fixture authoring note (see e2e/fixtures/17-loop-mode.json): the schedule_wakeup
+  args MUST use the tool spec's names (delay_secs/reason/prompt). The legacy
+  seconds/message names silently default delay_secs to the tool's unwrap_or(60),
+  making the loop sleep 60s and trip argusai's setup-exec timeout — which is
+  what previously made this suite's session assertion look impossible.
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
-        rm -rf /workspace/test-multi-loop
+        rm -rf /workspace/test-multi-loop /tmp/rh-loop17 /tmp/sessions-loop17
         mkdir -p /workspace/test-multi-loop
         echo prepared
 
-  - name: "Run loop mode (act): multi-turn with schedule_wakeup"
+  - name: "Run loop mode (act): multi-turn with schedule_wakeup + capture session"
     exec:
       container: recursive-e2e
       command: |
-        RECURSIVE_HOME=/tmp/rh-loop \
-          recursive --workspace /workspace/test-multi-loop \
-            --api-base http://aimock:4010/v1 \
-            --api-key mock-key -m mock-chat \
-            --max-steps 8 \
-            loop Write file multi-loop.txt with content wakeup-done
+        unset RECURSIVE_SESSIONS_DIR
+        RECURSIVE_HOME=/tmp/rh-loop17 \
+        recursive --workspace /workspace/test-multi-loop \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 8 \
+          loop "Write file multi-loop.txt with content wakeup-done"
+        SESSION_DIR=$(find /tmp/rh-loop17 -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-loop17
+          cp -r "$SESSION_DIR/." /tmp/sessions-loop17/
+        fi
 
 cases:
   - name: "multi-loop.txt produced after wakeup turn"
@@ -54,10 +60,20 @@ cases:
       output:
         contains: "wakeup-done"
 
+  - name: "loop persisted ONE multi-turn session with both turns' tool calls"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-loop17
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      hasToolCalls: ["schedule_wakeup", "write_file"]
+      minMessages: 8
+      finalized: true
+
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
     ignoreError: true
     exec:
       container: recursive-e2e
       command: |
-        rm -rf /workspace/test-multi-loop /tmp/rh-loop
+        rm -rf /workspace/test-multi-loop /tmp/rh-loop17 /tmp/sessions-loop17
