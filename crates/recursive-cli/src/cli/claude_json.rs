@@ -9,6 +9,28 @@
 //! of the one-way `SDKMessage` stream — they require a bidirectional
 //! control channel on stdin. This module only emits observational events;
 //! interactive approval remains a separate concern.
+//!
+//! ## `--input-format stream-json` Client mode (multi-turn, one session)
+//!
+//! Claude's `ClaudeSDKClient` keeps stdin open and lets the host issue
+//! multiple `query()` calls in the **same session**; each `query()` drives
+//! one response stream that ends with its own `ResultMessage` (per the
+//! SDK docs: `receive_response()` "Receive messages until and including a
+//! ResultMessage"). Recursive mirrors this: `run --input-format
+//! stream-json` emits one `result` envelope per turn, then waits for the
+//! next `type: user` frame on stdin. So **one stream carrying multiple
+//! `result` events is aligned, not a bug** — each `result` terminates one
+//! turn/query, and the host reads the next turn's stream after it.
+//!
+//! `result.num_turns` is therefore a **per-turn (per-query)** value, not a
+//! run-wide cumulative count. Here it is set to that turn's agent-loop
+//! step count (`steps`, i.e. LLM call rounds within the turn), which
+//! approximates Claude's per-`ResultMessage` `num_turns`. A downstream that
+//! expects a cumulative turn count across queries is misreading the
+//! contract; detect multi-turn by counting `result` events instead.
+//!
+//! Single-turn `run` (no `--input-format stream-json`) is unchanged: one
+//! `init`, the turn's events, one terminal `result`.
 
 use std::time::Instant;
 
@@ -407,6 +429,9 @@ impl ClaudeJsonEmitter {
         } else {
             self.api_ms
         };
+        // Per-turn (per-query) value: this turn's agent-loop step count,
+        // approximating Claude's per-ResultMessage `num_turns`. See module
+        // doc — NOT a run-wide cumulative turn count.
         let num_turns = if steps > 0 { steps } else { self.num_turns };
 
         let (subtype, is_error, errors) = match finish {

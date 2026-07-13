@@ -3,26 +3,38 @@ description: >
   Verify `recursive loop` runs the agent with the ScheduleWakeup tool
   available. The agent completes its goal and exits without scheduling a
   wakeup.
+
+  Goal 327: `recursive loop` now persists one multi-turn session to disk
+  (transcript.jsonl + .meta.json), so this suite also asserts the session
+  is valid via recursive-session: — the loop's single turn (write_file +
+  final answer, no schedule_wakeup) must land as a completed session with
+  the write_file tool call recorded.
 sequential: true
 
 setup:
-  - name: "Prepare workspace"
+  - name: "Prepare workspace + RECURSIVE_HOME"
     exec:
       container: recursive-e2e
       command: |
-        rm -rf /workspace/test-loop
+        rm -rf /workspace/test-loop /tmp/rh-loop /tmp/sessions-loop
         mkdir -p /workspace/test-loop
         echo prepared
 
-  - name: "Run loop mode (act)"
+  - name: "Run loop mode (act) + capture session"
     exec:
       container: recursive-e2e
-      command: >
-        recursive --workspace /workspace/test-loop
-        --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
-        --max-steps 5
-        loop Write file loop-result.txt with content loop-done
+      command: |
+        unset RECURSIVE_SESSIONS_DIR
+        RECURSIVE_HOME=/tmp/rh-loop \
+        recursive --workspace /workspace/test-loop \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 5 \
+          loop "Write file loop-result.txt with content loop-done"
+        SESSION_DIR=$(find /tmp/rh-loop -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-loop
+          cp -r "$SESSION_DIR/." /tmp/sessions-loop/
+        fi
 
 cases:
   - name: "loop-result.txt was produced by the loop run"
@@ -32,9 +44,20 @@ cases:
       exists: true
       contains: "loop-done"
 
+  - name: "loop persisted a valid completed session with the write_file call"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-loop
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      hasToolCalls: ["write_file"]
+      minMessages: 3
+      finalized: true
+
 teardown:
-  - name: "Clean workspace"
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -rf /workspace/test-loop
+      command: |
+        rm -rf /workspace/test-loop /tmp/rh-loop /tmp/sessions-loop

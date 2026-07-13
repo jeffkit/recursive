@@ -824,6 +824,7 @@ async fn main() -> anyhow::Result<()> {
                 effective_stream,
                 cli.mcp_config,
                 cli.hook_timing,
+                !cli.no_session,
                 shutdown,
             )
             .await
@@ -1677,6 +1678,7 @@ async fn run_loop(
     stream: bool,
     mcp_config: Option<PathBuf>,
     hook_timing: bool,
+    session: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use std::sync::Mutex;
@@ -1685,6 +1687,62 @@ async fn run_loop(
         eprintln!("{msg}");
         std::process::exit(1);
     }
+
+    // Session persistence (Goal 327): a loop is one multi-turn session, so
+    // every wakeup turn appends to the SAME transcript.jsonl. Mirrors
+    // run_once's writer/sink wiring, EXCEPT the event_sink carries only
+    // SessionPersistenceSink — loop has no stdout printer draining a
+    // ChannelSink, so attaching one would deadlock the unbounded channel.
+    // `--no-session` skips all of this and matches pre-327 behaviour.
+    let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> = if session {
+        match SessionWriter::create_with_tools(
+            &config.workspace,
+            &goal,
+            &config.model,
+            &config.provider_type,
+            &[],
+            config.preset.as_deref(),
+        ) {
+            Ok(mut writer) => {
+                if let Some(ref name) = config.session_name {
+                    writer.set_name(name.as_str());
+                }
+                if !json_mode {
+                    eprintln!("session: recording to {}", writer.session_dir().display());
+                }
+                Some(Arc::new(std::sync::Mutex::new(writer)))
+            }
+            Err(e) => {
+                eprintln!("session: failed to create session writer: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
+        session_writer.as_ref().map(|w| {
+            let session_dir = w
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .session_dir()
+                .to_path_buf();
+            std::sync::Mutex::new(recursive::cost::CostTracker::new(
+                session_dir,
+                &config.model,
+                &config.provider_type,
+            ))
+        })
+    } else {
+        None
+    };
+
+    // SessionPersistenceSink only (see comment above). `None` when
+    // `--no-session` or writer creation failed — runtime gets no sink.
+    let event_sink: Option<Arc<dyn EventSink>> = session_writer
+        .as_ref()
+        .map(|sw| Arc::new(SessionPersistenceSink::new(sw.clone())) as Arc<dyn EventSink>);
 
     let wakeup_slot: WakeupSlot = Arc::new(Mutex::new(None));
 
@@ -1754,9 +1812,25 @@ async fn run_loop(
         hooks.register(Arc::new(recursive::hooks::ToolTimingHook::new()));
         builder = builder.hooks(hooks);
     }
+    if let Some(sink) = event_sink {
+        builder = builder.event_sink(sink);
+    }
     let mut runtime = builder.build().map_err(Into::<anyhow::Error>::into)?;
 
-    let outcomes = runtime.run_loop(&goal, &wakeup_slot).await?;
+    // `runtime.run_loop` `?`-propagates a mid-loop error (e.g. provider 404
+    // on a wakeup turn). We must NOT let that skip session finalization —
+    // the turns that DID complete already appended to transcript.jsonl, and
+    // leaving the session `active` makes it look unresumable. So capture the
+    // error, finalize the writer as `Crashed`, then propagate. Mirrors the
+    // run_once invariant that every run closes its session envelope.
+    let outcomes = match runtime.run_loop(&goal, &wakeup_slot).await {
+        Ok(o) => o,
+        Err(e) => {
+            drop(runtime);
+            cli::output::finalize_session_writer(session_writer, SessionStatus::Crashed);
+            return Err(e.into());
+        }
+    };
 
     // Cancellation now reflected in each outcome's finish_reason
     // (FinishReason::Cancelled). Historical `if shutdown.is_cancelled()`
@@ -1777,6 +1851,33 @@ async fn run_loop(
     } else {
         eprintln!("Loop completed: {} turn(s)", outcomes.len());
     }
+
+    // Aggregate run-wide usage/cost across every turn for the cost tracker,
+    // and derive the session status from the LAST turn's finish reason.
+    let mut total_usage = recursive::llm::TokenUsage::default();
+    let mut total_llm_latency_ms = 0u64;
+    for o in &outcomes {
+        total_usage = total_usage.accumulate(o.total_usage);
+        total_llm_latency_ms = total_llm_latency_ms.saturating_add(o.llm_latency_ms);
+    }
+    let finish_status = outcomes
+        .last()
+        .map(|o| cli::output::finish_to_session_status(&o.finish_reason))
+        .unwrap_or(SessionStatus::Completed);
+
+    // Drop the runtime BEFORE finalizing the writer: SessionPersistenceSink
+    // holds a clone of the writer Arc, so the writer can't be uniquely
+    // finalized (Arc::into_inner) until the runtime — and thus the sink — is
+    // gone. Same pattern as run_once (main.rs drop(runtime) before finalize).
+    drop(runtime);
+
+    cli::output::finalize_session_writer(session_writer, finish_status);
+    cli::output::finalize_cost_tracker(
+        cost_tracker,
+        total_usage,
+        total_llm_latency_ms,
+        &config.model,
+    );
 
     if let Some(last) = outcomes.last() {
         let _ = cli::output::exit_for_finish(&last.finish_reason, last.steps);

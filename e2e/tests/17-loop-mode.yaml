@@ -7,6 +7,14 @@ description: |
 
   This complements 10-loop-mode (which tests the single-turn no-wakeup case)
   by exercising the actual wakeup/reschedule path.
+
+  Session persistence for `recursive loop` is asserted in 10-loop-mode (single
+  turn → completed session). The multi-turn-same-session property (both turns
+  land in ONE transcript.jsonl) is verified manually — see journal
+  manual-20260713-loop-session-persistence — because this suite's turn-2 wakeup
+  404s by fixture design (only 3 fixtures), which collides with an argusai
+  setup-exec limitation on non-zero-exiting commands and makes an in-suite
+  recursive-session assertion unreliable here.
 sequential: true
 
 setup:

@@ -124,6 +124,24 @@ pub(crate) fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Re
     }
 }
 
+/// Map a turn's `FinishReason` to the `SessionStatus` written to `.meta.json`.
+///
+/// Used by `run_loop`: the loop's *last* turn decides the whole session's
+/// status. `NoMoreToolCalls` → `Completed`; `Cancelled` (SIGINT/SIGTERM via
+/// the shutdown token) → `Interrupted` (user-initiated, resumable); every
+/// other finish (budget / stuck / transcript-limit / provider-stop / …) →
+/// `Crashed`. `run_once` uses a simpler Completed/Crashed split because a
+/// single `run` that gets cancelled returns `Err` before reaching finalize;
+/// loop runs multiple turns and surfaces `Cancelled` as a normal last
+/// outcome, so it deserves the resumable `Interrupted` label.
+pub(crate) fn finish_to_session_status(finish: &FinishReason) -> SessionStatus {
+    match finish {
+        FinishReason::NoMoreToolCalls => SessionStatus::Completed,
+        FinishReason::Cancelled => SessionStatus::Interrupted,
+        _ => SessionStatus::Crashed,
+    }
+}
+
 pub(crate) fn finalize_session_writer(
     session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
     status: SessionStatus,
@@ -386,5 +404,45 @@ impl JsonEventTask {
                 handle.await.ok();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_to_session_status_maps_cancelled_to_interrupted() {
+        assert_eq!(
+            finish_to_session_status(&FinishReason::Cancelled),
+            SessionStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn finish_to_session_status_maps_success_to_completed() {
+        assert_eq!(
+            finish_to_session_status(&FinishReason::NoMoreToolCalls),
+            SessionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn finish_to_session_status_maps_errors_to_crashed() {
+        assert_eq!(
+            finish_to_session_status(&FinishReason::BudgetExceeded),
+            SessionStatus::Crashed
+        );
+        assert_eq!(
+            finish_to_session_status(&FinishReason::Stuck {
+                repeated_call: "x".into(),
+                repeats: 3,
+            }),
+            SessionStatus::Crashed
+        );
+        assert_eq!(
+            finish_to_session_status(&FinishReason::ProviderStop("boom".into())),
+            SessionStatus::Crashed
+        );
     }
 }
