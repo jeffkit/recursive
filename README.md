@@ -190,6 +190,59 @@ export RECURSIVE_MODEL="qwen2.5-coder"
 recursive run "explain the repo layout"
 ```
 
+#### Adding a custom provider
+
+The bundled catalog (see `providers.toml`) ships presets for OpenAI,
+Anthropic, DeepSeek, MiniMax, GLM/Zhipu, Moonshot, Doubao, DashScope,
+Hunyuan, StepFun, Gemini, Groq, Mistral, xAI, and a local Ollama. If
+the vendor you want isn't there, you have two paths.
+
+**Interactive wizard** — run `recursive init`, pick `0` for "custom API
+base", then enter the URL, the model name, and the API key. The wizard
+will offer to save the result as a reusable preset under
+`~/.recursive/providers.d/<your-id>.toml` so the next run can call it
+by id.
+
+**Hand-written preset** — drop a file into
+`~/.recursive/providers.d/`:
+
+```toml
+# ~/.recursive/providers.d/myvendor.toml
+
+[[providers]]
+id = "myvendor"                      # the id you'll pass to --provider
+name = "My Vendor"                   # shown in `recursive init` / `providers list`
+provider_type = "openai"             # "openai" or "anthropic"
+api_base = "https://api.myvendor.com/v1"
+default_model = "myvendor-1"
+key_env = "MYVENDOR_API_KEY"        # the env var the runtime reads at start
+key_url = "https://myvendor.com/keys"
+models = [
+  { name = "myvendor-1", context_window = 32_000 },
+  { name = "myvendor-2-mini", context_window = 16_000,
+    pricing = { input_per_million = 0.10, output_per_million = 0.30 } },
+]
+mainland_accessible = false
+```
+
+Verified on the next `recursive` launch — `recursive providers list`
+will show it, and `recursive init` will offer it in the picker. To
+override a bundled preset's models or pricing (e.g. to ride out a
+catalog drift until the next release), give your file the same `id`
+as the bundled one: the bundled entry stays visible but your file's
+`models[]` and `pricing` win.
+
+**Remote catalog** — `recursive providers update` pulls the latest
+catalog from the upstream JSON the project maintains
+(`RECURSIVE_PROVIDERS_URL` overrides the URL; defaults to a GitHub
+raw URL). The wizard prompts to refresh on every run; one-shot
+commands read whatever is already cached (TTL 7 days). Use
+`recursive providers update` explicitly when you want the latest
+without waiting for the TTL to expire.
+
+`recursive providers list` / `status` cover the operations side of
+catalog management — see `--help` for the available sub-commands.
+
 ## Docker / Cloud Deployment
 
 ### Single-container (local mode)
