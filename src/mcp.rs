@@ -1707,7 +1707,7 @@ pub async fn kill_gracefully(
 
     #[cfg(not(unix))]
     {
-        let _ = server_name;
+        let _ = (grace_period, server_name);
         tracing::info!("kill-gracefully: non-Unix, sending kill immediately");
         let _ = child.start_kill();
         let _ = child.wait().await;
