@@ -1795,6 +1795,12 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────
 
+    /// JSON-encode a filesystem path for embedding in test request strings.
+    /// Windows paths contain backslashes that must be escaped as JSON string content.
+    fn json_path(path: &std::path::Path) -> String {
+        serde_json::to_string(&path.to_string_lossy().as_ref()).expect("path is valid UTF-8")
+    }
+
     /// Create a MockProvider that returns a single "Hello" completion.
     fn mock_llm() -> Arc<dyn ChatProvider> {
         Arc::new(MockProvider::new(vec![crate::llm::Completion {
@@ -2310,10 +2316,10 @@ mod tests {
     #[tokio::test]
     async fn session_cancel_valid_session_returns_result_true() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/cancel","params":{{"sessionId":"acp-sess-1"}}}}"#,
             cwd
         );
@@ -2373,7 +2379,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_token_fresh_after_each_turn() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
 
         let multi_llm = mock_llm_multi(vec![
             crate::llm::Completion {
@@ -2391,7 +2397,7 @@ mod tests {
         // fresh (not cancelled).
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/cancel","params":{{"sessionId":"acp-sess-1"}}}}
 {{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"hi"}}]}}}}"#,
             cwd
@@ -2669,10 +2675,10 @@ mod tests {
     #[tokio::test]
     async fn session_new_returns_session_id() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}"#,
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
             cwd
         );
         let lines = run_server(&input).await;
@@ -2738,12 +2744,12 @@ mod tests {
     #[tokio::test]
     async fn session_prompt_emits_agent_message_chunk_and_stop_reason() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
 
         // Phase 1: create session, get ID
         let phase1_input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}"#,
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
             cwd
         );
         let reader1 = std::io::Cursor::new(phase1_input.as_bytes().to_owned());
@@ -2760,7 +2766,7 @@ mod tests {
         // Phase 2: use the sessionId for session/prompt
         let phase2_input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"hello"}}]}}}}"#,
             cwd, sid
         );
@@ -2813,7 +2819,7 @@ mod tests {
     #[tokio::test]
     async fn session_prompt_content_block_text_concatenation() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
 
         let echo_llm = mock_llm_multi(vec![crate::llm::Completion {
             content: "hello world".into(),
@@ -2822,7 +2828,7 @@ mod tests {
 
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"hello"}},{{"type":"text","text":" world"}}]}}}}"#,
             cwd
         );
@@ -2837,11 +2843,11 @@ mod tests {
     #[tokio::test]
     async fn session_prompt_non_text_blocks_ignored() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
 
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"image","data":"AAAA","mimeType":"image/png"}}]}}}}"#,
             cwd
         );
@@ -2860,10 +2866,10 @@ mod tests {
     #[tokio::test]
     async fn session_prompt_missing_prompt_field_returns_error() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1"}}}}"#,
             cwd
         );
@@ -2881,7 +2887,7 @@ mod tests {
     #[tokio::test]
     async fn multi_turn_context_preserved() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
 
         let multi_llm = mock_llm_multi(vec![
             crate::llm::Completion {
@@ -2897,7 +2903,7 @@ mod tests {
         // Phase 1: create session
         let phase1_input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}"#,
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
             cwd
         );
         let reader1 = std::io::Cursor::new(phase1_input.as_bytes().to_owned());
@@ -2918,7 +2924,7 @@ mod tests {
         // Phase 2: run two turns with the same session
         let phase2_input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"my name is Alice"}}]}}}}
 {{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"what is my name?"}}]}}}}"#,
             cwd, sid, sid
@@ -2941,11 +2947,10 @@ mod tests {
     #[tokio::test]
     async fn ac21_session_new_path_traversal_rejected_or_normalized() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path().to_string_lossy().to_string();
-        let traversal = format!("{}/../../../etc", workspace);
+        let traversal = json_path(&tmp.path().join("../../../etc"));
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}"#,
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
             traversal
         );
         let lines = run_server(&input).await;
@@ -2967,10 +2972,10 @@ mod tests {
     #[tokio::test]
     async fn ac21_session_new_stable_id_valid_for_prompt() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"hello"}}]}}}}"#,
             cwd
         );
@@ -3007,10 +3012,10 @@ mod tests {
     #[tokio::test]
     async fn ac22_session_prompt_streams_chunks_and_end_turn() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"Say hello and list the current directory"}}]}}}}"#,
             cwd
         );
@@ -3037,10 +3042,10 @@ mod tests {
     #[tokio::test]
     async fn ac22_end_turn_is_last_notification() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"hello"}}]}}}}"#,
             cwd
         );
@@ -3058,10 +3063,10 @@ mod tests {
     #[tokio::test]
     async fn ac23_mixed_text_and_non_text_no_crash() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"hello"}},{{"type":"resource_link","uri":"file:///workspace/project/README.md"}},{{"type":"image","uri":"data:image/png;base64,iVBORw0KGgo="}}]}}}}"#,
             cwd
         );
@@ -3077,10 +3082,10 @@ mod tests {
     #[tokio::test]
     async fn ac23_only_non_text_blocks_returns_graceful() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"resource_link","uri":"file:///workspace/README.md"}}]}}}}"#,
             cwd
         );
@@ -3105,7 +3110,7 @@ mod tests {
     #[tokio::test]
     async fn ac24_multi_turn_context_preserved() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let multi_llm = mock_llm_multi(vec![
             crate::llm::Completion {
                 content: "Got it, Alice. I'll remember stellar.".into(),
@@ -3118,7 +3123,7 @@ mod tests {
         ]);
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"My name is Alice and I'm working on a Rust project called stellar"}}]}}}}
 {{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"What's my name and what project am I working on?"}}]}}}}"#,
             cwd
@@ -3147,10 +3152,10 @@ mod tests {
     #[tokio::test]
     async fn ac25_stop_reason_end_turn_for_normal_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"hello"}}]}}}}"#,
             cwd
         );
@@ -3169,7 +3174,7 @@ mod tests {
     #[tokio::test]
     async fn ac26_message_id_deterministic_across_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let mk_llm = || {
             mock_llm_multi(vec![crate::llm::Completion {
                 content: "Hi!".into(),
@@ -3198,7 +3203,7 @@ mod tests {
         let input_sess = |text: &str| -> String {
             format!(
                 r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"{}"}}]}}}}"#,
                 cwd, text
             )
@@ -3229,10 +3234,10 @@ mod tests {
     #[tokio::test]
     async fn ac27_event_sink_only_allowed_notifications() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[{{"type":"text","text":"Say hello and explain what you can do"}}]}}}}"#,
             cwd
         );
@@ -3273,11 +3278,11 @@ mod tests {
     #[tokio::test]
     async fn ac29_stale_session_returns_error_not_crash() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
 {{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"nonexistent-session-id","prompt":[{{"type":"text","text":"hi"}}]}}}}
-{{"jsonrpc":"2.0","id":3,"method":"session/new","params":{{"cwd":"{}"}}}}"#,
+{{"jsonrpc":"2.0","id":3,"method":"session/new","params":{{"cwd":{}}}}}"#,
             cwd
         );
         let lines = run_server(&input).await;
@@ -3302,10 +3307,10 @@ mod tests {
     #[tokio::test]
     async fn ac210_empty_prompt_array_returns_error_or_helpful() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cwd = tmp.path().to_string_lossy();
+        let cwd = json_path(tmp.path());
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}
-{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":"{}"}}}}
+{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"acp-sess-1","prompt":[]}}}}"#,
             cwd
         );
