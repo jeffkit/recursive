@@ -1313,6 +1313,31 @@ mod tests {
         );
     }
 
+    // weixin_final_text extracts the final assistant text from a turn
+    // result. `FinishReason` is `#[non_exhaustive]`, so the outcome is built
+    // via the core crate's `test_util::runtime_outcome_fixture`. Pins all
+    // four mutants cargo-mutants surfaces for this fn (replace return with
+    // None / Some("") / Some("xyzzy"), and delete the Ok(Ok(Some(_))) arm).
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn weixin_final_text_extracts_outcome_final_text() {
+        let outcome = recursive::test_util::runtime_outcome_fixture(Some("hello".into()));
+        let got = weixin_final_text(Ok(Ok(Some(outcome))));
+        assert_eq!(got.as_deref(), Some("hello"));
+    }
+
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn weixin_final_text_returns_none_when_no_outcome() {
+        // Ok(Ok(None)) — no outcome produced → None. Pins the `_ => None`
+        // fallback arm so a mutant that swaps it to `Some(...)` is caught.
+        let none_outcome: std::result::Result<
+            recursive::Result<Option<recursive::RuntimeOutcome>>,
+            tokio::task::JoinError,
+        > = Ok(Ok(None));
+        assert_eq!(weixin_final_text(none_outcome), None);
+    }
+
     #[test]
     fn map_assistant_text_to_assistant_message() {
         let ev = AgentEvent::AssistantText {

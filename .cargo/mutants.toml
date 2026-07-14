@@ -17,4 +17,8 @@ exclude_re = [
     "impl .*Debug.*>::fmt",
     # Long-running server entrypoint; covered by e2e/http suites, not unit mutants.
     "serve_with_graceful_shutdown",
+    # render_empty_state's vertical-centre guard: when area.height ==
+    # content_h, both `>` and `>=` produce pad=0 and identical output, so the
+    # `>`→`>=` mutant is equivalent and unobservable from rendered output.
+    "replace > with >= in render_empty_state",
 ]

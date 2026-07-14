@@ -2032,6 +2032,43 @@ mod tests {
     }
 
     #[test]
+    fn build_model_lines_warns_when_api_key_is_empty_string() {
+        // An empty-string api_key is treated as "not configured" (the runtime
+        // builder's `effective_api_key` filters empty keys). This pins the
+        // `!` in `.map(|k| !k.is_empty())`: a `delete !` mutant would treat
+        // an empty key as configured and hide the banner.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let cfg_dir = empty_home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[provider]\napi_key = \"\"\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .expect("write config");
+
+        let text = text_of(&build_model_lines());
+        assert!(
+            text.contains("Not configured"),
+            "empty-string api_key should trigger the not-configured banner, got: {text:?}"
+        );
+
+        match prev_recursive {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+        match prev_openai {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
+
+    #[test]
     fn build_tool_lines_truncates_long_descriptions_at_60_chars() {
         // 61-char description: `> 60` true → truncated with ellipsis.
         let long = (0..61).map(|_| 'x').collect::<String>();
