@@ -242,6 +242,62 @@ pub fn find_model_pricing_effective(model: &str) -> Option<ModelPricingSpec> {
     None
 }
 
+/// Result of writing a user override preset — returned to the caller so
+/// `recursive init` and `recursive providers add` can show the user
+/// exactly where the file landed and what was written.
+#[derive(Debug, Clone)]
+pub struct WrittenPreset {
+    pub path: std::path::PathBuf,
+    pub id: String,
+}
+
+#[derive(serde::Serialize)]
+struct PresetsFileSer<'a> {
+    providers: &'a [ProviderPreset],
+}
+
+/// Serialize `preset` to TOML and write it to
+/// `<user_data_dir>/providers.d/<id>.toml`. Creates the directory if
+/// missing. Used by `recursive init`'s "save as reusable preset?" path
+/// (init.rs) and by `recursive providers add` so the persistence
+/// surface lives in one place rather than being reimplemented at each
+/// caller.
+///
+/// On Linux/macOS the file is created with mode 0644 (minus umask), the
+/// same as `std::fs::write`. The file is *not* a secret (the API key is
+/// stored separately under `<user_data_dir>/secrets.env`), so 0644 is
+/// acceptable here.
+///
+/// Errors are mapped to the existing [`crate::error::Error`] variants
+/// so call sites that already thread `Result<_>` through don't need a
+/// separate `io::Error` plumbing.
+///
+/// The on-disk shape matches the `PresetsFile { providers: Vec<_> }`
+/// envelope that `additional_presets()` parses via `toml::from_str`.
+/// Hand-concatenating `[[providers]]` in front of a serialised preset
+/// is brittle (and indeed tripped the parser on first round), so we
+/// emit it through a tiny wrapper struct.
+pub fn write_user_preset(preset: &ProviderPreset) -> crate::error::Result<WrittenPreset> {
+    use crate::error::Error;
+
+    let dir = providers_d_dir().ok_or(Error::Config {
+        message: "cannot resolve user data directory for providers.d".into(),
+    })?;
+    std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+    let path = dir.join(format!("{}.toml", preset.id));
+    let body = toml::to_string_pretty(&PresetsFileSer {
+        providers: std::slice::from_ref(preset),
+    })
+    .map_err(|e| Error::Config {
+        message: format!("serialize preset {}: {e}", preset.id),
+    })?;
+    std::fs::write(&path, body).map_err(Error::Io)?;
+    Ok(WrittenPreset {
+        path,
+        id: preset.id.clone(),
+    })
+}
+
 /// Look up pricing for a model name across all presets.
 /// Returns `None` if the model is not listed or has no pricing field.
 pub fn find_model_pricing(model: &str) -> Option<&'static ModelPricingSpec> {
@@ -497,6 +553,84 @@ key_url = "https://custom.example.com/keys"
         // Sanity: bundled presets are still reachable through the
         // legacy strict API.
         assert!(find_preset("anthropic").is_some());
+        Ok(())
+    }
+
+    // Goal-351 (`recursive init onboarding-smooth`): write_user_preset is the
+    // one-stop persistence helper invoked by `recursive init`'s "save as
+    // reusable preset?" flow and by `recursive providers add`. These tests
+    // pin (a) round-trip through additional_presets, (b) overwrite-on-write
+    // (idempotent re-save of the same id), and (c) <id> slug sanity.
+
+    fn sample_test_preset(id: &str) -> ProviderPreset {
+        ProviderPreset {
+            id: id.to_string(),
+            name: "Test Write Helper".to_string(),
+            provider_type: "openai".to_string(),
+            api_base: "https://write-helper.example.com/v1".to_string(),
+            anthropic_api_base: None,
+            default_model: "wh-1".to_string(),
+            models: vec![ModelSpec {
+                name: "wh-1".to_string(),
+                context_window: 8192,
+                pricing: Some(ModelPricingSpec {
+                    input_per_million: 0.10,
+                    output_per_million: 0.20,
+                    cache_hit_input_per_million: None,
+                }),
+            }],
+            mainland_accessible: false,
+            key_env: "WH_KEY".to_string(),
+            key_url: "https://write-helper.example.com/keys".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_user_preset_round_trips_through_additional_presets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // PinnedRecursiveHome pins RECURSIVE_HOME = tmp.path().join(".recursive"),
+        // matching how Goal 254 / existing tests isolate the providers.d dir.
+        // user_data_dir() honors RECURSIVE_HOME and returns it verbatim, so
+        // providers.d lands at <tmp>/.recursive/providers.d/.
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+
+        let written = write_user_preset(&sample_test_preset("write-rt"))?;
+        assert_eq!(written.id, "write-rt");
+        assert!(
+            written.path.ends_with("providers.d/write-rt.toml"),
+            "file must land at <user_data_dir>/providers.d/<id>.toml, got {}",
+            written.path.display()
+        );
+
+        let loaded = additional_presets();
+        assert_eq!(loaded.len(), 1, "exactly the preset we wrote should load");
+        assert_eq!(loaded[0].id, "write-rt");
+        assert_eq!(loaded[0].api_base, "https://write-helper.example.com/v1");
+        assert_eq!(loaded[0].models.len(), 1);
+        assert_eq!(loaded[0].models[0].name, "wh-1");
+        Ok(())
+    }
+
+    #[test]
+    fn write_user_preset_overwrites_existing_file() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+
+        let mut first = sample_test_preset("over");
+        first.default_model = "old".to_string();
+        write_user_preset(&first)?;
+
+        let mut second = sample_test_preset("over");
+        second.default_model = "new".to_string();
+        write_user_preset(&second)?;
+
+        let loaded = additional_presets();
+        assert_eq!(loaded.len(), 1, "overwrite must not duplicate files");
+        assert_eq!(
+            loaded[0].default_model, "new",
+            "second write must replace the first"
+        );
         Ok(())
     }
 }
