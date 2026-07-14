@@ -32,7 +32,7 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 | `src/checkpoint.rs` | 2026-07-09: list/diff/read/gc pins + equivalent skips (`log_line_incomplete`, `is_missing_blob_stderr`, `session_id_has_path_separator`, whole `gc`). Remaining: `snapshot_for_session` stderr-warning `&&`/`!` (git stderr shape) |
 | `src/skills.rs` | 2026-07-09 ROI pins: skip invalid discover entries, extract_body, trigger case-insensitivity, unknown mode / empty triggers, globs quote-strip, depends_on+[globs] index, rb/js + chmod+x scripts. ROI re-verify (extract_body/discover_scripts/discover_skills `!`) **15 caught / 0 missed**. Remaining: full-file gate (~554 mutants) |
 | `src/tools/facts.rs` | **gate-0** (2026-07-09): 151 mutants → 140 caught / 0 missed / 11 unviable. Soft-skip scoring/timestamp/year-subtract; pins for eviction/jaccard/dedup/calendar/summary-120/deferred/access_count |
-| `src/http/handlers.rs` | 2026-07-09 ROI pins: permission/SSE/goal/core arms, tool_use-without-text, AguiConverter stream close, `get_session` idle/pending/busy, `patch_session` empty title; soft-skip thin wrappers. Remaining: `agui_run` resume/interrupt paths |
+| `src/http/handlers.rs` | 2026-07-10 full gate: **18 missed** / 64 caught / 56 unviable. Survivors: `record_run_success`/`record_run_failed` (thin telemetry), `get_session` status `==`, `runtime_goal_state_clear`, AguiConverter Hook*/TodoUpdated/TurnFinished arms, `agui_run` resume/interrupt (`==`/`!`), `agui_session_dir`/`load|save|clear_open_interrupts`, `TestInterruptHook::check` |
 
 ## Accepted non-debt
 
