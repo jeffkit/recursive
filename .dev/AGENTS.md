@@ -299,6 +299,14 @@ e2e/
    Write the test as you write the code, not after the gate fires — the
    mutation gate will catch tautological tests, costing a resume-fix cycle.
 
+   **Manual edits vs. the autonomous flow.** The hard mutation gate above
+   is the self-improve *flow's* policy (it drives rollback for the
+   autonomous loop). For manual edits to `crates/recursive-tui/src/`,
+   `tui-mutants.sh` is **recommended but advisory** — run it and fix
+   survivors inside your diff, but a non-zero exit does not block a manual
+   change. See `CLAUDE.md`'s "Mandatory quality gates" section for the
+   manual-edit policy. (`tui-test-presence.sh` stays a hard gate for both.)
+
    **E2E test authoring rules (applies when a goal touches `e2e/`).**
    The container binary (`recursive-e2e`) may lag the source tree. Before
    writing E2E assertions, verify the actual tool names and env-var support:
