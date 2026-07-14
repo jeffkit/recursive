@@ -321,7 +321,10 @@ impl AgentKernel {
 /// Messages produced after `input_len` in this turn. Soft-skipped: `>` vs `>=`
 /// is equivalent when lengths are equal (empty suffix slice).
 #[cfg_attr(test, mutants::skip)]
-fn turn_delta_messages(inner: &[crate::message::Message], input_len: usize) -> Vec<crate::message::Message> {
+fn turn_delta_messages(
+    inner: &[crate::message::Message],
+    input_len: usize,
+) -> Vec<crate::message::Message> {
     if inner.len() > input_len {
         inner[input_len..].to_vec()
     } else {
@@ -792,7 +795,10 @@ mod tests {
             Some(12_345),
             "max_transcript_chars must survive builder chaining"
         );
-        assert_eq!(kernel.max_steps, 3, "builder chain must not reset max_steps");
+        assert_eq!(
+            kernel.max_steps, 3,
+            "builder chain must not reset max_steps"
+        );
     }
 
     // -- AgentKernelBuilder Debug fmt test ----------------------------------

@@ -979,7 +979,11 @@ interactive = ["delete_file"]
         let tmp = tempfile::tempdir().unwrap();
         let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
 
-        set_secret("DEEPSEEK_API_KEY", "sk-first-write-aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        set_secret(
+            "DEEPSEEK_API_KEY",
+            "sk-first-write-aaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(secrets_env_path().unwrap()).unwrap();
         assert!(
