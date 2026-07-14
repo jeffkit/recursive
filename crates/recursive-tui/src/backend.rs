@@ -554,6 +554,16 @@ async fn worker_loop(
         }));
         // Signal the UI that the runtime is ready — drives App::connected = true.
         let _ = event_tx.send(UiEvent::RuntimeReady);
+    } else if let RuntimeBuild::Offline { reason } = &state {
+        // No usable runtime was built (missing API key / preset, or
+        // provider construction failed). Tell the UI immediately so the
+        // status bar can show `offline` and the transcript can surface an
+        // actionable setup hint — otherwise the UI stays stuck at
+        // "starting…" with no explanation. The same reason is re-sent as
+        // `UiEvent::Error` when the user tries to send a message.
+        let _ = event_tx.send(UiEvent::RuntimeOffline {
+            reason: reason.clone(),
+        });
     }
 
     let bash_registry = build_bash_registry(&resolve_workspace_root());

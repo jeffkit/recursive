@@ -30,6 +30,7 @@ impl App {
             should_quit: false,
             session_id: None,
             connected: false,
+            offline_reason: None,
             scroll_offset: 0,
             screen: AppScreen::Chat,
             start_time: Instant::now(),

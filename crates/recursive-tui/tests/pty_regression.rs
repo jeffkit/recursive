@@ -55,11 +55,12 @@ fn tour(keys: &str, wait_ms: u64) -> String {
     lines.join("\n")
 }
 
-/// Boot the TUI with no input and confirm the empty-state splash renders:
-/// the wordmark, the "Type a message to start" hint, and the `/resume` +
-/// `/help` hint. This pins the alternate-screen + raw-mode boot path — if
-/// any of that regresses, the splash never reaches the screen and this test
-/// fails instead of a human noticing a blank terminal.
+/// Boot the TUI with no input and confirm the empty-state renders:
+/// the wordmark plus either the "Type a message to start" hint (when a
+/// provider is configured) or the offline setup guidance (when none is).
+/// This pins the alternate-screen + raw-mode boot path — if any of that
+/// regresses, the screen never reaches the user and this test fails
+/// instead of a human noticing a blank terminal.
 /// Ignored on Windows: `tui_pty_harness` drives a real PTY + the
 /// `recursive-tui` subprocess, and on `windows-latest` CI both this test and
 /// `pty_help_command_opens_modal` hang forever (libtest reports "has been
@@ -75,9 +76,16 @@ fn tour(keys: &str, wait_ms: u64) -> String {
 #[cfg_attr(target_os = "windows", ignore)]
 fn pty_boot_renders_splash() {
     let text = tour("", 3000);
+    // The boot screen reflects the real ~/.recursive/config.toml: online
+    // shows the typing hint, offline (no provider) shows the setup
+    // guidance. Either is a valid, non-blank boot — assert the user sees
+    // one of them, plus the always-present command hint.
+    let online = text.contains("Type a message to start");
+    let offline =
+        text.contains("Offline") && text.contains("recursive init") && text.contains("no provider");
     assert!(
-        text.contains("Type a message to start"),
-        "splash hint should be visible on boot, got:\n{text}"
+        online || offline,
+        "boot should show either the online splash or the offline setup guidance, got:\n{text}"
     );
     assert!(
         text.contains("/resume") && text.contains("/help"),

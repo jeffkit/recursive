@@ -887,16 +887,36 @@ pub fn build_model_lines() -> Vec<Line<'static>> {
         .as_ref()
         .map(|c| c.model.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    // `Config::from_env` already resolves the api_key through the full
+    // chain (env → file → preset's key_env). An empty/None key here means
+    // no provider is usable — the runtime would build as Offline. Surface
+    // that explicitly so `/model` doesn't show the hardcoded
+    // `deepseek-v4-flash` fallback as if it were a live configuration.
+    let configured = cfg
+        .as_ref()
+        .and_then(|c| c.api_key.as_deref())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
 
     let header = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
+    let warn = Style::default().fg(Color::Red);
     let mut out: Vec<Line<'static>> = vec![Line::from(Span::styled(
         "Current model".to_string(),
         header,
     ))];
     out.push(Line::raw(""));
+    if !configured {
+        out.push(Line::from(Span::styled(
+            "  Not configured — no API key set. Run `recursive init` \
+             outside the TUI, then restart."
+                .to_string(),
+            warn,
+        )));
+        out.push(Line::raw(""));
+    }
     out.push(Line::from(format!("  Model    : {model}")));
     out.push(Line::from(format!("  Provider : {provider}")));
     out.push(Line::from(format!("  Endpoint : {api_base}")));
@@ -1975,6 +1995,40 @@ mod tests {
         assert!(text.contains("Model    :"), "got {text:?}");
         assert!(text.contains("Provider :"), "got {text:?}");
         assert!(text.contains("Endpoint :"), "got {text:?}");
+    }
+
+    #[test]
+    fn build_model_lines_warns_when_no_api_key_configured() {
+        // Pin RECURSIVE_HOME to an empty temp dir and clear the generic
+        // API-key env vars so `Config::from_env` resolves no provider —
+        // the same condition that leaves the TUI offline. The panel must
+        // surface a "Not configured" banner rather than presenting the
+        // hardcoded `deepseek-v4-flash` fallback as a live configuration.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let text = text_of(&build_model_lines());
+        assert!(
+            text.contains("Not configured"),
+            "expected not-configured banner, got: {text:?}"
+        );
+        assert!(
+            text.contains("recursive init"),
+            "banner should point to the wizard, got: {text:?}"
+        );
+
+        match prev_recursive {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+        match prev_openai {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
     }
 
     #[test]
