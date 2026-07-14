@@ -42,20 +42,34 @@ test gates and the PTY tour described in `.dev/skills/tui-acceptance.md`:
 
 ```bash
 .dev/scripts/tui-test-presence.sh    # fast: must exit 0 (you added tests)
-.dev/scripts/tui-mutants.sh          # must exit 0 (no surviving mutants)
+.dev/scripts/tui-mutants.sh          # recommended (advisory for manual edits)
 ```
 
-The presence gate fails if TUI src changed with no test-bearing addition
-(`RECURSIVE_TUI_TEST_PRESENCE=0` opt-out for a pure refactor — document
-why). The mutation gate fails if tests pass but don't pin behaviour.
-`self-improve.sh` enforces these as hard gates (`RECURSIVE_TUI_MUTANTS`),
-so a TUI change that lands weak tests gets rolled back. The canonical
-self-improve path is the Flowcast flow (`.dev/flows/self-improve.flow.js`);
-its `tui-presence` and `tui-mutants` project gates (declared in
+The presence gate is a hard gate: it fails if TUI src changed with no
+test-bearing addition (`RECURSIVE_TUI_TEST_PRESENCE=0` opt-out for a pure
+refactor — document why).
+
+The mutation gate (`tui-mutants.sh`) is **recommended but advisory for
+manual edits** — run it and address survivors in your changed code, but a
+non-zero exit does not block a manual change. Rationale: it mutates whole
+files (not just the diff), so on a large touched file it can surface
+pre-existing survivors unrelated to your change (false friction), and the
+run itself is slow (~minutes). It is most valuable when scoped to the
+behaviour you actually changed; treat any survivor that lands inside your
+diff hunks as a real weak-test signal to fix, and survivors in untouched
+regions of the file as pre-existing debt to note (e.g. in the journal),
+not as a regression you introduced.
+
+The Flowcast self-improve flow (`.dev/flows/self-improve.flow.js`,
+launched by `.dev/scripts/launch-flow.sh`) is a separate, autonomous
+pipeline and **does** still enforce `tui-mutants` as a hard gate: its
+`tui-presence` and `tui-mutants` project gates (declared in
 `.flowcast/gates.json`) run `tui-test-presence.sh` then `tui-mutants.sh`
 with `onFail: resume-fix`, so missing/weak tests are fed back to the
-agent. `self-improve.sh` is deprecated —
-see the warning at its top.
+agent and a TUI change that lands weak tests gets rolled back. That
+flow-level enforcement is intentional for the autonomous loop and is not
+changed by the lighter manual-edit policy above. `self-improve.sh` is
+deprecated — see the warning at its top.
 
 ## Code conventions
 

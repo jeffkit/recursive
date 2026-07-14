@@ -288,3 +288,20 @@ impl Default for IsolatedWorkspace {
         Self::new()
     }
 }
+
+/// Build a `RuntimeOutcome` fixture with the given `final_text` and neutral
+/// defaults for the other fields. `FinishReason` is `#[non_exhaustive]`, so
+/// downstream crates (e.g. `recursive-tui`) cannot construct it directly —
+/// this helper lives in the core crate where the variant is reachable, and is
+/// exposed under `test-utils` so external test suites can build outcomes to
+/// pin functions like the TUI's `weixin_final_text` extractor.
+pub fn runtime_outcome_fixture(final_text: Option<String>) -> crate::runtime::RuntimeOutcome {
+    crate::runtime::RuntimeOutcome {
+        final_text,
+        finish_reason: crate::agent::FinishReason::NoMoreToolCalls,
+        total_usage: crate::llm::TokenUsage::default(),
+        steps: 0,
+        llm_latency_ms: 0,
+        checkpoint_id: None,
+    }
+}

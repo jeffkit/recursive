@@ -554,6 +554,16 @@ async fn worker_loop(
         }));
         // Signal the UI that the runtime is ready — drives App::connected = true.
         let _ = event_tx.send(UiEvent::RuntimeReady);
+    } else if let RuntimeBuild::Offline { reason } = &state {
+        // No usable runtime was built (missing API key / preset, or
+        // provider construction failed). Tell the UI immediately so the
+        // status bar can show `offline` and the transcript can surface an
+        // actionable setup hint — otherwise the UI stays stuck at
+        // "starting…" with no explanation. The same reason is re-sent as
+        // `UiEvent::Error` when the user tries to send a message.
+        let _ = event_tx.send(UiEvent::RuntimeOffline {
+            reason: reason.clone(),
+        });
     }
 
     let bash_registry = build_bash_registry(&resolve_workspace_root());
@@ -1301,6 +1311,31 @@ mod tests {
             map_agent_event(ev),
             Some(UiEvent::AssistantPartial { text: "hel".into() })
         );
+    }
+
+    // weixin_final_text extracts the final assistant text from a turn
+    // result. `FinishReason` is `#[non_exhaustive]`, so the outcome is built
+    // via the core crate's `test_util::runtime_outcome_fixture`. Pins all
+    // four mutants cargo-mutants surfaces for this fn (replace return with
+    // None / Some("") / Some("xyzzy"), and delete the Ok(Ok(Some(_))) arm).
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn weixin_final_text_extracts_outcome_final_text() {
+        let outcome = recursive::test_util::runtime_outcome_fixture(Some("hello".into()));
+        let got = weixin_final_text(Ok(Ok(Some(outcome))));
+        assert_eq!(got.as_deref(), Some("hello"));
+    }
+
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn weixin_final_text_returns_none_when_no_outcome() {
+        // Ok(Ok(None)) — no outcome produced → None. Pins the `_ => None`
+        // fallback arm so a mutant that swaps it to `Some(...)` is caught.
+        let none_outcome: std::result::Result<
+            recursive::Result<Option<recursive::RuntimeOutcome>>,
+            tokio::task::JoinError,
+        > = Ok(Ok(None));
+        assert_eq!(weixin_final_text(none_outcome), None);
     }
 
     #[test]

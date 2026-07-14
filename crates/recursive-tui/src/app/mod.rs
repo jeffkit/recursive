@@ -49,6 +49,13 @@ pub struct App {
     pub should_quit: bool,
     pub session_id: Option<String>,
     pub connected: bool,
+    /// `Some` when the backend could not build a usable runtime (no LLM
+    /// provider configured, or provider construction failed). Set by
+    /// `UiEvent::RuntimeOffline`, cleared by `UiEvent::RuntimeReady`. When
+    /// set, the status bar shows `offline` (red) and the model slot shows
+    /// `no provider` — so the user isn't misled by the hardcoded
+    /// `deepseek-v4-flash` model fallback while the agent can't actually run.
+    pub offline_reason: Option<String>,
     pub scroll_offset: usize,
     pub screen: AppScreen,
     /// Tracks when the TUI session started. Used by `/status` to report uptime.

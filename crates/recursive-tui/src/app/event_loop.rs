@@ -11,6 +11,19 @@ impl App {
         match event {
             UiEvent::RuntimeReady => {
                 self.connected = true;
+                self.offline_reason = None;
+            }
+            UiEvent::RuntimeOffline { reason } => {
+                // The backend never built a usable runtime — record the
+                // reason so the status bar can show `offline` (red) and the
+                // empty-state chat area can surface an actionable setup
+                // hint. We deliberately do NOT push transcript blocks here:
+                // that would suppress the boot splash and pollute the
+                // transcript. The hint is rendered from `offline_reason` in
+                // `render_empty_state` while the transcript is still empty.
+                // The same reason is re-surfaced as `UiEvent::Error` when
+                // the user tries to send a message while offline.
+                self.offline_reason = Some(reason);
             }
             UiEvent::AssistantPartial { text } => {
                 self.append_streaming_assistant(&text);
@@ -863,6 +876,47 @@ mod tests {
             app.blocks.last(),
             Some(TranscriptBlock::Error { text }) if text.contains("boom")
         ));
+    }
+
+    // ── Offline state (no provider configured) ───────────────────────
+
+    #[test]
+    fn runtime_offline_sets_reason_without_polluting_transcript() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        assert!(app.offline_reason.is_none());
+        assert!(app.blocks.is_empty());
+
+        app.handle_ui_event(UiEvent::RuntimeOffline {
+            reason: "No LLM provider configured.".into(),
+        });
+
+        assert_eq!(
+            app.offline_reason.as_deref(),
+            Some("No LLM provider configured.")
+        );
+        assert!(!app.connected);
+        // The reason is recorded for the status bar + empty-state hint, but
+        // no transcript blocks are pushed — the boot splash must still be
+        // reachable while the transcript is empty.
+        assert!(
+            app.blocks.is_empty(),
+            "RuntimeOffline must not push transcript blocks, got: {:?}",
+            app.blocks
+        );
+    }
+
+    #[test]
+    fn runtime_ready_clears_offline_reason() {
+        let mut app = App::new();
+        app.handle_ui_event(UiEvent::RuntimeOffline {
+            reason: "still offline".into(),
+        });
+        assert_eq!(app.offline_reason.as_deref(), Some("still offline"));
+
+        app.handle_ui_event(UiEvent::RuntimeReady);
+        assert!(app.offline_reason.is_none());
+        assert!(app.connected);
     }
 
     // ── Plan Mode (Goal 147) ───────────────────────────────────────

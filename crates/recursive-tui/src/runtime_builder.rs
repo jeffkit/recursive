@@ -57,6 +57,20 @@ fn effective_api_key(api_key: Option<&str>) -> Option<&str> {
     api_key.filter(|k| !k.is_empty())
 }
 
+/// The actionable "no LLM provider configured" message shown both at TUI
+/// startup (as `UiEvent::RuntimeOffline`) and when the user tries to send a
+/// message while offline (as `UiEvent::Error`). Kept in one place so the
+/// two surfaces never drift, and so a test can pin the recommended next
+/// step (`recursive init`). Extracted as a function rather than a constant
+/// so the `&str` → `String` mutant on the recommended command is observable.
+fn offline_no_provider_reason() -> String {
+    "No LLM provider configured. Run `recursive init` (outside the TUI) to \
+     set one up, then restart. Or set provider.preset + API key manually: \
+     `recursive config set provider.preset <id>` and \
+     `recursive config set-secret <KEY_ENV> <KEY>`."
+        .to_string()
+}
+
 /// Build the `(root, tier)` list used to expand the filesystem sandbox
 /// beyond the primary workspace. Read-write roots come from `--add-dir` /
 /// `[sandbox] extra_dirs`; read-only roots come from
@@ -128,11 +142,7 @@ pub fn build_runtime() -> TuiRuntime {
         None => {
             return TuiRuntime {
                 state: RuntimeBuild::Offline {
-                    reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
-                             OPENAI_API_KEY, or run `recursive config set \
-                             provider.api_key <KEY>` to populate \
-                             ~/.recursive/config.toml."
-                        .to_string(),
+                    reason: offline_no_provider_reason(),
                 },
                 session_roots,
                 wakeup_slot,
@@ -257,11 +267,7 @@ fn build_runtime_with_skill_tx(
         None => {
             return TuiRuntime {
                 state: RuntimeBuild::Offline {
-                    reason: "no LLM provider configured. Set RECURSIVE_API_KEY / \
-                             OPENAI_API_KEY, or run `recursive config set \
-                             provider.api_key <KEY>` to populate \
-                             ~/.recursive/config.toml."
-                        .to_string(),
+                    reason: offline_no_provider_reason(),
                 },
                 session_roots,
                 wakeup_slot,
@@ -414,8 +420,12 @@ mod tests {
             match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
                 Ok(Some(UiEvent::Error { message })) => {
                     assert!(
-                        message.contains("no LLM provider configured"),
+                        message.contains("No LLM provider configured"),
                         "expected offline reason, got {message:?}"
+                    );
+                    assert!(
+                        message.contains("recursive init"),
+                        "offline reason should point to the wizard, got {message:?}"
                     );
                     assert!(
                         message.contains("recursive config set"),
@@ -424,6 +434,7 @@ mod tests {
                     got_error = true;
                     break;
                 }
+                Ok(Some(UiEvent::RuntimeOffline { .. })) => continue,
                 Ok(Some(_)) => continue,
                 Ok(None) => break,
                 Err(_) => continue,
@@ -455,6 +466,51 @@ type = "openai"
             }
         }
         // _keys guard restores API key env vars on drop here.
+    }
+
+    /// Goal: when no provider is configured, the backend must emit
+    /// `UiEvent::RuntimeOffline` at init — not stay silent and leave the
+    /// status bar stuck at "starting…". This pins the init-time signal
+    /// independently of the send-while-offline `Error` path covered above.
+    #[tokio::test]
+    async fn offline_backend_emits_runtime_offline_at_init() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _keys = ApiKeyGuard::clear();
+
+        let mut backend = Backend::spawn();
+        let mut got_offline = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), backend.event_rx.recv()).await {
+                Ok(Some(UiEvent::RuntimeOffline { reason })) => {
+                    assert!(
+                        reason.contains("No LLM provider configured"),
+                        "init offline reason should explain, got {reason:?}"
+                    );
+                    got_offline = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        assert!(
+            got_offline,
+            "expected UiEvent::RuntimeOffline at init when no provider is configured"
+        );
+    }
+
+    #[test]
+    fn offline_no_provider_reason_mentions_init_and_config() {
+        let r = offline_no_provider_reason();
+        // Pins the recommended next step so a mutant that drops the wizard
+        // hint (leaving the user with no actionable path) is killed.
+        assert!(r.contains("recursive init"), "reason: {r:?}");
+        assert!(r.contains("recursive config set"), "reason: {r:?}");
+        assert!(r.contains("set-secret"), "reason: {r:?}");
     }
 
     // ── Pre-existing helper coverage (pulled into scope by g323 touch) ────

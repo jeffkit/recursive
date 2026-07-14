@@ -172,9 +172,20 @@ fn render_empty_state(frame: &mut Frame, area: Rect, app: &App) {
     let orange = Style::default().fg(Color::Rgb(205, 100, 50));
     let gray = Style::default().fg(Color::Rgb(150, 150, 150));
     let dim = Style::default().fg(Color::Rgb(110, 110, 110));
+    let red = Style::default().fg(Color::Rgb(205, 80, 80));
+    let red_bold = Style::default()
+        .fg(Color::Rgb(205, 80, 80))
+        .add_modifier(Modifier::BOLD);
 
     let version = env!("CARGO_PKG_VERSION");
-    let model = app.model_name.clone();
+    // When offline, the hardcoded `deepseek-v4-flash` model fallback is
+    // misleading — show "no provider" instead so the user understands the
+    // agent can't run. The status bar does the same for its model slot.
+    let model = if app.offline_reason.is_some() {
+        "no provider".to_string()
+    } else {
+        app.model_name.clone()
+    };
 
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled("┬─┐┌─┐┌─┐┬ ┬┬─┐┌─┐┬┬  ┬┌─┐", orange_bold)),
@@ -183,12 +194,52 @@ fn render_empty_state(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(Span::styled(format!("v{version}  ·  {model}"), gray)),
         Line::raw(""),
-        Line::from(Span::styled("Type a message to start", dim)),
-        Line::from(Span::styled(
+    ];
+
+    if app.offline_reason.is_some() {
+        // No usable runtime was built (missing API key / preset). Show an
+        // actionable setup hint in place of the "Type a message to start"
+        // splash — the user's next step is to configure a provider outside
+        // the TUI and restart, not to type a message.
+        lines.push(Line::from(Span::styled(
+            "Offline — no LLM provider configured.",
+            red_bold,
+        )));
+        lines.push(Line::from(Span::styled(
+            "The agent can't run until you set one up.",
+            red,
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  1) Outside the TUI, run:  recursive init   (interactive wizard)",
+            dim,
+        )));
+        lines.push(Line::from(Span::styled("  2) Or configure manually:", dim)));
+        lines.push(Line::from(Span::styled(
+            "       recursive config set provider.preset <id>",
+            dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            "       recursive config set-secret <KEY_ENV> <KEY>",
+            dim,
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  Then /exit (or Ctrl+C twice) and restart `cargo tui`.",
+            dim,
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
             "/resume to continue a session  ·  /help for commands",
             dim,
-        )),
-    ];
+        )));
+    } else {
+        lines.push(Line::from(Span::styled("Type a message to start", dim)));
+        lines.push(Line::from(Span::styled(
+            "/resume to continue a session  ·  /help for commands",
+            dim,
+        )));
+    }
 
     // Vertically centre by padding the top with blank rows.
     let content_h = lines.len() as u16;
@@ -457,6 +508,38 @@ mod debt_tests {
             y >= 10,
             "logo should be vertically centred (y>=10), got y={y}"
         );
+    }
+
+    #[test]
+    fn render_empty_state_shows_offline_setup_guidance() {
+        // When no provider is configured, the empty state must surface an
+        // actionable setup hint (recursive init) and show "no provider"
+        // instead of the misleading hardcoded model fallback. Pins the
+        // offline branch of render_empty_state.
+        let mut app = App::new();
+        app.model_name = "deepseek-v4-flash".to_string();
+        app.offline_reason = Some("No LLM provider configured.".to_string());
+        let buf = draw(&app, 100, 30);
+        let text = all_text(&buf);
+        assert!(
+            text.contains("Offline"),
+            "expected 'Offline' heading, got:\n{text}"
+        );
+        assert!(
+            text.contains("recursive init"),
+            "expected wizard hint, got:\n{text}"
+        );
+        assert!(
+            text.contains("no provider"),
+            "expected 'no provider' model label, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Type a message to start"),
+            "online splash hint should be hidden when offline, got:\n{text}"
+        );
+        // /resume + /help should still be advertised so the user can
+        // discover commands even while offline.
+        assert!(text.contains("/resume") && text.contains("/help"));
     }
 
     #[test]

@@ -68,6 +68,14 @@ pub enum UiEvent {
     /// user messages. Drives `App::connected = true` in the event loop so the
     /// status bar can show an accurate connection label instead of "starting…".
     RuntimeReady,
+    /// The backend worker could not build a usable runtime — no LLM provider
+    /// is configured (missing API key / preset), or provider construction
+    /// failed. Drives `App::offline_reason = Some(reason)` so the status bar
+    /// can show `offline` (red) instead of staying stuck at `starting…`, and
+    /// the event loop can push an actionable setup hint into the transcript.
+    /// Emitted once at worker init; re-surfaced as `UiEvent::Error` when the
+    /// user tries to send a message while offline.
+    RuntimeOffline { reason: String },
     /// Marks the start of a turn the backend is about to run so the UI can
     /// (re)arm the spinner. Emitted for every turn, including those drained
     /// from the type-ahead queue after an earlier turn finished — without it

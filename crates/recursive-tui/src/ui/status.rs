@@ -31,10 +31,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 pub fn build_line(app: &App) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // [connection] — "local" once the runtime is ready, "starting…" before that.
+    // [connection] — "local" once the runtime is ready, "offline" (red) when
+    // the backend could not build a runtime, "starting…" before either signal
+    // arrives. `offline_reason` is set by `UiEvent::RuntimeOffline` at init,
+    // so the user sees the real state immediately instead of a stuck spinner.
     spans.push(Span::raw(" "));
     let (conn_label, conn_color) = if app.connected {
         ("local", Color::Green)
+    } else if app.offline_reason.is_some() {
+        ("offline", Color::Red)
     } else {
         ("starting\u{2026}", Color::Yellow)
     };
@@ -46,11 +51,24 @@ pub fn build_line(app: &App) -> Line<'static> {
             .add_modifier(Modifier::BOLD),
     ));
 
-    // [model]
+    // [model] — when offline, show "no provider" instead of the hardcoded
+    // `deepseek-v4-flash` fallback that `detect_model_name` produces when
+    // nothing is configured. Otherwise the user would see a real-looking
+    // model name while the agent can't actually run.
     spans.push(separator());
+    let model_label: String = if app.offline_reason.is_some() && !app.connected {
+        "no provider".to_string()
+    } else {
+        app.model_name.clone()
+    };
+    let model_color = if app.offline_reason.is_some() && !app.connected {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     spans.push(Span::styled(
-        app.model_name.clone(),
-        Style::default().fg(Color::Cyan).bg(Color::DarkGray),
+        model_label,
+        Style::default().fg(model_color).bg(Color::DarkGray),
     ));
 
     // [version + workspace] — the identity info that used to live in the
@@ -196,6 +214,25 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// Content of the span at `idx`, panicking if it's out of range. Used to
+    /// assert on a specific status-bar slot (connection label, model label)
+    /// rather than the joined line, which can contain overlapping substrings
+    /// from the workspace path.
+    fn span_content(line: &Line, idx: usize) -> String {
+        line.spans
+            .get(idx)
+            .map(|s| s.content.as_ref().to_string())
+            .unwrap_or_else(|| panic!("span {idx} missing; line has {} spans", line.spans.len()))
+    }
+
+    /// Foreground color of the span at `idx`, or `None` if unset. Used to pin
+    /// the offline/online model-slot color so a mutant that flips the color
+    /// condition (e.g. `&&`→`||` on the color branch) is caught, not just the
+    /// label text.
+    fn span_fg(line: &Line, idx: usize) -> Option<Color> {
+        line.spans.get(idx).and_then(|s| s.style.fg)
+    }
+
     #[test]
     fn human_count_formats_thresholds() {
         assert_eq!(human_count(0), "0");
@@ -231,6 +268,88 @@ mod tests {
         assert!(text.contains("↑1.2k"));
         assert!(text.contains("↓342"));
         assert!(text.contains("turn"));
+    }
+
+    #[test]
+    fn status_bar_shows_offline_when_offline_reason_set() {
+        // Reproduces the bug report: with no provider configured, the model
+        // falls back to the hardcoded "deepseek-v4-flash" and the status bar
+        // used to stay stuck at "starting…". With offline_reason set, it must
+        // show "offline" and "no provider" instead.
+        //
+        // We assert on the specific connection/model spans rather than the
+        // joined line text, because the workspace path printed later in the
+        // bar can itself contain the substring "offline" (e.g. a worktree
+        // named `tui-offline-status`), which would make a naive
+        // `text.contains("offline")` pass for the wrong reason.
+        let mut app = App::new();
+        app.model_name = "deepseek-v4-flash".to_string();
+        app.offline_reason = Some("No LLM provider configured.".to_string());
+
+        let line = build_line(&app);
+        // span[0] = leading space, span[1] = connection label,
+        // span[2] = separator, span[3] = model label.
+        let conn = span_content(&line, 1);
+        let model = span_content(&line, 3);
+        assert_eq!(conn, "offline", "connection label should be 'offline'");
+        assert_eq!(model, "no provider", "model label should be 'no provider'");
+        // The model slot must be red when offline — pins the color branch so
+        // a `&&`→`||` or `delete !` mutant on the color condition is caught,
+        // not just the label.
+        assert_eq!(
+            span_fg(&line, 3),
+            Some(Color::Red),
+            "model label should be red when offline"
+        );
+    }
+
+    #[test]
+    fn status_bar_offline_resolves_to_local_after_runtime_ready() {
+        // RuntimeReady clears offline_reason and flips to "local". Pins the
+        // recovery path so a mutant that leaves offline_reason sticky is
+        // killed.
+        let mut app = App::new();
+        app.model_name = "deepseek-chat".to_string();
+        app.offline_reason = Some("offline".to_string());
+        assert_eq!(span_content(&build_line(&app), 1), "offline");
+
+        app.handle_ui_event(crate::events::UiEvent::RuntimeReady);
+        let line = build_line(&app);
+        assert_eq!(
+            span_content(&line, 1),
+            "local",
+            "connection label should be 'local' after RuntimeReady"
+        );
+        assert_eq!(
+            span_content(&line, 3),
+            "deepseek-chat",
+            "model label should reflect the configured model after RuntimeReady"
+        );
+        // Online → cyan model slot. Pins the color branch's else arm.
+        assert_eq!(
+            span_fg(&line, 3),
+            Some(Color::Cyan),
+            "model label should be cyan when online"
+        );
+    }
+
+    #[test]
+    fn status_bar_starting_state_shows_model_in_cyan() {
+        // Before any runtime signal (offline_reason None, connected false):
+        // "starting…" connection, model shown in cyan (not red). Pins the
+        // color condition's `&&` so `&&`→`||` (which would turn the starting
+        // model slot red) is caught.
+        let mut app = App::new();
+        app.model_name = "deepseek-chat".to_string();
+        // offline_reason None, connected false → starting state.
+        let line = build_line(&app);
+        assert_eq!(span_content(&line, 1), "starting\u{2026}");
+        assert_eq!(span_content(&line, 3), "deepseek-chat");
+        assert_eq!(
+            span_fg(&line, 3),
+            Some(Color::Cyan),
+            "model label should be cyan in the starting state, not red"
+        );
     }
 
     #[test]
