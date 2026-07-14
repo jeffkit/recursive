@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::providers::{find_preset, ProviderPreset};
+use crate::providers::{all_presets_effective, find_preset_effective, ProviderPreset};
 use crate::tools::episodic_recall::episodic_recall_summary;
 use crate::tools::facts::facts_summary;
 use crate::tools::memory::memory_summary;
@@ -173,9 +173,11 @@ impl Config {
     ///
     ///   1. env var (e.g. `RECURSIVE_API_BASE`, `OPENAI_API_KEY`)
     ///   2. explicit field in the file's `[provider]` section
-    ///   3. preset field — `provider.preset = "<id>"` looks up the bundled
-    ///      `providers.toml` and takes its `api_base` / `default_model` /
-    ///      `provider_type`. For `api_key`, step 3 instead consults
+    ///   3. preset field — `provider.preset = "<id>"` looks up the preset in
+    ///      the **effective** catalog (bundled `providers.toml` + user
+    ///      overrides from `~/.recursive/providers.d/*.toml` + remote cache)
+    ///      and takes its `api_base` / `default_model` / `provider_type`.
+    ///      For `api_key`, step 3 instead consults
     ///      `std::env::var(preset.key_env)` (e.g. `DEEPSEEK_API_KEY`).
     ///   4. hardcoded default
     ///
@@ -199,23 +201,30 @@ impl Config {
 
         // Resolve preset (if any). Unknown id is a hard error so users
         // see a typo at startup rather than silent default-fallback.
-        let preset: Option<&'static ProviderPreset> =
-            match file_provider.and_then(|p| p.preset.as_deref()) {
-                None => None,
-                Some(id) => Some(find_preset(id).ok_or_else(|| {
-                    let known: Vec<&str> = crate::providers::all_presets()
-                        .iter()
-                        .map(|p| p.id.as_str())
-                        .collect();
-                    Error::Config {
-                        message: format!(
-                            "provider.preset = {:?} not found in providers.toml. Valid ids: {}",
-                            id,
-                            known.join(", "),
-                        ),
-                    }
-                })?),
-            };
+        //
+        // We resolve against the **effective** catalog (bundled +
+        // `providers.d/` + remote cache) so a preset the user added via
+        // `~/.recursive/providers.d/<id>.toml` — the same surface
+        // `recursive init --provider <id>` and `recursive providers add`
+        // write to — can be activated with `provider.preset = "<id>"`.
+        // The strict bundled-only `find_preset` is intentionally not
+        // used here: it would reject every providers.d preset id, which
+        // directly contradicts the providers.d feature.
+        let preset: Option<ProviderPreset> = match file_provider.and_then(|p| p.preset.as_deref()) {
+            None => None,
+            Some(id) => Some(find_preset_effective(id).ok_or_else(|| {
+                let known: Vec<String> =
+                    all_presets_effective().into_iter().map(|p| p.id).collect();
+                Error::Config {
+                    message: format!(
+                        "provider.preset = {:?} not found in providers.toml \
+                             or ~/.recursive/providers.d/. Valid ids: {}",
+                        id,
+                        known.join(", "),
+                    ),
+                }
+            })?),
+        };
 
         let workspace = std::env::var("RECURSIVE_WORKSPACE")
             .map(PathBuf::from)
@@ -257,12 +266,12 @@ impl Config {
         let provider_type = std::env::var("RECURSIVE_PROVIDER_TYPE")
             .ok()
             .or_else(|| file_provider.and_then(|p| p.provider_type.clone()))
-            .or_else(|| preset.map(|p| p.provider_type.clone()))
+            .or_else(|| preset.as_ref().map(|p| p.provider_type.clone()))
             .unwrap_or_else(|| "anthropic".into());
 
         // When the user requests the Anthropic protocol and the preset has a
         // dedicated Anthropic endpoint, prefer that over the default api_base.
-        let preset_api_base = preset.map(|p| {
+        let preset_api_base = preset.as_ref().map(|p| {
             if provider_type == "anthropic" {
                 p.anthropic_api_base
                     .as_deref()
@@ -288,6 +297,7 @@ impl Config {
             .or_else(|| file_provider.and_then(|p| p.api_key.clone()))
             .or_else(|| {
                 preset
+                    .as_ref()
                     .filter(|p| !p.key_env.is_empty())
                     .and_then(|p| std::env::var(&p.key_env).ok())
             });
@@ -296,7 +306,7 @@ impl Config {
             .or_else(|_| std::env::var("OPENAI_MODEL"))
             .ok()
             .or_else(|| file_provider.and_then(|p| p.model.clone()))
-            .or_else(|| preset.map(|p| p.default_model.clone()))
+            .or_else(|| preset.as_ref().map(|p| p.default_model.clone()))
             .unwrap_or_else(|| {
                 // Fall back to the default preset's model from the catalog.
                 crate::providers::find_preset("deepseek")
@@ -328,7 +338,7 @@ impl Config {
         // api_key takes precedence over the preset's key_env env var, which
         // may surprise users who expected the env var to be used.
         if let (Some(preset), Some(_)) = (
-            preset.filter(|p| !p.key_env.is_empty()),
+            preset.as_ref().filter(|p| !p.key_env.is_empty()),
             file_provider.and_then(|p| p.api_key.as_ref()),
         ) {
             if std::env::var(&preset.key_env).is_ok() {
@@ -1394,6 +1404,87 @@ preset = "ollama"
             );
         }
         std::env::remove_var("OLLAMA_API_KEY");
+
+        // Case 7: a preset the user dropped into ~/.recursive/providers.d/
+        // must be activatable via `provider.preset = "<id>"`. This is the
+        // core providers.d feature: `recursive init --provider <id>` and
+        // `recursive providers add` both write to providers.d and persist
+        // `provider.preset = "<id>"`, so from_env MUST resolve ids from the
+        // effective catalog (bundled + providers.d), not bundled-only.
+        {
+            std::env::remove_var("RECURSIVE_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            let providers_d = tmp.path().join("providers.d");
+            std::fs::create_dir_all(&providers_d).expect("mkdir providers.d");
+            std::fs::write(
+                providers_d.join("case7-vendor.toml"),
+                r#"[[providers]]
+id = "case7-vendor"
+name = "Case7 Vendor"
+provider_type = "openai"
+api_base = "https://example.invalid/v1"
+default_model = "case7-model"
+mainland_accessible = false
+key_env = "CASE7_VENDOR_API_KEY"
+key_url = ""
+
+[[providers.models]]
+name = "case7-model"
+context_window = 0
+"#,
+            )
+            .expect("write providers.d preset");
+            std::fs::write(
+                &config_path,
+                r#"[provider]
+preset = "case7-vendor"
+"#,
+            )
+            .expect("rewrite config");
+
+            // 7a: without the key_env env var, preset fills api_base /
+            // model / type but api_key is None.
+            std::env::remove_var("CASE7_VENDOR_API_KEY");
+            let c = Config::from_env().expect("case 7a");
+            assert_eq!(c.preset.as_deref(), Some("case7-vendor"));
+            assert_eq!(c.provider_type, "openai");
+            assert_eq!(c.api_base, "https://example.invalid/v1");
+            assert_eq!(c.model, "case7-model");
+            assert!(c.api_key.is_none(), "no key_env env set → None");
+
+            // 7b: with the key_env env var, api_key is pulled from it.
+            std::env::set_var("CASE7_VENDOR_API_KEY", "sk-case7");
+            let c = Config::from_env().expect("case 7b");
+            assert_eq!(
+                c.api_key.as_deref(),
+                Some("sk-case7"),
+                "providers.d preset's key_env env var must be consulted"
+            );
+
+            // 7c: the providers.d id appears in the unknown-id error's
+            // valid list (proves all_presets_effective, not all_presets,
+            // drives the message).
+            std::fs::write(
+                &config_path,
+                r#"[provider]
+preset = "totally-bogus-id"
+"#,
+            )
+            .expect("rewrite config");
+            let err = Config::from_env().expect_err("case 7c should fail");
+            let msg = format!("{err}");
+            assert!(msg.contains("totally-bogus-id"), "msg was: {msg}");
+            assert!(
+                msg.contains("case7-vendor"),
+                "providers.d id must appear in valid list: {msg}"
+            );
+
+            // Clean up the providers.d file so later cases / other tests
+            // don't see it.
+            std::fs::remove_file(providers_d.join("case7-vendor.toml"))
+                .expect("remove providers.d preset");
+            std::env::remove_var("CASE7_VENDOR_API_KEY");
+        }
 
         // Restore originals.
         for (name, prev) in [
