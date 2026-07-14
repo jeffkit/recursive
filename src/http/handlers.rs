@@ -27,6 +27,8 @@ use super::{
     SseContentBlock, SseEvent, ToolInfo, UsageInfo,
 };
 
+// Constant body — no branching worth scoring.
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn health() -> &'static str {
     "ok"
 }
@@ -52,10 +54,14 @@ fn record_run_failed(metrics: &super::Metrics) {
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
 }
 
+// Thin wrapper around `build_openapi_spec` (schema covered elsewhere).
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn openapi_spec() -> Json<serde_json::Value> {
     Json(build_openapi_spec())
 }
 
+// Pure clone of AppState field — no branching worth scoring.
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<ToolInfo>> {
     Json(state.tools.clone())
 }
@@ -163,6 +169,8 @@ fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMode {
 // ── Session endpoints ──────────────────────────────────────────────────────
 
 /// Generate a session ID using UUID v7 (time-ordered, globally unique).
+// Non-deterministic UUID — not unit-observable for mutation scoring.
+#[cfg_attr(test, mutants::skip)]
 fn generate_session_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
@@ -785,6 +793,8 @@ pub(super) async fn session_interrupt(
 // ── Goal-169: slash commands endpoint ─────────────────────────────────────
 
 /// GET /slash-commands — list all registered slash commands.
+// Pure clone of AppState field — no branching worth scoring.
+#[cfg_attr(test, mutants::skip)]
 pub(super) async fn list_slash_commands(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<SlashCommandInfo>> {
@@ -2261,6 +2271,146 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
     }
 
+    /// Helper: build a minimal AppState with one session for handler unit tests.
+    fn test_app_state_with_session(
+        session_id: &str,
+    ) -> (
+        Arc<AppState>,
+        Arc<tokio::sync::Mutex<crate::runtime::AgentRuntime>>,
+    ) {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tokio::sync::Semaphore;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        let session = SessionState {
+            id: session_id.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: Some("old".into()),
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Default::default(),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            prompt_tokens: Arc::new(AtomicU64::new(0)),
+            completion_tokens: Arc::new(AtomicU64::new(0)),
+        };
+        let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
+        let state = Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            session_ttl_secs: 3600,
+            run_semaphore: Arc::new(Semaphore::new(8)),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+        });
+        (state, runtime_arc)
+    }
+
+    #[tokio::test]
+    async fn get_session_status_idle_vs_plan_pending() {
+        let sid = "test-plan-status";
+        let (state, _) = test_app_state_with_session(sid);
+
+        let idle = match get_session(State(state.clone()), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("get_session idle"),
+        };
+        assert_eq!(idle.status, "idle");
+        assert!(idle.pending_plan.is_none());
+
+        // Set pending plan via the gate.
+        {
+            let sessions = state.sessions.read().await;
+            let session = sessions.get(sid).unwrap();
+            *session.plan_approval_gate.pending_plan.write().unwrap() = Some("do the thing".into());
+        }
+        let pending = match get_session(State(state), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("get_session pending"),
+        };
+        assert_eq!(pending.status, "plan_pending_approval");
+        assert_eq!(pending.pending_plan.as_deref(), Some("do the thing"));
+    }
+
+    #[tokio::test]
+    async fn get_session_busy_runtime_returns_empty_messages() {
+        let sid = "test-busy-get";
+        let (state, runtime_arc) = test_app_state_with_session(sid);
+        let _guard = runtime_arc.lock().await;
+        let detail = match get_session(State(state), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("busy get_session must still 200"),
+        };
+        assert!(
+            detail.messages.is_empty(),
+            "busy runtime must fall back to empty messages"
+        );
+        assert_eq!(detail.status, "idle");
+    }
+
+    #[tokio::test]
+    async fn patch_session_empty_title_clears() {
+        let sid = "test-patch-title";
+        let (state, _) = test_app_state_with_session(sid);
+
+        let cleared = match patch_session(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest {
+                title: Some("".into()),
+            }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch empty title"),
+        };
+        assert!(cleared.title.is_none(), "empty title must clear to None");
+
+        let set = match patch_session(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest {
+                title: Some("new".into()),
+            }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch new title"),
+        };
+        assert_eq!(set.title.as_deref(), Some("new"));
+
+        // Omitting title must leave existing value unchanged.
+        let keep = match patch_session(
+            State(state),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest { title: None }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch omit title"),
+        };
+        assert_eq!(keep.title.as_deref(), Some("new"));
+    }
+
     /// Goal-292: metrics_handler output includes sessions_active and
     /// rate_limits_rejected.
     #[tokio::test]
@@ -2592,6 +2742,261 @@ mod tests {
         }
         // The prompt should be unchanged.
         assert_eq!(sp, base_prompt);
+    }
+
+    // ── parse_permission_mode ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_permission_mode_all_variants() {
+        assert_eq!(parse_permission_mode("auto", false), PermissionMode::Auto);
+        assert_eq!(parse_permission_mode("AUTO", true), PermissionMode::Auto);
+        assert_eq!(
+            parse_permission_mode("strict", false),
+            PermissionMode::Strict
+        );
+        assert_eq!(
+            parse_permission_mode("bypass", true),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            parse_permission_mode("bypass_permissions", true),
+            PermissionMode::BypassPermissions
+        );
+        // Bypass rejected when allow_bypass=false → Default (kills match-guard mutant).
+        assert_eq!(
+            parse_permission_mode("bypass", false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("bypass_permissions", false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("default", true),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("unknown", true),
+            PermissionMode::Default
+        );
+    }
+
+    // ── map_agent_event / sse_message_from_canonical ────────────────────────
+
+    #[test]
+    fn map_agent_event_tool_result_success_flag() {
+        let ok = AgentEvent::ToolResult {
+            id: "tc-1".into(),
+            name: "Bash".into(),
+            output: "ok".into(),
+            step: 0,
+            is_error: false,
+        };
+        let err = AgentEvent::ToolResult {
+            id: "tc-2".into(),
+            name: "Bash".into(),
+            output: "fail".into(),
+            step: 0,
+            is_error: true,
+        };
+        match map_agent_event(&ok) {
+            Some(SseEvent::ToolResult { success, .. }) => assert!(success),
+            other => panic!("expected ToolResult success=true, got {other:?}"),
+        }
+        match map_agent_event(&err) {
+            Some(SseEvent::ToolResult { success, .. }) => assert!(!success),
+            other => panic!("expected ToolResult success=false, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_suppresses_non_sse_variants() {
+        // Latency / Usage / AssistantText have no SSE equivalent.
+        assert!(map_agent_event(&AgentEvent::Latency { step: 0, llm_ms: 1 }).is_none());
+        assert!(map_agent_event(&AgentEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            step: 0,
+        })
+        .is_none());
+        assert!(map_agent_event(&AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 0
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn map_agent_event_forwards_goal_loop_events() {
+        // kills delete-match-arm on GoalContinuing / GoalAchieved
+        match map_agent_event(&AgentEvent::GoalContinuing {
+            reason: "still working".into(),
+            turns: 3,
+        }) {
+            Some(SseEvent::GoalContinuing { reason, turns }) => {
+                assert_eq!(reason, "still working");
+                assert_eq!(turns, 3);
+            }
+            other => panic!("expected GoalContinuing, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::GoalAchieved {
+            condition: "tests pass".into(),
+            turns: 5,
+        }) {
+            Some(SseEvent::GoalAchieved { condition, turns }) => {
+                assert_eq!(condition, "tests pass");
+                assert_eq!(turns, 5);
+            }
+            other => panic!("expected GoalAchieved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_forwards_core_sse_arms() {
+        // kills delete-match-arm on PartialToken / ToolCall / TurnFinished / PlanProposed
+        match map_agent_event(&AgentEvent::PartialToken {
+            text: "tok".into(),
+            step: 2,
+        }) {
+            Some(SseEvent::PartialMessage { text, step }) => {
+                assert_eq!(text, "tok");
+                assert_eq!(step, 2);
+            }
+            other => panic!("expected PartialMessage, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::ToolCall {
+            name: "Bash".into(),
+            id: "tc-1".into(),
+            arguments: "{}".into(),
+            step: 1,
+        }) {
+            Some(SseEvent::ToolCall { name, step }) => {
+                assert_eq!(name, "Bash");
+                assert_eq!(step, 1);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::TurnFinished {
+            reason: "no_more_tool_calls".into(),
+            steps: 4,
+        }) {
+            Some(SseEvent::Done {
+                finish_reason,
+                total_steps,
+            }) => {
+                assert_eq!(finish_reason, "no_more_tool_calls");
+                assert_eq!(total_steps, 4);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::PlanProposed {
+            plan_text: "do X".into(),
+            tool_calls: vec![],
+        }) {
+            Some(SseEvent::PlanProposed { plan }) => assert_eq!(plan, "do X"),
+            other => panic!("expected PlanProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_message_from_canonical_filters_system_tool_and_empty() {
+        assert!(
+            sse_message_from_canonical(&crate::message::Message::system("seed")).is_none(),
+            "system messages must be filtered"
+        );
+        let mut tool = crate::message::Message::user("unused");
+        tool.role = crate::message::Role::Tool;
+        tool.tool_call_id = Some("tc-1".into());
+        assert!(
+            sse_message_from_canonical(&tool).is_none(),
+            "tool messages must be filtered"
+        );
+        assert!(
+            sse_message_from_canonical(&crate::message::Message::assistant("")).is_none(),
+            "empty assistant with no tool_calls must be None"
+        );
+        match sse_message_from_canonical(&crate::message::Message::assistant("hello")) {
+            Some(SseEvent::Message { role, content }) => {
+                assert_eq!(role, "assistant");
+                assert!(!content.is_empty());
+            }
+            other => panic!("expected Message event, got {other:?}"),
+        }
+        match sse_message_from_canonical(&crate::message::Message::user("hi")) {
+            Some(SseEvent::Message { role, .. }) => assert_eq!(role, "user"),
+            other => panic!("expected user Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_message_from_canonical_emits_tool_use_without_text() {
+        // kills early-empty return before tool_calls loop / ToolUse arm delete
+        let msg = crate::message::Message::assistant_with_tool_calls(
+            "",
+            vec![crate::llm::ToolCall {
+                id: "tc-9".into(),
+                name: "Read".into(),
+                arguments: serde_json::json!({"path":"a.rs"}),
+            }],
+        );
+        match sse_message_from_canonical(&msg) {
+            Some(SseEvent::Message { role, content }) => {
+                assert_eq!(role, "assistant");
+                assert!(
+                    content.iter().any(|b| matches!(
+                        b,
+                        SseContentBlock::ToolUse { id, name, .. }
+                            if id == "tc-9" && name == "Read"
+                    )),
+                    "expected ToolUse block, got {content:?}"
+                );
+            }
+            other => panic!("expected Message with ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agui_events_for_partial_token_then_tool_call_closes_stream() {
+        use agui_protocol as ag;
+        // Use AguiConverter directly so open_message_id state spans events.
+        let mut conv = AguiConverter::new();
+        let t1 = conv.convert(&AgentEvent::PartialToken {
+            text: "a".into(),
+            step: 0,
+        });
+        assert_eq!(t1.len(), 2, "Start+Content expected: {t1:?}");
+        assert!(matches!(t1[0], ag::Event::TextMessageStart(_)));
+        assert!(matches!(t1[1], ag::Event::TextMessageContent(_)));
+        let t2 = conv.convert(&AgentEvent::PartialToken {
+            text: "b".into(),
+            step: 0,
+        });
+        assert_eq!(t2.len(), 1, "Content-only expected: {t2:?}");
+        assert!(matches!(t2[0], ag::Event::TextMessageContent(_)));
+        let t3 = conv.convert(&AgentEvent::ToolCall {
+            id: "tc-1".into(),
+            name: "Bash".into(),
+            arguments: "{}".into(),
+            step: 0,
+        });
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::TextMessageEnd(_))),
+            "ToolCall must close open text stream: {t3:?}"
+        );
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::ToolCallStart(_))),
+            "ToolCall must emit ToolCallStart: {t3:?}"
+        );
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::ToolCallArgs(_))),
+            "ToolCall must emit ToolCallArgs: {t3:?}"
+        );
+        assert!(
+            t3.iter().any(|e| matches!(e, ag::Event::ToolCallEnd(_))),
+            "ToolCall must emit ToolCallEnd: {t3:?}"
+        );
     }
 
     // ── format_timestamp ────────────────────────────────────────────────────

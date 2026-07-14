@@ -200,6 +200,7 @@ impl std::fmt::Debug for AgentKernel {
 
 impl AgentKernel {
     /// Create a new builder for `AgentKernel`.
+    #[cfg_attr(test, mutants::skip)]
     pub fn builder() -> AgentKernelBuilder {
         AgentKernelBuilder::default()
     }
@@ -299,11 +300,7 @@ impl AgentKernel {
         // (marked with `is_compaction_summary`) is inserted at position 0.
         // `inner.messages[input_len..]` would miss that summary, so detect
         // it and prepend.
-        let mut new_messages = if inner.messages.len() > input_len {
-            inner.messages[input_len..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut new_messages = turn_delta_messages(&inner.messages, input_len);
         if !inner.messages.is_empty() && inner.messages[0].is_compaction_summary {
             new_messages.insert(0, inner.messages[0].clone());
         }
@@ -318,6 +315,20 @@ impl AgentKernel {
             tool_audits: inner.tool_audits,
             turn: ctx.turn,
         })
+    }
+}
+
+/// Messages produced after `input_len` in this turn. Soft-skipped: `>` vs `>=`
+/// is equivalent when lengths are equal (empty suffix slice).
+#[cfg_attr(test, mutants::skip)]
+fn turn_delta_messages(
+    inner: &[crate::message::Message],
+    input_len: usize,
+) -> Vec<crate::message::Message> {
+    if inner.len() > input_len {
+        inner[input_len..].to_vec()
+    } else {
+        Vec::new()
     }
 }
 
@@ -684,6 +695,109 @@ mod tests {
         assert!(
             outcome.new_messages[0].content != "question",
             "input must not appear in new_messages"
+        );
+    }
+
+    /// Kills: `delete !` on the compaction-summary prepend guard — when the
+    /// first message is NOT a compaction summary, it must not be prepended.
+    #[tokio::test]
+    async fn kernel_run_does_not_prepend_non_summary_first_message() {
+        use crate::llm::Completion;
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "reply".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let kernel = AgentKernel::builder()
+            .llm(provider)
+            .max_steps(1)
+            .build()
+            .expect("build");
+
+        let system = Message::system("sys".to_string());
+        assert!(
+            !system.is_compaction_summary,
+            "fixture must not be a compaction summary"
+        );
+        let ctx = make_minimal_ctx(vec![system, Message::user("q".to_string())]);
+        let outcome = kernel.run(ctx).await.expect("run");
+        assert_eq!(outcome.new_messages.len(), 1);
+        assert_eq!(outcome.new_messages[0].content, "reply");
+        assert!(
+            outcome.new_messages.iter().all(|m| m.content != "sys"),
+            "non-summary first message must not be prepended; got {:?}",
+            outcome.new_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn kernel_run_prepends_compaction_summary_to_new_messages() {
+        use crate::compact::Compactor;
+        use crate::llm::Completion;
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("u1".to_string()),
+            Message::assistant("a1".to_string()),
+            Message::user("u2".to_string()),
+            Message::assistant("a2".to_string()),
+            Message::user("u3".to_string()),
+        ];
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "compact summary".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "final".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let kernel = AgentKernel::builder()
+            .llm(provider)
+            .compactor(Compactor::new(0).keep_recent_n(2))
+            .max_steps(1)
+            .build()
+            .expect("build");
+
+        let ctx = make_minimal_ctx(messages);
+        let outcome = kernel.run(ctx).await.expect("run");
+
+        assert!(
+            !outcome.new_messages.is_empty(),
+            "expected new messages after compaction + reply"
+        );
+        assert!(
+            outcome.new_messages[0].is_compaction_summary,
+            "compaction summary must be prepended to new_messages; got {:?}",
+            outcome.new_messages
+        );
+    }
+
+    #[test]
+    fn kernel_builder_max_transcript_chars_stored_and_chains() {
+        let mock = Arc::new(MockProvider::default());
+        let kernel = AgentKernel::builder()
+            .llm(mock)
+            .max_transcript_chars(12_345)
+            .max_steps(3)
+            .build()
+            .expect("build");
+        assert_eq!(
+            kernel.max_transcript_chars,
+            Some(12_345),
+            "max_transcript_chars must survive builder chaining"
+        );
+        assert_eq!(
+            kernel.max_steps, 3,
+            "builder chain must not reset max_steps"
         );
     }
 

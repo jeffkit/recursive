@@ -1,0 +1,20 @@
+# cargo-mutants project defaults for Recursive.
+# Scoped gate scripts (agent/cli/tui-mutants.sh) still pass -p / --features /
+# --file; this file excludes known non-product noise so baseline and scoped
+# runs don't burn time on fixtures or unobservable surface area.
+#
+# Docs: https://mutants.rs/config-file.html
+
+# Test helper binaries are not product code; surviving mutants there are not debt.
+exclude_globs = [
+    "tests/bin/**/*.rs",
+]
+
+# Regexes match the mutant *name* string cargo-mutants prints.
+exclude_re = [
+    # Display/Debug fmt bodies are unobservable from unit tests.
+    "impl .*Display.*>::fmt",
+    "impl .*Debug.*>::fmt",
+    # Long-running server entrypoint; covered by e2e/http suites, not unit mutants.
+    "serve_with_graceful_shutdown",
+]

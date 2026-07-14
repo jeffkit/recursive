@@ -160,11 +160,21 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
-    let mut end = max_bytes.min(s.len());
+    let end = max_bytes.min(s.len());
+    &s[..rewind_to_char_boundary(s, end)]
+}
+
+/// Walk `end` back to a UTF-8 char boundary.
+///
+/// `end > 0` is behavior-equivalent to `end >= 0` for `usize` (index 0 is
+/// always a boundary), so the comparison mutant is skipped rather than
+/// chased with an unobservable test.
+#[cfg_attr(test, mutants::skip)]
+fn rewind_to_char_boundary(s: &str, mut end: usize) -> usize {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    &s[..end]
+    end
 }
 
 #[cfg(test)]

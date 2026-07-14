@@ -18,11 +18,23 @@
       "onFail": "resume-fix",
       "timeout": 1200000
     },
+    "agent-presence": {
+      "_comment": "快存在性门：动了 src/（排除 weixin/test_util）就必须有测试改动。排在 agent-mutants 前。RECURSIVE_AGENT_TEST_PRESENCE=0 opt-out。",
+      "cmd": "sh .dev/scripts/agent-test-presence.sh",
+      "onFail": "resume-fix",
+      "timeout": 60000
+    },
     "agent-mutants": {
       "_comment": "主 kernel 测试有效性门。agent-mutants.sh 自带变更检测：未动 src/（排除 src/weixin/ 和 src/test_util.rs）即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix 把 survivor 报告喂回 agent 强化测试后再跑一次。覆盖 recursive-agent crate 的全部核心逻辑（transcript、compact、session、checkpoint、tools、http、llm 等）。超时设较高值因 kernel 测试套件较重（baseline ~5min）。",
       "cmd": "sh .dev/scripts/agent-mutants.sh",
       "onFail": "resume-fix",
       "timeout": 2400000
+    },
+    "cli-presence": {
+      "_comment": "快存在性门：动了 crates/recursive-cli/src/ 就必须有测试改动。排在 cli-mutants 前。RECURSIVE_CLI_TEST_PRESENCE=0 opt-out。",
+      "cmd": "sh .dev/scripts/cli-test-presence.sh",
+      "onFail": "resume-fix",
+      "timeout": 60000
     },
     "cli-mutants": {
       "_comment": "CLI crate 测试有效性门。cli-mutants.sh 自带变更检测：未动 crates/recursive-cli/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix。",

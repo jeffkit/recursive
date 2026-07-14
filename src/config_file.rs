@@ -971,4 +971,94 @@ interactive = ["delete_file"]
             "single quote should be escaped as '\\''; got:\n{content}"
         );
     }
+
+    #[test]
+    fn set_secret_first_write_has_no_blank_export_prefix() {
+        // Kills: `replace && with ||` — on an empty file `||` inserts a spurious
+        // blank line before the first export.
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        set_secret(
+            "DEEPSEEK_API_KEY",
+            "sk-first-write-aaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(secrets_env_path().unwrap()).unwrap();
+        assert!(
+            content.contains("export DEEPSEEK_API_KEY='sk-first-write-aaaaaaaaaaaaaaaaaaaaaaaa'"),
+            "first secret must be written; got:\n{content}"
+        );
+        assert!(
+            !content.contains("\n\nexport DEEPSEEK_API_KEY"),
+            "first write must not insert a blank line before the export; got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn set_secret_appends_without_extra_blank_when_file_has_trailing_newline() {
+        // Kills: `delete !` on `!existing.ends_with('\n')` — when the file already
+        // ends with a newline, appending must not insert an extra blank line.
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        let path = secrets_env_path().unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "export OTHER_KEY='keep-me'\n").unwrap();
+
+        set_secret(
+            "DEEPSEEK_API_KEY",
+            "sk-fixture-dddddddddddddddddddddddddddd",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("export OTHER_KEY='keep-me'\nexport DEEPSEEK_API_KEY="),
+            "exports must be separated by a single newline; got:\n{content}"
+        );
+        assert!(
+            !content.contains("\n\nexport DEEPSEEK_API_KEY"),
+            "must not insert a blank line before the appended export; got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn set_secret_appends_when_file_lacks_trailing_newline() {
+        // Kills: `delete !` on `!existing.ends_with('\n')` — without the
+        // guard, appending would glue the new export onto the previous
+        // line when the file has no trailing newline.
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        let path = secrets_env_path().unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // No trailing newline on purpose.
+        std::fs::write(&path, "export OTHER_KEY='keep-me'").unwrap();
+
+        set_secret(
+            "DEEPSEEK_API_KEY",
+            "sk-fixture-cccccccccccccccccccccccccccc",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("export OTHER_KEY='keep-me'\n"),
+            "existing line must keep its identity (newline inserted); got:\n{content}"
+        );
+        assert!(
+            content.contains("export DEEPSEEK_API_KEY="),
+            "new secret must be on its own line; got:\n{content}"
+        );
+        assert!(
+            !content.contains("keep-me'export"),
+            "must not glue the new export onto the previous line; got:\n{content}"
+        );
+    }
 }

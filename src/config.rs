@@ -2211,4 +2211,231 @@ api_key = "sk-from-file"
             "must return base unchanged when no context files"
         );
     }
+
+    // ── subagent_enabled OR-gate ─────────────────────────────────────────────
+
+    #[test]
+    fn subagent_enabled_via_team_env_alone() {
+        // Kills: `replace || with &&` at the SUBAGENT/TEAM OR-gate.
+        // With only RECURSIVE_TEAM_ENABLED=1 (SUBAGENT unset), the mutant
+        // `a && b` would leave subagent_enabled=false.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let orig_team = std::env::var("RECURSIVE_TEAM_ENABLED").ok();
+        let orig_sub = std::env::var("RECURSIVE_SUBAGENT_ENABLED").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED");
+        std::env::set_var("RECURSIVE_TEAM_ENABLED", "1");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        let config = Config::from_env().expect("from_env");
+        assert!(
+            config.subagent_enabled,
+            "RECURSIVE_TEAM_ENABLED=1 alone must enable subagent"
+        );
+        match orig_team {
+            Some(v) => std::env::set_var("RECURSIVE_TEAM_ENABLED", v),
+            None => std::env::remove_var("RECURSIVE_TEAM_ENABLED"),
+        }
+        match orig_sub {
+            Some(v) => std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", v),
+            None => std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED"),
+        }
+        match orig_model {
+            Some(v) => std::env::set_var("RECURSIVE_MODEL", v),
+            None => std::env::remove_var("RECURSIVE_MODEL"),
+        }
+        match orig_key {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn subagent_enabled_via_subagent_env_alone() {
+        // Complementary pin: SUBAGENT=1 with TEAM unset must also enable.
+        // Kills: `replace == with !=` on the SUBAGENT "1" check.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let orig_team = std::env::var("RECURSIVE_TEAM_ENABLED").ok();
+        let orig_sub = std::env::var("RECURSIVE_SUBAGENT_ENABLED").ok();
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_TEAM_ENABLED");
+        std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", "1");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        let config = Config::from_env().expect("from_env");
+        assert!(
+            config.subagent_enabled,
+            "RECURSIVE_SUBAGENT_ENABLED=1 alone must enable subagent"
+        );
+        match orig_team {
+            Some(v) => std::env::set_var("RECURSIVE_TEAM_ENABLED", v),
+            None => std::env::remove_var("RECURSIVE_TEAM_ENABLED"),
+        }
+        match orig_sub {
+            Some(v) => std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", v),
+            None => std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED"),
+        }
+        match orig_model {
+            Some(v) => std::env::set_var("RECURSIVE_MODEL", v),
+            None => std::env::remove_var("RECURSIVE_MODEL"),
+        }
+        match orig_key {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn load_project_context_exactly_16kb_is_not_truncated() {
+        // Kills: `replace * with +` in MAX_PROJECT_CONTEXT_SIZE (16*1024 →
+        // 1040). A 2 KB file is above 1040 but below 16384, so the mutant
+        // would truncate while the real constant must not.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("AGENTS.md");
+        let content = "y".repeat(2000);
+        std::fs::write(&path, &content).expect("write");
+        let loaded = load_project_context(tmp.path()).expect("must load");
+        assert!(
+            !loaded.contains("truncated"),
+            "2 KB AGENTS.md must not be truncated under 16 KB cap; got: {loaded}"
+        );
+        assert!(
+            loaded.contains(&content),
+            "full content must be present under the 16 KB cap"
+        );
+    }
+
+    #[test]
+    fn from_env_injects_memory_and_scratchpad_layers() {
+        // Kills: `delete !` on `!memory_block.is_empty()` / `!scratchpad_block.is_empty()`
+        // / `!facts_block.is_empty()` / `!episodic_block.is_empty()`.
+        // Without the guards, empty summaries would still be pushed as layers
+        // (or, with the mutant deleting the `!`, non-empty blocks would be
+        // skipped). Seed all four stores and assert the headings appear.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let ws = tempfile::tempdir().expect("workspace");
+        let mem_path = crate::tools::memory::memory_path(ws.path());
+        if let Some(parent) = mem_path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(
+            &mem_path,
+            r#"{"notes":[{"id":"N1","tags":[],"text":"mutant-kill-memory-note","ts":"2026-07-09T00:00:00Z"}]}"#,
+        )
+        .expect("write memory");
+
+        let pad_path = crate::tools::memory::scratchpad_path(ws.path());
+        if let Some(parent) = pad_path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(
+            &pad_path,
+            r#"{"entries":[{"key":"k","value":"mutant-kill-scratchpad-value"}]}"#,
+        )
+        .expect("write scratchpad");
+
+        // Workspace facts (JSONL) — kills `delete !` on facts_block guard.
+        let facts_path = crate::tools::facts::facts_path(ws.path(), "workspace");
+        if let Some(parent) = facts_path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(
+            &facts_path,
+            r#"{"id":"F1","text":"mutant-kill-fact","tags":[],"source":null,"created_at":"2026-07-09T00:00:00Z","last_accessed":"2026-07-09T00:00:00Z","access_count":1,"superseded_by":null}
+"#,
+        )
+        .expect("write facts");
+
+        // A completed session so episodic_recall_summary is non-empty.
+        {
+            let mut writer = crate::session::SessionWriter::create(
+                ws.path(),
+                "mutant-kill-episodic-goal",
+                "test-model",
+                "test-provider",
+            )
+            .expect("create session");
+            writer
+                .append(&crate::Message::user("hello".to_string()), None, None)
+                .expect("append");
+            writer
+                .finish(crate::session::SessionStatus::Completed)
+                .expect("finish");
+        }
+
+        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
+        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
+        let orig_ws = std::env::var("RECURSIVE_WORKSPACE").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path().to_str().unwrap());
+
+        let config = Config::from_env().expect("from_env");
+        let prompt = &config.system_prompt;
+        assert!(
+            prompt.contains("# Memory summary"),
+            "non-empty memory must inject Memory summary layer; prompt={prompt}"
+        );
+        assert!(
+            prompt.contains("mutant-kill-memory-note"),
+            "memory note text must appear in system prompt"
+        );
+        assert!(
+            prompt.contains("# Scratchpad"),
+            "non-empty scratchpad must inject Scratchpad layer; prompt={prompt}"
+        );
+        assert!(
+            prompt.contains("mutant-kill-scratchpad-value"),
+            "scratchpad value must appear in system prompt"
+        );
+        assert!(
+            prompt.contains("# Facts"),
+            "non-empty facts must inject Facts layer; prompt={prompt}"
+        );
+        assert!(
+            prompt.contains("mutant-kill-fact"),
+            "fact text must appear in system prompt"
+        );
+        assert!(
+            prompt.contains("# Episodic recall"),
+            "non-empty episodic recall must inject layer; prompt={prompt}"
+        );
+        assert!(
+            prompt.contains("mutant-kill-episodic-goal"),
+            "session goal must appear in episodic layer"
+        );
+
+        // Kills: `replace > with >=` in the layer separator loop (`if i > 0`).
+        // With `>=`, the first layer also gets a leading `\n\n`, producing
+        // four newlines after the `---` separator instead of two.
+        let sep = prompt.find("\n\n---\n\n").expect("layer separator");
+        let after = &prompt[sep + "\n\n---\n\n".len()..];
+        assert!(
+            after.starts_with('#'),
+            "first layer heading must follow --- immediately (no extra blank line); after={:?}",
+            &after[..after.len().min(40)]
+        );
+
+        match orig_model {
+            Some(v) => std::env::set_var("RECURSIVE_MODEL", v),
+            None => std::env::remove_var("RECURSIVE_MODEL"),
+        }
+        match orig_key {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+        match orig_ws {
+            Some(v) => std::env::set_var("RECURSIVE_WORKSPACE", v),
+            None => std::env::remove_var("RECURSIVE_WORKSPACE"),
+        }
+    }
 }

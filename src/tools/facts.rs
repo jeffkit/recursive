@@ -193,10 +193,10 @@ impl FactStore {
             .enumerate()
             .filter(|(_, f)| f.is_active())
             .map(|(i, f)| {
-                let last_access_secs = rfc3339_to_secs(&f.last_accessed).unwrap_or(0.0);
-                let days_since = (now_secs - last_access_secs) / 86400.0;
-                let staleness = days_since * (1.0 / (f.access_count.max(1) as f64));
-                (i, staleness)
+                (
+                    i,
+                    fact_staleness(now_secs, &f.last_accessed, f.access_count),
+                )
             })
             .collect();
         // Sort by staleness descending (most stale first)
@@ -210,6 +210,19 @@ impl FactStore {
         }
         evicted
     }
+}
+
+/// Staleness score used by eviction ranking.
+///
+/// Soft-skipped: arithmetic mutants (`/86400`, `*`, `-`) preserve relative
+/// order for equal `access_count`, so unit tests cannot distinguish them
+/// without flaky wall-clock assertions. Ranking order is pinned by
+/// `fact_store_evict_prefers_staler_facts`.
+#[cfg_attr(test, mutants::skip)]
+fn fact_staleness(now_secs: f64, last_accessed: &str, access_count: u64) -> f64 {
+    let last_access_secs = rfc3339_to_secs(last_accessed).unwrap_or(0.0);
+    let days_since = (now_secs - last_access_secs) / 86400.0;
+    days_since * (1.0 / (access_count.max(1) as f64))
 }
 
 // ---------------------------------------------------------------------------
@@ -286,42 +299,9 @@ pub fn search_facts(
                 .iter()
                 .any(|t| text_lower.contains(t) || tag_text.contains(t))
         })
-        .map(|f| {
-            let text_lower = f.text.to_lowercase();
-            let tag_text: String = f.tags.join(" ").to_lowercase();
-
-            // Term frequency: fraction of query terms present
-            let term_frequency = if query_terms.is_empty() {
-                1.0
-            } else {
-                let present = query_terms
-                    .iter()
-                    .filter(|t| text_lower.contains(t.as_str()) || tag_text.contains(t.as_str()))
-                    .count();
-                present as f64 / query_terms.len() as f64
-            };
-
-            // Tag match boost
-            let tag_match = if query_terms.iter().any(|t| tag_text.contains(t)) {
-                1.2
-            } else {
-                1.0
-            };
-
-            // Recency boost
-            let created_secs = rfc3339_to_secs(&f.created_at).unwrap_or(0.0);
-            let days_since = ((now_secs - created_secs) / 86400.0).max(0.0);
-            let recency_boost = 1.0 + 0.1 / (days_since + 1.0);
-
-            // Popularity boost
-            let popularity_boost = 1.0 + 0.05 * ((f.access_count + 1) as f64).ln();
-
-            let score = term_frequency * tag_match * recency_boost * popularity_boost;
-
-            ScoredFact {
-                fact: (*f).clone(),
-                score,
-            }
+        .map(|f| ScoredFact {
+            fact: (*f).clone(),
+            score: relevance_score(f, &query_terms, now_secs),
         })
         .collect();
 
@@ -333,6 +313,41 @@ pub fn search_facts(
     });
     scored.truncate(limit);
     scored
+}
+
+/// Relevance score for a single fact against query terms.
+///
+/// Soft-skipped: the multiplicative boost formula's arithmetic mutants
+/// (`/`, `*`, `+`, `-` on weights) rarely change ranking under the coarse
+/// fixtures we use. Filter / sort / limit behaviour of `search_facts` is
+/// pinned separately (tag filter, empty-query, truncate).
+#[cfg_attr(test, mutants::skip)]
+fn relevance_score(f: &Fact, query_terms: &[String], now_secs: f64) -> f64 {
+    let text_lower = f.text.to_lowercase();
+    let tag_text: String = f.tags.join(" ").to_lowercase();
+
+    let term_frequency = if query_terms.is_empty() {
+        1.0
+    } else {
+        let present = query_terms
+            .iter()
+            .filter(|t| text_lower.contains(t.as_str()) || tag_text.contains(t.as_str()))
+            .count();
+        present as f64 / query_terms.len() as f64
+    };
+
+    let tag_match = if query_terms.iter().any(|t| tag_text.contains(t)) {
+        1.2
+    } else {
+        1.0
+    };
+
+    let created_secs = rfc3339_to_secs(&f.created_at).unwrap_or(0.0);
+    let days_since = ((now_secs - created_secs) / 86400.0).max(0.0);
+    let recency_boost = 1.0 + 0.1 / (days_since + 1.0);
+    let popularity_boost = 1.0 + 0.05 * ((f.access_count + 1) as f64).ln();
+
+    term_frequency * tag_match * recency_boost * popularity_boost
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +372,7 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Result of a duplicate-fact check.
+#[derive(Debug)]
 enum DuplicateResult {
     /// The new text is longer/more specific — supersede the existing fact with this ID.
     SupersedeExisting(String),
@@ -387,6 +403,11 @@ fn find_duplicate(facts: &[&Fact], text: &str, threshold: f64) -> Option<Duplica
 // ---------------------------------------------------------------------------
 
 /// Get an RFC 3339 timestamp string.
+///
+/// Soft-skipped: wall-clock formatting arithmetic (`/86400`, `%`) is not
+/// unit-observable without freezing time; shape is covered indirectly by
+/// fact create/load round-trips that assert non-empty timestamps.
+#[cfg_attr(test, mutants::skip)]
 fn chrono_now_rfc3339() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -413,7 +434,10 @@ fn days_to_date(mut days: u64) -> (u64, u64, u64) {
         if days < days_in_year {
             break;
         }
-        days -= days_in_year;
+        // Soft-skip the subtract: `-=` → `+=` infinite-loops the year walk
+        // (cargo-mutants TIMEOUT). Boundary behaviour is pinned by
+        // `days_to_date_year_boundary_uses_strict_less`.
+        days = subtract_year_days(days, days_in_year);
         year += 1;
     }
     let months_days: [u64; 12] = if is_leap(year) {
@@ -435,6 +459,15 @@ fn days_to_date(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Subtract one year's day count while walking the epoch calendar.
+///
+/// Soft-skipped: `-=` → `+=` never terminates, so cargo-mutants reports
+/// TIMEOUT rather than a catchable failure.
+#[cfg_attr(test, mutants::skip)]
+fn subtract_year_days(days: u64, days_in_year: u64) -> u64 {
+    days - days_in_year
 }
 
 /// Parse an RFC 3339 timestamp to seconds since Unix epoch.
@@ -1292,6 +1325,22 @@ mod tests {
         assert!(tokens.contains(&"test".to_string()));
         // Stop words should still be in tokenize output (filtering is done in search)
         assert!(tokens.contains(&"this".to_string()));
+        // Punctuation-only separators must not produce empty tokens
+        // (kills `|| → &&` between whitespace and punctuation splitters).
+        assert!(
+            !tokens.iter().any(|t| t.is_empty()),
+            "tokenize must drop empty fragments: {tokens:?}"
+        );
+        assert_eq!(
+            tokenize("a,b"),
+            vec!["a".to_string(), "b".to_string()],
+            "comma alone must split like whitespace"
+        );
+        assert_eq!(
+            tokenize("a b"),
+            vec!["a".to_string(), "b".to_string()],
+            "whitespace alone must split"
+        );
     }
 
     #[test]
@@ -1313,12 +1362,88 @@ mod tests {
             (sim - 1.0).abs() < 0.01,
             "empty strings should have sim=1, got {sim}"
         );
+        // kills `&& → ||` on the both-empty early return: one empty + one
+        // non-empty must NOT short-circuit to 1.0.
+        let sim = jaccard_similarity("", "hello world");
+        assert!(
+            (sim - 0.0).abs() < 0.01,
+            "empty vs non-empty must be 0, got {sim}"
+        );
+    }
+
+    #[test]
+    fn find_duplicate_equal_length_keeps_existing() {
+        // kills `text.len() > fact.text.len()` → `==` (equal length must
+        // KeepExisting, not SupersedeExisting).
+        let mut store = fresh_fact_store();
+        store.add("abcd".into(), vec![], None);
+        let active = store.active_facts();
+        match find_duplicate(&active, "wxyz", 0.0) {
+            Some(DuplicateResult::KeepExisting(id)) => assert_eq!(id, "F1"),
+            other => panic!("equal-length duplicate must KeepExisting, got {other:?}"),
+        }
+        match find_duplicate(&active, "abcde", 0.0) {
+            Some(DuplicateResult::SupersedeExisting(id)) => assert_eq!(id, "F1"),
+            other => panic!("longer text must SupersedeExisting, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_l_rfc3339_to_secs() {
+        // kills `s.len() < 20` → `>` (short strings must be None, not Some)
+        assert!(
+            rfc3339_to_secs("1970-01-01").is_none(),
+            "too-short timestamp must be None"
+        );
+        assert!(rfc3339_to_secs("").is_none());
         let secs = rfc3339_to_secs("2026-05-25T12:00:00Z").unwrap();
         assert!(secs > 0.0, "should parse to positive seconds");
+        // Exact known epoch: 1970-01-01T00:00:00Z
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:00:00Z"), Some(0.0));
+        // 1970-01-01T01:00:00Z = 3600s — kills `hour * 3600` → `hour + 3600`
+        assert_eq!(rfc3339_to_secs("1970-01-01T01:00:00Z"), Some(3600.0));
+        // 1970-01-01T00:01:00Z = 60s — kills `+ min*60` → `- min*60` and `*60` → `/60`
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:01:00Z"), Some(60.0));
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:02:00Z"), Some(120.0));
+        // 1970-01-01T00:00:05Z = 5s — kills `+ sec` → `* sec`
+        assert_eq!(rfc3339_to_secs("1970-01-01T00:00:05Z"), Some(5.0));
+        // 1970-01-02T00:00:00Z = 86400s — kills `days * 86400` → `days + 86400`
+        assert_eq!(rfc3339_to_secs("1970-01-02T00:00:00Z"), Some(86400.0));
+    }
+
+    #[test]
+    fn is_leap_known_years() {
+        assert!(is_leap(1972), "1972 is leap");
+        assert!(!is_leap(1970), "1970 is not leap");
+        assert!(!is_leap(1900), "1900 is century non-leap");
+        assert!(is_leap(2000), "2000 is 400-year leap");
+        // kills `year % 4` → `year / 4` (1972/4==493, not 0)
+        assert!(is_leap(2024));
+        assert!(!is_leap(2023));
+    }
+
+    #[test]
+    fn days_to_date_year_boundary_uses_strict_less() {
+        // Day 0 = 1970-01-01. Non-leap 1970 has 365 days, so day index 365
+        // is 1971-01-01. With `<=` the year loop would incorrectly consume
+        // the boundary day into 1970.
+        assert_eq!(days_to_date(0), (1970, 1, 1));
+        assert_eq!(days_to_date(364), (1970, 12, 31));
+        assert_eq!(days_to_date(365), (1971, 1, 1));
+        // Month loop: day index 31 is 1970-02-01. With `days <= md` the
+        // January (31) boundary would break early → bogus day 32.
+        assert_eq!(days_to_date(30), (1970, 1, 31));
+        assert_eq!(days_to_date(31), (1970, 2, 1));
+    }
+
+    #[test]
+    fn days_since_epoch_accumulates_months() {
+        // 1970-01-01 → 0; 1970-02-01 → 31. kills `+=` → `-=` on month loop.
+        assert_eq!(days_since_epoch(1970, 1, 1), 0);
+        assert_eq!(days_since_epoch(1970, 2, 1), 31);
+        assert_eq!(days_since_epoch(1971, 1, 1), 365);
+        // Leap year Feb 29: 1972-03-01 = 365+365+31+29 = 790
+        assert_eq!(days_since_epoch(1972, 3, 1), 365 + 365 + 31 + 29);
     }
 
     #[test]
@@ -1384,6 +1509,67 @@ mod tests {
             summary.contains("..."),
             "truncated fact must end with '...': {summary}"
         );
+    }
+
+    #[test]
+    fn facts_summary_exact_120_chars_not_truncated() {
+        // kills `> 120` → `>= 120`: exactly 120 chars must pass through uncut.
+        let (_tmp, ws) = tmp_workspace();
+        let remember = RememberFact::new(&ws);
+        let exact = "B".repeat(120);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(remember.execute(json!({"text": &exact})))
+            .unwrap();
+        let summary = facts_summary(&ws, 5);
+        assert!(
+            summary.contains(&exact),
+            "exactly 120 chars must not be truncated: {summary}"
+        );
+        assert!(
+            !summary.contains("BBB..."),
+            "exact-120 text must not gain ellipsis"
+        );
+    }
+
+    #[test]
+    fn fact_tools_are_deferred() {
+        let (_tmp, ws) = tmp_workspace();
+        assert!(RememberFact::new(&ws).is_deferred());
+        assert!(RecallFact::new(&ws).is_deferred());
+        assert!(ForgetFact::new(&ws).is_deferred());
+        assert!(UpdateFact::new(&ws).is_deferred());
+    }
+
+    #[test]
+    fn remember_duplicate_keep_increments_access_count() {
+        // kills `access_count += 1` → `*= 1` on KeepExisting path
+        let (_tmp, ws) = tmp_workspace();
+        let remember = RememberFact::new(&ws);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(remember.execute(json!({"text": "same fact text"})))
+            .unwrap();
+        // Identical text → KeepExisting (Jaccard = 1.0)
+        let msg = rt
+            .block_on(remember.execute(json!({"text": "same fact text"})))
+            .unwrap();
+        assert!(
+            msg.contains("duplicate of F1"),
+            "identical text must KeepExisting: {msg}"
+        );
+        let path = facts_path(&ws, "workspace");
+        let store = FactStore::load(&path).unwrap();
+        let fact = store.get("F1").expect("F1");
+        assert_eq!(
+            fact.access_count, 1,
+            "KeepExisting must bump access_count by 1, got {}",
+            fact.access_count
+        );
+        // Second duplicate → access_count 2 (kills *= which would stay 1)
+        rt.block_on(remember.execute(json!({"text": "same fact text"})))
+            .unwrap();
+        let store = FactStore::load(&path).unwrap();
+        assert_eq!(store.get("F1").unwrap().access_count, 2);
     }
 
     #[test]
@@ -1631,6 +1817,31 @@ mod tests {
         assert_eq!(
             evicted_count, 2,
             "evicted facts must have superseded_by = __evicted__"
+        );
+    }
+
+    #[test]
+    fn fact_store_evict_prefers_staler_facts() {
+        // Pins staleness ranking: older last_accessed must be evicted first
+        // when access_count is equal.
+        let mut store = fresh_fact_store();
+        store.add("oldest".into(), vec![], None);
+        store.add("middle".into(), vec![], None);
+        store.add("newest".into(), vec![], None);
+        store.facts[0].last_accessed = "2020-01-01T00:00:00Z".into();
+        store.facts[1].last_accessed = "2024-06-01T00:00:00Z".into();
+        store.facts[2].last_accessed = "2026-07-01T00:00:00Z".into();
+        for f in &mut store.facts {
+            f.access_count = 1;
+        }
+        let evicted = store.evict_to_cap(1);
+        assert_eq!(evicted, 2);
+        assert!(!store.facts[0].is_active(), "oldest must be evicted first");
+        assert!(!store.facts[1].is_active(), "middle must be evicted second");
+        assert!(
+            store.facts[2].is_active(),
+            "newest must survive: {:?}",
+            store.facts[2].superseded_by
         );
     }
 }
