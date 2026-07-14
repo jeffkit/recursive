@@ -1,0 +1,45 @@
+# Contract: Sprint 1 — stdio JSON-RPC loop + initialize handshake (rev 2)
+
+Deliver a working `recursive acp` subcommand that listens on stdin for newline-delimited JSON-RPC 2.0 messages, handles the `initialize` method with full agent capabilities (typed from `src/acp/protocol.rs`), emits the `initialized` notification after handshake, enforces the pre-initialize state machine (−32002), and strictly separates protocol output (stdout) from diagnostic logs (stderr). The server runner lives in `src/acp/server.rs` as a standalone adapter mirroring McpServerRunner's stdin/stdout loop — no changes to `src/run_core.rs` or `src/kernel.rs`.
+
+## Criteria
+- [C1] `recursive acp` starts without error and blocks reading from stdin
+  - how: Run `echo '' | recursive acp` — process starts, reads stdin, exits cleanly (no panic, no crash). stderr may contain startup messages but exit code is 0.
+- [C2] Valid JSON-RPC 2.0 initialize request produces at least one valid JSON-RPC response on stdout; the server may emit additional protocol messages (e.g. `initialized` notification) so exact line count is not asserted
+  - how: Pipe `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` into `recursive acp`. Assert at least one stdout line is valid JSON containing `"jsonrpc":"2.0"`, `"id":1`, and `"result"`. Do not assert exact line count.
+- [C3] `initialize` response includes `protocolVersion: 1`
+  - how: Parse the JSON-RPC response from C2; assert `result.protocolVersion` equals `1` (integer).
+- [C4] `initialize` response includes `agentInfo.name` = `"recursive"` and `agentInfo.version` matches Cargo.toml version
+  - how: Parse the initialize response; assert `result.agentInfo.name === "recursive"`. Read `Cargo.toml` version field, assert `result.agentInfo.version` equals that string (e.g. `"0.7.0"`). Version must come from the compiled binary, not hardcoded.
+- [C5] `initialize` response includes complete `agentCapabilities` matching the nested `AgentCapabilities` struct from ACP v1 spec (not flat keys)
+  - how: Parse the initialize response; assert `result.agentCapabilities` is a non-null object with nested sub-structs matching the typed `AgentCapabilities` definition from `src/acp/protocol.rs`. Specifically assert: `agentCapabilities.promptCapabilities` is an object with at least `text` field; `agentCapabilities.mcpCapabilities` is an object with `http` and `sse` fields; `agentCapabilities.fs` is a `FileSystemCapabilities`-shaped object with `readTextFile` and `writeTextFile`; `agentCapabilities.sessionCapabilities` is an object with `resume` and `loadSession`. These must be populated from typed structs, not ad-hoc `serde_json::Value`.
+- [C6] All log/diagnostic output goes to stderr only; stdout is strictly protocol JSON-RPC; stderr must contain no valid JSON-RPC lines
+  - how: Run `recursive acp` with a valid initialize request, redirect stdout and stderr separately. Parse each stdout line as valid JSON-RPC. Assert that no stderr line starts with `{"jsonrpc"` — i.e., grep stderr for the literal substring `"jsonrpc"` and assert zero matches.
+- [C7] Unknown JSON-RPC method returns error response with code -32601 (Method not found)
+  - how: Pipe `{"jsonrpc":"2.0","id":2,"method":"nonexistent"}` into `recursive acp`. Assert response is a JSON-RPC error with `error.code === -32601`. Response must still include the matched `id: 2`.
+- [C8] Malformed (non-JSON) input on stdin returns a JSON-RPC parse error (-32700) and continues reading
+  - how: Pipe `not json\n{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":1}}` into `recursive acp`. Assert first output line is a JSON-RPC error with `error.code === -32700` and `id: null`. Assert second output line is a valid initialize response with `id: 3`. Server must not crash or exit.
+- [C9] JSON-RPC notification (no `id` field) is consumed silently — no response written to stdout
+  - how: Pipe `{"jsonrpc":"2.0","method":"someNotification"}\n{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":1}}` into `recursive acp`. Assert stdout contains a valid initialize response with `id: 4`. No response line for the notification (note: the server's own `initialized` notification may appear; exclude it — only verify that `someNotification` produces no response).
+- [C10] Multiple requests in sequence all receive valid responses in order
+  - how: Pipe three initialize requests with distinct ids (5, 6, 7) into `recursive acp`. Assert stdout has at least three response lines, each a valid JSON-RPC response with matching ids 5, 6, 7, in that order.
+- [C11] `recursive acp` is a registered CLI subcommand visible in `--help`
+  - how: Run `recursive --help` and assert the output contains `acp` (case-insensitive) as a listed subcommand alongside `mcp` and `http`. Run `recursive acp --help` and assert it shows ACP-specific help text.
+- [C12] ACP server runner lives in `src/acp/server.rs` as a standalone module with no imports from or edits to `src/run_core.rs` or `src/kernel.rs`
+  - how: Verify `src/acp/server.rs` exists and is a valid Rust file. Grep `src/run_core.rs` for any reference to `acp` — assert zero matches. Grep `src/kernel.rs` for any reference to `acp` — assert zero matches. Grep `src/acp/server.rs` for `run_core`, `RunCore`, or `kernel` imports — assert zero matches. The server runner is a self-contained stdin/stdout loop that touches neither kernel file.
+- [C13] ACP server loop mirrors `McpServerRunner::run()` pattern: read line from stdin → parse JSON-RPC → dispatch → write response to stdout → loop
+  - how: Read `src/acp/server.rs` and `src/mcp_server.rs`. Assert both use the same structural pattern: a `run()` or `serve()` async function that loops on `BufReader::read_line` (or equivalent line-at-a-time stdin read), passes each line to a JSON-RPC dispatcher, and writes the serialized response to stdout with `writeln!`. No shared code is required — just structurally analogous.
+- [C14] The `initialize` response uses types defined in Sprint 0's protocol types module (`src/acp/protocol.rs`)
+  - how: Grep `src/acp/server.rs` for imports from `crate::acp::protocol` or `super::protocol`. Assert that `InitializeResult`, `AgentInfo`, and `AgentCapabilities` structs from Sprint 0 are used (not ad-hoc `serde_json::Value`). Verify by checking that `protocolVersion`, `agentInfo`, and `agentCapabilities` fields are populated from the typed structs.
+- [C15] Server handles EOF on stdin gracefully (client disconnects) — exits with code 0
+  - how: Pipe a single valid initialize request into `recursive acp` (no further input). After receiving the response(s), stdin closes. Assert the process exits with code 0, no panic messages on stderr.
+- [C16] `cargo test --workspace` passes with ACP server unit tests covering at minimum: valid initialize, unknown method, malformed JSON, notification, EOF, pre-initialize state machine, initialized notification
+  - how: Run `cargo test --workspace` and assert all tests pass. Check `src/acp/server.rs` (or its test module) for `#[cfg(test)] mod tests` containing test functions named descriptively matching C2-C20 scenarios. Minimum: `test_initialize_success`, `test_unknown_method`, `test_malformed_json`, `test_notification_no_response`, `test_eof_clean_exit`, `test_pre_initialize_error`, `test_initialized_notification`.
+- [C17] `cargo clippy --all-targets --all-features -- -D warnings` passes with zero warnings
+  - how: Run `cargo clippy --all-targets --all-features -- -D warnings` and assert exit code 0. No new clippy warnings introduced.
+- [C18] `cargo fmt --all -- --check` passes with no formatting diffs
+  - how: Run `cargo fmt --all -- --check` and assert exit code 0. All new code is rustfmt-compliant.
+- [C19] After a successful `initialize` response, the server emits an `initialized` JSON-RPC notification on stdout as required by ACP v1 spec
+  - how: Pipe `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` into `recursive acp`. Assert that after the initialize response line (matching `"id":1`), there is a subsequent stdout line that is a valid JSON-RPC notification (no `id` field) with `"method"` equal to `"initialized"`. The notification must appear after the initialize response, not before.
+- [C20] Before `initialize` completes, any non-initialize method returns error code -32002 (Server not initialized) per ACP v1 state machine
+  - how: Pipe `{"jsonrpc":"2.0","id":99,"method":"session/new","params":{}}` as the first and only message into `recursive acp`. Assert the response is a JSON-RPC error with `error.code === -32002` and `id: 99`. In a separate test, send a non-initialize method first (assert -32002), then send a valid `initialize` — assert the initialize succeeds normally, proving the server is not permanently locked.

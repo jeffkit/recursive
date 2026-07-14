@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -187,6 +188,10 @@ impl Tool for GlobTool {
 
     fn side_effect_class(&self) -> crate::tools::ToolSideEffect {
         crate::tools::ToolSideEffect::ReadOnly
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Search
     }
 
     async fn execute(&self, args: Value) -> Result<String> {

@@ -1,0 +1,165 @@
+{
+  "overall": "fail",
+  "findings": [
+    {
+      "criterion": "S2-E1",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 376,
+      "note": "handle_initialize 不提取或存储 client capabilities（如 fs.readTextFile）。Read 工具硬编码本地文件系统访问路径。ClientReadFile 虽在 client_fs.rs 实现但未接入 session，无代码路径将 Read 路由到 ClientReadFile。",
+      "repro": "grep -r 'readTextFile' src/acp/ → 无匹配。grep -r 'ClientReadFile' src/acp/ → 无匹配。确认 bridge 或 session/new 未读取 client capability 参数。"
+    },
+    {
+      "criterion": "S2-E2",
+      "status": "fail",
+      "file": "src/tools/client_fs.rs",
+      "line": 117,
+      "note": "ClientReadFile::execute 硬编码返回 Err(\"Client not available...fallback to local read\")，但本地 Read 降级路径未实现。实际执行路径中，Read 工具从不调用 ClientReadFile，因此无降级逻辑。超时阈值 acp.client_read_timeout_ms 是 ClientReadFile struct 字段但从未被 ACP session 读取/设置。无日志标记 'fallback to local read'。",
+      "repro": "无法编写 test 验证 Read 工具降级，因为 Read 工具代码 (src/tools/fs.rs) 不引用 AcpClientFsState。"
+    },
+    {
+      "criterion": "S2-E3",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 376,
+      "note": "initialize 中 client 传入的 capabilities 字段被完全忽略（仅提取 protocolVersion）。无代码在 session/new 时读取 capabilities.fs.readTextFile 并据此隐藏 ClientReadFile。",
+      "repro": "运行 test: 初始化时传入 {\"capabilities\": {\"fs\": {\"readTextFile\": false}}}，验证 session/new 后 tools/list 是否包含 ClientReadFile → 无注册，两路径无差别。"
+    },
+    {
+      "criterion": "S2-E4",
+      "status": "fail",
+      "file": "src/tools/fs.rs",
+      "line": 1,
+      "note": "WriteFile 工具不引用 ACP capabilities 或 ClientWriteFile。ClientWriteFile 虽在 client_fs.rs 实现但未被任何 session/registry 实例化。Agent 始终调用本地 Write 工具，不发出 ClientWriteFile。",
+      "repro": "grep -r 'ClientWriteFile' src/tools/fs.rs → 无匹配。确认 WriteFile 工具代码无 ACP 分支。"
+    },
+    {
+      "criterion": "S2-E5",
+      "status": "fail",
+      "file": "src/tools/client_fs.rs",
+      "line": 228,
+      "note": "ClientWriteFile::execute 包含 resolve_within 校验（单元测试表明此函数逻辑正确），但 ClientWriteFile 从未被调用（E2E 路径不存在），所以 sandbox 逃逸检测是死代码。",
+      "repro": "确认无 thread 或 session 通过 registry.invoke('ClientWriteFile', ...) 调用此工具。"
+    },
+    {
+      "criterion": "S2-E6",
+      "status": "pass",
+      "file": "src/mcp.rs",
+      "line": 399,
+      "note": "McpClient::spawn_stdio 完整实现：子进程创建，stdin/stdout JSON-RPC，do_initialize 握手。单元测试覆盖基础 JSON-RPC 通信。但是未集成到 ACP session（session/new 忽略 mcpServers 的 stdio 配置，不 spawn MCP client）。",
+      "repro": "cargo test -- mcp 通过。test_http_sse_config_url_takes_priority 等测试验证 stdio 路径正确性。"
+    },
+    {
+      "criterion": "S2-E7",
+      "status": "pass",
+      "file": "src/mcp.rs",
+      "line": 458,
+      "note": "McpClient::spawn_http_sse 包含 HTTP POST 实现。transport 通过 reqwest POST /messages 发送 JSON-RPC request。do_initialize 用于 initialize 握手。",
+      "repro": "test_http_sse_discovery_with_url 验证 url 配置解析。parse_sse_endpoint/parse_sse_response 单元测试覆盖 SSE 解析。"
+    },
+    {
+      "criterion": "S2-E8",
+      "status": "pass",
+      "file": "src/mcp.rs",
+      "line": 458,
+      "note": "McpClient::spawn_http_sse 通过 SSE 流接收 server→client 消息，通过 endpoint 事件发现 POST URL，然后 POST JSON-RPC 消息。",
+      "repro": "parse_sse_endpoint 单元测试验证 endpoint 发现逻辑。parse_sse_response 验证 response 匹配。"
+    },
+    {
+      "criterion": "S2-E9",
+      "status": "pass",
+      "file": "src/mcp.rs",
+      "line": 380,
+      "note": "McpClient::spawn 在 url.is_some() 时走 spawn_http_sse，否则走 spawn_stdio。McpServer 结构体含 command 和 url 字段，互斥使用。但未集成到 ACP session：无三种 transport 混合配置的 E2E 测试。",
+      "repro": "test_http_sse_config_url_takes_priority 验证 url 优先于 command。无多 server 混合 test。"
+    },
+    {
+      "criterion": "S2-E10",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 558,
+      "note": "session/new 解析 mcpServers 参数为 serde_json::Value 并存储在 session.mcp_servers 中，但不比较、不解析、不 shadow 全局 MCP config。无全局 MCP config 加载逻辑，无 session-scoped vs global 合并/覆盖策略。未在 ACP server 中包含 MCP config 管理。",
+      "repro": "设置全局 MCP config，session/new 传入同名 server 但仅含 command，验证 env 为空 → 无法测试，因为此逻辑不存在。"
+    },
+    {
+      "criterion": "S2-E11",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 1,
+      "note": "session/close JSON-RPC 方法未在 dispatch_async 中实现。grep session/close → 无匹配。kill-gracefully 函数存在（src/mcp.rs:1569）但无调用者。无子进程追踪机制，session 不记录已启动的 MCP 子进程 PID。",
+      "repro": "grep -r 'session/close' src/ → 无匹配。"
+    },
+    {
+      "criterion": "S2-E12",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 1,
+      "note": "由于 session/close 不存在，无隔离多 session 所需的子进程管理。子进程 PID 不在 session 结构中追踪。",
+      "repro": "创建两个 ACP session（通过 ACP 协议启动)，确认每个 session 的 MCP server 进程 → 无法验证，因为 MCP server 从未在 session/new 时启动。"
+    },
+    {
+      "criterion": "S2-E13",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 637,
+      "note": "handle_session_load 创建新 AgentRuntime 和 AcpSession，但不调用 kill_gracefully kill 旧 MCP 子进程。session/load 无子进程追踪或清理。",
+      "repro": "grep -r 'kill_gracefully' src/acp/ → 无匹配。"
+    },
+    {
+      "criterion": "S2-E14",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 867,
+      "note": "handle_session_resume 同样调用 insert_with_id 覆盖旧 session，不 kill 旧 MCP 子进程。",
+      "repro": "grep -r 'kill_gracefully' src/acp/server.rs → 无匹配。"
+    },
+    {
+      "criterion": "S2-E15",
+      "status": "pass",
+      "file": "src/mcp.rs",
+      "line": 1569,
+      "note": "kill_gracefully 函数存在，实现三阶段：1) SIGTERM(start_kill) 2) timeout(grace_period, wait()) 3) SIGKILL(kill -9)。返回 KillOutcome::Graceful 或 Timeout。grace_period 可配置。但缺少直接调用 kill_gracefully 的单元测试（函数只有实现，无测试用例调用它）。",
+      "repro": "grep -r 'kill_gracefully(' src/mcp.rs → 仅定义行，无测试调用。"
+    },
+    {
+      "criterion": "S2-E16",
+      "status": "fail",
+      "file": "src/mcp.rs",
+      "line": 1569,
+      "note": "kill_gracefully 的 grep 结果显示其无任何调用者（仅在定义处出现）。session/close 不存在。session/load、session/resume 不调用它。agent 崩溃清理和 ACP client 断连清理路径不存在。",
+      "repro": "grep -rn 'kill_gracefully' src/ → 仅 src/mcp.rs 第 1569 行定义。确认无其他调用点。"
+    },
+    {
+      "criterion": "S2-E17",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 1,
+      "note": "McpToolRouter 定义在 src/mcp.rs:1654 但从未集成到 ACP bridge 或 session/prompt 处理逻辑。dispatch_async 中 session/prompt 直接调用 runtime.run()，无 MCP tool 路由层。工具调用从 LLM 输出直接进入 AgentRuntime 的 ToolRegistry，不经路由。",
+      "repro": "grep -r 'McpToolRouter' src/acp/ → 无匹配。"
+    },
+    {
+      "criterion": "S2-E18",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 524,
+      "note": "handle_session_new 不尝试连接 MCP server（mcpServers 仅存储为 JSON 值），所以无传输层连接、无失败、无 degraded 状态。session 状态只有正常态，无 error 标记的 server 字段。",
+      "repro": "session/new 接受 mcpServers 参数但不解析/连接。确认无 McpClient::spawn 调用路径。"
+    },
+    {
+      "criterion": "S2-E19",
+      "status": "fail",
+      "file": "src/acp/server.rs",
+      "line": 1,
+      "note": "ACP server 仅通过 stdio JSON-RPC 通信（无 WebSocket/HTTP stream 长连接），不存在连接断开检测机制。无 event handler 或 watch-dog 在 client 断连时触发清理。",
+      "repro": "grep -r 'disconnect' src/acp/ → 无匹配。grep -r 'cleanup' src/acp/ → 无匹配。"
+    },
+    {
+      "criterion": "S2-E20",
+      "status": "fail",
+      "file": "src/tools/mod.rs",
+      "line": 95,
+      "note": "ClientReadFile 和 ClientWriteFile 在 mod.rs 中 re-export（pub use），但未注册到 build_standard_tools_with_roots（grep 'ClientReadFile' src/tools/registry.rs → 无匹配）。不在 ACP session 内有条件注册。tools/list 在 ACP session 中不返回 ClientReadFile/ClientWriteFile，在非 ACP session 中也相同（都不返回）。description 虽含 'use this when the session client has declared fs.readTextFile=true'（正确），但 tools/list 不包含此工具，所以 agent 无法发现它。",
+      "repro": "运行 test: 在 ACP session 中调用 tools/list，assert 不包含 'ClientReadFile' → 通过（因为没有注册，不是期望的行为）。"
+    }
+  ]
+}

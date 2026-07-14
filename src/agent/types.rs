@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Decision returned by a permission hook to allow, deny, or transform a tool call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
     /// Let the tool execute with the original arguments.

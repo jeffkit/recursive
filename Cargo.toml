@@ -92,6 +92,7 @@ walkdir = "2"
 regex = "1"
 base64 = "0.22"
 blake3 = "1"
+sha2 = "0.10"
 futures-util = { version = "0.3.32" }
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
@@ -99,6 +100,7 @@ tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 jsonwebtoken = { version = "9", optional = true }
 tempfile = { version = "3", optional = true }
+agent-client-protocol-schema = "1.4"
 agui-protocol = { version = "0.1", path = "crates/agui-protocol", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 deadpool-redis = { version = "0.18", optional = true }

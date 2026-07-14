@@ -10,6 +10,7 @@ pub mod agent;
 pub mod agent_defs;
 pub mod audit;
 pub mod checkpoint;
+pub mod client_fs;
 pub mod count_lines;
 pub mod dispatch;
 #[cfg(feature = "cloud-runtime")]
@@ -91,6 +92,7 @@ pub use checkpoint::{
     build_checkpoint_save_tool, build_checkpoint_tools, CheckpointDiff, CheckpointList,
     CheckpointSave, CheckpointSaveCtx, CheckpointToolCtx,
 };
+pub use client_fs::{AcpClientFsState, ClientReadFile, ClientWriteFile};
 pub use count_lines::CountLines;
 pub use edit::EditTool;
 pub use episodic_recall::{episodic_recall_summary, EpisodicRecall};

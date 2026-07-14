@@ -81,6 +81,10 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Operation cancelled via CancellationToken.
+    #[error("cancelled")]
+    Cancelled,
+
     /// Timeout after a specified duration
     #[error("timeout after {duration_ms}ms")]
     Timeout { duration_ms: u64 },
@@ -207,6 +211,13 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("missing RECURSIVE_API_KEY"));
+    }
+
+    #[test]
+    fn test_cancelled_format() {
+        let err = Error::Cancelled;
+        let msg = err.to_string();
+        assert!(msg.contains("cancelled"));
     }
 
     #[test]

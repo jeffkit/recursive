@@ -570,8 +570,9 @@ impl<'a> RunCore<'a> {
             };
 
         if let Some(ref tx) = stream_sender {
+            let cancel_token = self.shutdown_token.clone();
             self.llm
-                .stream(messages, call_specs, Some(tx.clone()))
+                .stream(messages, call_specs, Some(tx.clone()), cancel_token)
                 .await
         } else {
             self.llm.complete(messages, call_specs).await

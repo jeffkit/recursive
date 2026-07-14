@@ -296,14 +296,24 @@ impl ChatProvider for OpenAiProvider {
         eager_tools: &[SpecWithHint],
         deferred_tools: &[SpecWithHint],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         if deferred_tools.is_empty() {
             let specs: Vec<ToolSpec> = eager_tools.iter().map(|(s, _)| s.clone()).collect();
             let tx = stream_tx.or_else(|| self.stream_tx.clone());
-            return self.stream_inner(messages, &specs, tx).await;
+            return self.stream_inner(messages, &specs, tx, cancel_token).await;
         }
-        self.run_stream_search_loop(messages, eager_tools, deferred_tools, &[], 0, stream_tx)
-            .await
+        // run_stream_search_loop 内部递归调 stream()，cancel_token 自然向下传
+        self.run_stream_search_loop(
+            messages,
+            eager_tools,
+            deferred_tools,
+            &[],
+            0,
+            stream_tx,
+            cancel_token,
+        )
+        .await
     }
 
     async fn stream(
@@ -311,10 +321,11 @@ impl ChatProvider for OpenAiProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         // If no stream_tx provided, fall back to the instance-level one
         let tx = stream_tx.or_else(|| self.stream_tx.clone());
-        self.stream_inner(messages, tools, tx).await
+        self.stream_inner(messages, tools, tx, cancel_token).await
     }
 }
 
@@ -434,6 +445,7 @@ impl OpenAiProvider {
     }
 
     /// Software-layer ToolSearch loop for `stream_with_search`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_stream_search_loop(
         &self,
         messages: &[Message],
@@ -442,6 +454,7 @@ impl OpenAiProvider {
         loaded_tools: &[ToolSpec],
         round: usize,
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         let mut call_tools: Vec<ToolSpec> = Vec::new();
         call_tools.push(Self::tool_search_spec().0);
@@ -449,7 +462,9 @@ impl OpenAiProvider {
         call_tools.extend_from_slice(loaded_tools);
 
         let tx = stream_tx.clone().or_else(|| self.stream_tx.clone());
-        let completion = self.stream_inner(messages, &call_tools, tx).await?;
+        let completion = self
+            .stream_inner(messages, &call_tools, tx, cancel_token.clone())
+            .await?;
 
         let search_call = completion
             .tool_calls
@@ -512,6 +527,7 @@ impl OpenAiProvider {
             &next_loaded,
             round + 1,
             stream_tx,
+            cancel_token,
         ))
         .await
     }
@@ -521,6 +537,7 @@ impl OpenAiProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         let mut body = build_request(
             &self.model,
@@ -550,7 +567,9 @@ impl OpenAiProvider {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return self.parse_sse_stream(resp, stream_tx.clone()).await;
+                        return self
+                            .parse_sse_stream(resp, stream_tx.clone(), cancel_token.clone())
+                            .await;
                     }
                     let text = resp.text().await?;
                     tracing::debug!(target: "recursive::llm", body = %text, "error response (stream)");
@@ -600,6 +619,7 @@ impl OpenAiProvider {
         &self,
         resp: reqwest::Response,
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         let mut content = String::new();
         let mut reasoning_content = String::new();
@@ -619,14 +639,33 @@ impl OpenAiProvider {
         let mut incomplete: Vec<u8> = Vec::new();
         let mut line_buf = String::new();
 
-        while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk.map_err(|e| self.make_err(format!("SSE stream read error: {e}")))?;
+        // 决策 4b：把 SSE 循环改成 tokio::select!，让 cancel_token 能在两个 chunk 之间立刻
+        // 触发。触发后函数返回 Err(Error::Cancelled)；调用方 stream() 把 reqwest::Response
+        // drop（连接关闭）；run_core 已有逻辑翻成 FinishReason::Cancelled（Invariant #7 不破）。
+        loop {
+            let chunk_result = if let Some(ct) = cancel_token.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => {
+                        // reqwest::Response 在函数返回时被 drop，HTTP 连接关闭
+                        return Err(Error::Cancelled);
+                    }
+                    next = byte_stream.next() => next,
+                }
+            } else {
+                byte_stream.next().await
+            };
+            let chunk = match chunk_result {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => return Err(self.make_err(format!("SSE stream read error: {e}"))),
+                None => break,
+            };
             // Prepend any leftover bytes from the previous chunk.
             let combined: Vec<u8> = if incomplete.is_empty() {
-                bytes.to_vec()
+                chunk.to_vec()
             } else {
                 let mut v = std::mem::take(&mut incomplete);
-                v.extend_from_slice(&bytes);
+                v.extend_from_slice(&chunk);
                 v
             };
             // Decode as much valid UTF-8 as possible; keep the remainder.
@@ -1435,7 +1474,7 @@ data: [DONE]\n\n";
         let provider =
             OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-stream-model").unwrap();
         let completion = provider
-            .stream(&[Message::user("hi")], &[], None)
+            .stream(&[Message::user("hi")], &[], None, None)
             .await
             .unwrap();
         assert_eq!(completion.content, "Hello World");
@@ -1456,7 +1495,7 @@ data: [DONE]\n\n";
         }]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
-            .stream(&[Message::user("hi")], &[], Some(tx))
+            .stream(&[Message::user("hi")], &[], Some(tx), None)
             .await
             .unwrap();
         assert_eq!(completion.content, "fallback works");

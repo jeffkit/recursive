@@ -1,0 +1,47 @@
+- [ACP-S1-01] handle_session_load exists and replays notifications, but there is zero test coverage: no unit test calls handle_session_load, no E2E test exists. The replay logic may produce malformed notifications because it treats every message as text-only — tool_results are rendered as plain text, not as proper ACP tool_call_update notifications with status fields. Additionally, no monitoring mechanism exists to verify tools are NOT re-executed.
+  - file: src/acp/server.rs:539
+  - repro: Add a unit test that: 1) creates a session, sends 3 messages including one with a tool call + result, 2) saves the session, 3) calls session/load, 4) asserts the output contains exactly the replayed notifications in order, 5) asserts last notification is session/loaded, 6) counts tool invocations to verify zero re-execution.
+
+- [ACP-S1-03] handle_session_resume exists and returns context without notifications (vec![]), but no test verifies that: 1) the returned system_prompt matches the original, 2) conversation history is present (last message content matches), 3) MCP servers are re-initialized (there is no MCP lifecycle code at all — see S1-06). No test verifies zero session/update notifications during resume.
+  - file: src/acp/server.rs:741
+  - repro: Add a unit test that: 1) creates a session with custom system_prompt and two MCP servers, 2) sends 3 messages, 3) calls session/resume, 4) asserts returned system_prompt is correct, 5) asserts last message content matches, 6) asserts no session/update notifications appear in output.
+
+- [ACP-S1-04] summarize_transcript exists as a local heuristic (no LLM call, good). It is called from handle_session_load. However, there is no test that: 1) inspects the system_prompt in the session/loaded response to verify the summary paragraph was injected, 2) uses a provider mock to assert zero LLM API calls were made during load. The injection into system_prompt is done (line ~584 in server.rs) but untested.
+  - file: src/acp/session.rs:368
+  - repro: Add a unit test that: 1) creates a session with 5+ messages spanning tool calls, 2) saves and calls session/load, 3) asserts the session/loaded response.systemPrompt contains a summary paragraph mentioning accomplishments and no blockers, 4) uses a MockProvider with an invocation counter to assert zero LLM calls.
+
+- [ACP-S1-06] mcp_servers field exists on AcpSession and is persisted/loaded in metadata, but there is ZERO code to spawn, kill, or manage stdio MCP subprocesses. The mcp_servers value is stored but never used to start servers. No session/close handler exists either. The contract requires killing old processes on load/resume and spinning up new ones from the provided mcpServers config.
+  - file: src/acp/server.rs:439
+  - repro: Add MCP subprocess lifecycle management: 1) store spawned child PIDs on AcpSession, 2) kill them (SIGTERM → 5s → SIGKILL) on session/load and session/resume before spawning fresh ones, 3) verify in a test that old processes are dead and new ones are running after load/resume.
+
+- [ACP-S1-07] PermissionOutcome, PermissionDecision, translate(), PermissionBridge are all defined in src/acp/permission.rs but the module is NOT exposed from src/acp/mod.rs (no `pub mod permission;` line). It is entirely dead code. The runtime never emits a session/request_permission notification before tool calls. The PermissionBridge is never instantiated. The translate exhaustiveness test (translate_allowed_to_allow, etc.) exists but the types are unreachable from the crate public API.
+  - file: src/acp/permission.rs:1
+  - repro: 1) Add `pub mod permission;` to src/acp/mod.rs. 2) Wire the PermissionBridge into the session/prompt flow: before dispatching each tool call, emit a session/request_permission notification and wait for PermissionBridge::wait_for_decision. 3) Add an integration test that sends a prompt triggering a write_file tool call and asserts a session/request_permission notification is emitted.
+
+- [ACP-S1-08] PermissionBridge::wait_for_decision implements a 30-second timeout via tokio::time::timeout(Duration::from_secs(30), ...) that defaults to Deny. However, this function is NEVER CALLED because the PermissionBridge is dead code (not exposed from mod.rs, not wired into runtime). The bridge_timeout_denies unit test only tests the drop-case (instant timeout), not the full 30-second wait.
+  - file: src/acp/permission.rs:115
+  - repro: Wire PermissionBridge into the runtime tool dispatch path. Add a test that: 1) configures the client to never respond, 2) triggers a tool call, 3) asserts the tool resolves with Deny after the timeout, 4) verifies no oneshot channel leak.
+
+- [ACP-S1-09] Three sub-criteria all fail: a) No E2E YAML test for session/cancel exists in e2e/tests/. b) No unit test in src/llm/ creates a CancellationToken, constructs an SSE source, and verifies parse_sse_stream returns Err(Error::Cancelled) within 100ms. c) No TCP RST integration test exists. The session/cancel handler in server.rs runs the cancel_token.cancel() logic but is untested end-to-end.
+  - file: src/acp/server.rs:882
+  - repro: a) Add e2e/tests/09-acp-cancel.yaml: session/new → session/prompt (with ≥5s artificial delay) → session/cancel (within 500ms), assert stopReason:'cancelled' and elapsed < 2s. b) Add unit test in src/llm/openai.rs: create CancellationToken, SSE source emitting 1 chunk/sec, cancel 10ms later, assert timeout(100ms, parse_sse_stream) returns Err(Error::Cancelled). c) Add integration test: start HTTP server sending 1 byte/sec, GET with reqwest, cancel (drop Response), verify server detects error within 500ms.
+
+- [ACP-S1-10] No test exists that: starts a fresh session, sends a prompt that produces exactly 3 tool_calls in a single turn, sends session/cancel after the second tool_result notification, then inspects the transcript to verify every Role::Tool has a paired Role::ToolResult and no orphaned entries exist. While the bridge has synthesize_cancelled_tool_results which handles this case, it is never tested in an end-to-end flow with a real transcript.
+  - file: src/acp/server.rs:882
+  - repro: Add both an integration test (using dispatch_one) and an E2E test that: 1) creates a session, 2) sends a prompt producing 3 tool_calls, 3) cancels after 2 results, 4) saves and inspects the transcript, 5) asserts every tool_call has exactly one tool_result and no orphans.
+
+- [ACP-S1-11] client_rpc_timeout_ms() is defined (line 102) but NEVER CALLED anywhere in the codebase. No fs/* RPC dispatch exists at all — there is no code path that sends a request_fs_read or request_fs_write to the client. No CancellationToken is bound to any client RPC. The constant ACP_CLIENT_RPC_TIMEOUT_MS does not exist (it's an inline function instead). No tokio::spawn tracking exists to assert no hanging futures.
+  - file: src/acp/server.rs:96
+  - repro: Implement fs/* RPC dispatch: when a tool requires client-side file access, send a notification via the bridge and wait on a oneshot channel guarded by client_rpc_timeout_ms() timeouts and the session's CancellationToken. Add tests that: 1) verify 30s timeout on non-response, 2) verify cancel via CancellationToken before timeout, 3) assert no leaked tasks.
+
+- [ACP-S1-13] Handler code exists for some error cases: non-existent session (line 571, returns -32000), corrupt session file (line 579, returns -32000 with parse failure message), cancel non-running session (line 881, returns -32000), cancel with missing sessionId (line 905, returns -32000) — but NONE of these have unit tests or E2E tests. Specifically missing: a) no test for non-existent session/load, b) no test for corrupt session file, c) no cancel idempotency test (double cancel), d) no invalid mcpServers test for resume, e) no cancel non-running session test, f) no double-cancel test, g) no cancel+natural-completion race test.
+  - file: src/acp/server.rs:561
+  - repro: Add all 7 sub-tests: a) session/load with nonexistent ID → -32000. b) corrupt JSONL file → -32000. c) session/cancel for completed prompt → success. d) invalid mcpServers binary path in resume → warning logged, valid context returned. e) session/cancel on session with no active turn → -32000. f) double cancel → second returns result:true with no side effects. g) tokio::join!(cancel, prompt_response) → exactly one stopReason emitted.
+
+- [ACP-S1-14] PermissionDebouncer is implemented in src/acp/permission.rs with 500ms window and flush logic. Unit tests verify add/flush/dedup. However, the entire permission module is dead code (not exposed from mod.rs, not wired into runtime). The debouncer is never instantiated, never populated with tool calls, and never flushed to produce a consolidated notification.
+  - file: src/acp/permission.rs:152
+  - repro: Expose permission module and wire PermissionDebouncer into the tool dispatch path. Add integration test: send a prompt that triggers 3 tool_calls at once, assert exactly 1 session/request_permission notification is emitted with a tools array of 3 entries.
+
+- [ACP-S1-15] Dedup logic in PermissionDebouncer::add() correctly increments count for identical tool+path pairs. Unit test debouncer_dedup_identical_tool_path verifies this. Same problem as S1-14: dead code, never wired in.
+  - file: src/acp/permission.rs:196
+  - repro: Wire PermissionDebouncer into the runtime. Add test: trigger 2x write_file on same path, 1x write_file on different path, 1x read_file. Assert consolidated notification has exactly 3 entries with correct counts.

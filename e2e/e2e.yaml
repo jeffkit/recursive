@@ -53,6 +53,10 @@ tests:
       id: smoke
       file: tests/00-smoke.yaml
 
+    - name: "ACP Initialize Handshake (Sprint 1)"
+      id: acp-init
+      file: tests/01-acp-initialize.yaml
+
     - name: "Basic Agent Tool Usage"
       id: basic
       file: tests/01-basic-tools.yaml

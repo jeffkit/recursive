@@ -229,6 +229,8 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    /// Start as an ACP (Agent Client Protocol) server (stdio transport).
+    Acp,
     /// Start the HTTP API server.
     #[cfg(feature = "http")]
     Http {
@@ -666,6 +668,41 @@ async fn main() -> anyhow::Result<()> {
             let workspace = std::fs::canonicalize(&workspace)?;
             config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
+        }
+        Cmd::Acp => {
+            // ACP server: stdio JSON-RPC transport for Agent Client Protocol.
+            tracing::info!("starting ACP v1 server on stdio");
+            // Build LLM provider from config for session operations.
+            let api_key = config
+                .require_api_key()
+                .context("ACP server requires an API key")?;
+            let retry = RetryPolicy {
+                max_retries: config.retry_max,
+                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+            };
+            let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
+                "anthropic" => {
+                    let anthropic_retry = recursive::llm::RetryPolicy {
+                        max_retries: config.retry_max,
+                        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+                    };
+                    let anthropic =
+                        AnthropicProvider::new(&config.api_base, api_key, &config.model)?
+                            .with_temperature(config.temperature)
+                            .with_retry_policy(anthropic_retry);
+                    Arc::new(anthropic)
+                }
+                _ => {
+                    let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
+                        .with_temperature(config.temperature)
+                        .with_retry_policy(retry);
+                    Arc::new(openai)
+                }
+            };
+            recursive::acp::server::AcpServer::run(Some(provider)).await;
+            Ok(())
         }
         #[cfg(feature = "http")]
         Cmd::Http { addr } => {

@@ -6,10 +6,11 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
+use crate::acp::ToolKind;
 use crate::agent::PermissionDecision;
 use crate::error::Result;
 use crate::llm::ToolSpec;
@@ -45,6 +46,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Return the ACP `ToolKind` for tool_call notifications (Sprint 3).
+    /// Defaults to `ToolKind::Other`. Concrete tools override to map
+    /// to their corresponding ACP category.
+    fn kind(&self) -> ToolKind {
+        ToolKind::Other
+    }
+
     /// Convenience: a tool is read-only iff it classifies as `ReadOnly`.
     /// Used by the parallel-dispatch path in `agent.rs`. Override only if
     /// you have an unusual reason (you almost never should — override
@@ -78,6 +86,19 @@ pub trait Tool: Send + Sync {
 pub trait PermissionHook: Send + Sync {
     /// Called before every tool dispatch.
     async fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision;
+}
+
+/// No-op permission hook that allows every tool call.
+///
+/// Used as the default when no ACP permission bridge is configured.
+/// Always returns [`PermissionDecision::Allow`] without any side effects.
+pub struct PermissionHookDisabled;
+
+#[async_trait]
+impl PermissionHook for PermissionHookDisabled {
+    async fn check(&self, _tool_name: &str, _args: &serde_json::Value) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
 }
 
 /// NOTE: Clone shares Arc state with all tools. Use fork() for isolation.
@@ -570,6 +591,16 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
+    /// Build a `HashMap<String, ToolKind>` mapping every registered tool
+    /// name to its ACP `ToolKind` (Sprint 3). Used by `AcpBridge` to
+    /// populate the `kind` field in `tool_call` notifications.
+    pub fn build_kind_map(&self) -> HashMap<String, ToolKind> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.kind()))
+            .collect()
+    }
+
     /// Like `is_readonly` but passes call-time arguments to the tool so it can
     /// make an argument-specific decision (e.g. `sub_agent` checking
     /// `subagent_type: "explore"`).
@@ -749,6 +780,22 @@ pub fn build_standard_tools_with_roots(
         registry = registry.register(Arc::new(super::load_skill::LoadSkill::new(skills.to_vec())));
     }
 
+    // Register ACP client FS tools (S2-E20).
+    // These are always registered so they appear in tools/list.
+    // execute() checks AcpClientFsState to determine if the capability
+    // has been declared — it returns an error when not in an ACP session
+    // or when the client hasn't declared the capability.
+    registry = registry.register(Arc::new(
+        super::client_fs::ClientReadFile::new(workspace)
+            .with_extra_roots(extra_roots.iter().cloned())
+            .with_session_roots_opt(session_roots.clone()),
+    ));
+    registry = registry.register(Arc::new(
+        super::client_fs::ClientWriteFile::new(workspace)
+            .with_extra_roots(extra_roots.iter().cloned())
+            .with_session_roots_opt(session_roots.clone()),
+    ));
+
     registry
 }
 
@@ -774,6 +821,9 @@ mod tests {
         fn side_effect_class(&self) -> super::super::audit::ToolSideEffect {
             super::super::audit::ToolSideEffect::ReadOnly
         }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Read
+        }
         async fn execute(&self, _args: Value) -> crate::error::Result<String> {
             Ok("read-result".into())
         }
@@ -792,6 +842,9 @@ mod tests {
                 description: "mutating test tool".into(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
             }
+        }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Other
         }
         async fn execute(&self, _args: Value) -> crate::error::Result<String> {
             Ok("mutated".into())
@@ -946,6 +999,9 @@ mod tests {
         }
         fn is_deferred(&self) -> bool {
             true
+        }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Other
         }
         async fn execute(&self, _args: Value) -> crate::error::Result<String> {
             Ok("deferred-result".into())
@@ -1301,5 +1357,46 @@ mod tests {
             !names.contains(&"anAlias".to_string()),
             "alias must NOT be in names()"
         );
+    }
+
+    // ── Sprint 3: ToolKind and build_kind_map ──────────────────────────────
+
+    struct DefaultKindTool;
+
+    #[async_trait]
+    impl Tool for DefaultKindTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "DefaultKind".into(),
+                description: "defaults to Other".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
+        }
+        async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+            Ok("ok".into())
+        }
+    }
+
+    #[test]
+    fn default_kind_is_other() {
+        let tool = DefaultKindTool;
+        assert_eq!(tool.kind(), ToolKind::Other);
+    }
+
+    #[test]
+    fn build_kind_map_works() {
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "ReadTool" }))
+            .register(Arc::new(MutatingTool { name: "MutTool" }));
+        let map = reg.build_kind_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("ReadTool"), Some(&ToolKind::Read));
+        assert_eq!(map.get("MutTool"), Some(&ToolKind::Other));
+    }
+
+    #[test]
+    fn build_kind_map_empty_registry() {
+        let map = make_registry().build_kind_map();
+        assert!(map.is_empty());
     }
 }

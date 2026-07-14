@@ -1616,6 +1616,173 @@ async fn load_mcp_discovery_config(path: &Path) -> Result<Vec<McpServer>> {
 }
 
 // ---------------------------------------------------------------------------
+// Kill-gracefully: SIGTERM → grace period → SIGKILL (S2-E15)
+// ---------------------------------------------------------------------------
+
+/// Result of a graceful process kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// Process exited gracefully after SIGTERM.
+    Graceful,
+    /// Process did not exit in time; SIGKILL was sent.
+    Timeout,
+}
+
+/// Kill a child process gracefully: send SIGTERM, wait for the grace
+/// period, then send SIGKILL if still alive.
+///
+/// On non-Unix platforms (Windows), falls back to `child.kill()` immediately
+/// since SIGTERM is not well-defined.
+///
+/// # Arguments
+///
+/// * `child` - The child process to kill.
+/// * `grace_period` - How long to wait after SIGTERM before sending SIGKILL.
+/// * `server_name` - Name of the server (for logging).
+///
+/// # Returns
+///
+/// The [`KillOutcome`] indicating whether the process exited gracefully
+/// or had to be killed.
+pub async fn kill_gracefully(
+    child: &mut tokio::process::Child,
+    grace_period: std::time::Duration,
+    server_name: &str,
+) -> KillOutcome {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::time::timeout;
+
+        // Phase 1: send SIGTERM
+        tracing::info!(server = %server_name, "kill-gracefully: sending SIGTERM");
+        let _ = child.start_kill(); // sends SIGTERM on Unix
+
+        // Phase 2: wait for grace period
+        match timeout(grace_period, child.wait()).await {
+            Ok(Ok(status)) => {
+                if let Some(signal) = status.signal() {
+                    tracing::info!(
+                        server = %server_name,
+                        signal = signal,
+                        "kill-gracefully: process exited via signal {signal}"
+                    );
+                } else {
+                    tracing::info!(
+                        server = %server_name,
+                        "kill-gracefully: process exited gracefully"
+                    );
+                }
+                KillOutcome::Graceful
+            }
+            Ok(Err(e)) => {
+                // wait() error -- try SIGKILL as fallback
+                tracing::warn!(
+                    server = %server_name,
+                    error = %e,
+                    "kill-gracefully: wait() error after SIGTERM, sending SIGKILL"
+                );
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                KillOutcome::Timeout
+            }
+            Err(_elapsed) => {
+                // Phase 3: timeout -- send SIGKILL
+                tracing::warn!(
+                    server = %server_name,
+                    grace_ms = grace_period.as_millis(),
+                    "kill-gracefully: SIGTERM timeout, sending SIGKILL"
+                );
+                // On Unix, start_kill sends SIGKILL after a SIGTERM for a process
+                // that hasn't exited. We need to forcefully kill.
+                let pid = child.id().unwrap_or(0);
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+                let _ = child.wait().await;
+                KillOutcome::Timeout
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (grace_period, server_name);
+        tracing::info!("kill-gracefully: non-Unix, sending kill immediately");
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        KillOutcome::Graceful
+    }
+}
+
+/// Default grace period for MCP subprocess shutdown (5 seconds).
+pub const DEFAULT_KILL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// MCP tool routing (S2-E17)
+// ---------------------------------------------------------------------------
+
+/// A mapping from tool name prefix to MCP server name.
+///
+/// When the agent issues a `tool_call`, the routing layer checks this
+/// mapping to determine which MCP server should handle the call. Tools
+/// that don't match any prefix are treated as native (non-MCP) tools
+/// and are handled by the local ToolRegistry.
+#[derive(Debug, Clone, Default)]
+pub struct McpToolRouter {
+    /// Maps server name → list of tool name prefixes registered by that server.
+    /// Lookup is O(n * m) where n = servers, m = prefixes per server,
+    /// but the number of servers is small (typically < 10).
+    server_prefixes: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl McpToolRouter {
+    /// Create a new empty router.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register tools from a server. The `tool_names` are the raw tool names
+    /// (without the `mcp__server__` prefix), and they are stored as-is for
+    /// exact-match routing. Callers should also register prefixed names
+    /// (e.g. `mcp__server__tool_name`) for MCP-prefixed dispatch.
+    pub fn register_server(&mut self, server_name: &str, tool_names: &[String]) {
+        let entry = self.server_prefixes.entry(server_name.to_string());
+        let prefixes = entry.or_default();
+        for name in tool_names {
+            // Store both the raw name and the MCP-prefixed name.
+            let prefixed = format!("mcp__{}__{}", server_name, name);
+            if !prefixes.contains(name) {
+                prefixes.push(name.clone());
+            }
+            if !prefixes.contains(&prefixed) {
+                prefixes.push(prefixed);
+            }
+        }
+    }
+
+    /// Route a tool name to the server that handles it.
+    ///
+    /// Returns `Some(server_name)` if the tool matches any registered prefix.
+    /// Returns `None` if no server handles this tool (it's a native tool).
+    pub fn route(&self, tool_name: &str) -> Option<&str> {
+        // Check MCP-prefixed names first: `mcp__<server>__<tool>`
+        for (server, prefixes) in &self.server_prefixes {
+            if prefixes.iter().any(|p| p == tool_name) {
+                return Some(server.as_str());
+            }
+        }
+        // Check raw names (exact match)
+        for (server, prefixes) in &self.server_prefixes {
+            if prefixes.iter().any(|p| p == tool_name) {
+                return Some(server.as_str());
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -200,8 +200,10 @@ impl ChatProvider for AnthropicProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
-        self.stream_inner(messages, tools, stream_tx).await
+        self.stream_inner(messages, tools, stream_tx, cancel_token)
+            .await
     }
 }
 
@@ -214,6 +216,7 @@ impl AnthropicProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         let (system, messages) = extract_system_message(messages);
         let messages = filter_leading_assistant(&messages);
@@ -248,7 +251,9 @@ impl AnthropicProvider {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return self.parse_sse_stream(resp, stream_tx.clone()).await;
+                        return self
+                            .parse_sse_stream(resp, stream_tx.clone(), cancel_token.clone())
+                            .await;
                     }
 
                     // Non-2xx: read body and check retry
@@ -310,6 +315,7 @@ impl AnthropicProvider {
         &self,
         resp: reqwest::Response,
         stream_tx: Option<StreamSender>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         // Process the byte stream incrementally so reasoning/text deltas are
         // forwarded to `stream_tx` as they arrive — not buffered until the
@@ -323,8 +329,26 @@ impl AnthropicProvider {
         let mut incomplete: Vec<u8> = Vec::new();
         let mut line_buf = String::new();
 
-        while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk.map_err(|e| self.make_err(format!("SSE stream read error: {e}")))?;
+        // 决策 4b：把 SSE 循环改成 tokio::select!，让 cancel_token 能在两个 chunk 之间立刻
+        // 触发。触发后 reqwest::Response 在函数返回时被 drop（HTTP 连接关闭），返回
+        // Err(Error::Cancelled)；run_core 已有逻辑翻成 FinishReason::Cancelled（Invariant #7）。
+        loop {
+            let chunk_result = if let Some(ct) = cancel_token.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => {
+                        return Err(Error::Cancelled);
+                    }
+                    next = byte_stream.next() => next,
+                }
+            } else {
+                byte_stream.next().await
+            };
+            let bytes = match chunk_result {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => return Err(self.make_err(format!("SSE stream read error: {e}"))),
+                None => break,
+            };
             let combined: Vec<u8> = if incomplete.is_empty() {
                 bytes.to_vec()
             } else {
@@ -1324,7 +1348,7 @@ mod tests {
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let _ = provider
-            .stream(&[Message::user("hi".to_string())], &[], None)
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
             .await;
 
         let body_str = captured.lock().unwrap().clone();
@@ -1378,7 +1402,7 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], None)
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
             .await
             .unwrap();
         assert_eq!(completion.content, "Hello World");
@@ -1443,7 +1467,7 @@ data: {\"type\":\"message_stop\"}
                 .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], Some(tx))
+            .stream(&[Message::user("hi".to_string())], &[], Some(tx), None)
             .await
             .unwrap();
 
@@ -1515,7 +1539,12 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
-            .stream(&[Message::user("read the file".to_string())], &[], None)
+            .stream(
+                &[Message::user("read the file".to_string())],
+                &[],
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(completion.tool_calls.len(), 1);
@@ -1573,7 +1602,7 @@ data: {\"type\":\"message_stop\"}
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], Some(tx))
+            .stream(&[Message::user("hi".to_string())], &[], Some(tx), None)
             .await
             .unwrap();
         assert_eq!(completion.content, "ABC");
@@ -1636,7 +1665,7 @@ data: {\"type\":\"message_stop\"}
         let provider =
             AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
         let completion = provider
-            .stream(&[Message::user("hi".to_string())], &[], None)
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
             .await
             .unwrap();
         assert_eq!(completion.content, "Hello");

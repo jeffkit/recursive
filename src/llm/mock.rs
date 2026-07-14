@@ -150,6 +150,7 @@ impl ChatProvider for MockProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         stream_tx: Option<StreamSender>,
+        _cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
         // MockProvider: just delegate to complete and emit the full content
         let completion = self.complete(messages, tools).await?;
@@ -290,7 +291,7 @@ mod tracing_tests {
             reasoning_content: None,
         }]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        provider.stream(&[], &[], Some(tx)).await.unwrap();
+        provider.stream(&[], &[], Some(tx), None).await.unwrap();
         let chunk = rx.try_recv().expect("must receive a chunk");
         assert!(
             matches!(chunk, StreamChunk::Text(t) if t == "streamed text"),
@@ -310,7 +311,7 @@ mod tracing_tests {
             reasoning_content: Some("thinking step".into()),
         }]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        provider.stream(&[], &[], Some(tx)).await.unwrap();
+        provider.stream(&[], &[], Some(tx), None).await.unwrap();
 
         let first = rx.try_recv().expect("must have first chunk");
         let second = rx.try_recv().expect("must have second chunk");
