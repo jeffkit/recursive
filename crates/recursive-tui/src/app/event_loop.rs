@@ -452,6 +452,7 @@ impl App {
         if let Some(TranscriptBlock::Reasoning {
             text,
             streaming: true,
+            ..
         }) = self.blocks.last_mut()
         {
             text.push_str(chunk);
@@ -459,6 +460,7 @@ impl App {
             self.blocks.push(TranscriptBlock::Reasoning {
                 text: chunk.to_string(),
                 streaming: true,
+                duration_ms: None,
             });
         }
     }
@@ -472,12 +474,22 @@ impl App {
     /// `<think>` tags — no such block exists, so we insert a fresh
     /// one before a trailing streaming Assistant block (keeping the
     /// visual order thinking → answer), or push it.
+    ///
+    /// Stamps `duration_ms` from the turn start so the renderer can
+    /// switch the header from `∴ Thinking…` to `∴ Thought for Xs`.
     fn finalise_streaming_reasoning(&mut self, content: String) {
+        let duration_ms = self.turn.started_at.map(|t| t.elapsed().as_millis() as u64);
         for block in self.blocks.iter_mut().rev() {
-            if let TranscriptBlock::Reasoning { text, streaming } = block {
+            if let TranscriptBlock::Reasoning {
+                text,
+                streaming,
+                duration_ms: dur,
+            } = block
+            {
                 if *streaming {
                     *text = content;
                     *streaming = false;
+                    *dur = duration_ms;
                     return;
                 }
             }
@@ -485,6 +497,7 @@ impl App {
         let block = TranscriptBlock::Reasoning {
             text: content,
             streaming: false,
+            duration_ms,
         };
         let insert_before_last = matches!(
             self.blocks.last(),
@@ -586,9 +599,14 @@ mod tests {
         });
         // Mid-stream the reasoning block is live.
         match app.blocks.last() {
-            Some(TranscriptBlock::Reasoning { text, streaming }) => {
+            Some(TranscriptBlock::Reasoning {
+                text,
+                streaming,
+                duration_ms,
+            }) => {
                 assert_eq!(text, "Step one. Step two.");
                 assert!(*streaming);
+                assert!(duration_ms.is_none());
             }
             other => panic!("expected streaming Reasoning, got {other:?}"),
         }
@@ -596,6 +614,8 @@ mod tests {
         app.handle_ui_event(UiEvent::AssistantPartial {
             text: "The answer.".into(),
         });
+        // Arm a turn clock so finalise can stamp Thought-for duration.
+        app.turn.start();
         // Finalisers arrive: reasoning first, then the assistant text.
         app.handle_ui_event(UiEvent::Reasoning {
             content: "Step one. Step two.".into(),
@@ -607,9 +627,17 @@ mod tests {
         // Visual order: Reasoning (finalised) above Assistant (finalised).
         assert_eq!(app.blocks.len(), 2);
         match &app.blocks[0] {
-            TranscriptBlock::Reasoning { text, streaming } => {
+            TranscriptBlock::Reasoning {
+                text,
+                streaming,
+                duration_ms,
+            } => {
                 assert_eq!(text, "Step one. Step two.");
                 assert!(!*streaming);
+                assert!(
+                    duration_ms.is_some(),
+                    "finalised reasoning should stamp duration_ms"
+                );
             }
             other => panic!("expected finalised Reasoning first, got {other:?}"),
         }
@@ -640,7 +668,11 @@ mod tests {
         assert_eq!(app.blocks.len(), 2);
         assert!(matches!(
             &app.blocks[0],
-            TranscriptBlock::Reasoning { text, streaming: false } if text == "thought"
+            TranscriptBlock::Reasoning {
+                text,
+                streaming: false,
+                ..
+            } if text == "thought"
         ));
         assert!(matches!(
             &app.blocks[1],

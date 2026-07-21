@@ -899,7 +899,26 @@ fn build_request(
         req["tools"] = Value::Array(tools_json);
         req["tool_choice"] = Value::String("auto".into());
     }
+    // MiniMax-M3 (and M2.x) default to embedding chain-of-thought inside
+    // `content` as `<think>…</think>`. That makes the TUI stream thinking
+    // as a normal assistant bullet, then hoist it into a Reasoning block
+    // only at finalise. `reasoning_split: true` asks MiniMax to emit
+    // thinking on the dedicated `reasoning_content` SSE field instead,
+    // which our stream parser already forwards as StreamChunk::Reasoning.
+    // Other OpenAI-compatible providers ignore unknown fields or reject
+    // them — keep this MiniMax-only.
+    if model_wants_reasoning_split(model) {
+        req["reasoning_split"] = Value::Bool(true);
+    }
     req
+}
+
+/// MiniMax OpenAI-compatible models that honour `reasoning_split`.
+fn model_wants_reasoning_split(model: &str) -> bool {
+    model
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == "minimax")
 }
 
 fn serialize_message(m: &Message) -> Value {
@@ -1369,12 +1388,43 @@ mod tests {
         assert!(req.get("tools").is_none());
         assert_eq!(req["messages"][0]["role"], "user");
         assert_eq!(req["max_tokens"], 16384);
+        assert!(
+            req.get("reasoning_split").is_none(),
+            "non-MiniMax models must not get reasoning_split"
+        );
     }
 
     #[test]
     fn builds_request_includes_max_tokens() {
         let req = build_request("m", 0.2, 1024, &[Message::user("hi")], &[]);
         assert_eq!(req["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn builds_request_minimax_sets_reasoning_split() {
+        for model in [
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+            "minimax-m3",
+            "ab-MiniMax-test",
+        ] {
+            let req = build_request(model, 0.2, 1024, &[Message::user("hi")], &[]);
+            assert_eq!(
+                req.get("reasoning_split"),
+                Some(&Value::Bool(true)),
+                "model {model} should request reasoning_split"
+            );
+        }
+    }
+
+    #[test]
+    fn model_wants_reasoning_split_detects_minimax_token() {
+        assert!(model_wants_reasoning_split("MiniMax-M3"));
+        assert!(model_wants_reasoning_split("minimax-m2.7"));
+        assert!(!model_wants_reasoning_split("deepseek-chat"));
+        assert!(!model_wants_reasoning_split("gpt-4o"));
+        // Must not false-positive on substrings that aren't a MiniMax token.
+        assert!(!model_wants_reasoning_split("notminimax"));
     }
 
     #[tokio::test]

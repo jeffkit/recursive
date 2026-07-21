@@ -84,11 +84,16 @@ pub enum TranscriptBlock {
     /// Reasoning / thinking content for a step. Streamed live via
     /// [`UiEvent::ReasoningPartial`] (while `streaming == true`) and
     /// finalised by [`UiEvent::Reasoning`]; rendered inline as a
-    /// `thinking…` header followed by the reasoning text in dim grey
-    /// italics, above the matching assistant text block.
+    /// `∴ Thinking…` header while in flight, then `∴ Thought for Xs`
+    /// once finalised, with the reasoning text in dim grey italics
+    /// above the matching assistant text block.
     Reasoning {
         text: String,
         streaming: bool,
+        /// Wall-clock duration of the thinking phase, stamped when the
+        /// block is finalised. `None` while still streaming, or when
+        /// the turn start time is unavailable (e.g. session resume).
+        duration_ms: Option<u64>,
     },
     /// Tool call (paired with its result once available).
     ///
