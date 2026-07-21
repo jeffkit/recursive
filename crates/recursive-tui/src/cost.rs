@@ -11,7 +11,7 @@ use std::time::Instant;
 // ──────────────────────────────────────────────────────────────────────
 
 /// Token usage and timing accumulated across the session.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageStats {
     /// Most recent per-turn input tokens.
     pub input_tokens: u64,
@@ -32,13 +32,21 @@ pub struct UsageStats {
     /// Cache-hit tokens summed over the in-progress / most recent turn.
     ///
     /// Reset to zero at the start of each turn via [`UsageStats::begin_turn`].
-    /// The status bar uses this (not the cumulative totals) for the cache-hit
-    /// rate, because the session totals trend toward ~100% as the cached
-    /// prompt prefix is re-read on every step, drowning out the cold-start
-    /// misses and making the figure useless.
+    /// Used to compute [`UsageStats::last_turn_cache_pct`] when the turn ends.
     pub turn_cache_hit: u64,
     /// Cache-miss tokens summed over the in-progress / most recent turn.
     pub turn_cache_miss: u64,
+    /// Cache-hit rate (0.0–100.0) of the most recently *completed* turn.
+    ///
+    /// `None` until the first turn finishes. The status bar reads this
+    /// instead of computing from `turn_cache_hit` / `turn_cache_miss`
+    /// live, so the figure stays stable across the active turn and only
+    /// refreshes when [`UsageStats::snapshot_turn_cache_pct`] runs at
+    /// `TurnFinished`. This trades intra-turn visibility for a non-
+    /// flickering number, which matters on long turns with many LLM
+    /// responses (tool-use loops, retries) where the live rate can hop
+    /// on every step.
+    pub last_turn_cache_pct: Option<f64>,
     /// Most recent LLM round-trip latency, in milliseconds.
     pub last_latency_ms: u64,
 }
@@ -78,6 +86,21 @@ impl UsageStats {
     pub fn begin_turn(&mut self) {
         self.turn_cache_hit = 0;
         self.turn_cache_miss = 0;
+    }
+
+    /// Snapshot the current per-turn cache counters into
+    /// [`UsageStats::last_turn_cache_pct`]. Called from the `TurnFinished`
+    /// handler so the status bar shows a stable value for the turn that just
+    /// ended. Sets `None` when the turn had no cache data (no LLM response
+    /// reported cache tokens), which makes the segment disappear rather than
+    /// render a meaningless `0%`.
+    pub fn snapshot_turn_cache_pct(&mut self) {
+        let total = self.turn_cache_hit.saturating_add(self.turn_cache_miss);
+        if total > 0 {
+            self.last_turn_cache_pct = Some((self.turn_cache_hit as f64 / total as f64) * 100.0);
+        } else {
+            self.last_turn_cache_pct = None;
+        }
     }
 }
 

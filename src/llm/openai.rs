@@ -547,6 +547,12 @@ impl OpenAiProvider {
             tools,
         );
         body["stream"] = Value::Bool(true);
+        // Ask providers that gate usage emission behind a flag (MiniMax,
+        // OpenAI native) to include the final usage chunk. Providers that
+        // always emit usage (DeepSeek) ignore the field harmlessly. Without
+        // this the streaming path never sees `usage.prompt_tokens_details`
+        // and the TUI cache-rate badge stays invisible on MiniMax-M3.
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
         let url = format!("{}/chat/completions", self.base_url);
 
         // Stream requests need the raw Response object for SSE parsing, so we
@@ -842,27 +848,45 @@ impl OpenAiProvider {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
             let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            // Cache hit: prefer top-level field (DeepSeek / OpenAI native),
+            // fall back to `prompt_tokens_details.cached_tokens` (MiniMax-M3).
             let cache_hit = u
                 .get("prompt_cache_hit_tokens")
                 .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    u.get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                })
                 .unwrap_or(0) as u32;
-            let cache_miss = u
+            let explicit_miss = u
                 .get("prompt_cache_miss_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
-            // Goal 273: o1 / o3 family reports reasoning tokens under
-            // Goal 273: the streaming path does not extract
-            // completion_tokens_details.reasoning_tokens here. The
-            // non-streaming ResponseUsage default is 0; the future
-            // enhancement is to add the field to ResponseUsage and
-            // pluck it in `to_token_usage`.
+            // Cache miss: prefer the explicit value; otherwise derive from
+            // `prompt_tokens - cache_hit` when the provider only reports
+            // `cached_tokens`. This honours the TokenUsage invariant
+            // `hit + miss == prompt_tokens` for the MiniMax-style shape so
+            // the TUI percentage is accurate instead of pegging at 100%.
+            let cache_miss = if explicit_miss > 0 {
+                explicit_miss
+            } else if cache_hit > 0 {
+                prompt.saturating_sub(cache_hit)
+            } else {
+                0
+            };
+            let reasoning = u
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
             *usage = Some(TokenUsage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: total,
                 cache_hit_tokens: cache_hit,
                 cache_miss_tokens: cache_miss,
-                reasoning_tokens: 0,
+                reasoning_tokens: reasoning,
             });
         }
         Ok(())
@@ -899,7 +923,26 @@ fn build_request(
         req["tools"] = Value::Array(tools_json);
         req["tool_choice"] = Value::String("auto".into());
     }
+    // MiniMax-M3 (and M2.x) default to embedding chain-of-thought inside
+    // `content` as `<think>…</think>`. That makes the TUI stream thinking
+    // as a normal assistant bullet, then hoist it into a Reasoning block
+    // only at finalise. `reasoning_split: true` asks MiniMax to emit
+    // thinking on the dedicated `reasoning_content` SSE field instead,
+    // which our stream parser already forwards as StreamChunk::Reasoning.
+    // Other OpenAI-compatible providers ignore unknown fields or reject
+    // them — keep this MiniMax-only.
+    if model_wants_reasoning_split(model) {
+        req["reasoning_split"] = Value::Bool(true);
+    }
     req
+}
+
+/// MiniMax OpenAI-compatible models that honour `reasoning_split`.
+fn model_wants_reasoning_split(model: &str) -> bool {
+    model
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == "minimax")
 }
 
 fn serialize_message(m: &Message) -> Value {
@@ -957,26 +1000,77 @@ struct ResponseUsage {
     completion_tokens: Option<u32>,
     #[serde(default)]
     total_tokens: Option<u32>,
+    /// OpenAI standard. Some compatible providers (DeepSeek) report cache
+    /// usage here directly. Others (MiniMax-M3) nest it under
+    /// `prompt_tokens_details.cached_tokens` instead — see below.
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u32>,
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u32>,
+    /// OpenAI-standard nested details. MiniMax-M3 reports prompt cache hits
+    /// here as `cached_tokens` rather than at the top level. The TUI cache
+    /// rate depends on this being read.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenAI-standard nested details. o1/o3 and thinking-capable MiniMax
+    /// models (e.g. MiniMax-M3) report reasoning tokens here. Previously
+    /// only the streaming path captured this; non-streaming calls left
+    /// `reasoning_tokens` at 0, undercharging the cost total. (Goal 273
+    /// follow-up.)
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 impl ResponseUsage {
     fn to_token_usage(&self) -> TokenUsage {
+        // Cache hit: top-level field first (DeepSeek, OpenAI native), then
+        // fall back to `prompt_tokens_details.cached_tokens` (MiniMax-M3).
+        let cache_hit = self
+            .prompt_cache_hit_tokens
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+            })
+            .unwrap_or(0);
+
+        // Cache miss: providers that report hit explicitly usually also
+        // report miss, so prefer the explicit value. For providers that
+        // only report `cached_tokens` (MiniMax), derive miss from
+        // `prompt_tokens - hit` to honour the documented invariant
+        // `cache_hit + cache_miss == prompt_tokens`. This keeps the TUI
+        // cache-hit percentage accurate instead of always reading 100%.
+        let cache_miss = match self.prompt_cache_miss_tokens {
+            Some(m) => m,
+            None if cache_hit > 0 => self.prompt_tokens.unwrap_or(0).saturating_sub(cache_hit),
+            None => 0,
+        };
+
+        let reasoning_tokens = self
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+
         TokenUsage {
-            reasoning_tokens: 0,
+            reasoning_tokens,
             prompt_tokens: self.prompt_tokens.unwrap_or(0),
             completion_tokens: self.completion_tokens.unwrap_or(0),
             total_tokens: self.total_tokens.unwrap_or(0),
-            cache_hit_tokens: self.prompt_cache_hit_tokens.unwrap_or(0),
-            cache_miss_tokens: self.prompt_cache_miss_tokens.unwrap_or(0),
-            // Goal 273: o1 / o3 family reports reasoning tokens
-            // under `completion_tokens_details.reasoning_tokens`,
-            // but the streaming path already captures that into
-            // TokenUsage directly. The non-streaming ResponseUsage
-            // has no such field, so default 0.
+            cache_hit_tokens: cache_hit,
+            cache_miss_tokens: cache_miss,
         }
     }
 }
@@ -1156,6 +1250,139 @@ mod tests {
         let u = c.usage.unwrap();
         assert_eq!(u.cache_hit_tokens, 0);
         assert_eq!(u.cache_miss_tokens, 0);
+    }
+
+    #[test]
+    fn parses_minimax_cached_tokens_nested_under_prompt_tokens_details() {
+        // MiniMax-M3 returns cache hits as
+        // `usage.prompt_tokens_details.cached_tokens` rather than at the
+        // top level. Without the nested read the TUI cache rate stays
+        // invisible because both hit and miss collapse to 0.
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":780,
+                "completion_tokens":20,
+                "total_tokens":800,
+                "completion_tokens_details":{"reasoning_tokens":19},
+                "prompt_tokens_details":{"cached_tokens":768}
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        let u = c.usage.expect("usage should be parsed");
+        assert_eq!(u.prompt_tokens, 780);
+        assert_eq!(u.completion_tokens, 20);
+        assert_eq!(u.cache_hit_tokens, 768, "cached_tokens must populate hit");
+        // hit + miss should equal prompt_tokens (invariant).
+        assert_eq!(
+            u.cache_hit_tokens + u.cache_miss_tokens,
+            u.prompt_tokens,
+            "cache_hit + cache_miss must equal prompt_tokens"
+        );
+        assert_eq!(u.reasoning_tokens, 19);
+    }
+
+    #[test]
+    fn derives_cache_miss_when_only_hit_is_reported() {
+        // MiniMax-style usage: only `cached_tokens` reported, no explicit
+        // `prompt_cache_miss_tokens`. Derive miss = prompt - hit so the
+        // TUI cache-hit percentage reflects reality (here ~98.5%) instead
+        // of pegging at 100%.
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":780,
+                "completion_tokens":20,
+                "total_tokens":800,
+                "prompt_tokens_details":{"cached_tokens":768}
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        let u = c.usage.expect("usage should be parsed");
+        assert_eq!(u.cache_hit_tokens, 768);
+        assert_eq!(u.cache_miss_tokens, 12);
+    }
+
+    #[test]
+    fn explicit_cache_miss_takes_precedence_over_derived() {
+        // When the provider reports both `prompt_cache_miss_tokens` and
+        // `cached_tokens`, the explicit miss wins — even if it would
+        // disagree with `prompt - hit`. This protects against providers
+        // that round or batch differently (e.g. DeepSeek reports the
+        // split directly and that's the source of truth).
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":100,
+                "completion_tokens":50,
+                "total_tokens":150,
+                "prompt_cache_hit_tokens":60,
+                "prompt_cache_miss_tokens":40,
+                "prompt_tokens_details":{"cached_tokens":999}
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        let u = c.usage.expect("usage should be parsed");
+        // Top-level hit field wins over the nested value.
+        assert_eq!(u.cache_hit_tokens, 60);
+        // Explicit miss wins over derived (100 - 60 = 40, agrees here,
+        // but the test guards against future regressions).
+        assert_eq!(u.cache_miss_tokens, 40);
+    }
+
+    #[test]
+    fn parses_reasoning_tokens_in_non_streaming_path() {
+        // o1 / o3 / MiniMax thinking-mode models report reasoning tokens
+        // under `usage.completion_tokens_details.reasoning_tokens`. The
+        // non-streaming path used to drop this on the floor, undercharging
+        // the cost total.
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":50,
+                "completion_tokens":200,
+                "total_tokens":250,
+                "completion_tokens_details":{"reasoning_tokens":175}
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        let u = c.usage.expect("usage should be parsed");
+        assert_eq!(u.completion_tokens, 200);
+        assert_eq!(u.reasoning_tokens, 175);
+    }
+
+    #[test]
+    fn stream_usage_parses_minimax_nested_cache_and_reasoning() {
+        // Drive process_sse_line directly with a single chunk whose
+        // usage shape matches MiniMax-M3. Assert both `cached_tokens`
+        // and `reasoning_tokens` are extracted.
+        let mut usage: Option<TokenUsage> = None;
+        let mut content = String::new();
+        let mut reasoning_content = String::new();
+        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new();
+        let mut finish_reason: Option<String> = None;
+        let data = r#"data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":780,"completion_tokens":20,"total_tokens":800,"completion_tokens_details":{"reasoning_tokens":19},"prompt_tokens_details":{"cached_tokens":768}}}"#;
+        OpenAiProvider::process_sse_line(
+            data,
+            "MiniMax-M3",
+            &mut content,
+            &mut reasoning_content,
+            &mut tool_call_builders,
+            &mut finish_reason,
+            &mut usage,
+            &None,
+        )
+        .unwrap();
+        let u = usage.expect("usage should be set");
+        assert_eq!(u.cache_hit_tokens, 768);
+        assert_eq!(u.cache_miss_tokens, 12);
+        assert_eq!(u.reasoning_tokens, 19);
+        assert_eq!(content, "ok");
     }
 
     #[test]
@@ -1369,12 +1596,96 @@ mod tests {
         assert!(req.get("tools").is_none());
         assert_eq!(req["messages"][0]["role"], "user");
         assert_eq!(req["max_tokens"], 16384);
+        assert!(
+            req.get("reasoning_split").is_none(),
+            "non-MiniMax models must not get reasoning_split"
+        );
     }
 
     #[test]
     fn builds_request_includes_max_tokens() {
         let req = build_request("m", 0.2, 1024, &[Message::user("hi")], &[]);
         assert_eq!(req["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn builds_request_minimax_sets_reasoning_split() {
+        for model in [
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+            "minimax-m3",
+            "ab-MiniMax-test",
+        ] {
+            let req = build_request(model, 0.2, 1024, &[Message::user("hi")], &[]);
+            assert_eq!(
+                req.get("reasoning_split"),
+                Some(&Value::Bool(true)),
+                "model {model} should request reasoning_split"
+            );
+        }
+    }
+
+    #[test]
+    fn model_wants_reasoning_split_detects_minimax_token() {
+        assert!(model_wants_reasoning_split("MiniMax-M3"));
+        assert!(model_wants_reasoning_split("minimax-m2.7"));
+        assert!(!model_wants_reasoning_split("deepseek-chat"));
+        assert!(!model_wants_reasoning_split("gpt-4o"));
+        // Must not false-positive on substrings that aren't a MiniMax token.
+        assert!(!model_wants_reasoning_split("notminimax"));
+    }
+
+    #[tokio::test]
+    async fn stream_request_includes_include_usage_flag() {
+        // Mock a streaming endpoint and capture the request body. Assert
+        // `stream_options.include_usage == true` is set, otherwise providers
+        // like MiniMax-M3 won't emit the final usage chunk and the TUI
+        // cache-rate badge stays invisible (regression for the bug where
+        // MiniMax cache hit rate never showed up after a parser fix).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            if let Some(body_start) = request.find("\r\n\r\n") {
+                let body = request[body_start + 4..].trim().to_string();
+                *captured_clone.lock().unwrap() = body.clone();
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "MiniMax-M3").unwrap();
+        let _ = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await
+            .unwrap();
+
+        let body_str = captured.lock().unwrap().clone();
+        let body: serde_json::Value =
+            serde_json::from_str(&body_str).expect("captured body should be valid JSON");
+        assert_eq!(body["stream"], true, "stream flag must be set");
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "stream_options.include_usage must be true so providers like MiniMax emit the usage chunk"
+        );
     }
 
     #[tokio::test]

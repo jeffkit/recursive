@@ -355,6 +355,22 @@ mod tests {
     }
 
     #[test]
+    fn find_preset_minimax_cn_uses_domestic_endpoint() {
+        // Pins that the mainland MiniMax preset points at api.minimaxi.com
+        // (domestic), not api.minimax.io (international). The two platforms
+        // issue independent keys; a domestic key sent to the international
+        // endpoint is rejected with 401 "invalid api key (2049)".
+        let preset = find_preset("minimax-cn").expect("minimax-cn preset must exist");
+        assert_eq!(preset.api_base, "https://api.minimaxi.com/v1");
+        assert_eq!(
+            preset.anthropic_api_base.as_deref(),
+            Some("https://api.minimaxi.com/anthropic"),
+        );
+        assert_eq!(preset.key_env, "MINIMAX_API_KEY");
+        assert!(preset.mainland_accessible);
+    }
+
+    #[test]
     fn find_preset_by_api_base_known() {
         let preset =
             find_preset_by_api_base("https://api.deepseek.com/v1").expect("deepseek preset");

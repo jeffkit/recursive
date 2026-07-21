@@ -43,6 +43,7 @@ pub fn blocks_from_messages(messages: &[recursive::message::Message]) -> Vec<Tra
                         blocks.push(TranscriptBlock::Reasoning {
                             text: reasoning.clone(),
                             streaming: false,
+                            duration_ms: None,
                         });
                     }
                 }

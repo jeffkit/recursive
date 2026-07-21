@@ -796,13 +796,10 @@ mod tests {
 
     #[test]
     fn default_max_steps_is_unlimited() {
-        // Pin RECURSIVE_HOME to an empty temp dir so Config::from_env() does
-        // not pick up the developer's real ~/.recursive/config.toml (which may
-        // reference a providers.d-only preset) and is not raced by other
-        // parallel tests that momentarily flip RECURSIVE_HOME.
         let _env_lock = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         let orig = std::env::var("RECURSIVE_MAX_STEPS").ok();
         // SAFETY: env lock held; RECURSIVE_MAX_STEPS is not path-related but
         // we still serialise via env_lock to keep the global env stable.
@@ -874,6 +871,9 @@ mod tests {
         // RECURSIVE_API_KEY, which race with provider_preset_resolution_chain and
         // similar tests without the lock.
         let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         // Save original env values
         let original_max = std::env::var("RECURSIVE_RETRY_MAX");
         let original_initial = std::env::var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS");
@@ -924,6 +924,9 @@ mod tests {
         // RECURSIVE_SHELL_TIMEOUT_SECS — hold the env lock so we don't race
         // with other tests that read or write the same vars.
         let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         let original = std::env::var("RECURSIVE_SHELL_TIMEOUT_SECS").ok();
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
@@ -1217,6 +1220,9 @@ mod tests {
         // Mutates RECURSIVE_MODEL / RECURSIVE_API_KEY / RECURSIVE_HEADLESS —
         // hold the env lock to serialise with other env-mutating tests.
         let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         let original_headless = std::env::var("RECURSIVE_HEADLESS").ok();
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
@@ -1632,6 +1638,9 @@ api_key = "sk-from-file"
     #[test]
     fn stuck_window_and_error_rate_env_override() {
         let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
 
@@ -1757,6 +1766,9 @@ api_key = "sk-from-file"
     #[test]
     fn goal_eval_transcript_tail_default_and_env_override() {
         let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
         let original = std::env::var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL").ok();
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
@@ -1776,6 +1788,9 @@ api_key = "sk-from-file"
         } else {
             std::env::remove_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL");
         }
+
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
     }
 
     // -----------------------------------------------------------------------

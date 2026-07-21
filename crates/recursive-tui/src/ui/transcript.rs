@@ -115,7 +115,11 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme, width: u16) -> Vec<Line
             streaming,
             latency_ms,
         } => render_assistant(text, *streaming, *latency_ms, th, width),
-        TranscriptBlock::Reasoning { text, .. } => render_reasoning(text),
+        TranscriptBlock::Reasoning {
+            text,
+            streaming,
+            duration_ms,
+        } => render_reasoning(text, *streaming, *duration_ms),
         TranscriptBlock::ToolCall {
             name,
             args_preview,
@@ -271,11 +275,13 @@ fn render_assistant(
 
 // ── Reasoning / thinking ──────────────────────────────────────────────
 
-/// Render a reasoning / thinking block in Claude-Code style:
-/// a `∴ Thinking…` header in dim yellow, followed by the
-/// reasoning text in a slightly muted gray. Empty / whitespace-only
-/// reasoning collapses to just the header.
-fn render_reasoning(text: &str) -> Vec<Line<'static>> {
+/// Render a reasoning / thinking block in Claude-Code style. While the
+/// model is still streaming, the header is `∴ Thinking…`; once the turn
+/// is finalised it becomes `∴ Thought for Xs` (or `∴ Thought` when no
+/// duration was recorded). The reasoning text follows in a slightly
+/// muted gray; empty / whitespace-only reasoning collapses to just the
+/// header.
+fn render_reasoning(text: &str, streaming: bool, duration_ms: Option<u64>) -> Vec<Line<'static>> {
     let header_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -286,10 +292,16 @@ fn render_reasoning(text: &str) -> Vec<Line<'static>> {
         .add_modifier(Modifier::ITALIC);
     let indent = Span::raw("  ");
 
-    let mut out = vec![Line::from(vec![
-        indent,
-        Span::styled("∴ Thinking…".to_string(), header_style),
-    ])];
+    let header = if streaming {
+        "∴ Thinking…".to_string()
+    } else {
+        match duration_ms {
+            Some(ms) => format!("∴ Thought for {:.1}s", ms as f64 / 1000.0),
+            None => "∴ Thought".to_string(),
+        }
+    };
+
+    let mut out = vec![Line::from(vec![indent, Span::styled(header, header_style)])];
 
     for line in text.lines() {
         if line.is_empty() {
@@ -799,19 +811,20 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_block_has_thinking_header_and_italic_body() {
+    fn reasoning_block_streaming_shows_thinking_header_and_italic_body() {
         let lines = render_block(
             &TranscriptBlock::Reasoning {
                 text: "let me think about this\nmaybe this way".into(),
-                streaming: false,
+                streaming: true,
+                duration_ms: None,
             },
             &theme::DARK,
             0,
         );
         let header = line_text(&lines[0]);
         assert!(
-            header.contains("Thinking") || header.contains("∴"),
-            "missing thinking header"
+            header.contains("Thinking") && header.contains("∴"),
+            "streaming header should be ∴ Thinking…, got {header:?}"
         );
         let body = full_text(&lines);
         assert!(body.contains("let me think about this"));
@@ -825,17 +838,44 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_block_empty_text_still_shows_header() {
+    fn reasoning_block_finalised_shows_thought_for_duration() {
+        let lines = render_block(
+            &TranscriptBlock::Reasoning {
+                text: "done thinking".into(),
+                streaming: false,
+                duration_ms: Some(36_900),
+            },
+            &theme::DARK,
+            0,
+        );
+        let header = line_text(&lines[0]);
+        assert!(
+            header.contains("Thought for 36.9s"),
+            "finalised header should be ∴ Thought for 36.9s, got {header:?}"
+        );
+        assert!(
+            !header.contains("Thinking"),
+            "finalised header must not say Thinking"
+        );
+    }
+
+    #[test]
+    fn reasoning_block_finalised_without_duration_shows_thought() {
         let lines = render_block(
             &TranscriptBlock::Reasoning {
                 text: String::new(),
                 streaming: false,
+                duration_ms: None,
             },
             &theme::DARK,
             0,
         );
         let h = line_text(&lines[0]);
-        assert!(h.contains("Thinking") || h.contains("∴"));
+        assert!(
+            h.contains("Thought") && h.contains("∴"),
+            "expected ∴ Thought, got {h:?}"
+        );
+        assert!(!h.contains("Thinking"), "must not say Thinking when done");
     }
 
     #[test]
