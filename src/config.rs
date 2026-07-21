@@ -173,8 +173,18 @@ impl Config {
     /// window instead of the stale compile-time `providers.toml` value.
     /// `context_window_override` still wins when set.
     pub fn context_window_tokens_effective(&self) -> usize {
+        self.context_window_tokens_effective_for(&self.model)
+    }
+
+    /// Effective context window for an arbitrary model name, honouring a
+    /// global `context_window_override` when set, else the effective
+    /// catalog for `model`. Used by the TUI gauge both at startup (for the
+    /// config-default model) and on a `/model` hot-swap, so the window
+    /// tracks the newly active model instead of staying pinned to the
+    /// startup value.
+    pub fn context_window_tokens_effective_for(&self, model: &str) -> usize {
         self.context_window_override
-            .unwrap_or_else(|| crate::llm::context_window_tokens_for_model_effective(&self.model))
+            .unwrap_or_else(|| crate::llm::context_window_tokens_for_model_effective(model))
     }
 
     /// Load from environment, with config file (~/.recursive/config.toml) as fallback.

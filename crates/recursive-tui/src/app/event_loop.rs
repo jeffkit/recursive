@@ -324,6 +324,10 @@ impl App {
             UiEvent::ModelSwitched { preset_id, model } => {
                 self.model_name = model.clone();
                 self.active_preset = Some(preset_id.clone());
+                // Recompute the context gauge's window for the newly active
+                // model so it tracks the hot-swap instead of staying pinned
+                // to the startup (config-default) model's window.
+                self.context_window = crate::cost::context_window_for_model(&model);
                 self.blocks.push(TranscriptBlock::System {
                     text: format!("Model switched to {model} ({preset_id})."),
                 });
@@ -944,6 +948,14 @@ mod tests {
 
         assert_eq!(app.model_name, "deepseek-chat");
         assert_eq!(app.active_preset.as_deref(), Some("deepseek"));
+        // The context gauge's window must track the hot-swap: it now equals
+        // the effective window for the newly active model, not the startup
+        // model's window.
+        assert_eq!(
+            app.context_window,
+            crate::cost::context_window_for_model("deepseek-chat"),
+            "context_window must recompute on ModelSwitched"
+        );
         // Distinct from the startup values (which come from Config::from_env).
         // Guard against the test env already being deepseek/deepseek-chat by
         // only asserting difference when the originals differed.

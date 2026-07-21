@@ -179,11 +179,22 @@ pub fn detect_model_name() -> String {
 /// picker agree on the window. Returns a sane non-zero fallback when no
 /// config can be loaded.
 pub fn detect_context_window() -> u64 {
+    context_window_for_model(&detect_model_name())
+}
+
+/// Return the effective context-window size (in tokens) for `model`,
+/// honouring a global `context_window_override` when set, else the
+/// effective provider catalog (remote cache + bundled `providers.toml` +
+/// `providers.d/` overrides) via `context_window_tokens_for_model_effective`.
+/// This is the single source the TUI context gauge uses -- both at startup
+/// (for the config-default model, via [`detect_context_window`]) and on a
+/// `/model` hot-swap, so the gauge tracks the live model instead of
+/// staying pinned to the startup value. Returns a sane non-zero fallback
+/// when no config can be loaded.
+pub fn context_window_for_model(model: &str) -> u64 {
     recursive::config::Config::from_env()
-        .map(|c| c.context_window_tokens_effective() as u64)
-        .unwrap_or_else(|_| {
-            recursive::llm::context_window_tokens_for_model_effective(&detect_model_name()) as u64
-        })
+        .map(|c| c.context_window_tokens_effective_for(model) as u64)
+        .unwrap_or_else(|_| recursive::llm::context_window_tokens_for_model_effective(model) as u64)
 }
 
 /// Saturating cast from u64 to u32: returns `u32::MAX` instead of wrapping.
@@ -265,5 +276,14 @@ mod tests {
         // sane non-zero window (the providers.toml fallback guarantees
         // one even for unknown models).
         assert!(detect_context_window() > 0);
+    }
+
+    #[test]
+    fn context_window_for_model_tracks_named_model() {
+        // A catalogued model resolves to a positive window. Used by the
+        // `/model` hot-swap handler so the gauge tracks the live model.
+        // Machine-independent: a global override only caps the window,
+        // never zeroes it, and the bundled fallback covers unknown names.
+        assert!(context_window_for_model("deepseek-chat") > 0);
     }
 }
