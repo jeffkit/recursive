@@ -166,6 +166,17 @@ impl Config {
             .unwrap_or_else(|| crate::llm::context_window_tokens_for_model(&self.model))
     }
 
+    /// Like [`context_window_tokens`] but resolves the per-model fallback
+    /// from the **effective** catalog (remote cache + bundled +
+    /// `providers.d/`) via [`context_window_tokens_for_model_effective`],
+    /// so the TUI context gauge matches the `/model` picker's displayed
+    /// window instead of the stale compile-time `providers.toml` value.
+    /// `context_window_override` still wins when set.
+    pub fn context_window_tokens_effective(&self) -> usize {
+        self.context_window_override
+            .unwrap_or_else(|| crate::llm::context_window_tokens_for_model_effective(&self.model))
+    }
+
     /// Load from environment, with config file (~/.recursive/config.toml) as fallback.
     ///
     /// Precedence (highest first), applied to `api_base` / `api_key` / `model` /

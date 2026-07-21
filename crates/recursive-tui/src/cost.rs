@@ -171,15 +171,18 @@ pub fn detect_model_name() -> String {
 /// Return the context-window size (in tokens) for the model the runtime
 /// will actually use, so the TUI can show a live "context used / window"
 /// gauge. Mirrors [`detect_model_name`] by delegating to
-/// `Config::context_window_tokens()`, which honours
-/// `context_window_override` and otherwise falls back to the bundled
-/// `providers.toml` spec via `context_window_tokens_for_model`. Returns
-/// a sane non-zero fallback when no config can be loaded.
+/// `Config::context_window_tokens_effective()`, which honours
+/// `context_window_override` and otherwise falls back to the **effective**
+/// provider catalog (remote cache + bundled `providers.toml` +
+/// `providers.d/` overrides) via `context_window_tokens_for_model_effective`
+/// — the same source the `/model` picker lists, so the gauge and the
+/// picker agree on the window. Returns a sane non-zero fallback when no
+/// config can be loaded.
 pub fn detect_context_window() -> u64 {
     recursive::config::Config::from_env()
-        .map(|c| c.context_window_tokens() as u64)
+        .map(|c| c.context_window_tokens_effective() as u64)
         .unwrap_or_else(|_| {
-            recursive::llm::context_window_tokens_for_model(&detect_model_name()) as u64
+            recursive::llm::context_window_tokens_for_model_effective(&detect_model_name()) as u64
         })
 }
 

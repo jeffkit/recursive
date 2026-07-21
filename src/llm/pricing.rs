@@ -110,6 +110,33 @@ pub fn context_window_tokens_for_model(model: &str) -> usize {
     128_000
 }
 
+/// Like [`context_window_tokens_for_model`] but consults the **effective**
+/// catalog (remote cache + bundled + `providers.d/`) rather than the
+/// compile-time `providers.toml` alone. Mirrors [`find_model_pricing_effective`]:
+/// the TUI's `/model` picker lists models with their effective
+/// `context_window`, so the input-box context gauge must read the same
+/// source — otherwise it shows a stale bundled value for a model the user
+/// has overridden to a different window in `providers.d/`.
+pub fn context_window_tokens_for_model_effective(model: &str) -> usize {
+    for preset in crate::providers::all_presets_effective() {
+        for spec in &preset.models {
+            if spec.name == model {
+                // A 0 context_window in an override means "unspecified"
+                // (e.g. an incomplete `providers.d` entry for a model the
+                // upstream catalog hasn't filled in yet). Fall through to
+                // the bundled lookup rather than reporting a nonsensical 0,
+                // so the gauge never shows "ctx x/0 - 100%".
+                if spec.context_window > 0 {
+                    return spec.context_window;
+                }
+            }
+        }
+    }
+    // No effective spec with a positive window — fall back to the bundled
+    // catalog (which itself falls back to 128K for unknown models).
+    context_window_tokens_for_model(model)
+}
+
 /// Compute the default compaction character-count threshold for a model.
 ///
 /// Strategy (mirrors fake-cc `getAutoCompactThreshold`):
@@ -367,6 +394,28 @@ mod tests {
     fn context_window_unknown_model_returns_fallback() {
         let w = context_window_tokens_for_model("totally-unknown-model-xyz");
         assert_eq!(w, 128_000, "unknown models must fall back to 128K");
+    }
+
+    // ── context_window_tokens_for_model_effective ───────────────────────────
+
+    #[test]
+    fn context_window_effective_unknown_model_returns_fallback() {
+        // The effective catalog falls back to the same 128K as the bundled
+        // path for models it doesn't list. Asserted as an exact value (not
+        // machine-dependent): no `providers.d` override can invent a spec
+        // for an unknown model name.
+        let w = context_window_tokens_for_model_effective("totally-unknown-model-xyz");
+        assert_eq!(w, 128_000, "unknown models must fall back to 128K");
+    }
+
+    #[test]
+    fn context_window_effective_known_model_is_nonzero() {
+        // A catalogued model must resolve to a positive window. We avoid
+        // asserting an exact value because the effective catalog honours
+        // `providers.d` overrides + the remote cache, which differ per
+        // machine — only the non-zero invariant is portable.
+        let w = context_window_tokens_for_model_effective("gpt-4o");
+        assert!(w > 0, "effective context window for gpt-4o must be > 0");
     }
 
     // ── default_compact_threshold_chars ─────────────────────────────────────
