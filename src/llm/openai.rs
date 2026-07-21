@@ -863,11 +863,12 @@ impl OpenAiProvider {
                 .get("prompt_cache_miss_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
-            // Cache miss: prefer the explicit value; otherwise derive from
-            // `prompt_tokens - cache_hit` when the provider only reports
-            // `cached_tokens`. This honours the TokenUsage invariant
-            // `hit + miss == prompt_tokens` for the MiniMax-style shape so
-            // the TUI percentage is accurate instead of pegging at 100%.
+            // Cache miss: prefer the explicit value when it is non-zero;
+            // an explicit 0 is ambiguous (OpenAI often omits the field or
+            // sends 0 while still reporting `cached_tokens`), so derive
+            // from `prompt_tokens - cache_hit` instead to honour the
+            // TokenUsage invariant `hit + miss == prompt_tokens` and keep
+            // the TUI percentage accurate instead of pegging at 100%.
             let cache_miss = if explicit_miss > 0 {
                 explicit_miss
             } else if cache_hit > 0 {
@@ -1047,15 +1048,19 @@ impl ResponseUsage {
             .unwrap_or(0);
 
         // Cache miss: providers that report hit explicitly usually also
-        // report miss, so prefer the explicit value. For providers that
-        // only report `cached_tokens` (MiniMax), derive miss from
-        // `prompt_tokens - hit` to honour the documented invariant
-        // `cache_hit + cache_miss == prompt_tokens`. This keeps the TUI
-        // cache-hit percentage accurate instead of always reading 100%.
+        // report miss, so prefer the explicit value — BUT a `0` miss is
+        // ambiguous: OpenAI's official API frequently omits
+        // `prompt_cache_miss_tokens` (or sends it as 0) while still
+        // reporting `cached_tokens`, which would falsely peg the TUI at
+        // 100%. Treat an explicit `0` the same as "not provided" and
+        // derive miss from `prompt_tokens - hit` so the documented
+        // invariant `cache_hit + cache_miss == prompt_tokens` holds. This
+        // keeps the TUI cache-hit percentage accurate instead of reading
+        // 100% on turns that actually had cache misses.
         let cache_miss = match self.prompt_cache_miss_tokens {
-            Some(m) => m,
-            None if cache_hit > 0 => self.prompt_tokens.unwrap_or(0).saturating_sub(cache_hit),
-            None => 0,
+            Some(m) if m > 0 => m,
+            _ if cache_hit > 0 => self.prompt_tokens.unwrap_or(0).saturating_sub(cache_hit),
+            _ => 0,
         };
 
         let reasoning_tokens = self
@@ -1303,6 +1308,33 @@ mod tests {
         let u = c.usage.expect("usage should be parsed");
         assert_eq!(u.cache_hit_tokens, 768);
         assert_eq!(u.cache_miss_tokens, 12);
+    }
+
+    #[test]
+    fn explicit_zero_cache_miss_is_derived_not_trusted() {
+        // OpenAI's official API often sends `prompt_cache_miss_tokens: 0`
+        // (or omits it) while still reporting a non-zero `cached_tokens`.
+        // A literal 0 must NOT be treated as "no misses" — that would peg
+        // the TUI at 100% on turns that actually had misses. Derive
+        // miss = prompt - hit instead, so the rate is ~98.5% here.
+        let raw = r#"{
+            "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":780,
+                "completion_tokens":20,
+                "total_tokens":800,
+                "prompt_cache_hit_tokens":768,
+                "prompt_cache_miss_tokens":0
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed.choices.into_iter().next().unwrap(), parsed.usage);
+        let u = c.usage.expect("usage should be parsed");
+        assert_eq!(u.cache_hit_tokens, 768);
+        assert_eq!(
+            u.cache_miss_tokens, 12,
+            "explicit 0 miss must derive, not peg at 100%"
+        );
     }
 
     #[test]

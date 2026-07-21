@@ -24,6 +24,9 @@ pub struct ModelSpec {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderPreset {
     pub id: String,
+    /// Defaults to `id` when omitted, so a partial `providers.d` override
+    /// that only adds models need not repeat the display name.
+    #[serde(default = "default_name")]
     pub name: String,
     pub provider_type: String,
     pub api_base: String,
@@ -34,9 +37,19 @@ pub struct ProviderPreset {
     pub anthropic_api_base: Option<String>,
     pub default_model: String,
     pub models: Vec<ModelSpec>,
+    /// Optional in a user override — defaults to `false` so a partial
+    /// `providers.d` file that only augments models need not set it.
+    #[serde(default)]
     pub mainland_accessible: bool,
+    #[serde(default)]
     pub key_env: String,
+    #[serde(default)]
     pub key_url: String,
+}
+
+/// Serde default for `ProviderPreset::name`: mirror `id`.
+fn default_name() -> String {
+    String::new()
 }
 
 #[derive(Deserialize)]
@@ -145,7 +158,16 @@ pub fn additional_presets() -> Vec<ProviderPreset> {
             }
         };
         match toml::from_str::<PresetsFile>(&content) {
-            Ok(file) => out.extend(file.providers),
+            Ok(file) => {
+                for mut p in file.providers {
+                    // A partial override (e.g. one that only adds models)
+                    // may omit `name`; mirror `id` so it still displays.
+                    if p.name.is_empty() {
+                        p.name = p.id.clone();
+                    }
+                    out.push(p);
+                }
+            }
             Err(e) => {
                 tracing::warn!("providers.d: failed to parse {}: {e}", path.display());
             }
@@ -185,6 +207,49 @@ pub fn find_preset_extended(id: &str) -> Option<ProviderPreset> {
 ///
 /// No network: reads the local `providers_cache.json` written by
 /// `recursive providers update` (or a stale background refresh). If the
+/// Merge the models of a user `providers.d` override into an existing
+/// preset. Models are keyed by `name`: a model in `override_models` with the
+/// same name as one already present *replaces* it (so a user can fix pricing
+/// or context window), while a new name is *appended*. This lets a user add
+/// models LiteLLM hasn't catalogued yet (e.g. a freshly released GLM) without
+/// having to re-declare the whole provider.
+fn merge_models(existing: &mut Vec<ModelSpec>, override_models: Vec<ModelSpec>) {
+    for om in override_models {
+        if let Some(slot) = existing.iter_mut().find(|m| m.name == om.name) {
+            *slot = om;
+        } else {
+            existing.push(om);
+        }
+    }
+}
+
+/// Merge a `providers.d` override whose `id` matches an existing preset.
+/// Endpoint/identity fields (`api_base`, `provider_type`, `default_model`, …)
+/// from the override win when present; the model list is merged model-by-model
+/// via [`merge_models`] so a partial override (just a few new models) augments
+/// rather than replaces the catalog entry.
+fn merge_preset_into(existing: &mut ProviderPreset, override_p: ProviderPreset) {
+    if !override_p.api_base.is_empty() {
+        existing.api_base = override_p.api_base;
+    }
+    if !override_p.provider_type.is_empty() {
+        existing.provider_type = override_p.provider_type;
+    }
+    if !override_p.default_model.is_empty() {
+        existing.default_model = override_p.default_model;
+    }
+    if override_p.anthropic_api_base.is_some() {
+        existing.anthropic_api_base = override_p.anthropic_api_base;
+    }
+    if !override_p.key_env.is_empty() {
+        existing.key_env = override_p.key_env;
+    }
+    if !override_p.key_url.is_empty() {
+        existing.key_url = override_p.key_url;
+    }
+    merge_models(&mut existing.models, override_p.models);
+}
+
 /// cache is absent or unreadable, falls back to [`all_presets_dynamic`].
 fn compute_effective_presets() -> Vec<ProviderPreset> {
     let bundled = bundled_presets().to_vec();
@@ -192,12 +257,16 @@ fn compute_effective_presets() -> Vec<ProviderPreset> {
         Some(cache) => crate::providers_cache::merge_over_bundled(&bundled, &cache.providers),
         None => bundled,
     };
-    // Layer providers.d overrides additively (main's existing semantics:
-    // providers.d adds new presets; it does not override bundled ids).
+    // Layer providers.d overrides. A user file whose `id` is *new* is appended
+    // as a whole (custom vendor). A file whose `id` matches an existing
+    // preset is merged model-by-model so users can augment an existing
+    // provider (e.g. add a model LiteLLM hasn't catalogued) without
+    // re-declaring the entire provider.
     let mut result = with_cache;
     for p in additional_presets() {
-        if !result.iter().any(|r| r.id == p.id) {
-            result.push(p);
+        match result.iter_mut().find(|r| r.id == p.id) {
+            Some(existing) => merge_preset_into(existing, p),
+            None => result.push(p),
         }
     }
     result
@@ -457,6 +526,99 @@ key_url = "https://x"
         assert_eq!(p.key_url, "https://x");
         assert_eq!(p.models.len(), 1);
         assert_eq!(p.models[0].name, "t1");
+        Ok(())
+    }
+
+    #[test]
+    fn effective_presets_merge_user_models_into_existing_provider(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A providers.d file with the SAME id as a bundled/cached provider
+        // must augment its model list (model-by-model merge), not be dropped.
+        // This is how a user adds a model LiteLLM hasn't catalogued without
+        // re-declaring the whole provider.
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+
+        let dir = tmp.path().join(".recursive").join("providers.d");
+        write_user_override(
+            &dir,
+            "zhipu.toml",
+            r#"
+[[providers]]
+id = "zhipu"
+name = "智谱 AI (GLM)"
+provider_type = "openai"
+api_base = "https://open.bigmodel.cn/api/paas/v4"
+default_model = "glm-4.7"
+models = [
+  { name = "glm-user-only", context_window = 12345, pricing = { input_per_million = 0.5, output_per_million = 1.0 } },
+]
+"#,
+        )?;
+
+        let zhipu = all_presets_effective()
+            .into_iter()
+            .find(|p| p.id == "zhipu")
+            .expect("zhipu must exist in effective catalog");
+
+        // Pre-existing bundled models are preserved …
+        assert!(
+            zhipu.models.iter().any(|m| m.name == "glm-5.2"),
+            "bundled glm-5.2 should survive the merge"
+        );
+        assert!(
+            zhipu.models.iter().any(|m| m.name == "glm-4.7"),
+            "bundled glm-4.7 should survive the merge"
+        );
+        // … and the user's new model is appended.
+        let user_only = zhipu
+            .models
+            .iter()
+            .find(|m| m.name == "glm-user-only")
+            .expect("user-only model should be merged in from providers.d");
+        assert_eq!(user_only.context_window, 12345);
+        Ok(())
+    }
+
+    #[test]
+    fn effective_presets_user_model_overrides_existing_pricing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A providers.d model with the SAME name as a bundled one replaces it,
+        // so a user can correct stale pricing without losing the rest.
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+
+        let dir = tmp.path().join(".recursive").join("providers.d");
+        write_user_override(
+            &dir,
+            "zhipu.toml",
+            r#"
+[[providers]]
+id = "zhipu"
+provider_type = "openai"
+api_base = "https://open.bigmodel.cn/api/paas/v4"
+default_model = "glm-4.7"
+models = [
+  { name = "glm-4.7", context_window = 999999, pricing = { input_per_million = 0.01, output_per_million = 0.02 } },
+]
+"#,
+        )?;
+
+        let zhipu = all_presets_effective()
+            .into_iter()
+            .find(|p| p.id == "zhipu")
+            .expect("zhipu must exist");
+        let glm47 = zhipu
+            .models
+            .iter()
+            .find(|m| m.name == "glm-4.7")
+            .expect("glm-4.7 must still exist");
+        assert_eq!(
+            glm47.context_window, 999999,
+            "user override must win on same name"
+        );
+        // Other bundled models untouched.
+        assert!(zhipu.models.iter().any(|m| m.name == "glm-5.2"));
         Ok(())
     }
 

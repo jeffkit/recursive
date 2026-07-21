@@ -373,6 +373,11 @@ enum ProvidersCmd {
     },
     /// Print the effective preset list (remote cache + bundled + providers.d).
     List,
+    /// List the models supported by a specific provider (by preset `id`).
+    Models {
+        /// Provider preset id, e.g. `deepseek`, `openai`, `gemini`.
+        id: String,
+    },
     /// Show cache file path, age, and whether a refresh is due.
     Status,
 }
@@ -1614,6 +1619,46 @@ async fn cmd_providers(cmd: ProvidersCmd) -> anyhow::Result<()> {
                     "{:<18} {:<14} {:<24} {}",
                     p.id, p.provider_type, p.default_model, p.api_base
                 );
+            }
+            Ok(())
+        }
+        ProvidersCmd::Models { id } => {
+            let presets = recursive::all_presets_effective();
+            let preset = match presets.iter().find(|p| p.id == id) {
+                Some(p) => p,
+                None => {
+                    println!("Unknown provider id: {id}");
+                    println!("Run `recursive providers list` to see valid ids.");
+                    return Ok(());
+                }
+            };
+            if preset.models.is_empty() {
+                println!("{}: no models listed.", preset.id);
+                return Ok(());
+            }
+            #[allow(clippy::print_literal)]
+            {
+                println!(
+                    "{:<32} {:<12} {}",
+                    "MODEL", "CTX_TOKENS", "PRICING (USD / 1M tokens)"
+                );
+            }
+            for m in &preset.models {
+                let ctx = m.context_window.to_string();
+                let pricing = match &m.pricing {
+                    Some(p) => {
+                        let cache = p
+                            .cache_hit_input_per_million
+                            .map(|c| format!(" cache_hit=${c}"))
+                            .unwrap_or_default();
+                        format!(
+                            "in=${} out=${}{}",
+                            p.input_per_million, p.output_per_million, cache
+                        )
+                    }
+                    None => "free / local".to_string(),
+                };
+                println!("{:<32} {:<12} {}", m.name, ctx, pricing);
             }
             Ok(())
         }
