@@ -197,6 +197,8 @@ pub fn context_window_for_model(model: &str) -> u64 {
         .unwrap_or_else(|_| recursive::llm::context_window_tokens_for_model_effective(model) as u64)
 }
 
+/// Saturating cast from u64 to u32
+
 /// Saturating cast from u64 to u32: returns `u32::MAX` instead of wrapping.
 ///
 /// `TokenUsage` fields are `u32` but session totals accumulate as `u64`.
