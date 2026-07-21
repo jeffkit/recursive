@@ -764,10 +764,17 @@ fn seed_read_state(session: &ControlSession, request: &Value) -> Result<(), Stri
         .read_file_state
         .as_ref()
         .ok_or_else(|| "read_file_state not available".to_string())?;
+    let content = std::fs::read_to_string(&abs).map_err(|e| e.to_string())?;
+    let mtime = std::fs::metadata(&abs)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .record(abs, false);
+        .record(abs, false, content, mtime);
     Ok(())
 }
 

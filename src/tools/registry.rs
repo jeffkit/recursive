@@ -698,7 +698,8 @@ pub fn build_standard_tools_with_roots(
         .register(Arc::new(
             super::fs::WriteFile::new(workspace)
                 .with_extra_roots(extra_roots.iter().cloned())
-                .with_session_roots_opt(session_roots.clone()),
+                .with_session_roots_opt(session_roots.clone())
+                .with_read_state(read_state.clone()),
         ))
         .register(Arc::new(
             super::edit::EditTool::new(workspace)

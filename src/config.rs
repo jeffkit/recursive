@@ -796,17 +796,31 @@ mod tests {
 
     #[test]
     fn default_max_steps_is_unlimited() {
+        // Pin RECURSIVE_HOME to an empty temp dir so Config::from_env() does
+        // not pick up the developer's real ~/.recursive/config.toml (which may
+        // reference a providers.d-only preset) and is not raced by other
+        // parallel tests that momentarily flip RECURSIVE_HOME.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
         let orig = std::env::var("RECURSIVE_MAX_STEPS").ok();
-        std::env::remove_var("RECURSIVE_MAX_STEPS");
+        // SAFETY: env lock held; RECURSIVE_MAX_STEPS is not path-related but
+        // we still serialise via env_lock to keep the global env stable.
+        unsafe {
+            std::env::remove_var("RECURSIVE_MAX_STEPS");
+        }
         let config = Config::from_env().unwrap();
         assert_eq!(
             config.max_steps, 0,
             "default max_steps should be 0 (unlimited)"
         );
-        if let Some(v) = orig {
-            std::env::set_var("RECURSIVE_MAX_STEPS", v);
-        } else {
-            std::env::remove_var("RECURSIVE_MAX_STEPS");
+        // SAFETY: env lock still held.
+        unsafe {
+            if let Some(v) = orig {
+                std::env::set_var("RECURSIVE_MAX_STEPS", v);
+            } else {
+                std::env::remove_var("RECURSIVE_MAX_STEPS");
+            }
         }
     }
 

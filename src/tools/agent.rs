@@ -38,7 +38,7 @@ use crate::permissions::PermissionMode;
 use crate::tasks::TaskRegistry;
 use crate::tools::agent_defs::AgentDefinitions;
 use crate::tools::edit::EditTool;
-use crate::tools::fs::{ReadFile, ReadFileState};
+use crate::tools::fs::{ReadFile, ReadFileState, WriteFile};
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
@@ -267,6 +267,9 @@ impl AgentTool {
                 "Edit" => {
                     Arc::new(EditTool::new(&self.workspace).with_read_state(sub_read_state.clone()))
                 }
+                "Write" => Arc::new(
+                    WriteFile::new(&self.workspace).with_read_state(sub_read_state.clone()),
+                ),
                 _ => {
                     if let Some(t) = self.all_tools.get(name) {
                         t

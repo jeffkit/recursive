@@ -30,7 +30,12 @@ use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
-use crate::tools::fs::ReadFileState;
+use crate::tools::fs::{get_file_mtime, ReadFileState};
+
+/// Maximum on-disk size of a file the Edit tool will touch, in bytes. Prevents
+/// OOM from reading multi-GB files into memory. Aligned with fake-cc's
+/// `MAX_EDIT_FILE_SIZE` (1 GiB stat bytes).
+const MAX_EDIT_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EditTool {
@@ -428,8 +433,16 @@ useful if you want to rename a variable for instance."
         // ── Partial-read guard ──────────────────────────────────────────
         // Reject edits on files that have never been read, or were only read
         // partially (via start_line/end_line), in this session.
+        //
+        // The lock is acquired briefly to extract the record, then dropped
+        // before any `.await` to keep the future `Send`.
         if let Some(slot) = &self.read_state {
-            if let Ok(state) = slot.lock() {
+            let staleness_check: Option<(u64, String)> = {
+                let state = slot.lock().map_err(|_| Error::Tool {
+                    name: "Edit".into(),
+                    call_id: None,
+                    message: "internal: read-state lock poisoned".into(),
+                })?;
                 match state.get(&abs_path) {
                     None => {
                         return Err(Error::Tool {
@@ -451,8 +464,67 @@ useful if you want to rename a variable for instance."
                             ),
                         });
                     }
-                    Some(_) => {} // full read — proceed
+                    Some(record) => {
+                        // Check mtime while holding the lock; if stale, extract
+                        // the cached content for an async content-fallback check
+                        // outside the lock.
+                        let disk_mtime = get_file_mtime(&abs_path);
+                        if disk_mtime > record.timestamp {
+                            Some((disk_mtime, record.content.clone()))
+                        } else {
+                            None // mtime unchanged — no staleness concern
+                        }
+                    }
                 }
+                // MutexGuard dropped here
+            };
+
+            // Async content-fallback staleness check (lock is not held).
+            if let Some((_disk_mtime, cached_content)) = staleness_check {
+                let disk_content = tokio::fs::read_to_string(&abs_path)
+                    .await
+                    .unwrap_or_default();
+                if disk_content != cached_content {
+                    return Err(Error::Tool {
+                        name: "Edit".into(),
+                        call_id: None,
+                        message: format!(
+                            "File `{file_path}` has been modified since it was \
+                             last read. Read it again before editing."
+                        ),
+                    });
+                }
+                // Content unchanged despite mtime bump — safe to proceed.
+            }
+        }
+
+        // ── File-size guard ─────────────────────────────────────────────
+        // Refuse to edit files larger than MAX_EDIT_FILE_SIZE to avoid OOM.
+        // A missing file (new-file create path) is exempt — no metadata yet.
+        match tokio::fs::metadata(&abs_path).await {
+            Ok(meta) => {
+                let size = meta.len();
+                if size > MAX_EDIT_FILE_SIZE {
+                    return Err(Error::Tool {
+                        name: "Edit".into(),
+                        call_id: None,
+                        message: format!(
+                            "File `{file_path}` is too large to edit ({} bytes). \
+                             Maximum editable file size is {} bytes.",
+                            size, MAX_EDIT_FILE_SIZE
+                        ),
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // New file — size guard does not apply.
+            }
+            Err(e) => {
+                return Err(Error::Tool {
+                    name: "Edit".into(),
+                    call_id: None,
+                    message: format!("{}: {e}", abs_path.display()),
+                });
             }
         }
 
@@ -543,6 +615,40 @@ the instance.\nString: {old_string}"
         let max_replace = if replace_all { usize::MAX } else { 1 };
         let updated = content.replacen(actual_old.as_str(), actual_new.as_str(), max_replace);
 
+        // ── Call-time staleness re-validation ──────────────────────────
+        // The pre-read guard at the top of execute() checked staleness, but
+        // several `.await` points (metadata, read_to_string) have yielded
+        // since. Re-probe mtime here and, if the file was touched since the
+        // cached read, compare the content we just read (`content`) against
+        // the cached content. This narrows the validate→write race window,
+        // mirroring fake-cc's `call()`-level mtime re-check.
+        if let Some(slot) = &self.read_state {
+            let cached: Option<(u64, String)> = {
+                let state = slot.lock().map_err(|_| Error::Tool {
+                    name: "Edit".into(),
+                    call_id: None,
+                    message: "internal: read-state lock poisoned".into(),
+                })?;
+                state
+                    .get(&abs_path)
+                    .map(|r| (r.timestamp, r.content.clone()))
+                // guard dropped
+            };
+            if let Some((cached_ts, cached_content)) = cached {
+                let disk_mtime = get_file_mtime(&abs_path);
+                if disk_mtime > cached_ts && content != cached_content {
+                    return Err(Error::Tool {
+                        name: "Edit".into(),
+                        call_id: None,
+                        message: format!(
+                            "File `{file_path}` was modified after it was last \
+                             read. Read it again before editing."
+                        ),
+                    });
+                }
+            }
+        }
+
         tokio::fs::write(&abs_path, &updated)
             .await
             .map_err(|e| Error::Tool {
@@ -550,6 +656,16 @@ the instance.\nString: {old_string}"
                 call_id: None,
                 message: format!("{}: {e}", abs_path.display()),
             })?;
+
+        // ── Post-edit cache update ───────────────────────────────────
+        // Update the read-state so subsequent edits to the same file
+        // don't require a redundant Read.
+        if let Some(slot) = &self.read_state {
+            if let Ok(mut state) = slot.lock() {
+                let new_mtime = get_file_mtime(&abs_path);
+                state.record(abs_path, false, updated.clone(), new_mtime);
+            }
+        }
 
         let replaced_count = if replace_all {
             occurrence_count.to_string()
@@ -1236,12 +1352,16 @@ mod tests {
     #[tokio::test]
     async fn edit_rejected_when_partial_read() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
         let slot = make_slot();
         // Simulate a partial read record.
-        slot.lock()
-            .unwrap()
-            .record(tmp.path().join("src.txt"), true);
+        slot.lock().unwrap().record(
+            path.clone(),
+            true,
+            std::fs::read_to_string(&path).unwrap(),
+            get_file_mtime(&path),
+        );
         let err = EditTool::new(tmp.path())
             .with_read_state(slot)
             .execute(serde_json::json!({
@@ -1261,12 +1381,16 @@ mod tests {
     #[tokio::test]
     async fn edit_allowed_after_full_read() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("src.txt"), "hello world\n").unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
         let slot = make_slot();
         // Simulate a full read record.
-        slot.lock()
-            .unwrap()
-            .record(tmp.path().join("src.txt"), false);
+        slot.lock().unwrap().record(
+            path.clone(),
+            false,
+            std::fs::read_to_string(&path).unwrap(),
+            get_file_mtime(&path),
+        );
         let result = EditTool::new(tmp.path())
             .with_read_state(slot)
             .execute(serde_json::json!({
@@ -1294,5 +1418,144 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("updated successfully"));
+    }
+
+    // ── Staleness, call-time re-validation, size limit, post-edit cache ──────
+
+    /// Bump a file's mtime to 1 hour in the future so `disk_mtime > cached_ts`
+    /// fires deterministically regardless of FS timestamp resolution.
+    fn bump_mtime_future(path: &std::path::Path) {
+        use std::time::{Duration, SystemTime};
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for set_modified");
+        f.set_modified(future).expect("set_modified");
+    }
+
+    #[tokio::test]
+    async fn edit_rejected_when_file_modified_since_read() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let slot = make_slot();
+        // Full read.
+        slot.lock().unwrap().record(
+            path.clone(),
+            false,
+            std::fs::read_to_string(&path).unwrap(),
+            get_file_mtime(&path),
+        );
+        // Externally modify content + bump mtime to the future.
+        std::fs::write(&path, "externally changed\n").unwrap();
+        bump_mtime_future(&path);
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("modified") && msg.contains("Read it again"),
+            "expected staleness rejection, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_allowed_when_mtime_bumped_but_content_unchanged() {
+        // Content-fallback: mtime bumped but content identical to cached →
+        // edit proceeds (Windows cloud-sync / antivirus false positive).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let slot = make_slot();
+        slot.lock().unwrap().record(
+            path.clone(),
+            false,
+            std::fs::read_to_string(&path).unwrap(),
+            get_file_mtime(&path),
+        );
+        // Bump mtime without changing content.
+        bump_mtime_future(&path);
+        let result = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .expect("unchanged content with bumped mtime must be allowed");
+        assert!(result.contains("updated successfully"));
+    }
+
+    #[tokio::test]
+    async fn edit_post_update_cache_allows_consecutive_edit() {
+        // After a successful edit, the cache is refreshed so a second edit
+        // to the same file does not require a redundant Read.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let slot = make_slot();
+        slot.lock().unwrap().record(
+            path.clone(),
+            false,
+            std::fs::read_to_string(&path).unwrap(),
+            get_file_mtime(&path),
+        );
+        let tool = EditTool::new(tmp.path()).with_read_state(slot);
+        tool.execute(serde_json::json!({
+            "file_path": "src.txt",
+            "old_string": "hello",
+            "new_string": "goodbye"
+        }))
+        .await
+        .unwrap();
+        // No re-read between edits — must succeed via post-edit cache update.
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "goodbye",
+                "new_string": "hello"
+            }))
+            .await
+            .expect("consecutive edit must succeed without re-read");
+        assert!(result.contains("updated successfully"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn edit_rejected_for_oversized_file() {
+        // A file whose logical size exceeds MAX_EDIT_FILE_SIZE is refused
+        // before reading. We materialise a sparse file (set_len) so the
+        // directory entry reports >1 GiB without allocating disk.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("big.txt");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_EDIT_FILE_SIZE + 1).unwrap();
+        drop(f);
+        let slot = make_slot();
+        slot.lock()
+            .unwrap()
+            .record(path.clone(), false, String::new(), get_file_mtime(&path));
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "big.txt",
+                "old_string": "x",
+                "new_string": "y"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("too large to edit"),
+            "expected 'too large to edit', got: {msg}"
+        );
     }
 }

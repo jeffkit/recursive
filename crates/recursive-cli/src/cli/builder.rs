@@ -68,7 +68,8 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
             Arc::new(
                 WriteFile::new(root)
                     .with_extra_roots(extra_roots.clone())
-                    .with_session_roots(session_roots.clone()),
+                    .with_session_roots(session_roots.clone())
+                    .with_read_state(read_state.clone()),
             ),
             &["write_file"],
         )
