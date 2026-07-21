@@ -108,15 +108,13 @@ pub fn build_line(app: &App) -> Line<'static> {
         ));
     }
 
-    // [cache hit rate] — most recent turn only, shown when there's cache data.
-    // Uses the per-turn counters (not the session totals) because the
-    // cumulative figure trends to ~100% as the cached prompt prefix is re-read
-    // on every step, hiding the cold-start misses. The invariant
-    // `hit + miss == total input tokens` holds for every provider (see
-    // `TokenUsage` docs), so this denominator is the real prompt size.
-    let turn_cache = app.usage.turn_cache_hit + app.usage.turn_cache_miss;
-    if turn_cache > 0 {
-        let pct = (app.usage.turn_cache_hit as f64 / turn_cache as f64) * 100.0;
+    // [cache hit rate] — most recent *completed* turn, snapshotted at
+    // TurnFinished (see `UsageStats::snapshot_turn_cache_pct`). Reading
+    // from a frozen snapshot rather than the live per-turn counters
+    // keeps the percentage stable across the active turn instead of
+    // flickering on every LLM response during a tool-use loop. The
+    // segment is hidden until the first turn finishes (`None`).
+    if let Some(pct) = app.usage.last_turn_cache_pct {
         spans.push(separator());
         spans.push(Span::styled(
             format!("📦{:.0}%", pct),
@@ -439,10 +437,14 @@ mod tests {
     fn cache_hit_rate_uses_turn_cache_not_total_input() {
         // The denominator is hit + miss (the real prompt size), never the
         // bare `total_input`, which for Anthropic excludes cached tokens.
+        // The status bar reads `last_turn_cache_pct`, so we drive that field
+        // via `snapshot_turn_cache_pct()` to keep the assertion rooted in the
+        // same data path the production code uses.
         let mut app = App::new();
         app.usage.total_input = 150; // "new" prompt tokens
         app.usage.turn_cache_hit = 900; // cached prefix tokens
         app.usage.turn_cache_miss = 150;
+        app.usage.snapshot_turn_cache_pct();
         let text = line_text(&build_line(&app));
         // Hit rate = 900 / (900 + 150) = 85.7% → "86%"
         assert!(
@@ -456,19 +458,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_rate_uses_current_turn_not_session_totals() {
-        // Session totals would read ~99% (a long warm session), but the
-        // current turn was a cold cache miss → the bar must show the turn.
+    fn cache_hit_rate_uses_snapshot_not_live_turn_counters() {
+        // The snapshot is what the status bar reads; live turn counters are
+        // ignored. This is the core invariant behind the deferred-update
+        // behaviour: during an active turn the figure stays at the previous
+        // turn's value rather than recomputing on every Usage event.
         let mut app = App::new();
+        // Session totals would read ~99% (a long warm session).
         app.usage.total_cache_hit = 99_000;
         app.usage.total_cache_miss = 1_000;
+        // Live counters say "cold miss this turn".
         app.usage.turn_cache_hit = 0;
         app.usage.turn_cache_miss = 500;
+        // Snapshot from the previous TurnFinished says 0%.
+        app.usage.last_turn_cache_pct = Some(0.0);
         let text = line_text(&build_line(&app));
-        assert!(
-            text.contains("📦0%"),
-            "expected current-turn 0%, got: {text:?}"
-        );
+        assert!(text.contains("📦0%"), "expected snapshot 0%, got: {text:?}");
         assert!(
             !text.contains("99%"),
             "must not use session totals: {text:?}"
@@ -476,24 +481,71 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_rate_stable_during_active_turn() {
+        // A new LLM response arrives mid-turn and bumps the live counters;
+        // the snapshot from the previous TurnFinished must NOT change. This
+        // pins the deferred-update behaviour — without it, the bar would
+        // flicker on every Usage event inside a tool-use loop.
+        let mut app = App::new();
+        app.usage.last_turn_cache_pct = Some(80.0); // previous turn
+        app.usage.turn_cache_hit = 10;
+        app.usage.turn_cache_miss = 90; // live would say 10%
+
+        // First Usage event in the current turn — would change live pct if
+        // it were used. Status bar must still show the snapshot.
+        app.usage.record_with_cache(100, 50, 200, 50);
+        let text = line_text(&build_line(&app));
+        assert!(
+            text.contains("80%"),
+            "snapshot must stay at previous-turn value, got: {text:?}"
+        );
+        assert!(
+            !text.contains("10%"),
+            "live turn counter must not drive display: {text:?}"
+        );
+    }
+
+    #[test]
     fn cache_hit_rate_zero_when_no_cache_data() {
         let app = App::new();
         let text = line_text(&build_line(&app));
-        // No cache data → no 📦 segment at all
+        // No snapshot yet (first turn in progress, no TurnFinished) → no 📦.
         assert!(
             !text.contains("📦"),
-            "got cache segment with no data: {text:?}"
+            "got cache segment with no snapshot: {text:?}"
         );
     }
 
     #[test]
     fn cache_hit_rate_shows_zero_pct_when_all_miss() {
         let mut app = App::new();
-        app.usage.turn_cache_hit = 0;
-        app.usage.turn_cache_miss = 500;
+        app.usage.last_turn_cache_pct = Some(0.0);
         let text = line_text(&build_line(&app));
-        // turn_cache = 500 > 0 → should show "0%"
         assert!(text.contains("0%"), "expected 0% cache rate, got: {text:?}");
+    }
+
+    #[test]
+    fn snapshot_turn_cache_pct_computes_correct_pct() {
+        // Direct unit test for the snapshot helper. The status bar relies
+        // on this method being called from the TurnFinished handler, so a
+        // broken implementation here silently breaks every test that goes
+        // through the event loop.
+        let mut u = crate::cost::UsageStats {
+            turn_cache_hit: 800,
+            turn_cache_miss: 200,
+            ..Default::default()
+        };
+        u.snapshot_turn_cache_pct();
+        assert_eq!(u.last_turn_cache_pct, Some(80.0));
+    }
+
+    #[test]
+    fn snapshot_turn_cache_pct_sets_none_when_no_data() {
+        // Zero counters → no snapshot. Prevents the status bar from
+        // rendering a meaningless 📦0% before the first LLM response.
+        let mut u = crate::cost::UsageStats::default();
+        u.snapshot_turn_cache_pct();
+        assert_eq!(u.last_turn_cache_pct, None);
     }
 
     // ── Goal-323: loop state indicator + pre-existing status.rs coverage ──

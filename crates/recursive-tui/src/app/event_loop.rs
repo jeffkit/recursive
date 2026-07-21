@@ -189,6 +189,11 @@ impl App {
                     *streaming = false;
                 }
                 self.turn.finish();
+                // Freeze the cache-hit rate for the turn that just ended
+                // so the status bar holds a stable value while the next
+                // turn runs. Without this the percentage would recompute
+                // on every LLM response and flicker on multi-step turns.
+                self.usage.snapshot_turn_cache_pct();
                 self.pending_latency_ms = None;
             }
             UiEvent::Error { message } => {
