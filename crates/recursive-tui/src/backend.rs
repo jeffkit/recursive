@@ -1136,6 +1136,38 @@ async fn worker_loop(
                 });
             }
 
+            // /model picker: hot-swap the LLM provider between turns. The
+            // runtime is owned outright by the worker here (no turn task is
+            // running), so `set_llm` is safe. Errors (unknown preset, no API
+            // key) surface as `UiEvent::Error` so the user can react.
+            UserAction::SwitchModel { preset_id, model } => match &mut state {
+                RuntimeBuild::Ready(rt_opt) => {
+                    let Some(rt) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available in SwitchModel");
+                        continue;
+                    };
+                    match crate::runtime_builder::build_provider_for_model(&preset_id, &model) {
+                        Ok(provider) => {
+                            rt.set_llm(provider);
+                            let _ = event_tx.send(UiEvent::ModelSwitched {
+                                preset_id: preset_id.clone(),
+                                model: model.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(UiEvent::Error {
+                                message: format!("switch model failed: {e}"),
+                            });
+                        }
+                    }
+                }
+                RuntimeBuild::Offline { reason } => {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: format!("switch model unavailable offline: {reason}"),
+                    });
+                }
+            },
+
             // Goal-169: run an already-expanded skill prompt.
             UserAction::RunSkillPrompt { prompt } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
@@ -2519,5 +2551,153 @@ mod tests {
         let _ = backend.action_tx.send(UserAction::Shutdown);
         assert_eq!(turns, 2, "expected exactly two turns before the cap");
         assert!(seen_stopped, "expected LoopStopped after max_turns=2");
+    }
+
+    // ── /model picker: SwitchModel hot-swaps the provider ───────────────────
+
+    /// `UserAction::SwitchModel` must build a fresh provider for the chosen
+    /// `(preset, model)` and emit `UiEvent::ModelSwitched` so the UI can mirror
+    /// the new active model. The provider is built from env config; we seed a
+    /// config api_key so the fallback path in `build_provider_for_model`
+    /// succeeds without a real network call (provider construction is offline).
+    #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    async fn switch_model_emits_model_switched() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+
+        // Save/restore the env vars we touch. PinnedRecursiveHome already
+        // holds env_lock(), serialising this against other env-mutating tests.
+        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        let prev_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("DEEPSEEK_API_KEY");
+
+        // Config api_key drives the fallback in build_provider_for_model.
+        let cfg_dir = empty_home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[provider]\napi_key = \"sk-shared\"\nmodel = \"x\"\ntype = \"openai\"\n",
+        )
+        .expect("write config");
+
+        // Start from a Ready mock runtime; SwitchModel swaps its provider.
+        let llm = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let rt = AgentRuntime::builder().llm(llm).build().expect("rt builds");
+        let mut backend = Backend::spawn_with_runtime(rt);
+
+        // Drain RuntimeReady.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+
+        backend
+            .action_tx
+            .send(UserAction::SwitchModel {
+                preset_id: "deepseek".into(),
+                model: "deepseek-chat".into(),
+            })
+            .unwrap();
+
+        let mut got_switched = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::ModelSwitched { preset_id, model })) => {
+                    assert_eq!(preset_id, "deepseek");
+                    assert_eq!(model, "deepseek-chat");
+                    got_switched = true;
+                    break;
+                }
+                Ok(Some(UiEvent::Error { message })) => {
+                    panic!("switch model failed: {message}");
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+
+        // Restore env vars.
+        match prev_recursive {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+        match prev_openai {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match prev_deepseek {
+            Some(v) => std::env::set_var("DEEPSEEK_API_KEY", v),
+            None => std::env::remove_var("DEEPSEEK_API_KEY"),
+        }
+        assert!(got_switched, "expected UiEvent::ModelSwitched");
+    }
+
+    /// `SwitchModel` while offline (no usable runtime) must surface a clear
+    /// error rather than panicking or silently dropping the request.
+    #[tokio::test]
+    async fn switch_model_offline_emits_error() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        std::env::remove_var("RECURSIVE_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let mut backend = Backend::spawn();
+        // Drain RuntimeOffline.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), backend.event_rx.recv()).await;
+
+        backend
+            .action_tx
+            .send(UserAction::SwitchModel {
+                preset_id: "deepseek".into(),
+                model: "deepseek-chat".into(),
+            })
+            .unwrap();
+
+        let mut got_error = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                backend.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(UiEvent::Error { message })) => {
+                    assert!(message.contains("offline"), "got: {message}");
+                    got_error = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = backend.action_tx.send(UserAction::Shutdown);
+        match prev_recursive {
+            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        }
+        match prev_openai {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        assert!(got_error, "expected an offline error for SwitchModel");
     }
 }

@@ -554,7 +554,7 @@ fn render_command_interact_panel(frame: &mut Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let normal_style = Style::default().fg(Color::White);
     let hint_style = Style::default()
-        .fg(Color::DarkGray)
+        .fg(Color::Rgb(110, 110, 110))
         .add_modifier(Modifier::ITALIC);
 
     // Reserve the last row for the hint when present.
@@ -563,19 +563,38 @@ fn render_command_interact_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         area.height.saturating_sub(2) as usize // 2 borders
     };
+    let content_rows = content_rows.max(1);
 
     // The highlight bar tracks the selected *item*, but `lines` may begin
     // with non-selectable rows (header + spacer). Map the item index to its
     // line index via `list_offset` so the bar lands on the same row as the
     // item's `▶` marker.
-    let highlight_line = panel.selected.map(|sel| sel + panel.list_offset);
+    let cursor_line = panel.selected.map(|sel| sel + panel.list_offset);
+    let total = panel.lines.len();
+    let max_scroll = total.saturating_sub(content_rows);
+
+    // Viewport follows the cursor: keep `scroll` only when the cursor is
+    // already inside the window; otherwise nudge the window the minimum
+    // amount to bring the cursor back into view. Computed read-only each
+    // render (the panel's `scroll` field is the sticky "last window" — it
+    // is not mutated here, so the window only moves when the cursor leaves
+    // it, avoiding jitter).
+    let sticky = (panel.scroll as usize).min(max_scroll);
+    let scroll = match cursor_line {
+        Some(c) if c < sticky => c.min(max_scroll),
+        Some(c) if c >= sticky + content_rows => c.saturating_sub(content_rows - 1).min(max_scroll),
+        _ => sticky,
+    };
+
     let mut lines: Vec<Line<'static>> = panel
         .lines
         .iter()
+        .skip(scroll)
         .take(content_rows)
         .enumerate()
-        .map(|(i, text)| {
-            let style = if highlight_line == Some(i) {
+        .map(|(row, text)| {
+            let abs = scroll + row;
+            let style = if cursor_line == Some(abs) {
                 selected_style
             } else {
                 normal_style

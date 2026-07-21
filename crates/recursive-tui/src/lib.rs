@@ -16,6 +16,7 @@ pub mod events;
 pub mod input_state;
 pub mod keymap;
 pub mod model;
+pub mod ollama_probe;
 pub mod runtime_builder;
 pub mod skill_commands;
 pub mod ui;

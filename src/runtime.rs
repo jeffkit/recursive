@@ -684,6 +684,15 @@ impl AgentRuntime {
         &self.kernel
     }
 
+    /// Hot-swap the LLM provider backing this runtime.
+    ///
+    /// Delegates to [`AgentKernel::set_llm`]. Used by the TUI `/model` picker
+    /// to switch models mid-session. Must be called between turns (not while
+    /// `run` / `enqueue` / `run_goal_loop` is executing on this runtime).
+    pub fn set_llm(&mut self, llm: Arc<dyn ChatProvider>) {
+        self.kernel.set_llm(llm);
+    }
+
     /// Return the event sink currently in use.
     pub fn event_sink(&self) -> &dyn EventSink {
         self.event_sink.as_ref()

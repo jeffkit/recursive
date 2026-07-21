@@ -109,10 +109,78 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let cy = cursor_y.min(max_y);
     frame.set_cursor_position(Position { x: cx, y: cy });
 
-    // Footer hint.
+    // Footer hint: left = mode hint, right = live context-window usage
+    // gauge. The gauge is right-aligned in the same 1-row strip so the
+    // user can see how much of the model's context window is in use
+    // without giving up the existing key-binding hint.
     let hint =
         Paragraph::new(footer_hint(mode)).style(Style::default().fg(Color::Gray).bg(Color::Reset));
+    if let Some((gauge_text, gauge_color)) = context_gauge(app) {
+        let gauge_width = unicode_width::UnicodeWidthStr::width(gauge_text.as_str()) as u16;
+        // Reserve the gauge column only when there's room for both the
+        // hint and the gauge; otherwise fall back to the hint alone so a
+        // very narrow terminal never drops the key-binding hint.
+        if hint_area.width > gauge_width.saturating_add(2) {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(gauge_width)])
+                .split(hint_area);
+            frame.render_widget(hint, cols[0]);
+            let gauge = Paragraph::new(gauge_text)
+                .style(Style::default().fg(gauge_color).bg(Color::Reset))
+                .alignment(Alignment::Right);
+            frame.render_widget(gauge, cols[1]);
+            return;
+        }
+    }
     frame.render_widget(hint, hint_area);
+}
+
+/// Build the live context-window usage gauge `(text, color)` shown at the
+/// bottom-right of the input box. Returns `None` when the context window
+/// size is unknown (0) — e.g. before the runtime has resolved a model —
+/// so we don't render a meaningless `0/0`.
+///
+/// `used` is [`UsageStats::last_prompt_tokens`] (the most recent LLM
+/// call's total prompt size); `window` is [`App::context_window`]. The
+/// colour ramps green → yellow → red as the window fills up so the user
+/// gets an at-a-glance warning before compaction becomes necessary.
+fn context_gauge(app: &App) -> Option<(String, Color)> {
+    let window = app.context_window;
+    if window == 0 {
+        return None;
+    }
+    let used = app.usage.last_prompt_tokens;
+    let pct = (used as f64 / window as f64) * 100.0;
+    let color = if pct >= 90.0 {
+        Color::Red
+    } else if pct >= 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    Some((
+        format!(
+            "ctx {}/{} · {:.0}%",
+            human_count(used),
+            human_count(window),
+            pct
+        ),
+        color,
+    ))
+}
+
+/// Compact integer formatting for the gauge: 1234 → "1.2k", 1_500_000 →
+/// "1.5M". Mirrors [`crate::ui::status::human_count`] but kept local so
+/// this module stays self-contained.
+fn human_count(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
 
 /// Style of the mode indicator character on the left of the box.
@@ -368,6 +436,101 @@ mod tests {
         assert!(
             text.contains("! a"),
             "expected `! a` prefix on the first content row; got {text:?}"
+        );
+    }
+
+    // ── context-window usage gauge (footer-right) ─────────────────────────
+
+    #[test]
+    fn context_gauge_returns_none_when_window_unknown() {
+        // context_window == 0 (e.g. before runtime resolved a model) →
+        // no gauge, so we never render a misleading `0/0`.
+        let mut app = App::new();
+        app.context_window = 0;
+        app.usage.last_prompt_tokens = 1234;
+        assert!(context_gauge(&app).is_none());
+    }
+
+    #[test]
+    fn context_gauge_formats_used_over_window_with_pct() {
+        let mut app = App::new();
+        app.context_window = 128_000;
+        app.usage.last_prompt_tokens = 12_345;
+        let (text, _color) = context_gauge(&app).expect("gauge should be present");
+        assert!(
+            text.contains("12.3k"),
+            "expected compact used tokens, got: {text}"
+        );
+        assert!(
+            text.contains("128.0k"),
+            "expected compact window tokens, got: {text}"
+        );
+        // 12345 / 128000 ≈ 9.6% → rounds to 10%.
+        assert!(text.contains("10%"), "expected ~10% usage, got: {text}");
+    }
+
+    #[test]
+    fn context_gauge_color_ramps_with_usage() {
+        let mut app = App::new();
+        app.context_window = 100_000;
+        // < 70% → green.
+        app.usage.last_prompt_tokens = 10_000;
+        assert_eq!(context_gauge(&app).unwrap().1, Color::Green);
+        // 70%–90% → yellow.
+        app.usage.last_prompt_tokens = 75_000;
+        assert_eq!(context_gauge(&app).unwrap().1, Color::Yellow);
+        // >= 90% → red.
+        app.usage.last_prompt_tokens = 95_000;
+        assert_eq!(context_gauge(&app).unwrap().1, Color::Red);
+    }
+
+    #[test]
+    fn render_draws_gauge_in_footer_when_room_available() {
+        // Wide-enough terminal: the gauge text must appear on the footer
+        // (hint) row, right-aligned. Pins the split-and-render path so a
+        // mutant that skips the gauge branch is caught.
+        let mut app = App::new();
+        app.context_window = 128_000;
+        app.usage.last_prompt_tokens = 12_345;
+        let backend = ratatui::backend::TestBackend::new(80, 6);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = term.backend().buffer();
+        // The footer hint is the last row of the rendered area.
+        let footer_y = buf.area().height - 1;
+        let footer: String = (0..buf.area().width)
+            .map(|x| buf[(x, footer_y)].symbol())
+            .collect();
+        assert!(
+            footer.contains("ctx"),
+            "expected gauge on footer row, got: {footer:?}"
+        );
+        assert!(
+            footer.contains("10%"),
+            "expected usage pct on footer row, got: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn render_falls_back_to_hint_only_on_narrow_terminal() {
+        // Very narrow terminal: not enough room for both hint and gauge,
+        // so the hint must still render and the gauge must be dropped
+        // rather than overflowing / clobbering the hint.
+        let mut app = App::new();
+        app.context_window = 128_000;
+        app.usage.last_prompt_tokens = 12_345;
+        let backend = ratatui::backend::TestBackend::new(10, 6);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = term.backend().buffer();
+        let footer_y = buf.area().height - 1;
+        let footer: String = (0..buf.area().width)
+            .map(|x| buf[(x, footer_y)].symbol())
+            .collect();
+        // The mode hint ("submit" for Prompt) should still be present.
+        assert!(
+            footer.contains("submit"),
+            "hint should remain on narrow terminal, got: {footer:?}"
         );
     }
 }

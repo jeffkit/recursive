@@ -5,8 +5,9 @@ use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
 use super::{
-    default_offline_tool_catalog, detect_model_name, App, AppScreen, DoublePressTracker, InputMode,
-    PendingPermission, PromptInputState, TranscriptBlock, TurnState, UsageStats,
+    default_offline_tool_catalog, detect_context_window, detect_model_name, App, AppScreen,
+    DoublePressTracker, InputMode, PendingPermission, PromptInputState, TranscriptBlock, TurnState,
+    UsageStats,
 };
 
 impl App {
@@ -39,6 +40,10 @@ impl App {
             turn_count: 0,
             pending_latency_ms: None,
             model_name: detect_model_name(),
+            active_preset: recursive::config::Config::from_env()
+                .ok()
+                .and_then(|c| c.preset),
+            context_window: detect_context_window(),
             spinner_frame: 0,
             modals: Vec::new(),
             commands,

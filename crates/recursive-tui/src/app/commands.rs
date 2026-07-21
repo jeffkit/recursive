@@ -806,44 +806,24 @@ impl App {
     /// - `Up` / `Down` / `PgUp` / `PgDn` → navigate list or scroll content.
     /// - `Enter` → command-specific confirm action, then close.
     pub fn handle_command_panel_key(&mut self, key: KeyEvent) -> Option<UserAction> {
+        // Ctrl+P / Ctrl+N navigate the panel list (emacs convention), matching
+        // the boot prompt's line-editing bindings. They reach here because the
+        // CommandInteract dispatch in `handle_key` runs before the prompt's
+        // own Ctrl+P/N handlers.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('p') => return self.panel_move_cursor(-1),
+                KeyCode::Char('n') => return self.panel_move_cursor(1),
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 self.close_command_panel();
                 None
             }
-            KeyCode::Up => {
-                if let Some(panel) = &self.active_command_panel {
-                    if let Some(sel) = panel.selected {
-                        let new_sel = sel.saturating_sub(1);
-                        let name = panel.command_name.clone();
-                        let ctx = panel.context.clone();
-                        if let Some(p) = &mut self.active_command_panel {
-                            p.selected = Some(new_sel);
-                        }
-                        self.rebuild_panel_lines_for_selection(&name, new_sel, ctx.as_deref());
-                    } else if let Some(p) = &mut self.active_command_panel {
-                        p.scroll = p.scroll.saturating_sub(1);
-                    }
-                }
-                None
-            }
-            KeyCode::Down => {
-                if let Some(panel) = &self.active_command_panel {
-                    if let Some(sel) = panel.selected {
-                        let max = panel.item_count.saturating_sub(1);
-                        let new_sel = (sel + 1).min(max);
-                        let name = panel.command_name.clone();
-                        let ctx = panel.context.clone();
-                        if let Some(p) = &mut self.active_command_panel {
-                            p.selected = Some(new_sel);
-                        }
-                        self.rebuild_panel_lines_for_selection(&name, new_sel, ctx.as_deref());
-                    } else if let Some(p) = &mut self.active_command_panel {
-                        p.scroll = p.scroll.saturating_add(1);
-                    }
-                }
-                None
-            }
+            KeyCode::Up => self.panel_move_cursor(-1),
+            KeyCode::Down => self.panel_move_cursor(1),
             KeyCode::PageUp => {
                 if let Some(p) = &mut self.active_command_panel {
                     p.scroll = p.scroll.saturating_sub(10);
@@ -861,6 +841,37 @@ impl App {
         }
     }
 
+    /// Move the panel cursor by `delta` rows (negative = up, positive = down),
+    /// clamped to the selectable range, and re-render the lines so the `▶`
+    /// marker tracks the cursor. When the panel has no selectable items
+    /// (`selected` is `None`) the scroll offset is nudged instead.
+    fn panel_move_cursor(&mut self, delta: i32) -> Option<UserAction> {
+        let panel = self.active_command_panel.clone()?;
+        if let Some(sel) = panel.selected {
+            let new_sel = if delta < 0 {
+                sel.saturating_sub(delta.unsigned_abs() as usize)
+            } else {
+                let max = panel.item_count.saturating_sub(1);
+                (sel + delta as usize).min(max)
+            };
+            if let Some(p) = &mut self.active_command_panel {
+                p.selected = Some(new_sel);
+            }
+            self.rebuild_panel_lines_for_selection(
+                &panel.command_name,
+                new_sel,
+                panel.context.as_deref(),
+            );
+        } else if let Some(p) = &mut self.active_command_panel {
+            if delta < 0 {
+                p.scroll = p.scroll.saturating_sub(1);
+            } else {
+                p.scroll = p.scroll.saturating_add(1);
+            }
+        }
+        None
+    }
+
     /// Re-render a list panel's lines after the selection changes so the
     /// highlight tracks the cursor without reopening the panel.
     fn rebuild_panel_lines_for_selection(
@@ -869,7 +880,10 @@ impl App {
         new_sel: usize,
         _ctx: Option<&str>,
     ) {
-        use crate::commands::{build_journal_lines, build_resume_lines, build_theme_picker_lines};
+        use crate::commands::{
+            build_journal_lines, build_resume_lines, build_theme_picker_lines,
+            rebuild_model_picker_lines,
+        };
         match command_name {
             "journal" => {
                 let entries = crate::ui::modal::load_recent_journal_entries(5);
@@ -888,6 +902,17 @@ impl App {
                 let current = self.theme.name;
                 if let Some(p) = &mut self.active_command_panel {
                     p.lines = build_theme_picker_lines(current, new_sel);
+                }
+            }
+            "model" => {
+                let active_preset = self.active_preset.clone();
+                let active_model = self.model_name.clone();
+                if let Some(p) = &mut self.active_command_panel {
+                    p.lines = rebuild_model_picker_lines(
+                        active_preset.as_deref(),
+                        &active_model,
+                        new_sel,
+                    );
                 }
             }
             _ => {}
@@ -927,6 +952,36 @@ impl App {
                 }
                 self.close_command_panel();
                 None
+            }
+            "model" => {
+                use crate::commands::parse_model_picker_context;
+                let action = match (sel, ctx.as_deref()) {
+                    (Some(idx), Some(raw)) => match parse_model_picker_context(raw, idx) {
+                        Some((preset_id, model)) => {
+                            self.close_command_panel();
+                            if preset_id.is_empty() {
+                                // Synthetic "current (custom provider)" row —
+                                // the model is already running, so re-affirm
+                                // is a no-op rather than a SwitchModel (which
+                                // would fail with "unknown provider preset").
+                                self.push_system(format!("Already using {model}."));
+                                None
+                            } else {
+                                Some(UserAction::SwitchModel { preset_id, model })
+                            }
+                        }
+                        None => {
+                            self.push_error("Could not switch model: malformed selection.");
+                            self.close_command_panel();
+                            None
+                        }
+                    },
+                    _ => {
+                        self.close_command_panel();
+                        None
+                    }
+                };
+                action
             }
             _ => {
                 self.close_command_panel();
@@ -3505,6 +3560,10 @@ mod command_panel_tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     fn panel(
         name: &str,
         selected: Option<usize>,
@@ -3625,6 +3684,130 @@ mod command_panel_tests {
         app.active_command_panel = Some(panel("resume", None, 0, None));
         app.rebuild_panel_lines_for_selection("resume", 0, None);
         assert!(!app.active_command_panel.as_ref().unwrap().lines.is_empty());
+    }
+
+    #[test]
+    fn rebuild_model_updates_panel_lines() {
+        // kills delete "model" arm in rebuild_panel_lines_for_selection
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("model", None, 0, None));
+        assert!(app.active_command_panel.as_ref().unwrap().lines.is_empty());
+        app.rebuild_panel_lines_for_selection("model", 0, None);
+        let lines = &app.active_command_panel.as_ref().unwrap().lines;
+        assert!(!lines.is_empty(), "model picker should rebuild lines");
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert!(
+            text.contains("Select model"),
+            "rebuilt lines should have header: {text:?}"
+        );
+    }
+
+    #[test]
+    fn panel_enter_model_emits_switch_model() {
+        // kills: delete "model" arm in confirm_command_panel, plus the
+        // parse_model_picker_context round-trip. Context encodes two entries
+        // as `preset_id\x1fmodel` per line; cursor at index 1 selects beta/b-2.
+        let mut app = App::new();
+        let ctx = "alpha\x1fa-1\nbeta\x1fb-2";
+        app.active_command_panel = Some(panel("model", Some(1), 2, Some(ctx)));
+        let action = app.handle_command_panel_key(k(KeyCode::Enter));
+        match action {
+            Some(UserAction::SwitchModel { preset_id, model }) => {
+                assert_eq!(preset_id, "beta");
+                assert_eq!(model, "b-2");
+            }
+            other => panic!("expected SwitchModel, got {other:?}"),
+        }
+        assert!(
+            app.active_command_panel.is_none(),
+            "Enter should close panel"
+        );
+    }
+
+    #[test]
+    fn panel_enter_model_malformed_context_pushes_error() {
+        // A garbled context line must not panic; it pushes an Error block and
+        // closes the panel without emitting an action.
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("model", Some(0), 1, Some("garbage")));
+        let action = app.handle_command_panel_key(k(KeyCode::Enter));
+        assert!(
+            action.is_none(),
+            "malformed context must not emit an action"
+        );
+        assert!(app.active_command_panel.is_none(), "panel should close");
+        let has_error = app
+            .blocks
+            .iter()
+            .any(|b| matches!(b, crate::app::TranscriptBlock::Error { text } if text.contains("switch model")));
+        assert!(has_error, "expected an error block for malformed selection");
+    }
+
+    #[test]
+    fn panel_enter_model_synthetic_current_is_noop() {
+        // The synthetic "current (custom provider)" row carries an empty
+        // preset_id. Confirming it must NOT dispatch SwitchModel (which would
+        // fail with "unknown provider preset"); it pushes a System note and
+        // closes the panel.
+        let mut app = App::new();
+        let ctx = "\x1fz-ai/glm-5.2\nanthropic\x1fclaude-haiku-4-5";
+        app.active_command_panel = Some(panel("model", Some(0), 2, Some(ctx)));
+        let action = app.handle_command_panel_key(k(KeyCode::Enter));
+        assert!(
+            action.is_none(),
+            "synthetic current row must not emit SwitchModel"
+        );
+        assert!(app.active_command_panel.is_none(), "panel should close");
+        let has_system = app
+            .blocks
+            .iter()
+            .any(|b| matches!(b, crate::app::TranscriptBlock::System { text } if text.contains("Already using")));
+        assert!(has_system, "expected an 'Already using' system note");
+    }
+
+    #[test]
+    fn panel_ctrl_p_moves_cursor_up() {
+        // Ctrl+P (emacs previous-line) navigates the model picker up. Pins the
+        // CommandInteract dispatch path that runs before the prompt's own
+        // Ctrl+P handler.
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("model", Some(2), 4, None));
+        let _ = app.handle_command_panel_key(ctrl(KeyCode::Char('p')));
+        assert_eq!(
+            app.active_command_panel.as_ref().unwrap().selected,
+            Some(1),
+            "Ctrl+P should decrement the cursor"
+        );
+    }
+
+    #[test]
+    fn panel_ctrl_n_moves_cursor_down() {
+        // Ctrl+N (emacs next-line) navigates the model picker down.
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("model", Some(1), 4, None));
+        let _ = app.handle_command_panel_key(ctrl(KeyCode::Char('n')));
+        assert_eq!(
+            app.active_command_panel.as_ref().unwrap().selected,
+            Some(2),
+            "Ctrl+N should increment the cursor"
+        );
+    }
+
+    #[test]
+    fn panel_ctrl_n_clamps_at_last_item() {
+        // Ctrl+N at the last item stays at the last item (no overflow).
+        let mut app = App::new();
+        app.active_command_panel = Some(panel("model", Some(3), 4, None));
+        let _ = app.handle_command_panel_key(ctrl(KeyCode::Char('n')));
+        assert_eq!(
+            app.active_command_panel.as_ref().unwrap().selected,
+            Some(3),
+            "Ctrl+N should clamp at the last item"
+        );
     }
 
     #[test]

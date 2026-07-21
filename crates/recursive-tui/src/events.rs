@@ -200,6 +200,12 @@ pub enum UiEvent {
     },
     /// The loop is idle, waiting for a trigger (background job, wakeup, user).
     LoopIdle,
+
+    // ── /model picker: model hot-swap confirmation ────────────────────────
+    /// The backend successfully swapped the LLM provider to `model` under
+    /// provider preset `preset_id`. Drives `App::model_name` + a System note
+    /// so the status bar and transcript reflect the new active model.
+    ModelSwitched { preset_id: String, model: String },
 }
 
 // ── Goal-161: permission side-channel ────────────────────────────────────────
@@ -300,6 +306,18 @@ pub enum UserAction {
     StopLoop,
     /// Manually inject a trigger into the loop.
     LoopTrigger { source: String, prompt: String },
+
+    // ── /model picker: hot-swap the LLM provider mid-session ──────────────
+    /// Switch the active model to `model` under provider preset `preset_id`.
+    /// The backend builds a fresh `ChatProvider` from the preset + model and
+    /// swaps it into the running `AgentRuntime` via `set_llm`, so the change
+    /// takes effect on the next turn without a restart.
+    SwitchModel {
+        /// Provider preset id (from `providers.toml` / `providers.d`).
+        preset_id: String,
+        /// Model name within that preset.
+        model: String,
+    },
 }
 
 // ── Goal-230: Skill-hub install side-channel ─────────────────────────────────

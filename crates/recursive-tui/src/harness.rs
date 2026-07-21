@@ -495,6 +495,129 @@ mod tests {
     }
 
     #[test]
+    fn model_panel_marker_row_carries_highlight_bg() {
+        // Regression: the /model picker must render the orange highlight bar on
+        // the ▶ marker row, like /theme. Set a key so the picker is non-empty,
+        // then render and inspect the actual buffer (not just panel state).
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-anthropic-dummy");
+
+        let mut h = Harness::new();
+        let panel = open_panel(h.app_mut(), "model", &[]);
+        h.app_mut().active_command_panel = Some(panel);
+        h.app_mut().prompt.mode = InputMode::CommandInteract;
+
+        let screen = h.render();
+        let marker_row = screen
+            .find_row("▶")
+            .expect("a ▶ marker should render on screen");
+        assert!(
+            screen.row_has_bg_color(marker_row, HIGHLIGHT),
+            "the ▶ marker row must carry the highlight bar\n{}",
+            screen.numbered()
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn model_panel_shows_current_custom_model_as_synthetic_entry() {
+        // When the active model isn't offered by any preset (a custom provider
+        // configured by raw api_base + model), the picker must still show it:
+        // the header names the real running model and a synthetic
+        // "Current (custom provider)" row is prepended with a ✓.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-anthropic-dummy");
+
+        let mut h = Harness::new();
+        // Force a custom active model that no preset lists.
+        h.app_mut().active_preset = None;
+        h.app_mut().model_name = "z-ai/glm-5.2".to_string();
+        let panel = open_panel(h.app_mut(), "model", &[]);
+        h.app_mut().active_command_panel = Some(panel);
+        h.app_mut().prompt.mode = InputMode::CommandInteract;
+
+        let screen = h.render();
+        let text = screen.text();
+        assert!(
+            text.contains("current: z-ai/glm-5.2"),
+            "header must name the real running model, got:\n{text}"
+        );
+        assert!(
+            text.contains("Current (custom provider)"),
+            "synthetic current row must appear, got:\n{text}"
+        );
+        assert!(
+            text.contains('✓'),
+            "the synthetic current row must carry a checkmark, got:\n{text}"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn model_panel_viewport_follows_cursor_for_long_list() {
+        // Regression: when the picker lists more models than fit on screen
+        // (MAX_VISIBLE = 8 content rows), the viewport must scroll to keep
+        // the cursor visible. Before the fix the renderer always showed the
+        // first `content_rows` lines, so a cursor near the bottom was
+        // off-screen and the user had to press ↑ many times before the
+        // highlight appeared. Build a 30-row panel with the cursor at row 25
+        // and assert the ▶ row is on screen and carries the highlight bar.
+        use crate::app::CommandPanelState;
+        use crate::commands::{build_model_picker_lines, ModelPickerEntry};
+
+        let entries: Vec<ModelPickerEntry> = (0..30)
+            .map(|i| ModelPickerEntry {
+                preset_id: "p".into(),
+                preset_name: "P".into(),
+                model: format!("m-{i}"),
+                context_window: 0,
+                pricing: None,
+            })
+            .collect();
+        // active = 25 (✓ on row 25), selected = 25 (▶ on row 25).
+        let lines = build_model_picker_lines(&entries, "m-25", 25, 25);
+        // list_offset = 2 (header + blank), so the cursor sits at line 27.
+        let panel = CommandPanelState::new("model", lines)
+            .with_selection(25)
+            .with_item_count(30)
+            .with_list_offset(2)
+            .with_hint("↑↓ / Ctrl+P Ctrl+N select  ·  enter switch  ·  esc cancel");
+
+        let mut h = Harness::new();
+        h.app_mut().active_command_panel = Some(panel);
+        h.app_mut().prompt.mode = InputMode::CommandInteract;
+
+        let screen = h.render();
+        let marker_row = screen
+            .find_row("▶")
+            .expect("the ▶ marker must be scrolled into view\n{}");
+        assert!(
+            screen.row_has_bg_color(marker_row, HIGHLIGHT),
+            "the ▶ marker row must carry the highlight bar\n{}",
+            screen.numbered()
+        );
+        // The active model's name must be visible (the viewport followed the
+        // cursor to row 25, not stayed at the top showing m-0..m-7).
+        assert!(
+            screen.text().contains("m-25"),
+            "the cursor's model must be visible after scroll\n{}",
+            screen.numbered()
+        );
+    }
+
+    #[test]
     fn session_resumed_replaces_visible_transcript() {
         // Regression: `/resume` must REPLACE the visible conversation, not
         // append to it. Pump some old content, then a SessionResumed event

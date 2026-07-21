@@ -57,6 +57,79 @@ fn effective_api_key(api_key: Option<&str>) -> Option<&str> {
     api_key.filter(|k| !k.is_empty())
 }
 
+/// Build a `ChatProvider` for an arbitrary `(preset_id, model)` pair, reusing
+/// the current process configuration for non-provider knobs (retry policy,
+/// temperature, max_search_rounds).
+///
+/// Used by the TUI `/model` picker to hot-swap models mid-session. The API key
+/// is resolved with the same precedence `Config::from_env` uses for presets:
+/// the preset's own `key_env` env var wins; otherwise the currently
+/// configured key (file / `RECURSIVE_API_KEY`) is reused so a user who already
+/// authenticated one provider can switch to another sharing the same key
+/// without re-authenticating. Returns an error when no key is available.
+pub fn build_provider_for_model(
+    preset_id: &str,
+    model: &str,
+) -> recursive::error::Result<Arc<dyn ChatProvider>> {
+    let preset = recursive::providers::find_preset_effective(preset_id).ok_or_else(|| {
+        recursive::error::Error::Config {
+            message: format!("unknown provider preset '{preset_id}'"),
+        }
+    })?;
+    let mut config =
+        recursive::config::Config::from_env().map_err(|e| recursive::error::Error::Config {
+            message: format!("failed to load configuration: {e}"),
+        })?;
+    let provider_type = preset.provider_type.clone();
+    let api_base = if provider_type == "anthropic" {
+        preset
+            .anthropic_api_base
+            .clone()
+            .unwrap_or_else(|| preset.api_base.clone())
+    } else {
+        preset.api_base.clone()
+    };
+    config.provider_type = provider_type;
+    config.api_base = api_base;
+    config.model = model.to_string();
+    // Prefer the preset's own key_env when present; fall back to the current
+    // config's key so cross-preset switches with a shared key just work.
+    if !preset.key_env.is_empty() {
+        if let Ok(k) = std::env::var(&preset.key_env) {
+            if !k.is_empty() {
+                config.api_key = Some(k);
+            }
+        }
+    }
+    let api_key = effective_api_key(config.api_key.as_deref())
+        .map(|k| k.to_string())
+        .ok_or_else(|| recursive::error::Error::Config {
+            message: format!(
+                "no API key for preset '{}' — set ${} (or RECURSIVE_API_KEY) and retry",
+                preset.id, preset.key_env,
+            ),
+        })?;
+    build_provider(&config, api_key)
+}
+
+/// Whether a preset's own API key is resolvable *without* the global
+/// `RECURSIVE_API_KEY` / config fallback. Used by the `/model` picker to
+/// decide which providers to offer: a model is only listed when switching
+/// to it would actually authenticate, so the user never sees a wall of
+/// unconfigured providers (the previous behaviour listed every bundled
+/// preset regardless of keys).
+///
+/// A preset with an empty `key_env` (e.g. local `ollama`) is treated as
+/// always available — it needs no key. The active preset is additionally
+/// kept available by the picker even when its key is missing, so the
+/// running model stays selectable for re-confirmation.
+pub fn preset_key_available(preset: &recursive::providers::ProviderPreset) -> bool {
+    if preset.key_env.is_empty() {
+        return true;
+    }
+    matches!(std::env::var(&preset.key_env), Ok(k) if !k.is_empty())
+}
+
 /// The actionable "no LLM provider configured" message shown both at TUI
 /// startup (as `UiEvent::RuntimeOffline`) and when the user tries to send a
 /// message while offline (as `UiEvent::Error`). Kept in one place so the
@@ -583,6 +656,105 @@ type = "openai"
             !provider.supports_deferred_tools(),
             "non-anthropic provider_type must yield a non-deferred provider"
         );
+    }
+
+    // ── /model picker: build_provider_for_model ────────────────────────────
+
+    /// RAII guard that saves/drops a single env var for the duration of a test.
+    /// Assumes the caller already holds `env_lock()` via `PinnedRecursiveHome`.
+    struct EnvGuard {
+        name: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prev }
+        }
+        fn remove(name: &'static str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[test]
+    fn build_provider_for_model_unknown_preset_errors() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _g1 = EnvGuard::remove("RECURSIVE_API_KEY");
+        let _g2 = EnvGuard::remove("OPENAI_API_KEY");
+        let err = build_provider_for_model("definitely-not-a-preset", "any")
+            .err()
+            .expect("expected error for unknown preset");
+        assert!(
+            err.to_string().contains("unknown provider preset"),
+            "expected unknown-preset error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_for_model_no_api_key_errors() {
+        // No preset key_env env var AND no RECURSIVE_API_KEY → error.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _g1 = EnvGuard::remove("RECURSIVE_API_KEY");
+        let _g2 = EnvGuard::remove("OPENAI_API_KEY");
+        // Pick a bundled preset with a non-empty key_env (deepseek → DEEPSEEK_API_KEY)
+        // and make sure that env var is also unset.
+        let _g3 = EnvGuard::remove("DEEPSEEK_API_KEY");
+        let err = build_provider_for_model("deepseek", "deepseek-chat")
+            .err()
+            .expect("expected error for missing api key");
+        assert!(
+            err.to_string().contains("no API key"),
+            "expected no-api-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_for_model_uses_preset_key_env() {
+        // Setting the preset's key_env env var lets the provider build even
+        // when RECURSIVE_API_KEY is unset. Pins the preset.key_env branch.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _g1 = EnvGuard::remove("RECURSIVE_API_KEY");
+        let _g2 = EnvGuard::remove("OPENAI_API_KEY");
+        let _g3 = EnvGuard::set("DEEPSEEK_API_KEY", "sk-deepseek-dummy");
+        let provider = build_provider_for_model("deepseek", "deepseek-chat")
+            .expect("provider builds with preset key_env set");
+        // DeepSeek is OpenAI-compatible → not a deferred-tools provider.
+        assert!(!provider.supports_deferred_tools());
+    }
+
+    #[test]
+    fn build_provider_for_model_falls_back_to_config_api_key() {
+        // When the preset's key_env env var is unset but the config file has
+        // an api_key, the fallback kicks in so a cross-preset switch succeeds.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _g1 = EnvGuard::remove("RECURSIVE_API_KEY");
+        let _g2 = EnvGuard::remove("OPENAI_API_KEY");
+        let _g3 = EnvGuard::remove("DEEPSEEK_API_KEY");
+        let cfg_dir = empty_home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[provider]\napi_key = \"sk-shared\"\nmodel = \"x\"\ntype = \"openai\"\n",
+        )
+        .expect("write config");
+        let provider = build_provider_for_model("deepseek", "deepseek-chat")
+            .expect("provider builds via config api_key fallback");
+        assert!(!provider.supports_deferred_tools());
     }
 
     #[test]

@@ -28,7 +28,9 @@ pub use crate::completion::{
     collect_files, default_offline_tool_catalog, glob_workspace_files, search_history,
     MAX_ATFILE_SUGGESTIONS, MAX_HSEARCH_RESULTS,
 };
-pub use crate::cost::{detect_model_name, estimate_cost, TurnState, UsageStats};
+pub use crate::cost::{
+    detect_context_window, detect_model_name, estimate_cost, TurnState, UsageStats,
+};
 pub use crate::input_state::{
     double_press_window, strip_history_prefix, DoublePressTracker, InputMode, PromptInputState,
     DOUBLE_PRESS_WINDOW, HISTORY_CAPACITY,
@@ -65,6 +67,16 @@ pub struct App {
     pub turn_count: u64,
     pub pending_latency_ms: Option<u64>,
     pub model_name: String,
+    /// Provider preset id of the currently active model. Initialised from
+    /// `Config::from_env()` at startup and updated on `UiEvent::ModelSwitched`
+    /// so the `/model` picker's `✓` tracks the live model after a hot-swap
+    /// (the config file is not rewritten, so re-reading it would show stale
+    /// data). `None` when no preset is configured (custom provider).
+    pub active_preset: Option<String>,
+    /// Context-window size (tokens) for [`App::model_name`], resolved at
+    /// startup via [`crate::cost::detect_context_window`]. Used by the
+    /// input-box footer to render a live "context used / window" gauge.
+    pub context_window: u64,
     pub spinner_frame: usize,
     /// Goal-146: stack of overlay modals. The topmost (last) modal
     /// receives keys; an empty stack means chat keys are active.

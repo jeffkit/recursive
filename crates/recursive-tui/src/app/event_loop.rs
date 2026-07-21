@@ -316,6 +316,19 @@ impl App {
             UiEvent::LoopIdle => {
                 // No-op: the loop is waiting. Don't flood the transcript.
             }
+            // /model picker: the backend swapped the LLM provider. Mirror the
+            // new (preset, model) into App state so the status bar, /cost, and
+            // the /model picker's ✓ all reflect the live model without a restart
+            // (the config file is not rewritten, so detect_model_name() would
+            // otherwise keep reporting the pre-switch value).
+            UiEvent::ModelSwitched { preset_id, model } => {
+                self.model_name = model.clone();
+                self.active_preset = Some(preset_id.clone());
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("Model switched to {model} ({preset_id})."),
+                });
+                self.scroll_to_bottom();
+            }
             // ── Goal-170: turn abort ──────────────────────────────────────────
             UiEvent::Interrupted => {
                 self.blocks.push(TranscriptBlock::System {
@@ -912,6 +925,35 @@ mod tests {
         assert!(matches!(
             app.blocks.last(),
             Some(TranscriptBlock::Error { text }) if text.contains("boom")
+        ));
+    }
+
+    // ── /model picker: ModelSwitched mirrors state ────────────────────────
+
+    #[test]
+    fn model_switched_updates_model_name_and_preset() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        let original_model = app.model_name.clone();
+        let original_preset = app.active_preset.clone();
+
+        app.handle_ui_event(UiEvent::ModelSwitched {
+            preset_id: "deepseek".into(),
+            model: "deepseek-chat".into(),
+        });
+
+        assert_eq!(app.model_name, "deepseek-chat");
+        assert_eq!(app.active_preset.as_deref(), Some("deepseek"));
+        // Distinct from the startup values (which come from Config::from_env).
+        // Guard against the test env already being deepseek/deepseek-chat by
+        // only asserting difference when the originals differed.
+        if original_model != "deepseek-chat" || original_preset.as_deref() != Some("deepseek") {
+            assert_ne!(app.model_name, original_model);
+        }
+        // A System note announces the switch.
+        assert!(matches!(
+            app.blocks.last(),
+            Some(TranscriptBlock::System { text }) if text.contains("Model switched")
         ));
     }
 

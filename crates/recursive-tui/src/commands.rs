@@ -333,9 +333,33 @@ fn cmd_cost(app: &mut AppState, _args: &[String]) -> CommandOutcome {
     CommandOutcome::OpenPanel(CommandPanelState::new("cost", lines).with_hint("esc close"))
 }
 
-fn cmd_model(_app: &mut AppState, _args: &[String]) -> CommandOutcome {
-    let lines = build_model_lines();
-    CommandOutcome::OpenPanel(CommandPanelState::new("model", lines).with_hint("esc close"))
+fn cmd_model(app: &mut AppState, _args: &[String]) -> CommandOutcome {
+    let (entries, active_idx, _current) =
+        model_picker_state(app.active_preset.as_deref(), &app.model_name);
+    if entries.is_empty() {
+        return CommandOutcome::Error(
+            "No models available — set a provider API key (e.g. ANTHROPIC_API_KEY, \
+             DEEPSEEK_API_KEY, …) or run `recursive init` outside the TUI, \
+             then reopen /model."
+                .into(),
+        );
+    }
+    let selected = active_idx;
+    let item_count = entries.len();
+    let lines = build_model_picker_lines(&entries, &app.model_name, active_idx, selected);
+    let ctx = serde_model_picker_context(&entries);
+    CommandOutcome::OpenPanel(
+        CommandPanelState::new("model", lines)
+            .with_selection(selected)
+            .with_item_count(item_count)
+            // Header (1) + blank spacer (1) precede the first model row, so
+            // the orange highlight bar (selected + list_offset) lands on the
+            // same row as the `▶` marker. No banner is inserted —
+            // unconfigured presets are filtered out upstream.
+            .with_list_offset(2)
+            .with_hint("↑↓ / Ctrl+P Ctrl+N select  ·  enter switch  ·  esc cancel")
+            .with_context(ctx),
+    )
 }
 
 fn cmd_status(app: &mut AppState, _args: &[String]) -> CommandOutcome {
@@ -870,62 +894,221 @@ pub fn build_cost_lines(usage: &crate::app::UsageStats, model: &str) -> Vec<Line
     out
 }
 
-pub fn build_model_lines() -> Vec<Line<'static>> {
-    let cfg = recursive::config::Config::from_env().ok();
-    let api_base = cfg
-        .as_ref()
-        .map(|c| c.api_base.clone())
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-    let provider = cfg
-        .as_ref()
-        .and_then(|c| c.preset.clone())
-        .or_else(|| {
-            recursive::providers::find_preset_by_api_base(&api_base).map(|p| p.id.to_string())
-        })
-        .unwrap_or_else(|| "custom".to_string());
-    let model = cfg
-        .as_ref()
-        .map(|c| c.model.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    // `Config::from_env` already resolves the api_key through the full
-    // chain (env → file → preset's key_env). An empty/None key here means
-    // no provider is usable — the runtime would build as Offline. Surface
-    // that explicitly so `/model` doesn't show the hardcoded
-    // `deepseek-v4-flash` fallback as if it were a live configuration.
-    let configured = cfg
-        .as_ref()
-        .and_then(|c| c.api_key.as_deref())
-        .map(|k| !k.is_empty())
-        .unwrap_or(false);
+/// One selectable row in the `/model` picker: a `(preset, model)` pair with
+/// the metadata the panel renders alongside it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelPickerEntry {
+    pub preset_id: String,
+    pub preset_name: String,
+    pub model: String,
+    pub context_window: usize,
+    /// `(input_per_million, output_per_million)` in USD when the preset lists pricing.
+    pub pricing: Option<(f64, f64)>,
+}
 
+/// Flatten the effective provider catalog (remote cache + bundled +
+/// `providers.d/`) into a stable, selectable `(preset, model)` list sorted
+/// by preset id then model name. Stable order keeps the cursor position
+/// meaningful across reopens.
+///
+/// Only presets whose own API key is resolvable are listed (see
+/// [`crate::runtime_builder::preset_key_available`]), so the picker never
+/// shows a wall of unconfigured providers. The `active_preset` is always
+/// kept in the list even when its key is missing, so the running model
+/// stays selectable for re-confirmation.
+pub fn collect_model_picker_entries(active_preset: Option<&str>) -> Vec<ModelPickerEntry> {
+    let mut presets = recursive::providers::all_presets_effective();
+    presets.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut out = Vec::new();
+    for preset in presets {
+        let is_active = Some(preset.id.as_str()) == active_preset;
+        if !is_active && !crate::runtime_builder::preset_key_available(&preset) {
+            continue;
+        }
+        // Ollama is a localhost service, not a cloud API. The bundled
+        // `providers.toml` list is just a placeholder; probe the real
+        // local instance so the picker shows what's actually installed.
+        let models: Vec<recursive::providers::ModelSpec> = if preset.id == "ollama" {
+            match crate::ollama_probe::ollama_models_for_picker() {
+                crate::ollama_probe::OllamaPickerModels::Local(probed) => probed,
+                crate::ollama_probe::OllamaPickerModels::Unreachable => {
+                    if is_active {
+                        preset.models.clone()
+                    } else {
+                        continue;
+                    }
+                }
+                crate::ollama_probe::OllamaPickerModels::Bundled => preset.models.clone(),
+            }
+        } else {
+            preset.models.clone()
+        };
+        let mut models = models;
+        models.sort_by(|a, b| a.name.cmp(&b.name));
+        for spec in models {
+            out.push(ModelPickerEntry {
+                preset_id: preset.id.clone(),
+                preset_name: preset.name.clone(),
+                model: spec.name,
+                context_window: spec.context_window,
+                pricing: spec
+                    .pricing
+                    .map(|p| (p.input_per_million, p.output_per_million)),
+            });
+        }
+    }
+    out
+}
+
+/// Compute the picker's static parameters: the entry list, the index of the
+/// currently active `(preset, model)` (so the panel opens with the cursor on
+/// the running model and a `✓` marks it), and the real current model name to
+/// show in the header.
+///
+/// `active_preset` / `active_model` come from App state (which is updated on
+/// `UiEvent::ModelSwitched`) rather than re-reading the config file — the
+/// file is not rewritten on a hot-swap, so `Config::from_env()` would report
+/// stale data after a switch.
+///
+/// When the active model isn't offered by any preset (e.g. a custom provider
+/// configured by raw `api_base` + `model` with no preset id), a synthetic
+/// "current" entry is prepended so the running model still appears in the
+/// list with a `✓`. Its `preset_id` is empty — `confirm_command_panel`
+/// treats an empty preset id as a no-op re-affirm (the model is already
+/// running) rather than dispatching `SwitchModel`.
+fn model_picker_state(
+    active_preset: Option<&str>,
+    active_model: &str,
+) -> (Vec<ModelPickerEntry>, usize, String) {
+    let entries = collect_model_picker_entries(active_preset);
+    let active_idx = entries
+        .iter()
+        .position(|e| Some(e.preset_id.as_str()) == active_preset && e.model == active_model);
+    let (entries, active_idx) = match active_idx {
+        Some(idx) => (entries, idx),
+        None => {
+            // Active model isn't in any preset (custom provider). Prepend a
+            // synthetic selectable row for it so the user sees what's
+            // running and can re-confirm it.
+            let mut synth = Vec::with_capacity(entries.len() + 1);
+            synth.push(ModelPickerEntry {
+                preset_id: String::new(),
+                preset_name: "Current (custom provider)".to_string(),
+                model: active_model.to_string(),
+                context_window: 0,
+                pricing: None,
+            });
+            synth.extend(entries);
+            (synth, 0)
+        }
+    };
+    (entries, active_idx, active_model.to_string())
+}
+
+/// Rebuild the `/model` picker lines for a new cursor position. Uses the
+/// App-tracked active `(preset, model)` so the `✓` stays accurate as the
+/// user moves the cursor and after a hot-swap. Called by
+/// `rebuild_panel_lines_for_selection`.
+pub fn rebuild_model_picker_lines(
+    active_preset: Option<&str>,
+    active_model: &str,
+    selected: usize,
+) -> Vec<Line<'static>> {
+    let (entries, active_idx, current) = model_picker_state(active_preset, active_model);
+    build_model_picker_lines(&entries, &current, active_idx, selected)
+}
+
+/// Render the `/model` picker panel.
+///
+/// `current` is the real name of the model now running (shown in the header)
+/// — passed in explicitly rather than derived from `entries[active_idx]` so
+/// the header stays honest when the active model isn't offered by any preset
+/// (a custom provider). `active_idx` is the row carrying the green `✓`;
+/// `selected` is the cursor row carrying the `▶` marker + yellow/bold. The
+/// list is preceded by a header line and a blank spacer, so the first model
+/// sits at line index 2 — `cmd_model` sets `list_offset = 2` so the orange
+/// highlight bar tracks the `▶` row exactly. No in-panel footer is drawn
+/// here; the key-binding hint comes from the panel's `with_hint` (rendered
+/// by `render_command_interact_panel` in the reserved bottom row).
+pub fn build_model_picker_lines(
+    entries: &[ModelPickerEntry],
+    current: &str,
+    active_idx: usize,
+    selected: usize,
+) -> Vec<Line<'static>> {
     let header = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
-    let warn = Style::default().fg(Color::Red);
+    let active_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let meta = Style::default().fg(Color::DarkGray);
+
     let mut out: Vec<Line<'static>> = vec![Line::from(Span::styled(
-        "Current model".to_string(),
+        format!("Select model  (current: {current})"),
         header,
     ))];
     out.push(Line::raw(""));
-    if !configured {
-        out.push(Line::from(Span::styled(
-            "  Not configured — no API key set. Run `recursive init` \
-             outside the TUI, then restart."
-                .to_string(),
-            warn,
-        )));
-        out.push(Line::raw(""));
+    for (i, entry) in entries.iter().enumerate() {
+        let marker = if i == selected { "▶" } else { " " };
+        let name_style = if i == selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let ctx_label = if entry.context_window > 0 {
+            format!("{}K ctx", entry.context_window / 1000)
+        } else {
+            "—".to_string()
+        };
+        let price_label = match entry.pricing {
+            Some((inp, outp)) => format!("${inp}/${outp} per Mtok"),
+            None => "no pricing".to_string(),
+        };
+        let mut spans = vec![
+            Span::raw(format!(" {marker} ")),
+            Span::styled(entry.model.clone(), name_style),
+            Span::raw("  ·  "),
+            Span::styled(entry.preset_name.clone(), meta),
+            Span::raw("  ·  "),
+            Span::raw(ctx_label),
+            Span::raw("  ·  "),
+            Span::raw(price_label),
+        ];
+        if i == active_idx {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("✓".to_string(), active_style));
+        }
+        out.push(Line::from(spans));
     }
-    out.push(Line::from(format!("  Model    : {model}")));
-    out.push(Line::from(format!("  Provider : {provider}")));
-    out.push(Line::from(format!("  Endpoint : {api_base}")));
-    out.push(Line::raw(""));
-    out.push(Line::from(Span::styled(
-        "  (read-only — switching models requires restart)".to_string(),
-        dim,
-    )));
     out
+}
+
+/// Serialise the picker entries as `preset_id\x1fmodel` per line so
+/// `confirm_command_panel` can reconstruct the chosen `SwitchModel` action
+/// without re-reading the (possibly stale) config.
+pub fn serde_model_picker_context(entries: &[ModelPickerEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| format!("{}\x1f{}", e.preset_id, e.model))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse a `serde_model_picker_context` line for the given cursor index into
+/// `(preset_id, model)`. Returns `None` if the index is out of range or the
+/// line is malformed. An empty `preset_id` is a valid sentinel for the
+/// synthetic "current (custom provider)" row — `confirm_command_panel`
+/// treats it as a no-op re-affirm rather than dispatching `SwitchModel`.
+pub fn parse_model_picker_context(ctx: &str, idx: usize) -> Option<(String, String)> {
+    let line = ctx.lines().nth(idx)?;
+    let (preset_id, model) = line.split_once('\x1f')?;
+    if model.is_empty() {
+        return None;
+    }
+    Some((preset_id.to_string(), model.to_string()))
 }
 
 pub fn build_tool_lines(entries: &[(String, String)]) -> Vec<Line<'static>> {
@@ -1105,6 +1288,26 @@ pub fn build_theme_picker_lines(current: &str, selected: usize) -> Vec<Line<'sta
 mod tests {
     use super::*;
     use crate::app::{App, TranscriptBlock};
+
+    /// Pin the ollama probe so picker tests don't depend on a live local
+    /// Ollama. Returns a guard that clears the override on drop. Default
+    /// pins to `Bundled` (legacy "ollama always listed" behaviour).
+    fn pin_ollama_probe(models: Option<crate::ollama_probe::OllamaPickerModels>) -> impl Drop {
+        crate::ollama_probe::set_probe_override_for_test(models);
+        crate::ollama_probe::invalidate_cache();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::ollama_probe::set_probe_override_for_test(None);
+                crate::ollama_probe::invalidate_cache();
+            }
+        }
+        Reset
+    }
+
+    fn pin_ollama_bundled() -> impl Drop {
+        pin_ollama_probe(Some(crate::ollama_probe::OllamaPickerModels::Bundled))
+    }
 
     fn invoke(app: &mut App, line: &str) -> InvokeResult {
         let mut parts = line.split_whitespace();
@@ -1959,6 +2162,13 @@ mod tests {
     #[test]
     fn build_cost_lines_computes_per_token_costs() {
         use crate::cost::UsageStats;
+        // Pin RECURSIVE_HOME so `pricing_for` reads the bundled catalog
+        // deterministically. Without this, env-mutating tests running in
+        // parallel can flip RECURSIVE_HOME between the two `pricing_for`
+        // calls below (one here, one inside `build_cost_lines`) and the
+        // rendered cost won't match the asserted one.
+        let _home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(_home.path());
         let usage = UsageStats {
             total_input: 1_000_000,
             total_output: 2_000_000,
@@ -1988,84 +2198,293 @@ mod tests {
     }
 
     #[test]
-    fn build_model_lines_renders_model_provider_endpoint() {
-        let lines = build_model_lines();
-        assert!(lines.len() > 3, "model panel should have several lines");
+    fn cmd_model_opens_interactive_picker_panel() {
+        let _probe = pin_ollama_bundled();
+        let mut app = App::new();
+        let r = invoke(&mut app, "model");
+        match r {
+            InvokeResult::Sync(CommandOutcome::OpenPanel(panel)) => {
+                assert_eq!(panel.command_name, "model");
+                assert!(panel.selected.is_some(), "picker should have a cursor");
+                assert!(
+                    panel.item_count > 0,
+                    "picker should list at least one model"
+                );
+                let text = text_of(&panel.lines);
+                assert!(
+                    text.contains("Select model"),
+                    "picker should have a header, got {text:?}"
+                );
+                assert!(
+                    text.contains('▶'),
+                    "picker should mark the selected row, got {text:?}"
+                );
+                assert!(
+                    panel.context.is_some(),
+                    "picker should carry a serialised context for confirm"
+                );
+            }
+            other => panic!("expected OpenPanel for /model, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_model_picker_entries_is_sorted_and_nonempty() {
+        // The keyless `ollama` preset is always available, so the picker is
+        // never empty even in a pristine env.
+        let _probe = pin_ollama_bundled();
+        let entries = collect_model_picker_entries(None);
+        assert!(!entries.is_empty(), "bundled catalog should list models");
+        let mut sorted = entries.clone();
+        sorted.sort_by(|a, b| {
+            a.preset_id
+                .cmp(&b.preset_id)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        assert_eq!(
+            entries, sorted,
+            "entries should be sorted by preset then model"
+        );
+    }
+
+    #[test]
+    fn build_model_picker_lines_marks_active_and_selected_rows() {
+        let entries = vec![
+            ModelPickerEntry {
+                preset_id: "alpha".into(),
+                preset_name: "Alpha".into(),
+                model: "a-1".into(),
+                context_window: 128_000,
+                pricing: Some((1.0, 5.0)),
+            },
+            ModelPickerEntry {
+                preset_id: "beta".into(),
+                preset_name: "Beta".into(),
+                model: "b-2".into(),
+                context_window: 0,
+                pricing: None,
+            },
+        ];
+        // active = 1, selected = 0: the ✓ lands on row 1, the ▶ on row 0.
+        let lines = build_model_picker_lines(&entries, "b-2", 1, 0);
         let text = text_of(&lines);
-        assert!(text.contains("Model    :"), "got {text:?}");
-        assert!(text.contains("Provider :"), "got {text:?}");
-        assert!(text.contains("Endpoint :"), "got {text:?}");
+        assert!(
+            text.contains("current: b-2"),
+            "header should name the active model: {text:?}"
+        );
+        assert!(
+            text.contains('✓'),
+            "active row should carry a checkmark: {text:?}"
+        );
+        assert!(
+            text.contains('▶'),
+            "selected row should carry the cursor: {text:?}"
+        );
+        assert!(
+            text.contains("$1/$5 per Mtok"),
+            "pricing should render for the priced entry: {text:?}"
+        );
+        assert!(
+            text.contains("no pricing"),
+            "missing pricing should render a placeholder: {text:?}"
+        );
     }
 
     #[test]
-    fn build_model_lines_warns_when_no_api_key_configured() {
-        // Pin RECURSIVE_HOME to an empty temp dir and clear the generic
-        // API-key env vars so `Config::from_env` resolves no provider —
-        // the same condition that leaves the TUI offline. The panel must
-        // surface a "Not configured" banner rather than presenting the
-        // hardcoded `deepseek-v4-flash` fallback as a live configuration.
+    fn collect_model_picker_entries_filters_unconfigured_presets() {
+        // The picker must not list a provider whose own key env is unset.
+        // We assert the anthropic preset specifically: absent when
+        // ANTHROPIC_API_KEY is missing, present once it is set. Other
+        // presets may or may not be configured in the surrounding env,
+        // so we don't make assumptions about them.
+        let _probe = pin_ollama_bundled();
         let empty_home = tempfile::tempdir().expect("tempdir");
         let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
-        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
-        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("RECURSIVE_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let prev_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let text = text_of(&build_model_lines());
+        let entries = collect_model_picker_entries(None);
+        let has_anthropic = entries.iter().any(|e| e.preset_id == "anthropic");
         assert!(
-            text.contains("Not configured"),
-            "expected not-configured banner, got: {text:?}"
-        );
-        assert!(
-            text.contains("recursive init"),
-            "banner should point to the wizard, got: {text:?}"
+            !has_anthropic,
+            "anthropic must NOT appear without ANTHROPIC_API_KEY, got: {:?}",
+            entries
+                .iter()
+                .map(|e| e.preset_id.as_str())
+                .collect::<Vec<_>>()
         );
 
-        match prev_recursive {
-            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
-            None => std::env::remove_var("RECURSIVE_API_KEY"),
-        }
-        match prev_openai {
-            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-            None => std::env::remove_var("OPENAI_API_KEY"),
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-anthropic-dummy");
+        let entries = collect_model_picker_entries(None);
+        let has_anthropic = entries.iter().any(|e| e.preset_id == "anthropic");
+        assert!(
+            has_anthropic,
+            "anthropic must appear once ANTHROPIC_API_KEY is set"
+        );
+
+        match prev_anthropic {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
         }
     }
 
     #[test]
-    fn build_model_lines_warns_when_api_key_is_empty_string() {
-        // An empty-string api_key is treated as "not configured" (the runtime
-        // builder's `effective_api_key` filters empty keys). This pins the
-        // `!` in `.map(|k| !k.is_empty())`: a `delete !` mutant would treat
-        // an empty key as configured and hide the banner.
+    fn collect_model_picker_entries_keeps_active_preset_without_key() {
+        // The active preset stays selectable even when its key env is unset,
+        // so the running model can be re-confirmed. Pins the `is_active`
+        // short-circuit in the availability filter.
+        let _probe = pin_ollama_bundled();
         let empty_home = tempfile::tempdir().expect("tempdir");
         let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
-        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
-        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("RECURSIVE_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let prev_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let cfg_dir = empty_home.path().join(".recursive");
-        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
-        std::fs::write(
-            cfg_dir.join("config.toml"),
-            "[provider]\napi_key = \"\"\nmodel = \"deepseek-v4-flash\"\n",
-        )
-        .expect("write config");
-
-        let text = text_of(&build_model_lines());
+        let entries = collect_model_picker_entries(Some("anthropic"));
+        let preset_ids: Vec<&str> = entries.iter().map(|e| e.preset_id.as_str()).collect();
         assert!(
-            text.contains("Not configured"),
-            "empty-string api_key should trigger the not-configured banner, got: {text:?}"
+            preset_ids.contains(&"anthropic"),
+            "active preset must stay listed without a key, got: {preset_ids:?}"
         );
 
-        match prev_recursive {
-            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
-            None => std::env::remove_var("RECURSIVE_API_KEY"),
+        match prev_anthropic {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
         }
-        match prev_openai {
-            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-            None => std::env::remove_var("OPENAI_API_KEY"),
+    }
+
+    #[test]
+    fn ollama_hidden_when_unreachable_and_not_active() {
+        // No local Ollama → the `ollama` preset must not appear, so a
+        // pristine env (no keys, no ollama) yields an empty picker.
+        let _probe = pin_ollama_probe(Some(crate::ollama_probe::OllamaPickerModels::Unreachable));
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let entries = collect_model_picker_entries(None);
+        assert!(
+            !entries.iter().any(|e| e.preset_id == "ollama"),
+            "ollama must not appear when unreachable, got: {:?}",
+            entries
+                .iter()
+                .map(|e| e.preset_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        if let Some(v) = prev {
+            std::env::set_var("ANTHROPIC_API_KEY", v);
         }
+    }
+
+    #[test]
+    fn ollama_kept_when_unreachable_but_active() {
+        // The active preset stays selectable even when its probe fails, so
+        // the running model row keeps its ✓. Falls back to the bundled
+        // list so the row is real, not a synthetic "custom provider" entry.
+        let _probe = pin_ollama_probe(Some(crate::ollama_probe::OllamaPickerModels::Unreachable));
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+
+        let entries = collect_model_picker_entries(Some("ollama"));
+        let ollama_rows: Vec<&ModelPickerEntry> =
+            entries.iter().filter(|e| e.preset_id == "ollama").collect();
+        assert!(
+            !ollama_rows.is_empty(),
+            "active ollama must stay listed when unreachable, got: {:?}",
+            entries
+                .iter()
+                .map(|e| e.preset_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        // Bundled fallback list is non-empty (qwen2.5-coder etc.).
+        assert!(
+            ollama_rows.iter().any(|e| e.model == "qwen2.5-coder"),
+            "should fall back to bundled ollama models"
+        );
+    }
+
+    #[test]
+    fn ollama_lists_real_local_models_when_reachable() {
+        // A live probe replaces the bundled placeholder list with the real
+        // local models, so the picker no longer shows `qwen2.5-coder` etc.
+        let probed = vec![recursive::providers::ModelSpec {
+            name: "my-local-model:latest".into(),
+            context_window: 4096,
+            pricing: None,
+        }];
+        let _probe = pin_ollama_probe(Some(crate::ollama_probe::OllamaPickerModels::Local(probed)));
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+
+        let entries = collect_model_picker_entries(Some("ollama"));
+        let ollama_rows: Vec<&ModelPickerEntry> =
+            entries.iter().filter(|e| e.preset_id == "ollama").collect();
+        assert_eq!(
+            ollama_rows.len(),
+            1,
+            "exactly one probed model, got {ollama_rows:?}"
+        );
+        assert_eq!(ollama_rows[0].model, "my-local-model:latest");
+        assert_eq!(ollama_rows[0].context_window, 4096);
+    }
+
+    #[test]
+    fn ollama_hidden_when_reachable_but_no_models() {
+        // Ollama up but `ollama list` is empty → nothing to select → the
+        // preset is hidden (unless active).
+        let _probe = pin_ollama_probe(Some(crate::ollama_probe::OllamaPickerModels::Local(
+            Vec::new(),
+        )));
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+
+        let entries = collect_model_picker_entries(None);
+        assert!(
+            !entries.iter().any(|e| e.preset_id == "ollama"),
+            "empty ollama should be hidden"
+        );
+    }
+
+    #[test]
+    fn serde_and_parse_model_picker_context_round_trip() {
+        let entries = vec![
+            ModelPickerEntry {
+                preset_id: "alpha".into(),
+                preset_name: "Alpha".into(),
+                model: "a-1".into(),
+                context_window: 0,
+                pricing: None,
+            },
+            ModelPickerEntry {
+                preset_id: "beta".into(),
+                preset_name: "Beta".into(),
+                model: "b-2".into(),
+                context_window: 0,
+                pricing: None,
+            },
+        ];
+        let ctx = serde_model_picker_context(&entries);
+        assert_eq!(
+            parse_model_picker_context(&ctx, 0),
+            Some(("alpha".into(), "a-1".into()))
+        );
+        assert_eq!(
+            parse_model_picker_context(&ctx, 1),
+            Some(("beta".into(), "b-2".into()))
+        );
+        assert!(
+            parse_model_picker_context(&ctx, 99).is_none(),
+            "out-of-range → None"
+        );
+        assert!(
+            parse_model_picker_context("garbage", 0).is_none(),
+            "malformed line → None"
+        );
+        assert!(
+            parse_model_picker_context("", 0).is_none(),
+            "empty ctx → None"
+        );
     }
 
     #[test]

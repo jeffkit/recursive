@@ -49,6 +49,15 @@ pub struct UsageStats {
     pub last_turn_cache_pct: Option<f64>,
     /// Most recent LLM round-trip latency, in milliseconds.
     pub last_latency_ms: u64,
+    /// Total prompt size of the most recent LLM call — the best proxy
+    /// for "how much of the context window is in use right now". Computed
+    /// as `max(input_tokens, cache_hit + cache_miss)` so it is correct
+    /// both for providers that report cache breakdowns (Anthropic, where
+    /// `input_tokens` excludes cached tokens) and for providers that
+    /// don't (OpenAI without cache details, where the cache fields are 0
+    /// and `input_tokens` already carries the full prompt size). Shown as
+    /// a live usage gauge at the bottom-right of the input box.
+    pub last_prompt_tokens: u64,
 }
 
 impl UsageStats {
@@ -78,6 +87,12 @@ impl UsageStats {
         self.total_cache_miss = self.total_cache_miss.saturating_add(cache_miss_tokens);
         self.turn_cache_hit = self.turn_cache_hit.saturating_add(cache_hit_tokens);
         self.turn_cache_miss = self.turn_cache_miss.saturating_add(cache_miss_tokens);
+        // Total prompt size of this LLM call. For Anthropic `input_tokens`
+        // excludes cached tokens, so the cache sum is the real prompt size;
+        // for OpenAI without cache reporting the cache sum is 0 and
+        // `input_tokens` already carries the full prompt. Take the max.
+        let cache_sum = cache_hit_tokens.saturating_add(cache_miss_tokens);
+        self.last_prompt_tokens = input_tokens.max(cache_sum);
     }
 
     /// Reset the per-turn cache counters. Called when a new turn starts so the
@@ -153,6 +168,21 @@ pub fn detect_model_name() -> String {
         .unwrap_or_else(|_| "gpt-4o-mini".to_string())
 }
 
+/// Return the context-window size (in tokens) for the model the runtime
+/// will actually use, so the TUI can show a live "context used / window"
+/// gauge. Mirrors [`detect_model_name`] by delegating to
+/// `Config::context_window_tokens()`, which honours
+/// `context_window_override` and otherwise falls back to the bundled
+/// `providers.toml` spec via `context_window_tokens_for_model`. Returns
+/// a sane non-zero fallback when no config can be loaded.
+pub fn detect_context_window() -> u64 {
+    recursive::config::Config::from_env()
+        .map(|c| c.context_window_tokens() as u64)
+        .unwrap_or_else(|_| {
+            recursive::llm::context_window_tokens_for_model(&detect_model_name()) as u64
+        })
+}
+
 /// Saturating cast from u64 to u32: returns `u32::MAX` instead of wrapping.
 ///
 /// `TokenUsage` fields are `u32` but session totals accumulate as `u64`.
@@ -199,5 +229,38 @@ mod tests {
         t.finish();
         assert!(!t.running, "finish should clear running");
         assert!(t.started_at.is_none(), "finish should clear started_at");
+    }
+
+    #[test]
+    fn record_with_cache_sets_last_prompt_tokens_to_cache_sum_for_anthropic() {
+        // Anthropic: input_tokens excludes cached tokens, so the real
+        // prompt size is cache_hit + cache_miss (which already folds in
+        // input_tokens). last_prompt_tokens must equal the cache sum,
+        // not the bare input_tokens.
+        let mut u = UsageStats::default();
+        u.record_with_cache(
+            /*input*/ 150, /*output*/ 50, /*hit*/ 900, /*miss*/ 150,
+        );
+        assert_eq!(u.last_prompt_tokens, 900 + 150);
+    }
+
+    #[test]
+    fn record_with_cache_falls_back_to_input_tokens_without_cache_report() {
+        // OpenAI without cache reporting: cache fields are 0, input_tokens
+        // already carries the full prompt size. last_prompt_tokens must
+        // fall back to input_tokens rather than reading 0.
+        let mut u = UsageStats::default();
+        u.record_with_cache(
+            /*input*/ 1234, /*output*/ 50, /*hit*/ 0, /*miss*/ 0,
+        );
+        assert_eq!(u.last_prompt_tokens, 1234);
+    }
+
+    #[test]
+    fn detect_context_window_returns_nonzero() {
+        // Whatever the configured model is, the resolver must produce a
+        // sane non-zero window (the providers.toml fallback guarantees
+        // one even for unknown models).
+        assert!(detect_context_window() > 0);
     }
 }

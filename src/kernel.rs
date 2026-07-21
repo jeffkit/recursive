@@ -210,6 +210,17 @@ impl AgentKernel {
         &self.llm
     }
 
+    /// Hot-swap the LLM provider.
+    ///
+    /// Replaces the provider used for subsequent completions. Used by the
+    /// TUI `/model` picker to switch models without restarting the process.
+    /// Safe to call between turns; callers must not invoke it while a turn
+    /// is in flight on the same kernel (the runtime's turn task owns the
+    /// kernel via `&mut self` for the duration of the turn).
+    pub fn set_llm(&mut self, llm: Arc<dyn ChatProvider>) {
+        self.llm = llm;
+    }
+
     /// Access the tool registry.
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
