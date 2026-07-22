@@ -33,19 +33,110 @@ import { execFileSync } from 'child_process'
 
 import {
   Checkpoint,
-  runAgent, recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
+  recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
   captureBaseline,
   runGate, loadGates, mergeGates,
   writeFailureContext, readAndConsumeFailureContext,
   loadProviders, resolveProvider,
   flowcastDir,
   gitWorktreeAdd, gitWorktreeRemove,
+  spawnCapture, resolveRecursiveBin, makeAgentResult,
+  FlowcastError, SpawnError, TimeoutError,
 } from 'flowcast'
 
-// flowcast 0.6 把 per-CLI adapter 换成了 agentproc in-process executor；
-// `recursive` 不再是顶层可调用导出，统一走 runAgent({cli:'recursive', ...})。
-// 这里保留老 `recursive(prompt, opts)` 调用形态，让下方 5 个 call site 零改动。
-const recursive = (prompt, opts) => runAgent(prompt, { cli: 'recursive', ...opts })
+// flowcast 0.6 把 per-CLI adapter 换成了 agentproc in-process executor，但 0.6 的
+// runAgent 对 systemPromptFile/transcriptOut/pricingFile 强制 isSafePath（拒绝绝对
+// 路径和 ..），而本 flow 按设计把这三个文件放在主仓库 .flowcast/runs/（worktree 之
+// 外），无法改用相对路径。且 0.6 的 runRecursiveDirect 只走 `run` 子命令，丢掉了老
+// adapter 的 replayFrom（→ `recursive replay --resume-from N <goal>`）语义。
+//
+// 因此这里本地重建 recursive 执行器，忠实移植 flowcast 内部的 runRecursiveDirect
+// （executor.js:357）+ deriveRecursiveMeta / maybeThrowRecursiveCritical
+// （executor/recursive-extras.js），并补回 replayFrom 翻译。绕开 runAgent 的路径检查，
+// 保留老 0.2.5 行为，下方 5 个 call site 零改动。
+const RECURSIVE_FINISH_REASON_RE = /\[done after \d+ steps\]\s*reason:\s*(.+)/
+const RECURSIVE_BUDGET_EXCEEDED_RE = /reason:\s*BudgetExceeded/
+
+function countTranscriptMessages(transcriptOut) {
+  if (!transcriptOut || !existsSync(transcriptOut)) return 0
+  try {
+    const data = JSON.parse(readFileSync(transcriptOut, 'utf8'))
+    return data?.messages?.length ?? 0
+  } catch {
+    return 0 // transcript 可能未写完（被 timeout 截断等）
+  }
+}
+
+async function recursive(prompt, opts = {}) {
+  const bin = opts.bin ?? resolveRecursiveBin(opts.cwd ?? '.')
+  const workspace = opts.workspace ?? '.'
+  const args = ['--workspace', workspace]
+  if (opts.systemPromptFile) args.push('--system-prompt-file', opts.systemPromptFile)
+  if (opts.transcriptOut) args.push('--transcript-out', opts.transcriptOut)
+  if (opts.pricingFile) args.push('--pricing-file', opts.pricingFile)
+  if (opts.model) args.push('--model', opts.model)
+  if (opts.maxSteps) args.push('--max-steps', String(opts.maxSteps))
+  if (opts.allowTools) args.push('--allow-tools', opts.allowTools)
+  // replayFrom：从已存 transcript 取前 N 条做 seed，走 `replay --resume-from N <goal>`
+  // 子命令（budget-resume / fix-round 重放）。无 replayFrom 走普通 `run`。
+  if (opts.replayFrom) {
+    const { transcript, resumeFrom } = opts.replayFrom
+    args.push('replay', transcript, '--resume-from', String(resumeFrom), String(prompt ?? ''))
+  } else {
+    args.push('run', String(prompt ?? ''))
+  }
+
+  const env = opts.env ? { ...process.env, ...opts.env } : undefined
+  const r = await spawnCapture(bin, args, {
+    cwd: opts.cwd,
+    timeout: opts.timeout,
+    env,
+    onData: opts.onData,
+  })
+  if (r.spawnError) {
+    throw new SpawnError(`[recursive] spawn error: ${r.spawnError}`, r.spawnError, {
+      _meta: { cli: 'recursive', exitCode: -1, spawnError: r.spawnError },
+    })
+  }
+  if (r.timedOut) {
+    throw new TimeoutError(`[recursive] timeout after ${opts.timeout}ms`, {
+      _meta: { cli: 'recursive', exitCode: r.exitCode ?? -1, timedOut: true },
+    })
+  }
+
+  // deriveRecursiveMeta：从 stdout 解析 finishReason / budgetExceeded / panicked，
+  // 从 transcriptOut 数消息条数。
+  const stdout = r.stdout ?? ''
+  const finishReason = (stdout.match(RECURSIVE_FINISH_REASON_RE)?.[1] ?? '').trim() || null
+  const budgetExceeded = RECURSIVE_BUDGET_EXCEEDED_RE.test(stdout)
+  const exitCode = r.exitCode ?? 0
+  const panicked = exitCode === 101 || (typeof exitCode === 'number' && exitCode >= 128)
+  const transcriptMessages = countTranscriptMessages(opts.transcriptOut)
+
+  // maybeThrowRecursiveCritical：throwOnCritical 且失败 → FlowcastError('RECURSIVE_FAIL')。
+  // flow 从不显式设 throwOnCritical，故默认不抛——panic/budget 以 _meta 返回，供
+  // runMeta.panicked / runMeta.budgetExceeded 分支处理（与 0.2.5 一致）。
+  const failed = panicked || budgetExceeded || exitCode !== 0
+  if (opts.throwOnCritical === true && failed) {
+    const reason = panicked ? 'panicked' : budgetExceeded ? 'BudgetExceeded' : `exit ${exitCode}`
+    throw new FlowcastError(
+      `[recursive] failed: ${reason}\n${stdout.slice(0, 500)}`,
+      'RECURSIVE_FAIL',
+      {
+        _meta: {
+          cli: 'recursive', exitCode, timedOut: !!r.timedOut,
+          panicked, budgetExceeded, finishReason, transcriptMessages,
+        },
+      },
+    )
+  }
+
+  const meta = {
+    cli: 'recursive', exitCode, timedOut: false,
+    finishReason, budgetExceeded, panicked, transcriptMessages,
+  }
+  return makeAgentResult(stdout, meta)
+}
 
 // ── CLI 参数 ─────────────────────────────────────────────────────
 const { values: opts } = parseArgs({
