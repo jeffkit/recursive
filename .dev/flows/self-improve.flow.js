@@ -411,6 +411,9 @@ async function landPreserve(preserveRunId) {
   const wtDir = join(repo, '.worktrees', `land-${preserveRunId}`)
   try {
     gitWorktreeAdd(repo, wtDir, { ref: sha })
+    // 跑门前先 fail-fast 检查 HARD 门前置（e2e 的 Docker/mcp2cli/argusai + mutant 的
+    // cargo-mutants），避免在 land worktree 冷编译完 test/clippy/fmt 后才在 e2e 门挂掉。
+    await cp.step('land.gate-prereqs', () => assertGatePrereqs(repo))
     const builtin = qualityGatesFor(wtDir)
     const projectGates = await loadGates({ repo })
     const gates = mergeGates(builtin, projectGates).map(g => normalizeGate(g, wtDir))
@@ -570,6 +573,12 @@ async function main() {
 
   // ── 预检：provider API 健康探测（快速失败，避免 agent 挂死数分钟）─
   await cp.step('preflight.provider-ping', () => pingProvider(buildEnv()))
+
+  // ── 预检：质量门前置（e2e 的 Docker/mcp2cli/argusai + mutant 的 cargo-mutants）─
+  // fail-fast：在 agent 跑之前确认 HARD 门能跑，而不是等 agent 跑 35min 后在门里才挂
+  // （曾因 colima 没起，e2e 门在 agent 跑完后才红灯）。Docker down 时 best-effort 自启
+  // colima；仍缺则抛带可操作指令的错。镜像 provider-ping 的「提前几十秒发现环境不可用」哲学。
+  await cp.step('preflight.gate-prereqs', () => assertGatePrereqs(repo))
 
   // ── 自改安全沙箱：整个尝试在 worktree 内执行，通过后 cherry-pick 回 main ──
   // worktree 本身就是沙箱，agent 改动隔离在 worktreeDir，main checkout 全程不被触碰
@@ -1383,5 +1392,58 @@ async function pingProvider(env) {
       ? `Provider ping timed out after 12s (${apiBase}) — API may be down or unreachable`
       : `Provider ping failed: ${e.message} (${apiBase})`
     throw new Error(msg)
+  }
+}
+
+/**
+ * 质量门前置 fail-fast：在 agent 跑之前确认 e2e 门（Docker daemon / mcp2cli /
+ * argusai-mcp / e2e.yaml）与 mutant 门（cargo-mutants）能跑。镜像 preflight.provider-ping
+ * 的哲学——提前几十秒发现环境不可用，而非等 agent 跑数分钟后在门里挂掉。
+ *
+ * e2e：复用 `e2e-gate.sh --check-prereqs`（单一真相源，含 Docker daemon 检查）。Docker
+ * daemon down 时 best-effort `colima start`（90s 超时），起不来再 fail-fast 给可操作指令。
+ * mutants：查 `cargo-mutants --version`，缺了直接 fail-fast——否则 mutant 门 exit 2 触发
+ * resume-fix，agent 在沙箱 worktree 里常装不上 cargo-mutants，白费轮次后仍 failed-preserved。
+ */
+async function assertGatePrereqs(repoPath) {
+  // ── e2e 前置 ──
+  const checkE2e = () => {
+    try {
+      const out = execFileSync('sh', ['.dev/scripts/e2e-gate.sh', '--check-prereqs'],
+        { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      return { ok: true, output: out }
+    } catch (e) {
+      // exit 3 = 缺前置；带出脚本的 stdout/stderr
+      return { ok: false, output: `${(e.stderr ?? '').trim()}\n${(e.stdout ?? '').trim()}`.trim() }
+    }
+  }
+  let e2e = checkE2e()
+  if (!e2e.ok && /docker daemon/i.test(e2e.output)) {
+    console.log('  [gate-prereqs] docker daemon down — best-effort `colima start` ...')
+    try {
+      execFileSync('colima', ['start'], { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000 })
+      console.log('  [gate-prereqs] colima started, re-checking e2e prereqs ...')
+      e2e = checkE2e()
+    } catch (e) {
+      // colima 不存在 / 启动超时 / 失败：继续走下面的 fail-fast
+      console.warn(`  [gate-prereqs] colima start failed: ${(e.message ?? '').toString().slice(0, 120)}`)
+    }
+  }
+  if (!e2e.ok) {
+    throw new Error(`e2e gate prereqs not ready — fix before running the agent:\n${e2e.output}\n  (start colima / uv tool install mcp2cli / npm i -g argusai-mcp)`)
+  }
+  console.log('  [gate-prereqs] e2e prereqs OK')
+
+  // ── mutant 前置：cargo-mutants ──
+  try {
+    execFileSync('cargo-mutants', ['--version'], { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    console.log('  [gate-prereqs] cargo-mutants OK')
+  } catch {
+    throw new Error(
+      'mutant gate prereq missing: cargo-mutants not found. ' +
+      'Install it once (`cargo install cargo-mutants`) before running self-improve — ' +
+      'otherwise the tui/agent/cli mutant gates exit 2 and waste resume-fix rounds ' +
+      'trying (and usually failing) to install it inside the sandboxed worktree.'
+    )
   }
 }

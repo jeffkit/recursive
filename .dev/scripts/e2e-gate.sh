@@ -21,6 +21,14 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# ---- --check-prereqs：只查前置（Docker/mcp2cli/argusai-mcp/e2e.yaml），不跑套件
+# 供 flow 的 preflight.e2e-prereqs fail-fast 调用：在 agent 跑之前确认 e2e 门
+# 能跑，而不是等 agent 跑 35min 后在门里才挂。退出码：0=前置齐，3=缺前置。
+CHECK_PREREQS=0
+if [[ "${1:-}" == "--check-prereqs" ]]; then
+  CHECK_PREREQS=1
+fi
+
 E2E_YAML="e2e/e2e.yaml"
 
 # ---- 解析 mcp2cli ----------------------------------------------------------
@@ -49,6 +57,12 @@ fi
 
 # ---- HARD-GATE：前置缺失即红灯 ---------------------------------------------
 _missing=()
+# Docker daemon：argusai smoke 依赖 recursive-e2e 容器，daemon 没起时 argus-setup
+# 才挂（晚且日志难读）。这里提前查 `docker info`，down 即红灯，配合 flow 的
+# best-effort colima 自启。
+if ! docker info >/dev/null 2>&1; then
+  _missing+=("docker daemon（colima start / Docker Desktop 启动）")
+fi
 [[ -n "$MCP2CLI" ]]        || _missing+=("mcp2cli（uv tool install mcp2cli）")
 [[ -n "$_MCP_STDIO_CMD" ]] || _missing+=("argusai-mcp（npm i -g argusai-mcp）")
 [[ -f "$E2E_YAML" ]]       || _missing+=("$E2E_YAML")
@@ -56,6 +70,12 @@ if [[ ${#_missing[@]} -gt 0 ]]; then
   echo "[e2e-gate] HARD-FAIL — 缺少 E2E 前置：" >&2
   printf '  - %s\n' "${_missing[@]}" >&2
   exit 3
+fi
+
+# --check-prereqs 模式：前置齐就到此为止（exit 0），不构建/不跑套件。
+if [[ "$CHECK_PREREQS" == 1 ]]; then
+  echo "[e2e-gate] prereqs OK (check-prereqs mode)"
+  exit 0
 fi
 
 # ---- 构建 e2e 插件（首次或 src 变动后）-------------------------------------
