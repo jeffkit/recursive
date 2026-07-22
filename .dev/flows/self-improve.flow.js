@@ -236,12 +236,31 @@ const FC_DIR = flowcastDir(repo)                       // 绝对路径
 const FC_REL = (relative(repo, FC_DIR) || '.flowcast') // 仓内相对目录名（.flowcast / .flowx）
 const cp = new Checkpoint(runId, join(FC_DIR, 'runs'))
 
-// 续跑时从 pauseContext 恢复 goal
-const goal = resolveGoal() ?? cp.getPauseContext().goal
-if (!goal) { console.error('缺少 --goal 或 --goal-file'); process.exit(1) }
+// 续跑时从 pauseContext 恢复 goal（preserve 消费模式不需要 --goal，见下方分发）
+let goal = resolveGoal() ?? cp.getPauseContext().goal
 
 setWorkdir(repo)
 configureHitl()
+
+// ── preserve 消费模式（g325）：从失败现场接着修 / 落地 / 清理 ──────────
+// 这些模式从 preserve run（readRunGoal）取 goal，不需要 --goal/--goal-file，
+// 故放在 goal 守卫 + banner 之前，避免被「缺少 --goal」误杀。各函数内部把
+// 模块级 `goal` 设成 readRunGoal 的结果，使 goalSubject() 能派生正确的提交标题。
+if (opts['resume-preserve']) {
+  await resumePreserve(opts['resume-preserve'])
+  process.exit(process.exitCode ?? 0)
+}
+if (opts['land-preserve']) {
+  await landPreserve(opts['land-preserve'])
+  process.exit(process.exitCode ?? 0)
+}
+if (opts['prune-preserve']) {
+  await prunePreserve(opts['prune-preserve'])
+  process.exit(process.exitCode ?? 0)
+}
+
+// commit-pending 与主流程（main）需要显式 goal
+if (!goal) { console.error('缺少 --goal 或 --goal-file'); process.exit(1) }
 
 console.log(`\n▶ recursive-self-improve  run=${runId}  repo=${repo}  status=${cp.status}`)
 console.log(`  goal: ${goal.slice(0, 80)}${goal.length > 80 ? '…' : ''}\n`)
@@ -253,20 +272,6 @@ console.log(`  goal: ${goal.slice(0, 80)}${goal.length > 80 ? '…' : ''}\n`)
 // 用法：node self-improve.flow.js --run-id <old-id> --commit-pending
 if (opts['commit-pending']) {
   await commitPending()
-  process.exit(process.exitCode ?? 0)
-}
-
-// ── preserve 消费模式（g325）：从失败现场接着修 / 落地 / 清理 ──────────
-if (opts['resume-preserve']) {
-  await resumePreserve(opts['resume-preserve'])
-  process.exit(process.exitCode ?? 0)
-}
-if (opts['land-preserve']) {
-  await landPreserve(opts['land-preserve'])
-  process.exit(process.exitCode ?? 0)
-}
-if (opts['prune-preserve']) {
-  await prunePreserve(opts['prune-preserve'])
   process.exit(process.exitCode ?? 0)
 }
 
@@ -366,6 +371,7 @@ async function resumePreserve(preserveRunId) {
   try { sha = git(['rev-parse', ref], repo) } catch { throw new Error(`preserve ref 不存在: ${ref}`) }
   const runDir = join(FC_DIR, 'runs', preserveRunId)
   const origGoal = readRunGoal(preserveRunId) ?? goal
+  goal = origGoal // 让 goalSubject() 派生正确的提交标题（resume-preserve 不传 --goal）
   const failureLog = readFailureLog(runDir)
   const resumeGoal =
     `A previous self-improve attempt was preserved at this state (it did NOT pass gates/review).\n` +
@@ -400,6 +406,7 @@ async function landPreserve(preserveRunId) {
   const ref = `refs/preserve/${preserveRunId}`
   let sha
   try { sha = git(['rev-parse', ref], repo) } catch { throw new Error(`preserve ref 不存在: ${ref}`) }
+  goal = readRunGoal(preserveRunId) ?? goal // 让 goalSubject() 派生正确的提交标题（land-preserve 不传 --goal）
   console.log(`[land-preserve] ${ref} -> ${sha.slice(0, 8)}，跑完整质量门验证…`)
   const wtDir = join(repo, '.worktrees', `land-${preserveRunId}`)
   try {
