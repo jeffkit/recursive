@@ -48,6 +48,11 @@ UX is natural-language first.
   (`cmd_loop_default_preserves_goal_with_trailing_max_word`) to satisfy the
   gate honestly. (Pre-existing gate gap: `#[tokio::test]` isn't recognised —
   noted here, not fixed, since `.dev/` is meta-tooling.)
-- `tui-mutants` (advisory) to be run scoped to `backend.rs`+`commands.rs`
-  after commit; survivors landing outside the diff hunks are pre-existing
-  debt per CLAUDE.md, survivors inside the hunks will be fixed.
+- `tui-mutants` (advisory) run scoped to `backend.rs`+`commands.rs` after
+  commit. It was interrupted by the 900s timeout after processing a subset of
+  206 mutants, but the only `MISSED` survivor reported was
+  `backend.rs:243: delete match arm AgentEvent::ContextBreakdown` — that is
+  pre-existing Goal-328 context-breakdown code, **outside this change's diff
+  hunks** (this change's backend.rs edit is the loop-control drain ~line 637
+  + a test). Per CLAUDE.md that's pre-existing debt, not a regression. No
+  survivors landed inside this change's hunks before the interruption.
