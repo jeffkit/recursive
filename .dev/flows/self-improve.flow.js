@@ -33,7 +33,7 @@ import { execFileSync } from 'child_process'
 
 import {
   Checkpoint,
-  recursive, recursiveProviderEnv, claude, setWorkdir, setHitlBackend, notify, waitForInput,
+  recursive, recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
   captureBaseline,
   runGate, loadGates, mergeGates,
   writeFailureContext, readAndConsumeFailureContext,
@@ -883,13 +883,13 @@ async function selfReview(worktreeDir) {
       `--- changed files (git diff --stat HEAD) ---\n${stat}\n\n` +
       `Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".`
 
-    // --reviewer-agent claude：用 claude CLI 做 review（自管鉴权，不需要外部 provider）
+    // --reviewer-agent claude：claude CLI 鉴权已停用（flowcast 不再导出 claude）。
+    // 保留分支以给出明确错误，而非静默跳过——避免用户以为 review 跑了其实没跑。
     if (opts['reviewer-agent'] === 'claude') {
-      try {
-        const text = await claude(prompt, { cwd: worktreeDir, timeout: 120_000 })
-        return { text: String(text), ok: true }
-      } catch (err) {
-        return { text: String(err), ok: false }
+      return {
+        text: '[reviewer-agent claude is no longer supported — claude API/CLI has been retired; use --reviewer-provider instead]',
+        ok: false,
+        misconfig: true,
       }
     }
 
