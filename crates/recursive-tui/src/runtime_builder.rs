@@ -190,6 +190,36 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
+/// Build the transcript compactor for TUI mode, mirroring the CLI's
+/// `RECURSIVE_COMPACT_THRESHOLD` env contract so headless and interactive
+/// runs compact at the same point:
+///   `RECURSIVE_COMPACT_THRESHOLD=<n>` → explicit char threshold
+///   `0` / `off` / `false`             → explicitly disabled
+///   unset                             → auto-compute from the model's context window
+/// Returns `None` when compaction is disabled; the runtime then runs without a
+/// compactor (transcript grows unbounded, but manual `/compact` still works).
+fn build_compactor(model: &str) -> Option<recursive::Compactor> {
+    build_compactor_from_env(
+        std::env::var("RECURSIVE_COMPACT_THRESHOLD").ok().as_deref(),
+        model,
+    )
+}
+
+/// Pure core of [`build_compactor`]: given the raw `RECURSIVE_COMPACT_THRESHOLD`
+/// env value and the model name, decide the compactor. Split out so the
+/// threshold-parsing logic is unit-testable without touching the process
+/// environment (which would race under parallel `cargo test`).
+fn build_compactor_from_env(raw: Option<&str>, model: &str) -> Option<recursive::Compactor> {
+    let threshold_chars: Option<usize> = match raw {
+        Some("0") | Some("off") | Some("false") => None,
+        Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
+        None => Some(recursive::llm::default_compact_threshold_chars(model)),
+    };
+    let n = threshold_chars?;
+    let token_threshold = recursive::llm::default_compact_threshold_tokens(model);
+    Some(recursive::Compactor::new(n).threshold_prompt_tokens(token_threshold))
+}
+
 pub fn build_runtime() -> TuiRuntime {
     let session_roots = new_shared_sandbox_roots();
     let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
@@ -265,7 +295,7 @@ pub fn build_runtime() -> TuiRuntime {
         config.subagent_enabled,
     );
 
-    let build = match AgentRuntimeBuilder::new()
+    let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
         .system_prompt(&system_prompt)
@@ -274,9 +304,11 @@ pub fn build_runtime() -> TuiRuntime {
         // Stream partial tokens so the TUI shows the answer building up live
         // and so reasoner models that only expose `reasoning_content` through
         // the streaming SSE channel surface their thinking block.
-        .streaming(true)
-        .build()
-    {
+        .streaming(true);
+    if let Some(c) = build_compactor(&config.model) {
+        builder = builder.compactor(c);
+    }
+    let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
             reason: format!("failed to build agent runtime: {e}"),
@@ -397,7 +429,7 @@ fn build_runtime_with_skill_tx(
         config.subagent_enabled,
     );
 
-    let build = match AgentRuntimeBuilder::new()
+    let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
         .system_prompt(&system_prompt)
@@ -406,9 +438,11 @@ fn build_runtime_with_skill_tx(
         // Stream partial tokens so the TUI shows the answer building up live
         // and so reasoner models that only expose `reasoning_content` through
         // the streaming SSE channel surface their thinking block.
-        .streaming(true)
-        .build()
-    {
+        .streaming(true);
+    if let Some(c) = build_compactor(&config.model) {
+        builder = builder.compactor(c);
+    }
+    let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
             reason: format!("failed to build agent runtime: {e}"),
@@ -430,6 +464,53 @@ mod tests {
     use crate::backend::Backend;
     use crate::events::UiEvent;
     use crate::events::UserAction;
+
+    #[test]
+    fn build_compactor_disabled_when_threshold_zero() {
+        // `0` / `off` / `false` all mean "explicitly disabled" → no compactor.
+        // Pins the disabled branch so a mutant that falls through to the
+        // auto-compute arm (treating `0` as unset) is caught.
+        assert!(build_compactor_from_env(Some("0"), "deepseek-chat").is_none());
+        assert!(build_compactor_from_env(Some("off"), "deepseek-chat").is_none());
+        assert!(build_compactor_from_env(Some("false"), "deepseek-chat").is_none());
+    }
+
+    #[test]
+    fn build_compactor_uses_explicit_threshold_when_set() {
+        // An explicit positive char threshold is honoured verbatim, and the
+        // token threshold is still derived from the model's context window.
+        let c = build_compactor_from_env(Some("500"), "deepseek-chat")
+            .expect("explicit positive threshold must yield a compactor");
+        assert_eq!(c.threshold_chars, 500, "char threshold must match override");
+        assert!(
+            c.threshold_prompt_tokens.is_some(),
+            "token threshold must be derived from the model context window"
+        );
+    }
+
+    #[test]
+    fn build_compactor_rejects_non_positive_explicit_threshold() {
+        // A parseable-but-non-positive value (e.g. negative parsed as 0 via
+        // a malformed input) is filtered out. `0` is handled by the disabled
+        // arm above; here we cover garbage that fails to parse → None.
+        assert!(build_compactor_from_env(Some("not-a-number"), "deepseek-chat").is_none());
+    }
+
+    #[test]
+    fn build_compactor_auto_computes_when_env_unset() {
+        // No env override → auto-compute from the model's context window.
+        // Both thresholds must be populated (non-zero) for a known model.
+        let c = build_compactor_from_env(None, "deepseek-chat")
+            .expect("unset env must auto-compute a compactor for a known model");
+        assert!(
+            c.threshold_chars > 0,
+            "auto char threshold must be positive"
+        );
+        assert!(
+            c.threshold_prompt_tokens.is_some(),
+            "auto token threshold must be derived"
+        );
+    }
 
     /// RAII guard that clears API key env vars for the duration of a test
     /// and restores them on drop (including on panic).
