@@ -69,3 +69,11 @@ Closes the gaps surfaced when manually babysitting goal 328's land-preserve.
   (prior commit) already removes the biggest env-prereq failure mode.
 - `cost.rs` clippy fix is incidental (toolchain drift), documented here for
   traceability.
+- `tui-mutants.sh` (advisory) scoped to `backend.rs`+`commands.rs` was
+  interrupted early (whole-file mutate on the 2700-line `backend.rs` is the
+  CLAUDE.md "false friction" case). The one survivor it reported before
+  interruption — `backend.rs:243:9 delete match arm AgentEvent::ContextBreakdown
+  in map_agent_event` — is **pre-existing Goal 328 debt** (the ContextBreakdown
+  event-mapping arm has no test that fails when deleted), not in this change's
+  diff hunks. Noted as debt; no fix required here. New logic is covered by
+  targeted unit tests.
