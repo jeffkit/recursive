@@ -17,6 +17,9 @@ Cargo.lock.bak
 .worktrees/
 .dev/runs/
 
+# Personal workbuddy memory dir (per-user, not project state)
+.workbuddy/
+
 # Auto-saved transcripts from self-improve.sh (kept on disk for diagnosis,
 # but never committed — they're huge JSON dumps that bloat the repo).
 .dev/transcripts/
