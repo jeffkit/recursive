@@ -2070,6 +2070,28 @@ mod tests {
     }
 
     #[test]
+    fn map_context_breakdown_to_context_breakdown() {
+        // Goal-328: the ContextBreakdown match arm must forward the breakdown
+        // verbatim (and drop the `step` field). A mutant that deletes this arm
+        // falls through to `_ => None`, which this test catches.
+        let breakdown = recursive::llm::ContextBreakdown {
+            system_prompt: 10,
+            rules: 20,
+            skills: 30,
+            subagents: 40,
+            tools: 50,
+            mcp_dynamic: 60,
+            conversation: 70,
+            overhead: 80,
+        };
+        let ev = AgentEvent::ContextBreakdown { breakdown, step: 7 };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::ContextBreakdown { breakdown })
+        );
+    }
+
+    #[test]
     fn map_turn_finished_to_turn_finished() {
         let ev = AgentEvent::TurnFinished {
             reason: "done".into(),
