@@ -68,6 +68,16 @@ pub struct WatchTarget {
     pub offset: u64,
 }
 
+/// Agent-requested loop control written by the `stop_loop` tool and read by
+/// the TUI loop arbiter between turns. Lets the agent end the event-driven
+/// loop itself (so the user can say "stop" in natural language and the agent
+/// calls `stop_loop`), making the loop lifecycle transparent to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopControl {
+    /// Stop the loop after the current turn and return to interactive mode.
+    Stop,
+}
+
 /// Shared manager for background jobs.
 pub struct BackgroundJobManager {
     jobs: HashMap<String, Job>,
@@ -80,6 +90,9 @@ pub struct BackgroundJobManager {
     /// event wakes. The loop arbiter polls it and wakes the agent when
     /// new bytes appear past `offset`.
     watch: Option<WatchTarget>,
+    /// Agent-requested loop control (set by the `stop_loop` tool). The loop
+    /// arbiter drains this between turns so the agent can end the loop itself.
+    loop_control: Option<LoopControl>,
 }
 
 impl Default for BackgroundJobManager {
@@ -95,6 +108,7 @@ impl BackgroundJobManager {
             next_id: 1,
             completed_notify: Arc::new(Notify::new()),
             watch: None,
+            loop_control: None,
         }
     }
 
@@ -165,6 +179,18 @@ impl BackgroundJobManager {
     /// Clear any registered file watch.
     pub fn clear_watch(&mut self) {
         self.watch = None;
+    }
+
+    /// Set an agent-requested loop control (e.g. `Stop`). Replaces any prior
+    /// pending control. Read and consumed by the loop arbiter between turns.
+    pub fn set_loop_control(&mut self, ctrl: LoopControl) {
+        self.loop_control = Some(ctrl);
+    }
+
+    /// Take (consume) any pending loop-control request. Returns `None` when
+    /// nothing is pending.
+    pub fn take_loop_control(&mut self) -> Option<LoopControl> {
+        self.loop_control.take()
     }
 
     /// Poll the registered watch file for new bytes past the stored offset.

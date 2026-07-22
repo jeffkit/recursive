@@ -24,6 +24,11 @@ $COMMAND
 - `schedule_wakeup` — your fallback heartbeat. Call it at end of turn to re-arm
   the next wake after N seconds (1–3600). If you arm neither a wakeup nor a
   watch, and no bg job is pending, the loop idles until the user speaks.
+- `stop_loop` — end the loop yourself. Call it when the supervised command has
+  reached a final outcome and you've reported the verdict, **or** when the user
+  asks you to stop / exit the loop in natural language ("停", "stop", "退出循环").
+  The loop stops after the current turn; you don't need the user to type
+  `/loop stop`.
 
 ## SOP
 
@@ -58,7 +63,9 @@ $COMMAND
    {bg job pending, watch armed, wakeup armed} is active so the loop continues.
    Never arm duplicates.
 6. **Stop.** When the supervised command has reached a final outcome and you've
-   handled it, do not arm any further wake; report the outcome to the user.
+   handled it, call `stop_loop` (the loop exits after this turn) and report the
+   outcome to the user. Likewise call `stop_loop` if the user asks in natural
+   language to stop / exit the loop. Do not arm any further wake.
 
 ## Discipline
 

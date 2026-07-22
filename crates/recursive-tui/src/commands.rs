@@ -214,8 +214,8 @@ impl CommandRegistry {
                 CommandSpec {
                     name: "loop",
                     aliases: &[],
-                    summary: "Event-driven loop (/loop start|stop|trigger|supervise)",
-                    usage: "/loop start <goal> [max N] | /loop stop | /loop trigger <text> | /loop supervise <command...>",
+                    summary: "Event-driven loop: /loop <goal> | /loop supervise <cmd> | /loop stop",
+                    usage: "/loop <natural-language goal>  (default: start an unlimited loop)\n  /loop start <goal> [max N]   (explicit start with optional turn cap)\n  /loop supervise <command...> (start + inject the monitor SOP)\n  /loop trigger <text>         (inject a one-shot prompt into the active loop)\n  /loop stop                   (stop the active loop)\nThe agent can also stop the loop itself via the `stop_loop` tool, so you can say \"stop\" in plain text.",
                     handler: CommandHandler::Async(cmd_loop),
                 },
             ],
@@ -681,10 +681,25 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
             }]
         }
         _ => {
-            app.push_error(format!(
-                "Unknown /loop sub-command: {sub}. Try /loop start|stop|trigger|supervise."
-            ));
-            Vec::new()
+            // Default: treat the whole line as a natural-language goal and
+            // start the loop — so `/loop <prompt>` ≡ a fresh loop with that
+            // goal (unlimited turns). Users who want a turn cap or the
+            // explicit monitor SOP still use `/loop start <goal> max N` or
+            // `/loop supervise <command>`. We deliberately do NOT parse a
+            // `max N` suffix here, so a goal that happens to contain the
+            // word "max" (e.g. "find the max value") is taken verbatim.
+            let goal = args.join(" ");
+            if goal.trim().is_empty() {
+                app.push_error("Usage: /loop <goal>  (or /loop start|stop|trigger|supervise ...)");
+                return Vec::new();
+            }
+            app.push_system(format!("Loop started: \"{goal}\" (unlimited turns)"));
+            app.loop_state = Some(crate::app::LoopUiState {
+                goal: goal.clone(),
+                turns_run: 0,
+                max_turns: 0,
+            });
+            vec![UserAction::StartLoop { goal, max_turns: 0 }]
         }
     }
 }
@@ -1930,15 +1945,46 @@ mod tests {
     }
 
     #[test]
-    fn cmd_loop_unknown_subcommand_errors() {
+    fn cmd_loop_default_treats_args_as_natural_language_goal() {
+        // `/loop <prompt>` (no known subcommand) starts a loop with the whole
+        // line as the goal — natural-language UX. A goal containing "max"
+        // verbatim must NOT be parsed as a turn cap.
         let mut app = App::new();
-        let r = invoke(&mut app, "loop frobnicate");
-        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
-        match app.blocks.last() {
-            Some(TranscriptBlock::Error { text }) => {
-                assert!(text.contains("Unknown /loop sub-command"), "got {text:?}");
+        let r = invoke(&mut app, "loop find the max value in src");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::StartLoop { goal, max_turns } => {
+                        assert_eq!(goal, "find the max value in src");
+                        assert_eq!(*max_turns, 0, "default loop is unlimited");
+                    }
+                    other => panic!("expected StartLoop, got {other:?}"),
+                }
             }
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected Async, got {other:?}"),
+        }
+        let ls = app.loop_state.as_ref().expect("loop_state set");
+        assert_eq!(ls.goal, "find the max value in src");
+    }
+
+    #[test]
+    fn cmd_loop_default_preserves_goal_with_trailing_max_word() {
+        // Additive regression guard: the default `/loop <goal>` path must NOT
+        // run `parse_loop_start_args` (which would truncate a goal ending in
+        // " max" with no number). A trailing "max" word is kept verbatim and
+        // the loop is unlimited.
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop tune the cache max");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::StartLoop { goal, max_turns } => {
+                    assert_eq!(goal, "tune the cache max");
+                    assert_eq!(*max_turns, 0);
+                }
+                other => panic!("expected StartLoop, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
         }
     }
 

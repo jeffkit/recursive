@@ -39,6 +39,7 @@ pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
 pub mod shell;
+pub mod stop_loop;
 #[cfg(feature = "coordinator-mode")]
 pub mod task_create;
 #[cfg(feature = "coordinator-mode")]
@@ -117,6 +118,7 @@ pub use plan_mode::{
     PlanModeRequestResult, RequestPlanModeTool,
 };
 pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
+pub use run_background::LoopControl;
 pub use run_background::{
     BackgroundJobManager, CheckBackground, Job, JobState, RunBackground, WatchTarget,
 };
@@ -124,6 +126,7 @@ pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
+pub use stop_loop::StopLoop;
 pub use watch_file::WatchFile;
 
 #[cfg(feature = "coordinator-mode")]

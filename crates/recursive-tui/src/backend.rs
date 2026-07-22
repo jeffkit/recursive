@@ -635,6 +635,19 @@ async fn worker_loop(
             }
             Either::Left(UserAction::SendMessage(text))
         } else if loop_state.as_ref().is_some_and(|ls| ls.active) {
+            // Goal-328: agent-requested loop control (the `stop_loop` tool)
+            // takes precedence over the arbiter. The agent calls `stop_loop`
+            // when the supervised work is done or the user asks (in natural
+            // language) to exit the loop; we drain the request here and end
+            // the loop, making its lifecycle transparent to the user.
+            {
+                let mut g = bg_manager.lock().await;
+                if let Some(recursive::tools::LoopControl::Stop) = g.take_loop_control() {
+                    let _ = event_tx.send(UiEvent::LoopStopped);
+                    loop_state = None;
+                    continue;
+                }
+            }
             // Goal-323: event-driven loop mode — poll the arbiter for next prompt.
             let decision = loop_arbiter(
                 &mut action_rx,
@@ -2383,6 +2396,35 @@ mod tests {
         .await
         .expect("arbiter should decide within 3s");
         assert!(matches!(decision, ArbiterDecision::Stop));
+    }
+
+    // ── Goal-328: agent-initiated loop stop (stop_loop tool) ────────────
+
+    #[tokio::test]
+    async fn loop_control_stop_drains_via_shared_bg_manager() {
+        // The `stop_loop` tool writes `LoopControl::Stop` onto the shared
+        // background-job manager; `worker_loop` drains it with
+        // `take_loop_control` before consulting the arbiter and emits
+        // `LoopStopped`. Verify that shared-state contract: set Stop, take
+        // returns Stop, a second take returns None (consumed, so the loop
+        // stops exactly once).
+        let bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>> = Arc::new(
+            tokio::sync::Mutex::new(recursive::tools::BackgroundJobManager::new()),
+        );
+        {
+            let mut mgr = bg_manager.lock().await;
+            mgr.set_loop_control(recursive::tools::LoopControl::Stop);
+        }
+        let taken = {
+            let mut mgr = bg_manager.lock().await;
+            mgr.take_loop_control()
+        };
+        assert!(matches!(taken, Some(recursive::tools::LoopControl::Stop)));
+        let again = {
+            let mut mgr = bg_manager.lock().await;
+            mgr.take_loop_control()
+        };
+        assert!(again.is_none(), "loop control must be consumed once");
     }
 
     // ── Goal-323: max_turns cap enforcement ────────────────────────────
