@@ -726,7 +726,10 @@ pub fn build_standard_tools_with_roots(
             bg_manager.clone(),
         )))
         .register(Arc::new(super::run_background::CheckBackground::new(
-            bg_manager,
+            bg_manager.clone(),
+        )))
+        .register(Arc::new(super::watch_file::WatchFile::new(
+            workspace, bg_manager,
         )))
         .register(Arc::new(
             super::estimate_tokens::EstimateTokens::new(workspace)

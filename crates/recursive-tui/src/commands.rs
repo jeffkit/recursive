@@ -23,6 +23,12 @@ use crate::events::UserAction;
 use crate::skill_commands::SkillCommand;
 use crate::ui::modal::Modal;
 
+/// The supervise-mode SOP injected as the loop goal when the user runs
+/// `/loop supervise <command...>`. Generic (not project-specific) so it ships
+/// with the agent and works for any long-running command. `$COMMAND` is
+/// substituted with the command the user asked to supervise.
+const SUPERVISE_SOP: &str = include_str!("supervise_sop.md");
+
 /// One registered slash command.
 #[derive(Clone)]
 pub struct CommandSpec {
@@ -208,8 +214,8 @@ impl CommandRegistry {
                 CommandSpec {
                     name: "loop",
                     aliases: &[],
-                    summary: "Event-driven loop (/loop start|stop|trigger)",
-                    usage: "/loop start <goal> [max N] | /loop stop | /loop trigger <text>",
+                    summary: "Event-driven loop (/loop start|stop|trigger|supervise)",
+                    usage: "/loop start <goal> [max N] | /loop stop | /loop trigger <text> | /loop supervise <command...>",
                     handler: CommandHandler::Async(cmd_loop),
                 },
             ],
@@ -637,6 +643,26 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
             });
             vec![UserAction::StartLoop { goal, max_turns }]
         }
+        // Supervise mode: launch a long-running command in the background and
+        // monitor + intervene via the event-driven loop. The full generic SOP
+        // is injected as the agent's goal; `loop_state.goal` keeps a short
+        // label for the `/loop` status display.
+        "supervise" => {
+            let command = args[1..].join(" ");
+            if command.trim().is_empty() {
+                app.push_error("Usage: /loop supervise <command...>");
+                return Vec::new();
+            }
+            let goal = SUPERVISE_SOP.replace("$COMMAND", &command);
+            let label = format!("supervise: {command}");
+            app.push_system(format!("Supervise loop started: {command}"));
+            app.loop_state = Some(crate::app::LoopUiState {
+                goal: label,
+                turns_run: 0,
+                max_turns: 0,
+            });
+            vec![UserAction::StartLoop { goal, max_turns: 0 }]
+        }
         "stop" => {
             app.loop_state = None;
             app.push_system("Loop stopped.");
@@ -656,7 +682,7 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
         }
         _ => {
             app.push_error(format!(
-                "Unknown /loop sub-command: {sub}. Try /loop start|stop|trigger."
+                "Unknown /loop sub-command: {sub}. Try /loop start|stop|trigger|supervise."
             ));
             Vec::new()
         }
@@ -1914,6 +1940,50 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cmd_loop_supervise_emits_start_with_sop_goal() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop supervise node flow.js --goal-file g.md");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::StartLoop { goal, max_turns } => {
+                        // The injected goal is the generic SOP with the command
+                        // substituted in, not the raw command.
+                        assert!(goal.contains("Supervise mode"), "SOP body missing: {goal}");
+                        assert!(
+                            goal.contains("node flow.js --goal-file g.md"),
+                            "command not substituted: {goal}"
+                        );
+                        assert!(!goal.contains("$COMMAND"), "unsubstituted placeholder");
+                        assert_eq!(*max_turns, 0, "supervise is unlimited");
+                    }
+                    other => panic!("expected StartLoop, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async, got {other:?}"),
+        }
+        // loop_state.goal is a short label for display, not the full SOP.
+        let ls = app.loop_state.as_ref().expect("loop_state set");
+        assert_eq!(ls.goal, "supervise: node flow.js --goal-file g.md");
+        assert_eq!(ls.max_turns, 0);
+    }
+
+    #[test]
+    fn cmd_loop_supervise_empty_errors() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop supervise");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("Usage"), "got {text:?}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(app.loop_state.is_none(), "no state on usage error");
     }
 
     #[test]

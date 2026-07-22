@@ -356,6 +356,7 @@ struct LoopState {
 }
 
 /// Decision returned by the loop arbiter.
+#[derive(Debug)]
 enum ArbiterDecision {
     /// Run a turn with this prompt.
     Run {
@@ -500,6 +501,33 @@ async fn loop_arbiter(
             } else {
                 // Spurious wakeup — nothing to do.
                 ArbiterDecision::Idle
+            }
+        }
+        // Watched-file event wake (mid-run events from a supervised command).
+        // The arbiter polls the registered watch file and wakes the agent only
+        // when new bytes appear, so a supervising agent reacts to structured
+        // events without burning a turn every tick.
+        new_content = async {
+            loop {
+                let polled = {
+                    let mut mgr = bg_manager.lock().await;
+                    mgr.poll_watch()
+                };
+                if let Some(text) = polled {
+                    break text;
+                }
+                // Brief sleep to avoid busy-looping; the other branches still
+                // preempt this between polls.
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+        } => {
+            ArbiterDecision::Run {
+                prompt: format!(
+                    "[event-watch] new bytes in watched file:\n{}",
+                    new_content
+                ),
+                source: "event-watch".to_string(),
+                delay_secs: None,
             }
         }
         // Scheduled wakeup.
@@ -2273,6 +2301,88 @@ mod tests {
         assert_eq!(req.prompt, "go");
         // Slot is cleared after take.
         assert!(wait_wakeup(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_arbiter_wakes_on_watched_file_new_bytes() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("events.log");
+        std::fs::write(&log, "old\n").unwrap();
+        let bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>> = Arc::new(
+            tokio::sync::Mutex::new(recursive::tools::BackgroundJobManager::new()),
+        );
+        {
+            let mut mgr = bg_manager.lock().await;
+            // Start past existing content so only appended bytes wake.
+            mgr.set_watch(log.clone(), 4);
+        }
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(f, "event1").unwrap();
+        }
+        let (_action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
+        let mut queued_messages: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            loop_arbiter(
+                &mut action_rx,
+                &wakeup_slot,
+                &bg_manager,
+                &mut queued_messages,
+            ),
+        )
+        .await
+        .expect("arbiter should decide within 3s");
+        match decision {
+            ArbiterDecision::Run {
+                source,
+                prompt,
+                delay_secs,
+            } => {
+                assert_eq!(source, "event-watch");
+                assert!(prompt.contains("event1"), "prompt: {prompt}");
+                assert!(delay_secs.is_none());
+            }
+            other => panic!("expected Run(event-watch), got {other:?}"),
+        }
+        assert!(queued_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_arbiter_idles_when_watch_has_no_new_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("events.log");
+        std::fs::write(&log, "old\n").unwrap();
+        let bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>> = Arc::new(
+            tokio::sync::Mutex::new(recursive::tools::BackgroundJobManager::new()),
+        );
+        {
+            let mut mgr = bg_manager.lock().await;
+            mgr.set_watch(log, 4); // at EOF, no new bytes
+        }
+        let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
+        let mut queued_messages: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+        // StopLoop pending in the channel unblocks the arbiter. Priority 1
+        // (user actions) must pre-empt the watch branch, proving the watch
+        // did NOT fire a spurious Run when there were no new bytes.
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<UserAction>();
+        stop_tx.send(UserAction::StopLoop).unwrap();
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            loop_arbiter(
+                &mut stop_rx,
+                &wakeup_slot,
+                &bg_manager,
+                &mut queued_messages,
+            ),
+        )
+        .await
+        .expect("arbiter should decide within 3s");
+        assert!(matches!(decision, ArbiterDecision::Stop));
     }
 
     // ── Goal-323: max_turns cap enforcement ────────────────────────────

@@ -39,7 +39,6 @@ pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
 pub mod shell;
-
 #[cfg(feature = "coordinator-mode")]
 pub mod task_create;
 #[cfg(feature = "coordinator-mode")]
@@ -59,6 +58,7 @@ pub mod team_delete;
 pub mod todo;
 pub mod tool_search;
 pub mod transport;
+pub mod watch_file;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 #[cfg(feature = "web_search")]
@@ -117,11 +117,14 @@ pub use plan_mode::{
     PlanModeRequestResult, RequestPlanModeTool,
 };
 pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
-pub use run_background::{BackgroundJobManager, CheckBackground, Job, JobState, RunBackground};
+pub use run_background::{
+    BackgroundJobManager, CheckBackground, Job, JobState, RunBackground, WatchTarget,
+};
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
+pub use watch_file::WatchFile;
 
 #[cfg(feature = "coordinator-mode")]
 pub use task_create::TaskCreateTool;

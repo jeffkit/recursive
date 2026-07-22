@@ -27,7 +27,7 @@
  */
 
 import { parseArgs } from 'util'
-import { readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync } from 'fs'
+import { readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync, appendFileSync, mkdirSync } from 'fs'
 import { join, relative } from 'path'
 import { execFileSync } from 'child_process'
 
@@ -236,6 +236,17 @@ const FC_DIR = flowcastDir(repo)                       // 绝对路径
 const FC_REL = (relative(repo, FC_DIR) || '.flowcast') // 仓内相对目录名（.flowcast / .flowx）
 const cp = new Checkpoint(runId, join(FC_DIR, 'runs'))
 
+// ── 结构化中途事件（g343）：写到 <run-dir>/events.jsonl，供 TUI supervise
+//    loop 的 watch_file 监听，实现「中途出问题→及时唤醒 agent」而非「等结束才补」。
+//    事件类型：start / gate-failed / preserve-created / verdict。
+function emitEvent(type, data = {}) {
+  try {
+    mkdirSync(cp.dir, { recursive: true })
+    const line = JSON.stringify({ ts: Date.now(), type, runId, ...data }) + '\n'
+    appendFileSync(join(cp.dir, 'events.jsonl'), line)
+  } catch { /* best-effort：目录不可写等情况忽略，不阻塞主流程 */ }
+}
+
 // 续跑时从 pauseContext 恢复 goal（preserve 消费模式不需要 --goal，见下方分发）
 let goal = resolveGoal() ?? cp.getPauseContext().goal
 
@@ -264,6 +275,7 @@ if (!goal) { console.error('缺少 --goal 或 --goal-file'); process.exit(1) }
 
 console.log(`\n▶ recursive-self-improve  run=${runId}  repo=${repo}  status=${cp.status}`)
 console.log(`  goal: ${goal.slice(0, 80)}${goal.length > 80 ? '…' : ''}\n`)
+emitEvent('start', { goal: goal.slice(0, 200), provider: opts.provider, model: opts.model })
 
 // ── --commit-pending 快速补提交模式 ──────────────────────────────
 // 专为「质量门全绿但 skip-commit（reviewer unavailable）」设计：
@@ -359,6 +371,7 @@ function preserveScene({ worktreeDir, baseline, reason, failureOutput, tag = 'fa
     console.warn(`  [preserve] worktree move failed, kept in place: ${e.message}`)
   }
   const detail = `${reason}\n  ref: ${ref}\n  worktree: ${preserveWt}\n  diff: ${join(cp.dir, 'preserved.diff')}\n  failure: ${join(cp.dir, `${tag}-failure.log`)}`
+  emitEvent('preserve-created', { verdict, reason, ref, worktree: preserveWt, diff: join(cp.dir, 'preserved.diff'), failure_log: join(cp.dir, `${tag}-failure.log`) })
   return { verdict, detail, preserve: { ref, worktree: preserveWt } }
 }
 
@@ -399,6 +412,7 @@ async function resumePreserve(preserveRunId) {
   }
   await announce(result, baseline)
   console.log(`\n✓ resume-preserve 结束  verdict=${result.verdict}`)
+  emitEvent('verdict', { verdict: result.verdict, mode: 'resume-preserve', detail: (result.detail ?? '').slice(0, 1200) })
 }
 
 /** 把 preserve 现场跑门后落地到 main：对 refs/preserve/<run-id> 的树跑完整门，全绿则提交。 */
@@ -430,6 +444,7 @@ async function landPreserve(preserveRunId) {
     const landed = git(['rev-parse', '--short', 'HEAD'], repo)
     console.log(`[land-preserve] ✅ 已落地 ${landed}`)
     await notify(`✅ land-preserve 落地\n仓库: ${repo}\n提交: ${landed}\n来源: ${ref}`)
+    emitEvent('verdict', { verdict: 'committed', mode: 'land-preserve', landed })
   } finally {
     try { gitWorktreeRemove(repo, wtDir) } catch { /* already gone */ }
   }
@@ -616,6 +631,7 @@ async function main() {
 
   await announce(result, baseline)
   console.log(`\n✓ recursive-self-improve 结束  verdict=${result.verdict}`)
+  emitEvent('verdict', { verdict: result.verdict, detail: (result.detail ?? '').slice(0, 1200) })
 }
 
 /**
@@ -843,6 +859,13 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
       } catch (err) {
         if (err.configError) throw err // autofix 缺 autofixCmd 等配置错，不修，直接抛
         lastOutput = err.output ?? ''
+        emitEvent('gate-failed', {
+          gate: g.name,
+          attempt,
+          exhausted: !!err.exhausted,
+          reason: err.reason ?? null,
+          output_tail: (lastOutput || '').slice(-1200),
+        })
         if (attempt === MAX_FIX_ROUNDS) {
           // N 轮仍红：带上最新 stderr 上抛，由 runAttempt 转 failed-preserved
           err.exhausted = true

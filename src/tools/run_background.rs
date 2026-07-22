@@ -29,6 +29,10 @@ use crate::llm::ToolSpec;
 /// Maximum bytes of stdout/stderr to capture per job.
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 
+/// Maximum bytes of a watched file to surface in a single event-watch wake.
+/// Keeps the injected prompt bounded; remaining bytes wake on the next poll.
+pub(crate) const WATCH_CHUNK_BYTES: usize = 16 * 1024;
+
 /// Default timeout for a background job (if none specified).
 const DEFAULT_JOB_TIMEOUT: u64 = 3600; // 1 hour
 
@@ -56,6 +60,14 @@ pub struct Job {
     pub created_at: Instant,
 }
 
+/// A file registered for mid-run event wakes. The TUI loop arbiter polls the
+/// file and wakes the agent when bytes are appended past `offset`.
+#[derive(Debug, Clone)]
+pub struct WatchTarget {
+    pub path: PathBuf,
+    pub offset: u64,
+}
+
 /// Shared manager for background jobs.
 pub struct BackgroundJobManager {
     jobs: HashMap<String, Job>,
@@ -64,6 +76,10 @@ pub struct BackgroundJobManager {
     /// (Completed, Failed, TimedOut). Used by the TUI loop arbiter
     /// to wake on background job completion.
     completed_notify: Arc<Notify>,
+    /// Optional file registered via the `watch_file` tool for mid-run
+    /// event wakes. The loop arbiter polls it and wakes the agent when
+    /// new bytes appear past `offset`.
+    watch: Option<WatchTarget>,
 }
 
 impl Default for BackgroundJobManager {
@@ -78,6 +94,7 @@ impl BackgroundJobManager {
             jobs: HashMap::new(),
             next_id: 1,
             completed_notify: Arc::new(Notify::new()),
+            watch: None,
         }
     }
 
@@ -135,6 +152,59 @@ impl BackgroundJobManager {
     /// Remove all jobs immediately.
     pub fn clear(&mut self) {
         self.jobs.clear();
+    }
+
+    /// Register a file for mid-run event wakes. `offset` is the byte offset to
+    /// start reading from (typically the file size at registration time, so
+    /// only bytes appended afterwards wake the agent). Replaces any prior
+    /// watch.
+    pub fn set_watch(&mut self, path: PathBuf, offset: u64) {
+        self.watch = Some(WatchTarget { path, offset });
+    }
+
+    /// Clear any registered file watch.
+    pub fn clear_watch(&mut self) {
+        self.watch = None;
+    }
+
+    /// Poll the registered watch file for new bytes past the stored offset.
+    /// On success, advances the offset and returns the new content (capped at
+    /// `WATCH_CHUNK_BYTES` per call; remaining bytes surface on the next
+    /// poll). Returns `None` when no watch is set, the file is gone, or no new
+    /// bytes are available. Handles log rotation (file shrank) by resetting to
+    /// the start.
+    pub fn poll_watch(&mut self) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let watch = self.watch.as_ref()?;
+        let path = watch.path.clone();
+        let metadata = std::fs::metadata(&path).ok()?;
+        let len = metadata.len();
+        let mut offset = watch.offset;
+        // Log rotation / truncation: reset to start.
+        if len < offset {
+            offset = 0;
+        }
+        if len <= offset {
+            return None;
+        }
+        let mut file = std::fs::File::open(&path).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let to_read = ((len - offset) as usize).min(WATCH_CHUNK_BYTES);
+        let mut buf = vec![0u8; to_read];
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        let new_offset = offset + n as u64;
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if let Some(w) = self.watch.as_mut() {
+            w.offset = new_offset;
+        }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Remove and return the first completed job, if any.
