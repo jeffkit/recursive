@@ -406,7 +406,7 @@ async function landPreserve(preserveRunId) {
     gitWorktreeAdd(repo, wtDir, { ref: sha })
     const builtin = qualityGatesFor(wtDir)
     const projectGates = await loadGates({ repo })
-    const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: wtDir, onFail: 'rollback', ...g }))
+    const gates = mergeGates(builtin, projectGates).map(g => normalizeGate(g, wtDir))
     for (const g of gates) {
       await cp.step(`land.gate.${g.name}`, () => runGate(g, { resumeFix: null }))
     }
@@ -786,6 +786,19 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
 // ── 质量门（N 轮 resume-fix 循环）─────────────────────────────────
 
 /**
+ * 把 merge 后的 gate 规范成 flow 自控循环所需的形态：
+ *   - cwd：项目门未显式写时默认 `cwd`；写了则尊重项目声明（`...g` 在后，覆盖默认）。
+ *   - onFail：0.6 的 runGate 对 `onFail='resume-fix'` 强制要求 resumeFix 回调，而本 flow
+ *     自控 N 轮 fix 循环（runFixRound），故把项目门声明的 'resume-fix' 降级为 'rollback'
+ *     （红灯即抛，循环由调用方控）。保留 'autofix'（fmt 的 `cargo fmt --all`）及其它值；
+ *     未声明时默认 'rollback'。`onFail` 放在 `...g` 之后以确保覆盖项目门里的 'resume-fix'。
+ */
+function normalizeGate(g, cwd) {
+  const onFail = g.onFail === 'resume-fix' ? 'rollback' : (g.onFail ?? 'rollback')
+  return { cwd, ...g, onFail }
+}
+
+/**
  * 跑每个门，红灯就走 resume-fix 循环：喂最新 stderr → agent 修 → 重跑门，最多 MAX_FIX_ROUNDS 轮。
  * 旧实现靠 flowcast runGate 内置的「1 轮 resume-fix」——1 轮修不过就抛错回滚，丢全部成果。
  * 现在改成 flow 自己控循环：runGate 用 onFail='rollback'（纯检查，红灯即抛），catch 后跑 runFixRound，
@@ -799,8 +812,9 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
   const builtin = qualityGatesFor(worktreeDir)
   const projectGates = await loadGates({ repo })
   // 项目门未显式写 cwd 时默认在 worktreeDir 跑；写了则尊重项目声明。
-  // onFail 统一 'rollback'：runGate 只做「跑 + 红灯抛错」，循环由本函数控。
-  const gates = mergeGates(builtin, projectGates).map(g => ({ cwd: worktreeDir, onFail: 'rollback', ...g }))
+  // onFail 统一 'rollback'：runGate 只做「跑 + 红灯抛错」，循环由本函数控
+  // （normalizeGate 把项目门声明的 'resume-fix' 降级为 'rollback'，见其注释）。
+  const gates = mergeGates(builtin, projectGates).map(g => normalizeGate(g, worktreeDir))
 
   for (const g of gates) {
     let lastOutput = ''
