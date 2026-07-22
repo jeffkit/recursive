@@ -33,7 +33,7 @@ import { execFileSync } from 'child_process'
 
 import {
   Checkpoint,
-  recursive, recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
+  runAgent, recursiveProviderEnv, setWorkdir, setHitlBackend, notify, waitForInput,
   captureBaseline,
   runGate, loadGates, mergeGates,
   writeFailureContext, readAndConsumeFailureContext,
@@ -41,6 +41,11 @@ import {
   flowcastDir,
   gitWorktreeAdd, gitWorktreeRemove,
 } from 'flowcast'
+
+// flowcast 0.6 把 per-CLI adapter 换成了 agentproc in-process executor；
+// `recursive` 不再是顶层可调用导出，统一走 runAgent({cli:'recursive', ...})。
+// 这里保留老 `recursive(prompt, opts)` 调用形态，让下方 5 个 call site 零改动。
+const recursive = (prompt, opts) => runAgent(prompt, { cli: 'recursive', ...opts })
 
 // ── CLI 参数 ─────────────────────────────────────────────────────
 const { values: opts } = parseArgs({
