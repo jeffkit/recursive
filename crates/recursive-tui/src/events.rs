@@ -54,6 +54,15 @@ pub enum UiEvent {
         /// Tokens written to the provider's prompt cache.
         cache_miss_tokens: u64,
     },
+    /// Goal-328: locally-estimated per-component breakdown of the
+    /// prompt sent to the provider. Mirrors the kernel's
+    /// [`AgentEvent::ContextBreakdown`] event but in the TUI's
+    /// `UiEvent` shape. Poweres the Context Usage modal and refreshes
+    /// the live status-bar gauge source so it advances during tool
+    /// execution (when no provider reading arrives).
+    ContextBreakdown {
+        breakdown: recursive::llm::ContextBreakdown,
+    },
     /// Reasoning / thinking content produced by the model for the
     /// current step (DeepSeek R1, OpenAI o1, …). Carries the full
     /// reasoning text; the TUI renders it as a `thinking…` block

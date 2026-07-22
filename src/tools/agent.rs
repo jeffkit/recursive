@@ -391,6 +391,7 @@ impl AgentTool {
             permission_mode: PermissionMode::Default,
             mailbox: None,
             turn: 0,
+            prompt_segments: None,
         };
 
         let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {

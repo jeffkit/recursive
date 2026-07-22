@@ -288,17 +288,19 @@ pub fn build_runtime() -> TuiRuntime {
     // Channel-agnostic sub-agent tool registration, in lockstep with the
     // coordinator prompt injected by `assemble_system_prompt`.
     let tools = register_subagent_if_enabled(tools, &config, provider.clone());
-    let system_prompt = assemble_system_prompt(
+    let assembled = assemble_system_prompt(
         &config.system_prompt,
         &config.workspace,
         &skills,
         config.subagent_enabled,
     );
+    let prompt_segments = assembled.segments;
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&system_prompt)
+        .system_prompt(&assembled.full)
+        .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
         .with_plan_mode_tools(true)
         // Stream partial tokens so the TUI shows the answer building up live
@@ -422,17 +424,19 @@ fn build_runtime_with_skill_tx(
     // Channel-agnostic sub-agent tool registration, in lockstep with the
     // coordinator prompt injected by `assemble_system_prompt`.
     tools = register_subagent_if_enabled(tools, &config, provider.clone());
-    let system_prompt = assemble_system_prompt(
+    let assembled = assemble_system_prompt(
         &config.system_prompt,
         &config.workspace,
         &skills,
         config.subagent_enabled,
     );
+    let prompt_segments = assembled.segments;
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&system_prompt)
+        .system_prompt(&assembled.full)
+        .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
         .with_plan_mode_tools(true)
         // Stream partial tokens so the TUI shows the answer building up live

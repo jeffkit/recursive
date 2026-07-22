@@ -57,7 +57,18 @@ pub struct UsageStats {
     /// don't (OpenAI without cache details, where the cache fields are 0
     /// and `input_tokens` already carries the full prompt size). Shown as
     /// a live usage gauge at the bottom-right of the input box.
+    ///
+    /// Goal-328: this field is still the provider-reported truth (it
+    /// drives the cost tracker). The live status-bar gauge reads
+    /// [`Self::current_prompt_estimate`] instead so the number
+    /// advances during tool execution, when no new provider reading
+    /// arrives.
     pub last_prompt_tokens: u64,
+    /// Goal-328: most recent [`recursive::llm::ContextBreakdown`] from
+    /// the kernel's local per-component estimator. `None` until the
+    /// first LLM-calling step. The breakdown is what powers the
+    /// Context Usage modal and the live gauge source.
+    pub last_breakdown: Option<recursive::llm::ContextBreakdown>,
 }
 
 impl UsageStats {
@@ -115,6 +126,34 @@ impl UsageStats {
             self.last_turn_cache_pct = Some((self.turn_cache_hit as f64 / total as f64) * 100.0);
         } else {
             self.last_turn_cache_pct = None;
+        }
+    }
+
+    /// Goal-328: store the most recent [`recursive::llm::ContextBreakdown`]
+    /// from the kernel's local estimator. Called from the
+    /// `AgentEvent::ContextBreakdown` handler. Replaces any previous value.
+    pub fn record_breakdown(&mut self, breakdown: recursive::llm::ContextBreakdown) {
+        self.last_breakdown = Some(breakdown);
+    }
+
+    /// Goal-328: best available estimate of the current prompt size
+    /// (tokens), suitable for the live status-bar gauge.
+    ///
+    /// Prefers the local breakdown when available because it is **fresh**
+    /// — it updates after every LLM call, while the provider-reported
+    /// `last_prompt_tokens` only refreshes when the provider returns
+    /// usage. Once we have a breakdown, the gauge source is the breakdown
+    /// total (`local_sum + overhead`), which advances naturally during
+    /// tool execution (the kernel re-estimates the conversation bucket
+    /// every step).
+    ///
+    /// Returns the provider-reported `last_prompt_tokens` only when no
+    /// breakdown has been recorded yet (e.g. before the first LLM call
+    /// or in tests that bypass the breakdown event).
+    pub fn current_prompt_estimate(&self) -> u64 {
+        match self.last_breakdown {
+            Some(b) => b.total() as u64,
+            None => self.last_prompt_tokens,
         }
     }
 }

@@ -59,6 +59,19 @@ pub enum AgentEvent {
         cache_miss_tokens: u32,
         step: usize,
     },
+    /// Goal-328: locally-estimated per-component token breakdown of the
+    /// prompt sent to the provider for `step`. Distinct from
+    /// [`Self::Usage`] (the provider's reported truth) — see
+    /// [`crate::llm::ContextBreakdown`] for the bucket definitions.
+    ///
+    /// Emitted once per step right after [`Self::Usage`] so consumers
+    /// see the provider truth first, then the local estimate. Steps
+    /// without an LLM call (denial-limit finishes, stuck-detection
+    /// short-circuits) skip the event entirely.
+    ContextBreakdown {
+        breakdown: crate::llm::ContextBreakdown,
+        step: usize,
+    },
     /// Partial token from streaming response (if streaming enabled).
     PartialToken { text: String, step: usize },
     /// Partial reasoning / thinking delta from a streaming response.

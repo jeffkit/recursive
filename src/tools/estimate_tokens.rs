@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
-use crate::llm::ToolSpec;
+use crate::llm::{estimate_tokens as llm_estimate_tokens, ToolSpec};
 use crate::tools::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 
 pub struct EstimateTokens {
@@ -65,8 +65,8 @@ impl EstimateTokens {
 
     /// Estimate tokens using chars/4 heuristic.
     fn estimate(&self, text: &str) -> (usize, usize, &'static str) {
+        let tokens = llm_estimate_tokens(text) as usize;
         let chars = text.len();
-        let tokens = (chars as f64 / 4.0).ceil() as usize;
         (tokens, chars, "chars-over-4")
     }
 }

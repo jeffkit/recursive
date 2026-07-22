@@ -379,6 +379,7 @@ impl AgentPool {
             permission_mode: PermissionMode::Default,
             mailbox: None,
             turn: 0,
+            prompt_segments: None,
         };
 
         kernel.run(ctx).await

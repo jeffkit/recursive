@@ -79,8 +79,9 @@ pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry, SdkHookForwarder};
 pub use kernel::{AgentKernel, AgentKernelBuilder, TurnContext, TurnOutcome};
 pub use llm::{
-    context_window_tokens_for_model, default_compact_threshold_chars, pricing_for, ChatProvider,
-    Completion, ModelPricing, RetryPolicy, TokenUsage, ToolCall, ToolSpec,
+    context_window_tokens_for_model, default_compact_threshold_chars, estimate_tokens, pricing_for,
+    ChatProvider, Completion, ContextBreakdown, ModelPricing, RetryPolicy, TokenUsage, ToolCall,
+    ToolSpec,
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{
@@ -135,7 +136,7 @@ pub use storage::S3StorageBackend;
 pub use storage::{
     AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
-pub use system_prompt::assemble_system_prompt;
+pub use system_prompt::{assemble_system_prompt, AssembledPrompt, PromptSegments};
 pub use tool_set_provider::{
     LocalToolSetProvider, PolicyToolSetProvider, SandboxMode, ToolSetProvider,
 };

@@ -98,6 +98,12 @@ pub struct TurnContext {
     /// keys so that tool-call-id collisions across turns cannot cause
     /// audit metadata to be overwritten or lost.
     pub turn: u32,
+
+    /// Goal-328: structured prompt segments from `assemble_system_prompt`,
+    /// forwarded to `RunCore` so it can size the static breakdown
+    /// buckets. `None` when the caller did not provide one (legacy
+    /// channels, tests).
+    pub prompt_segments: Option<crate::system_prompt::PromptSegments>,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,29 +284,43 @@ impl AgentKernel {
     /// All cross-turn concerns (transcript accumulation, compaction, persistence)
     /// are the Wrapper's responsibility.
     pub async fn run(&self, ctx: TurnContext) -> crate::error::Result<TurnOutcome> {
-        use crate::run_core::RunCore;
-
         let input_len = ctx.messages.len();
 
-        let core = RunCore {
-            messages: ctx.messages,
-            llm: self.llm.clone(),
-            tools: Arc::new(self.tools.clone()),
-            max_steps: self.max_steps,
-            max_transcript_chars: self.max_transcript_chars,
-            events: ctx.step_events_tx,
-            streaming: ctx.streaming,
-            compactor: self.compactor.clone(),
-            permission_hook: ctx.permission_hook,
-            hooks: &self.hooks,
-            total_llm_latency_ms: 0,
-            exploring_plan_mode: ctx.exploring_plan_mode,
-            shutdown_token: self.shutdown_token.clone(),
-            mailbox: ctx.mailbox,
-            stuck_window: self.stuck_window,
-            stuck_error_rate: self.stuck_error_rate,
-            turn: ctx.turn,
-            globs_skills: self.globs_skills.clone(),
+        let core = {
+            use crate::run_core::{RunCore, StaticBreakdownCache};
+            // Goal-328: size the static breakdown cache from the provided
+            // prompt segments + the tool registry's specs. The cache is
+            // read-only for the rest of the run (no field on RunCore
+            // mutates it after construction); only `conversation` and
+            // `overhead` are recomputed per step.
+            let static_breakdown = match ctx.prompt_segments.as_ref() {
+                Some(segments) => {
+                    StaticBreakdownCache::build(segments, &self.tools.specs(), &self.tools)
+                }
+                None => StaticBreakdownCache::default(),
+            };
+            RunCore {
+                messages: ctx.messages,
+                llm: self.llm.clone(),
+                tools: Arc::new(self.tools.clone()),
+                max_steps: self.max_steps,
+                max_transcript_chars: self.max_transcript_chars,
+                events: ctx.step_events_tx,
+                streaming: ctx.streaming,
+                compactor: self.compactor.clone(),
+                permission_hook: ctx.permission_hook,
+                hooks: &self.hooks,
+                total_llm_latency_ms: 0,
+                exploring_plan_mode: ctx.exploring_plan_mode,
+                shutdown_token: self.shutdown_token.clone(),
+                mailbox: ctx.mailbox,
+                stuck_window: self.stuck_window,
+                stuck_error_rate: self.stuck_error_rate,
+                turn: ctx.turn,
+                globs_skills: self.globs_skills.clone(),
+                prompt_segments: ctx.prompt_segments,
+                static_breakdown,
+            }
         };
 
         let inner = core.run_inner().await?;
@@ -634,6 +654,7 @@ mod tests {
             permission_mode: crate::permissions::PermissionMode::Default,
             mailbox: None,
             turn: 0,
+            prompt_segments: None,
         }
     }
 

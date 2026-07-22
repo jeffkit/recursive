@@ -101,12 +101,14 @@ pub(super) async fn run_agent(
     };
     // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
     // + base + skill index + coordinator/sub_agent note (when enabled).
-    let system_prompt = crate::assemble_system_prompt(
+    let assembled_system_prompt = crate::assemble_system_prompt(
         &system_prompt,
         &state.config.workspace,
         &state.skills,
         state.config.subagent_enabled,
     );
+    let system_prompt = assembled_system_prompt.full;
+    let prompt_segments = assembled_system_prompt.segments;
     let mut tool_registry = state.tool_registry.clone();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
@@ -120,6 +122,7 @@ pub(super) async fn run_agent(
         .llm(state.provider.clone())
         .tools(tool_registry)
         .system_prompt(system_prompt)
+        .prompt_segments(prompt_segments)
         .max_steps(max_steps)
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
@@ -215,12 +218,14 @@ pub(super) async fn create_session(
     };
     // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
     // + base + skill index + coordinator/sub_agent note (when enabled).
-    let system_prompt = crate::assemble_system_prompt(
+    let assembled_system_prompt = crate::assemble_system_prompt(
         &system_prompt,
         &state.config.workspace,
         &state.skills,
         state.config.subagent_enabled,
     );
+    let system_prompt = assembled_system_prompt.full;
+    let prompt_segments = assembled_system_prompt.segments;
     let max_steps = body
         .max_steps
         .map(|n| n as usize)
@@ -238,6 +243,7 @@ pub(super) async fn create_session(
         .llm(state.provider.clone())
         .tools(tool_registry)
         .system_prompt(system_prompt)
+        .prompt_segments(prompt_segments)
         .max_steps(max_steps)
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
@@ -531,20 +537,23 @@ pub(super) async fn fork_session(
     // Build a new session with the copied transcript.
     let new_id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
-    let system_prompt = state.config.system_prompt.clone();
+    let base_system_prompt = state.config.system_prompt.clone();
     // Common system-prompt assembly so the forked session matches every
     // other channel (project context + skill index + sub-agent note).
-    let system_prompt = crate::assemble_system_prompt(
-        &system_prompt,
+    let assembled_system_prompt = crate::assemble_system_prompt(
+        &base_system_prompt,
         &state.config.workspace,
         &state.skills,
         state.config.subagent_enabled,
     );
+    let system_prompt = assembled_system_prompt.full;
+    let prompt_segments = assembled_system_prompt.segments;
 
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
         .tools(state.tool_registry.clone())
         .system_prompt(system_prompt)
+        .prompt_segments(prompt_segments)
         .max_steps(state.config.max_steps)
         .build()
         .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
@@ -1568,12 +1577,14 @@ pub(super) async fn agui_run(
 
     // Common system-prompt assembly: project context + skill index +
     // coordinator/sub_agent note (when enabled).
-    let system_prompt = crate::assemble_system_prompt(
+    let assembled_system_prompt = crate::assemble_system_prompt(
         &state.config.system_prompt,
         &state.config.workspace,
         &state.skills,
         state.config.subagent_enabled,
     );
+    let system_prompt = assembled_system_prompt.full;
+    let prompt_segments = assembled_system_prompt.segments;
 
     // If interrupt_before is set, install a test-only permission hook on a
     // clone of the registry so matching tools are denied. The driver task
@@ -1597,6 +1608,7 @@ pub(super) async fn agui_run(
         .llm(state.provider.clone())
         .tools(tool_registry)
         .system_prompt(system_prompt)
+        .prompt_segments(prompt_segments)
         .max_steps(state.config.max_steps);
 
     // Seed the transcript if we're resuming.

@@ -106,6 +106,12 @@ pub enum Modal {
         entries: Vec<McpEntry>,
         selected: usize,
     },
+    /// Goal-328: Context Usage panel. Renders a Cursor-style
+    /// per-component breakdown of the prompt sent to the provider for
+    /// the most recent LLM call. Keybound to `Ctrl+O`. Owns no mutable
+    /// state; reads [`crate::app::UsageStats::last_breakdown`] on
+    /// every render.
+    ContextUsage,
     /// Goal-230: skill-hub installation flow. Three-stage interactive modal:
     /// Results (search results) → Files (zip contents) → Preview (file viewer).
     #[cfg(feature = "skill-hub")]
@@ -152,6 +158,7 @@ impl Modal {
             Modal::PlanReview { .. } => " Plan Proposal ",
             Modal::ResumePicker { .. } => " Resume Session ",
             Modal::McpServers { .. } => " MCP Servers ",
+            Modal::ContextUsage => " Context Usage ",
             #[cfg(feature = "skill-hub")]
             Modal::SkillInstall(_) => " Install Skill ",
         }
@@ -188,6 +195,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::Confirm { prompt, .. } => render_confirm_body(prompt),
         Modal::ResumePicker { entries, selected } => render_resume_picker_body(entries, *selected),
         Modal::McpServers { entries, selected } => render_mcp_servers_body(entries, *selected),
+        Modal::ContextUsage => {
+            render_context_usage_body(&app.usage, &app.model_name, app.context_window)
+        }
         Modal::PlanReview {
             plan_text,
             tool_calls,
@@ -403,6 +413,156 @@ fn render_model_body(model: &str) -> Vec<Line<'static>> {
         "  (read-only — switching models requires restart)".to_string(),
         dim,
     )));
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "  Esc / q to close".to_string(),
+        dim,
+    )));
+    out
+}
+
+/// Render the Context Usage panel: a Cursor-style per-component
+/// breakdown of the prompt sent to the provider.
+///
+/// Reads [`UsageStats::last_breakdown`]; renders a "no breakdown yet"
+/// placeholder when `None` (the runtime hasn't emitted one yet, e.g.
+/// before the first LLM-calling step). The bar widths are proportional
+/// to each bucket's share of the *current* prompt total, so the user
+/// can see at a glance whether the system prompt or the conversation
+/// is dominating the window.
+fn render_context_usage_body(
+    usage: &UsageStats,
+    model: &str,
+    context_window: u64,
+) -> Vec<Line<'static>> {
+    let header = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let body = Style::default().fg(Color::White);
+
+    let mut out = Vec::new();
+    out.push(Line::from(Span::styled(
+        "Context Usage".to_string(),
+        header,
+    )));
+    out.push(Line::raw(""));
+
+    let Some(breakdown) = usage.last_breakdown else {
+        out.push(Line::from(Span::styled(
+            "  No breakdown yet.".to_string(),
+            body,
+        )));
+        out.push(Line::from(Span::styled(
+            "  The first LLM call will populate this panel.".to_string(),
+            dim,
+        )));
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled(
+            "  Esc / q to close".to_string(),
+            dim,
+        )));
+        return out;
+    };
+
+    // Total for percentage math. u64 because each bucket may be u32 and
+    // their sum fits comfortably in u64 even on huge contexts.
+    let total = breakdown.total() as u64;
+    if total == 0 {
+        out.push(Line::from(Span::styled(
+            "  Prompt is empty — waiting for first LLM round-trip.".to_string(),
+            body,
+        )));
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled(
+            "  Esc / q to close".to_string(),
+            dim,
+        )));
+        return out;
+    }
+
+    // Bucket definitions: (label, color, value). Order matches Cursor's
+    // Context Usage panel and the Goal-328 spec.
+    let buckets: &[(&str, Color, u32)] = &[
+        ("system prompt", Color::Magenta, breakdown.system_prompt),
+        ("rules", Color::Blue, breakdown.rules),
+        ("skills", Color::Cyan, breakdown.skills),
+        ("subagents", Color::LightMagenta, breakdown.subagents),
+        ("tools", Color::Green, breakdown.tools),
+        ("mcp / dynamic", Color::LightGreen, breakdown.mcp_dynamic),
+        ("conversation", Color::Yellow, breakdown.conversation),
+        ("overhead", Color::DarkGray, breakdown.overhead),
+    ];
+
+    // ── Legend rows ─────────────────────────────────────────────────────
+    for (label, color, value) in buckets {
+        let pct = (*value as f64 / total as f64) * 100.0;
+        out.push(Line::from(vec![
+            Span::styled(format!("  █ {label:<14}"), Style::default().fg(*color)),
+            Span::styled(format!("{:>6} tok · {pct:>5.1}%", *value), body),
+        ]));
+    }
+    out.push(Line::raw(""));
+    out.push(Line::from(vec![
+        Span::styled("  total".to_string(), dim),
+        Span::raw(format!("{:>17} tok · 100.0%", total)),
+    ]));
+
+    // ── Proportional bar ────────────────────────────────────────────────
+    // Width = min(60, panel-area width minus 4 for indent). Each bucket
+    // gets `pct * width` cells, rounded down; the leftover cell goes to
+    // the largest bucket so the bar always sums to `width`.
+    let bar_width: usize = 60;
+    let mut widths = [0usize; 8];
+    let mut total_assigned = 0usize;
+    for (i, (_label, _color, value)) in buckets.iter().enumerate() {
+        let w = ((*value as f64 / total as f64) * bar_width as f64).floor() as usize;
+        widths[i] = w;
+        total_assigned += w;
+    }
+    // Distribute leftover cells (rounding remainder) to the largest
+    // bucket(s) in order so the bar length exactly matches bar_width.
+    let leftover = bar_width.saturating_sub(total_assigned);
+    if leftover > 0 {
+        let mut largest_idx = 0usize;
+        let mut largest_val = buckets[0].2;
+        for (i, (_label, _color, value)) in buckets.iter().enumerate() {
+            if *value > largest_val {
+                largest_val = *value;
+                largest_idx = i;
+            }
+        }
+        widths[largest_idx] = widths[largest_idx].saturating_add(leftover);
+    }
+    // Render as a single line of cells.
+    let mut bar_spans = Vec::new();
+    bar_spans.push(Span::raw("  "));
+    for (i, (_label, color, _value)) in buckets.iter().enumerate() {
+        if widths[i] == 0 {
+            continue;
+        }
+        bar_spans.push(Span::styled(
+            "█".repeat(widths[i]),
+            Style::default().fg(*color),
+        ));
+    }
+    out.push(Line::from(bar_spans));
+
+    // ── Context window line ─────────────────────────────────────────────
+    if context_window > 0 {
+        let pct = (breakdown.total() as f64 / context_window as f64) * 100.0;
+        out.push(Line::raw(""));
+        out.push(Line::from(vec![
+            Span::styled("  window  ".to_string(), dim),
+            Span::raw(format!(
+                "{} / {} tok · {:.0}%  ({model})",
+                breakdown.total(),
+                context_window,
+                pct
+            )),
+        ]));
+    }
+
     out.push(Line::raw(""));
     out.push(Line::from(Span::styled(
         "  Esc / q to close".to_string(),
@@ -1228,6 +1388,110 @@ mod tests {
         app.modals = vec![Modal::ModelInfo];
         let text = draw_modal_text(&app);
         assert!(text.contains("debt-model-marker"), "got {text:?}");
+    }
+
+    // ── Goal-328: Context Usage panel ──────────────────────────────────────
+
+    #[test]
+    fn render_context_usage_body_emits_all_seven_bucket_labels() {
+        // With a fully populated breakdown, every bucket label must be
+        // rendered. `mcp / dynamic` is intentionally rendered as a
+        // single legend row (the source struct splits tools vs
+        // mcp_dynamic, but the panel groups them visually).
+        let mut app = crate::app::App::new();
+        app.context_window = 1_000_000;
+        app.model_name = "test-model".into();
+        app.usage.last_breakdown = Some(recursive::llm::ContextBreakdown {
+            system_prompt: 100,
+            rules: 50,
+            skills: 25,
+            subagents: 10,
+            tools: 200,
+            mcp_dynamic: 30,
+            conversation: 500,
+            overhead: 85,
+        });
+        app.modals = vec![Modal::ContextUsage];
+        let text = draw_modal_text(&app);
+
+        // Every bucket name must appear in the rendered text.
+        for label in [
+            "system prompt",
+            "rules",
+            "skills",
+            "subagents",
+            "tools",
+            "mcp / dynamic",
+            "conversation",
+            "overhead",
+        ] {
+            assert!(
+                text.contains(label),
+                "bucket label {label:?} must appear in rendered text; got:
+{text}"
+            );
+        }
+        // The proportional bar must render at least one bar cell (█).
+        assert!(
+            text.contains('█'),
+            "the proportional bar must render at least one cell"
+        );
+        // Total line.
+        assert!(text.contains("total"), "the panel must show a total line");
+    }
+
+    #[test]
+    fn render_context_usage_body_handles_no_breakdown_yet() {
+        // Before the first LLM call, `last_breakdown` is None. The panel
+        // must show a placeholder rather than crash or render 0s.
+        let mut app = crate::app::App::new();
+        app.modals = vec![Modal::ContextUsage];
+        let text = draw_modal_text(&app);
+        assert!(
+            text.contains("No breakdown yet"),
+            "panel must show placeholder when no breakdown is recorded yet; got:
+{text}"
+        );
+    }
+
+    #[test]
+    fn render_context_usage_body_handles_all_zero_breakdown() {
+        // Edge case: every bucket is zero (transcript + prompt segments
+        // are empty). `total == 0` must show the empty-prompt placeholder,
+        // not a divide-by-zero crash.
+        let mut app = crate::app::App::new();
+        app.usage.last_breakdown = Some(recursive::llm::ContextBreakdown::default());
+        app.modals = vec![Modal::ContextUsage];
+        let text = draw_modal_text(&app);
+        assert!(
+            text.contains("Prompt is empty") || text.contains("No breakdown yet"),
+            "panel must show empty-prompt placeholder when total == 0; got:
+{text}"
+        );
+    }
+
+    #[test]
+    fn render_context_usage_body_shows_window_line_when_known() {
+        // When `context_window > 0` the panel renders a "window X / Y" line
+        // carrying the live percentage.
+        let mut app = crate::app::App::new();
+        app.context_window = 200_000;
+        app.usage.last_breakdown = Some(recursive::llm::ContextBreakdown {
+            conversation: 1000,
+            ..recursive::llm::ContextBreakdown::default()
+        });
+        app.modals = vec![Modal::ContextUsage];
+        let text = draw_modal_text(&app);
+        assert!(
+            text.contains("window"),
+            "panel must show the context-window line; got:
+{text}"
+        );
+        assert!(
+            text.contains("200000") || text.contains("200K"),
+            "panel must show the window size; got:
+{text}"
+        );
     }
 
     #[test]

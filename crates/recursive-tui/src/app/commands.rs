@@ -130,6 +130,16 @@ impl App {
             }
         }
 
+        // ── Goal-328: Ctrl+O opens the Context Usage panel ─────────
+        // The modal is purely a read-only view over
+        // `UsageStats::last_breakdown`; Esc / q close it (handled by
+        // the generic modal Esc / q path below).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            use crate::ui::modal::Modal;
+            self.modals.push(Modal::ContextUsage);
+            return None;
+        }
+
         // ── Shift+Tab: cycle modes ───────────────────────────────────
         if key.code == KeyCode::BackTab {
             self.prompt.mode = self.prompt.mode.cycle_next();

@@ -388,16 +388,19 @@ pub(crate) async fn build_runtime(
 
     // Common system-prompt assembly (project context + base + skill index +
     // coordinator workflow/sub_agent note when enabled) lives in one place.
-    let mut system_prompt = assemble_system_prompt(
+    // We hold onto the full AssembledPrompt (not just the joined string)
+    // so the Goal-328 ContextBreakdown estimator can size the static
+    // buckets from the structured segments.
+    //
+    // CLI-run-only: auto-load matching skill *bodies* based on the goal (the
+    // index above only lists skill names). Other channels don't have a goal
+    // at prompt-build time, so this stays a CLI-run-specific suffix.
+    let mut assembled = assemble_system_prompt(
         &config.system_prompt,
         &config.workspace,
         &skills,
         config.subagent_enabled,
     );
-
-    // CLI-run-only: auto-load matching skill *bodies* based on the goal (the
-    // index above only lists skill names). Other channels don't have a goal
-    // at prompt-build time, so this stays a CLI-run-specific suffix.
     let injected = skills_for_injection(&skills, goal.unwrap_or(""));
     if !injected.is_empty() {
         let mut injection_block = String::new();
@@ -430,18 +433,24 @@ pub(crate) async fn build_runtime(
             injection_block.push_str(&snippet);
             total_chars += snippet.len();
         }
-        system_prompt = format!(
+        assembled.full = format!(
             "{}
 
 {}",
-            system_prompt, injection_block
+            assembled.full, injection_block
         );
     }
+    // Goal-328: forward the structured segments to the runtime so the
+    // local ContextBreakdown estimator can size the static buckets.
+    // The joined prompt (`assembled.full`) is consumed directly by the
+    // builder.
+    let prompt_segments = assembled.segments;
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&system_prompt)
+        .system_prompt(&assembled.full)
+        .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
         .streaming(stream)
         .stuck_window(config.stuck_window)

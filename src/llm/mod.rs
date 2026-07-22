@@ -29,7 +29,8 @@ pub mod openai;
 // ── Re-exports: chat types ────────────────────────────────────────────────────
 
 pub use chat::{
-    Completion, StreamChunk, StreamSender, StructuredRequest, TokenUsage, ToolCall, ToolSpec,
+    estimate_tokens, Completion, ContextBreakdown, StreamChunk, StreamSender, StructuredRequest,
+    TokenUsage, ToolCall, ToolSpec,
 };
 
 // ── Re-exports: pricing ───────────────────────────────────────────────────────

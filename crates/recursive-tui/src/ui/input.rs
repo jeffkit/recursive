@@ -141,16 +141,20 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 /// size is unknown (0) — e.g. before the runtime has resolved a model —
 /// so we don't render a meaningless `0/0`.
 ///
-/// `used` is [`UsageStats::last_prompt_tokens`] (the most recent LLM
-/// call's total prompt size); `window` is [`App::context_window`]. The
-/// colour ramps green → yellow → red as the window fills up so the user
-/// gets an at-a-glance warning before compaction becomes necessary.
+/// `used` is [`UsageStats::current_prompt_estimate`] — the live
+/// estimate that advances during tool execution (the local breakdown
+/// re-estimates the conversation bucket every step), not the
+/// provider-reported `last_prompt_tokens` (which only refreshes when
+/// the provider returns usage). `window` is [`App::context_window`].
+/// The colour ramps green → yellow → red as the window fills up so
+/// the user gets an at-a-glance warning before compaction becomes
+/// necessary.
 fn context_gauge(app: &App) -> Option<(String, Color)> {
     let window = app.context_window;
     if window == 0 {
         return None;
     }
-    let used = app.usage.last_prompt_tokens;
+    let used = app.usage.current_prompt_estimate();
     let pct = (used as f64 / window as f64) * 100.0;
     let color = if pct >= 90.0 {
         Color::Red

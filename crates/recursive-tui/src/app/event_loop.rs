@@ -153,6 +153,9 @@ impl App {
                     cache_miss_tokens,
                 );
             }
+            UiEvent::ContextBreakdown { breakdown } => {
+                self.usage.record_breakdown(breakdown);
+            }
             UiEvent::Latency { llm_ms } => {
                 self.usage.last_latency_ms = llm_ms;
                 self.pending_latency_ms = Some(llm_ms);

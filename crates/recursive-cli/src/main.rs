@@ -1927,17 +1927,19 @@ async fn run_loop(
     // matching every other agent-loop surface.
     tools = recursive::register_subagent_if_enabled(tools, &config, provider.clone());
     let skills = cli::builder::discover_loaded_skills(&config);
-    let system_prompt = recursive::assemble_system_prompt(
+    let assembled = recursive::assemble_system_prompt(
         &config.system_prompt,
         &config.workspace,
         &skills,
         config.subagent_enabled,
     );
+    let prompt_segments = assembled.segments;
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&system_prompt)
+        .system_prompt(&assembled.full)
+        .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
         .streaming(stream)
         .shutdown_token(shutdown.clone());

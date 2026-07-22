@@ -238,6 +238,7 @@ async fn worker_receives_coordinator_message_via_mailbox() {
         permission_mode: PermissionMode::Default,
         mailbox: Some(mailbox.clone()),
         turn: 0,
+        prompt_segments: None,
     };
 
     let outcome = kernel.run(ctx).await.unwrap();

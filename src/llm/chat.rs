@@ -28,6 +28,87 @@ pub enum StreamChunk {
 /// Each [`StreamChunk`] is a delta emitted by the provider.
 pub type StreamSender = mpsc::UnboundedSender<StreamChunk>;
 
+/// Locally-estimated per-component token breakdown of the prompt sent to the
+/// provider.
+///
+/// Distinct from [`TokenUsage`] (which is the provider's reported truth):
+/// these are local chars/4 estimates, one bucket per logical segment of the
+/// assembled prompt. The `overhead` bucket absorbs the difference between
+/// the sum of the other buckets and the provider's reported `prompt_tokens`
+/// (chat-template wrapping, tool JSON envelope, message separators) so the
+/// breakdown is honest about its estimation error rather than pretending
+/// to be exact.
+///
+/// Recomputed every step: the static buckets (`system_prompt`, `rules`,
+/// `skills`, `subagents`, `tools`, `mcp_dynamic`) change only on a `/model`
+/// hot-swap or tool-registry change, while `conversation` grows with every
+/// transcript mutation and `overhead` is derived from the provider's
+/// reported `prompt_tokens` after each step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    /// `default_system_prompt` + the six memory layers + any channel
+    /// `append_system_prompt` suffix.
+    pub system_prompt: u32,
+    /// `# Project context` block: `AGENTS.md` + `CLAUDE.md` from
+    /// `prepend_project_context`.
+    pub rules: u32,
+    /// `skill_index()` output.
+    pub skills: u32,
+    /// `## Coordinator workflow` + `sub_agent` usage note (only when
+    /// `sub_agent_enabled`).
+    pub subagents: u32,
+    /// Eager tool specs that are NOT from MCP and NOT deferred.
+    pub tools: u32,
+    /// Tool specs that ARE MCP-sourced or deferred (the dynamic /
+    /// discovered-tools bucket).
+    pub mcp_dynamic: u32,
+    /// `self.messages` text content (transcript body).
+    pub conversation: u32,
+    /// Provider total - local sum (saturating to 0). Absorbs chat-template
+    /// wrapping, tool JSON envelope, and message separators that the local
+    /// estimate can't reproduce.
+    pub overhead: u32,
+}
+
+impl ContextBreakdown {
+    /// Sum of the seven non-overhead buckets.
+    pub fn local_sum(&self) -> u32 {
+        self.system_prompt
+            .saturating_add(self.rules)
+            .saturating_add(self.skills)
+            .saturating_add(self.subagents)
+            .saturating_add(self.tools)
+            .saturating_add(self.mcp_dynamic)
+            .saturating_add(self.conversation)
+    }
+
+    /// Total of every bucket including overhead.
+    pub fn total(&self) -> u32 {
+        self.local_sum().saturating_add(self.overhead)
+    }
+}
+
+/// Estimate token count from a string using the chars/4 heuristic
+/// (ceiling). Used by both the `estimate_tokens` tool and the local
+/// `ContextBreakdown` so the two share the same arithmetic.
+///
+/// The estimator deliberately rounds up (ceil) so a 5-character string
+/// becomes 2 tokens, not 1; this matches the conservative budgeting the
+/// rest of the codebase applies when comparing local estimates against
+/// the provider's reported truth.
+pub fn estimate_tokens(text: &str) -> u32 {
+    let chars = text.len();
+    let tokens = (chars as f64 / 4.0).ceil() as u32;
+    // Defensive: if chars overflow the divisor (impossible for `str::len()`
+    // on a single allocation but possible in theory), the f64 rounding
+    // path can yield 0. Force a 1-token floor for any non-empty input.
+    if tokens == 0 && !text.is_empty() {
+        1
+    } else {
+        tokens
+    }
+}
+
 /// Token usage data from an LLM response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -339,5 +420,108 @@ mod tests {
         c.extract_inline_reasoning();
         assert_eq!(c.reasoning_content.as_deref(), Some("real reasoning"));
         assert_eq!(c.content, "<think>ignored</think>answer");
+    }
+
+    // ── estimate_tokens tests ───────────────────────────────────────────
+
+    #[test]
+    fn estimate_tokens_empty_string_is_zero() {
+        // kills `replace / 4.0 with % 4.0` mutation — % would yield 0 / 4 = 0
+        // for "" (correct by accident), but the ceil-cast branch must still
+        // produce 0. The defensive floor only kicks in when ceil is 0 AND
+        // text is non-empty, so empty text → 0 must round-trip cleanly.
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_exact_multiple_of_four() {
+        // 4 chars / 4 = 1 → ceil = 1 token exactly.
+        // kills `replace ceil with floor` — 4/4 = 1 either way, so we
+        // additionally check that the no-op rounding doesn't drift.
+        assert_eq!(estimate_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_uses_ceil_not_floor() {
+        // 5 chars / 4 = 1.25 → ceil = 2 tokens; floor would give 1.
+        // This is the load-bearing case: a half-token string must round UP
+        // so we never underestimate the local prompt size.
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(
+            estimate_tokens("abcdefg"),
+            2, // 7/4 = 1.75 → 2
+            "7-char string must round up to 2 tokens"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_long_string_scales_linearly() {
+        // 100 chars / 4 = 25 → ceil = 25.
+        let text = "a".repeat(100);
+        assert_eq!(estimate_tokens(&text), 25);
+    }
+
+    #[test]
+    fn estimate_tokens_single_nonempty_returns_at_least_one() {
+        // Defensive floor: any non-empty input must yield >= 1 token so
+        // a 1-char string (which ceil-divides to 0.25 → 1 anyway) and a
+        // 2-char string (which ceil-divides to 0.5 → 1) are consistent.
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens("ab"), 1);
+    }
+
+    // ── ContextBreakdown tests ──────────────────────────────────────────
+
+    #[test]
+    fn context_breakdown_default_is_all_zeros() {
+        // All buckets default to 0 so a freshly-built breakdown serialises
+        // cleanly without per-field Option wrappers.
+        let b = ContextBreakdown::default();
+        assert_eq!(b.system_prompt, 0);
+        assert_eq!(b.rules, 0);
+        assert_eq!(b.skills, 0);
+        assert_eq!(b.subagents, 0);
+        assert_eq!(b.tools, 0);
+        assert_eq!(b.mcp_dynamic, 0);
+        assert_eq!(b.conversation, 0);
+        assert_eq!(b.overhead, 0);
+        assert_eq!(b.local_sum(), 0);
+        assert_eq!(b.total(), 0);
+    }
+
+    #[test]
+    fn context_breakdown_local_sum_excludes_overhead() {
+        // local_sum is the seven user-meaningful buckets. Overhead must be
+        // excluded so it can be subtracted by the breakdown-computation
+        // code without double-counting.
+        let b = ContextBreakdown {
+            system_prompt: 10,
+            rules: 20,
+            skills: 30,
+            subagents: 40,
+            tools: 50,
+            mcp_dynamic: 60,
+            conversation: 70,
+            overhead: 9999,
+        };
+        assert_eq!(b.local_sum(), 280);
+        assert_eq!(b.total(), 280 + 9999);
+    }
+
+    #[test]
+    fn context_breakdown_serde_round_trip() {
+        let b = ContextBreakdown {
+            system_prompt: 11,
+            rules: 22,
+            skills: 33,
+            subagents: 44,
+            tools: 55,
+            mcp_dynamic: 66,
+            conversation: 77,
+            overhead: 88,
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        let back: ContextBreakdown = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
     }
 }

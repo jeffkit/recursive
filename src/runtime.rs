@@ -200,6 +200,11 @@ pub struct AgentRuntime {
     /// larger values give the judge more context for long sessions.
     /// Default 12. Set via [`AgentRuntimeBuilder::goal_eval_transcript_tail`].
     goal_eval_transcript_tail: usize,
+    /// Goal-328: structured prompt segments from `assemble_system_prompt`,
+    /// forwarded to the kernel so it can size the static breakdown
+    /// buckets. `None` for runtimes that don't supply a structured
+    /// prompt (tests, programmatic builders).
+    prompt_segments: Option<crate::system_prompt::PromptSegments>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -511,6 +516,7 @@ impl AgentRuntime {
             permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
             turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
+            prompt_segments: self.prompt_segments.clone(),
         };
 
         let turn_outcome = self.kernel.run(ctx).await?;
@@ -1205,6 +1211,9 @@ pub struct AgentRuntimeBuilder {
     goal_eval_transcript_tail: usize,
     /// Goal-318: skills passed through to AgentKernel for Globs-mode injection.
     skills: Vec<crate::skills::Skill>,
+    /// Goal-328: structured prompt segments from `assemble_system_prompt`,
+    /// forwarded to the kernel for the local `ContextBreakdown` estimator.
+    prompt_segments: Option<crate::system_prompt::PromptSegments>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -1242,7 +1251,26 @@ impl AgentRuntimeBuilder {
             with_plan_mode_tools: false,
             goal_eval_transcript_tail: 12,
             skills: Vec::new(),
+            prompt_segments: None,
         }
+    }
+
+    /// Goal-328: forward structured prompt segments to the kernel so the
+    /// local `ContextBreakdown` estimator can size the static buckets
+    /// (`system_prompt`, `rules`, `skills`, `subagents`, `tools`,
+    /// `mcp_dynamic`). Callers that built the prompt via
+    /// [`crate::assemble_system_prompt`] should chain the returned
+    /// `segments` through this method:
+    ///
+    /// ```ignore
+    /// let assembled = assemble_system_prompt(base, ws, &skills, sub);
+    /// let mut builder = AgentRuntimeBuilder::new()
+    ///     .system_prompt(assembled.full())
+    ///     .prompt_segments(assembled.segments);
+    /// ```
+    pub fn prompt_segments(mut self, segments: crate::system_prompt::PromptSegments) -> Self {
+        self.prompt_segments = Some(segments);
+        self
     }
 
     /// Register `enter_plan_mode`, `exit_plan_mode`, and `request_plan_mode`
@@ -1442,6 +1470,7 @@ impl AgentRuntimeBuilder {
             deferred_turn_finished: None,
             session: SessionLifecycle::open(),
             goal_eval_transcript_tail: self.goal_eval_transcript_tail,
+            prompt_segments: self.prompt_segments,
         })
     }
 }

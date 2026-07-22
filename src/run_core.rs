@@ -28,7 +28,10 @@ pub(crate) const DENIAL_LIMIT_SENTINEL: &str = "ERROR_DENIAL_LIMIT:";
 use crate::compact::Compactor;
 use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
-use crate::llm::{ChatProvider, Completion, StreamChunk, StreamSender, TokenUsage, ToolCall};
+use crate::llm::{
+    estimate_tokens, ChatProvider, Completion, ContextBreakdown, StreamChunk, StreamSender,
+    TokenUsage, ToolCall, ToolSpec,
+};
 use crate::message::Message;
 
 use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
@@ -38,6 +41,7 @@ use crate::agent::{FinishReason, PermissionDecision};
 use crate::event::AgentEvent;
 use crate::skills::Skill;
 use crate::skills_injector::SkillInjector;
+use crate::system_prompt::PromptSegments;
 use crate::tools::PermissionHook;
 
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
@@ -45,6 +49,21 @@ pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit bud
 
 /// Minimum tool-result size (bytes) worth trimming; shorter results are kept verbatim.
 const MIN_TRIM_LENGTH: usize = 200;
+
+/// Goal-328: token estimate from a pre-computed char count.
+///
+/// Same arithmetic as [`crate::llm::estimate_tokens`] but takes a `usize`
+/// char-count directly so the conversation bucket can avoid re-iterating
+/// the transcript just to read each message's `len()`. Matches the public
+/// helper's ceil semantics so a 5-char transcript chunk is 2 tokens, not 1.
+fn estimate_tokens_by_chars(chars: usize) -> u32 {
+    let tokens = (chars as f64 / 4.0).ceil() as u32;
+    if tokens == 0 && chars > 0 {
+        1
+    } else {
+        tokens
+    }
+}
 
 /// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
 ///
@@ -110,6 +129,79 @@ pub(crate) struct RunCore<'a> {
     /// Goal-318: `Globs`-mode skills for path-triggered injection.
     /// Injected as system messages after tool calls match a skill's glob patterns.
     pub(crate) globs_skills: Vec<Skill>,
+    /// Goal-328: structured prompt segments from `assemble_system_prompt`,
+    /// used to size the static breakdown buckets (`system_prompt`, `rules`,
+    /// `skills`, `subagents`). `None` when the runtime was built without a
+    /// system-prompt path (tests, headless loops without prompts).
+    ///
+    /// Currently held for introspection / future hot-reload; the breakdown
+    /// computation only reads [`Self::static_breakdown`] (which was sized
+    /// at construction). The `#[allow(dead_code)]` silences the lint
+    /// without removing the field — the goal explicitly preserves the
+    /// structured segment accessor surface so callers can reason about
+    /// which buckets contribute to the prompt.
+    #[allow(dead_code)]
+    pub(crate) prompt_segments: Option<PromptSegments>,
+    /// Goal-328: per-bucket token counts for the static prompt portions,
+    /// cached once at construction so the breakdown estimator does not
+    /// re-tokenise `PromptSegments` every step. The `conversation`
+    /// bucket is recomputed every step from `self.messages`.
+    pub(crate) static_breakdown: StaticBreakdownCache,
+}
+
+/// Goal-328: cached token counts for the static breakdown buckets.
+///
+/// Sized once at `RunCore` construction from `PromptSegments`. The
+/// `tools` and `mcp_dynamic` buckets are also cached because they only
+/// change on a `/model` hot-swap or tool-registry change — the same
+/// hook that re-creates the runtime. `conversation` and `overhead`
+/// stay dynamic (recomputed every step).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StaticBreakdownCache {
+    pub system_prompt: u32,
+    pub rules: u32,
+    pub skills: u32,
+    pub subagents: u32,
+    /// Eager tool specs that are NOT MCP / NOT deferred.
+    pub tools: u32,
+    /// MCP / deferred tool specs.
+    pub mcp_dynamic: u32,
+}
+
+impl StaticBreakdownCache {
+    /// Build a fresh cache from a `PromptSegments` + the registry's tool
+    /// specs. `registry` is consulted to partition `eager` vs
+    /// `deferred_or_mcp` (McpTool reports `is_deferred() == true`).
+    pub(crate) fn build(
+        segments: &PromptSegments,
+        specs: &[ToolSpec],
+        registry: &ToolRegistry,
+    ) -> Self {
+        let mut tools = 0u32;
+        let mut mcp_dynamic = 0u32;
+        for spec in specs {
+            // Mirror the serde-shape the provider adapter would send: a
+            // single ToolSpec serialises to a JSON object with
+            // name/description/parameters. We tokenise that JSON text
+            // so the local estimate is comparable to what the provider
+            // actually sees after wrapping.
+            let text = serde_json::to_string(spec).unwrap_or_default();
+            let n = estimate_tokens(&text);
+            if registry.is_deferred_spec(spec) {
+                mcp_dynamic = mcp_dynamic.saturating_add(n);
+            } else {
+                tools = tools.saturating_add(n);
+            }
+        }
+        Self {
+            system_prompt: estimate_tokens(&segments.system_prompt),
+            rules: estimate_tokens(&segments.rules),
+            skills: estimate_tokens(&segments.skills),
+            subagents: estimate_tokens(&segments.subagents),
+            tools,
+            mcp_dynamic,
+        }
+    }
 }
 
 impl<'a> RunCore<'a> {
@@ -133,6 +225,65 @@ impl<'a> RunCore<'a> {
                 msg.reasoning_content = reasoning;
             }
         }
+    }
+
+    /// Goal-328: build a fresh [`ContextBreakdown`] from the cached static
+    /// buckets + a re-tokenised `conversation` (the transcript body).
+    /// `provider_total` is the `max(input_tokens, cache_hit + cache_miss)`
+    /// reading from the just-completed LLM call; it backs the `overhead`
+    /// bucket.
+    fn compute_breakdown(&self, provider_total: u32) -> ContextBreakdown {
+        // Conversation bucket: chars/4 over the transcript body. We
+        // intentionally re-tokenise every step (rather than caching) so
+        // the bucket grows naturally with each new assistant / tool /
+        // user message appended this run.
+        let mut conversation_chars: usize = 0;
+        for msg in self.messages.iter() {
+            conversation_chars = conversation_chars.saturating_add(msg.content.len());
+            if let Some(rc) = &msg.reasoning_content {
+                conversation_chars = conversation_chars.saturating_add(rc.len());
+            }
+        }
+        // `estimate_tokens` uses (chars as f64 / 4.0).ceil() as u32.
+        let conversation = estimate_tokens_by_chars(conversation_chars);
+
+        let local_sum = self
+            .static_breakdown
+            .system_prompt
+            .saturating_add(self.static_breakdown.rules)
+            .saturating_add(self.static_breakdown.skills)
+            .saturating_add(self.static_breakdown.subagents)
+            .saturating_add(self.static_breakdown.tools)
+            .saturating_add(self.static_breakdown.mcp_dynamic)
+            .saturating_add(conversation);
+        let overhead = provider_total.saturating_sub(local_sum);
+
+        ContextBreakdown {
+            system_prompt: self.static_breakdown.system_prompt,
+            rules: self.static_breakdown.rules,
+            skills: self.static_breakdown.skills,
+            subagents: self.static_breakdown.subagents,
+            tools: self.static_breakdown.tools,
+            mcp_dynamic: self.static_breakdown.mcp_dynamic,
+            conversation,
+            overhead,
+        }
+    }
+
+    /// Goal-328: emit the [`AgentEvent::ContextBreakdown`] event for `step`.
+    /// `usage` is the provider's reported truth for this step.
+    fn emit_breakdown(&self, step: usize, usage: &TokenUsage) {
+        // Match `UsageStats::record_with_cache`'s logic:
+        //   max(input_tokens, cache_hit + cache_miss)
+        // so Anthropic (cache_hit excludes input_tokens) and OpenAI
+        // (cache_hit == 0, input_tokens is the full prompt) both feed
+        // a sensible `provider_total`.
+        let cache_sum = usage
+            .cache_hit_tokens
+            .saturating_add(usage.cache_miss_tokens);
+        let provider_total = usage.prompt_tokens.max(cache_sum);
+        let breakdown = self.compute_breakdown(provider_total);
+        self.emit(AgentEvent::ContextBreakdown { breakdown, step });
     }
 
     /// Execute one LLM call for this step and surface everything the
@@ -209,6 +360,13 @@ impl<'a> RunCore<'a> {
                 cache_miss_tokens: u.cache_miss_tokens,
                 step,
             });
+            // Goal-328: emit the local per-component breakdown right after
+            // the provider's `Usage` truth. The `overhead` bucket absorbs
+            // the difference between our 7-bucket local sum and the
+            // provider's reported `prompt_tokens` (computed as
+            // `max(input_tokens, cache_hit + cache_miss)` so Anthropic
+            // and OpenAI reporting differences are handled).
+            self.emit_breakdown(step, &u);
         }
 
         // Surface reasoning / thinking content to UI consumers (TUI) as
@@ -1039,7 +1197,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        effective_step_limit, finish_reason_str, RunCore, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
+        effective_step_limit, finish_reason_str, RunCore, StaticBreakdownCache, MIN_TRIM_LENGTH,
+        TRIM_PLACEHOLDER,
     };
     use crate::message::Message;
 
@@ -1254,6 +1413,8 @@ mod tests {
             stuck_error_rate: 1.0,
             turn: 0,
             globs_skills: vec![],
+            prompt_segments: None,
+            static_breakdown: StaticBreakdownCache::default(),
         }
     }
 
@@ -1876,6 +2037,8 @@ mod tests {
             stuck_error_rate: 1.0,
             turn: 0,
             globs_skills: vec![],
+            prompt_segments: None,
+            static_breakdown: StaticBreakdownCache::default(),
         }
     }
 
@@ -2256,5 +2419,413 @@ mod tests {
             Some(true),
             "ToolResult for DENIAL_LIMIT_SENTINEL must have is_error = true; events: {events:?}"
         );
+    }
+
+    // ========================================================================
+    // Goal-328: ContextBreakdown event emission
+    // ========================================================================
+
+    /// `compute_breakdown` must populate `overhead = max(0, provider_total -
+    /// local_sum)`. With `prompt_tokens = 1000` and a local sum of 700,
+    /// the breakdown's overhead must be 300. The other buckets must match
+    /// `static_breakdown` (cached at construction).
+    #[test]
+    fn compute_breakdown_overhead_is_provider_total_minus_local_sum() {
+        use crate::llm::ContextBreakdown;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Seed a transcript long enough to make the conversation bucket non-zero.
+        let messages = vec![
+            Message::system("s".to_string()),
+            Message::user("hello world this is a turn".to_string()),
+            Message::assistant("ok".to_string()),
+        ];
+        let mut core = make_test_core(messages, &hooks);
+        // Hand-build a static breakdown whose sum we can predict.
+        core.static_breakdown = StaticBreakdownCache {
+            system_prompt: 100,
+            rules: 50,
+            skills: 25,
+            subagents: 10,
+            tools: 15,
+            mcp_dynamic: 0,
+        };
+        let breakdown = core.compute_breakdown(1000);
+
+        // Provider total - local_sum = 1000 - (100 + 50 + 25 + 10 + 15 + 0 + conversation).
+        let local = breakdown.local_sum();
+        let expected_overhead = 1000u32.saturating_sub(local);
+        assert_eq!(
+            breakdown.overhead, expected_overhead,
+            "overhead must be provider_total - local_sum"
+        );
+        // Conversation must be > 0 (we seeded a non-trivial transcript).
+        assert!(
+            breakdown.conversation > 0,
+            "conversation bucket must be non-zero for a seeded transcript"
+        );
+        // Static buckets must mirror the cache verbatim.
+        assert_eq!(breakdown.system_prompt, 100);
+        assert_eq!(breakdown.rules, 50);
+        assert_eq!(breakdown.skills, 25);
+        assert_eq!(breakdown.subagents, 10);
+        assert_eq!(breakdown.tools, 15);
+        assert_eq!(breakdown.mcp_dynamic, 0);
+        // Sanity: the public type's helpers agree.
+        assert_eq!(breakdown.local_sum(), local);
+        assert_eq!(breakdown.total(), local + expected_overhead);
+        // Silence unused-variable warning for ContextBreakdown import.
+        let _ = ContextBreakdown::default();
+    }
+
+    /// When the local sum exceeds the provider's reported total (which can
+    /// happen with chars/4 over-estimation on dense CJK content), the
+    /// overhead bucket must saturate to 0 — not wrap to a huge u32.
+    #[test]
+    fn compute_breakdown_overhead_saturates_at_zero_when_local_exceeds_provider() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        core.static_breakdown = StaticBreakdownCache {
+            system_prompt: 5000,
+            rules: 1000,
+            skills: 0,
+            subagents: 0,
+            tools: 0,
+            mcp_dynamic: 0,
+        };
+        let breakdown = core.compute_breakdown(100); // local sum ≫ 100
+        assert_eq!(
+            breakdown.overhead, 0,
+            "overhead must saturate to 0 when local sum > provider total; got {}",
+            breakdown.overhead
+        );
+    }
+
+    /// `emit_breakdown` consumes a `TokenUsage` and emits
+    /// `AgentEvent::ContextBreakdown`. We assert the emitted event's
+    /// bucket totals match the spec (overhead uses `max(input_tokens,
+    /// cache_hit + cache_miss)` so Anthropic + OpenAI reporting
+    /// differences are handled).
+    #[tokio::test]
+    async fn dispatch_llm_step_emits_context_breakdown_after_usage() {
+        use crate::event::AgentEvent;
+        use crate::llm::TokenUsage;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hello world".to_string())], &hooks);
+        // Seed static buckets so the breakdown has deterministic non-zero values.
+        core.static_breakdown = StaticBreakdownCache {
+            system_prompt: 100,
+            rules: 50,
+            skills: 25,
+            subagents: 10,
+            tools: 15,
+            mcp_dynamic: 0,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        core.events = Some(tx);
+
+        // The `Usage` reading: provider reports 1000 prompt tokens with
+        // no cache split (OpenAI shape). Anthropic-style reporting would
+        // put the cache split separately; both flows feed the breakdown
+        // the same `max(input_tokens, cache_sum)`.
+        let usage = TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            total_tokens: 1050,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        core.emit_breakdown(7, &usage);
+
+        // Drain the channel and find the ContextBreakdown event.
+        let event = rx
+            .try_recv()
+            .expect("ContextBreakdown event must be emitted");
+        match event {
+            AgentEvent::ContextBreakdown { breakdown, step } => {
+                assert_eq!(step, 7, "step must be forwarded verbatim");
+                let local = breakdown.local_sum();
+                let expected_overhead = 1000u32.saturating_sub(local);
+                assert_eq!(breakdown.overhead, expected_overhead);
+                assert!(
+                    breakdown.total() >= 1000,
+                    "total must be >= provider_total; got {}",
+                    breakdown.total()
+                );
+            }
+            other => panic!("expected ContextBreakdown event, got {other:?}"),
+        }
+    }
+
+    /// `run_inner` emits `AgentEvent::ContextBreakdown` once per
+    /// LLM-calling step (i.e. exactly once on the single-step happy
+    /// path). The breakdown must come AFTER `Usage` so consumers
+    /// observe the provider truth first.
+    #[tokio::test]
+    async fn run_inner_emits_context_breakdown_once_per_llm_step() {
+        use crate::agent::FinishReason;
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, TokenUsage};
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: Some(TokenUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 50,
+                total_tokens: 1050,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
+                reasoning_tokens: 0,
+            }),
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hi".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 1);
+        core.events = Some(tx);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert_eq!(outcome.finish_reason, FinishReason::NoMoreToolCalls);
+
+        // Drain events. Find the index of Usage and the index of
+        // ContextBreakdown; the latter must come strictly after.
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let usage_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Usage { .. }))
+            .expect("a Usage event must have been emitted");
+        let breakdown_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ContextBreakdown { .. }))
+            .expect("a ContextBreakdown event must have been emitted");
+        assert!(
+            breakdown_idx > usage_idx,
+            "ContextBreakdown (idx={breakdown_idx}) must come AFTER Usage (idx={usage_idx})"
+        );
+    }
+
+    /// `run_inner` does NOT emit `ContextBreakdown` on a step that
+    /// never calls the LLM (e.g. an immediate `TranscriptLimit` finish).
+    #[tokio::test]
+    async fn run_inner_skips_context_breakdown_on_no_llm_step() {
+        use crate::agent::FinishReason;
+        use crate::event::AgentEvent;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]));
+        let messages = vec![Message::system("hello".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 1);
+        core.events = Some(tx);
+        // 5 chars > limit 3 → enforce_transcript_budget fires BEFORE the
+        // first LLM call, so there should be no Usage / ContextBreakdown.
+        core.max_transcript_chars = Some(3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::TranscriptLimit { .. }),
+            "expected TranscriptLimit finish; got {:?}",
+            outcome.finish_reason
+        );
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextBreakdown { .. })),
+            "no ContextBreakdown must be emitted on a no-LLM step; got: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })),
+            "no Usage must be emitted on a no-LLM step; got: {events:?}"
+        );
+    }
+
+    /// Static breakdown buckets must be cached once at `RunCore`
+    /// construction and reused every step — the conversation bucket
+    /// alone grows between steps. Verified by running two steps and
+    /// comparing the breakdowns.
+    ///
+    /// Step 1: LLM returns a tool call (forces a second step).
+    /// Step 2: LLM returns a final reply (loop exits).
+    #[tokio::test]
+    async fn static_buckets_dont_change_across_steps_conversation_grows() {
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, TokenUsage, ToolCall, ToolSpec};
+        use crate::tools::{Tool, ToolRegistry};
+        use async_trait::async_trait;
+        use serde_json::{json, Value};
+        use tokio::sync::mpsc;
+
+        /// Minimal tool that always succeeds so step 1's tool call is
+        /// dispatched cleanly and the loop proceeds to step 2.
+        struct Adder;
+        #[async_trait]
+        impl Tool for Adder {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "add".to_string(),
+                    description: "add two numbers".to_string(),
+                    parameters: json!({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}),
+                }
+            }
+            async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+                Ok("7".to_string())
+            }
+        }
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let registry = ToolRegistry::default().register(Arc::new(Adder));
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            // Step 1: tool call → forces step 2.
+            Completion {
+                content: "calculating…".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "tc1".to_string(),
+                    name: "add".to_string(),
+                    arguments: json!({"a": 3, "b": 4}),
+                }],
+                finish_reason: Some("tool_calls".to_string()),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 1000,
+                    completion_tokens: 30,
+                    total_tokens: 1030,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+                reasoning_content: None,
+            },
+            // Step 2: final reply → loop exits.
+            Completion {
+                content: "the answer is 7".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 1200, // provider thinks transcript grew
+                    completion_tokens: 50,
+                    total_tokens: 1250,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+                reasoning_content: None,
+            },
+        ]));
+        let messages = vec![Message::user("hi".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 5);
+        core.tools = Arc::new(registry);
+        core.events = Some(tx);
+        // Seed static buckets so we can verify they're identical across
+        // both steps.
+        core.static_breakdown = StaticBreakdownCache {
+            system_prompt: 100,
+            rules: 50,
+            skills: 25,
+            subagents: 10,
+            tools: 15,
+            mcp_dynamic: 0,
+        };
+        core.prompt_segments = Some(crate::system_prompt::PromptSegments {
+            rules: "RR".into(),
+            system_prompt: "SS".into(),
+            skills: String::new(),
+            subagents: String::new(),
+        });
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        drop(outcome); // satisfy unused-var lint
+
+        // Collect both ContextBreakdown events.
+        let mut breakdowns = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if let AgentEvent::ContextBreakdown { breakdown, .. } = e {
+                breakdowns.push(breakdown);
+            }
+        }
+        assert_eq!(
+            breakdowns.len(),
+            2,
+            "two ContextBreakdown events must have been emitted; got {breakdowns:?}"
+        );
+
+        // Static buckets must be identical across both steps.
+        assert_eq!(breakdowns[0].system_prompt, breakdowns[1].system_prompt);
+        assert_eq!(breakdowns[0].rules, breakdowns[1].rules);
+        assert_eq!(breakdowns[0].skills, breakdowns[1].skills);
+        assert_eq!(breakdowns[0].subagents, breakdowns[1].subagents);
+        assert_eq!(breakdowns[0].tools, breakdowns[1].tools);
+        assert_eq!(breakdowns[0].mcp_dynamic, breakdowns[1].mcp_dynamic);
+        assert_eq!(
+            breakdowns[0].system_prompt, 100,
+            "static_breakdown cache must be honoured"
+        );
+
+        // Conversation bucket must grow between step 1 and step 2
+        // (the tool result + assistant reply add to the transcript).
+        assert!(
+            breakdowns[1].conversation > breakdowns[0].conversation,
+            "conversation must grow between steps: step1={} step2={}",
+            breakdowns[0].conversation,
+            breakdowns[1].conversation
+        );
+
+        // Overhead must be positive (provider total > local sum): the
+        // provider reports 1000 / 1200 prompt tokens, which includes
+        // wrapping the local estimate doesn't capture.
+        assert!(breakdowns[0].overhead > 0);
+        assert!(breakdowns[1].overhead > 0);
+    }
+
+    /// `StaticBreakdownCache::build` must partition specs into eager
+    /// vs deferred via `ToolRegistry::is_deferred_spec`. We can't easily
+    /// register a deferred spec on a `default()` registry, so the
+    /// zero-spec case must produce zero tokens and the cache must not
+    /// crash.
+    #[test]
+    fn static_breakdown_cache_build_zero_specs_yields_zero_tokens() {
+        let segments = crate::system_prompt::PromptSegments::default();
+        let registry = crate::tools::ToolRegistry::default();
+        let cache = StaticBreakdownCache::build(&segments, &[], &registry);
+        assert_eq!(cache.system_prompt, 0);
+        assert_eq!(cache.rules, 0);
+        assert_eq!(cache.skills, 0);
+        assert_eq!(cache.subagents, 0);
+        assert_eq!(cache.tools, 0);
+        assert_eq!(cache.mcp_dynamic, 0);
+    }
+
+    /// `StaticBreakdownCache::build` must tokenise each segment's
+    /// length using chars/4 ceil, identical to `llm::estimate_tokens`.
+    #[test]
+    fn static_breakdown_cache_build_tokenises_segments() {
+        // 9-char segment → ceil(9/4) = 3 tokens. (9/4 = 2.25, ceil = 3.)
+        let segments = crate::system_prompt::PromptSegments {
+            rules: "012345678".into(),          // 9 chars
+            system_prompt: "1234567890".into(), // 10 chars → 3 tokens (10/4=2.5, ceil=3)
+            skills: "abcde".into(),             // 5 chars → 2 tokens (5/4=1.25, ceil=2)
+            subagents: "abcdefgh".into(),       // 8 chars → 2 tokens (8/4=2.0, ceil=2)
+        };
+        let registry = crate::tools::ToolRegistry::default();
+        let cache = StaticBreakdownCache::build(&segments, &[], &registry);
+        assert_eq!(cache.rules, 3, "9 chars / 4 = 2.25 → ceil = 3");
+        assert_eq!(cache.system_prompt, 3, "10 chars / 4 = 2.5 → ceil = 3");
+        assert_eq!(cache.skills, 2, "5 chars / 4 = 1.25 → ceil = 2");
+        assert_eq!(cache.subagents, 2, "8 chars / 4 = 2.0 → ceil = 2");
     }
 }

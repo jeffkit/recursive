@@ -240,6 +240,9 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
             cache_hit_tokens: cache_hit_tokens as u64,
             cache_miss_tokens: cache_miss_tokens as u64,
         }),
+        AgentEvent::ContextBreakdown { breakdown, .. } => {
+            Some(UiEvent::ContextBreakdown { breakdown })
+        }
         AgentEvent::Latency { llm_ms, .. } => Some(UiEvent::Latency { llm_ms }),
         AgentEvent::Compacted { removed, kept, .. } => Some(UiEvent::Compacted { removed, kept }),
         AgentEvent::TurnFinished { .. } => Some(UiEvent::TurnFinished),
