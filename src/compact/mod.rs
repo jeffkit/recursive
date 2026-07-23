@@ -91,6 +91,19 @@ impl Compactor {
             .sum()
     }
 
+    /// Decide whether compaction should run, preferring the token-based
+    /// threshold (accurate, CJK-safe) when actual API `prompt_tokens` are
+    /// available, falling back to the char estimate.
+    ///
+    /// `last_prompt_tokens` of `0` means "no API reading yet" (first step,
+    /// or a provider that never reports usage) — the char estimate is used.
+    pub fn should_compact(&self, estimate_chars: usize, last_prompt_tokens: u32) -> bool {
+        match (self.threshold_prompt_tokens, last_prompt_tokens) {
+            (Some(token_threshold), actual) if actual > 0 => actual >= token_threshold,
+            _ => estimate_chars >= self.threshold_chars,
+        }
+    }
+
     /// JSON schema for structured compaction output.
     const COMPACT_SCHEMA: &'static str = r#"{"type":"object","properties":{"summary":{"type":"string","description":"1-3 paragraph summary of the conversation so far, preserving key decisions, file paths touched, and outcomes."},"kept_facts":{"type":"array","items":{"type":"string"},"description":"Discrete facts worth remembering across compaction (e.g. 'goal=add_X_to_Y', 'compaction happened at step N', 'tool X failed 3 times')."},"next_steps":{"type":"array","items":{"type":"string"},"description":"Outstanding TODOs the agent identified before compaction (each one a single-sentence imperative)."}},"required":["summary","kept_facts"]}"#;
 
@@ -464,6 +477,54 @@ mod tests {
         assert_eq!(c.threshold_chars, 500_000);
         assert_eq!(c.threshold_prompt_tokens, Some(144_000));
         assert_eq!(c.keep_recent_n, 8);
+    }
+
+    // ========================================================================
+    // should_compact tests (Goal 330)
+    // ========================================================================
+
+    #[test]
+    fn should_compact_uses_token_threshold_when_available() {
+        let c = Compactor::new(usize::MAX).threshold_prompt_tokens(1000);
+        // At threshold → true
+        assert!(c.should_compact(0, 1000));
+        // Below threshold → false
+        assert!(!c.should_compact(0, 999));
+        // Far below → false
+        assert!(!c.should_compact(0, 1));
+    }
+
+    #[test]
+    fn should_compact_falls_back_to_chars_when_tokens_zero() {
+        let c = Compactor::new(500).threshold_prompt_tokens(1000);
+        // last_prompt_tokens = 0 means no reading yet → use char threshold
+        // 600 chars >= 500 → true
+        assert!(c.should_compact(600, 0));
+        // 400 chars < 500 → false
+        assert!(!c.should_compact(400, 0));
+    }
+
+    #[test]
+    fn should_compact_falls_back_to_chars_when_threshold_none() {
+        let c = Compactor::new(500);
+        assert_eq!(c.threshold_prompt_tokens, None);
+        // 600 chars >= 500 → true
+        assert!(c.should_compact(600, 42));
+        // 400 chars < 500 → false
+        assert!(!c.should_compact(400, 42));
+    }
+
+    #[test]
+    fn should_compact_zero_token_threshold_fires_on_zero() {
+        // threshold_prompt_tokens = Some(0) is a degenerate case:
+        // only match when last_prompt_tokens == 0, the predicate
+        // guard `actual > 0` prevents it, so it falls through to char.
+        let c = Compactor::new(usize::MAX).threshold_prompt_tokens(0);
+        // last_prompt_tokens = 0 → guard fails, falls to char threshold
+        // usize::MAX chars → 0 >= usize::MAX is false
+        assert!(!c.should_compact(0, 0));
+        // With actual > 0, guard is active: 1 >= 0 is true
+        assert!(c.should_compact(0, 1));
     }
 
     // ========================================================================

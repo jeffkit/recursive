@@ -320,6 +320,7 @@ impl AgentKernel {
                 globs_skills: self.globs_skills.clone(),
                 prompt_segments: ctx.prompt_segments,
                 static_breakdown,
+                last_prompt_tokens: 0,
             }
         };
 

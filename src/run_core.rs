@@ -147,6 +147,10 @@ pub(crate) struct RunCore<'a> {
     /// re-tokenise `PromptSegments` every step. The `conversation`
     /// bucket is recomputed every step from `self.messages`.
     pub(crate) static_breakdown: StaticBreakdownCache,
+    /// Goal-330: `prompt_tokens` from the most recent LLM response, used
+    /// by [`Compactor::should_compact`] intra-turn. `0` means "no reading
+    /// yet" (first step, or provider never reports usage).
+    pub(crate) last_prompt_tokens: u32,
 }
 
 /// Goal-328: cached token counts for the static breakdown buckets.
@@ -353,6 +357,7 @@ impl<'a> RunCore<'a> {
 
         if let Some(u) = completion.usage {
             *total_usage = total_usage.accumulate(u);
+            self.last_prompt_tokens = u.prompt_tokens;
             self.emit(AgentEvent::Usage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
@@ -783,7 +788,7 @@ impl<'a> RunCore<'a> {
         };
 
         let chars = Compactor::estimate_chars(&self.messages);
-        if chars < compactor.threshold_chars {
+        if !compactor.should_compact(chars, self.last_prompt_tokens) {
             return Ok(());
         }
 
@@ -1415,6 +1420,7 @@ mod tests {
             globs_skills: vec![],
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
+            last_prompt_tokens: 0,
         }
     }
 
@@ -1898,6 +1904,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn maybe_compact_uses_token_threshold_intra_turn() {
+        // Goal-330 regression: intra-turn maybe_compact must use the
+        // token-based threshold when `last_prompt_tokens` is available,
+        // even if the char threshold is high enough that it alone would
+        // NOT fire.
+        use crate::compact::Compactor;
+        use crate::llm::{Completion, MockProvider};
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+            Message::user("msg3".to_string()),
+        ];
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "token-threshold triggered summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider;
+        // Set high char threshold (would NOT fire on this transcript)
+        // and low token threshold (WILL fire when last_prompt_tokens is set).
+        let chars = crate::compact::Compactor::estimate_chars(&core.messages);
+        core.compactor = Some(
+            Compactor::new(chars + 1000) // char threshold too high
+                .threshold_prompt_tokens(500) // low token threshold
+                .keep_recent_n(2),
+        );
+        // Set last_prompt_tokens above the token threshold.
+        core.last_prompt_tokens = 500;
+
+        let result = core.maybe_compact(1).await;
+        assert!(result.is_ok());
+        assert!(
+            core.messages[0].is_compaction_summary,
+            "compaction must fire via token threshold even though chars are below char threshold"
+        );
+    }
+
     /// Kills: `delete ! in RunCore<'a>::execute_tool_calls` at line 306.
     ///
     /// When `exploring_plan_mode == false` and the registry's mode is Plan,
@@ -2039,6 +2090,7 @@ mod tests {
             globs_skills: vec![],
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
+            last_prompt_tokens: 0,
         }
     }
 

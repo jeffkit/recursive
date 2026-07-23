@@ -378,16 +378,10 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        // Prefer the token-based threshold when actual API usage data is
-        // available; fall back to the character estimate otherwise.
-        let should_compact = match (compactor.threshold_prompt_tokens, last_prompt_tokens) {
-            (Some(token_threshold), actual) if actual > 0 => actual >= token_threshold,
-            _ => Compactor::estimate_chars(&self.transcript) >= compactor.threshold_chars,
-        };
-        if !should_compact {
+        let chars = Compactor::estimate_chars(&self.transcript);
+        if !compactor.should_compact(chars, last_prompt_tokens) {
             return Ok(());
         }
-        let chars = Compactor::estimate_chars(&self.transcript);
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: chars,
         });
