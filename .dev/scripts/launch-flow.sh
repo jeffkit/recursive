@@ -23,6 +23,14 @@
 
 set -euo pipefail
 
+# ── 确保 cargo 工具链在 PATH 里（根治「cargo-mutants not found」假报错）────
+# flow 的 preflight.gate-prereqs 调 `cargo mutants --version`；若启动本脚本的 shell
+# 没把 ~/.cargo/bin 放进 PATH（非 login/非交互 shell 不会 source ~/.cargo/env），
+# `cargo` 本身就找不到，execFileSync 抛 ENOENT，catch 却笼统报「cargo-mutants
+# not found」——方向误导。这里无条件前置 ~/.cargo/bin，让 flow 不依赖父 shell 的 PATH。
+# （2026-07-23 g329 事故：14:50/14:53 两次 flow 因此崩在 preflight，supervisor 还以为在跑。）
+export PATH="$HOME/.cargo/bin:$PATH"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FLOW_SCRIPT="$REPO_ROOT/.dev/flows/self-improve.flow.js"
 LOGS_DIR="$REPO_ROOT/.flowcast/logs"

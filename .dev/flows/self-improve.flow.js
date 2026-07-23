@@ -287,7 +287,32 @@ if (opts['commit-pending']) {
   process.exit(process.exitCode ?? 0)
 }
 
-await main()
+// ── 顶层崩溃兜底（2026-07-23 g329 事故）──────────────────────────────
+// 旧实现 `await main()` 裸跑：preflight 同步 throw（如 gate-prereqs 的 ENOENT）
+// 直接穿透到顶层，Node 打印栈后非 0 退出，但 state.json 永远停在 "running"，
+// events.jsonl 也只有 `start` —— supervisor 读不到终态，把「死 flow」误判成
+// 「idle/健康，No intervention needed」，空转到天荒地老。这里兜一层：任何未捕获
+// 的崩溃都落盘 failed 状态 + emit 'fatal' 事件，让 supervisor 下次心跳能看见。
+// PauseSignal 是 pause() 主动抛的（status 已置 'paused'），不算崩溃，放行。
+try {
+  await main()
+} catch (err) {
+  if (cp.status !== 'paused') {
+    try {
+      cp.state.status = 'failed'
+      cp.state.error = String(err?.message ?? err)
+      cp.state.failedAt = new Date().toISOString()
+      if (cp.state.currentStep) cp.state.failedStep = cp.state.currentStep
+      cp.flush()
+    } catch { /* best-effort：落盘失败不应掩盖原始错误 */ }
+    emitEvent('fatal', {
+      error: String(err?.message ?? err).slice(0, 500),
+      step: cp.state.currentStep ?? null,
+      stack: String(err?.stack ?? '').slice(0, 2000),
+    })
+  }
+  throw err // 保留 Node 打印栈 + 非 0 退出的既有行为，便于 tmux 日志诊断
+}
 
 // ── --commit-pending 补提交实现 ───────────────────────────────────
 
@@ -1466,7 +1491,20 @@ async function assertGatePrereqs(repoPath) {
   try {
     execFileSync('cargo', ['mutants', '--version'], { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     console.log('  [gate-prereqs] cargo-mutants OK')
-  } catch {
+  } catch (e) {
+    // 区分两种失败，避免方向误导（2026-07-23 g329 事故）：
+    //   - ENOENT：`cargo` 本身不在 PATH（~/.cargo/bin 没进 PATH，最常见）。
+    //     旧实现笼统报「cargo-mutants not found」，让人去查 cargo-mutants 装没装，
+    //     实际 cargo-mutants 27.1.0 装得好好的，是 cargo 找不到。
+    //   - 非零退出：cargo 在，但 `mutants` 子命令缺失 → 才是真的 cargo-mutants 没装。
+    if (e?.code === 'ENOENT') {
+      throw new Error(
+        'gate-prereqs: `cargo` not found on PATH — is ~/.cargo/bin in PATH?\n' +
+        '  The flow runs `cargo mutants --version`; without cargo on PATH the mutant gates cannot run.\n' +
+        '  Fix: `source ~/.cargo/env`, or launch via .dev/scripts/launch-flow.sh (it prepends ~/.cargo/bin).\n' +
+        '  (cargo-mutants itself is probably installed fine — this is a PATH issue, not an install issue.)'
+      )
+    }
     throw new Error(
       'mutant gate prereq missing: cargo-mutants not found. ' +
       'Install it once (`cargo install cargo-mutants`) before running self-improve — ' +

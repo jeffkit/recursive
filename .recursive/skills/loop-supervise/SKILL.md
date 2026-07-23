@@ -53,9 +53,28 @@ event schema, and intervention rules.
    cadence — long enough that idle ticks aren't pure overhead (e.g. 120–300s).
    This is your safety net if neither bg-completion nor watch fires.
 5. **On each wake** (bg-complete / event-watch / heartbeat / user):
+   - **Probe liveness FIRST.** Before concluding "healthy / no intervention",
+     verify the supervised process is actually still alive — a **dead**
+     process produces no new log/event bytes, which looks identical to
+     "alive but slow". Check the `run_background` job status (or, for a
+     tmux/nohup launch, `pgrep -f <run-id>` / the tmux pane's foreground
+     process). Only say "healthy, no intervention" if the process is alive
+     OR you've seen a terminal event/verdict. If the process is gone AND
+     no terminal event (e.g. `verdict` / `fatal` / a non-zero exit) was
+     emitted AND `state.json` still says `running` → that's a **crash,
+     intervene** (see below), not "idle". This is the single most
+     important check — without it you will narrate "No intervention
+     needed" over a corpse (observed 2026-07-23: a flow crashed in
+     preflight, supervisor idled indefinitely watching its corpse's
+     events.jsonl).
    - Read the new log lines / event payload since last check.
-   - **Healthy progress** → re-arm the heartbeat (maybe lean the delay longer).
-     Do NOT intervene.
+   - **Healthy progress** (process alive OR terminal event seen) → re-arm
+     the heartbeat (maybe lean the delay longer). Do NOT intervene.
+   - **Crashed** (process gone, no terminal event, state still `running`)
+     → **intervene**: read the tmux pane / tee'd log tail for the stack
+     trace, diagnose, apply the minimal fix (PATH/dep/config), then
+     re-launch or resume. Do NOT just re-arm the heartbeat over a dead
+     process.
    - **Recoverable problem** (missing prerequisite, transient error, a config
      the command can't fix itself) → **intervene**: diagnose (read the command's
      source/config), apply the minimal fix (edit, install dep, start a service),
