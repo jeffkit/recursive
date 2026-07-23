@@ -36,8 +36,13 @@ into a skill; keep `/loop <prompt>` as the single natural-language entry.
   arbiter are unchanged — only the hardcoded subcommand + SOP moved to the
   skill layer.
 - Gates: fmt / clippy `-D warnings` / `cargo test --workspace` clean;
-  `tui-test-presence` PASS. `tui-mutants` (advisory) to be run scoped to
-  `commands.rs` after commit.
+  `tui-test-presence` PASS. `tui-mutants` (advisory) run scoped to
+  `commands.rs`: after fixing pre-existing survivors in `model_picker_state`
+  (extracted `picker_entry_is_active` helper + 4 tests, commit 10c9d0b) and
+  `build_model_picker_lines` (strengthened active/selected/ctx-label/style
+  assertions + additive `ctx_label_boundary` test, commit 43f56c6), a full
+  parallel run (`--jobs 6`) completed: **149 mutants, 121 caught + 28
+  unviable, 0 MISSED**. commands.rs is now mutation-clean.
 - UX now: `/loop <自然语言>` is the only entry; `start`/`stop`/`trigger` remain
   as explicit lifecycle overrides. Generic monitoring = `loop-supervise`
   skill; self-improve = `recursive-loop` skill. Rust has only the loop primitive.
