@@ -809,30 +809,81 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
     }
   }
 
-  // ⑤ 全绿 → 将 worktree 改动 cherry-pick 回 main checkout，再统一提交
+  // ⑤ 全绿 → 将 worktree 改动落地到 main checkout
   if (opts['no-commit']) return { verdict: 'skip-commit', detail: '--no-commit' }
-  await cp.step('commit', () => {
-    // 在 worktree 创建一个临时提交，包含 agent 的所有改动（含新增文件）
+
+  // ⑤a 在 worktree 提交 agent 改动，并判定 main 是否在 baseline 之后被推进过
+  //    （并发 flow 已落地 / 外部 admin merge）。main 未动 → 快路径直接 cherry-pick；
+  //    main 已动 → 慢路径 rebase 到当前 mainHead + 在合并树上重跑门（见 ⑤b/c）。
+  const prep = await cp.step('commit.prep', () => {
     git(['add', '-A'], worktreeDir)
+    if (!worktreeDirty(worktreeDir)) return { empty: true }
     git(['commit', '-m', `wt: ${goalSubject()}`], worktreeDir)
-    const wtSha = git(['rev-parse', 'HEAD'], worktreeDir)
-    // 安全网：cherry-pick 前确认 main checkout 没在 baseline 之后被推进过
-    // （并发 admin merge / 另一个 run 已落地）。若被推进，直接拒绝落地——
-    // 绝不 reset --hard baseline（那会吃掉别人的提交）。worktree 提交已在 wtSha 保留。
-    const mainHead = git(['rev-parse', 'HEAD'], repo)
-    if (mainHead !== baseline) {
-      throw new Error(
-        `main checkout moved since baseline (baseline=${baseline.slice(0, 8)} HEAD=${mainHead.slice(0, 8)}); ` +
-        `refusing to cherry-pick to avoid clobbering unrelated commits. Worktree commit: ${wtSha.slice(0, 8)}`,
-      )
+    const s = git(['rev-parse', 'HEAD'], worktreeDir)
+    const m = git(['rev-parse', 'HEAD'], repo)
+    return { wtSha: s, mainHead: m, mainMoved: m !== baseline }
+  })
+  if (prep.empty) return { verdict: 'skip-commit', detail: 'no changes in worktree' }
+  let wtSha = prep.wtSha
+  const mainHead = prep.mainHead
+
+  if (!prep.mainMoved) {
+    // 快路径：main 仍在 baseline，cherry-pick 即落地（落下的 == 被门验过的 B0+ours）。
+    await cp.step('commit.land', () => {
+      try {
+        git(['cherry-pick', '--no-commit', wtSha], repo)
+      } catch (err) {
+        try { git(['cherry-pick', '--abort'], repo) } catch { /* 未进入 cherry-pick 状态 */ }
+        throw new Error(`cherry-pick conflict landing ${wtSha.slice(0, 8)}: ${err.message}`)
+      }
+      git(['commit', '-m', `self-improve: ${goalSubject()}`], repo)
+      return git(['rev-parse', 'HEAD'], repo)
+    })
+    return { verdict: 'committed' }
+  }
+
+  // ⑤b 慢路径：main 已推进。把 worktree 提交 rebase 到当前 mainHead 之上，
+  //    得到 B1+ours（= 即将落下的真实树）。worktree 是 detached HEAD（gitWorktreeAdd --detach），
+  //    `git rebase <mainHead>` 把 wtSha 重放到 mainHead 之上。冲突 → abort → preserve。
+  //    返回 rebased full sha（非短 sha），从返回值赋给 wtSha——resume 时 cp.step 跳过回调、
+  //    返回缓存值，若靠回调内副作用赋值，wtSha 会退回 pre-rebase 旧 sha，cherry-pick 错树。
+  const rebasedSha = await cp.step('commit.rebase', () => {
+    try {
+      git(['rebase', mainHead], worktreeDir)
+    } catch (err) {
+      try { git(['rebase', '--abort'], worktreeDir) } catch { /* 未进入 rebase 状态 */ }
+      throw new Error(`rebase conflict onto ${mainHead.slice(0, 8)} (worktree ${wtSha.slice(0, 8)}): ${err.message}`)
     }
-    // cherry-pick 到 main checkout（--no-commit 保留暂存区，由我们写最终 message）；
-    // 冲突时 abort 进行中的 cherry-pick 保持 repo 索引/工作树干净，再上抛（不 reset）。
+    return git(['rev-parse', 'HEAD'], worktreeDir) // rebase 后的新 full SHA = B1+ours
+  })
+  wtSha = rebasedSha
+
+  // ⑤c 在 rebased worktree（= B1+ours，即将落下的真实树）上重跑完整质量门。
+  //    不带 resume-fix 循环：rebase 引入的语义冲突（兄弟 flow 改了与自己交互的代码）
+  //    交给 preserve/人处理——agent 已收工，不再自动改。门红 → preserve。
+  //    （mutant 门按 diff 自跳，disjoint-files 并发下开销与首轮相同；test/clippy/fmt/e2e
+  //    重验合并树，保证「落下的 == 被门验过的」在并发下仍成立。）
+  try {
+    await runRegate(worktreeDir)
+  } catch (err) {
+    writeFailureContext(cp.dir, 'recursive', {
+      reason: `regate '${err.gate}' failed after rebase onto ${mainHead.slice(0, 8)}`,
+      tailLog: (err.output ?? '').slice(-2000), provider: opts.provider, model: opts.model,
+    })
+    return preserveScene({
+      worktreeDir, baseline,
+      reason: `regate '${err.gate}' failed after rebase onto ${mainHead.slice(0, 8)} (sibling interaction)`,
+      failureOutput: err.output ?? '', tag: `regate-${err.gate}`,
+    })
+  }
+
+  // ⑤d rebase+regate 全绿 → cherry-pick rebased wtSha（其父即 mainHead，故无冲突）落地。
+  await cp.step('commit.land', () => {
     try {
       git(['cherry-pick', '--no-commit', wtSha], repo)
     } catch (err) {
       try { git(['cherry-pick', '--abort'], repo) } catch { /* 未进入 cherry-pick 状态 */ }
-      throw new Error(`cherry-pick conflict landing ${wtSha.slice(0, 8)}: ${err.message}`)
+      throw new Error(`cherry-pick conflict landing rebased ${wtSha.slice(0, 8)}: ${err.message}`)
     }
     git(['commit', '-m', `self-improve: ${goalSubject()}`], repo)
     return git(['rev-parse', 'HEAD'], repo)
@@ -913,6 +964,23 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
         }
       }
     }
+  }
+}
+
+/**
+ * rebase 后在 rebased worktree（= 即将落下的真实树 B1+ours）上重跑完整质量门。
+ * 与 runQualityGates 的区别：
+ *   - step key 用 `regate.<name>`（`gate.<name>` 已 completed，cp.step 会跳过），故不 no-op；
+ *   - 不带 resume-fix 循环：rebase 引入的语义冲突交给 preserve/人，agent 已收工不再自动改；
+ *   - 门红即抛（runGate onFail='rollback'），由调用方转 preserveScene。
+ * mutant 门按 diff 自跳（disjoint-files 并发下开销与首轮相同）；test/clippy/fmt/e2e 重验合并树。
+ */
+async function runRegate(worktreeDir) {
+  const builtin = qualityGatesFor(worktreeDir)
+  const projectGates = await loadGates({ repo })
+  const gates = mergeGates(builtin, projectGates).map(g => normalizeGate(g, worktreeDir))
+  for (const g of gates) {
+    await cp.step(`regate.${g.name}`, () => runGate(g, { resumeFix: null }))
   }
 }
 
