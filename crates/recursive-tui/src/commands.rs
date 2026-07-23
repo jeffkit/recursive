@@ -998,6 +998,19 @@ pub fn collect_model_picker_entries(active_preset: Option<&str>) -> Vec<ModelPic
 /// list with a `✓`. Its `preset_id` is empty — `confirm_command_panel`
 /// treats an empty preset id as a no-op re-affirm (the model is already
 /// running) rather than dispatching `SwitchModel`.
+/// Whether a picker entry is the currently-running model. Both the preset id
+/// AND the model name must match (an entry is "active" only when the running
+/// model came from that exact preset). Extracted as a pure helper so the
+/// match semantics can be unit-tested without the config-dependent
+/// `collect_model_picker_entries`.
+fn picker_entry_is_active(
+    e: &ModelPickerEntry,
+    active_preset: Option<&str>,
+    active_model: &str,
+) -> bool {
+    Some(e.preset_id.as_str()) == active_preset && e.model == active_model
+}
+
 fn model_picker_state(
     active_preset: Option<&str>,
     active_model: &str,
@@ -1005,7 +1018,7 @@ fn model_picker_state(
     let entries = collect_model_picker_entries(active_preset);
     let active_idx = entries
         .iter()
-        .position(|e| Some(e.preset_id.as_str()) == active_preset && e.model == active_model);
+        .position(|e| picker_entry_is_active(e, active_preset, active_model));
     let (entries, active_idx) = match active_idx {
         Some(idx) => (entries, idx),
         None => {
@@ -2346,6 +2359,62 @@ mod tests {
             entries, sorted,
             "entries should be sorted by preset then model"
         );
+    }
+
+    #[test]
+    fn picker_entry_is_active_true_when_preset_and_model_both_match() {
+        let e = ModelPickerEntry {
+            preset_id: "p".into(),
+            preset_name: "P".into(),
+            model: "m".into(),
+            context_window: 0,
+            pricing: None,
+        };
+        assert!(picker_entry_is_active(&e, Some("p"), "m"));
+    }
+
+    #[test]
+    fn picker_entry_is_active_false_when_preset_matches_but_model_differs() {
+        // Kills the `&& → ||` mutant: with `||`, a matching preset alone
+        // would wrongly mark this entry active.
+        let e = ModelPickerEntry {
+            preset_id: "p".into(),
+            preset_name: "P".into(),
+            model: "other".into(),
+            context_window: 0,
+            pricing: None,
+        };
+        assert!(!picker_entry_is_active(&e, Some("p"), "m"));
+    }
+
+    #[test]
+    fn picker_entry_is_active_false_when_model_matches_but_preset_differs() {
+        // Kills the `&& → ||` mutant from the other side, and the preset
+        // `== → !=` mutant (a mismatched preset must NOT be active).
+        let e = ModelPickerEntry {
+            preset_id: "other".into(),
+            preset_name: "Other".into(),
+            model: "m".into(),
+            context_window: 0,
+            pricing: None,
+        };
+        assert!(!picker_entry_is_active(&e, Some("p"), "m"));
+    }
+
+    #[test]
+    fn picker_entry_is_active_false_when_active_preset_is_none() {
+        // When no preset is active, no entry is active — even if its model
+        // name matches. Kills the preset `== → !=` mutant: with `!=`,
+        // `Some(preset_id) != None` is always true, so a matching model would
+        // wrongly be marked active.
+        let e = ModelPickerEntry {
+            preset_id: "p".into(),
+            preset_name: "P".into(),
+            model: "m".into(),
+            context_window: 0,
+            pricing: None,
+        };
+        assert!(!picker_entry_is_active(&e, None, "m"));
     }
 
     #[test]
