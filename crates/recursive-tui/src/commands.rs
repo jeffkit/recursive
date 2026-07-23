@@ -2418,7 +2418,43 @@ mod tests {
     }
 
     #[test]
+    fn build_model_picker_lines_ctx_label_boundary() {
+        // Additive boundary test for the `context_window > 0` ctx_label branch
+        // (line ~1096): 0 → "—", any positive value → "<N>K ctx". Isolates
+        // the boundary from the active/selected/style concerns of the main
+        // test.
+        let pos = vec![ModelPickerEntry {
+            preset_id: "p".into(),
+            preset_name: "P".into(),
+            model: "m".into(),
+            context_window: 4_096,
+            pricing: None,
+        }];
+        let lines = build_model_picker_lines(&pos, "m", 0, 0);
+        // [0]=header, [1]=blank, [2]=entry.
+        let row: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(row.contains("4K ctx"), "positive ctx → 4K ctx: {row:?}");
+        assert!(!row.contains('—'), "positive ctx must not show —: {row:?}");
+
+        let zero = vec![ModelPickerEntry {
+            preset_id: "p".into(),
+            preset_name: "P".into(),
+            model: "m".into(),
+            context_window: 0,
+            pricing: None,
+        }];
+        let lines = build_model_picker_lines(&zero, "m", 0, 0);
+        let row: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(row.contains('—'), "zero ctx → —: {row:?}");
+        assert!(
+            !row.contains("ctx"),
+            "zero ctx must not show K ctx: {row:?}"
+        );
+    }
+
+    #[test]
     fn build_model_picker_lines_marks_active_and_selected_rows() {
+        use ratatui::style::{Color, Modifier};
         let entries = vec![
             ModelPickerEntry {
                 preset_id: "alpha".into(),
@@ -2443,20 +2479,80 @@ mod tests {
             "header should name the active model: {text:?}"
         );
         assert!(
-            text.contains('✓'),
-            "active row should carry a checkmark: {text:?}"
-        );
-        assert!(
-            text.contains('▶'),
-            "selected row should carry the cursor: {text:?}"
-        );
-        assert!(
             text.contains("$1/$5 per Mtok"),
             "pricing should render for the priced entry: {text:?}"
         );
         assert!(
             text.contains("no pricing"),
             "missing pricing should render a placeholder: {text:?}"
+        );
+
+        // Row layout: [0]=header, [1]=blank, [2]=alpha, [3]=beta. active=1
+        // (beta), selected=0 (alpha) — deliberately distinct rows so a wrong
+        // `==`/`!=` comparator puts the marker on the OTHER row and is caught.
+        let alpha_row = &lines[2];
+        let beta_row = &lines[3];
+        let alpha_text: String = alpha_row.spans.iter().map(|s| s.content.as_ref()).collect();
+        let beta_text: String = beta_row.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        // ctx_label pins `context_window > 0` (line ~1096): alpha (128000>0)
+        // → "128K ctx"; beta (0) → "—". Kills `> → ==`/`<`/`>=`.
+        assert!(
+            alpha_text.contains("128K ctx"),
+            "alpha ctx label: {alpha_text:?}"
+        );
+        assert!(
+            beta_text.contains('—') && !beta_text.contains("ctx"),
+            "beta ctx label should be — (context_window 0): {beta_text:?}"
+        );
+
+        // ▶ cursor on the SELECTED row (alpha), not on beta.
+        assert!(
+            alpha_text.contains('▶'),
+            "selected row has cursor: {alpha_text:?}"
+        );
+        assert!(
+            !beta_text.contains('▶'),
+            "non-selected row has no cursor: {beta_text:?}"
+        );
+
+        // ✓ checkmark on the ACTIVE row (beta), not on alpha. Kills
+        // `i == active_idx → !=` (line ~1115): the mutant would put ✓ on alpha.
+        assert!(
+            beta_text.contains('✓'),
+            "active row has checkmark: {beta_text:?}"
+        );
+        assert!(
+            !alpha_text.contains('✓'),
+            "non-active row has no checkmark: {alpha_text:?}"
+        );
+
+        // name_style pins `i == selected` (line ~1089): the selected row's
+        // model-name span is Yellow + BOLD; a non-selected row's is White.
+        // The `== → !=` mutant would swap these.
+        let alpha_name = alpha_row
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "a-1")
+            .expect("alpha name span");
+        assert_eq!(
+            alpha_name.style.fg,
+            Some(Color::Yellow),
+            "selected row name should be Yellow"
+        );
+        assert!(
+            alpha_name.style.add_modifier.contains(Modifier::BOLD),
+            "selected row name should be BOLD"
+        );
+        let beta_name = beta_row
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "b-2")
+            .expect("beta name span");
+        assert_eq!(
+            beta_name.style.fg,
+            Some(Color::White),
+            "non-selected row name should be White"
         );
     }
 
