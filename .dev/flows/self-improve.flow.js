@@ -1458,8 +1458,13 @@ async function assertGatePrereqs(repoPath) {
   console.log('  [gate-prereqs] e2e prereqs OK')
 
   // ── mutant 前置：cargo-mutants ──
+  // NOTE: invoke as `cargo mutants --version`, not `cargo-mutants --version`.
+  // cargo-mutants 27.x is a cargo subcommand: a bare `cargo-mutants --version`
+  // exits 1 ("unexpected argument '--version'"), which would trip this prereq
+  // even though the binary is installed and working. `cargo mutants --version`
+  // exits 0 on the same install.
   try {
-    execFileSync('cargo-mutants', ['--version'], { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    execFileSync('cargo', ['mutants', '--version'], { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     console.log('  [gate-prereqs] cargo-mutants OK')
   } catch {
     throw new Error(
