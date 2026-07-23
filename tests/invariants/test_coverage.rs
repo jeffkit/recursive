@@ -24,7 +24,7 @@ const MUST_HAVE_TESTS: &[&str] = &[
     "src/error.rs",
     "src/message.rs",
     "src/config.rs",
-    "src/compact.rs",
+    "src/compact/mod.rs",
     "src/transcript.rs",
     "src/cost.rs",
     "src/llm/mod.rs",
