@@ -13,12 +13,16 @@ into a skill; keep `/loop <prompt>` as the single natural-language entry.
   a natural-language goal (the agent loads the `loop-supervise` skill from the
   goal text). Updated the `/loop` command summary/usage to drop `supervise`.
 - `crates/recursive-tui/src/supervise_sop.md` — deleted.
-- `.claude/skills/loop-supervise/SKILL.md` (new) — the generic monitor+intervene
-  playbook as a `mode: trigger` skill (triggers: supervise/monitor/watch/盯…).
-  Command-agnostic; the command comes from the user's natural-language prompt.
-  Points to `recursive-loop` for the project-specific self-improve flow.
-- `.claude/skills/recursive-loop/SKILL.md` — §3/§3.5 reworked to recommend
-  `/loop <自然语言>` + the `loop-supervise` skill instead of `/loop supervise`.
+- `.recursive/skills/loop-supervise/SKILL.md` (new, tracked) — the generic
+  monitor+intervene playbook as a `mode: trigger` skill (triggers:
+  supervise/monitor/watch/盯…). Command-agnostic; the command comes from the
+  user's natural-language prompt. Points to `recursive-loop` for the
+  project-specific self-improve flow. (Shipped skills live in
+  `.recursive/skills/`, which is tracked; `.claude/skills/` is gitignored,
+  per-user — that's where the `recursive-loop` skill lives.)
+- `.claude/skills/recursive-loop/SKILL.md` (local, gitignored) — §3/§3.5
+  reworked to recommend `/loop <自然语言>` + the `loop-supervise` skill instead
+  of `/loop supervise`. (Local-only, like the rest of `.claude/`.)
 **Tests added**:
 - `cmd_loop_supervise_now_natural_language_goal` — `/loop supervise <cmd>`
   now yields goal = the whole line (no SOP injected), unlimited.
