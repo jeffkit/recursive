@@ -38,7 +38,8 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -63,6 +64,7 @@ impl Drop for RawModeGuard {
     // mutation of the drop body.
     #[cfg_attr(test, mutants::skip)]
     fn drop(&mut self) {
+        let _ = io::stdout().execute(DisableBracketedPaste);
         let _ = io::stdout().execute(DisableMouseCapture);
         let _ = io::stdout().execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();
@@ -158,6 +160,7 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableMouseCapture)?;
+    io::stdout().execute(EnableBracketedPaste)?;
     let _guard = RawModeGuard;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -183,6 +186,7 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
                             }
                         }
                         Event::Mouse(mev) => handle_mouse(&mut app, mev),
+                        Event::Paste(text) => app.handle_paste(&text),
                         _ => {}
                     }
                 }

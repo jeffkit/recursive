@@ -405,6 +405,38 @@ impl App {
         self.prompt.insert_char(c);
     }
 
+    /// Insert pasted text into the prompt buffer at the cursor,
+    /// preserving newlines. Never submits, never triggers first-char
+    /// mode auto-detect (`!`/`#`/`/`/`@`) — a paste is raw content,
+    /// not typed input.
+    ///
+    /// Guard predicates mirror the early-return checks at the top of
+    /// [`handle_key`]: if a permission modal / plan approval / plan-
+    /// mode request / interactive panel / modal stack is active, the
+    /// paste is dropped so it cannot corrupt dialog state.
+    pub fn handle_paste(&mut self, text: &str) {
+        // ── Guard: drop paste while any dialog is active ──────────
+        if self.pending_permission.is_some() {
+            return;
+        }
+        if self.prompt.mode == InputMode::CommandInteract {
+            return;
+        }
+        if self.plan_awaiting_approval {
+            return;
+        }
+        if self.plan_mode_request_pending {
+            return;
+        }
+        if !self.modals.is_empty() {
+            return;
+        }
+
+        for c in text.chars() {
+            self.prompt.insert_char(c);
+        }
+    }
+
     /// Dispatch the current buffer based on the active mode. Returns
     /// the [`UserAction`] (if any) the caller must forward to the
     /// backend worker. Always resets the prompt to a clean state.
@@ -2214,6 +2246,145 @@ mod prompt_input_tests {
         assert_eq!(strip_history_prefix("/cmd").0, InputMode::Command);
         assert_eq!(strip_history_prefix("hello").0, InputMode::Prompt);
         assert_eq!(strip_history_prefix("!ls").1, "ls");
+    }
+}
+
+// ── Goal-343: bracketed paste tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod paste_tests {
+    use crate::app::{App, AppScreen, InputMode};
+    use crate::events::PermissionRequest;
+    use crate::ui::modal::Modal;
+
+    fn fresh_app() -> App {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app
+    }
+
+    #[test]
+    fn paste_inserts_text_into_buffer_without_submitting() {
+        let mut app = fresh_app();
+        app.handle_paste("hello");
+        assert_eq!(app.prompt.buffer, "hello");
+        assert_eq!(app.prompt.cursor, 5);
+        // No transcript blocks were pushed (nothing was submitted).
+        assert!(app.blocks.is_empty());
+    }
+
+    #[test]
+    fn paste_with_newlines_does_not_submit() {
+        let mut app = fresh_app();
+        app.handle_paste("line1\nline2");
+        assert_eq!(app.prompt.buffer, "line1\nline2");
+        assert!(app.blocks.is_empty());
+    }
+
+    #[test]
+    fn empty_paste_is_noop() {
+        let mut app = fresh_app();
+        app.handle_paste("");
+        assert!(app.prompt.buffer.is_empty());
+        assert_eq!(app.prompt.cursor, 0);
+    }
+
+    #[test]
+    fn paste_does_not_trigger_mode_autodetect() {
+        let mut app = fresh_app();
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        app.handle_paste("!ls -la");
+        // Mode must stay Prompt (the ! is literal content, not a mode marker).
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert_eq!(app.prompt.buffer, "!ls -la");
+    }
+
+    #[test]
+    fn paste_does_not_enter_atfile_on_at_sign() {
+        let mut app = fresh_app();
+        app.handle_paste("@file.txt");
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        assert_eq!(app.prompt.buffer, "@file.txt");
+        assert!(!matches!(app.prompt.mode, InputMode::AtFile));
+    }
+
+    #[test]
+    fn paste_dropped_while_permission_modal_pending() {
+        let mut app = fresh_app();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.set_pending_permission(PermissionRequest {
+            tool_name: "Bash".into(),
+            args_preview: "ls".into(),
+            reply: tx,
+        });
+        assert!(app.pending_permission.is_some());
+        app.handle_paste("x");
+        assert!(
+            app.prompt.buffer.is_empty(),
+            "paste should be dropped while permission modal is active"
+        );
+    }
+
+    #[test]
+    fn paste_dropped_while_plan_awaiting_approval() {
+        let mut app = fresh_app();
+        app.plan_awaiting_approval = true;
+        app.handle_paste("x");
+        assert!(
+            app.prompt.buffer.is_empty(),
+            "paste should be dropped while plan approval is pending"
+        );
+    }
+
+    #[test]
+    fn paste_dropped_while_modal_open() {
+        let mut app = fresh_app();
+        app.modals.push(Modal::Help);
+        app.handle_paste("x");
+        assert!(
+            app.prompt.buffer.is_empty(),
+            "paste should be dropped while a modal is open"
+        );
+    }
+
+    #[test]
+    fn paste_dropped_while_command_interact() {
+        let mut app = fresh_app();
+        app.prompt.mode = InputMode::CommandInteract;
+        app.handle_paste("x");
+        assert!(
+            app.prompt.buffer.is_empty(),
+            "paste should be dropped while command panel is active"
+        );
+    }
+
+    #[test]
+    fn paste_dropped_while_plan_mode_request_pending() {
+        let mut app = fresh_app();
+        app.plan_mode_request_pending = true;
+        app.handle_paste("x");
+        assert!(
+            app.prompt.buffer.is_empty(),
+            "paste should be dropped while plan-mode request is pending"
+        );
+    }
+
+    #[test]
+    fn paste_preserves_multi_byte_chars() {
+        let mut app = fresh_app();
+        app.handle_paste("中文 paste ✅");
+        assert_eq!(app.prompt.buffer, "中文 paste ✅");
+        assert_eq!(app.prompt.cursor, "中文 paste ✅".len());
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_position() {
+        let mut app = fresh_app();
+        app.set_input("ab");
+        app.prompt.cursor = 1; // between 'a' and 'b'
+        app.handle_paste("XY");
+        assert_eq!(app.prompt.buffer, "aXYb");
+        assert_eq!(app.prompt.cursor, 3);
     }
 }
 
