@@ -23,12 +23,6 @@ use crate::events::UserAction;
 use crate::skill_commands::SkillCommand;
 use crate::ui::modal::Modal;
 
-/// The supervise-mode SOP injected as the loop goal when the user runs
-/// `/loop supervise <command...>`. Generic (not project-specific) so it ships
-/// with the agent and works for any long-running command. `$COMMAND` is
-/// substituted with the command the user asked to supervise.
-const SUPERVISE_SOP: &str = include_str!("supervise_sop.md");
-
 /// One registered slash command.
 #[derive(Clone)]
 pub struct CommandSpec {
@@ -214,8 +208,8 @@ impl CommandRegistry {
                 CommandSpec {
                     name: "loop",
                     aliases: &[],
-                    summary: "Event-driven loop: /loop <goal> | /loop supervise <cmd> | /loop stop",
-                    usage: "/loop <natural-language goal>  (default: start an unlimited loop)\n  /loop start <goal> [max N]   (explicit start with optional turn cap)\n  /loop supervise <command...> (start + inject the monitor SOP)\n  /loop trigger <text>         (inject a one-shot prompt into the active loop)\n  /loop stop                   (stop the active loop)\nThe agent can also stop the loop itself via the `stop_loop` tool, so you can say \"stop\" in plain text.",
+                    summary: "Event-driven loop: /loop <goal> | /loop stop | /loop trigger <text>",
+                    usage: "/loop <natural-language goal>  (default: start an unlimited loop)\n  /loop start <goal> [max N]   (explicit start with optional turn cap)\n  /loop trigger <text>         (inject a one-shot prompt into the active loop)\n  /loop stop                   (stop the active loop)\nFor monitoring a long-running command, just describe it in the goal — the agent\nloads the `loop-supervise` skill. The agent can also stop the loop itself via\nthe `stop_loop` tool, so you can say \"stop\" in plain text.",
                     handler: CommandHandler::Async(cmd_loop),
                 },
             ],
@@ -643,26 +637,13 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
             });
             vec![UserAction::StartLoop { goal, max_turns }]
         }
-        // Supervise mode: launch a long-running command in the background and
-        // monitor + intervene via the event-driven loop. The full generic SOP
-        // is injected as the agent's goal; `loop_state.goal` keeps a short
-        // label for the `/loop` status display.
-        "supervise" => {
-            let command = args[1..].join(" ");
-            if command.trim().is_empty() {
-                app.push_error("Usage: /loop supervise <command...>");
-                return Vec::new();
-            }
-            let goal = SUPERVISE_SOP.replace("$COMMAND", &command);
-            let label = format!("supervise: {command}");
-            app.push_system(format!("Supervise loop started: {command}"));
-            app.loop_state = Some(crate::app::LoopUiState {
-                goal: label,
-                turns_run: 0,
-                max_turns: 0,
-            });
-            vec![UserAction::StartLoop { goal, max_turns: 0 }]
-        }
+        // Supervise mode was a hardcoded subcommand that injected a fixed
+        // monitor SOP. It has been retired: the generic monitor+intervene
+        // playbook now lives as a loadable skill (`loop-supervise`), and the
+        // loop's only entry is the natural-language `/loop <prompt>`. So
+        // `/loop supervise <cmd>` now falls through to the default arm below
+        // and is treated as a natural-language goal — which is what we want
+        // (the agent loads the `loop-supervise` skill from the goal text).
         "stop" => {
             app.loop_state = None;
             app.push_system("Loop stopped.");
@@ -1989,7 +1970,34 @@ mod tests {
     }
 
     #[test]
-    fn cmd_loop_supervise_emits_start_with_sop_goal() {
+    fn cmd_loop_default_does_not_parse_max_suffix_unlike_start() {
+        // Additive guard: the default `/loop <goal>` path must NOT run
+        // `parse_loop_start_args`, so a trailing "max N" is kept verbatim in
+        // the goal and the loop is unlimited. This contrasts with the
+        // explicit `/loop start <goal> max N` arm, which DOES parse the cap.
+        // Guards against the default arm accidentally swallowing the cap.
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop watch the build max 5");
+        match r {
+            InvokeResult::Async(actions) => match &actions[0] {
+                UserAction::StartLoop { goal, max_turns } => {
+                    assert_eq!(goal, "watch the build max 5");
+                    assert_eq!(*max_turns, 0, "default path must not parse max N");
+                }
+                other => panic!("expected StartLoop, got {other:?}"),
+            },
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_loop_supervise_now_natural_language_goal() {
+        // The hardcoded `supervise` subcommand has been retired (the monitor
+        // playbook is now the loadable `loop-supervise` skill). So
+        // `/loop supervise <cmd>` falls through to the default arm and is
+        // treated as a natural-language goal — the agent loads the skill from
+        // the goal text. The whole line (including the word "supervise") is
+        // the goal; no SOP is injected.
         let mut app = App::new();
         let r = invoke(&mut app, "loop supervise node flow.js --goal-file g.md");
         match r {
@@ -1997,39 +2005,16 @@ mod tests {
                 assert_eq!(actions.len(), 1);
                 match &actions[0] {
                     UserAction::StartLoop { goal, max_turns } => {
-                        // The injected goal is the generic SOP with the command
-                        // substituted in, not the raw command.
-                        assert!(goal.contains("Supervise mode"), "SOP body missing: {goal}");
-                        assert!(
-                            goal.contains("node flow.js --goal-file g.md"),
-                            "command not substituted: {goal}"
-                        );
-                        assert!(!goal.contains("$COMMAND"), "unsubstituted placeholder");
-                        assert_eq!(*max_turns, 0, "supervise is unlimited");
+                        assert_eq!(goal, "supervise node flow.js --goal-file g.md");
+                        assert_eq!(*max_turns, 0, "default loop is unlimited");
                     }
                     other => panic!("expected StartLoop, got {other:?}"),
                 }
             }
             other => panic!("expected Async, got {other:?}"),
         }
-        // loop_state.goal is a short label for display, not the full SOP.
         let ls = app.loop_state.as_ref().expect("loop_state set");
-        assert_eq!(ls.goal, "supervise: node flow.js --goal-file g.md");
-        assert_eq!(ls.max_turns, 0);
-    }
-
-    #[test]
-    fn cmd_loop_supervise_empty_errors() {
-        let mut app = App::new();
-        let r = invoke(&mut app, "loop supervise");
-        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
-        match app.blocks.last() {
-            Some(TranscriptBlock::Error { text }) => {
-                assert!(text.contains("Usage"), "got {text:?}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(app.loop_state.is_none(), "no state on usage error");
+        assert_eq!(ls.goal, "supervise node flow.js --goal-file g.md");
     }
 
     #[test]
