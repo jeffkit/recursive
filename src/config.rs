@@ -33,6 +33,12 @@ pub struct Config {
     pub retry_initial_backoff_secs: u64,
     pub retry_max_backoff_secs: u64,
     pub shell_timeout_secs: u64,
+    /// Wall-clock deadline for the entire agent run (Goal 345).
+    /// When > 0, the step loop checks an elapsed-time deadline and
+    /// terminates cleanly with [`FinishReason::WallClockExceeded`]
+    /// when exceeded.  Default 0 = unset (no wall-clock cap).
+    /// Set via `--wall-timeout` CLI flag or `RECURSIVE_WALL_TIMEOUT_SECS` env.
+    pub wall_timeout_secs: u64,
     /// Run in headless mode: interactive tools go through external hooks
     /// instead of waiting for terminal input. If no hook approves the call,
     /// the tool is auto-denied.
@@ -126,6 +132,7 @@ impl std::fmt::Debug for Config {
             )
             .field("retry_max_backoff_secs", &self.retry_max_backoff_secs)
             .field("shell_timeout_secs", &self.shell_timeout_secs)
+            .field("wall_timeout_secs", &self.wall_timeout_secs)
             .field("headless", &self.headless)
             .field("memory_summary_limit", &self.memory_summary_limit)
             .field("thinking_budget", &self.thinking_budget)
@@ -389,6 +396,11 @@ impl Config {
             .or_else(|| file_agent.and_then(|a| a.shell_timeout_secs))
             .unwrap_or(300);
 
+        let wall_timeout_secs = std::env::var("RECURSIVE_WALL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
         let headless = std::env::var("RECURSIVE_HEADLESS")
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
@@ -555,6 +567,7 @@ impl Config {
             retry_initial_backoff_secs,
             retry_max_backoff_secs,
             shell_timeout_secs,
+            wall_timeout_secs,
             headless,
             memory_summary_limit,
             thinking_budget: None,
@@ -859,6 +872,7 @@ mod tests {
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            wall_timeout_secs: 0,
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
@@ -1561,6 +1575,7 @@ preset = "totally-bogus-id"
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            wall_timeout_secs: 0,
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
@@ -1706,6 +1721,7 @@ api_key = "sk-from-file"
                 retry_initial_backoff_secs: 1,
                 retry_max_backoff_secs: 8,
                 shell_timeout_secs: 300,
+                wall_timeout_secs: 0,
                 headless: false,
                 memory_summary_limit: 5,
                 thinking_budget: None,
@@ -1754,6 +1770,7 @@ api_key = "sk-from-file"
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            wall_timeout_secs: 0,
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
@@ -1840,6 +1857,7 @@ api_key = "sk-from-file"
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
             shell_timeout_secs: 300,
+            wall_timeout_secs: 0,
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,

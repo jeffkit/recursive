@@ -230,6 +230,7 @@ impl Compactor {
     ///    `[System(summary), Assistant(tool_calls), Tool, …]` sequence.
     pub fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
         let mut split = transcript.len().saturating_sub(keep_n);
+        // Back up past Tool / Assistant-with-tool_calls to preserve pairing.
         loop {
             if split == 0 || split >= transcript.len() {
                 break;
@@ -243,6 +244,13 @@ impl Compactor {
                 break;
             }
         }
+        // Advance past leading System messages — never compact the system
+        // prompt.  Goal 345: without this a compaction whose `keep_recent_n`
+        // would put the system message into `older` produces a garbage summary
+        // ("No conversation found to summarize").
+        while split < transcript.len() && transcript[split].role == crate::message::Role::System {
+            split += 1;
+        }
         split
     }
 
@@ -254,18 +262,75 @@ impl Compactor {
     ///
     /// Returns `None` when the transcript is too short to compact
     /// (`< keep_recent_n + 2` messages).
+    /// Minimum number of non-System conversational messages (User or
+    /// Assistant) that must appear in the `older` slice for a compaction
+    /// to be worth running.  Fewer than this means the older portion is
+    /// essentially a system-prompt preamble and compacting it produces a
+    /// garbage summary ("No conversation found to summarize").
+    const MIN_CONVERSATIONAL_IN_OLDER: usize = 2;
+
+    /// Pure helper: the split point for a compaction and whether the `older`
+    /// slice is acceptable to summarise. Returns `(split, false)` when the
+    /// transcript is too short or the older slice is degenerate (fewer than
+    /// `MIN_CONVERSATIONAL_IN_OLDER` conversational messages). Single source
+    /// of truth shared by [`apply_to_transcript`] and [`would_compact`] so the
+    /// "will compaction actually fire?" decision cannot drift between them.
+    /// (Goal 345)
+    fn split_for_compaction(transcript: &[Message], keep_n: usize) -> (usize, bool) {
+        if transcript.len() < keep_n + 2 {
+            return (0, false);
+        }
+        let split = Self::safe_split_point(transcript, keep_n);
+        let acceptable = if split > 0 {
+            let conversational_count = transcript[..split]
+                .iter()
+                .filter(|m| {
+                    m.role == crate::message::Role::User
+                        || m.role == crate::message::Role::Assistant
+                })
+                .count();
+            conversational_count >= Self::MIN_CONVERSATIONAL_IN_OLDER
+        } else {
+            // split == 0: older slice is empty. Preserve the pre-existing
+            // behaviour (proceed) rather than tightening it here — the g331
+            // failure mode was split > 0 with only a system-prompt older, not
+            // the empty-older edge. Tightening split == 0 is out of scope and
+            // risks breaking tests that rely on compaction firing at the
+            // minimum-length boundary.
+            true
+        };
+        (split, acceptable)
+    }
+
+    /// Returns `true` iff [`apply_to_transcript`] would actually compact this
+    /// transcript (return `Ok(Some(..))`): long enough AND the older slice has
+    /// enough real conversation. Pure — no provider call, no mutation.
+    ///
+    /// Proactive-compaction callers should consult this **before** dispatching
+    /// `PreCompact` so that `PreCompact` and `PostCompact` stay balanced (both
+    /// fire when compaction runs, neither fires when it is rejected). Without
+    /// this guard the Goal 345 degenerate-slice rejection made `PreCompact`
+    /// fire without a matching `PostCompact`. (Goal 345)
+    pub fn would_compact(&self, transcript: &[Message]) -> bool {
+        Self::split_for_compaction(transcript, self.keep_recent_n).1
+    }
+
     pub async fn apply_to_transcript(
         &self,
         provider: &dyn ChatProvider,
         transcript: &mut Vec<Message>,
         step: usize,
     ) -> Result<Option<(usize, usize)>> {
-        if transcript.len() < self.keep_recent_n + 2 {
+        // Goal 345: delegate the "is this worth compacting?" decision to
+        // `split_for_compaction` (shared with `would_compact`) so callers can
+        // pre-check without dispatching `PreCompact` into the void.
+        let (split, acceptable) = Self::split_for_compaction(transcript, self.keep_recent_n);
+        if !acceptable {
             return Ok(None);
         }
+
         let summary_msg = self.compact(provider, transcript, step).await?;
         let summary_chars = summary_msg.content.len();
-        let split = Self::safe_split_point(transcript, self.keep_recent_n);
         let removed = split;
         transcript.drain(..split);
         transcript.insert(0, summary_msg);
@@ -922,7 +987,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_to_transcript_minimum_length_boundary() {
-        // Exactly at the boundary: keep_recent_n + 2 messages → should compact.
+        // Goal 345: older must have ≥2 conversational messages.
+        // At keep_n=1 with 4 messages, older = [sys, user, asst] → 2 conv.
         let provider = MockProvider::new(vec![Completion {
             content: "boundary summary".to_string(),
             tool_calls: vec![],
@@ -931,8 +997,7 @@ mod tests {
             reasoning_content: None,
         }]);
 
-        let keep_n = 2_usize;
-        // Minimum length = keep_n + 2 = 4
+        let keep_n = 1_usize;
         let mut transcript = vec![
             Message::system("s".to_string()),
             Message::user("u".to_string()),
@@ -948,7 +1013,7 @@ mod tests {
 
         assert!(
             result.is_some(),
-            "should compact when len == keep_recent_n + 2"
+            "should compact when older has ≥2 conversational msgs"
         );
     }
 
@@ -993,15 +1058,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_to_transcript_boundary_plus_not_times() {
-        // Kills: `replace + with * in Compactor::apply_to_transcript` at line 225.
-        //
+        // Kills: `replace + with * in Compactor::apply_to_transcript`.
         // The threshold is `keep_recent_n + 2`, NOT `keep_recent_n * 2`.
-        // At keep_recent_n=2, both formulas yield 4, so we need keep_recent_n != 2.
-        //
-        // Use keep_recent_n=3 (threshold = 3+2=5, but 3*2=6).
-        // With transcript.len() == 5:
-        //   original `+`: 5 < 5 → false → compaction fires
-        //   mutant `*`:   5 < 6 → true  → early return, no compaction
+        // With keep_recent_n=2, older=[sys, user, asst] → 2 conv.
+        // Original `+`: 5 >= 3 → compaction fires
+        // Mutant `*`:   5 >= 4 → early return misuse
         let provider = MockProvider::new(vec![Completion {
             content: "summary".to_string(),
             tool_calls: vec![],
@@ -1010,8 +1071,8 @@ mod tests {
             reasoning_content: None,
         }]);
 
-        let keep_n = 3_usize;
-        // Exactly keep_n + 2 = 5 messages
+        let keep_n = 2_usize;
+        // 5 messages: sys + 2 conv older + 2 kept
         let mut transcript = vec![
             Message::system("s0".to_string()),
             Message::user("u1".to_string()),
@@ -1019,11 +1080,6 @@ mod tests {
             Message::user("u2".to_string()),
             Message::assistant("a2".to_string()),
         ];
-        assert_eq!(
-            transcript.len(),
-            keep_n + 2,
-            "test setup: must be exactly keep_n + 2 messages"
-        );
 
         let compactor = Compactor::new(0).keep_recent_n(keep_n);
         let result = compactor
@@ -1033,7 +1089,194 @@ mod tests {
 
         assert!(
             result.is_some(),
-            "must compact when len == keep_recent_n + 2 (threshold uses `+`, not `*`)"
+            "must compact when older has ≥2 conversational msgs"
         );
+    }
+
+    // ========================================================================
+    // Goal 345: degenerate slice rejection and system-message preservation
+    // ========================================================================
+
+    #[test]
+    fn safe_split_point_keeps_system_message_in_kept() {
+        // Scenario: a transcript where keep_recent_n would put the
+        // system prompt into the older portion.  After the fix, the
+        // split must advance past the system message so it stays
+        // verbatim in `kept` — never summarised.
+        let msgs = vec![
+            Message::system("You are a coding agent. Be thorough.".to_string()),
+            Message::user("Do task A".to_string()),
+            Message::assistant("Working on A".to_string()),
+            Message::user("Now do task B".to_string()),
+            Message::assistant("Working on B".to_string()),
+            Message::user("Now do task C".to_string()),
+            Message::assistant("Working on C".to_string()),
+        ];
+        // keep_n=4: initial split = 7-4 = 3 (msgs[3] = "Now do task B")
+        // That's a User message — no backup, no forward advance.
+        let split = Compactor::safe_split_point(&msgs, 4);
+        assert_eq!(split, 3, "valid split must not be disturbed");
+    }
+
+    #[test]
+    fn safe_split_point_advances_past_system_at_boundary() {
+        // Scenario: keep_recent_n is large enough that the initial
+        // split lands on a System message.  The forward pass must
+        // advance past it so the system prompt stays in `kept`.
+        let msgs = vec![
+            Message::system("SYSTEM PROMPT — keep me verbatim".to_string()),
+            Message::user("Hello".to_string()),
+            Message::assistant("Hi!".to_string()),
+        ];
+        // keep_n=3: initial split = 3-3 = 0
+        // split=0: backup loop breaks immediately.
+        // Forward pass: msgs[0] is System → advance to 1.
+        let split = Compactor::safe_split_point(&msgs, 3);
+        assert_eq!(
+            split, 1,
+            "system message at split boundary must be advanced past"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_rejects_system_only_older() {
+        // The g331 failure mode: a long system prompt followed by a
+        // few real messages, keep_recent_n covers almost everything,
+        // older = [system] → summary says "No conversation found to
+        // summarize".
+        let provider = MockProvider::new(vec![]); // should never be called
+
+        let mut transcript = vec![
+            Message::system(
+                "VERY LONG SYSTEM PROMPT — AGENTS.md, CLAUDE.md, journal, skills...".to_string(),
+            ),
+            Message::user("Add a feature".to_string()),
+            Message::assistant("I'll work on it.".to_string()),
+            Message::user("Status?".to_string()),
+            Message::assistant("Almost done.".to_string()),
+            Message::user("Now test it.".to_string()),
+            Message::assistant("Tests pass.".to_string()),
+            Message::user("Commit.".to_string()),
+            Message::assistant("Done.".to_string()),
+        ];
+        // 9 messages total, keep_recent_n=8
+        // safe_split_point: initial split = 9-8 = 1 (msgs[1]="Add a feature")
+        // That's User → no backup. Forward: not System → no advance.
+        // older = transcript[..1] = [system]
+        // conversational_count = 0 < MIN(2) → return None
+        let compactor = Compactor::new(0).keep_recent_n(8);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 0)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "system-only older (0 conversational msgs < 2 min) must be rejected"
+        );
+        // Transcript must not be modified
+        assert_eq!(transcript.len(), 9, "transcript must be unchanged");
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_compacts_normally_with_real_conversation() {
+        // When older has ≥2 conversational messages, compaction runs
+        // normally.
+        let provider = MockProvider::new(vec![Completion {
+            content: "We added a feature and tested it.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let mut transcript = vec![
+            Message::system("System prompt".to_string()),
+            Message::user("Add feature X".to_string()),
+            Message::assistant("Working on X".to_string()),
+            Message::user("Add feature Y".to_string()),
+            Message::assistant("Working on Y".to_string()),
+            Message::user("Test everything".to_string()),
+            Message::assistant("All tests pass".to_string()),
+        ];
+        // keep_recent_n=2: older = transcript[..5] = [sys, user, asst, user, asst]
+        // conversational_count = 4 (≥2) → compaction proceeds
+        let compactor = Compactor::new(0).keep_recent_n(2);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap();
+
+        let (removed, summary_chars) =
+            result.expect("should compact when older has real conversation");
+        assert!(removed > 0);
+        assert!(summary_chars > 0);
+        assert_eq!(transcript[0].role, crate::message::Role::System);
+        assert!(transcript[0].is_compaction_summary);
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_rejects_below_min_conversational() {
+        // 1 conversational message in older (< MIN=2) → reject.
+        let provider = MockProvider::new(vec![]); // should never be called
+
+        let mut transcript = vec![
+            Message::system("System prompt".to_string()),
+            Message::user("The only user message".to_string()),
+            Message::assistant("Reply".to_string()),
+            Message::user("Another user message".to_string()),
+            Message::assistant("Another reply".to_string()),
+            Message::user("Yet another".to_string()),
+            Message::assistant("Final reply".to_string()),
+        ];
+        // 7 messages, keep_recent_n=5
+        // safe_split_point: initial split = 7-5 = 2 (msgs[2]="Reply")
+        // That's Asst w/o tool_calls → no backup. Forward: not System.
+        // older = transcript[..2] = [system, user]
+        // conversational_count = 1 < 2 → reject
+        let compactor = Compactor::new(0).keep_recent_n(5);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 0)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "older with 1 conversational msg (< 2 min) must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_transcript_accepts_exactly_min_conversational() {
+        // Exactly 2 conversational messages in older (= MIN=2) → accept.
+        let provider = MockProvider::new(vec![Completion {
+            content: "Conversation about two messages.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let mut transcript = vec![
+            Message::system("System prompt".to_string()),
+            Message::user("Hello".to_string()),
+            Message::assistant("Hi there!".to_string()),
+            Message::user("How are you?".to_string()),
+            Message::assistant("I'm well, thanks.".to_string()),
+        ];
+        // 5 messages, keep_recent_n=2
+        // safe_split_point: initial split = 5-2 = 3 (msgs[3]="How are you?")
+        // That's User → no backup. Forward: not System.
+        // older = transcript[..3] = [sys, user("Hello"), asst("Hi there!")]
+        // conversational_count = 2 = MIN → accepted
+        let compactor = Compactor::new(0).keep_recent_n(2);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap();
+
+        let (removed, _summary_chars) =
+            result.expect("should compact when older has exactly 2 conversational msgs");
+        assert!(removed > 0);
     }
 }

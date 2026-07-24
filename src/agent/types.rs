@@ -70,6 +70,11 @@ pub enum FinishReason {
     /// (3 consecutive or 10 total denials). All subsequent tool
     /// calls are blocked to prevent denial loops.
     PermissionDenialLimit,
+
+    /// Wall-clock deadline exceeded (Goal 345). The agent's
+    /// `--wall-timeout` was reached before any other finish
+    /// condition.
+    WallClockExceeded { secs: u64 },
 }
 
 impl std::fmt::Display for FinishReason {
@@ -87,6 +92,9 @@ impl std::fmt::Display for FinishReason {
             }
             FinishReason::Cancelled => write!(f, "cancelled"),
             FinishReason::PermissionDenialLimit => write!(f, "permission_denial_limit"),
+            FinishReason::WallClockExceeded { secs } => {
+                write!(f, "wall_clock_exceeded:{secs}")
+            }
         }
     }
 }
@@ -129,6 +137,10 @@ mod tests {
             FinishReason::PermissionDenialLimit.to_string(),
             "permission_denial_limit"
         );
+        assert_eq!(
+            FinishReason::WallClockExceeded { secs: 120 }.to_string(),
+            "wall_clock_exceeded:120"
+        );
     }
 
     #[test]
@@ -168,6 +180,10 @@ mod tests {
 
         let json = serde_json::to_value(&FinishReason::PermissionDenialLimit).unwrap();
         assert_eq!(json["kind"], "permission_denial_limit");
+
+        let json = serde_json::to_value(&FinishReason::WallClockExceeded { secs: 300 }).unwrap();
+        assert_eq!(json["kind"], "wall_clock_exceeded");
+        assert_eq!(json["secs"], 300);
     }
 
     #[test]
@@ -191,6 +207,10 @@ mod tests {
 
         let r: FinishReason = serde_json::from_str(r#"{"kind":"cancelled"}"#).unwrap();
         assert!(matches!(r, FinishReason::Cancelled));
+
+        let r: FinishReason =
+            serde_json::from_str(r#"{"kind":"wall_clock_exceeded","secs":99}"#).unwrap();
+        assert!(matches!(r, FinishReason::WallClockExceeded { secs: 99 }));
     }
 
     #[test]

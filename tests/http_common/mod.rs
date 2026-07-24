@@ -65,6 +65,7 @@ pub fn mock_config() -> Config {
         web_search_provider: None,
         web_search_api_key: None,
         web_search_jina_key: None,
+        wall_timeout_secs: 0,
     }
 }
 

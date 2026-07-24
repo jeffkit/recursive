@@ -1335,7 +1335,8 @@ async fn handle_session_prompt(
         FinishReason::Stuck { .. }
         | FinishReason::TranscriptLimit { .. }
         | FinishReason::ProviderStop(_)
-        | FinishReason::PermissionDenialLimit => "error",
+        | FinishReason::PermissionDenialLimit
+        | FinishReason::WallClockExceeded { .. } => "error",
     };
 
     let result = serde_json::json!({

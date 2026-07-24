@@ -392,6 +392,7 @@ impl AgentTool {
             mailbox: None,
             turn: 0,
             prompt_segments: None,
+            wall_timeout_secs: 0,
         };
 
         let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
@@ -408,6 +409,7 @@ impl AgentTool {
             FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
             FinishReason::Cancelled => "Cancelled",
             FinishReason::PermissionDenialLimit => "PermissionDenialLimit",
+            FinishReason::WallClockExceeded { .. } => "WallClockExceeded",
         };
 
         let final_text = outcome

@@ -380,6 +380,7 @@ impl AgentPool {
             mailbox: None,
             turn: 0,
             prompt_segments: None,
+            wall_timeout_secs: 0,
         };
 
         kernel.run(ctx).await
@@ -549,6 +550,7 @@ mod tests {
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
+            wall_timeout_secs: 0,
         }
     }
 

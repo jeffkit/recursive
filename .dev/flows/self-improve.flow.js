@@ -592,16 +592,51 @@ async function main() {
   // 用具名引用统一注册/注销，避免旧代码里 exit 与信号 handler 各自 cleanupWt
   // 导致重复清理，以及 runAttempt 后只 remove exit handler、信号 handler 仍挂着
   // 指向已清理 worktree 的闭包泄漏。
+  //
+  // Goal 345: when a signal arrives BEFORE a terminal verdict (result is still
+  // undefined), preserve the scene instead of deleting the worktree. This
+  // prevents the g331 data-loss pattern where an external kill destroyed
+  // in-flight agent work. If preserveScene fails (signal context is
+  // hostile), fall back to leaving the worktree in place rather than
+  // force-removing it.
   const cleanupWt = () => {
     try { gitWorktreeRemove(repo, worktreeDir) } catch { /* already gone */ }
   }
-  const onSigint = () => { cleanupWt(); process.exitCode = 130 }
-  const onSigterm = () => { cleanupWt(); process.exitCode = 143 }
-  process.once('exit', cleanupWt)
+  // result is declared here so the signal handlers can see it; it is
+  // assigned later (after runAttempt returns).  Before assignment it is
+  // `undefined` → no verdict yet → preserve, not delete.
+  let result
+  const onSigint = () => {
+    if (!result) {
+      try {
+        preserveScene({ worktreeDir, baseline, reason: 'killed by SIGINT mid-run', failureOutput: '', tag: 'killed' })
+        process.exitCode = 0
+      } catch { /* preserve failed in signal context — leave worktree */ }
+    } else if (result.verdict !== 'failed-preserved' && result.verdict !== 'panic-preserved') {
+      cleanupWt()
+      process.exitCode = 130
+    }
+  }
+  const onSigterm = () => {
+    if (!result) {
+      try {
+        preserveScene({ worktreeDir, baseline, reason: 'killed by SIGTERM mid-run', failureOutput: '', tag: 'killed' })
+        process.exitCode = 0
+      } catch { /* preserve failed — leave worktree */ }
+    } else if (result.verdict !== 'failed-preserved' && result.verdict !== 'panic-preserved') {
+      cleanupWt()
+      process.exitCode = 143
+    }
+  }
   process.once('SIGINT', onSigint)
   process.once('SIGTERM', onSigterm)
+  // exit handler: only delete if result is a non-preserved verdict
+  process.on('exit', () => {
+    if (result && result.verdict !== 'failed-preserved' && result.verdict !== 'panic-preserved') {
+      cleanupWt()
+    }
+  })
   const unregisterCleanup = () => {
-    process.removeListener('exit', cleanupWt)
     process.removeListener('SIGINT', onSigint)
     process.removeListener('SIGTERM', onSigterm)
   }
@@ -627,7 +662,6 @@ async function main() {
   // 分支 + 导出 diff/failure.log，供 --resume-preserve / --land-preserve 消费。
   // cherry-pick 前显式校验 main 未移动、冲突时 abort 而非 reset（绝不吃掉别人的提交）。
   const transcriptOut = join(cp.dir, 'transcript.json')
-  let result
   try {
     result = await runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir })
   } catch (err) {

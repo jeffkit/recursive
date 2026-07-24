@@ -246,14 +246,14 @@ async fn compaction_summary_appears_in_jsonl() {
     // - turn1 (reply1)
     // - turn2 (reply2)
     // - cross-turn compaction after turn 2 (Goal 289)
-    // - intra-turn compaction during turn 3 (kernel fires maybe_compact before
-    //   each step's LLM call when transcript ≥ keep_recent_n+2)
     // - turn3 LLM (reply3)
     // - cross-turn compaction after turn 3
+    // (Goal 345: intra-turn compaction before turn 3 is now rejected
+    //  because older has <2 conversational messages, so one fewer
+    //  LLM call is needed.)
     let llm = Arc::new(MockProvider::new(vec![
         simple_completion("reply1"),
         simple_completion("reply2"),
-        simple_completion("compact summary"),
         simple_completion("compact summary"),
         simple_completion("reply3"),
         simple_completion("compact summary"),

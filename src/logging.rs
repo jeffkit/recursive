@@ -113,9 +113,24 @@ impl<'a> MakeWriter<'a> for StderrOrNullMaker {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Mutex, MutexGuard};
+
+    // `TUI_QUIET` is a process-global `AtomicBool`. Every test in this module
+    // mutates it (`set_tui_quiet` / `suppress_tracing_for_tui`) and several
+    // assert its value. Run in parallel (cargo test's default) they race: one
+    // test's `set_tui_quiet(true)` flips the flag while another is in the
+    // middle of `assert!(!is_tui_quiet())`, producing intermittent failures
+    // (observed blocking the g331 land-preserve run on 2026-07-24). Acquire
+    // this lock at the top of every test that touches the global so the whole
+    // module runs serially. (Goal 345 hardening)
+    static QUIET_TEST_LOCK: Mutex<()> = Mutex::new(());
+    fn quiet_test_lock() -> MutexGuard<'static, ()> {
+        QUIET_TEST_LOCK.lock().expect("quiet test lock poisoned")
+    }
 
     #[test]
     fn stderr_or_null_drops_bytes_when_quiet() {
+        let _l = quiet_test_lock();
         set_tui_quiet(true);
         let mut w = StderrOrNull;
         let n = w.write(b"hello").unwrap();
@@ -126,6 +141,7 @@ mod tests {
 
     #[test]
     fn guard_restores_quiet_state_on_drop() {
+        let _l = quiet_test_lock();
         assert!(!is_tui_quiet());
         {
             let _g = suppress_tracing_for_tui();
@@ -136,6 +152,7 @@ mod tests {
 
     #[test]
     fn set_tui_quiet_stores_given_value() {
+        let _l = quiet_test_lock();
         // kills `store(!quiet, ...)` or `store(true, ...)` mutations in set_tui_quiet
         set_tui_quiet(true);
         assert!(is_tui_quiet(), "must be quiet after set_tui_quiet(true)");
@@ -148,6 +165,7 @@ mod tests {
 
     #[test]
     fn guard_restores_even_if_another_guard_already_dropped() {
+        let _l = quiet_test_lock();
         // Two nested guards; the inner drop will flip the flag to
         // false even though the outer is still alive. The guard is
         // single-shot, not reference-counted. The pragmatic
@@ -170,6 +188,7 @@ mod tests {
 
     #[test]
     fn stderr_or_null_write_not_quiet_returns_byte_count() {
+        let _l = quiet_test_lock();
         // kills branch mutation: write path when TUI_QUIET is false must call
         // the real stderr, not the short-circuit return.
         set_tui_quiet(false);
@@ -181,6 +200,7 @@ mod tests {
 
     #[test]
     fn stderr_or_null_flush_not_quiet_succeeds() {
+        let _l = quiet_test_lock();
         // kills `if TUI_QUIET.load(...)` guard removal mutation in flush():
         // when not quiet, flush must succeed (delegates to real stderr).
         set_tui_quiet(false);
@@ -190,6 +210,7 @@ mod tests {
 
     #[test]
     fn suppress_tracing_sets_quiet_immediately() {
+        let _l = quiet_test_lock();
         // kills `set_tui_quiet(true)` → `set_tui_quiet(false)` mutation
         // in suppress_tracing_for_tui before the guard is dropped.
         set_tui_quiet(false);

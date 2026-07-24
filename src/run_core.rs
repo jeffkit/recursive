@@ -151,6 +151,14 @@ pub(crate) struct RunCore<'a> {
     /// by [`Compactor::should_compact`] intra-turn. `0` means "no reading
     /// yet" (first step, or provider never reports usage).
     pub(crate) last_prompt_tokens: u32,
+    /// Goal 345: optional wall-clock deadline. When
+    /// `wall_timeout_secs > 0`, the step loop checks elapsed time at
+    /// each step boundary and terminates cleanly with
+    /// [`FinishReason::WallClockExceeded`] when exceeded.
+    pub(crate) wall_timeout_secs: u64,
+    /// Wall-clock start instant, recorded when `RunCore` is
+    /// constructed. `None` when the timeout is not active.
+    pub(crate) wall_start: Option<std::time::Instant>,
 }
 
 /// Goal-328: cached token counts for the static breakdown buckets.
@@ -664,6 +672,41 @@ impl<'a> RunCore<'a> {
         Some((finish, finished_steps))
     }
 
+    /// Goal 345: check the wall-clock deadline at the top of a step.
+    /// Returns `Some((finish, finished_steps))` when the deadline has
+    /// been exceeded; the caller routes through [`make_outcome`].
+    fn check_wall_deadline(
+        &self,
+        step: usize,
+        total_usage: &TokenUsage,
+    ) -> Option<(FinishReason, usize)> {
+        if self.wall_timeout_secs == 0 {
+            return None;
+        }
+        let elapsed = self.wall_start?.elapsed();
+        if elapsed.as_secs() < self.wall_timeout_secs {
+            return None;
+        }
+        let finished_steps = step.saturating_sub(1);
+        let finish = FinishReason::WallClockExceeded {
+            secs: self.wall_timeout_secs,
+        };
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: finished_steps,
+        });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = finished_steps,
+            tokens_in = total_usage.prompt_tokens,
+            tokens_out = total_usage.completion_tokens,
+            finish = ?finish,
+            llm_latency_ms = self.total_llm_latency_ms,
+            "agent.run.complete (wall clock)"
+        );
+        Some((finish, finished_steps))
+    }
+
     /// Assemble the final outcome for a run that terminates with `finish`
     /// at step `steps`. All early-return paths in [`run_inner`] route here
     /// so the seven-field struct cannot drift out of sync across sites.
@@ -789,6 +832,14 @@ impl<'a> RunCore<'a> {
 
         let chars = Compactor::estimate_chars(&self.messages);
         if !compactor.should_compact(chars, self.last_prompt_tokens) {
+            return Ok(());
+        }
+        // Goal 345: only dispatch PreCompact when compaction will actually run.
+        // `would_compact` mirrors `apply_to_transcript`'s degenerate-slice
+        // rejection so PreCompact / PostCompact stay balanced (both fire, or
+        // neither does) — without this the new Ok(None) path fired PreCompact
+        // without a matching PostCompact.
+        if !compactor.would_compact(&self.messages) {
             return Ok(());
         }
 
@@ -1076,6 +1127,17 @@ impl<'a> RunCore<'a> {
             // and it fired between steps, finish cleanly with
             // FinishReason::Cancelled.
             if let Some((finish, finished_steps)) = self.check_shutdown(step, &total_usage) {
+                return Ok(self.make_outcome(
+                    finish,
+                    finished_steps,
+                    final_message,
+                    total_usage,
+                    tool_audits,
+                ));
+            }
+
+            // ---- wall-clock deadline (Goal 345) ---------------------------------
+            if let Some((finish, finished_steps)) = self.check_wall_deadline(step, &total_usage) {
                 return Ok(self.make_outcome(
                     finish,
                     finished_steps,
@@ -1421,6 +1483,8 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            wall_timeout_secs: 0,
+            wall_start: None,
         }
     }
 
@@ -2091,6 +2155,8 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            wall_timeout_secs: 0,
+            wall_start: None,
         }
     }
 

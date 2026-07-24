@@ -382,6 +382,13 @@ impl AgentRuntime {
         if !compactor.should_compact(chars, last_prompt_tokens) {
             return Ok(());
         }
+        // Goal 345: only dispatch PreCompact when compaction will actually run,
+        // so PreCompact / PostCompact stay balanced (mirrors run_core's
+        // maybe_compact). Without this the degenerate-slice Ok(None) path
+        // fired PreCompact with no matching PostCompact.
+        if !compactor.would_compact(&self.transcript) {
+            return Ok(());
+        }
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: chars,
         });
@@ -511,6 +518,7 @@ impl AgentRuntime {
             mailbox: None,
             turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
             prompt_segments: self.prompt_segments.clone(),
+            wall_timeout_secs: 0,
         };
 
         let turn_outcome = self.kernel.run(ctx).await?;

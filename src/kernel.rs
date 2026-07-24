@@ -104,6 +104,11 @@ pub struct TurnContext {
     /// buckets. `None` when the caller did not provide one (legacy
     /// channels, tests).
     pub prompt_segments: Option<crate::system_prompt::PromptSegments>,
+
+    /// Goal 345: wall-clock timeout in seconds. When > 0, the step
+    /// loop checks elapsed time and terminates cleanly with
+    /// [`FinishReason::WallClockExceeded`]. Default 0 = unset.
+    pub wall_timeout_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +326,12 @@ impl AgentKernel {
                 prompt_segments: ctx.prompt_segments,
                 static_breakdown,
                 last_prompt_tokens: 0,
+                wall_timeout_secs: ctx.wall_timeout_secs,
+                wall_start: if ctx.wall_timeout_secs > 0 {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                },
             }
         };
 
@@ -656,6 +667,7 @@ mod tests {
             mailbox: None,
             turn: 0,
             prompt_segments: None,
+            wall_timeout_secs: 0,
         }
     }
 

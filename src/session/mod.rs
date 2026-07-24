@@ -155,7 +155,8 @@ impl SessionStatus {
             | FinishReason::ProviderStop(_)
             | FinishReason::Stuck { .. }
             | FinishReason::TranscriptLimit { .. }
-            | FinishReason::PermissionDenialLimit => Self::Crashed,
+            | FinishReason::PermissionDenialLimit
+            | FinishReason::WallClockExceeded { .. } => Self::Crashed,
             FinishReason::Cancelled => Self::Interrupted,
         }
     }
