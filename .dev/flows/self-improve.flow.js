@@ -29,7 +29,7 @@
 import { parseArgs } from 'util'
 import { readdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync, appendFileSync, mkdirSync } from 'fs'
 import { join, relative } from 'path'
-import { execFileSync } from 'child_process'
+import { execFileSync, spawnSync } from 'child_process'
 
 import {
   Checkpoint,
@@ -136,6 +136,103 @@ async function recursive(prompt, opts = {}) {
     finishReason, budgetExceeded, panicked, transcriptMessages,
   }
   return makeAgentResult(stdout, meta)
+}
+
+// ── Flow watchdog (Goal 346) ──────────────────────────────────────
+// Detects a hung `recursive` child process and preserves the scene fast
+// (minutes, not 2h). Runs concurrently with the `recursive` await via
+// setInterval; SIGTERMs the child by PID so `spawnCapture`'s `proc.on('close')`
+// fires and `recursive()` resolves normally.
+//
+// Two trigger modes:
+//   1. no-growth: transcript file hasn't grown for `idleMs` ms (after the
+//      run has had at least `idleMs` to start producing output)
+//   2. finish-marker-hang: transcript contains `[done after N steps] reason:`
+//      but the process hasn't exited within `graceMs`
+
+/**
+ * Find the PID of a `recursive` process whose argv contains the given
+ * `--transcript-out <path>`.  Returns `null` when no match.
+ *
+ * The transcript path is escaped for ERE metacharacters so `pgrep -f` does
+ * not misinterpret dots / parens as regex syntax.
+ * @param {string} transcriptOut
+ * @returns {number|null}
+ */
+export function findRecursivePid(transcriptOut) {
+  if (!transcriptOut) return null
+  // escape ERE metachars so the literal path is matched, not a regex
+  const pat = transcriptOut.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  try {
+    const r = spawnSync('pgrep', ['-f', pat], { encoding: 'utf8' })
+    if (r.status !== 0) return null
+    const pids = r.stdout.split('\n').map(s => s.trim()).filter(Boolean).map(Number)
+    return pids.length ? pids[0] : null
+  } catch { return null }
+}
+
+/**
+ * Start a watchdog that monitors `transcriptOut` and fires `onTrigger` if:
+ *   - the file hasn't grown for `idleMs` ms (no-growth), OR
+ *   - a finish marker is seen but the process hasn't exited within `graceMs`.
+ *
+ * When triggered: SIGTERMs the `recursive` child by PID, then calls
+ * `onTrigger(reason)`.  `stop()` clears the interval and idempotently
+ * disables further fires.
+ *
+ * @param {{ transcriptOut: string, idleMs?: number, pollMs?: number, graceMs?: number, onTrigger: (reason: string) => void }} opts
+ * @returns {{ stop: () => void, reason: string|null }}
+ */
+export function startRecursiveWatchdog({ transcriptOut, idleMs = 10 * 60 * 1000, pollMs = 15_000, graceMs = 30_000, onTrigger }) {
+  const start = Date.now()
+  let lastSize = -1
+  let lastGrowthAt = start
+  let finishMarkerSeenAt = null
+  let stopped = false
+  const reason = { current: null }
+
+  const tick = () => {
+    if (stopped) return
+    let size = -1
+    if (existsSync(transcriptOut)) {
+      try { size = statSync(transcriptOut).size } catch { size = lastSize }
+    }
+    if (size > lastSize) { lastSize = size; lastGrowthAt = Date.now() }
+    // finish-marker short-circuit: scan the file tail for the done marker
+    if (size > 0) {
+      try {
+        const tail = readFileSync(transcriptOut, 'utf8').slice(-4096)
+        if (/\[done after \d+ steps\]\s*reason:/.test(tail)) {
+          if (finishMarkerSeenAt === null) finishMarkerSeenAt = Date.now()
+        }
+      } catch { /* file mid-write */ }
+    }
+    const now = Date.now()
+    if (finishMarkerSeenAt !== null && now - finishMarkerSeenAt > graceMs) {
+      reason.current = 'finish-marker-hang'; fire(); return
+    }
+    // only trip no-growth after the run has had at least idleMs to even start
+    if (now - start >= idleMs && now - lastGrowthAt >= idleMs) {
+      reason.current = 'no-growth-hung'; fire(); return
+    }
+  }
+
+  const fire = () => {
+    if (stopped) return
+    stopped = true
+    const pid = findRecursivePid(transcriptOut)
+    if (pid != null) { try { process.kill(pid, 'SIGTERM') } catch { /* already dead */ } }
+    try { onTrigger?.(reason.current) } catch { /* watcher cb must not break */ }
+  }
+
+  const timer = setInterval(tick, pollMs)
+  // also do one immediate tick so a pre-existing finish marker is caught fast
+  tick()
+
+  return {
+    stop() { stopped = true; clearInterval(timer) },
+    get reason() { return reason.current },
+  }
 }
 
 // ── CLI 参数 ─────────────────────────────────────────────────────
@@ -713,11 +810,38 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
     pricingFile: pricingFileOf(repo), env, onData: tee, timeout: RUN_TIMEOUT_MS,
   })
 
-  // ① 跑 recursive 二进制
+  // ① 跑 recursive 二进制（with flow watchdog — Goal 346）
+  // The watchdog runs concurrently via setInterval and monitors the transcript
+  // file.  If the agent hangs (no output growth for 10 min, or finish marker
+  // seen but process hasn't exited), it SIGTERMs the child by PID so
+  // `spawnCapture`'s `proc.on('close')` fires and `recursive()` resolves.
+  let watchdogReason = null
   const runMeta = await cp.step('run.recursive', async () => {
-    const out = await recursive(goal, { ...base(), transcriptOut })
-    return out._meta
+    const watchdog = startRecursiveWatchdog({
+      transcriptOut,
+      idleMs: (parseInt(process.env.RECURSIVE_WATCHDOG_IDLE_MS ?? '', 10) || 10 * 60 * 1000),
+      pollMs: 15_000,
+      graceMs: 30_000,
+      onTrigger: (r) => { watchdogReason = r },
+    })
+    try {
+      const out = await recursive(goal, { ...base(), transcriptOut })
+      return out._meta
+    } finally {
+      watchdog.stop()
+    }
   })
+
+  // watchdog detected a hung process (SIGTERM'd by us) → preserve now.
+  // Must short-circuit BEFORE the generic `panicked` check below: SIGTERM
+  // exits 143 (128+15) which `panicked` catches, but we want failed-preserved
+  // (resumable), not panic-preserved.
+  if (watchdogReason) {
+    writeFailureContext(cp.dir, 'recursive', {
+      reason: `watchdog: ${watchdogReason}`, tailLog: tailOf(transcriptOut), provider: opts.provider, model: opts.model,
+    })
+    return preserveScene({ worktreeDir, baseline, reason: `watchdog: ${watchdogReason}`, failureOutput: tailOf(transcriptOut), tag: 'watchdog' })
+  }
 
   // panic：保留现场（代码 + transcript）不回滚，留作诊断 / 接续修
   if (runMeta.panicked) {

@@ -41,6 +41,12 @@
       "cmd": "sh .dev/scripts/cli-mutants.sh",
       "onFail": "resume-fix",
       "timeout": 1200000
+    },
+    "flow-watchdog": {
+      "_comment": "Goal 346: watchdog unit tests for self-improve.flow.js (startRecursiveWatchdog / findRecursivePid). Run with node --test. Keeps the flow's own test coverage enforceable in CI.",
+      "cmd": "node --test .dev/flows/test/watchdog.test.mjs",
+      "onFail": "resume-fix",
+      "timeout": 30000
     }
   }
 }
