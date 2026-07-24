@@ -81,6 +81,7 @@ Make it safe and reliable for real deployments.
 | 17.3 | Tool permission system | M | ✅ Allow/deny patterns shipped (Goal 133 + Goal 140, wired into config.toml + env). Per-caller / role-based permissions remain a SaaS-only concern and are intentionally deferred until the project takes that direction. |
 | 17.4 | Graceful shutdown + in-flight request draining | S | ✅ Batch 38 (Goal 120 signal handling + Goal 137 wired token through kernel/runtime) |
 | 17.5 | Docker packaging + health probes | S | ✅ Batch 38 (Goal 138 — Dockerfile + .dockerignore + ghcr.io workflow; /health auth-exempt suffices for k8s probes) |
+| 17.6 | Self-improve loop reliability (incident-driven, g331 post-mortem) | M | ✅ Goal 345 `4d9744b` (compaction slice correctness — never summarize system-prompt-only slice; `would_compact` predicate balances PreCompact/PostCompact hooks; agent-side wall-clock exit `RECURSIVE_WALL_TIMEOUT_SECS`/`FinishReason::WallClockExceeded`; flow signal handlers `preserveScene` on kill instead of `cleanupWt`) + Goal 346 `99787d9` (flow-side watchdog — `pgrep`-based hung-`recursive` detection, SIGTERM + `preserveScene` within ~10min instead of 2h `RUN_TIMEOUT_MS`, `failed-preserved` not `panic-preserved`, `flow-watchdog` gate) |
 
 **Total**: ~2 batches
 
