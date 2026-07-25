@@ -79,7 +79,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         if app.turn.running {
             let elapsed = app
                 .turn
-                .started_at
+                .step_started_at
                 .map(|t| t.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
             lines.push(Line::raw(""));

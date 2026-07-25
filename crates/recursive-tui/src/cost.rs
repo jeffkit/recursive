@@ -163,6 +163,7 @@ impl UsageStats {
 pub struct TurnState {
     pub running: bool,
     pub started_at: Option<Instant>,
+    pub step_started_at: Option<Instant>,
     pub spinner_verb: &'static str,
 }
 
@@ -171,6 +172,7 @@ impl Default for TurnState {
         Self {
             running: false,
             started_at: None,
+            step_started_at: None,
             spinner_verb: "Thinking",
         }
     }
@@ -180,13 +182,20 @@ impl TurnState {
     pub fn start(&mut self) {
         self.running = true;
         self.started_at = Some(Instant::now());
+        self.step_started_at = Some(Instant::now());
         self.spinner_verb = "Thinking";
     }
 
     pub fn finish(&mut self) {
         self.running = false;
         self.started_at = None;
+        self.step_started_at = None;
         self.spinner_verb = "Thinking";
+    }
+
+    /// Reset the step timer to track a new step's elapsed time independently.
+    pub fn start_step(&mut self) {
+        self.step_started_at = Some(Instant::now());
     }
 }
 
@@ -279,9 +288,36 @@ mod tests {
         let mut t = TurnState::default();
         t.start();
         assert!(t.running);
+        assert!(
+            t.step_started_at.is_some(),
+            "start should set step_started_at"
+        );
         t.finish();
         assert!(!t.running, "finish should clear running");
         assert!(t.started_at.is_none(), "finish should clear started_at");
+        assert!(
+            t.step_started_at.is_none(),
+            "finish should clear step_started_at"
+        );
+    }
+
+    #[test]
+    fn start_step_resets_step_timer() {
+        // Verify that start_step() resets the step timer independently of the
+        // overall turn timer, enabling per-step elapsed time display.
+        let mut t = TurnState::default();
+        t.start();
+        let turn_start = t.started_at.unwrap();
+        let step1_start = t.step_started_at.unwrap();
+
+        // Simulate time passing and a step change (e.g., Thinking → Editing).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        t.start_step();
+        let step2_start = t.step_started_at.unwrap();
+
+        // turn timer stays the same, step timer resets
+        assert_eq!(t.started_at.unwrap(), turn_start, "turn timer unchanged");
+        assert!(step2_start > step1_start, "step timer reset");
     }
 
     #[test]

@@ -16,6 +16,7 @@
 use ratatui::layout::Position;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, InputMode};
 
@@ -26,17 +27,110 @@ pub const MAX_VISIBLE_ROWS: u16 = 6;
 /// Total height the chat layout should reserve for the input + footer
 /// stack, given the current buffer.
 pub fn total_height(app: &App) -> u16 {
-    visible_rows(&app.prompt.buffer) + 2 /* borders */ + 1 /* footer */
+    // Estimate based on logical lines - the actual rendering will wrap as needed
+    let logical_lines = app.prompt.buffer.lines().count().max(1);
+    let trailing = if app.prompt.buffer.ends_with('\n') { 1 } else { 0 };
+    let estimated_lines = (logical_lines + trailing) as u16;
+    estimated_lines.clamp(1, MAX_VISIBLE_ROWS) + 2 /* borders */ + 1 /* footer */
 }
 
-/// Number of buffer rows we want visible.
-fn visible_rows(buffer: &str) -> u16 {
-    let lines = buffer.lines().count().max(1);
-    // If the buffer ends in a `\n`, lines() under-counts the trailing
-    // empty line; add one so the cursor on the new line is visible.
-    let trailing = if buffer.ends_with('\n') { 1 } else { 0 };
-    let total = lines + trailing;
-    (total as u16).clamp(1, MAX_VISIBLE_ROWS)
+/// Calculate the available width for text content in the input box.
+///
+/// Subtracts the box borders (2 columns) and the prefix width (indicator + space)
+/// from the total input area width.
+fn available_text_width(area: Rect) -> usize {
+    let border_width = 2; // left and right borders
+    let prefix_width = 2; // indicator + space (e.g., "❯ ")
+    area.width.saturating_sub(border_width + prefix_width) as usize
+}
+
+/// Wrap a single line of text to fit within the available width.
+/// Returns a vector of line segments that fit within the width constraint.
+fn wrap_line_by_width(line: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    let mut wrapped_lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+
+    for ch in line.chars() {
+        // Calculate display width of this character using a slice
+        let mut char_buf = [0u8; 4];
+        let ch_str = ch.encode_utf8(&mut char_buf);
+        let ch_width = UnicodeWidthStr::width(ch_str);
+
+        if current_width + ch_width > max_width && !current_line.is_empty() {
+            // Start a new line
+            wrapped_lines.push(current_line);
+            current_line = String::new();
+            current_width = 0;
+        }
+
+        current_line.push(ch);
+        current_width += ch_width;
+    }
+
+    if !current_line.is_empty() {
+        wrapped_lines.push(current_line);
+    }
+
+    if wrapped_lines.is_empty() {
+        wrapped_lines.push(String::new());
+    }
+
+    wrapped_lines
+}
+
+/// Calculate the visual position of the cursor in the wrapped display.
+/// Returns (col, row) where col is the visual column within the line
+/// and row is the visual row number in the displayed text.
+fn cursor_visual_position_wrapped(buffer: &str, cursor: usize, avail_width: usize) -> (u16, u16) {
+    let head = &buffer[..cursor.min(buffer.len())];
+
+    // Count how many logical newlines are before the cursor
+    let logical_newlines_before = head.matches('\n').count();
+
+    // Find the start of the current logical line
+    let line_start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let current_logical_line = &buffer[line_start..cursor.min(buffer.len())];
+
+    // Calculate how many wrapped lines come from previous logical lines
+    let mut wrapped_lines_before = 0u16;
+
+    // Process all complete logical lines before the current one
+    for (i, line) in buffer.split('\n').enumerate() {
+        if i < logical_newlines_before {
+            let wrapped = wrap_line_by_width(line, avail_width);
+            wrapped_lines_before += wrapped.len() as u16;
+        } else if i == logical_newlines_before {
+            // This is the current logical line - calculate position within wrapped lines
+            let wrapped = wrap_line_by_width(line, avail_width);
+
+            // Find where the cursor falls within the wrapped lines
+            let mut byte_offset = 0;
+            let mut target_row = 0u16;
+            let mut target_col = 0u16;
+
+            for (row_idx, wrapped_line) in wrapped.iter().enumerate() {
+                let line_bytes = wrapped_line.len();
+                if byte_offset + line_bytes >= current_logical_line.len() {
+                    // Cursor is on this wrapped line
+                    target_col = UnicodeWidthStr::width(&current_logical_line[byte_offset..]) as u16;
+                    target_row = row_idx as u16;
+                    break;
+                } else {
+                    byte_offset += line_bytes;
+                }
+            }
+
+            return (target_col, wrapped_lines_before + target_row);
+        }
+    }
+
+    // Fallback for empty buffer
+    (0, 0)
 }
 
 /// Render the input frame + footer hint into `area`. Sets the
@@ -64,8 +158,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let buffer = &app.prompt.buffer;
     let cursor_byte = app.prompt.cursor.min(buffer.len());
 
+    // Calculate available width for text content
+    let avail_width = available_text_width(input_area);
+
     // Build the body lines: prefix the indicator on the very first
     // visual row, plain space-padding on subsequent rows.
+    // Now handles long lines by wrapping them to fit the available width.
     let indicator_style = indicator_style(mode);
     let body_style = Style::default().fg(Color::White);
 
@@ -75,18 +173,30 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(String::new(), body_style),
         ])]
     } else {
-        buffer
-            .split('\n')
-            .enumerate()
-            .map(|(i, line)| {
-                let prefix = if i == 0 {
+        let mut all_lines = Vec::new();
+        let raw_lines: Vec<&str> = buffer.split('\n').collect();
+
+        for (i, line) in raw_lines.iter().enumerate() {
+            let is_first_logical_line = i == 0;
+
+            // Wrap long lines to fit within available width
+            let wrapped = wrap_line_by_width(line, avail_width);
+
+            for (j, wrapped_line) in wrapped.iter().enumerate() {
+                let is_first_visual_row = is_first_logical_line && j == 0;
+                let prefix = if is_first_visual_row {
                     Span::styled(format!("{} ", mode.indicator()), indicator_style)
                 } else {
                     Span::raw("  ")
                 };
-                Line::from(vec![prefix, Span::styled(line.to_string(), body_style)])
-            })
-            .collect()
+                all_lines.push(Line::from(vec![
+                    prefix.clone(),
+                    Span::styled(wrapped_line.to_string(), body_style)
+                ]));
+            }
+        }
+
+        all_lines
     };
 
     let input = Paragraph::new(lines).block(
@@ -96,10 +206,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(input, input_area);
 
-    // Compute cursor visual position. The input box has 1-cell border
-    // and a 2-cell prefix ("X "), so the first column of editable
-    // content is `area.x + 1 + 2`.
-    let (col, row) = cursor_visual_position(buffer, cursor_byte);
+    // Compute cursor visual position with wrapped lines considered.
+    // The input box has 1-cell border and a 2-cell prefix ("X "),
+    // so the first column of editable content is `area.x + 1 + 2`.
+    let (col, row) = cursor_visual_position_wrapped(buffer, cursor_byte, avail_width);
     let cursor_x = input_area.x.saturating_add(1).saturating_add(2 + col);
     let cursor_y = input_area.y.saturating_add(1).saturating_add(row);
     // Clamp inside the input frame.

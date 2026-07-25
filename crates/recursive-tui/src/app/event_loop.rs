@@ -58,6 +58,7 @@ impl App {
                 });
                 // Refine spinner verb based on tool category.
                 self.turn.spinner_verb = verb_for_tool(&name);
+                self.turn.start_step();
             }
             UiEvent::ToolResult {
                 id,
