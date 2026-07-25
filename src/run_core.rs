@@ -73,6 +73,19 @@ fn finish_reason_str(reason: &FinishReason) -> String {
     reason.to_string()
 }
 
+/// Rough token estimate from message content lengths.
+///
+/// Used as fallback when the LLM provider does not report `usage` in its
+/// response. 4 chars per token is a conservative heuristic that works for
+/// mixed English + CJK text; it will slightly *under*-estimate, which is
+/// safer for the context gauge than over-estimating (false compaction
+/// warnings). Divide by at least 1 so a zero-length message list doesn't
+/// report zero tokens (the system prompt always exists).
+fn estimate_prompt_tokens(messages: &[Message]) -> u32 {
+    let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+    (total_chars / 4).max(1) as u32
+}
+
 /// Outcome returned by the stateless [`run_inner`] loop.
 pub(crate) struct RunInnerOutcome {
     pub(crate) messages: Arc<Vec<Message>>,
@@ -380,6 +393,20 @@ impl<'a> RunCore<'a> {
             // `max(input_tokens, cache_hit + cache_miss)` so Anthropic
             // and OpenAI reporting differences are handled).
             self.emit_breakdown(step, &u);
+        } else {
+            // Provider did not report usage — emit a best-effort estimate
+            // so the TUI context gauge still updates on every turn.
+            let estimated_input = estimate_prompt_tokens(&self.messages);
+            let output_len = completion.content.len()
+                + completion.reasoning_content.as_ref().map_or(0, |s| s.len());
+            let estimated_output = (output_len / 4).max(1) as u32;
+            self.emit(AgentEvent::Usage {
+                input_tokens: estimated_input,
+                output_tokens: estimated_output,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
+                step,
+            });
         }
 
         // Surface reasoning / thinking content to UI consumers (TUI) as
@@ -1264,8 +1291,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        effective_step_limit, finish_reason_str, RunCore, StaticBreakdownCache, MIN_TRIM_LENGTH,
-        TRIM_PLACEHOLDER,
+        effective_step_limit, estimate_prompt_tokens, finish_reason_str, RunCore,
+        StaticBreakdownCache, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
     };
     use crate::message::Message;
 
@@ -1562,6 +1589,162 @@ mod tests {
             reason.to_string(),
             "finish_reason_str must delegate to Display"
         );
+    }
+
+    // ========================================================================
+    // estimate_prompt_tokens / fallback-usage tests
+    // (cover the else branch in dispatch_llm_step used when the provider
+    //  does not report `usage`)
+    // ========================================================================
+
+    #[test]
+    fn estimate_prompt_tokens_divides_total_chars_by_four() {
+        // 3 messages: 4 + 8 + 12 = 24 chars → 24 / 4 = 6 tokens.
+        let messages = vec![
+            Message::user("abcd".to_string()),           // 4
+            Message::assistant("abcdefgh".to_string()),  // 8
+            Message::system("abcdefghijkl".to_string()), // 12
+        ];
+        assert_eq!(
+            estimate_prompt_tokens(&messages),
+            6,
+            "24 total chars / 4 = 6 tokens"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_truncates_partial_tokens() {
+        // 7 chars → 7 / 4 = 1 (integer truncation), not rounded up to 2.
+        let messages = vec![Message::user("abcdefg".to_string())];
+        assert_eq!(
+            estimate_prompt_tokens(&messages),
+            1,
+            "integer division must truncate 7/4 to 1"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_floors_to_one_for_empty_messages() {
+        // No messages → 0 / 4 = 0, but .max(1) floors to 1 so the gauge
+        // never reports zero (the system prompt always exists).
+        let messages: Vec<Message> = vec![];
+        assert_eq!(
+            estimate_prompt_tokens(&messages),
+            1,
+            "empty transcript must still report at least 1 token"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_floors_to_one_for_sub_four_chars() {
+        // 3 chars → 3 / 4 = 0, floored to 1 by .max(1).
+        let messages = vec![Message::user("abc".to_string())];
+        assert_eq!(
+            estimate_prompt_tokens(&messages),
+            1,
+            "content shorter than 4 chars must floor to 1 token"
+        );
+    }
+
+    // Helper: build a RunCore wired to a custom provider and event sender so
+    // tests can drive `dispatch_llm_step` and inspect emitted events.
+    fn make_core_with_llm_and_events<'a>(
+        messages: Vec<Message>,
+        llm: Arc<dyn crate::llm::ChatProvider>,
+        events: tokio::sync::mpsc::UnboundedSender<crate::event::AgentEvent>,
+        hooks: &'a crate::hooks::HookRegistry,
+    ) -> RunCore<'a> {
+        use std::sync::atomic::AtomicBool;
+        RunCore {
+            messages: Arc::new(messages),
+            llm,
+            tools: Arc::new(crate::tools::ToolRegistry::default()),
+            max_steps: 1,
+            max_transcript_chars: None,
+            events: Some(events),
+            streaming: false,
+            compactor: None,
+            permission_hook: None,
+            hooks,
+            total_llm_latency_ms: 0,
+            exploring_plan_mode: Arc::new(AtomicBool::new(false)),
+            shutdown_token: None,
+            mailbox: None,
+            stuck_window: 3,
+            stuck_error_rate: 1.0,
+            turn: 0,
+            globs_skills: vec![],
+        }
+    }
+
+    /// When the provider returns a completion without `usage`, the fallback
+    /// branch must emit a best-effort estimated `Usage` event: input from the
+    /// transcript chars, output from `content` + `reasoning_content`, both
+    /// divided by 4, with zero cache tokens — and it must NOT accumulate into
+    /// `total_usage` (only provider-reported usage does).
+    #[tokio::test]
+    async fn dispatch_llm_step_emits_estimated_usage_when_provider_reports_none() {
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, MockProvider, TokenUsage};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Transcript: a single user message of exactly 40 bytes → 40/4 = 10.
+        let messages = vec![Message::user("x".repeat(40))];
+
+        // Completion WITHOUT usage forces the fallback branch.
+        // content = 8 bytes, reasoning = 4 bytes → 12/4 = 3 output tokens.
+        let completion = Completion {
+            content: "12345678".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: Some("abcd".to_string()),
+        };
+        let llm = Arc::new(MockProvider::new(vec![completion]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_core_with_llm_and_events(messages, llm, tx, &hooks);
+
+        let specs: Vec<crate::llm::ToolSpec> = vec![];
+        let mut total_usage = TokenUsage::default();
+        core.dispatch_llm_step(&specs, 0, &mut total_usage)
+            .await
+            .expect("dispatch_llm_step should succeed");
+
+        // Estimated usage must not be folded into total_usage.
+        assert_eq!(
+            total_usage.prompt_tokens, 0,
+            "estimate must not accumulate input into total_usage"
+        );
+        assert_eq!(
+            total_usage.completion_tokens, 0,
+            "estimate must not accumulate output into total_usage"
+        );
+
+        // Locate the emitted Usage event.
+        let mut usage_event = None;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, AgentEvent::Usage { .. }) {
+                usage_event = Some(ev);
+                break;
+            }
+        }
+        match usage_event.expect("fallback branch must emit a Usage event") {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
+                step,
+            } => {
+                assert_eq!(input_tokens, 10, "input estimate = 40 chars / 4");
+                assert_eq!(output_tokens, 3, "output estimate = (8 + 4) chars / 4");
+                assert_eq!(cache_hit_tokens, 0, "estimate reports no cache hits");
+                assert_eq!(cache_miss_tokens, 0, "estimate reports no cache misses");
+                assert_eq!(step, 0, "step must be forwarded unchanged");
+            }
+            other => panic!("expected Usage event, got {other:?}"),
+        }
     }
 
     // ========================================================================
