@@ -974,6 +974,13 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
   //    （并发 flow 已落地 / 外部 admin merge）。main 未动 → 快路径直接 cherry-pick；
   //    main 已动 → 慢路径 rebase 到当前 mainHead + 在合并树上重跑门（见 ⑤b/c）。
   const prep = await cp.step('commit.prep', () => {
+    // fix round が生成したゲートログは debug 用途のみ — コミットに混入させない。
+    // buildFixGoal がworktreeDirに書いた .gate-*-output.log を git add -A の前に消す。
+    try {
+      readdirSync(worktreeDir)
+        .filter(f => /^\.gate-[^/\\]+-output\.log$/.test(f))
+        .forEach(f => { try { rmSync(join(worktreeDir, f), { force: true }) } catch { /* best-effort */ } })
+    } catch { /* best-effort */ }
     git(['add', '-A'], worktreeDir)
     if (!worktreeDirty(worktreeDir)) return { empty: true }
     git(['commit', '-m', `wt: ${goalSubject()}`], worktreeDir)
@@ -1104,6 +1111,7 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
           // N 轮仍红：带上最新 stderr 上抛，由 runAttempt 转 failed-preserved
           err.exhausted = true
           err.output = lastOutput
+          err.gate = err.gate ?? g.name // 确保 gate 名称传播到上层 catch（runAttempt 用于 detail/tag）
           throw err
         }
         // 红灯 → 喂「可操作的错误清单」让 agent 修一轮，链式 replay，再回到 for 顶端重跑本门
@@ -1118,6 +1126,7 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
           err.exhausted = true
           err.output = lastOutput
           err.reason = `agent made no edits in fix round ${attempt + 1} (likely could not act on ${g.name} output)`
+          err.gate = err.gate ?? g.name // 同上
           throw err
         }
       }
@@ -1216,12 +1225,29 @@ async function runFixRound({ transcriptOut, sysPromptFile, env, worktreeDir, fix
   const replayFrom = msgCount > 0
     ? { transcript: transcriptOut, resumeFrom: msgCount }
     : undefined
-  await recursive(fixGoal, {
-    cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
-    transcriptOut: fixTranscript, pricingFile: pricingFileOf(repo), env: fixEnv, onData: tee,
-    timeout: RUN_TIMEOUT_MS,
-    ...(replayFrom ? { replayFrom } : {}),
+  // fix round 同样可能挂死（g331 教训）— 用独立 watchdog 保护，触发后 SIGTERM recursive，
+  // runFixRound 正常返回，外层 gate 仍会失败并计入 fix-round 次数，最终 failed-preserved。
+  let watchdogReason = null
+  const watchdog = startRecursiveWatchdog({
+    transcriptOut: fixTranscript,
+    idleMs: parseInt(process.env.RECURSIVE_WATCHDOG_IDLE_MS ?? '', 10) || 10 * 60 * 1_000,
+    pollMs: 15_000,
+    graceMs: 30_000,
+    onTrigger: (r) => { watchdogReason = r },
   })
+  try {
+    await recursive(fixGoal, {
+      cwd: worktreeDir, workspace: '.', bin: resolvedBin, systemPromptFile: sysPromptFile,
+      transcriptOut: fixTranscript, pricingFile: pricingFileOf(repo), env: fixEnv, onData: tee,
+      timeout: RUN_TIMEOUT_MS,
+      ...(replayFrom ? { replayFrom } : {}),
+    })
+  } finally {
+    watchdog.stop()
+  }
+  if (watchdogReason) {
+    console.warn(`  [fix-round/${tag}] watchdog 触发（${watchdogReason}）— fix round 被强制终止，gate 将重跑并计入失败轮次。`)
+  }
   return fixTranscript
 }
 
@@ -1293,29 +1319,29 @@ async function selfReview(worktreeDir) {
       }
     }
 
-  // 默认：recursive executor + reviewer-provider（在 worktree 内可 Read/Glob/Grep 查上下文）
-  const revEnv = buildEnv(opts['reviewer-provider'])
-  // 未配置 reviewer-provider（无 API base/key）时显式跳过并标记 misconfig，
-  // 与「网络 down」区分开，避免用户忘了加 --reviewer-provider 时 review 层悄无声息缺席。
-  if (!revEnv.RECURSIVE_API_BASE || !revEnv.RECURSIVE_API_KEY) {
-    console.warn('  [review] reviewer-provider 未配置（无 RECURSIVE_API_BASE/API_KEY），跳过 self-review。')
-    return { text: '[reviewer provider not configured — review skipped]', ok: false, misconfig: true }
-  }
-  const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
-  const out = await recursive(
-    prompt,
-    {
-      cwd: worktreeDir, workspace: '.', bin: resolvedBin, allowTools: 'Read,Glob,Grep',
-      // 给 reviewer 一个独立 transcript（审计可见）+ 显式步数上限，防止只读 reviewer 空转挂很久。
-      transcriptOut: join(cp.dir, 'review.json'),
-      pricingFile: pricingFileOf(repo), env: revEnv, onData: tee,
-      // reviewer 不沿用 agent 的 maxSteps（agent 可能 budget 很大）；用独立默认上限。
-      ...(opts['reviewer-max-steps'] ? { maxSteps: opts['reviewer-max-steps'] } : {}),
-    },
-  )
-  const m = out._meta ?? {}
-  const ok = m.exitCode === 0 && !m.spawnError && !m.timedOut
-  return { text: String(out), ok }
+    // 默认：recursive executor + reviewer-provider（在 worktree 内可 Read/Glob/Grep 查上下文）
+    const revEnv = buildEnv(opts['reviewer-provider'])
+    // 未配置 reviewer-provider（无 API base/key）时显式跳过并标记 misconfig，
+    // 与「网络 down」区分开，避免用户忘了加 --reviewer-provider 时 review 层悄无声息缺席。
+    if (!revEnv.RECURSIVE_API_BASE || !revEnv.RECURSIVE_API_KEY) {
+      console.warn('  [review] reviewer-provider 未配置（无 RECURSIVE_API_BASE/API_KEY），跳过 self-review。')
+      return { text: '[reviewer provider not configured — review skipped]', ok: false, misconfig: true }
+    }
+    const resolvedBin = opts.bin ?? join(repo, 'target', 'release', 'recursive')
+    const out = await recursive(
+      prompt,
+      {
+        cwd: worktreeDir, workspace: '.', bin: resolvedBin, allowTools: 'Read,Glob,Grep',
+        // 给 reviewer 一个独立 transcript（审计可见）+ 显式步数上限，防止只读 reviewer 空转挂很久。
+        transcriptOut: join(cp.dir, 'review.json'),
+        pricingFile: pricingFileOf(repo), env: revEnv, onData: tee,
+        // reviewer 不沿用 agent 的 maxSteps（agent 可能 budget 很大）；用独立默认上限。
+        ...(opts['reviewer-max-steps'] ? { maxSteps: opts['reviewer-max-steps'] } : {}),
+      },
+    )
+    const m = out._meta ?? {}
+    const ok = m.exitCode === 0 && !m.spawnError && !m.timedOut
+    return { text: String(out), ok }
   } finally {
     // 评审完清掉 diff 文件 + 撤销 gitDiff 可能给它打的 intent-to-add，避免污染后续 diff / 提交
     try { rmSync(diffPath, { force: true }) } catch { /* 已不在 */ }
@@ -1625,7 +1651,9 @@ function killStaleRecursiveProcs(repoPath, currentRunId) {
         if (!line.includes(repoPath) && !line.includes('target/release/recursive') && !line.includes('target/debug/recursive')) continue
       }
       try {
-        process.kill(pid, 'SIGKILL')
+        // SIGTERM（非 SIGKILL）：给进程机会释放 git worktree 锁及临时文件。
+        // 与 watchdog 策略一致（Goal 346）。进程若拒绝退出，下次 preflight 会再次处理。
+        process.kill(pid, 'SIGTERM')
         killed.push(pid)
       } catch { /* 进程已消失 */ }
     }

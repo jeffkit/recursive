@@ -36,6 +36,14 @@ function setup() {
   const repo = join(root, 'repo')
   mkdirSync(join(repo, 'target', 'release'), { recursive: true })
   mkdirSync(join(repo, 'src'), { recursive: true })
+  // assertGatePrereqs 要求 .dev/scripts/e2e-gate.sh 存在且 --check-prereqs 通过。
+  // 临时仓没有真实 e2e 环境，用一个始终成功的桩脚本绕过前置检查。
+  mkdirSync(join(repo, '.dev', 'scripts'), { recursive: true })
+  writeFileSync(
+    join(repo, '.dev', 'scripts', 'e2e-gate.sh'),
+    '#!/bin/sh\n# stub: always pass in test env\nexit 0\n',
+  )
+  chmodSync(join(repo, '.dev', 'scripts', 'e2e-gate.sh'), 0o755)
 
   const recBin = join(repo, 'target', 'release', 'recursive')
   writeFileSync(recBin, FAKE_RECURSIVE); chmodSync(recBin, 0o755)
@@ -89,20 +97,23 @@ test('E2E 成功路径：verdict=committed，落地 commit + report.md', () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-test('E2E 回滚路径：cargo test 红灯 → verdict=rolled-back，工作树回到 baseline', () => {
+test('E2E 失败保留路径：cargo test 红灯 MAX_FIX_ROUNDS 后 → verdict=failed-preserved，HEAD 未变', () => {
+  // 旧行为是硬回滚（rolled-back）；现在 gate 耗尽 fix rounds 后 → failed-preserved（保留现场不回滚）。
+  // main checkout 仍干净（worktree 被挪到 .worktrees/preserve/，已 git/info/exclude 排除）。
   const { root, repo, binDir } = setup()
   const baseline = git(['rev-parse', 'HEAD'], repo)
   const runId = 'e2e-rollback'
 
   const r = runFlow({ repo, binDir, runId, cargoFail: 'test' })
-  assert.equal(r.status, 0, `flow 应正常退出（回滚不算崩溃）:\n${r.stdout}\n${r.stderr}`)
+  assert.equal(r.status, 0, `flow 应正常退出（failed-preserved 不算崩溃）:\n${r.stdout}\n${r.stderr}`)
 
-  // HEAD 不变 + 工作树干净（硬回滚生效）
+  // HEAD 不变（无 cherry-pick 发生）
   assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, 'HEAD 应回到 baseline')
-  assert.equal(git(['status', '--porcelain'], repo), '', '工作树应干净（含 untracked 被 clean）')
+  // main checkout 干净（preserve worktree 已被 git/info/exclude 排除）
+  assert.equal(git(['status', '--porcelain'], repo), '', 'main checkout 应干净')
 
   const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
-  assert.equal(state.summary.verdict, 'rolled-back')
+  assert.equal(state.summary.verdict, 'failed-preserved', `verdict 应为 failed-preserved，实际: ${state.summary.verdict}`)
 
   rmSync(root, { recursive: true, force: true })
 })
@@ -125,20 +136,21 @@ test('E2E 项目自定义门：.flowcast/gates.json 声明的门红灯 → rolle
   assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, 'HEAD 应回到 baseline（自定义门红灯触发回滚）')
 
   const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
-  assert.equal(state.summary.verdict, 'rolled-back')
-  // 回滚原因必须正是项目自定义门 custombiz（内置 cargo 门全绿，唯一红灯来源）——
+  assert.equal(state.summary.verdict, 'failed-preserved', `verdict 应为 failed-preserved，实际: ${state.summary.verdict}`)
+  // 失败原因必须正是项目自定义门 custombiz（内置 cargo 门全绿，唯一红灯来源）——
   // 直接证明 loadGates 加载的项目门被合并进门链并真正执行。
   assert.match(
     state.summary.detail ?? '',
     /custombiz/,
-    `回滚原因应来自项目门 custombiz，实际 detail: ${state.summary.detail}`,
+    `失败原因应来自项目门 custombiz，实际 detail: ${state.summary.detail}`,
   )
 
   rmSync(root, { recursive: true, force: true })
 })
 
-test('E2E clippy 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () => {
+test('E2E clippy 门红灯 → verdict=failed-preserved，HEAD 未变', () => {
   // CARGO_FAIL=clippy 让假 cargo clippy 以非零退出，触发 clippy 质量门失败路径。
+  // fix rounds 耗尽后 → failed-preserved（保留现场，不硬回滚）。
   const { root, repo, binDir } = setup()
   const baseline = git(['rev-parse', 'HEAD'], repo)
   const runId = 'e2e-clippy-fail'
@@ -146,25 +158,26 @@ test('E2E clippy 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () =
   const r = runFlow({ repo, binDir, runId, cargoFail: 'clippy' })
   assert.equal(r.status, 0, `flow 应正常退出（clippy 失败不是 crash）:\n${r.stdout}\n${r.stderr}`)
 
-  // clippy 门失败 → 回滚：HEAD 不变
+  // clippy 门失败 → failed-preserved：HEAD 不变
   assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, 'clippy 红灯后 HEAD 应回到 baseline')
 
   const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
-  assert.equal(state.summary.verdict, 'rolled-back', `verdict 应为 rolled-back，实际: ${state.summary.verdict}`)
+  assert.equal(state.summary.verdict, 'failed-preserved', `verdict 应为 failed-preserved，实际: ${state.summary.verdict}`)
 
-  // 回滚原因必须来自 clippy 门
+  // 失败原因必须来自 clippy 门
   assert.match(
     state.summary.detail ?? '',
     /clippy/i,
-    `回滚原因应来自 clippy 门，实际 detail: ${state.summary.detail}`,
+    `失败原因应来自 clippy 门，实际 detail: ${state.summary.detail}`,
   )
 
   rmSync(root, { recursive: true, force: true })
 })
 
-test('E2E fmt 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () => {
+test('E2E fmt 门红灯 → verdict=failed-preserved，HEAD 未变', () => {
   // CARGO_FAIL=fmt 让假 cargo fmt 以非零退出，触发 fmt 质量门失败路径。
   // fmt 门的 cmd 是 `cargo fmt --all -- --check`，$1 = "fmt"，CARGO_FAIL=fmt 即可触发。
+  // fix rounds 耗尽后 → failed-preserved（保留现场，不硬回滚）。
   const { root, repo, binDir } = setup()
   const baseline = git(['rev-parse', 'HEAD'], repo)
   const runId = 'e2e-fmt-fail'
@@ -172,17 +185,17 @@ test('E2E fmt 门红灯 → verdict=rolled-back，HEAD 回到 baseline', () => {
   const r = runFlow({ repo, binDir, runId, cargoFail: 'fmt' })
   assert.equal(r.status, 0, `flow 应正常退出（fmt 失败不是 crash）:\n${r.stdout}\n${r.stderr}`)
 
-  // fmt 门失败 → 回滚：HEAD 不变
+  // fmt 门失败 → failed-preserved：HEAD 不变
   assert.equal(git(['rev-parse', 'HEAD'], repo), baseline, 'fmt 红灯后 HEAD 应回到 baseline')
 
   const state = JSON.parse(readFileSync(join(repo, '.flowcast', 'runs', runId, 'state.json'), 'utf8'))
-  assert.equal(state.summary.verdict, 'rolled-back', `verdict 应为 rolled-back，实际: ${state.summary.verdict}`)
+  assert.equal(state.summary.verdict, 'failed-preserved', `verdict 应为 failed-preserved，实际: ${state.summary.verdict}`)
 
-  // 回滚原因必须来自 fmt 门
+  // 失败原因必须来自 fmt 门
   assert.match(
     state.summary.detail ?? '',
     /fmt/i,
-    `回滚原因应来自 fmt 门，实际 detail: ${state.summary.detail}`,
+    `失败原因应来自 fmt 门，实际 detail: ${state.summary.detail}`,
   )
 
   rmSync(root, { recursive: true, force: true })
