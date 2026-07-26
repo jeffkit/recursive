@@ -220,6 +220,22 @@ fn build_compactor_from_env(raw: Option<&str>, model: &str) -> Option<recursive:
     Some(recursive::Compactor::new(n).threshold_prompt_tokens(token_threshold))
 }
 
+/// Build the microcompactor for TUI mode, mirroring the CLI's
+/// RECURSIVE_MICROCOMPACT_TRIGGER env contract so interactive and headless
+/// runs microcompact at the same point:
+///   RECURSIVE_MICROCOMPACT_TRIGGER=<n> → explicit trigger count
+///   0 / off / false                → explicitly disabled
+///   unset                                → default 12
+/// Returns None when microcompact is disabled.
+fn build_microcompactor() -> Option<recursive::compact::Microcompactor> {
+    recursive::compact::micro::build_microcompactor_from_env(
+        std::env::var("RECURSIVE_MICROCOMPACT_TRIGGER")
+            .ok()
+            .as_deref(),
+        std::env::var("RECURSIVE_MICROCOMPACT_KEEP").ok().as_deref(),
+    )
+}
+
 pub fn build_runtime() -> TuiRuntime {
     let session_roots = new_shared_sandbox_roots();
     let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(None));
@@ -309,6 +325,9 @@ pub fn build_runtime() -> TuiRuntime {
         .streaming(true);
     if let Some(c) = build_compactor(&config.model) {
         builder = builder.compactor(c);
+    }
+    if let Some(mc) = build_microcompactor() {
+        builder = builder.microcompactor(mc);
     }
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
@@ -445,6 +464,9 @@ fn build_runtime_with_skill_tx(
         .streaming(true);
     if let Some(c) = build_compactor(&config.model) {
         builder = builder.compactor(c);
+    }
+    if let Some(mc) = build_microcompactor() {
+        builder = builder.microcompactor(mc);
     }
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),

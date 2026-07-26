@@ -120,6 +120,10 @@ pub(crate) struct RunCore<'a> {
     /// When set, tool results are pruned at the end of each step BEFORE
     /// the next LLM call, keeping the transcript short enough that
     /// proactive cross-turn compaction rarely fires mid-response.
+    /// NOTE: field exists but intra-turn invocation is not yet wired
+    /// (Goal 332 added the type + field; Goal 333 wires cross-turn;
+    /// a future goal will wire intra-turn in maybe_compact).
+    #[allow(dead_code)]
     pub(crate) microcompactor: Option<crate::compact::Microcompactor>,
     pub(crate) permission_hook: Option<Arc<dyn PermissionHook>>,
     pub(crate) hooks: &'a HookRegistry,
@@ -2382,7 +2386,11 @@ mod tests {
             }
         }
         assert!(found_breaker, "must emit CircuitBreaker skip event");
-        assert_eq!(core.messages.len(), 3, "must not compact when breaker is tripped");
+        assert_eq!(
+            core.messages.len(),
+            3,
+            "must not compact when breaker is tripped"
+        );
     }
 
     #[tokio::test]
@@ -2413,7 +2421,10 @@ mod tests {
 
         core.maybe_compact(1).await;
 
-        assert_eq!(core.consecutive_compact_failures, 0, "breaker must reset on success");
+        assert_eq!(
+            core.consecutive_compact_failures, 0,
+            "breaker must reset on success"
+        );
     }
 
     #[tokio::test]
@@ -2436,12 +2447,10 @@ mod tests {
             Message::assistant("rep2".to_string()),
         ];
         // MockProvider that errors on the first complete() call → compaction fails.
-        let provider = Arc::new(
-            MockProvider::new(vec![]).with_errors(vec![Error::Llm {
-                provider: "mock".into(),
-                message: "simulated compaction failure".into(),
-            }]),
-        );
+        let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
+            provider: "mock".into(),
+            message: "simulated compaction failure".into(),
+        }]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut core = make_test_core(messages, &hooks);
         core.llm = provider;
@@ -2490,9 +2499,12 @@ mod tests {
             provider: "mock".into(),
             message: "simulated compaction failure".into(),
         };
-        let provider = Arc::new(
-            MockProvider::new(vec![]).with_errors(vec![mk_err(), mk_err(), mk_err(), mk_err()]),
-        );
+        let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![
+            mk_err(),
+            mk_err(),
+            mk_err(),
+            mk_err(),
+        ]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut core = make_test_core(messages, &hooks);
         core.llm = provider.clone();
@@ -2515,23 +2527,23 @@ mod tests {
         // Third call: reaches threshold → breaker trips, no compaction attempted
         // Drain events before third call
         while rx.try_recv().is_ok() {}
-        core.maybe_compact((MAX_CONSECUTIVE_COMPACT_FAILURES - 1) as usize).await;
+        core.maybe_compact((MAX_CONSECUTIVE_COMPACT_FAILURES - 1) as usize)
+            .await;
 
         // Counter stays at threshold (doesn't overflow)
         assert_eq!(
-            core.consecutive_compact_failures,
-            MAX_CONSECUTIVE_COMPACT_FAILURES,
+            core.consecutive_compact_failures, MAX_CONSECUTIVE_COMPACT_FAILURES,
             "counter must not exceed threshold"
         );
 
         // Fourth call: breaker already tripped → emits CircuitBreaker, no counter change
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         core.events = Some(tx2);
-        core.maybe_compact(MAX_CONSECUTIVE_COMPACT_FAILURES as usize).await;
+        core.maybe_compact(MAX_CONSECUTIVE_COMPACT_FAILURES as usize)
+            .await;
 
         assert_eq!(
-            core.consecutive_compact_failures,
-            MAX_CONSECUTIVE_COMPACT_FAILURES,
+            core.consecutive_compact_failures, MAX_CONSECUTIVE_COMPACT_FAILURES,
             "breaker tripped: counter should stay at max"
         );
 
@@ -2546,7 +2558,10 @@ mod tests {
                 panic!("circuit breaker should prevent compaction once tripped");
             }
         }
-        assert!(breaker_count >= 1, "must emit CircuitBreaker event when tripped");
+        assert!(
+            breaker_count >= 1,
+            "must emit CircuitBreaker event when tripped"
+        );
     }
 
     // ========================================================================

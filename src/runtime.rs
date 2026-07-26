@@ -167,6 +167,9 @@ pub struct AgentRuntime {
     streaming: bool,
     /// Optional compactor for cross-turn transcript summarization.
     compactor: Option<Compactor>,
+    /// Optional microcompactor for no-LLM proactive pruning of old tool
+    /// results by count at cross-turn boundaries.
+    microcompactor: Option<crate::compact::Microcompactor>,
     /// Goal-331: consecutive proactive compaction failures (cross-turn).
     /// Same semantics as `RunCore::consecutive_compact_failures`.
     consecutive_compact_failures: u32,
@@ -378,16 +381,31 @@ impl AgentRuntime {
     /// priority over the character estimate (more reliable for CJK content where
     /// the 4-char/token assumption significantly underestimates token density).
     async fn maybe_compact_cross_turn(&mut self, last_prompt_tokens: u32) -> Result<()> {
+        // Goal 333: run microcompact before the LLM-summary check so that
+        // count-based pruning of old tool results may drop the transcript
+        // below the compaction threshold, skipping the expensive summary.
+        if let Some(m) = &self.microcompactor {
+            let turn = self.checkpoints.turn_index.load(Ordering::Relaxed);
+            let pruned = m.prune(&mut *Arc::make_mut(&mut self.transcript));
+            if pruned > 0 {
+                self.event_sink
+                    .emit(AgentEvent::Microcompact { step: turn, pruned })
+                    .await;
+            }
+        }
+
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
 
         // Circuit breaker: stop trying after too many consecutive failures.
         if self.consecutive_compact_failures >= crate::compact::MAX_CONSECUTIVE_COMPACT_FAILURES {
-            self.event_sink.emit(AgentEvent::CompactionSkipped {
-                step: self.checkpoints.turn_index.load(Ordering::Relaxed),
-                reason: crate::event::CompactionSkipReason::CircuitBreaker,
-            }).await;
+            self.event_sink
+                .emit(AgentEvent::CompactionSkipped {
+                    step: self.checkpoints.turn_index.load(Ordering::Relaxed),
+                    reason: crate::event::CompactionSkipReason::CircuitBreaker,
+                })
+                .await;
             return Ok(());
         }
 
@@ -430,10 +448,12 @@ impl AgentRuntime {
                     })
                     .await;
                 if let Some(summary) = self.transcript.first().cloned() {
-                    self.event_sink.emit(AgentEvent::MessageAppended {
-                        message: summary,
-                        usage: None,
-                    }).await;
+                    self.event_sink
+                        .emit(AgentEvent::MessageAppended {
+                            message: summary,
+                            usage: None,
+                        })
+                        .await;
                 }
             }
             Ok(None) => {
@@ -443,10 +463,12 @@ impl AgentRuntime {
                 // Compaction failed — increment the breaker, emit event, continue.
                 tracing::warn!(error = %e, "cross-turn proactive compaction failed");
                 self.consecutive_compact_failures += 1;
-                self.event_sink.emit(AgentEvent::CompactionSkipped {
-                    step: self.checkpoints.turn_index.load(Ordering::Relaxed),
-                    reason: crate::event::CompactionSkipReason::Error,
-                }).await;
+                self.event_sink
+                    .emit(AgentEvent::CompactionSkipped {
+                        step: self.checkpoints.turn_index.load(Ordering::Relaxed),
+                        reason: crate::event::CompactionSkipReason::Error,
+                    })
+                    .await;
             }
         }
         Ok(())
@@ -1499,6 +1521,7 @@ impl AgentRuntimeBuilder {
             event_sink,
             streaming: self.streaming,
             compactor: self.compactor,
+            microcompactor: self.microcompactor,
             consecutive_compact_failures: 0,
             checkpoints: CheckpointState::disabled(),
             todo_list,
@@ -3182,6 +3205,103 @@ mod tests {
         assert!(
             !is_context_window_exceeded(&err),
             "Config errors must not be detected even if they contain the keyword"
+        );
+    }
+
+    // ── cross-turn microcompact (Goal 333) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn cross_turn_microcompact_prunes_before_summary_check() {
+        // Build a runtime with a Microcompactor (low trigger=2) and a Compactor
+        // (char threshold high enough that the post-prune transcript would NOT
+        // trigger the LLM summary). Seed a transcript with many tool results.
+        // Verify: Microcompact event was emitted AND the compactor's LLM was
+        // NOT called (summary skipped).
+        let provider = Arc::new(MockProvider::new(vec![])); // should not be called
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        let sink_arc = Arc::new(sink);
+
+        let mc = crate::compact::Microcompactor::new(2, 1); // trigger at 2
+        let compactor = crate::compact::Compactor::new(usize::MAX); // never fires by char
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .microcompactor(mc)
+            .compactor(compactor)
+            .event_sink(sink_arc)
+            .build()
+            .unwrap();
+
+        // Seed transcript with 5 tool-result messages (trigger=2, keep=1).
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..5 {
+            msgs.push(Message::user(format!("user {i}")));
+            msgs.push(Message::assistant(format!("asst {i}")));
+            msgs.push(Message::tool_result(format!("call_{i}"), "x".repeat(300)));
+        }
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+
+        // Drain channel events from builder setup.
+        while rx.try_recv().is_ok() {}
+
+        // Call maybe_compact_cross_turn directly.
+        rt.maybe_compact_cross_turn(0).await.unwrap();
+
+        // Check for Microcompact event.
+        let mut microcompact_fired = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, AgentEvent::Microcompact { .. }) {
+                microcompact_fired = true;
+            }
+        }
+
+        assert!(
+            microcompact_fired,
+            "Microcompact event must be emitted when microcompactor prunes"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_turn_microcompact_disabled_when_none() {
+        // No microcompactor configured → behavior identical to today (no Microcompact).
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        let sink_arc = Arc::new(sink);
+
+        // Build runtime with ONLY a compactor (threshold=MAX so it never fires),
+        // but NO microcompactor.
+        let compactor = crate::compact::Compactor::new(usize::MAX);
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .compactor(compactor)
+            .event_sink(sink_arc)
+            .build()
+            .unwrap();
+
+        // Seed transcript with many tool results.
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..5 {
+            msgs.push(Message::user(format!("user {i}")));
+            msgs.push(Message::assistant(format!("asst {i}")));
+            msgs.push(Message::tool_result(format!("call_{i}"), "x".repeat(300)));
+        }
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+
+        while rx.try_recv().is_ok() {}
+
+        // Call maybe_compact_cross_turn — it has no microcompactor, so the
+        // microcompact block is skipped.
+        rt.maybe_compact_cross_turn(0).await.unwrap();
+
+        let mut microcompact_fired = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, AgentEvent::Microcompact { .. }) {
+                microcompact_fired = true;
+            }
+        }
+
+        assert!(
+            !microcompact_fired,
+            "Microcompact must NOT fire when no microcompactor is configured"
         );
     }
 
