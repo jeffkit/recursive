@@ -531,27 +531,31 @@ async fn loop_arbiter(
             }
         }
         // Scheduled wakeup.
+        //
+        // The delay sleep lives INSIDE this branch's future, not in the
+        // match body. Keeping the future pending for the whole delay lets
+        // the `action` branch above (biased first) preempt it the instant
+        // the user sends a message, stops the loop, or interrupts — so
+        // user input is never stuck behind a scheduled wakeup. If
+        // preempted, this future is dropped and the already-consumed
+        // wakeup request is discarded in favour of the user's action;
+        // the agent can re-schedule on a later turn.
         req = async {
-            // Poll the wakeup slot periodically until something arrives.
-            loop {
+            let req = loop {
                 if let Some(req) = wait_wakeup(wakeup_slot) {
-                    return Some(req);
+                    break req;
                 }
                 // Brief sleep to avoid busy-looping; the other branches
                 // in the select! will still preempt this.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
+            };
+            tokio::time::sleep(req.delay).await;
+            req
         } => {
-            match req {
-                Some(req) => {
-                    tokio::time::sleep(req.delay).await;
-                    ArbiterDecision::Run {
-                        prompt: req.prompt.clone(),
-                        source: "wakeup".to_string(),
-                        delay_secs: Some(req.delay.as_secs()),
-                    }
-                }
-                None => ArbiterDecision::Idle,
+            ArbiterDecision::Run {
+                prompt: req.prompt.clone(),
+                source: "wakeup".to_string(),
+                delay_secs: Some(req.delay.as_secs()),
             }
         }
     }
@@ -2418,6 +2422,118 @@ mod tests {
         .await
         .expect("arbiter should decide within 3s");
         assert!(matches!(decision, ArbiterDecision::Stop));
+    }
+
+    // ── schedule_wakeup delay must yield to user input ───────────────
+
+    #[tokio::test]
+    async fn loop_arbiter_user_message_preempts_pending_wakeup() {
+        // Regression: when a wakeup is scheduled with a long delay, a user
+        // message arriving during that delay must be serviced immediately
+        // (queued for the next turn) — not blocked behind the wakeup timer.
+        // Before the fix the delay was a bare `sleep` in the match body, so
+        // the arbiter did not return until the whole delay elapsed and the
+        // user's input sat unread in action_rx.
+        let bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>> = Arc::new(
+            tokio::sync::Mutex::new(recursive::tools::BackgroundJobManager::new()),
+        );
+        // Wakeup scheduled far in the future.
+        let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(Some(
+            recursive::tools::WakeupRequest {
+                delay: std::time::Duration::from_secs(60),
+                reason: "poll".into(),
+                prompt: "scheduled turn".into(),
+            },
+        )));
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let mut queued_messages: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+
+        // Send a user message shortly after the arbiter starts — well after
+        // the wakeup branch has consumed the request and begun its delay sleep.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let _ = action_tx.send(UserAction::SendMessage("hello".into()));
+        });
+
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            loop_arbiter(
+                &mut action_rx,
+                &wakeup_slot,
+                &bg_manager,
+                &mut queued_messages,
+            ),
+        )
+        .await
+        .expect("user message must preempt the wakeup, not wait 60s");
+
+        // The user's message is queued; the arbiter yields Idle so worker_loop
+        // drains the queue and runs the message on its next iteration.
+        assert!(
+            matches!(decision, ArbiterDecision::Idle),
+            "expected Idle (user message queued), got {decision:?}"
+        );
+        assert_eq!(queued_messages.len(), 1);
+        assert_eq!(queued_messages.front().unwrap(), "hello");
+        // The wakeup was consumed (taken from the slot) and discarded in
+        // favour of the user's action.
+        assert!(
+            wait_wakeup(&wakeup_slot).is_none(),
+            "wakeup slot should be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_arbiter_wakeup_fires_after_delay_when_no_user_action() {
+        // Happy path: with no competing user action, the wakeup still fires
+        // after its delay and produces a Run decision. Guards against the
+        // fix accidentally swallowing the normal wakeup flow.
+        let bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>> = Arc::new(
+            tokio::sync::Mutex::new(recursive::tools::BackgroundJobManager::new()),
+        );
+        let wakeup_slot: recursive::tools::WakeupSlot = Arc::new(std::sync::Mutex::new(Some(
+            recursive::tools::WakeupRequest {
+                delay: std::time::Duration::from_millis(100),
+                reason: "tick".into(),
+                prompt: "go".into(),
+            },
+        )));
+        // Keep the sender alive so action_rx.recv() stays Pending rather than
+        // resolving to None (which would otherwise look like a Stop).
+        let (_action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let mut queued_messages: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            loop_arbiter(
+                &mut action_rx,
+                &wakeup_slot,
+                &bg_manager,
+                &mut queued_messages,
+            ),
+        )
+        .await
+        .expect("wakeup should fire within 3s");
+
+        match decision {
+            ArbiterDecision::Run {
+                source,
+                prompt,
+                delay_secs,
+            } => {
+                assert_eq!(source, "wakeup");
+                assert_eq!(prompt, "go");
+                assert!(delay_secs.is_some(), "delay_secs must be set for wakeup");
+            }
+            other => panic!("expected Run(wakeup), got {other:?}"),
+        }
+        assert!(queued_messages.is_empty());
+        assert!(
+            wait_wakeup(&wakeup_slot).is_none(),
+            "wakeup slot should be cleared after firing"
+        );
     }
 
     // ── Goal-328: agent-initiated loop stop (stop_loop tool) ────────────
