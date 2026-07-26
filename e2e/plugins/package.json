@@ -10,7 +10,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "argusai-core": "file:../../../infra4agent/argusai/packages/core"
+    "argusai-core": "^0.14.2"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
