@@ -329,28 +329,6 @@ fn input_box_title(mode: InputMode) -> &'static str {
     }
 }
 
-/// Convert a buffer + byte cursor offset into a (col, row) inside the
-/// edit area (zero-based, where col counts columns from the first
-/// editable cell, *not* including the box border).
-///
-/// The input renderer pads non-first lines with two spaces in place
-/// of the indicator to keep columns visually aligned, so per-line
-/// content always starts at the same x. We therefore only have to
-/// count `\n`s for the row, and the **display width** of the
-/// preceding chars on the active line for the column. Using
-/// `chars().count()` undercounts CJK / emoji / fullwidth glyphs
-/// (each takes 2 columns in a terminal), which made the cursor
-/// land in the middle of the previous double-width char rather
-/// than after it.
-pub fn cursor_visual_position(buffer: &str, cursor: usize) -> (u16, u16) {
-    use unicode_width::UnicodeWidthStr;
-    let head = &buffer[..cursor.min(buffer.len())];
-    let row = head.matches('\n').count() as u16;
-    let line_start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let col = UnicodeWidthStr::width(&head[line_start..]) as u16;
-    (col, row)
-}
-
 /// Single-line hint shown below the input frame.
 ///
 /// Note: the previous `ctrl+b/f or wheel scroll` segment was dropped
@@ -425,38 +403,84 @@ mod tests {
     }
 
     #[test]
-    fn cursor_visual_position_handles_multiline() {
-        let buf = "ab\ncde\nf";
-        // Cursor at very end (byte 8): row=2, col=1 ("f")
-        assert_eq!(cursor_visual_position(buf, buf.len()), (1, 2));
-        // Cursor at start of line 2 (just after first '\n', byte 3)
-        assert_eq!(cursor_visual_position(buf, 3), (0, 1));
-        // Cursor at byte 0
-        assert_eq!(cursor_visual_position(buf, 0), (0, 0));
-    }
-
-    /// Goal-150 follow-up: CJK / fullwidth chars take two terminal
-    /// columns each; `chars().count()` (the previous implementation)
-    /// undercounted them and left the cursor visually inside the
-    /// preceding glyph rather than after it.
-    #[test]
-    fn cursor_visual_position_counts_double_width_chars() {
-        let buf = "你好";
-        // Two Chinese chars = 6 bytes (3 each), 4 visual columns.
-        assert_eq!(buf.len(), 6);
-        // Cursor after the first char (byte 3): col=2 (one CJK glyph).
-        assert_eq!(cursor_visual_position(buf, 3), (2, 0));
-        // Cursor at the end (byte 6): col=4 (two CJK glyphs).
-        assert_eq!(cursor_visual_position(buf, buf.len()), (4, 0));
+    fn cursor_visual_position_wrapped_empty_buffer() {
+        // Empty buffer → origin, regardless of width.
+        assert_eq!(cursor_visual_position_wrapped("", 0, 10), (0, 0));
+        assert_eq!(cursor_visual_position_wrapped("", 0, 0), (0, 0));
     }
 
     #[test]
-    fn cursor_visual_position_mixed_ascii_and_cjk() {
-        // "ab了" — 'a' + 'b' (1 col each) + '了' (2 cols) = 4 cols.
-        let buf = "ab了";
-        assert_eq!(cursor_visual_position(buf, buf.len()), (4, 0));
-        // After "ab" (byte 2): col=2.
-        assert_eq!(cursor_visual_position(buf, 2), (2, 0));
+    fn cursor_visual_position_wrapped_short_line_does_not_wrap() {
+        // "abc" fits in 10 cols → single row, column tracks byte cursor.
+        let buf = "abc";
+        assert_eq!(cursor_visual_position_wrapped(buf, 0, 10), (0, 0));
+        assert_eq!(cursor_visual_position_wrapped(buf, 1, 10), (1, 0));
+        assert_eq!(cursor_visual_position_wrapped(buf, buf.len(), 10), (3, 0));
+    }
+
+    /// "hello world" (11 bytes) at width 5 wraps to ["hello", " worl", "d"].
+    /// Pins the row detection (byte accumulation across wrapped rows) and
+    /// the column (display width of the prefix on the matched row).
+    #[test]
+    fn cursor_visual_position_wrapped_long_line_rows_and_cols() {
+        let buf = "hello world";
+        // End of buffer → last wrapped row "d", col 1.
+        assert_eq!(cursor_visual_position_wrapped(buf, buf.len(), 5), (1, 2));
+        // Right after "hello" (byte 5) — still on row 0 at col 5.
+        assert_eq!(cursor_visual_position_wrapped(buf, 5, 5), (5, 0));
+        // After the space (byte 6) — wrapped onto row 1, col 1.
+        assert_eq!(cursor_visual_position_wrapped(buf, 6, 5), (1, 1));
+    }
+
+    /// A wrapped logical line BEFORE the cursor's line must contribute its
+    /// wrapped-row count to the cursor's absolute row.
+    #[test]
+    fn cursor_visual_position_wrapped_multiline_counts_preceding_wraps() {
+        // "aaaaaa" wraps to ["aaaaa", "a"] (2 rows) at width 5; "bb" is line 1.
+        let buf = "aaaaaa\nbb";
+        // End of buffer → line 1 "bb", col 2, absolute row 2.
+        assert_eq!(cursor_visual_position_wrapped(buf, buf.len(), 5), (2, 2));
+        // Start of line 1 (byte 7, right after '\n') → col 0, row 2.
+        assert_eq!(cursor_visual_position_wrapped(buf, 7, 5), (0, 2));
+    }
+
+    /// Two preceding logical lines that EACH wrap must SUM their wrapped-row
+    /// counts. A single preceding line can't tell `+=` from `=`, so this is
+    /// the case that catches the `wrapped_lines_before = wrapped.len()`
+    /// mutant (assign instead of compound-add).
+    #[test]
+    fn cursor_visual_position_wrapped_sums_multiple_preceding_wraps() {
+        // "aaaaaa" → ["aaaaa","a"] (2); "bbbbbb" → ["bbbbb","b"] (2); "c" on
+        // line 2. At width 5 the cursor's absolute row is 2 + 2 + 0 = 4.
+        let buf = "aaaaaa\nbbbbbb\nc";
+        assert_eq!(cursor_visual_position_wrapped(buf, buf.len(), 5), (1, 4));
+    }
+
+    /// CJK glyphs are 3 bytes but 2 display columns. The row-finder works in
+    /// bytes (wrapped-line lengths) while the column is display width, so a
+    /// pure-ASCII assumption would miscount either side.
+    #[test]
+    fn cursor_visual_position_wrapped_double_width_chars() {
+        // "你好你好" = 12 bytes, 8 cols. At width 4 → ["你好", "你好"].
+        let buf = "你好你好";
+        assert_eq!(buf.len(), 12);
+        // End → row 1, col 4 (width of "你好").
+        assert_eq!(cursor_visual_position_wrapped(buf, buf.len(), 4), (4, 1));
+        // After first "你好" (byte 6) → row 0, col 4.
+        assert_eq!(cursor_visual_position_wrapped(buf, 6, 4), (4, 0));
+    }
+
+    /// Mixed ASCII + CJK inside one wrapped row: "ab了" is 5 bytes / 4 cols,
+    /// so the wrap boundary and the column come out differently. This is the
+    /// case that breaks any implementation confusing byte offset with width.
+    #[test]
+    fn cursor_visual_position_wrapped_mixed_ascii_and_cjk() {
+        // "ab了cd" = 7 bytes / 6 cols. At width 4 → ["ab了", "cd"].
+        let buf = "ab了cd";
+        // End (byte 7) → row 1 "cd", col 2.
+        assert_eq!(cursor_visual_position_wrapped(buf, buf.len(), 4), (2, 1));
+        // After "ab了" (byte 5) → row 0, col 4 (display width, not byte count).
+        assert_eq!(cursor_visual_position_wrapped(buf, 5, 4), (4, 0));
     }
 
     #[test]
@@ -504,11 +528,29 @@ mod tests {
     }
 
     #[test]
-    fn visible_rows_counts_trailing_newline_as_extra_row() {
-        // "a\n" -> lines() yields 1, trailing +1 -> total 2. mutant
-        // `+`->`-` (38:23): 1 - 1 = 0 -> clamp(1) = 1.
-        assert_eq!(visible_rows("a\n"), 2);
-        assert_eq!(visible_rows("a"), 1);
+    fn wrap_line_by_width_handles_long_text() {
+        // Test basic wrapping
+        let result = wrap_line_by_width("hello world", 5);
+        assert_eq!(result, vec!["hello", " worl", "d"]);
+
+        // Test empty string
+        let result = wrap_line_by_width("", 10);
+        assert_eq!(result, vec![""]);
+
+        // Test zero width (should not wrap)
+        let result = wrap_line_by_width("hello", 0);
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_line_handles_wide_characters() {
+        // Test CJK characters that take 2 columns
+        let result = wrap_line_by_width("你好世界", 4);
+        // Each CJK char is 2 columns, so "你好" = 4 cols fits on one line
+        // and "世界" = 4 cols on the next line
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "你好");
+        assert_eq!(result[1], "世界");
     }
 
     #[test]

@@ -621,15 +621,11 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
                 return Vec::new();
             }
             let (goal, max_turns) = parse_loop_start_args(&raw);
-            app.push_system(format!(
-                "Loop started: \"{}\" (max {} turns)",
-                goal,
-                if max_turns > 0 {
-                    max_turns.to_string()
-                } else {
-                    "unlimited".to_string()
-                }
-            ));
+            // The "Loop started" confirmation is pushed by the backend's
+            // `LoopStarted` event (see `event_loop.rs`), which only fires
+            // after the loop-state mutex checks pass — so a rejected start
+            // surfaces an Error instead of a false "started" line, and we
+            // avoid duplicating the message with an optimistic push here.
             app.loop_state = Some(crate::app::LoopUiState {
                 goal: goal.clone(),
                 turns_run: 0,
@@ -646,7 +642,9 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
         // (the agent loads the `loop-supervise` skill from the goal text).
         "stop" => {
             app.loop_state = None;
-            app.push_system("Loop stopped.");
+            // "Loop stopped." is pushed by the `LoopStopped` event — the
+            // same handler covers max-turns cap and agent-requested stop,
+            // so emitting it here would duplicate the line on `/loop stop`.
             vec![UserAction::StopLoop]
         }
         "trigger" => {
@@ -674,7 +672,8 @@ fn cmd_loop(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
                 app.push_error("Usage: /loop <goal>  (or /loop start|stop|trigger|supervise ...)");
                 return Vec::new();
             }
-            app.push_system(format!("Loop started: \"{goal}\" (unlimited turns)"));
+            // Confirmation comes from the backend `LoopStarted` event —
+            // see the `start` arm above for why we don't push here.
             app.loop_state = Some(crate::app::LoopUiState {
                 goal: goal.clone(),
                 turns_run: 0,
@@ -1887,6 +1886,7 @@ mod tests {
 
     #[test]
     fn cmd_loop_stop_emits_stop_and_clears_state() {
+        use crate::events::UiEvent;
         let mut app = App::new();
         app.loop_state = Some(crate::app::LoopUiState {
             goal: "g".into(),
@@ -1901,12 +1901,95 @@ mod tests {
             other => panic!("expected Async([StopLoop]), got {other:?}"),
         }
         assert!(app.loop_state.is_none());
+        // The "Loop stopped." line is no longer pushed synchronously by
+        // cmd_loop; it arrives via the backend's LoopStopped event.
+        app.handle_ui_event(UiEvent::LoopStopped);
         match app.blocks.last() {
             Some(TranscriptBlock::System { text }) => {
                 assert!(text.contains("Loop stopped"), "got {text:?}");
             }
-            other => panic!("expected System, got {other:?}"),
+            other => panic!("expected System after LoopStopped, got {other:?}"),
         }
+    }
+
+    /// Regression: `/loop start <goal>` used to surface TWO "Loop started"
+    /// system messages — one pushed optimistically by `cmd_loop`, plus
+    /// another pushed when the backend's authoritative `LoopStarted`
+    /// event arrived. The synchronous push is dropped so only the
+    /// backend-confirmed message remains (and a failed start surfaces an
+    /// Error instead of a false "started" line).
+    #[test]
+    fn cmd_loop_start_does_not_duplicate_loop_started_message() {
+        use crate::events::UiEvent;
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop start watch the build");
+        assert!(
+            matches!(r, InvokeResult::Async(_)),
+            "expected StartLoop action"
+        );
+        app.handle_ui_event(UiEvent::LoopStarted {
+            goal: "watch the build".into(),
+        });
+        let count = app
+            .blocks
+            .iter()
+            .filter(
+                |b| matches!(b, TranscriptBlock::System { text } if text.contains("Loop started")),
+            )
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one \"Loop started\" message after backend confirmation, got {count}"
+        );
+    }
+
+    /// Same regression on the default `/loop <goal>` arm (natural-language goal).
+    #[test]
+    fn cmd_loop_default_does_not_duplicate_loop_started_message() {
+        use crate::events::UiEvent;
+        let mut app = App::new();
+        let r = invoke(&mut app, "loop watch the build");
+        assert!(matches!(r, InvokeResult::Async(_)));
+        app.handle_ui_event(UiEvent::LoopStarted {
+            goal: "watch the build".into(),
+        });
+        let count = app
+            .blocks
+            .iter()
+            .filter(
+                |b| matches!(b, TranscriptBlock::System { text } if text.contains("Loop started")),
+            )
+            .count();
+        assert_eq!(
+            count, 1,
+            "default arm must not duplicate the Loop started line"
+        );
+    }
+
+    /// Regression counterpart for `/loop stop`: the synchronous "Loop stopped."
+    /// push used to duplicate the `LoopStopped` event's line.
+    #[test]
+    fn cmd_loop_stop_does_not_duplicate_loop_stopped_message() {
+        use crate::events::UiEvent;
+        let mut app = App::new();
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "g".into(),
+            turns_run: 1,
+            max_turns: 0,
+        });
+        invoke(&mut app, "loop stop");
+        app.handle_ui_event(UiEvent::LoopStopped);
+        let count = app
+            .blocks
+            .iter()
+            .filter(
+                |b| matches!(b, TranscriptBlock::System { text } if text.contains("Loop stopped")),
+            )
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one \"Loop stopped\" message, got {count}"
+        );
     }
 
     #[test]
