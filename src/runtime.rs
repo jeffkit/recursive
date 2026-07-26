@@ -167,6 +167,9 @@ pub struct AgentRuntime {
     streaming: bool,
     /// Optional compactor for cross-turn transcript summarization.
     compactor: Option<Compactor>,
+    /// Goal-331: consecutive proactive compaction failures (cross-turn).
+    /// Same semantics as `RunCore::consecutive_compact_failures`.
+    consecutive_compact_failures: u32,
     /// Checkpoint subsystem (snapshot, session-id, writer, touched-files).
     /// Grouped to reduce field count; inactive when checkpoints are disabled.
     checkpoints: CheckpointState,
@@ -378,6 +381,16 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
+
+        // Circuit breaker: stop trying after too many consecutive failures.
+        if self.consecutive_compact_failures >= crate::compact::MAX_CONSECUTIVE_COMPACT_FAILURES {
+            self.event_sink.emit(AgentEvent::CompactionSkipped {
+                step: self.checkpoints.turn_index.load(Ordering::Relaxed),
+                reason: crate::event::CompactionSkipReason::CircuitBreaker,
+            }).await;
+            return Ok(());
+        }
+
         let chars = Compactor::estimate_chars(&self.transcript);
         if !compactor.should_compact(chars, last_prompt_tokens) {
             return Ok(());
@@ -392,7 +405,7 @@ impl AgentRuntime {
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: chars,
         });
-        let Some((removed, summary_chars)) = compactor
+        let result = compactor
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
@@ -400,28 +413,41 @@ impl AgentRuntime {
                     .turn_index
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
-            .await?
-        else {
-            return Ok(());
-        };
-        self.kernel.hooks().dispatch(HookEvent::PostCompact {
-            removed,
-            summary_chars,
-        });
-        self.event_sink
-            .emit(AgentEvent::CompactionBoundary {
-                turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
-                compacted_count: removed,
-                summary_uuid: None,
-            })
             .await;
-        if let Some(summary) = self.transcript.first().cloned() {
-            self.event_sink
-                .emit(AgentEvent::MessageAppended {
-                    message: summary,
-                    usage: None,
-                })
-                .await;
+        match result {
+            Ok(Some((removed, summary_chars))) => {
+                // Success — reset the circuit breaker.
+                self.consecutive_compact_failures = 0;
+                self.kernel.hooks().dispatch(HookEvent::PostCompact {
+                    removed,
+                    summary_chars,
+                });
+                self.event_sink
+                    .emit(AgentEvent::CompactionBoundary {
+                        turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
+                        compacted_count: removed,
+                        summary_uuid: None,
+                    })
+                    .await;
+                if let Some(summary) = self.transcript.first().cloned() {
+                    self.event_sink.emit(AgentEvent::MessageAppended {
+                        message: summary,
+                        usage: None,
+                    }).await;
+                }
+            }
+            Ok(None) => {
+                // Transcript too short to compact — not a failure, leave counter unchanged.
+            }
+            Err(e) => {
+                // Compaction failed — increment the breaker, emit event, continue.
+                tracing::warn!(error = %e, "cross-turn proactive compaction failed");
+                self.consecutive_compact_failures += 1;
+                self.event_sink.emit(AgentEvent::CompactionSkipped {
+                    step: self.checkpoints.turn_index.load(Ordering::Relaxed),
+                    reason: crate::event::CompactionSkipReason::Error,
+                }).await;
+            }
         }
         Ok(())
     }
@@ -1463,6 +1489,7 @@ impl AgentRuntimeBuilder {
             event_sink,
             streaming: self.streaming,
             compactor: self.compactor,
+            consecutive_compact_failures: 0,
             checkpoints: CheckpointState::disabled(),
             todo_list,
             plan_approval_gate,

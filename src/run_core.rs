@@ -164,6 +164,12 @@ pub(crate) struct RunCore<'a> {
     /// by [`Compactor::should_compact`] intra-turn. `0` means "no reading
     /// yet" (first step, or provider never reports usage).
     pub(crate) last_prompt_tokens: u32,
+    /// Goal-331: consecutive proactive compaction failures. Resets to 0 on
+    /// any successful compaction (including `Ok(None)` when transcript too
+    /// short is **not** a failure — only actual `Err` from the provider or
+    /// the compactor increments). When >= `MAX_CONSECUTIVE_COMPACT_FAILURES`,
+    /// subsequent proactive compaction attempts are skipped.
+    pub(crate) consecutive_compact_failures: u32,
     /// Goal 345: optional wall-clock deadline. When
     /// `wall_timeout_secs > 0`, the step loop checks elapsed time at
     /// each step boundary and terminates cleanly with
@@ -851,15 +857,28 @@ impl<'a> RunCore<'a> {
     ///
     /// `PreCompact` and `PostCompact` hooks are dispatched only when
     /// compaction actually runs (threshold is exceeded), not on every step.
-    async fn maybe_compact(&mut self, step: usize) -> Result<()> {
+    ///
+    /// **Best-effort**: compaction failures are caught, logged, and counted
+    /// by the circuit breaker. A failed compaction NEVER propagates to the
+    /// caller — compaction is an optimization, not a correctness requirement.
+    async fn maybe_compact(&mut self, step: usize) {
         let compactor = match &self.compactor {
             Some(c) => c,
-            None => return Ok(()),
+            None => return,
         };
+
+        // Circuit breaker: stop trying after too many consecutive failures.
+        if self.consecutive_compact_failures >= crate::compact::MAX_CONSECUTIVE_COMPACT_FAILURES {
+            self.emit(AgentEvent::CompactionSkipped {
+                step,
+                reason: crate::event::CompactionSkipReason::CircuitBreaker,
+            });
+            return;
+        }
 
         let chars = Compactor::estimate_chars(&self.messages);
         if !compactor.should_compact(chars, self.last_prompt_tokens) {
-            return Ok(());
+            return;
         }
         // Goal 345: only dispatch PreCompact when compaction will actually run.
         // `would_compact` mirrors `apply_to_transcript`'s degenerate-slice
@@ -867,7 +886,7 @@ impl<'a> RunCore<'a> {
         // neither does) — without this the new Ok(None) path fired PreCompact
         // without a matching PostCompact.
         if !compactor.would_compact(&self.messages) {
-            return Ok(());
+            return;
         }
 
         // Only dispatch PreCompact when we're actually about to compact.
@@ -876,24 +895,38 @@ impl<'a> RunCore<'a> {
         });
 
         let kept_before = self.messages.len();
-        if let Some((removed, summary_chars)) = compactor
+        match compactor
             .apply_to_transcript(self.llm.as_ref(), Arc::make_mut(&mut self.messages), step)
-            .await?
+            .await
         {
-            let kept = kept_before - removed;
-            self.hooks.dispatch(HookEvent::PostCompact {
-                removed,
-                summary_chars,
-            });
-            self.emit(AgentEvent::Compacted {
-                removed,
-                kept,
-                summary_chars,
-                step,
-            });
+            Ok(Some((removed, summary_chars))) => {
+                // Success — reset the circuit breaker.
+                self.consecutive_compact_failures = 0;
+                let kept = kept_before - removed;
+                self.hooks.dispatch(HookEvent::PostCompact {
+                    removed,
+                    summary_chars,
+                });
+                self.emit(AgentEvent::Compacted {
+                    removed,
+                    kept,
+                    summary_chars,
+                    step,
+                });
+            }
+            Ok(None) => {
+                // Transcript too short to compact — not a failure, leave counter unchanged.
+            }
+            Err(e) => {
+                // Compaction failed — increment the breaker, emit event, continue.
+                tracing::warn!(error = %e, "proactive compaction failed");
+                self.consecutive_compact_failures += 1;
+                self.emit(AgentEvent::CompactionSkipped {
+                    step,
+                    reason: crate::event::CompactionSkipReason::Error,
+                });
+            }
         }
-
-        Ok(())
     }
 
     /// Execute a set of tool calls, returning `(id, name, output, args)` for each.
@@ -1190,7 +1223,7 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- compaction -------------------------------------------------------
-            self.maybe_compact(step).await?;
+            self.maybe_compact(step).await;
 
             // ---- LLM call (with retry) --------------------------------------------
             let (completion, new_final_message) = self
@@ -1510,6 +1543,7 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
         }
@@ -1674,6 +1708,12 @@ mod tests {
             stuck_error_rate: 1.0,
             turn: 0,
             globs_skills: vec![],
+            prompt_segments: None,
+            static_breakdown: StaticBreakdownCache::default(),
+            last_prompt_tokens: 0,
+            consecutive_compact_failures: 0,
+            wall_timeout_secs: 0,
+            wall_start: None,
         }
     }
 
@@ -2056,8 +2096,7 @@ mod tests {
         ];
         let mut core = make_test_core(messages, &hooks);
         // compactor is None by default in make_test_core
-        let result = core.maybe_compact(0).await;
-        assert!(result.is_ok());
+        core.maybe_compact(0).await;
         assert_eq!(core.messages.len(), 2, "messages must not change");
     }
 
@@ -2073,8 +2112,7 @@ mod tests {
         // Set a threshold much larger than the transcript
         core.compactor = Some(Compactor::new(usize::MAX));
 
-        let result = core.maybe_compact(0).await;
-        assert!(result.is_ok());
+        core.maybe_compact(0).await;
         assert_eq!(core.messages.len(), 2, "no compaction under threshold");
     }
 
@@ -2104,8 +2142,7 @@ mod tests {
         // Threshold = 0 → always compact
         core.compactor = Some(Compactor::new(0).keep_recent_n(2));
 
-        let result = core.maybe_compact(1).await;
-        assert!(result.is_ok());
+        core.maybe_compact(1).await;
         // After compaction the transcript starts with a compaction summary
         assert!(
             core.messages[0].is_compaction_summary,
@@ -2143,8 +2180,7 @@ mod tests {
         // With `< → <=`: `chars <= chars` is true → returns early → no compaction
         core.compactor = Some(Compactor::new(chars).keep_recent_n(2));
 
-        let result = core.maybe_compact(1).await;
-        assert!(result.is_ok());
+        core.maybe_compact(1).await;
         assert!(
             core.messages[0].is_compaction_summary,
             "compaction must fire when chars == threshold (chars is NOT less than threshold)"
@@ -2188,8 +2224,7 @@ mod tests {
         // Set last_prompt_tokens above the token threshold.
         core.last_prompt_tokens = 500;
 
-        let result = core.maybe_compact(1).await;
-        assert!(result.is_ok());
+        core.maybe_compact(1).await;
         assert!(
             core.messages[0].is_compaction_summary,
             "compaction must fire via token threshold even though chars are below char threshold"
@@ -2277,8 +2312,7 @@ mod tests {
         core.events = Some(tx);
         core.compactor = Some(Compactor::new(0).keep_recent_n(2));
 
-        let result = core.maybe_compact(1).await;
-        assert!(result.is_ok());
+        core.maybe_compact(1).await;
 
         // Drain events to find Compacted
         let mut found_compacted = false;
@@ -2299,6 +2333,213 @@ mod tests {
             }
         }
         assert!(found_compacted, "a Compacted event must have been emitted");
+    }
+
+    // ========================================================================
+    // Circuit breaker tests (Goal 331)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn maybe_compact_circuit_breaker_skips_when_failures_exceed_threshold() {
+        // When consecutive_compact_failures >= MAX_CONSECUTIVE_COMPACT_FAILURES,
+        // maybe_compact must emit CircuitBreaker and return without compacting.
+        use crate::compact::{Compactor, MAX_CONSECUTIVE_COMPACT_FAILURES};
+        use crate::event::AgentEvent::{Compacted, CompactionSkipped};
+        use crate::event::CompactionSkipReason;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("long enough to trigger compaction".to_string()),
+            Message::assistant("response".to_string()),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = make_test_core(messages, &hooks);
+        core.events = Some(tx);
+        core.compactor = Some(Compactor::new(0)); // 0 → always compact
+        core.consecutive_compact_failures = MAX_CONSECUTIVE_COMPACT_FAILURES;
+
+        core.maybe_compact(0).await;
+
+        // No Compacted event; only CompactionSkipped::CircuitBreaker
+        let mut found_breaker = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Compacted { .. } => panic!("circuit breaker should prevent compaction"),
+                CompactionSkipped { reason, .. } => {
+                    assert_eq!(reason, CompactionSkipReason::CircuitBreaker);
+                    found_breaker = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(found_breaker, "must emit CircuitBreaker skip event");
+        assert_eq!(core.messages.len(), 3, "must not compact when breaker is tripped");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_circuit_breaker_resets_on_success() {
+        // After a successful compaction, consecutive_compact_failures must be 0.
+        use crate::compact::Compactor;
+        use crate::llm::{Completion, MockProvider};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+        ];
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider;
+        core.compactor = Some(Compactor::new(0).keep_recent_n(2));
+        core.consecutive_compact_failures = 2; // near threshold but not reached
+
+        core.maybe_compact(1).await;
+
+        assert_eq!(core.consecutive_compact_failures, 0, "breaker must reset on success");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_circuit_breaker_increments_on_error() {
+        // When compaction returns an error, consecutive_compact_failures must increment.
+        use crate::compact::Compactor;
+        use crate::error::Error;
+        use crate::event::AgentEvent::CompactionSkipped;
+        use crate::event::CompactionSkipReason;
+        use crate::llm::MockProvider;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Need at least 2 conversational msgs in "older" (pre-keep_recent_n) for compaction to fire.
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+        ];
+        // MockProvider that errors on the first complete() call → compaction fails.
+        let provider = Arc::new(
+            MockProvider::new(vec![]).with_errors(vec![Error::Llm {
+                provider: "mock".into(),
+                message: "simulated compaction failure".into(),
+            }]),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider;
+        core.events = Some(tx);
+        core.compactor = Some(Compactor::new(0).keep_recent_n(2));
+        core.consecutive_compact_failures = 0;
+
+        core.maybe_compact(1).await;
+
+        assert_eq!(
+            core.consecutive_compact_failures, 1,
+            "breaker must increment on error"
+        );
+        // Must emit CompactionSkipped::Error
+        let mut found_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let CompactionSkipped { reason, .. } = ev {
+                assert_eq!(reason, CompactionSkipReason::Error);
+                found_error = true;
+            }
+        }
+        assert!(found_error, "must emit CompactionSkipped::Error event");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_circuit_breaker_accumulates_to_threshold() {
+        // Three consecutive failures must trip the breaker (MAX_CONSECUTIVE_COMPACT_FAILURES = 3).
+        use crate::compact::{Compactor, MAX_CONSECUTIVE_COMPACT_FAILURES};
+        use crate::error::Error;
+        use crate::event::AgentEvent::{Compacted, CompactionSkipped};
+        use crate::event::CompactionSkipReason;
+        use crate::llm::MockProvider;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Need at least 2 conversational msgs in older for compaction to fire.
+        let messages = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+        ];
+        // MockProvider errors on every complete() call → compaction always fails.
+        let mk_err = || Error::Llm {
+            provider: "mock".into(),
+            message: "simulated compaction failure".into(),
+        };
+        let provider = Arc::new(
+            MockProvider::new(vec![]).with_errors(vec![mk_err(), mk_err(), mk_err(), mk_err()]),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = make_test_core(messages, &hooks);
+        core.llm = provider.clone();
+        core.events = Some(tx);
+        core.compactor = Some(Compactor::new(0).keep_recent_n(2));
+        core.consecutive_compact_failures = 0;
+
+        // First two calls: each increments the counter
+        for step in 0..(MAX_CONSECUTIVE_COMPACT_FAILURES - 1) as usize {
+            core.maybe_compact(step).await;
+        }
+        assert_eq!(
+            core.consecutive_compact_failures,
+            MAX_CONSECUTIVE_COMPACT_FAILURES - 1,
+            "after {} failures, counter should be {}",
+            MAX_CONSECUTIVE_COMPACT_FAILURES - 1,
+            MAX_CONSECUTIVE_COMPACT_FAILURES - 1
+        );
+
+        // Third call: reaches threshold → breaker trips, no compaction attempted
+        // Drain events before third call
+        while rx.try_recv().is_ok() {}
+        core.maybe_compact((MAX_CONSECUTIVE_COMPACT_FAILURES - 1) as usize).await;
+
+        // Counter stays at threshold (doesn't overflow)
+        assert_eq!(
+            core.consecutive_compact_failures,
+            MAX_CONSECUTIVE_COMPACT_FAILURES,
+            "counter must not exceed threshold"
+        );
+
+        // Fourth call: breaker already tripped → emits CircuitBreaker, no counter change
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        core.events = Some(tx2);
+        core.maybe_compact(MAX_CONSECUTIVE_COMPACT_FAILURES as usize).await;
+
+        assert_eq!(
+            core.consecutive_compact_failures,
+            MAX_CONSECUTIVE_COMPACT_FAILURES,
+            "breaker tripped: counter should stay at max"
+        );
+
+        // Must have emitted CircuitBreaker (no further increments)
+        let mut breaker_count = 0;
+        while let Ok(ev) = rx2.try_recv() {
+            if let CompactionSkipped { ref reason, .. } = ev {
+                assert_eq!(*reason, CompactionSkipReason::CircuitBreaker);
+                breaker_count += 1;
+            }
+            if let Compacted { .. } = ev {
+                panic!("circuit breaker should prevent compaction once tripped");
+            }
+        }
+        assert!(breaker_count >= 1, "must emit CircuitBreaker event when tripped");
     }
 
     // ========================================================================
@@ -2338,6 +2579,7 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
         }

@@ -8,6 +8,11 @@
 //! Compaction is **disabled by default** (threshold = `usize::MAX`). Enable
 //! it via `AgentBuilder::compactor(...)`.
 
+/// Stop attempting proactive compaction after this many consecutive
+/// failures. Emergency compaction (`compact_on_overflow`) is exempt —
+/// it is the last-resort recovery for an already-failed turn.
+pub const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
+
 use crate::error::Result;
 use crate::llm::{ChatProvider, StructuredRequest, ToolSpec};
 use crate::message::Message;

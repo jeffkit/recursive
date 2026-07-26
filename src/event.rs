@@ -100,6 +100,14 @@ pub enum AgentEvent {
         summary_chars: usize,
         step: usize,
     },
+    /// Proactive compaction was skipped — either the circuit breaker tripped
+    /// (`CompactionSkipReason::CircuitBreaker`) or the compaction call itself
+    /// failed (`CompactionSkipReason::Error`). Compaction is best-effort;
+    /// a skipped compaction is never fatal to the turn.
+    CompactionSkipped {
+        step: usize,
+        reason: CompactionSkipReason,
+    },
     /// Agent run completed.
     TurnFinished {
         /// Human-readable reason for termination (e.g. "no_more_tool_calls").
@@ -242,6 +250,20 @@ pub enum AgentEvent {
         /// Short human-readable description of the error ("rate_limited" or "timeout").
         reason: String,
     },
+}
+
+/// Why a proactive compaction was skipped.
+///
+/// See [`AgentEvent::CompactionSkipped`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionSkipReason {
+    /// The circuit breaker tripped after `MAX_CONSECUTIVE_COMPACT_FAILURES`
+    /// consecutive failures. Further proactive compaction attempts are
+    /// suppressed until a successful compaction resets the counter.
+    CircuitBreaker,
+    /// The compaction call itself failed (provider error, network issue, etc.).
+    Error,
 }
 
 // ---------------------------------------------------------------------------
