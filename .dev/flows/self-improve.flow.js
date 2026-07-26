@@ -279,6 +279,22 @@ const RUN_TIMEOUT_MS = Number(opts.timeout) || 7_200_000
 const MAX_FIX_ROUNDS = Number(opts['max-fix-rounds']) || 3
 // 失败现场保留目录：与活跃 self-improve worktree 分开命名空间，不污染新 run。
 const PRESERVE_DIR = join(repo, '.worktrees', 'preserve')
+// 门禁专属修复提示，给弱模型一条明确路径（必须在 await main() 之前声明，避免 ES 模块 TDZ 访问错误）。
+const GATE_FIX_HINTS = {
+  clippy: [
+    'These are clippy lints. Fix the SOURCE, never silence with `#[allow]`.',
+    '- `clippy::unwrap_used` on `Mutex::lock()`: `.lock().unwrap()` → `.lock().unwrap_or_else(|e| e.into_inner())` (poison recovery; also satisfies invariant #5 — no unwrap in product code).',
+    '- `clippy::expect_used`: same — recover or propagate via `?`/`match`.',
+    '- `clippy::empty_line_after_doc_comments`: remove the blank line, or change the section-divider `///` to a plain `//` comment.',
+    '- `clippy::cloned_ref_to_slice_refs`: `&[x.clone()]` → `std::slice::from_ref(&x)`.',
+    'Each `--> file:line:col` above is one lint site. Fix them all in one pass, then re-run clippy.',
+  ].join('\n'),
+  test: [
+    'These are compile/test failures. Read each `error[...]` / `--> file:line` and the `note:` below it.',
+    'If a doctest fails to compile (e.g. `missing field`), a struct gained a field — update the doctest example to include it.',
+    'Fix the source (or the test if it is wrong), then re-run `cargo test --workspace`.',
+  ].join('\n'),
+}
 
 // Batch-run constraint prepended to every system prompt:
 // plan mode tools block indefinitely when no interactive channel is present.
@@ -1182,23 +1198,6 @@ function buildFixGoal({ gate, output, attempt, worktreeDir }) {
     `\n--- full check output ---`,
     `Read the file \`.gate-${gate.name}-output.log\` in the worktree for the complete output (incl. notes/help).`,
   ].join('\n')
-}
-
-/** 门禁专属修复提示，给弱模型一条明确路径。 */
-const GATE_FIX_HINTS = {
-  clippy: [
-    'These are clippy lints. Fix the SOURCE, never silence with `#[allow]`.',
-    '- `clippy::unwrap_used` on `Mutex::lock()`: `.lock().unwrap()` → `.lock().unwrap_or_else(|e| e.into_inner())` (poison recovery; also satisfies invariant #5 — no unwrap in product code).',
-    '- `clippy::expect_used`: same — recover or propagate via `?`/`match`.',
-    '- `clippy::empty_line_after_doc_comments`: remove the blank line, or change the section-divider `///` to a plain `//` comment.',
-    '- `clippy::cloned_ref_to_slice_refs`: `&[x.clone()]` → `std::slice::from_ref(&x)`.',
-    'Each `--> file:line:col` above is one lint site. Fix them all in one pass, then re-run clippy.',
-  ].join('\n'),
-  test: [
-    'These are compile/test failures. Read each `error[...]` / `--> file:line` and the `note:` below it.',
-    'If a doctest fails to compile (e.g. `missing field`), a struct gained a field — update the doctest example to include it.',
-    'Fix the source (or the test if it is wrong), then re-run `cargo test --workspace`.',
-  ].join('\n'),
 }
 
 /** worktree 是否有未提交改动（fix 轮防空转用）。fileNotFound / git 出错时返回 true（保守不 break）。 */
