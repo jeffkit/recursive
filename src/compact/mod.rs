@@ -1,12 +1,19 @@
-//! LLM-driven context compaction.
+//! Context compaction.
 //!
-//! When the transcript grows large, `Compactor::compact` asks the model to
-//! summarize the older portion into a single system message, preserving key
-//! decisions, paths, and outcomes. The agent then continues with the summary
-//! plus recent messages, staying within the context window.
+//! Two layers:
 //!
-//! Compaction is **disabled by default** (threshold = `usize::MAX`). Enable
-//! it via `AgentBuilder::compactor(...)`.
+//! * [`Compactor`] — LLM-driven summarisation of older transcript messages
+//!   into a single system message. Disabled by default (threshold =
+//!   `usize::MAX`), enabled via `AgentBuilder::compactor(...)`.
+//!
+//! * [`Microcompactor`] — no-LLM proactive pruning of old tool results by
+//!   count. Runs before the LLM-driven compactor each step so the transcript
+//!   may drop below the compaction threshold and the expensive LLM summary
+//!   is skipped entirely.
+
+pub mod micro;
+
+pub use micro::{Microcompactor, MICROCOMPACT_PLACEHOLDER};
 
 /// Stop attempting proactive compaction after this many consecutive
 /// failures. Emergency compaction (`compact_on_overflow`) is exempt —

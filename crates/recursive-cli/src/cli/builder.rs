@@ -490,6 +490,19 @@ pub(crate) async fn build_runtime(
         builder = builder
             .compactor(recursive::Compactor::new(n).threshold_prompt_tokens(token_threshold));
     }
+    // Determine the microcompactor settings (count-based proactive prune):
+    //   RECURSIVE_MICROCOMPACT_TRIGGER=<n> → explicit trigger count (0 = disabled)
+    //   RECURSIVE_MICROCOMPACT_TRIGGER unset → default 12
+    //   RECURSIVE_MICROCOMPACT_KEEP=<n>    → keep count (default 4)
+    let microcompactor = recursive::compact::micro::build_microcompactor_from_env(
+        std::env::var("RECURSIVE_MICROCOMPACT_TRIGGER")
+            .ok()
+            .as_deref(),
+        std::env::var("RECURSIVE_MICROCOMPACT_KEEP").ok().as_deref(),
+    );
+    if let Some(mc) = microcompactor {
+        builder = builder.microcompactor(mc);
+    }
     if hook_timing {
         use recursive::hooks::HookRegistry;
         let mut hooks = HookRegistry::new();

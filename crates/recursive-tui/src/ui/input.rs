@@ -29,7 +29,11 @@ pub const MAX_VISIBLE_ROWS: u16 = 6;
 pub fn total_height(app: &App) -> u16 {
     // Estimate based on logical lines - the actual rendering will wrap as needed
     let logical_lines = app.prompt.buffer.lines().count().max(1);
-    let trailing = if app.prompt.buffer.ends_with('\n') { 1 } else { 0 };
+    let trailing = if app.prompt.buffer.ends_with('\n') {
+        1
+    } else {
+        0
+    };
     let estimated_lines = (logical_lines + trailing) as u16;
     estimated_lines.clamp(1, MAX_VISIBLE_ROWS) + 2 /* borders */ + 1 /* footer */
 }
@@ -117,7 +121,8 @@ fn cursor_visual_position_wrapped(buffer: &str, cursor: usize, avail_width: usiz
                 let line_bytes = wrapped_line.len();
                 if byte_offset + line_bytes >= current_logical_line.len() {
                     // Cursor is on this wrapped line
-                    target_col = UnicodeWidthStr::width(&current_logical_line[byte_offset..]) as u16;
+                    target_col =
+                        UnicodeWidthStr::width(&current_logical_line[byte_offset..]) as u16;
                     target_row = row_idx as u16;
                     break;
                 } else {
@@ -191,7 +196,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 };
                 all_lines.push(Line::from(vec![
                     prefix.clone(),
-                    Span::styled(wrapped_line.to_string(), body_style)
+                    Span::styled(wrapped_line.to_string(), body_style),
                 ]));
             }
         }

@@ -116,6 +116,11 @@ pub(crate) struct RunCore<'a> {
     pub(crate) events: Option<mpsc::UnboundedSender<AgentEvent>>,
     pub(crate) streaming: bool,
     pub(crate) compactor: Option<Compactor>,
+    /// Goal-332: micro-compactor for intra-turn tool-result pruning.
+    /// When set, tool results are pruned at the end of each step BEFORE
+    /// the next LLM call, keeping the transcript short enough that
+    /// proactive cross-turn compaction rarely fires mid-response.
+    pub(crate) microcompactor: Option<crate::compact::Microcompactor>,
     pub(crate) permission_hook: Option<Arc<dyn PermissionHook>>,
     pub(crate) hooks: &'a HookRegistry,
     pub(crate) total_llm_latency_ms: u64,
@@ -1530,6 +1535,7 @@ mod tests {
             events: None,
             streaming: false,
             compactor: None,
+            microcompactor: None,
             permission_hook: None,
             hooks,
             total_llm_latency_ms: 0,
@@ -1698,6 +1704,7 @@ mod tests {
             events: Some(events),
             streaming: false,
             compactor: None,
+            microcompactor: None,
             permission_hook: None,
             hooks,
             total_llm_latency_ms: 0,
@@ -2566,6 +2573,7 @@ mod tests {
             events: None,
             streaming: false,
             compactor: None,
+            microcompactor: None,
             permission_hook: None,
             hooks,
             total_llm_latency_ms: 0,

@@ -1227,6 +1227,7 @@ pub struct AgentRuntimeBuilder {
     streaming: bool,
     saved_event_sink: Option<Arc<dyn EventSink>>,
     compactor: Option<Compactor>,
+    microcompactor: Option<crate::compact::Microcompactor>,
     /// When `true`, register `enter_plan_mode`, `exit_plan_mode`, and
     /// `request_plan_mode` tools. These tools block waiting for human
     /// approval via the plan approval gate, so they must only be registered
@@ -1276,6 +1277,7 @@ impl AgentRuntimeBuilder {
             streaming: false,
             saved_event_sink: None,
             compactor: None,
+            microcompactor: None,
             with_plan_mode_tools: false,
             goal_eval_transcript_tail: 12,
             skills: Vec::new(),
@@ -1355,6 +1357,14 @@ impl AgentRuntimeBuilder {
         // hooks). Cross-turn compaction is performed by the runtime itself.
         self.kernel_builder = self.kernel_builder.compactor(compactor.clone());
         self.compactor = Some(compactor);
+        self
+    }
+
+    /// Set an optional microcompactor for no-LLM proactive pruning of old
+    /// tool results by count.
+    pub fn microcompactor(mut self, microcompactor: crate::compact::Microcompactor) -> Self {
+        self.kernel_builder = self.kernel_builder.microcompactor(microcompactor.clone());
+        self.microcompactor = Some(microcompactor);
         self
     }
 

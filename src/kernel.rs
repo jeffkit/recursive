@@ -171,6 +171,8 @@ pub struct AgentKernel {
     pub(crate) max_transcript_chars: Option<usize>,
     /// Optional compactor for summarising old messages.
     pub(crate) compactor: Option<Compactor>,
+    /// Optional microcompactor for no-LLM proactive pruning of old tool results.
+    pub(crate) microcompactor: Option<crate::compact::Microcompactor>,
     /// Hook registry for lifecycle hooks.
     pub(crate) hooks: HookRegistry,
     /// Optional cancellation token for graceful shutdown. When the token
@@ -313,6 +315,7 @@ impl AgentKernel {
                 events: ctx.step_events_tx,
                 streaming: ctx.streaming,
                 compactor: self.compactor.clone(),
+                microcompactor: self.microcompactor.clone(),
                 permission_hook: ctx.permission_hook,
                 hooks: &self.hooks,
                 total_llm_latency_ms: 0,
@@ -388,6 +391,7 @@ pub struct AgentKernelBuilder {
     max_steps: Option<usize>,
     max_transcript_chars: Option<usize>,
     compactor: Option<Compactor>,
+    microcompactor: Option<crate::compact::Microcompactor>,
     hooks: Option<HookRegistry>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
     /// Pluggable storage backend. When `None`, `build()` falls back to
@@ -462,6 +466,12 @@ impl AgentKernelBuilder {
     /// Set the compactor for summarising old messages.
     pub fn compactor(mut self, compactor: Compactor) -> Self {
         self.compactor = Some(compactor);
+        self
+    }
+
+    /// Set the microcompactor for no-LLM proactive pruning of old tool results.
+    pub fn microcompactor(mut self, microcompactor: crate::compact::Microcompactor) -> Self {
+        self.microcompactor = Some(microcompactor);
         self
     }
 
@@ -544,6 +554,7 @@ impl AgentKernelBuilder {
             max_steps,
             max_transcript_chars: self.max_transcript_chars,
             compactor: self.compactor,
+            microcompactor: self.microcompactor,
             hooks,
             shutdown_token: self.shutdown_token,
             storage,

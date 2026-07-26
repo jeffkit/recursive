@@ -93,6 +93,12 @@ pub enum AgentEvent {
     /// that produced reasoning content; steps without reasoning
     /// skip the event.
     Reasoning { text: String, step: usize },
+    /// No-LLM proactive pruning of old tool results by count.
+    /// Emitted with `pruned > 0` when the [`Microcompactor`] replaced
+    /// the content of old tool-result messages with a placeholder.
+    ///
+    /// [`Microcompactor`]: crate::compact::micro::Microcompactor
+    Microcompact { step: usize, pruned: usize },
     /// Transcript was compacted to fit size constraints.
     Compacted {
         removed: usize,
@@ -485,6 +491,7 @@ mod tests {
                 text: "hel".into(),
                 step: 5,
             },
+            AgentEvent::Microcompact { step: 5, pruned: 3 },
             AgentEvent::Compacted {
                 removed: 5,
                 kept: 3,
@@ -671,6 +678,7 @@ mod tests {
             AgentEvent::HookSystemMessage {
                 text: "hook message".into(),
             },
+            AgentEvent::Microcompact { step: 3, pruned: 2 },
             AgentEvent::LlmRetry {
                 step: 2,
                 attempt: 1,
