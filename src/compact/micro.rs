@@ -99,8 +99,8 @@ impl Microcompactor {
         let to_process = eligible_count.min(target_prune);
 
         let mut pruned = 0;
-        for i in 0..to_process {
-            let idx = tool_indices[i];
+        for idx in tool_indices.iter().take(to_process) {
+            let idx = *idx;
             let msg = &mut messages[idx];
             // Skip if already placeholdered or too short.
             if msg.content == MICROCOMPACT_PLACEHOLDER || msg.content.len() <= MIN_PRUNE_LENGTH {
@@ -145,7 +145,7 @@ mod tests {
 
     /// Helper to build a tool message with a given content length.
     fn tool_msg(content_len: usize) -> Message {
-        Message::tool_result("call_1", &"x".repeat(content_len))
+        Message::tool_result("call_1", "x".repeat(content_len))
     }
 
     // ====================================================================
@@ -180,25 +180,25 @@ mod tests {
         );
 
         // The last 4 should be untouched (indices 11..14 after sorting).
-        for i in 11..15 {
+        for msg in msgs[11..15].iter() {
             assert_ne!(
-                msgs[i].content, MICROCOMPACT_PLACEHOLDER,
-                "message {i} (recent) must not be pruned"
+                msg.content, MICROCOMPACT_PLACEHOLDER,
+                "message must not be pruned"
             );
         }
         // The first 3 should be placeholdered (indices 0,1,2).
-        for i in 0..3 {
+        for msg in msgs[0..3].iter() {
             assert_eq!(
-                msgs[i].content, MICROCOMPACT_PLACEHOLDER,
-                "message {i} (oldest) must be pruned"
+                msg.content, MICROCOMPACT_PLACEHOLDER,
+                "message must be pruned"
             );
         }
         // Messages 3..10 should still be untouched (not placeholdered)
         // because we stop pruning once count - pruned <= trigger.
-        for i in 3..11 {
+        for msg in msgs[3..11].iter() {
             assert_ne!(
-                msgs[i].content, MICROCOMPACT_PLACEHOLDER,
-                "message {i} should not be pruned (pruning stopped at 3)"
+                msg.content, MICROCOMPACT_PLACEHOLDER,
+                "message should not be pruned (pruning stopped at 3)"
             );
         }
     }
@@ -275,8 +275,8 @@ mod tests {
         // Index 2 (long, old) should be pruned.
         assert_eq!(msgs[2].content, MICROCOMPACT_PLACEHOLDER);
         // Recent (last 4) should be untouched.
-        for i in 7..11 {
-            assert_ne!(msgs[i].content, MICROCOMPACT_PLACEHOLDER);
+        for msg in msgs[7..11].iter() {
+            assert_ne!(msg.content, MICROCOMPACT_PLACEHOLDER);
         }
         // We pruned at least 1 (the old long one).
         assert!(pruned >= 1, "should prune at least 1 eligible long result");

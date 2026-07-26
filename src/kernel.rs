@@ -329,7 +329,7 @@ impl AgentKernel {
                 prompt_segments: ctx.prompt_segments,
                 static_breakdown,
                 last_prompt_tokens: 0,
-            consecutive_compact_failures: 0,
+                consecutive_compact_failures: 0,
                 wall_timeout_secs: ctx.wall_timeout_secs,
                 wall_start: if ctx.wall_timeout_secs > 0 {
                     Some(std::time::Instant::now())
