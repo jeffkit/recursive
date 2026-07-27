@@ -207,8 +207,13 @@ pub fn load_memory(workspace: &std::path::Path) -> Result<MemoryStore> {
 }
 
 /// Build a memory summary string for injection into the system prompt.
-/// Returns the top N most recent notes as a formatted block, or empty
+/// Returns the top N most recent notes as an index-style listing, or empty
 /// string if no notes exist.
+///
+/// The output format mimics fake-cc's MEMORY.md index style:
+/// `- [ID](recall) — one-line hook`
+/// This keeps the summary compact and token-efficient while guiding the
+/// agent to use `recall` for full content when needed.
 pub fn memory_summary(workspace: &std::path::Path, limit: usize) -> String {
     let store = match load_memory(workspace) {
         Ok(s) => s,
@@ -218,26 +223,26 @@ pub fn memory_summary(workspace: &std::path::Path, limit: usize) -> String {
         return String::new();
     }
     let mut lines: Vec<String> = Vec::new();
+    lines.push("# Memory Index".to_string());
     lines.push(format!(
-        "# Memory (top {} most recent notes; use `recall` for more)",
+        "Top {} most recent notes. Use `recall` with the note ID to read full content.",
         limit
     ));
     // Most recent first
     let mut notes: Vec<&Note> = store.notes.iter().collect();
     notes.reverse();
     for note in notes.iter().take(limit) {
-        let tags_str = if note.tags.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", note.tags.join(","))
-        };
-        // Truncate long text for the summary
-        let text_preview = if note.text.len() > 120 {
-            format!("{}...", crate::truncate_str(&note.text, 117))
+        // Generate a concise "hook" from the note text
+        let hook = if note.text.len() > 80 {
+            format!("{}...", crate::truncate_str(&note.text, 77))
         } else {
             note.text.clone()
         };
-        lines.push(format!("- {}{} {}", note.id, tags_str, text_preview));
+        // Replace newlines with spaces to keep the index compact
+        let hook = hook.replace('\n', " ");
+        // Index-style format: `- [ID](recall) — hook`
+        // The "(recall)" indicates the tool to use for full content
+        lines.push(format!("- [{}](recall) — {}", note.id, hook));
     }
     lines.join("\n")
 }
@@ -1257,6 +1262,131 @@ mod tests {
         assert!(
             summary.contains("..."),
             "truncated value must end with '...': {summary}"
+        );
+    }
+
+    // ── memory_summary unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn memory_summary_returns_empty_for_no_notes() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let summary = memory_summary(tmp.path(), 10);
+        assert!(
+            summary.is_empty(),
+            "empty memory must produce empty summary, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn memory_summary_uses_index_format() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = memory_path(tmp.path());
+        let mut store = MemoryStore::default();
+        store.add("test note content".into(), vec!["tag1".into()]);
+        store.save(&path).unwrap();
+
+        let summary = memory_summary(tmp.path(), 10);
+        assert!(
+            summary.contains("# Memory Index"),
+            "summary must start with '# Memory Index'"
+        );
+        assert!(
+            summary.contains("- [N1](recall) — test note content"),
+            "summary must use index format: '- [ID](recall) — hook'"
+        );
+        assert!(
+            !summary.contains("[tag1]"),
+            "index format should not inline tags (they're in the full note)"
+        );
+    }
+
+    #[test]
+    fn memory_summary_truncates_long_hooks() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = memory_path(tmp.path());
+        let mut store = MemoryStore::default();
+        store.add("X".repeat(200), vec![]);
+        store.save(&path).unwrap();
+
+        let summary = memory_summary(tmp.path(), 10);
+        assert!(
+            summary.contains("..."),
+            "long hook must be truncated with '...'"
+        );
+        // Verify the index format is preserved even with truncation
+        assert!(
+            summary.contains("- [N1](recall) — "),
+            "truncated hook must still use index format"
+        );
+    }
+
+    #[test]
+    fn memory_summary_replaces_newlines_in_hook() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = memory_path(tmp.path());
+        let mut store = MemoryStore::default();
+        store.add("line1\nline2\nline3".into(), vec![]);
+        store.save(&path).unwrap();
+
+        let summary = memory_summary(tmp.path(), 10);
+        // Find the index line (starts with "- [N")
+        let index_line = summary
+            .lines()
+            .find(|l| l.starts_with("- [N"))
+            .expect("should find an index line");
+        assert!(
+            !index_line.contains('\n'),
+            "newlines in hook must be replaced with spaces to keep index compact"
+        );
+        assert!(
+            index_line.contains("line1 line2 line3") || index_line.contains("line1 line2"),
+            "hook content should be preserved with spaces instead of newlines"
+        );
+    }
+
+    #[test]
+    fn memory_summary_respects_limit() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = memory_path(tmp.path());
+        let mut store = MemoryStore::default();
+        for i in 0..10 {
+            store.add(format!("note {}", i), vec![]);
+        }
+        store.save(&path).unwrap();
+
+        let summary = memory_summary(tmp.path(), 3);
+        // Should have header + 3 entries
+        let entry_count = summary.matches("- [N").count();
+        assert_eq!(entry_count, 3, "summary must respect limit parameter");
+    }
+
+    #[test]
+    fn memory_summary_most_recent_first() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = memory_path(tmp.path());
+        let mut store = MemoryStore::default();
+        store.add("first".into(), vec![]);
+        store.add("second".into(), vec![]);
+        store.add("third".into(), vec![]);
+        store.save(&path).unwrap();
+
+        let summary = memory_summary(tmp.path(), 10);
+        let lines: Vec<&str> = summary.lines().collect();
+        // Find the index lines (starting with "- [N")
+        let mut index_lines = Vec::new();
+        for line in lines {
+            if line.starts_with("- [N") {
+                index_lines.push(line);
+            }
+        }
+        // Most recent (N3, N2, N1) should appear first
+        assert!(
+            index_lines[0].contains("N3"),
+            "most recent note (N3) should appear first"
+        );
+        assert!(
+            index_lines[2].contains("N1"),
+            "oldest note (N1) should appear last"
         );
     }
 }
