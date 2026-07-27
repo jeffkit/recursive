@@ -79,9 +79,19 @@ impl Tool for TodoWriteTool {
         ToolSpec {
             name: "TodoWrite".into(),
             description: "Create and manage a structured task list for the current session. \
-                Use proactively for tasks with 3 or more distinct steps. \
-                Update status in real-time as you work. \
-                Mark exactly ONE task as in_progress at a time."
+                Use it proactively for tasks with 3 or more distinct steps; update status \
+                in real time as you work.\n\n\
+                When to use:\n\
+                - Create the list BEFORE starting work (capture requirements as todos)\n\
+                - Mark exactly ONE task as in_progress at a time\n\
+                - Mark completed IMMEDIATELY after finishing (not batched)\n\
+                - ONLY mark completed when fully done (tests passing, no partial work)\n\
+                - Clear the list (call with an empty array) when all tasks are done\n\n\
+                When NOT to use:\n\
+                - Single, straightforward tasks\n\
+                - Purely conversational responses\n\
+                - Tasks completable in less than 3 trivial steps\n\n\
+                Do not use this tool for a single trivial task — just do the task directly."
                 .into(),
             parameters: json!({
                 "type": "object",

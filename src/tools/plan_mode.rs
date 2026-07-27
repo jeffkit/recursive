@@ -198,9 +198,17 @@ impl Tool for EnterPlanModeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ENTER_PLAN_MODE_TOOL_NAME.into(),
-            description: "Enter read-only planning mode. While active, write tools (Write, \
-                 Edit, Bash, …) are blocked. Use read tools to explore the \
-                 codebase freely, then call exit_plan_mode with a markdown plan summary."
+            description: "Enter read-only planning mode for non-trivial or architectural \
+                 changes. While active, write tools (Write, Edit, Bash, …) are blocked.\n\n\
+                 Use enter_plan_mode when:\n\
+                 - The task requires exploring 3+ files before deciding what to change\n\
+                 - The task touches architectural boundaries (new module, new tool, API change)\n\
+                 - You are unsure of the correct approach and want to discuss options first\n\n\
+                 While in plan mode:\n\
+                 - Read files freely (Read, Glob, Grep)\n\
+                 - Think through trade-offs in your responses\n\
+                 - DO NOT call Write, Edit, or Bash\n\
+                 - When you have a clear plan, call exit_plan_mode with a markdown summary"
                 .into(),
             parameters: json!({
                 "type": "object",

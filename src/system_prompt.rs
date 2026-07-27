@@ -141,10 +141,12 @@ pub fn assemble_system_prompt(
     // (so the existing prepended string's prefix matches byte-for-byte).
     let mut full = prepend_project_context(base, workspace);
 
-    if !segments.skills.is_empty() {
-        full.push('\n');
-        full.push_str(&segments.skills);
-    }
+    // NOTE: the skill catalog is intentionally NOT inlined into `full`.
+    // It is volatile and long, so inlining it would break prefix-cache
+    // stability on every skill change. It ships instead as a per-turn
+    // `system-reminder` via `crate::skills::skill_reminder` (see
+    // `crate::run_core::call_llm`). `segments.skills` is still computed
+    // above so the prompt-breakdown estimator can account for its tokens.
     if !segments.subagents.is_empty() {
         full.push_str(&segments.subagents);
     }
@@ -214,12 +216,21 @@ mod tests {
     }
 
     #[test]
-    fn appends_skill_index_when_skills_present() {
+    fn skill_index_not_inlined_into_system_prompt() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let skills = vec![make_skill("pdf", "Manipulate PDF documents")];
+        // The skill catalog must NOT be inlined into the static system
+        // prompt — it now ships per-turn as a `system-reminder` via
+        // `skill_reminder()`. This keeps the `system` field stable for
+        // prefix caching.
         let out = assemble_system_prompt("BASE", tmp.path(), &skills, false).into_full();
-        assert!(out.contains("Available skills"), "{out}");
-        assert!(out.contains("pdf"), "{out}");
+        assert!(!out.contains("Available skills"), "{out}");
+        assert!(!out.contains("pdf"), "{out}");
+        // The catalog is still produced — just via the reminder channel.
+        let reminder = crate::skills::skill_reminder(&skills);
+        assert!(reminder.contains("Available skills"), "{reminder}");
+        assert!(reminder.contains("pdf"), "{reminder}");
+        assert!(reminder.contains("<system-reminder>"), "{reminder}");
     }
 
     #[test]
@@ -235,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn ordering_project_context_then_base_then_skills_then_subagent() {
+    fn ordering_project_context_then_base_then_subagent() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("AGENTS.md"), "AG").expect("write");
         let skills = vec![make_skill("xlsx", "Spreadsheets")];
@@ -243,12 +254,11 @@ mod tests {
 
         let pc = out.find("# Project context").unwrap();
         let base = out.find("BASE").unwrap();
-        let skills_idx = out.find("Available skills").unwrap();
         let coord = out.find("Coordinator workflow").unwrap();
-        assert!(
-            pc < base && base < skills_idx && skills_idx < coord,
-            "{out}"
-        );
+        // Skill catalog is NOT in the static system prompt (ships as a
+        // per-turn system-reminder), so it must be absent here.
+        assert!(out.find("Available skills").is_none(), "{out}");
+        assert!(pc < base && base < coord, "{out}");
     }
 
     // ── Goal-328: byte-identical full, structured segments ───────────────
@@ -259,7 +269,7 @@ mod tests {
     /// byte-identical `full` is a hard requirement: prefix-cache stability
     /// depends on it).
     #[test]
-    fn full_is_byte_identical_to_pre_goal_328_assembly() {
+    fn full_is_stable_and_excludes_skill_index() {
         // Same fixture as the existing ordering test (the most demanding
         // path: all four layers present, sub-agent enabled).
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -275,11 +285,11 @@ mod tests {
         //   ("\n\n---\n\n## Coordinator workflow\n\n" + coordinator_system_prompt()
         //    + "\n\nWhen you need to do focused research …") when sub-agent enabled.
         let mut expected = crate::config::prepend_project_context("BASE", tmp.path());
-        let idx = crate::skills::skill_index(&skills);
-        if !idx.is_empty() {
-            expected.push('\n');
-            expected.push_str(&idx);
-        }
+        // Sanity: the catalog still ships via skill_reminder (not inlined).
+        assert!(
+            crate::skills::skill_reminder(&skills).contains("Available skills"),
+            "skill_reminder must still produce the catalog"
+        );
         expected.push_str("\n\n---\n\n## Coordinator workflow\n\n");
         expected.push_str(crate::multi::coordinator_system_prompt());
         expected.push_str(
@@ -292,7 +302,11 @@ mod tests {
         let assembled = assemble_system_prompt("BASE", tmp.path(), &skills, true).into_full();
         assert_eq!(
             assembled, expected,
-            "AssembledPrompt::full must be byte-identical to the pre-goal-328 output"
+            "AssembledPrompt::full must be stable and exclude the skill catalog"
+        );
+        assert!(
+            !assembled.contains("Available skills"),
+            "skill catalog must not be inlined into full (ships via skill_reminder): {assembled}"
         );
     }
 
@@ -363,13 +377,16 @@ mod tests {
             assembled.full.contains("AGENTS.md"),
             "full must contain the AGENTS.md heading from the rules segment"
         );
+        // The skill catalog is NOT inlined into `full` (it ships via the
+        // `skill_reminder` channel); the `segments.skills` field above still
+        // accounts for its tokens in the breakdown estimator.
         assert!(
-            assembled.full.contains("Available skills"),
-            "full must contain the skill index after BASE"
+            !assembled.full.contains("Available skills"),
+            "full must NOT inline the skill catalog: {assembled}"
         );
         assert!(
             assembled.full.contains("Coordinator workflow"),
-            "full must contain the sub-agent suffix after skills"
+            "full must contain the sub-agent suffix after BASE"
         );
     }
 

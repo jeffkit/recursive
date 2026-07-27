@@ -2692,10 +2692,11 @@ mod tests {
 
     // ── Goal-312: skill_index injection into system prompt ──────────
 
-    /// Verify that system prompt construction logic correctly appends
-    /// the skill index when skills are present in AppState.
+    /// Verify the skill catalog is produced as a `system-reminder` and is
+    /// NOT inlined into the static system prompt (it ships per-turn via
+    /// `skill_reminder`, keeping the `system` field cacheable).
     #[test]
-    fn system_prompt_includes_skill_index_when_skills_present() {
+    fn skill_reminder_produced_and_not_inlined() {
         let skills = vec![crate::skills::Skill {
             name: "rust-patch-discipline".to_string(),
             description: "V4A patch format rules".to_string(),
@@ -2711,7 +2712,6 @@ mod tests {
             globs: None,
         }];
 
-        let base_prompt = "You are a helpful agent.";
         let idx = crate::skills::skill_index(&skills);
         assert!(!idx.is_empty(), "skill_index should not be empty");
         assert!(
@@ -2723,18 +2723,26 @@ mod tests {
             "skill_index should list skill names"
         );
 
-        // Simulate what run_agent/create_session do.
-        let mut sp = base_prompt.to_string();
-        sp.push('\n');
-        sp.push_str(&idx);
-
+        // The catalog ships as a system-reminder block.
+        let reminder = crate::skills::skill_reminder(&skills);
+        assert!(reminder.contains("<system-reminder>"), "reminder wrapper");
         assert!(
-            sp.contains("Available skills"),
-            "system prompt should contain skill index after injection"
+            reminder.contains("Available skills"),
+            "reminder should contain header"
         );
         assert!(
-            sp.contains("rust-patch-discipline"),
-            "system prompt should contain skill name"
+            reminder.contains("rust-patch-discipline"),
+            "reminder should contain skill name"
+        );
+
+        // The static system prompt must NOT inline it.
+        let base_prompt = "You are a helpful agent.";
+        let assembled =
+            crate::assemble_system_prompt(base_prompt, std::path::Path::new(""), &skills, false)
+                .into_full();
+        assert!(
+            !assembled.contains("Available skills"),
+            "system prompt must not inline skill catalog: {assembled}"
         );
     }
 
