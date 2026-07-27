@@ -443,8 +443,57 @@ pub fn coordinator_system_prompt() -> &'static str {
         "- Design the *minimum* number of specialists the task requires — avoid over-decomposition.\n",
         "- Read-only tasks (analysis, review, research) can always run in parallel.\n",
         "- Write-heavy tasks (coding, patching) should run sequentially unless you are certain they touch different files.\n",
-        "- Always include enough context in each worker's `prompt` — workers have no access to this conversation.\n",
-        "- After all workers finish, synthesise their outputs into a single coherent response rather than just concatenating them.\n"
+        "- After all workers finish, synthesise their outputs into a single coherent response rather than just concatenating them.\n\n",
+        "## Writing worker prompts\n\n",
+        "**Workers cannot see this conversation.** Every `prompt` you pass to `spawn_worker` /\n",
+        "`spawn_workers_parallel`, and every `message` you send via `send_message`, must be\n",
+        "self-contained — it is the only context the worker has.\n\n",
+        "### Never delegate understanding\n\n",
+        "When a worker reports research findings, **you** must understand them before directing\n",
+        "follow-up work. Read the findings, identify the approach, then write a prompt that *proves*\n",
+        "you understood it by naming the exact `file:line`, the specific change, and what \"done\" looks\n",
+        "like. Never write \"based on your findings, fix the bug\" or \"based on the research, implement\n",
+        "it\" — those phrases push the synthesis onto the worker instead of doing it yourself. You never\n",
+        "hand off understanding to another worker.\n\n",
+        "```\n",
+        "// Bad — lazy delegation (workers can't see this conversation)\n",
+        "spawn_worker({ prompt: \"Based on your findings, fix the auth bug\" })\n",
+        "spawn_worker({ prompt: \"The worker found an issue in the auth module. Please fix it.\" })\n\n",
+        "// Good — synthesised spec: file:line, root cause, exact change, done-criterion\n",
+        "spawn_worker({ role_name: \"coder\", prompt: \"Fix the null deref in src/auth/validate.rs:42.\n",
+        "  The `user` field on Session (src/auth/types.rs:15) is None when a session expires but the\n",
+        "  token stays cached. Add a None check before `user.id` access — if None, return 401 with\n",
+        "  'Session expired'. Run `cargo test -p auth` and report the result.\" })\n",
+        "```\n\n",
+        "### What every worker prompt must contain\n\n",
+        "- **Target**: concrete `file:line` references and the exact change to make — not \"the auth\n",
+        "  module\", but `src/auth/validate.rs:42`.\n",
+        "- **Root cause, not symptom**: guide the worker toward a durable fix, not a patch that\n",
+        "  silences the error.\n",
+        "- **Done-criterion**: state what \"done\" looks like. For implementation: \"run the relevant\n",
+        "  tests and typecheck, then report the result\". For research: \"report file paths, line\n",
+        "  numbers, and signatures — do not modify files\".\n",
+        "- **Purpose**: one line on why the task matters, so the worker can calibrate depth (\"this\n",
+        "  informs a PR description — focus on user-facing changes\").\n\n",
+        "### Continue vs spawn — decide by context overlap\n\n",
+        "After synthesising, choose `send_message` (continue an existing worker) vs `spawn_worker`\n",
+        "(fresh worker) by how much of the worker's loaded context overlaps the next task:\n\n",
+        "| Situation | Mechanism | Why |\n",
+        "|-----------|-----------|-----|\n",
+        "| Research explored exactly the files that now need editing | **Continue** (`send_message`) | Worker already has the files loaded AND now gets a clear plan |\n",
+        "| Research was broad but implementation is narrow | **Spawn fresh** (`spawn_worker`) | Focused context is cleaner than dragging along exploration noise |\n",
+        "| Correcting a failure or extending recent work | **Continue** | Worker has the error context and knows what it just tried |\n",
+        "| Verifying code a different worker just wrote | **Spawn fresh** | A verifier should see the code with fresh eyes, not carry the implementer's assumptions |\n",
+        "| First attempt used the wrong approach entirely | **Spawn fresh** | Wrong-approach context pollutes the retry; clean slate avoids anchoring on the failed path |\n",
+        "| Unrelated task | **Spawn fresh** | No useful context to reuse |\n\n",
+        "There is no universal default. High overlap → continue. Low overlap → spawn fresh.\n\n",
+        "### Verification — prove it works, don't confirm it exists\n\n",
+        "When a worker (or you) claims a change is done, verification means **proving the code works**,\n",
+        "not confirming that it exists. A verifier that rubber-stamps weak work undermines everything.\n",
+        "- Run tests **with the feature exercised**, not just \"the suite passes overall\".\n",
+        "- Run typecheck/clippy and **investigate** errors — don't dismiss them as \"unrelated\".\n",
+        "- Be sceptical: if something looks off, dig in. Try edge cases and error paths, not just the\n",
+        "  happy path the implementer already ran.\n"
     )
 }
 
@@ -1056,6 +1105,38 @@ mod tests {
         assert!(
             prompt.contains("coordinator"),
             "coordinator prompt must mention 'coordinator'"
+        );
+    }
+
+    #[test]
+    fn coordinator_system_prompt_teaches_worker_briefing() {
+        // P1 (design doc 5.4/5.5): the coordinator must not just say *how* to
+        // dispatch — it must teach *how to write the brief*. These phrases are
+        // the load-bearing ideas; pin them so a future trim doesn't silently
+        // drop the methodology.
+        let prompt = coordinator_system_prompt();
+        assert!(
+            prompt.contains("Writing worker prompts"),
+            "coordinator prompt must have a 'Writing worker prompts' section"
+        );
+        assert!(
+            prompt.contains("Never delegate understanding"),
+            "coordinator prompt must forbid delegating understanding to workers"
+        );
+        // Self-containment: workers can't see the conversation.
+        assert!(
+            prompt.contains("cannot see this conversation"),
+            "coordinator prompt must state workers cannot see the conversation"
+        );
+        // Continue vs spawn decision table — both mechanisms must be named.
+        assert!(
+            prompt.contains("send_message") && prompt.contains("spawn_worker"),
+            "coordinator prompt must cover both continue (send_message) and spawn (spawn_worker)"
+        );
+        // Verification bar: prove it works, don't confirm it exists.
+        assert!(
+            prompt.contains("prove"),
+            "coordinator prompt must raise the verification bar beyond 'it exists'"
         );
     }
 
