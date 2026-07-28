@@ -116,9 +116,14 @@ impl Microcompactor {
 
 /// Build a `Microcompactor` from environment-variable strings.
 ///
-/// Returns `None` when the microcompactor is disabled (trigger is `0`, `off`,
-/// or `false`). Implements the same env-parsing discipline as the compactor
-/// builders in the CLI and TUI so the contract is consistent across surfaces.
+/// **Disabled by default.** Set `RECURSIVE_MICROCOMPACT_TRIGGER=<n>` (e.g.
+/// `40`) to enable. Disabled when unset or when the value is `0`, `off`, or
+/// `false`.
+///
+/// Rationale: the old default of 12 was too aggressive for large-context
+/// models (1 M+). At 12 tool messages the pruner fires when the session is
+/// only ~50–80 K tokens — 5–8 % of a 1 M window — causing surprising ctx
+/// gauge drops. Opt-in lets operators tune the threshold to their model size.
 ///
 /// `trigger_raw` — the value of `RECURSIVE_MICROCOMPACT_TRIGGER`.
 /// `keep_raw`    — the value of `RECURSIVE_MICROCOMPACT_KEEP`.
@@ -127,13 +132,12 @@ pub fn build_microcompactor_from_env(
     keep_raw: Option<&str>,
 ) -> Option<Microcompactor> {
     let trigger: usize = match trigger_raw {
-        Some("0") | Some("off") | Some("false") => return None,
-        Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(12),
-        None => 12, // default
+        None | Some("0") | Some("off") | Some("false") => return None, // disabled by default
+        Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0)?,
     };
     let keep: usize = match keep_raw {
         Some(s) => s.parse::<usize>().ok().unwrap_or(4),
-        None => 4, // default
+        None => 4,
     };
     Some(Microcompactor::new(trigger, keep))
 }
@@ -330,11 +334,12 @@ mod tests {
     }
 
     #[test]
-    fn build_microcompactor_from_env_defaults_when_unset() {
-        // trigger unset → default 12, keep unset → default 4.
-        let mc = build_microcompactor_from_env(None, None).unwrap();
-        assert_eq!(mc.trigger_tool_count, 12);
-        assert_eq!(mc.keep_recent, 4);
+    fn build_microcompactor_from_env_disabled_by_default() {
+        // Microcompactor is OFF when env var is unset — opt-in only.
+        assert!(
+            build_microcompactor_from_env(None, None).is_none(),
+            "unset trigger must return None (disabled by default)"
+        );
     }
 
     #[test]
@@ -353,9 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn build_microcompactor_from_env_invalid_trigger_falls_back() {
-        // Non-numeric trigger → fall back to default 12.
-        let mc = build_microcompactor_from_env(Some("not-a-number"), None).unwrap();
-        assert_eq!(mc.trigger_tool_count, 12);
+    fn build_microcompactor_from_env_invalid_trigger_returns_none() {
+        // Non-numeric trigger cannot be parsed → None (disabled), not fallback.
+        assert!(
+            build_microcompactor_from_env(Some("not-a-number"), None).is_none(),
+            "unparseable trigger must return None"
+        );
     }
 }
