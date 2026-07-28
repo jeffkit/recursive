@@ -100,7 +100,7 @@ impl CommandRegistry {
                     aliases: &["cls"],
                     summary: "Clear conversation transcript",
                     usage: "/clear",
-                    handler: CommandHandler::Sync(cmd_clear),
+                    handler: CommandHandler::Async(cmd_clear),
                 },
                 CommandSpec {
                     name: "compact",
@@ -318,9 +318,11 @@ fn cmd_help(app: &mut AppState, _args: &[String]) -> CommandOutcome {
     )
 }
 
-fn cmd_clear(app: &mut AppState, _args: &[String]) -> CommandOutcome {
+fn cmd_clear(app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
+    use crate::events::UserAction;
+
     app.reset_transcript();
-    CommandOutcome::Done
+    vec![UserAction::StopLoop]
 }
 
 fn cmd_compact(app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
@@ -2131,7 +2133,7 @@ mod tests {
             aliases: &["f", "fb"],
             summary: "frob a thing",
             usage: "/frob <x>",
-            handler: CommandHandler::Sync(cmd_clear),
+            handler: CommandHandler::Async(cmd_clear),
         };
         let s = format!("{spec:?}");
         assert!(s.contains("CommandSpec"), "got {s:?}");

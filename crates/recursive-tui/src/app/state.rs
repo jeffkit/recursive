@@ -155,8 +155,9 @@ impl App {
         self.prompt.mode = InputMode::Prompt;
     }
 
-    /// Reset the transcript to a single fresh welcome block and zero
-    /// out per-session usage. Called by `/clear`.
+    /// Reset the transcript to a single "Conversation cleared." block,
+    /// zero out per-session usage, and stop any active event-driven loop.
+    /// Called by `/clear`.
     pub fn reset_transcript(&mut self) {
         self.blocks.clear();
         self.blocks.push(TranscriptBlock::System {
@@ -165,6 +166,7 @@ impl App {
         self.usage = UsageStats::default();
         self.turn_count = 0;
         self.pending_latency_ms = None;
+        self.loop_state = None;
         self.scroll_to_bottom();
     }
 
@@ -576,5 +578,21 @@ mod tests {
             app.pending_skill_install,
             Some(PendingSkillInstall::Files(_))
         ));
+    }
+
+    // ── Goal-NNN: /clear resets loop turn counter ───────────────────────
+
+    #[test]
+    fn reset_transcript_clears_loop_state() {
+        let mut app = App::new();
+        // Simulate an active loop with a running turn count.
+        app.loop_state = Some(crate::app::LoopUiState {
+            goal: "test loop".into(),
+            turns_run: 7,
+            max_turns: 0,
+        });
+        app.reset_transcript();
+        // Loop state must be None — /clear stops the loop.
+        assert!(app.loop_state.is_none(), "loop_state cleared by /clear");
     }
 }
