@@ -100,6 +100,13 @@ pub(crate) struct RunInnerOutcome {
     /// by turn to prevent cross-turn id collisions.
     pub(crate) tool_audits:
         std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
+    /// `prompt_tokens` from the **last** LLM call in this turn.
+    ///
+    /// Unlike `total_usage.prompt_tokens` (which is the accumulated sum across
+    /// all LLM calls in the turn), this is the single most-recent reading from
+    /// the API response. It represents the actual current context size and is
+    /// the correct input to cross-turn compaction's `should_compact` check.
+    pub(crate) last_prompt_tokens: u32,
 }
 
 /// Private core holding all state needed for one run of the ReAct loop.
@@ -751,7 +758,7 @@ impl<'a> RunCore<'a> {
 
     /// Assemble the final outcome for a run that terminates with `finish`
     /// at step `steps`. All early-return paths in [`run_inner`] route here
-    /// so the seven-field struct cannot drift out of sync across sites.
+    /// so the eight-field struct cannot drift out of sync across sites.
     fn make_outcome(
         self,
         finish: FinishReason,
@@ -768,6 +775,7 @@ impl<'a> RunCore<'a> {
             total_llm_latency_ms: self.total_llm_latency_ms,
             steps,
             tool_audits,
+            last_prompt_tokens: self.last_prompt_tokens,
         }
     }
 

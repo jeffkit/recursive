@@ -310,10 +310,13 @@ impl AgentRuntime {
         // pass per turn covers the entire growth instead of firing
         // reactively at the start of every turn.
         //
-        // Pass the actual prompt_tokens from the API response so the
-        // token-based threshold check (more accurate than the char estimate
-        // for CJK content) can be used when data is available.
-        self.maybe_compact_cross_turn(turn_outcome.usage.prompt_tokens)
+        // Use `last_prompt_tokens` — the single most-recent LLM call's
+        // prompt_tokens — rather than `usage.prompt_tokens` (the accumulated
+        // sum across all LLM calls in the turn). The accumulated sum grows
+        // proportionally to the number of tool-use steps in the turn, causing
+        // `should_compact` to fire prematurely on multi-step turns even when
+        // the actual context usage is well below the threshold.
+        self.maybe_compact_cross_turn(turn_outcome.last_prompt_tokens)
             .await?;
 
         let outcome: RuntimeOutcome = turn_outcome.into();

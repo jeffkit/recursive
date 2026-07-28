@@ -604,6 +604,45 @@ mod tests {
         assert!(c.should_compact(0, 1));
     }
 
+    /// Regression test — cross-turn compaction must use `last_prompt_tokens`
+    /// (the single most-recent LLM call's value) not the accumulated sum over all
+    /// LLM calls in the turn.  Before the fix, `runtime.rs` passed
+    /// `turn_outcome.usage.prompt_tokens` (accumulated), which caused premature
+    /// compaction on multi-step turns even when the actual context was well below
+    /// the threshold.
+    ///
+    /// Scenario: deepseek-v4-flash (1 M context), threshold = 784 000 tokens.
+    /// A turn with 8 LLM calls each at ~100 K tokens:
+    ///   accumulated = 8 × 100_000 = 800_000  →  should_compact = TRUE  (OLD WRONG behaviour)
+    ///   last_call   =     100_000            →  should_compact = FALSE (CORRECT)
+    #[test]
+    fn cross_turn_compact_uses_last_not_accumulated_prompt_tokens() {
+        // deepseek-v4-flash threshold: (1_000_000 - 20_000) * 0.80 = 784_000
+        let threshold = 784_000u32;
+        let c = Compactor::new(usize::MAX).threshold_prompt_tokens(threshold);
+
+        let per_call_tokens: u32 = 100_000;
+        let llm_calls_in_turn: u32 = 8;
+        let accumulated_tokens = per_call_tokens * llm_calls_in_turn; // 800_000
+        let last_call_tokens = per_call_tokens; // 100_000
+
+        // Confirm that the accumulated value WOULD have triggered compaction
+        // (this is what the old code passed — it was wrong).
+        assert!(
+            c.should_compact(0, accumulated_tokens),
+            "accumulated tokens ({accumulated_tokens}) exceeds threshold \
+             ({threshold}): should_compact is true — shows why old code was wrong"
+        );
+
+        // With the correct last_call value, compaction must NOT fire.
+        // runtime.rs now passes TurnOutcome::last_prompt_tokens here.
+        assert!(
+            !c.should_compact(0, last_call_tokens),
+            "last_call tokens ({last_call_tokens}) is well below threshold \
+             ({threshold}): compaction must NOT fire"
+        );
+    }
+
     // ========================================================================
     // Structured compaction tests
     // ========================================================================

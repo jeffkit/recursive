@@ -134,6 +134,10 @@ pub struct TurnOutcome {
     /// Cumulative token usage across all LLM calls in this turn.
     pub usage: TokenUsage,
 
+    /// `prompt_tokens` from the last LLM call only (not accumulated).
+    /// Use for cross-turn compaction; `usage.prompt_tokens` is the turn sum.
+    pub last_prompt_tokens: u32,
+
     /// Total LLM call latency in milliseconds (excluding tool execution time).
     pub llm_latency_ms: u64,
 
@@ -357,6 +361,7 @@ impl AgentKernel {
             final_text: inner.final_message,
             finish_reason: inner.finish_reason,
             usage: inner.total_usage,
+            last_prompt_tokens: inner.last_prompt_tokens,
             llm_latency_ms: inner.total_llm_latency_ms,
             steps: inner.steps,
             tool_audits: inner.tool_audits,
@@ -977,6 +982,7 @@ mod tests {
             final_text: None,
             finish_reason: FinishReason::NoMoreToolCalls,
             usage: TokenUsage::default(),
+            last_prompt_tokens: 0,
             llm_latency_ms: 0,
             steps: 0,
             tool_audits: std::collections::HashMap::new(),
