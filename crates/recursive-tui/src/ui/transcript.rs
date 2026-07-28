@@ -392,9 +392,20 @@ fn render_tool_call(
             output,
             expanded,
         }) => {
+            // Only the first result line gets the ⎿ connector; subsequent lines
+            // use plain indentation to match Claude's single-connector style.
+            let mut connector_used = false;
+            let mut next_pfx = || -> &'static str {
+                if connector_used {
+                    "       "
+                } else {
+                    connector_used = true;
+                    "    ⎿  "
+                }
+            };
             if !size.is_empty() {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
+                    Span::styled(next_pfx(), Style::default().fg(body_color)),
                     Span::styled(
                         size,
                         Style::default()
@@ -412,13 +423,13 @@ fn render_tool_call(
             };
             for line in visible {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
+                    Span::styled(next_pfx(), Style::default().fg(body_color)),
                     Span::styled((*line).to_string(), Style::default().fg(body_color)),
                 ]));
             }
             if !*expanded && n > 6 {
                 out.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Style::default().fg(body_color)),
+                    Span::styled(next_pfx(), Style::default().fg(body_color)),
                     Span::styled(
                         format!("… ({} more lines, press Ctrl+E to expand)", n - 3),
                         Style::default()
@@ -1335,6 +1346,31 @@ mod tests {
         let lines = render_tool_call("Read", "args", &Some(result), th);
         let text = full_text(&lines);
         assert!(text.contains("1 B"), "expected size row; got {text}");
+    }
+
+    #[test]
+    fn render_tool_call_only_first_result_line_has_connector() {
+        // Verifies the Claude-style connector rule: only the first result line
+        // (size row or first content line) carries the ⎿ glyph; all subsequent
+        // lines use plain indentation so the visual tree has a single connector.
+        let th = &theme::DARK;
+        let output = "alpha\nbeta\ngamma";
+        let result = ToolResultData {
+            success: true,
+            output: output.into(),
+            expanded: false,
+        };
+        let lines = render_tool_call("Read", "args", &Some(result), th);
+        // lines[0] = header ("⏺ Read(args)"), lines[1] = size row (connector),
+        // lines[2..] = content rows (no connector).
+        let connector_count = lines[1..]
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content.contains('⎿')))
+            .count();
+        assert_eq!(
+            connector_count, 1,
+            "exactly one result line should carry ⎿; got {connector_count}"
+        );
     }
 
     #[test]

@@ -22,6 +22,9 @@ Cargo.lock.bak
 
 .workbuddy/
 
+# Agent skills directory (per-user, not project state)
+.agents/
+
 # Auto-saved transcripts from self-improve.sh (kept on disk for diagnosis,
 # but never committed — they're huge JSON dumps that bloat the repo).
 .dev/transcripts/
