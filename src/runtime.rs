@@ -1019,6 +1019,105 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Goal-342: partial compaction — summarise messages *before* a given
+    /// transcript index, keeping everything from `pivot_index` onward
+    /// (plus the compactor's `keep_recent_n` safety margin) verbatim.
+    ///
+    /// `pivot_index` is a transcript message index (0-based, same indexing
+    /// as `transcript()`). Uses `Compactor::safe_split_point` on the
+    /// sub-transcript `[..=pivot_index]` to find a safe split that never
+    /// breaks tool-call pairs (invariant #8).
+    ///
+    /// No-op when no compactor is configured, `pivot_index` is out of
+    /// range, or the computed split is 0 (nothing to compact).
+    pub async fn compact_partial_before(&mut self, pivot_index: usize) -> Result<()> {
+        let Some(ref compactor) = self.compactor else {
+            return Ok(());
+        };
+        let transcript = Arc::make_mut(&mut self.transcript);
+        if pivot_index >= transcript.len() {
+            return Ok(());
+        }
+        // Consider the sub-transcript up to and including the pivot.
+        let scope = &transcript[..=pivot_index];
+        let split = Compactor::safe_split_point(scope, compactor.keep_recent_n);
+        if split == 0 {
+            return Ok(());
+        }
+        // Create a temporary compactor with keep_recent_n=0 so that
+        // compact() summarises *all* of transcript[..split] (not just
+        // the oldest part of it as the full keep_recent_n would).
+        let zero_keep = Compactor {
+            threshold_chars: compactor.threshold_chars,
+            threshold_prompt_tokens: compactor.threshold_prompt_tokens,
+            keep_recent_n: 0,
+        };
+        let step = self.checkpoints.turn_index.load(Ordering::Relaxed);
+        let summary_msg = zero_keep
+            .compact(self.kernel.llm().as_ref(), &transcript[..split], step)
+            .await?;
+        transcript.drain(..split);
+        transcript.insert(0, summary_msg);
+        self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
+        Ok(())
+    }
+
+    /// Goal-342: partial compaction — summarise messages *after* a given
+    /// transcript index, keeping everything *before* `pivot_index` verbatim.
+    ///
+    /// `pivot_index` is a transcript message index (0-based). Backs up
+    /// from the pivot as needed to avoid splitting tool-call pairs
+    /// (invariant #8): any `Tool` or `Assistant` carrying `tool_calls`
+    /// at the boundary is included with its pair.
+    ///
+    /// No-op when no compactor is configured or `pivot_index` is out of
+    /// range.
+    pub async fn compact_partial_after(&mut self, pivot_index: usize) -> Result<()> {
+        let Some(ref compactor) = self.compactor else {
+            return Ok(());
+        };
+        let transcript = Arc::make_mut(&mut self.transcript);
+        if pivot_index >= transcript.len() {
+            return Ok(());
+        }
+        // Back up from the pivot to avoid splitting tool-call pairs.
+        // If the message at pivot_index is a Tool result or an
+        // Assistant that issued tool_calls, include its pair by
+        // starting earlier.
+        let mut start = pivot_index;
+        loop {
+            if start == 0 {
+                break;
+            }
+            let msg = &transcript[start];
+            let should_back_up = msg.role == crate::message::Role::Tool
+                || (msg.role == crate::message::Role::Assistant && !msg.tool_calls.is_empty());
+            if should_back_up {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if start >= transcript.len() {
+            return Ok(());
+        }
+        let suffix = transcript[start..].to_vec();
+        // Same zero-keep trick so compact() summarises everything in the suffix.
+        let zero_keep = Compactor {
+            threshold_chars: compactor.threshold_chars,
+            threshold_prompt_tokens: compactor.threshold_prompt_tokens,
+            keep_recent_n: 0,
+        };
+        let step = self.checkpoints.turn_index.load(Ordering::Relaxed);
+        let summary_msg = zero_keep
+            .compact(self.kernel.llm().as_ref(), &suffix, step)
+            .await?;
+        transcript.truncate(start);
+        transcript.push(summary_msg);
+        self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
+        Ok(())
+    }
+
     /// Goal-202: approve the plan-mode entry request.
     ///
     /// Wakes `RequestPlanModeTool`'s blocking wait, returning `{"approved": true}`
@@ -2184,6 +2283,185 @@ mod tests {
             summary.contains("at step 2"),
             "compaction header should contain 'at step 2', got: {summary}"
         );
+    }
+
+    // ── Goal-342: compact_partial_before / compact_partial_after ─────────
+
+    #[tokio::test]
+    async fn compact_partial_before_summarizes_prefix_keeps_suffix() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "partial summary before pivot".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let compactor = crate::compact::Compactor::new(usize::MAX).keep_recent_n(2);
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+        // Seed: [system, user0, asst0, user1, asst1, user2, asst2]
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant("a0"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+        ];
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+        let before = rt.transcript().len(); // 7
+
+        // Compact before index 5 (u2). With keep_recent_n=2 on scope[..=5]=6 msgs,
+        // safe_split_point keeps ~2 recent: u1, a1, u2 → split=4 (a0+earlier summarized).
+        rt.compact_partial_before(5).await.unwrap();
+
+        // Transcript after: [summary, u1, a1, u2, a2]
+        assert_eq!(rt.transcript().len(), 5);
+        assert!(rt.transcript()[0].content.starts_with("[compacted:"));
+        // Suffix after the summary is the same messages
+        assert_eq!(rt.transcript()[1].content, "u1");
+        assert_eq!(rt.transcript()[2].content, "a1");
+        assert_eq!(rt.transcript()[3].content, "u2");
+        assert_eq!(rt.transcript()[4].content, "a2");
+    }
+
+    #[tokio::test]
+    async fn compact_partial_after_summarizes_suffix_keeps_prefix() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "partial summary after pivot".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let compactor = crate::compact::Compactor::new(usize::MAX).keep_recent_n(2);
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+        // Seed: [system, user0, asst0, user1, asst1, user2, asst2]
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant("a0"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+        ];
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+
+        // Compact after index 3 (u1 prefix ends): keep prefix [system, u0, a0, u1],
+        // compact suffix [a1, u2, a2].
+        rt.compact_partial_after(3).await.unwrap();
+
+        // Transcript after: [system, u0, a0, u1, summary]
+        assert_eq!(rt.transcript().len(), 5);
+        assert_eq!(rt.transcript()[0].content, "sys");
+        assert_eq!(rt.transcript()[1].content, "u0");
+        assert_eq!(rt.transcript()[2].content, "a0");
+        assert_eq!(rt.transcript()[3].content, "u1");
+        assert!(rt.transcript()[4].content.starts_with("[compacted:"));
+    }
+
+    #[tokio::test]
+    async fn compact_partial_too_short_is_noop() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "summary".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let compactor = crate::compact::Compactor::new(usize::MAX).keep_recent_n(2);
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+        // Very short transcript: just a system prompt.
+        *Arc::make_mut(&mut rt.transcript) = vec![Message::system("sys")];
+
+        let before = rt.transcript().len();
+        rt.compact_partial_before(0).await.unwrap();
+        assert_eq!(rt.transcript().len(), before);
+
+        rt.compact_partial_after(0).await.unwrap();
+        assert_eq!(rt.transcript().len(), before);
+    }
+
+    #[tokio::test]
+    async fn compact_partial_preserves_tool_call_pairing() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "tool-pair-summary".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let compactor = crate::compact::Compactor::new(usize::MAX).keep_recent_n(1);
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .compactor(compactor)
+            .build()
+            .unwrap();
+
+        // Messages with a tool-call pair: [u0, a0(tool_calls), tool0, u1, a1]
+        let tc = crate::llm::ToolCall {
+            id: "c1".into(),
+            name: "add".into(),
+            arguments: serde_json::json!({}),
+        };
+        let msgs = vec![
+            Message::user("u0"),
+            Message::assistant_with_tool_calls("a0".into(), vec![tc]),
+            Message::tool_result("call_c1", "3".into()),
+            Message::user("u1"),
+            Message::assistant("a1"),
+        ];
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+
+        // compact_partial_before at index 3 (u1). safe_split_point backs up
+        // past Tool at index 2 in scope[..=3] → split=2. Older [0..2] compacted.
+        rt.compact_partial_before(3).await.unwrap();
+
+        // After: [summary, u1, a1] — no orphan Tool messages.
+        assert_eq!(rt.transcript().len(), 3, "summary + 2 kept");
+        assert!(rt.transcript()[0].content.starts_with("[compacted:"));
+        assert_eq!(rt.transcript()[1].content, "u1");
+        assert_eq!(rt.transcript()[2].content, "a1");
+        // No orphan Tool messages in the kept region
+        for msg in &rt.transcript()[1..] {
+            if msg.role == crate::message::Role::Tool {
+                panic!("orphan Tool message in kept region: {:?}", msg);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_partial_noop_without_compactor() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "x".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut rt = AgentRuntime::builder().llm(provider).build().unwrap();
+        rt.set_transcript(vec![
+            Message::user("hi"),
+            Message::assistant("ok"),
+        ]);
+        let before = rt.transcript().len();
+        rt.compact_partial_before(1).await.unwrap();
+        assert_eq!(rt.transcript().len(), before);
+        rt.compact_partial_after(0).await.unwrap();
+        assert_eq!(rt.transcript().len(), before);
     }
 
     // ── Goal-168: GoalState / GoalEvaluator / run_goal_loop tests ──────────

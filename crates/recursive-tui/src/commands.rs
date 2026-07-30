@@ -109,6 +109,21 @@ impl CommandRegistry {
                     usage: "/compact",
                     handler: CommandHandler::Async(cmd_compact),
                 },
+                // Goal-342: partial compaction commands.
+                CommandSpec {
+                    name: "compact-before-index",
+                    aliases: &[],
+                    summary: "Compact messages before a transcript index",
+                    usage: "/compact-before-index <i>",
+                    handler: CommandHandler::Async(cmd_compact_before_index),
+                },
+                CommandSpec {
+                    name: "compact-after-index",
+                    aliases: &[],
+                    summary: "Compact messages from a transcript index onward",
+                    usage: "/compact-after-index <i>",
+                    handler: CommandHandler::Async(cmd_compact_after_index),
+                },
                 CommandSpec {
                     name: "cost",
                     aliases: &[],
@@ -328,6 +343,50 @@ fn cmd_clear(app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
 fn cmd_compact(app: &mut AppState, _args: &[String]) -> Vec<UserAction> {
     app.push_system("Compacting transcript…");
     vec![UserAction::Compact]
+}
+
+fn cmd_compact_before_index(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
+    use crate::events::PartialDirection;
+
+    let index = match parse_usize_arg(args) {
+        Ok(i) => i,
+        Err(msg) => {
+            app.push_error(msg);
+            return Vec::new();
+        }
+    };
+    app.push_system(format!("Compacting messages before index {index}…"));
+    vec![UserAction::CompactPartial {
+        direction: PartialDirection::Before,
+        pivot_index: index,
+    }]
+}
+
+fn cmd_compact_after_index(app: &mut AppState, args: &[String]) -> Vec<UserAction> {
+    use crate::events::PartialDirection;
+
+    let index = match parse_usize_arg(args) {
+        Ok(i) => i,
+        Err(msg) => {
+            app.push_error(msg);
+            return Vec::new();
+        }
+    };
+    app.push_system(format!("Compacting messages from index {index} onward…"));
+    vec![UserAction::CompactPartial {
+        direction: PartialDirection::After,
+        pivot_index: index,
+    }]
+}
+
+/// Parse a single `usize` argument from a command's argument list.
+/// Returns an error message string on failure.
+fn parse_usize_arg(args: &[String]) -> Result<usize, String> {
+    let raw = args.first().ok_or_else(|| {
+        "usage: requires a message index argument (e.g. /compact-before-index 5)".to_string()
+    })?;
+    raw.parse::<usize>()
+        .map_err(|_| format!("invalid index '{raw}' — expected a non-negative integer (e.g. 5)"))
 }
 
 fn cmd_cost(app: &mut AppState, _args: &[String]) -> CommandOutcome {
@@ -1542,21 +1601,32 @@ mod tests {
         }
         // 15 named above plus one lazily-registered built-in (/resume) = 16.
         // Plus /loop (Goal-323) = 17.
-        assert_eq!(names.len(), 17);
+        // Plus /compact-before-index and /compact-after-index (Goal-342) = 19.
+        assert_eq!(names.len(), 19);
     }
 
     #[test]
     fn registry_search_returns_prefix_matches_sorted() {
         let r = CommandRegistry::default_set();
-        // "c" prefix matches clear, compact, cost.
+        // "c" prefix matches clear, compact, compact-after-index,
+        // compact-before-index, cost.
         let hits: Vec<&str> = r.search("c").iter().map(|c| c.name).collect();
-        assert_eq!(hits, vec!["clear", "compact", "cost"]);
+        assert_eq!(
+            hits,
+            vec![
+                "clear",
+                "compact",
+                "compact-after-index",
+                "compact-before-index",
+                "cost"
+            ]
+        );
         // alias-prefix hit: "?" matches /help via alias.
         let hits: Vec<&str> = r.search("?").iter().map(|c| c.name).collect();
         assert!(hits.contains(&"help"));
         // Empty prefix returns everything (sorted).
         let hits: Vec<&str> = r.search("").iter().map(|c| c.name).collect();
-        assert_eq!(hits.len(), 17);
+        assert_eq!(hits.len(), 19);
         // Sorted check.
         let mut sorted = hits.clone();
         sorted.sort();
@@ -1703,6 +1773,114 @@ mod tests {
             }
             other => panic!("expected Async([Compact]), got {other:?}"),
         }
+    }
+
+    // ── Goal-342: /compact-before-index and /compact-after-index tests ──
+
+    #[test]
+    fn compact_before_index_dispatches_partial_action() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "compact-before-index 3");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::CompactPartial {
+                        direction,
+                        pivot_index,
+                    } => {
+                        assert_eq!(*direction, PartialDirection::Before);
+                        assert_eq!(*pivot_index, 3);
+                    }
+                    other => panic!("expected CompactPartial, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_after_index_dispatches_partial_action() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "compact-after-index 7");
+        match r {
+            InvokeResult::Async(actions) => {
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    UserAction::CompactPartial {
+                        direction,
+                        pivot_index,
+                    } => {
+                        assert_eq!(*direction, PartialDirection::After);
+                        assert_eq!(*pivot_index, 7);
+                    }
+                    other => panic!("expected CompactPartial, got {other:?}"),
+                }
+            }
+            other => panic!("expected Async, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_before_index_invalid_arg_shows_error() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "compact-before-index abc");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("invalid index"), "got {text:?}");
+            }
+            other => panic!("expected Error block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_before_index_missing_arg_shows_error() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "compact-before-index");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("usage"), "got {text:?}");
+            }
+            other => panic!("expected Error block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_after_index_invalid_arg_shows_error() {
+        let mut app = App::new();
+        let r = invoke(&mut app, "compact-after-index xyz");
+        assert!(matches!(r, InvokeResult::Async(a) if a.is_empty()));
+        match app.blocks.last() {
+            Some(TranscriptBlock::Error { text }) => {
+                assert!(text.contains("invalid index"), "got {text:?}");
+            }
+            other => panic!("expected Error block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_partial_commands_are_registered() {
+        let r = CommandRegistry::default_set();
+        assert!(
+            r.lookup("compact-before-index").is_some(),
+            "/compact-before-index should be registered"
+        );
+        assert!(
+            r.lookup("compact-after-index").is_some(),
+            "/compact-after-index should be registered"
+        );
+        let spec_before = r.lookup("compact-before-index").unwrap();
+        assert!(
+            matches!(spec_before.handler, CommandHandler::Async(_)),
+            "compact-before-index should be async"
+        );
+        let spec_after = r.lookup("compact-after-index").unwrap();
+        assert!(
+            matches!(spec_after.handler, CommandHandler::Async(_)),
+            "compact-after-index should be async"
+        );
     }
 
     // ── Goal-323: /loop command tests ───────────────────────────────

@@ -231,6 +231,17 @@ pub struct PermissionRequest {
     pub reply: tokio::sync::oneshot::Sender<bool>,
 }
 
+/// Which side of a pivot index to compact in a partial-compaction command.
+///
+/// Goal-342: used by [`UserAction::CompactPartial`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialDirection {
+    /// Compact messages *before* the pivot index; keep the suffix verbatim.
+    Before,
+    /// Compact messages *after* the pivot index; keep the prefix verbatim.
+    After,
+}
+
 /// Actions originating from key events that the backend worker must
 /// service against the [`recursive::AgentRuntime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +270,16 @@ pub enum UserAction {
     /// [`AgentRuntime::compact_now`]. The worker pushes a
     /// `Compacted` event when summarisation succeeds.
     Compact,
+    /// Goal-342: partial compaction — compact messages before or after
+    /// a given transcript index. The worker calls
+    /// [`AgentRuntime::compact_partial_before`] or
+    /// [`AgentRuntime::compact_partial_after`] depending on `direction`.
+    CompactPartial {
+        /// Which side of the pivot to compact.
+        direction: PartialDirection,
+        /// Transcript message index (0-based) that defines the pivot.
+        pivot_index: usize,
+    },
     /// Goal-146: flip the runtime's planning mode. `true` enables
     /// plan-first mode, `false` reverts to immediate execution.
     /// The worker echoes a `System` block confirming the new state.

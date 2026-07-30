@@ -1038,6 +1038,36 @@ async fn worker_loop(
                 }
             },
 
+            UserAction::CompactPartial {
+                direction,
+                pivot_index,
+            } => match &mut state {
+                RuntimeBuild::Ready(rt_opt) => {
+                    let Some(rt) = rt_opt.as_mut() else {
+                        tracing::warn!("backend: runtime not available for CompactPartial");
+                        continue;
+                    };
+                    let result = match direction {
+                        crate::events::PartialDirection::Before => {
+                            rt.compact_partial_before(pivot_index).await
+                        }
+                        crate::events::PartialDirection::After => {
+                            rt.compact_partial_after(pivot_index).await
+                        }
+                    };
+                    if let Err(e) = result {
+                        let _ = event_tx.send(UiEvent::Error {
+                            message: format!("compact partial failed: {e}"),
+                        });
+                    }
+                }
+                RuntimeBuild::Offline { .. } => {
+                    let _ = event_tx.send(UiEvent::Error {
+                        message: "compact unavailable in offline mode".into(),
+                    });
+                }
+            },
+
             UserAction::SetPlanningMode(_on) => {
                 // PlanFirst mode removed; this action is now a no-op.
                 // Plan Mode 2.0 (enter_plan_mode / exit_plan_mode tools) handles
