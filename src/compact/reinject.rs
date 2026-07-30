@@ -11,10 +11,12 @@
 //! per file, deduplicated against the preserved tail.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::message::Message;
 use crate::tools::fs::ReadFileState;
+use crate::tools::plan_mode::PlanApprovalGate;
+use crate::tools::todo::{TodoItem, TodoStatus};
 
 /// Post-compaction re-injector for recently-read files.
 ///
@@ -351,6 +353,91 @@ pub fn build_skill_reinjector_from_env(
         per_skill_budget: 5_000,
         skills,
     })
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// PlanTodoReinjector
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Post-compaction re-injector for the pending plan and task list.
+///
+/// After an LLM-summary compaction, the plan text and todo checklist are
+/// folded into prose or dropped entirely — the model loses track of the
+/// pending plan and outstanding tasks, and may re-propose a plan or forget
+/// about pending checklist items. This reinjector recovers both from the
+/// shared runtime state and emits [`Role::System`] attachment messages
+/// (plan first, then todos).
+///
+/// Only emits [`Role::System`] messages — no [`Role::Tool`] messages, so
+/// no orphan tool result can be created (invariant #8 safe).
+#[derive(Debug, Clone)]
+pub struct PlanTodoReinjector {
+    /// Shared task list (same `Arc` used by `TodoWriteTool`).
+    pub todos: Arc<RwLock<Vec<TodoItem>>>,
+    /// Shared plan-approval gate (same `Arc` used by `EnterPlanModeTool` /
+    /// `ExitPlanModeTool`).
+    pub plan_gate: Arc<PlanApprovalGate>,
+}
+
+impl PlanTodoReinjector {
+    /// Create a new [`PlanTodoReinjector`].
+    pub fn new(todos: Arc<RwLock<Vec<TodoItem>>>, plan_gate: Arc<PlanApprovalGate>) -> Self {
+        Self { todos, plan_gate }
+    }
+
+    /// Return 0-2 System attachment messages: the pending plan (if any) and
+    /// the current todo list (if non-empty). Empty Vec if neither applies.
+    ///
+    /// Plan goes first (so the model reads the plan before the task list).
+    pub fn reinject(&self) -> Vec<Message> {
+        let mut result: Vec<Message> = Vec::new();
+
+        // 1. Pending plan.
+        match self.plan_gate.pending_plan() {
+            Some(plan) => {
+                let msg = format!(
+                    "[post-compact plan restore]\n\
+                     You are in plan mode. The pending plan (awaiting approval) is:\n\
+                     {}",
+                    plan
+                );
+                result.push(Message::system(msg));
+            }
+            None => {
+                // No pending plan — skip.
+            }
+        }
+
+        // 2. Current todo list (if non-empty).
+        let todo_items: Vec<TodoItem> = match self.todos.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                tracing::warn!("PlanTodoReinjector: todo list lock poisoned, skipping todos");
+                Vec::new()
+            }
+        };
+
+        if !todo_items.is_empty() {
+            let mut list_body = String::from("[post-compact todo restore]\nCurrent task list:\n");
+            for item in &todo_items {
+                let checkbox = match item.status {
+                    TodoStatus::Completed => "[x]",
+                    TodoStatus::Cancelled => "[~]",
+                    TodoStatus::Pending => "[ ]",
+                    TodoStatus::InProgress => "[/]",
+                };
+                list_body.push_str(&format!("- {} {}\n", checkbox, item.content));
+                if item.status == TodoStatus::InProgress {
+                    if let Some(ref active) = item.active_form {
+                        list_body.push_str(&format!("  (active: {})\n", active));
+                    }
+                }
+            }
+            result.push(Message::system(list_body));
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -863,5 +950,102 @@ mod tests {
                 assert_eq!(r.token_budget, 10000);
             });
         });
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // PlanTodoReinjector tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn make_plan_todo_reinjector(todos: Vec<TodoItem>, plan: Option<&str>) -> PlanTodoReinjector {
+        let todo_list = Arc::new(RwLock::new(todos));
+        let gate = Arc::new(PlanApprovalGate::new());
+        if let Some(p) = plan {
+            gate.begin_approval(p.to_string());
+        }
+        PlanTodoReinjector::new(todo_list, gate)
+    }
+
+    #[test]
+    fn plan_todo_reinject_plan_when_pending() {
+        let r = make_plan_todo_reinjector(vec![], Some("Step 1: read files\nStep 2: edit"));
+        let msgs = r.reinject();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, crate::message::Role::System);
+        assert!(msgs[0].content.contains("[post-compact plan restore]"));
+        assert!(msgs[0].content.contains("You are in plan mode"));
+        assert!(msgs[0].content.contains("Step 1: read files"));
+        assert!(msgs[0].content.contains("Step 2: edit"));
+    }
+
+    #[test]
+    fn plan_todo_reinject_no_plan_when_none() {
+        let r = make_plan_todo_reinjector(vec![], None);
+        let msgs = r.reinject();
+        // No plan, no todos → empty vec
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn plan_todo_reinject_todos_when_non_empty() {
+        let todos = vec![
+            TodoItem {
+                content: "Step 1".to_string(),
+                status: TodoStatus::Completed,
+                active_form: None,
+            },
+            TodoItem {
+                content: "Step 2".to_string(),
+                status: TodoStatus::Pending,
+                active_form: None,
+            },
+            TodoItem {
+                content: "Step 3".to_string(),
+                status: TodoStatus::InProgress,
+                active_form: Some("Running step 3...".to_string()),
+            },
+        ];
+        let r = make_plan_todo_reinjector(todos, None);
+        let msgs = r.reinject();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, crate::message::Role::System);
+        let content = &msgs[0].content;
+        assert!(content.contains("[post-compact todo restore]"));
+        assert!(content.contains("- [x] Step 1"));
+        assert!(content.contains("- [ ] Step 2"));
+        assert!(content.contains("- [/] Step 3"));
+        assert!(content.contains("(active: Running step 3...)"));
+    }
+
+    #[test]
+    fn plan_todo_reinject_no_todos_when_empty() {
+        let r = make_plan_todo_reinjector(vec![], Some("my plan"));
+        let msgs = r.reinject();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("[post-compact plan restore]"));
+        // Only plan message, no todo message
+    }
+
+    #[test]
+    fn plan_todo_reinject_both_plan_and_todos() {
+        let todos = vec![TodoItem {
+            content: "Read files".to_string(),
+            status: TodoStatus::Completed,
+            active_form: None,
+        }];
+        let r = make_plan_todo_reinjector(todos, Some("my plan text"));
+        let msgs = r.reinject();
+        assert_eq!(msgs.len(), 2, "plan first, then todos");
+        // First message: plan
+        assert!(msgs[0].content.contains("[post-compact plan restore]"));
+        // Second message: todos
+        assert!(msgs[1].content.contains("[post-compact todo restore]"));
+        assert!(msgs[1].content.contains("- [x] Read files"));
+    }
+
+    #[test]
+    fn plan_todo_reinject_empty_when_neither() {
+        let r = make_plan_todo_reinjector(vec![], None);
+        let msgs = r.reinject();
+        assert!(msgs.is_empty());
     }
 }

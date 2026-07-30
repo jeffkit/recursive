@@ -65,6 +65,7 @@ pub enum PlanApprovalResult {
 /// * [`ExitPlanModeTool`] — clears flag, emits event, awaits decision
 /// * [`AgentRuntime`] — calls [`approve`](Self::approve) / [`reject`](Self::reject)
 /// * [`RunCore`](crate::run_core::RunCore) — reads `exploring_plan_mode` to gate writes
+#[derive(Debug)]
 pub struct PlanApprovalGate {
     /// `true` while the agent is in exploring (read-only plan) mode.
     pub exploring_plan_mode: Arc<AtomicBool>,
@@ -112,21 +113,46 @@ impl PlanApprovalGate {
     }
 
     /// Approve the pending plan. Called by TUI / HTTP on user confirmation.
+    ///
+    /// Clears the pending plan text so stale re-injection after compaction
+    /// cannot occur — the reinjector reads [`pending_plan`](Self::pending_plan)
+    /// which returns `None` after this call.
     pub fn approve(&self) {
         if let Ok(mut w) = self.response.write() {
             *w = Some(PlanApprovalResult::Approved);
+        }
+        if let Ok(mut w) = self.pending_plan.write() {
+            *w = None;
         }
         self.notify.notify_one();
     }
 
     /// Reject the pending plan with a reason. Called by TUI / HTTP.
+    ///
+    /// Clears the pending plan text so stale re-injection after compaction
+    /// cannot occur.
     pub fn reject(&self, reason: impl Into<String>) {
         if let Ok(mut w) = self.response.write() {
             *w = Some(PlanApprovalResult::Rejected {
                 reason: reason.into(),
             });
         }
+        if let Ok(mut w) = self.pending_plan.write() {
+            *w = None;
+        }
         self.notify.notify_one();
+    }
+
+    /// Return the currently-pending plan text, if any (set by
+    /// [`begin_approval`](Self::begin_approval), cleared by
+    /// [`approve`](Self::approve) or [`reject`](Self::reject)).
+    /// Used by post-compact re-injection so the model retains the plan
+    /// across compaction while it is still pending approval.
+    ///
+    /// Returns `None` gracefully on a poisoned lock (invariant #5 —
+    /// no unwrap in product code).
+    pub fn pending_plan(&self) -> Option<String> {
+        self.pending_plan.read().ok().and_then(|g| g.clone())
     }
 
     /// Set the pending plan text and clear any stale approval/rejection
@@ -743,6 +769,46 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["approved"], false);
         assert_eq!(parsed["reason"], "not needed");
+    }
+
+    // -- PlanApprovalGate::pending_plan -------------------------------------
+
+    #[test]
+    fn pending_plan_returns_begin_approval_text() {
+        let gate = PlanApprovalGate::new();
+        assert_eq!(gate.pending_plan(), None, "starts empty");
+        gate.begin_approval("my plan".to_string());
+        assert_eq!(
+            gate.pending_plan().as_deref(),
+            Some("my plan"),
+            "returns the text set by begin_approval"
+        );
+    }
+
+    #[test]
+    fn pending_plan_cleared_on_approve() {
+        let gate = PlanApprovalGate::new();
+        gate.begin_approval("plan text".to_string());
+        assert_eq!(gate.pending_plan().as_deref(), Some("plan text"));
+        gate.approve();
+        assert_eq!(
+            gate.pending_plan(),
+            None,
+            "pending_plan must be cleared after approve() to prevent stale re-injection"
+        );
+    }
+
+    #[test]
+    fn pending_plan_cleared_on_reject() {
+        let gate = PlanApprovalGate::new();
+        gate.begin_approval("plan text".to_string());
+        assert_eq!(gate.pending_plan().as_deref(), Some("plan text"));
+        gate.reject("bad plan");
+        assert_eq!(
+            gate.pending_plan(),
+            None,
+            "pending_plan must be cleared after reject() to prevent stale re-injection"
+        );
     }
 
     // -- PlanApprovalGate::begin_approval -----------------------------------

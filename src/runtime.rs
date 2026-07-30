@@ -211,6 +211,8 @@ pub struct AgentRuntime {
     file_reinjector: Option<crate::compact::FileReinjector>,
     /// Goal-335: skill re-injector (invoked skill bodies as System atts).
     skill_reinjector: Option<crate::compact::SkillReinjector>,
+    /// Goal-340: plan/todo re-injector (pending plan + task list as System atts).
+    plan_todo_reinjector: Option<crate::compact::PlanTodoReinjector>,
     /// Goal-338: turn index of the most recent compaction, used to detect
     /// recompaction chains (compacting again within a few turns of the
     /// previous compaction). `None` when no compaction has occurred yet.
@@ -243,6 +245,7 @@ impl std::fmt::Debug for AgentRuntime {
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .field("file_reinjector", &self.file_reinjector.is_some())
             .field("skill_reinjector", &self.skill_reinjector.is_some())
+            .field("plan_todo_reinjector", &self.plan_todo_reinjector.is_some())
             .finish()
     }
 }
@@ -530,6 +533,33 @@ impl AgentRuntime {
                                 usage: None,
                             })
                             .await;
+                    }
+                }
+                // Goal-340: re-inject pending plan and task list (reads shared state).
+                if let Some(ptr) = &self.plan_todo_reinjector {
+                    let atts = ptr.reinject();
+                    if !atts.is_empty() {
+                        // Count all already-inserted post-compact attachments so we
+                        // insert right after them, before the preserved tail.
+                        let insert_base: usize = 1 + self
+                            .transcript
+                            .iter()
+                            .skip(1)
+                            .take_while(|m| {
+                                m.content.starts_with("[post-compact file restore:")
+                                    || m.content.starts_with("[post-compact skill restore:")
+                            })
+                            .count();
+                        for (offset, att) in atts.into_iter().enumerate() {
+                            Arc::make_mut(&mut self.transcript)
+                                .insert(insert_base + offset, att.clone());
+                            self.event_sink
+                                .emit(AgentEvent::MessageAppended {
+                                    message: att,
+                                    usage: None,
+                                })
+                                .await;
+                        }
                     }
                 }
             }
@@ -1623,6 +1653,13 @@ impl AgentRuntimeBuilder {
                 )));
         }
 
+        // Goal-340: plan/todo re-injector shares the same todo_list and
+        // plan_approval_gate arcs already constructed above.
+        let plan_todo_reinjector = Some(crate::compact::PlanTodoReinjector::new(
+            todo_list.clone(),
+            plan_approval_gate.clone(),
+        ));
+
         // Register ToolSearchTool only when the provider supports deferred
         // tool loading via tool_reference (Anthropic API feature).
         // OpenAI and compatible providers get all tools eagerly.
@@ -1650,6 +1687,7 @@ impl AgentRuntimeBuilder {
             prompt_segments: self.prompt_segments,
             file_reinjector: self.file_reinjector,
             skill_reinjector: self.skill_reinjector,
+            plan_todo_reinjector,
             last_compact_turn: None,
         })
     }
@@ -1670,6 +1708,7 @@ mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider};
     use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
+    use crate::tools::todo::TodoStatus;
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -3523,6 +3562,111 @@ mod tests {
         assert!(
             rt.transcript[0].is_compaction_summary,
             "summary message must be flagged as compaction_summary"
+        );
+    }
+
+    // ── Goal-340: cross-turn compaction re-injects plan and todos ─────────
+
+    #[tokio::test]
+    async fn cross_turn_compaction_reinjects_plan_and_todos() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "Summary of prior conversation.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+
+        let mut rt = AgentRuntime::builder()
+            .llm(provider)
+            .compactor(crate::Compactor::new(0)) // always compact
+            .build()
+            .unwrap();
+
+        // Seed pending plan via the runtime's shared plan gate.
+        rt.plan_approval_gate
+            .begin_approval("Step 1: explore\nStep 2: implement".to_string());
+
+        // Seed todos via the runtime's shared todo list.
+        {
+            let mut todos = rt.todo_list.write().unwrap();
+            todos.push(TodoItem {
+                content: "Read files".to_string(),
+                status: TodoStatus::Completed,
+                active_form: None,
+            });
+            todos.push(TodoItem {
+                content: "Edit code".to_string(),
+                status: TodoStatus::InProgress,
+                active_form: Some("Editing code...".to_string()),
+            });
+            todos.push(TodoItem {
+                content: "Run tests".to_string(),
+                status: TodoStatus::Pending,
+                active_form: None,
+            });
+        }
+
+        // Populate transcript long enough for compaction.
+        let msgs: Vec<Message> = (0..14)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("msg {i}"))
+                } else {
+                    Message::assistant(format!("reply {i}"))
+                }
+            })
+            .collect();
+        *Arc::make_mut(&mut rt.transcript) = msgs;
+
+        rt.maybe_compact_cross_turn(&TokenUsage::default())
+            .await
+            .unwrap();
+
+        let transcript = rt.transcript();
+
+        // Transcript order: [summary, plan-att, todo-att, ...preserved]
+        assert!(
+            transcript.len() >= 3,
+            "at least summary + 2 atts + preserved"
+        );
+        assert_eq!(transcript[0].role, crate::message::Role::System);
+        assert!(
+            transcript[0].is_compaction_summary,
+            "first message is the compaction summary"
+        );
+
+        // Find the plan and todo attachments.
+        let plan_msg = transcript
+            .iter()
+            .find(|m| m.content.starts_with("[post-compact plan restore]"))
+            .expect("plan restore message must be present");
+
+        assert!(plan_msg.content.contains("Step 1: explore"));
+        assert!(plan_msg.content.contains("You are in plan mode"));
+
+        let todo_msg = transcript
+            .iter()
+            .find(|m| m.content.starts_with("[post-compact todo restore]"))
+            .expect("todo restore message must be present");
+
+        assert!(todo_msg.content.contains("- [x] Read files"));
+        assert!(todo_msg.content.contains("- [/] Edit code"));
+        assert!(todo_msg.content.contains("(active: Editing code...)"));
+        assert!(todo_msg.content.contains("- [ ] Run tests"));
+
+        // Plan attachment should be before the todo attachment (plan first).
+        let plan_idx = transcript
+            .iter()
+            .position(|m| m.content.starts_with("[post-compact plan restore]"))
+            .unwrap();
+        let todo_idx = transcript
+            .iter()
+            .position(|m| m.content.starts_with("[post-compact todo restore]"))
+            .unwrap();
+        assert!(
+            plan_idx < todo_idx,
+            "plan attachment must come before todo attachment"
         );
     }
 }

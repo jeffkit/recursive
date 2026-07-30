@@ -17,7 +17,9 @@ pub mod reinject;
 pub mod retry;
 
 pub use micro::{Microcompactor, MICROCOMPACT_PLACEHOLDER};
-pub use reinject::{build_skill_reinjector_from_env, FileReinjector, SkillReinjector};
+pub use reinject::{
+    build_skill_reinjector_from_env, FileReinjector, PlanTodoReinjector, SkillReinjector,
+};
 pub use retry::{truncate_head_for_retry, MAX_PTL_RETRIES};
 
 /// Stop attempting proactive compaction after this many consecutive

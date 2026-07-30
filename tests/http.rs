@@ -3025,11 +3025,13 @@ mod http_tests {
             .unwrap();
 
         assert_eq!(resp.status(), 200);
-        // The gate's pending_plan was updated before approve() was called.
-        // After approve() the gate clears the response (not the pending_plan)
-        // so the edited text is still readable.
-        let stored = gate.pending_plan.read().unwrap().clone();
-        assert_eq!(stored.as_deref(), Some("Revised plan"));
+        // The handler reads pending_plan (with edits applied) and then calls
+        // approve(), which clears pending_plan to prevent stale re-injection.
+        let after = gate.pending_plan.read().unwrap().clone();
+        assert!(
+            after.is_none(),
+            "pending_plan must be cleared after approve() to prevent stale re-injection"
+        );
     }
 
     #[tokio::test]
