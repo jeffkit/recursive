@@ -13,9 +13,11 @@
 
 pub mod micro;
 pub mod reinject;
+pub mod retry;
 
 pub use micro::{Microcompactor, MICROCOMPACT_PLACEHOLDER};
 pub use reinject::{build_skill_reinjector_from_env, FileReinjector, SkillReinjector};
+pub use retry::{truncate_head_for_retry, MAX_PTL_RETRIES};
 
 /// Stop attempting proactive compaction after this many consecutive
 /// failures. Emergency compaction (`compact_on_overflow`) is exempt —
@@ -351,29 +353,11 @@ impl Compactor {
         Ok(Some((removed, summary_chars)))
     }
 
-    /// Compact the transcript: summarize older messages into a single system
-    /// message, keeping the last `keep_recent_n` messages verbatim.
-    ///
-    /// `step` is the current turn number and is embedded in the compaction
-    /// header for debuggability.
-    ///
-    /// Returns the summary `Message` that should replace the older portion.
-    /// The caller is responsible for splicing it into the transcript.
-    #[tracing::instrument(skip(self, provider, transcript))]
-    pub async fn compact(
-        &self,
-        provider: &dyn ChatProvider,
-        transcript: &[Message],
-        step: usize,
-    ) -> Result<Message> {
-        let split = Self::safe_split_point(transcript, self.keep_recent_n);
-        let older = &transcript[..split];
-        let _recent = &transcript[split..];
-
-        // Build a meta-prompt asking the model to summarize the older portion.
-        // Include tool_calls on assistant messages so the compactor sees what
-        // tools were invoked, not just the text content.
-        let older_text: String = older
+    /// Render a slice of messages into a single text block for the
+    /// summarisation prompt. Each message is wrapped in XML-style tags
+    /// with tool_call summaries appended.
+    fn render_for_summarize(messages: &[Message]) -> String {
+        messages
             .iter()
             .map(|m| {
                 let role_tag = match m.role {
@@ -394,14 +378,25 @@ impl Compactor {
                 format!("<{role_tag}>{body}</{role_tag}>")
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
+
+    /// Ask the provider to summarise the given messages.
+    /// Tries structured output first, falls back to free-text completion.
+    async fn summarize(
+        &self,
+        provider: &dyn ChatProvider,
+        messages: &[Message],
+        step: usize,
+    ) -> Result<String> {
+        let older_text = Self::render_for_summarize(messages);
 
         // Try structured output first
-        let summary = match self
+        match self
             .try_structured_compact(provider, &older_text, step)
             .await
         {
-            Some(rendered) => rendered,
+            Some(rendered) => Ok(rendered),
             None => {
                 // Fall back to free-text path
                 let summary_prompt = format!(
@@ -414,7 +409,66 @@ impl Compactor {
                 let completion = provider
                     .complete(&[Message::user(summary_prompt)], &[] as &[ToolSpec])
                     .await?;
-                completion.content
+                Ok(completion.content)
+            }
+        }
+    }
+
+    /// Compact the transcript: summarize older messages into a single system
+    /// message, keeping the last `keep_recent_n` messages verbatim.
+    ///
+    /// `step` is the current turn number and is embedded in the compaction
+    /// header for debuggability.
+    ///
+    /// Returns the summary `Message` that should replace the older portion.
+    /// The caller is responsible for splicing it into the transcript.
+    ///
+    /// If the summarisation call returns a context-window-exceeded error,
+    /// the oldest message groups are dropped (via [`truncate_head_for_retry`])
+    /// and the call is retried up to [`MAX_PTL_RETRIES`] times.
+    #[tracing::instrument(skip(self, provider, transcript))]
+    pub async fn compact(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &[Message],
+        step: usize,
+    ) -> Result<Message> {
+        let split = Self::safe_split_point(transcript, self.keep_recent_n);
+        let older = &transcript[..split];
+        let _recent = &transcript[split..];
+
+        // Retry loop: if the summarisation call itself exceeds the context
+        // window, drop oldest message groups and try again.
+        let mut to_summarize: Vec<Message> = older.to_vec();
+        let mut ptl_attempts = 0_usize;
+
+        let summary = loop {
+            match self.summarize(provider, &to_summarize, step).await {
+                Ok(text) => break text,
+                Err(e) if crate::error::is_context_window_exceeded(&e) => {
+                    ptl_attempts += 1;
+                    if ptl_attempts > MAX_PTL_RETRIES {
+                        return Err(e);
+                    }
+                    let target = retry::estimate_target_from_error(&e);
+                    match retry::truncate_head_for_retry(&to_summarize, target) {
+                        Some(truncated) => {
+                            tracing::info!(
+                                target: "recursive::compact",
+                                ptl_attempts,
+                                original_len = to_summarize.len(),
+                                truncated_len = truncated.len(),
+                                "compaction PTL retry: dropped oldest groups"
+                            );
+                            to_summarize = truncated;
+                        }
+                        None => {
+                            // Cannot truncate further — propagate the error.
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
             }
         };
 
@@ -1331,5 +1385,118 @@ mod tests {
         let (removed, _summary_chars) =
             result.expect("should compact when older has exactly 2 conversational msgs");
         assert!(removed > 0);
+    }
+
+    // ========================================================================
+    // Goal 337: PTL retry loop tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn compact_retries_on_ptl_then_succeeds() {
+        // First summarization call returns PTL error, second succeeds.
+        let provider = MockProvider::new(vec![Completion {
+            content: "Second attempt summary.".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }])
+        .with_errors(vec![crate::error::Error::Llm {
+            provider: "mock".into(),
+            message: "HTTP 400: context_length_exceeded, prompt is too long".into(),
+        }]);
+
+        let transcript = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+            Message::user("msg2".to_string()),
+            Message::assistant("rep2".to_string()),
+            Message::user("msg3".to_string()),
+            Message::assistant("rep3".to_string()),
+            Message::user("msg4".to_string()),
+            Message::assistant("rep4".to_string()),
+            Message::user("msg5".to_string()),
+            Message::assistant("rep5".to_string()),
+        ];
+
+        let compactor = Compactor::new(0).keep_recent_n(2);
+        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+
+        assert_eq!(summary_msg.role, crate::message::Role::System);
+        assert!(
+            summary_msg.content.contains("Second attempt summary."),
+            "should contain the retry's summary, got: {}",
+            summary_msg.content
+        );
+
+        // The provider should have been called twice (first error → retry).
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "provider must be called twice (first error, then retry)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_gives_up_after_max_retries() {
+        // Provider returns PTL error every time.
+        let mut errors = Vec::new();
+        for _ in 0..=MAX_PTL_RETRIES {
+            errors.push(crate::error::Error::Llm {
+                provider: "mock".into(),
+                message: "HTTP 400: context_length_exceeded, prompt is too long".into(),
+            });
+        }
+        // Add one more completion so total calls = MAX_PTL_RETRIES + 1.
+        // The loop tries once + 3 retries = 4 total calls, all errors.
+        let provider = MockProvider::new(vec![]).with_errors(errors);
+
+        let transcript = vec![
+            Message::system("sys".to_string()),
+            Message::user("long msg1".to_string()),
+            Message::assistant("long rep1".to_string()),
+            Message::user("long msg2".to_string()),
+            Message::assistant("long rep2".to_string()),
+        ];
+
+        let compactor = Compactor::new(0).keep_recent_n(1);
+        let result = compactor.compact(&provider, &transcript, 0).await;
+        assert!(
+            result.is_err(),
+            "should return error after exhausting retries"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("context_length_exceeded"),
+            "error should contain the PTL signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_non_ptl_error_propagates_immediately() {
+        // Non-PTL error — should NOT retry.
+        let provider = MockProvider::new(vec![]).with_errors(vec![crate::error::Error::Llm {
+            provider: "mock".into(),
+            message: "HTTP 400: invalid request".into(),
+        }]);
+
+        let transcript = vec![
+            Message::system("sys".to_string()),
+            Message::user("msg1".to_string()),
+            Message::assistant("rep1".to_string()),
+        ];
+
+        let compactor = Compactor::new(0).keep_recent_n(1);
+        let result = compactor.compact(&provider, &transcript, 0).await;
+        assert!(
+            result.is_err(),
+            "non-PTL error should propagate immediately"
+        );
+
+        // Provider should have been called only once (no retry).
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1, "non-PTL error must not trigger retry");
     }
 }

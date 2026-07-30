@@ -1630,35 +1630,7 @@ impl AgentRuntimeBuilder {
 // Context-window overflow detection
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Return `true` when `err` looks like an LLM context-window-exceeded error.
-///
-/// OpenAI-compatible providers (GLM, DeepSeek, …) return HTTP 400 whose body
-/// contains an error code or human-readable message indicating the prompt is
-/// too long. We match several common patterns across providers:
-///
-/// | Provider | Typical signal |
-/// |---|---|
-/// | OpenAI / NIM | `"context_length_exceeded"` (error `code`) |
-/// | OpenAI / NIM | `"maximum context length"` (human message) |
-/// | Some providers | `"context window"` |
-/// | DeepSeek | `"prompt is too long"` |
-/// | Some providers | `"tokens exceeds"` |
-///
-/// The function intentionally casts to lowercase before matching so it is
-/// resilient to capitalisation differences across providers.
-fn is_context_window_exceeded(err: &crate::error::Error) -> bool {
-    if let crate::error::Error::Llm { message, .. } = err {
-        let msg = message.to_lowercase();
-        msg.contains("context_length_exceeded")
-            || msg.contains("maximum context length")
-            || msg.contains("context window")
-            || msg.contains("prompt is too long")
-            || msg.contains("tokens exceeds")
-            || msg.contains("exceeds the model")
-    } else {
-        false
-    }
-}
+use crate::error::is_context_window_exceeded;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Tests

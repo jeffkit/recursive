@@ -131,6 +131,36 @@ impl Error {
     }
 }
 
+/// Return `true` when `err` looks like an LLM context-window-exceeded error.
+///
+/// OpenAI-compatible providers (GLM, DeepSeek, …) return HTTP 400 whose body
+/// contains an error code or human-readable message indicating the prompt is
+/// too long. We match several common patterns across providers:
+///
+/// | Provider | Typical signal |
+/// |---|---|
+/// | OpenAI / NIM | `"context_length_exceeded"` (error `code`) |
+/// | OpenAI / NIM | `"maximum context length"` (human message) |
+/// | Some providers | `"context window"` |
+/// | DeepSeek | `"prompt is too long"` |
+/// | Some providers | `"tokens exceeds"` |
+///
+/// The function intentionally casts to lowercase before matching so it is
+/// resilient to capitalisation differences across providers.
+pub fn is_context_window_exceeded(err: &Error) -> bool {
+    if let Error::Llm { message, .. } = err {
+        let msg = message.to_lowercase();
+        msg.contains("context_length_exceeded")
+            || msg.contains("maximum context length")
+            || msg.contains("context window")
+            || msg.contains("prompt is too long")
+            || msg.contains("tokens exceeds")
+            || msg.contains("exceeds the model")
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +422,62 @@ mod tests {
             message: "bad config".into()
         }
         .is_transient());
+    }
+
+    // ── is_context_window_exceeded ────────────────────────────────────
+
+    #[test]
+    fn context_overflow_matches_known_patterns() {
+        let cases = [
+            "HTTP 400: {\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}",
+            "HTTP 400: This model's maximum context length is 200000 tokens",
+            "HTTP 400: prompt is too long for the model",
+            "HTTP 400: tokens exceeds model limit",
+            "HTTP 400: exceeds the model context window",
+        ];
+        for msg in &cases {
+            let err = Error::Llm {
+                provider: "test".into(),
+                message: msg.to_string(),
+            };
+            assert!(
+                is_context_window_exceeded(&err),
+                "should detect context overflow in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_overflow_ignores_unrelated_errors() {
+        let cases = [
+            "HTTP 400: invalid request body",
+            "HTTP 401: unauthorized",
+            "HTTP 429: rate limit exceeded",
+            "network error: connection refused",
+        ];
+        for msg in &cases {
+            let err = Error::Llm {
+                provider: "test".into(),
+                message: msg.to_string(),
+            };
+            assert!(
+                !is_context_window_exceeded(&err),
+                "should NOT detect context overflow in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_overflow_ignores_non_llm_errors() {
+        assert!(!is_context_window_exceeded(&Error::Timeout {
+            duration_ms: 30_000
+        }));
+        let err = Error::Config {
+            message: "context_length_exceeded".into(),
+        };
+        assert!(
+            !is_context_window_exceeded(&err),
+            "Config errors must not be detected even if they contain the keyword"
+        );
     }
 }
