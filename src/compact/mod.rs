@@ -15,7 +15,7 @@ pub mod micro;
 pub mod reinject;
 
 pub use micro::{Microcompactor, MICROCOMPACT_PLACEHOLDER};
-pub use reinject::FileReinjector;
+pub use reinject::{build_skill_reinjector_from_env, FileReinjector, SkillReinjector};
 
 /// Stop attempting proactive compaction after this many consecutive
 /// failures. Emergency compaction (`compact_on_overflow`) is exempt —

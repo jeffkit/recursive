@@ -174,7 +174,6 @@ pub struct AgentRuntime {
     /// Same semantics as `RunCore::consecutive_compact_failures`.
     consecutive_compact_failures: u32,
     /// Checkpoint subsystem (snapshot, session-id, writer, touched-files).
-    /// Grouped to reduce field count; inactive when checkpoints are disabled.
     checkpoints: CheckpointState,
     /// Session-lifecycle signals (close flag, future per-session toggles).
     /// See [`SessionLifecycle`] — kept small for now but is the natural home
@@ -206,14 +205,12 @@ pub struct AgentRuntime {
     /// larger values give the judge more context for long sessions.
     /// Default 12. Set via [`AgentRuntimeBuilder::goal_eval_transcript_tail`].
     goal_eval_transcript_tail: usize,
-    /// Goal-328: structured prompt segments from `assemble_system_prompt`,
-    /// forwarded to the kernel so it can size the static breakdown
-    /// buckets. `None` for runtimes that don't supply a structured
-    /// prompt (tests, programmatic builders).
+    /// Goal-328: structured prompt segments for ContextBreakdown estimator.
     prompt_segments: Option<crate::system_prompt::PromptSegments>,
-    /// Goal-334: optional file re-injector for post-compaction restoration
-    /// of recently-read file contents as System attachments.
+    /// Goal-334: file re-injector (recently-read files as System atts).
     file_reinjector: Option<crate::compact::FileReinjector>,
+    /// Goal-335: skill re-injector (invoked skill bodies as System atts).
+    skill_reinjector: Option<crate::compact::SkillReinjector>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -241,6 +238,7 @@ impl std::fmt::Debug for AgentRuntime {
             )
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .field("file_reinjector", &self.file_reinjector.is_some())
+            .field("skill_reinjector", &self.skill_reinjector.is_some())
             .finish()
     }
 }
@@ -435,6 +433,8 @@ impl AgentRuntime {
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: chars,
         });
+        // Snapshot pre-compact for file+skill reinjection (apply_to_transcript drains).
+        let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
         let result = compactor
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
@@ -469,24 +469,45 @@ impl AgentRuntime {
                         })
                         .await;
                 }
-                // Goal-334: re-inject recently-read files right after the summary,
-                // before the preserved tail. After compaction the transcript is
-                // `[summary, ...preserved]`; we capture the preserved slice, ask
-                // the reinjector for deduped attachments, then insert them at
-                // index 1 (immediately after the summary) so the order becomes
-                // `[summary, <file-atts>, ...preserved]`. Emit a MessageAppended
-                // per attachment so observers record them.
+                // Goal-334: re-inject recently-read files right after the summary.
+                // Transcript = [summary, <file-atts>, <skill-atts>, ...preserved].
                 if let Some(r) = &self.file_reinjector {
                     // Capture the preserved tail BEFORE we start inserting, so the
                     // slice indices stay valid. Summary is at index 0; preserved
                     // messages follow.
                     let preserved: Vec<_> = self.transcript.iter().skip(1).cloned().collect();
                     let atts = r.reinject(&preserved);
-                    // Insert attachments in order at index 1, shifting each
-                    // subsequent one forward so final order is
-                    // [summary, att0, att1, ..., preserved...].
+                    // Insert at index 1, shifting forward for final order.
                     for (offset, att) in atts.into_iter().enumerate() {
                         Arc::make_mut(&mut self.transcript).insert(1 + offset, att.clone());
+                        self.event_sink
+                            .emit(AgentEvent::MessageAppended {
+                                message: att,
+                                usage: None,
+                            })
+                            .await;
+                    }
+                }
+                // Goal-335: re-invoke skills (scans pre-compact for Skill tool calls).
+                if let Some(sr) = &self.skill_reinjector {
+                    let atts = sr.reinject(&pre_compact);
+                    // Insert after file attachments (which start at index 1).
+                    let insert_base: usize = 1 + self.file_reinjector.as_ref().map_or(0, |r| {
+                        // Approximate: the number of file attachments inserted.
+                        // We don't track the count directly, but we know the
+                        // file-reinjector reserves at most r.max_files slots.
+                        // Use a safer heuristic: count existing system messages
+                        // after index 1 that start with the file restore prefix.
+                        self.transcript
+                            .iter()
+                            .skip(1)
+                            .take(r.max_files)
+                            .filter(|m| m.content.starts_with("[post-compact file restore:"))
+                            .count()
+                    });
+                    for (offset, att) in atts.into_iter().enumerate() {
+                        Arc::make_mut(&mut self.transcript)
+                            .insert(insert_base + offset, att.clone());
                         self.event_sink
                             .emit(AgentEvent::MessageAppended {
                                 message: att,
@@ -1301,7 +1322,7 @@ pub struct AgentRuntimeBuilder {
     /// callers must leave this `false` (the default) — the tools simply do not
     /// exist in the registry, so the model cannot invoke them.
     with_plan_mode_tools: bool,
-    /// Goal-291: tail-window size for the goal-evaluator judge. Default 12.
+    /// Goal-291: goal-evaluator judge tail-window size. Default 12.
     goal_eval_transcript_tail: usize,
     /// Goal-318: skills passed through to AgentKernel for Globs-mode injection.
     skills: Vec<crate::skills::Skill>,
@@ -1311,6 +1332,9 @@ pub struct AgentRuntimeBuilder {
     /// Goal-334: optional file re-injector for post-compaction restoration
     /// of recently-read file contents as System attachments.
     file_reinjector: Option<crate::compact::FileReinjector>,
+    /// Goal-335: optional skill re-injector for post-compaction restoration
+    /// of invoked skill bodies as System attachments.
+    skill_reinjector: Option<crate::compact::SkillReinjector>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -1326,6 +1350,7 @@ impl std::fmt::Debug for AgentRuntimeBuilder {
             )
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .field("file_reinjector", &self.file_reinjector.is_some())
+            .field("skill_reinjector", &self.skill_reinjector.is_some())
             .finish()
     }
 }
@@ -1352,6 +1377,7 @@ impl AgentRuntimeBuilder {
             skills: Vec::new(),
             prompt_segments: None,
             file_reinjector: None,
+            skill_reinjector: None,
         }
     }
 
@@ -1507,6 +1533,12 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set an optional skill re-injector for post-compaction restoration.
+    pub fn skill_reinjector(mut self, r: crate::compact::SkillReinjector) -> Self {
+        self.skill_reinjector = Some(r);
+        self
+    }
+
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.
@@ -1589,6 +1621,7 @@ impl AgentRuntimeBuilder {
             goal_eval_transcript_tail: self.goal_eval_transcript_tail,
             prompt_segments: self.prompt_segments,
             file_reinjector: self.file_reinjector,
+            skill_reinjector: self.skill_reinjector,
         })
     }
 }

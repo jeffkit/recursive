@@ -514,6 +514,10 @@ pub(crate) async fn build_runtime(
     if let Some(r) = recursive::build_file_reinjector_from_env(read_state.clone()) {
         builder = builder.file_reinjector(r);
     }
+    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
+    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
+        builder = builder.skill_reinjector(r);
+    }
     if hook_timing {
         use recursive::hooks::HookRegistry;
         let mut hooks = HookRegistry::new();

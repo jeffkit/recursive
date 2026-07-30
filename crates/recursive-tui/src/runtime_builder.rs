@@ -339,6 +339,18 @@ pub fn build_runtime() -> TuiRuntime {
             builder = builder.file_reinjector(r);
         }
     }
+    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
+    // skills was discovered above (discover_loaded_skills); clone it so the
+    // reinjector can look up bodies for skills the agent invoked pre-compaction.
+    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
+        builder = builder.skill_reinjector(r);
+    }
+    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
+    // skills was discovered above (discover_loaded_skills); clone it so the
+    // reinjector can look up bodies for skills the agent invoked pre-compaction.
+    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
+        builder = builder.skill_reinjector(r);
+    }
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
@@ -487,6 +499,18 @@ fn build_runtime_with_skill_tx(
         if let Some(r) = recursive::build_file_reinjector_from_env(rs) {
             builder = builder.file_reinjector(r);
         }
+    }
+    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
+    // skills was discovered above (discover_loaded_skills); clone it so the
+    // reinjector can look up bodies for skills the agent invoked pre-compaction.
+    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
+        builder = builder.skill_reinjector(r);
+    }
+    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
+    // skills was discovered above (discover_loaded_skills); clone it so the
+    // reinjector can look up bodies for skills the agent invoked pre-compaction.
+    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
+        builder = builder.skill_reinjector(r);
     }
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
@@ -1012,6 +1036,36 @@ type = "openai"
         assert!(
             recursive::build_file_reinjector_from_env(read_state).is_none(),
             "RECURSIVE_REINJECT_FILES=0 must disable the reinjector in TUI mode"
+        );
+    }
+
+    // ── Goal-335: skill reinjector wiring in build_runtime ───────────────
+    // Mirrors the file-reinjector tests above: the TUI wiring calls
+    // build_skill_reinjector_from_env(skills) right after the file reinjector.
+    // Pin that the env helper honours enabled/disabled so TUI mode parity holds.
+
+    #[test]
+    fn skill_reinjector_enabled_from_env_in_tui() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _g = EnvGuard::set("RECURSIVE_REINJECT_SKILLS", "0");
+        // disabled sentinel must yield None in TUI mode too.
+        assert!(
+            recursive::build_skill_reinjector_from_env(Vec::new()).is_none(),
+            "RECURSIVE_REINJECT_SKILLS=0 must disable the skill reinjector in TUI mode"
+        );
+    }
+
+    #[test]
+    fn skill_reinjector_default_when_unset_in_tui() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _g = EnvGuard::remove("RECURSIVE_REINJECT_SKILLS");
+        let r = recursive::build_skill_reinjector_from_env(Vec::new())
+            .expect("unset env must yield Some with defaults");
+        assert_eq!(
+            r.token_budget, 25_000,
+            "default skill-reinjector token budget must be 25_000"
         );
     }
 }
