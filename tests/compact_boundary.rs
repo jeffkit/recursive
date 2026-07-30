@@ -260,7 +260,7 @@ fn seed_runtime_for_boundary(
     let (sink, rx) = recursive::event::ChannelSink::new();
     let mut rt = AgentRuntime::builder()
         .llm(provider)
-        .compactor(Compactor::new(100))
+        .compactor(Compactor::new(100).keep_recent_n(1))
         .event_sink(Arc::new(sink))
         .build()
         .unwrap();
@@ -344,4 +344,178 @@ async fn compaction_boundary_cache_zero_when_no_usage() {
         found,
         "CompactionBoundary cache fields must be 0 when usage is default"
     );
+}
+
+// ── Goal 338: recompaction-in-chain telemetry ──────────────────────────
+//
+// The CompactionBoundary event carries three new fields:
+//   is_recompaction_in_chain, turns_since_previous_compact,
+//   previous_compact_turn.
+// These are populated from AgentRuntime::last_compact_turn and distinguish
+// first-in-session compaction from recompaction chains.
+
+/// Drive one compaction (via maybe_compact_cross_turn) and collect the
+/// emitted CompactionBoundary event from the receiver.
+async fn capture_compaction_boundary(
+    rt: &mut AgentRuntime,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<recursive::AgentEvent>,
+    usage: recursive::llm::TokenUsage,
+) -> Option<recursive::AgentEvent> {
+    while rx.try_recv().is_ok() {} // drain old events
+    rt.maybe_compact_cross_turn(&usage).await.unwrap();
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, recursive::AgentEvent::CompactionBoundary { .. }) {
+            return Some(ev);
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn first_compaction_is_not_recompaction() {
+    let (mut rt, mut rx) = seed_runtime_for_boundary(Arc::new(MockProvider::new(vec![
+        summary_completion(),
+        summary_completion(),
+    ])));
+
+    let ev = capture_compaction_boundary(&mut rt, &mut rx, recursive::llm::TokenUsage::default())
+        .await
+        .expect("first compaction must emit CompactionBoundary");
+
+    match ev {
+        recursive::AgentEvent::CompactionBoundary {
+            is_recompaction_in_chain,
+            turns_since_previous_compact,
+            previous_compact_turn,
+            ..
+        } => {
+            assert!(
+                !is_recompaction_in_chain,
+                "first compaction must NOT be a recompaction"
+            );
+            assert_eq!(
+                turns_since_previous_compact, 0,
+                "first compaction must have turns_since=0"
+            );
+            assert!(
+                previous_compact_turn.is_none(),
+                "first compaction must have previous_compact_turn=None"
+            );
+        }
+        other => panic!("expected CompactionBoundary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn recompaction_marks_chain_when_within_session() {
+    let (mut rt, mut rx) = seed_runtime_for_boundary(Arc::new(MockProvider::new(vec![
+        summary_completion(),
+        summary_completion(),
+    ])));
+
+    // First compaction — not a recompaction.
+    capture_compaction_boundary(&mut rt, &mut rx, recursive::llm::TokenUsage::default())
+        .await
+        .expect("first compact");
+
+    // Second compaction — reseed transcript past threshold.
+    let msgs: Vec<Message> = (0..16)
+        .map(|i| {
+            if i % 2 == 0 {
+                Message::user("x".repeat(40))
+            } else {
+                Message::assistant("y".repeat(40))
+            }
+        })
+        .collect();
+    rt.set_transcript(msgs);
+
+    let ev = capture_compaction_boundary(&mut rt, &mut rx, recursive::llm::TokenUsage::default())
+        .await
+        .expect("second compaction must emit CompactionBoundary");
+
+    match ev {
+        recursive::AgentEvent::CompactionBoundary {
+            is_recompaction_in_chain,
+            previous_compact_turn,
+            ..
+        } => {
+            assert!(
+                is_recompaction_in_chain,
+                "second compaction must be marked as recompaction"
+            );
+            assert_eq!(
+                previous_compact_turn,
+                Some(0),
+                "previous compact turn should match first compaction turn"
+            );
+        }
+        other => panic!("expected CompactionBoundary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn manual_then_auto_detected_as_chain() {
+    // Provider: 2 summary completions (one for compact_now, one for auto)
+    let summary = summary_completion();
+    let llm = Arc::new(MockProvider::new(vec![summary.clone(), summary.clone()]));
+    let (sink, mut rx) = recursive::event::ChannelSink::new();
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .compactor(Compactor::new(100).keep_recent_n(1))
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+
+    // Seed a transcript with enough messages for compact_now
+    // (keep_recent_n=1 means any 3+ messages get compacted).
+    let msgs: Vec<Message> = (0..8)
+        .map(|i| {
+            if i % 2 == 0 {
+                Message::user("x".repeat(40))
+            } else {
+                Message::assistant("y".repeat(40))
+            }
+        })
+        .collect();
+    rt.set_transcript(msgs.clone());
+
+    // Step 1: manual compact via compact_now
+    while rx.try_recv().is_ok() {}
+    rt.compact_now().await.unwrap();
+
+    // Step 2: reseed so cross-turn compaction will fire.
+    rt.set_transcript(msgs);
+    while rx.try_recv().is_ok() {}
+    rt.maybe_compact_cross_turn(&recursive::llm::TokenUsage::default())
+        .await
+        .unwrap();
+
+    // Find the CompactionBoundary from the auto-compact.
+    let mut auto_boundary: Option<recursive::AgentEvent> = None;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, recursive::AgentEvent::CompactionBoundary { .. }) {
+            auto_boundary = Some(ev);
+        }
+    }
+
+    let ev = auto_boundary.expect("auto-compact must emit CompactionBoundary");
+    match ev {
+        recursive::AgentEvent::CompactionBoundary {
+            is_recompaction_in_chain,
+            previous_compact_turn,
+            ..
+        } => {
+            assert!(
+                is_recompaction_in_chain,
+                "auto compact after manual compact must be a recompaction chain"
+            );
+            assert_eq!(
+                previous_compact_turn,
+                Some(0),
+                "previous_compact_turn should be the turn of the manual compact (turn 0)"
+            );
+        }
+        other => panic!("expected CompactionBoundary, got {other:?}"),
+    }
 }

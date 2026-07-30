@@ -185,12 +185,22 @@ pub enum AgentEvent {
     ///   the just-completed turn (g336). Zero when no usage was reported.
     /// `cache_miss_tokens` — tokens that missed the prompt cache on the
     ///   just-completed turn (g336). Zero when no usage was reported.
+    /// `is_recompaction_in_chain` — true when this is not the first compaction
+    ///   in the session (g338). Signals a recompaction chain — the compaction
+    ///   strategy may be failing for this session.
+    /// `turns_since_previous_compact` — how many turns elapsed since the
+    ///   previous compaction (g338). `0` when no previous compaction.
+    /// `previous_compact_turn` — the turn index of the previous compaction,
+    ///   or `None` on the first compaction (g338).
     CompactionBoundary {
         turn: u32,
         compacted_count: usize,
         summary_uuid: Option<String>,
         cache_hit_tokens: u32,
         cache_miss_tokens: u32,
+        is_recompaction_in_chain: bool,
+        turns_since_previous_compact: u32,
+        previous_compact_turn: Option<u32>,
     },
 
     /// Goal-167: emitted when the agent updates its task checklist via
@@ -653,6 +663,9 @@ mod tests {
                 summary_uuid: Some("abc-123".into()),
                 cache_hit_tokens: 42,
                 cache_miss_tokens: 158,
+                is_recompaction_in_chain: true,
+                turns_since_previous_compact: 3,
+                previous_compact_turn: Some(2),
             },
             AgentEvent::GoalSet {
                 condition: "all tests pass".into(),

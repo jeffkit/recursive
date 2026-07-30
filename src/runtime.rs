@@ -211,6 +211,10 @@ pub struct AgentRuntime {
     file_reinjector: Option<crate::compact::FileReinjector>,
     /// Goal-335: skill re-injector (invoked skill bodies as System atts).
     skill_reinjector: Option<crate::compact::SkillReinjector>,
+    /// Goal-338: turn index of the most recent compaction, used to detect
+    /// recompaction chains (compacting again within a few turns of the
+    /// previous compaction). `None` when no compaction has occurred yet.
+    last_compact_turn: Option<u32>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -459,8 +463,20 @@ impl AgentRuntime {
                         summary_uuid: None,
                         cache_hit_tokens: last_usage.cache_hit_tokens,
                         cache_miss_tokens: last_usage.cache_miss_tokens,
+                        is_recompaction_in_chain: self.last_compact_turn.is_some(),
+                        turns_since_previous_compact: match self.last_compact_turn {
+                            Some(prev) => {
+                                let current =
+                                    self.checkpoints.turn_index.load(Ordering::Relaxed) as u32;
+                                current.saturating_sub(prev)
+                            }
+                            None => 0,
+                        },
+                        previous_compact_turn: self.last_compact_turn,
                     })
                     .await;
+                self.last_compact_turn =
+                    Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
                 if let Some(summary) = self.transcript.first().cloned() {
                     self.event_sink
                         .emit(AgentEvent::MessageAppended {
@@ -579,8 +595,15 @@ impl AgentRuntime {
                 summary_uuid: None,
                 cache_hit_tokens: 0,
                 cache_miss_tokens: 0,
+                is_recompaction_in_chain: self.last_compact_turn.is_some(),
+                turns_since_previous_compact: match self.last_compact_turn {
+                    Some(prev) => (turn as u32).saturating_sub(prev),
+                    None => 0,
+                },
+                previous_compact_turn: self.last_compact_turn,
             })
             .await;
+        self.last_compact_turn = Some(turn as u32);
         if let Some(summary) = self.transcript.first().cloned() {
             self.event_sink
                 .emit(AgentEvent::MessageAppended {
@@ -949,7 +972,7 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        compactor
+        if compactor
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
@@ -957,7 +980,12 @@ impl AgentRuntime {
                     .turn_index
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
-            .await?;
+            .await?
+            .is_some()
+        {
+            self.last_compact_turn =
+                Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
+        }
         Ok(())
     }
 
@@ -1622,6 +1650,7 @@ impl AgentRuntimeBuilder {
             prompt_segments: self.prompt_segments,
             file_reinjector: self.file_reinjector,
             skill_reinjector: self.skill_reinjector,
+            last_compact_turn: None,
         })
     }
 }
