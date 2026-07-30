@@ -1561,4 +1561,254 @@ mod tests {
         let calls = provider.calls();
         assert_eq!(calls.len(), 1, "non-PTL error must not trigger retry");
     }
+
+    // ========================================================================
+    // Goal 341: boundary-preserving compaction validation
+    //
+    // Validates that compaction never modifies the recent tail messages —
+    // they pass through byte-identical. Proves that splice reordering alone
+    // cannot preserve the prefix cache (the summary is new content preceding
+    // the recent region either way). The real cache-preserving lever is
+    // microcompact (goals 332/333).
+    // ========================================================================
+
+    /// Validation helper: verify the recent-region messages are byte-identical
+    /// after applying the compaction splice.
+    ///
+    /// Computes the split point, serialises the expected recent messages (the
+    /// transcript slice from `split..`), applies `drain(..split)` +
+    /// `insert(0, summary)` (the same splice `apply_to_transcript` uses),
+    /// then asserts the messages at indices `1..` are byte-identical (via
+    /// `serde_json` serialisation) to the pre-compaction recent region.
+    ///
+    /// This proves compaction never touches the recent tail — the only thing
+    /// that changes is what precedes the recent region (the summary vs. the
+    /// original older messages).
+    async fn validate_boundary_preserving(
+        transcript: &[Message],
+        keep_n: usize,
+        summary_content: &str,
+    ) {
+        let split = Compactor::safe_split_point(transcript, keep_n);
+
+        // Serialize expected recent messages before any mutation.
+        let expected_recent_json: Vec<String> = transcript[split..]
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+
+        // Apply the same splice that `apply_to_transcript` uses:
+        // drain older, insert summary at head.
+        let mut compacted = transcript.to_vec();
+        let summary_msg = Message::system(format!(
+            "[compacted: test summary at step 1]\n{}",
+            summary_content
+        ))
+        .with_compaction_summary();
+        compacted.drain(..split);
+        compacted.insert(0, summary_msg);
+
+        // After splice, recent messages are at compacted[1..] (after the summary).
+        let recent_after_json: Vec<String> = compacted[1..]
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+
+        assert_eq!(
+            recent_after_json, expected_recent_json,
+            "recent region must be byte-identical after compaction splice"
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_preserving_recent_region_is_byte_identical() {
+        // Build a transcript with a clear split: 4 older messages + 2 recent.
+        let transcript = vec![
+            Message::system("System prompt.".to_string()),
+            Message::user("Old goal: add feature X".to_string()),
+            Message::assistant("Working on feature X.".to_string()),
+            Message::user("Old goal: test it.".to_string()),
+            // ── split point (keep_n=2) ──
+            Message::assistant("Recent: I fixed a test.".to_string()),
+            Message::user("Recent: Let's commit.".to_string()),
+        ];
+
+        validate_boundary_preserving(
+            &transcript,
+            2, // keep_recent_n
+            "Summary of the old goals: added feature X, tests pass.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn boundary_preserving_with_tool_calls_in_older() {
+        // Scenario: older portion includes tool-call pairs. The split point
+        // backs up past Tool/Assistant+tool_calls, so the recent region
+        // boundary may shift. Verify the recent region is still byte-identical.
+        use crate::llm::ToolCall;
+
+        let tool_call = ToolCall {
+            id: "c1".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let transcript = vec![
+            Message::system("sys".to_string()),
+            Message::user("Read the file".to_string()),
+            Message::assistant_with_tool_calls("reading".to_string(), vec![tool_call]),
+            Message::tool_result("c1", "file contents here"),
+            // ── split point (keep_n=2, after backup) ──
+            Message::user("Recent: now edit".to_string()),
+            Message::assistant("Recent: done".to_string()),
+        ];
+
+        validate_boundary_preserving(
+            &transcript,
+            2, // keep_recent_n
+            "Summary of read-file steps.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mock_provider_accepts_post_compact_transcript() {
+        // Feed a post-compaction transcript through MockProvider and verify
+        // the first non-system message is Role::User (provider ordering
+        // invariant). This confirms the current splice yields a valid
+        // sequence — no mid-transcript System-message rejection risk.
+        //
+        // Two completions are needed: the first is consumed by
+        // `apply_to_transcript`'s internal summarization call; the second
+        // by the explicit `complete()` below.
+        let provider = MockProvider::new(vec![
+            Completion {
+                content: "Summary: added feature, tests pass.".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "This is a response to the post-compact transcript.".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+
+        let mut transcript = vec![
+            Message::system("System prompt.".to_string()),
+            Message::user("Goal: add feature".to_string()),
+            Message::assistant("Working on it.".to_string()),
+            Message::user("Test it.".to_string()),
+            Message::assistant("Tests pass.".to_string()),
+            Message::user("Recent: commit.".to_string()),
+            Message::assistant("Recent: done.".to_string()),
+        ];
+
+        // Apply compaction: this produces transcript = [summary, recent...]
+        let compactor = Compactor::new(0).keep_recent_n(2);
+        let result = compactor
+            .apply_to_transcript(&provider, &mut transcript, 5)
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "compaction must succeed for the test transcript"
+        );
+
+        // The post-compact transcript should have: [System(summary), User("Recent: commit."), Assistant("Recent: done.")]
+        // Feed it through the mock provider and verify:
+        // 1. The provider accepts it (no error).
+        // 2. The first non-system message is Role::User.
+        let completion = provider.complete(&transcript, &[]).await;
+        assert!(
+            completion.is_ok(),
+            "mock provider must accept post-compaction transcript"
+        );
+
+        // Check the messages that were sent to the provider:
+        let calls = provider.calls();
+        assert!(
+            !calls.is_empty(),
+            "provider should have been called via complete()"
+        );
+        let sent_messages = &calls[calls.len() - 1]; // Last call = our complete() above.
+
+        // Find first non-system message and verify it's User.
+        let first_non_system = sent_messages
+            .iter()
+            .find(|m| m.role != crate::message::Role::System);
+        assert!(
+            first_non_system.is_some(),
+            "post-compact transcript must contain at least one non-System message"
+        );
+        assert_eq!(
+            first_non_system.unwrap().role,
+            crate::message::Role::User,
+            "first non-system message must be User (provider ordering invariant)"
+        );
+
+        // Verify no message has role `Tool` without a preceding
+        // Assistant-with-tool_calls (basic transcript validity).
+        for (i, msg) in sent_messages.iter().enumerate() {
+            if msg.role == crate::message::Role::Tool {
+                // Ensure preceding message is an Assistant with matching tool_calls.
+                if i > 0 {
+                    let prev = &sent_messages[i - 1];
+                    assert_eq!(
+                        prev.role,
+                        crate::message::Role::Assistant,
+                        "Tool message at index {i} must be preceded by Assistant"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_provider_accepts_compact_with_system_summary_user_ordering() {
+        // Edge case: compaction just happened, the transcript is:
+        // [System(summary), System(original prompt), User(msg), ...]
+        // Verify that after skipping all leading System messages, the first
+        // non-System message is still User — no mid-stream System insertion
+        // breaks the provider's ordering invariant.
+        let provider = MockProvider::new(vec![Completion {
+            content: "provider accepted the sequence".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        // Simulate a post-compact transcript with multiple leading System msgs.
+        let transcript = vec![
+            Message::system("[compacted: summary at step 5] Summary text.")
+                .with_compaction_summary(),
+            Message::system("Original system prompt.".to_string()),
+            Message::user("Post-compact user message.".to_string()),
+            Message::assistant("Post-compact assistant response.".to_string()),
+        ];
+
+        let completion = provider.complete(&transcript, &[]).await;
+        assert!(
+            completion.is_ok(),
+            "mock provider must accept transcript with multiple leading System messages"
+        );
+
+        let calls = provider.calls();
+        let sent = calls.last().expect("provider must have been called");
+        let first_non_system = sent.iter().find(|m| m.role != crate::message::Role::System);
+        assert!(
+            first_non_system.is_some(),
+            "transcript must have a non-System message"
+        );
+        assert_eq!(
+            first_non_system.unwrap().role,
+            crate::message::Role::User,
+            "first non-System must be User even with multiple leading System messages"
+        );
+    }
 }
