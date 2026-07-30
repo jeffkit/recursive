@@ -12,6 +12,7 @@
 //!   is skipped entirely.
 
 pub mod micro;
+pub mod prompt;
 pub mod reinject;
 pub mod retry;
 
@@ -398,18 +399,18 @@ impl Compactor {
         {
             Some(rendered) => Ok(rendered),
             None => {
-                // Fall back to free-text path
+                // Fall back to free-text path with structured 9-section template
                 let summary_prompt = format!(
-                    "Summarize the following conversation in ≤300 words. \
-                     Preserve: file paths modified, key technical decisions, test \
-                     outcomes, and any errors not yet resolved. Drop: file contents, \
-                     repeated tool errors, exploratory dead-ends.\n\n\
-                     Conversation to summarize:\n{older_text}"
+                    "{}\n\nConversation to summarize:\n{}",
+                    crate::compact::prompt::FREE_TEXT_COMPACT_PROMPT,
+                    older_text,
                 );
                 let completion = provider
                     .complete(&[Message::user(summary_prompt)], &[] as &[ToolSpec])
                     .await?;
-                Ok(completion.content)
+                Ok(crate::compact::prompt::format_compact_summary(
+                    &completion.content,
+                ))
             }
         }
     }
@@ -815,6 +816,65 @@ mod tests {
         assert!(summary_msg
             .content
             .contains("Fallback after invalid structured response."));
+    }
+
+    #[tokio::test]
+    async fn compact_freetext_fallback_uses_structured_prompt_and_formats() {
+        // MockProvider with no structured responses -> falls back to free-text path.
+        // The free-text fallback now uses the 9-section template and
+        // format_compact_summary post-processor. This test verifies that:
+        //   - The <analysis>...<analysis> block is stripped.
+        //   - The <summary>...</summary> is converted to "Summary:" header.
+        //   - The [compacted: header is still present from compact().
+        let provider = MockProvider::new(vec![Completion {
+            content: "<analysis>scratchpad thinking</analysis>\n\
+                       <summary>Added feature X. Tests pass.</summary>"
+                .to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+
+        let transcript = vec![
+            Message::user("Add feature X".to_string()),
+            Message::assistant("Working on it.".to_string()),
+            Message::user("Test it.".to_string()),
+            Message::assistant("Tests pass.".to_string()),
+        ];
+
+        let compactor = Compactor::new(100).keep_recent_n(2);
+        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+
+        assert_eq!(summary_msg.role, crate::message::Role::System);
+        // Must carry the [compacted: header from compact()
+        assert!(
+            summary_msg.content.contains("[compacted:"),
+            "compactor must include the [compacted: header, got: {}",
+            summary_msg.content
+        );
+        // The analysis block must have been stripped
+        assert!(
+            !summary_msg.content.contains("scratchpad thinking"),
+            "analysis scratchpad must be stripped"
+        );
+        // The summary tag must be converted to a "Summary:" header
+        assert!(
+            summary_msg.content.contains("Summary:"),
+            "summary must contain 'Summary:' header, got: {}",
+            summary_msg.content
+        );
+        // The actual summary content must be present
+        assert!(
+            summary_msg.content.contains("Added feature X"),
+            "summary content must be preserved, got: {}",
+            summary_msg.content
+        );
+        assert!(
+            summary_msg.content.contains("Tests pass."),
+            "summary content must be preserved, got: {}",
+            summary_msg.content
+        );
     }
 
     #[test]

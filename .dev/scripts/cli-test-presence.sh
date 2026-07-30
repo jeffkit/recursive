@@ -54,7 +54,7 @@ while IFS= read -r f; do
     git diff main...HEAD -- "$f" 2>/dev/null || true
     git diff -- "$f" 2>/dev/null || true
   } | grep -E '^\+' | grep -vE '^\+\+\+' || true )"
-  if echo "$added" | grep -qE '#\[test\]|#\[cfg\(test\)\]|mod tests'; then
+  if echo "$added" | grep -qE '#\[[a-z_:]*::test\]|#\[test\]|#\[cfg\(test\)\]|mod tests'; then
     echo "[cli-test-presence] found new test marker in $f" >&2
     has_test_change=1
   fi

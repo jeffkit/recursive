@@ -7,7 +7,7 @@
 #
 # "Test-bearing" means ANY of:
 #   - a new/changed file under `tests/` (integration / invariant tests)
-#   - a changed `src/**` file whose diff adds `#[test]`, `#[cfg(test)]`,
+#   - a changed `src/**` file whose diff adds `#[tokio::test]`, `#[test]`, `#[cfg(test)]`,
 #     or a `mod tests` block
 #
 # Excluded from the "src changed" trigger (same as agent-mutants.sh):
@@ -59,7 +59,7 @@ while IFS= read -r f; do
     git diff main...HEAD -- "$f" 2>/dev/null || true
     git diff -- "$f" 2>/dev/null || true
   } | grep -E '^\+' | grep -vE '^\+\+\+' || true )"
-  if echo "$added" | grep -qE '#\[test\]|#\[cfg\(test\)\]|mod tests'; then
+  if echo "$added" | grep -qE '#\[[a-z_:]*::test\]|#\[test\]|#\[cfg\(test\)\]|mod tests'; then
     echo "[agent-test-presence] found new test marker in $f" >&2
     has_test_change=1
   fi
