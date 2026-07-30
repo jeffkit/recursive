@@ -181,7 +181,7 @@ pub(crate) async fn cmd_resume(
     // same error string the legacy SessionFile path used.
     let meta = recursive::session::SessionReader::load_meta(&session_dir)
         .with_context(|| format!("reading .meta.json for session {}", session_dir.display()))?;
-    let tools = build_tools(&config).await;
+    let (tools, _) = build_tools(&config, None).await;
     let specs = tools.specs();
     let current_hash = recursive::session::hash_tool_specs(&specs);
     match &meta.tool_registry_hash {

@@ -27,11 +27,18 @@ use recursive::{
 };
 
 /// Build the tool registry, optionally registering MCP tools from a config file.
-pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
+///
+/// When `read_state` is `Some`, the given shared state is used instead of
+/// creating a new one. Returns both the registry and the read_state so
+/// callers can share it with a [`FileReinjector`](recursive::compact::FileReinjector).
+pub(crate) async fn build_tools(
+    config: &Config,
+    read_state: Option<Arc<Mutex<ReadFileState>>>,
+) -> (ToolRegistry, Arc<Mutex<ReadFileState>>) {
     let root = &config.workspace;
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
-    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
+    let read_state = read_state.unwrap_or_else(|| Arc::new(Mutex::new(ReadFileState::new())));
     // Sandbox expansion: extra read-write roots (CLI `--add-dir` +
     // `[sandbox] extra_dirs`) and read-only roots (`[sandbox]
     // extra_readonly_dirs`). Each structured fs tool receives these so the
@@ -165,7 +172,7 @@ pub(crate) async fn build_tools(config: &Config) -> ToolRegistry {
             .with_headless(config.headless)
             .with_hook_runner(hook_runner);
     }
-    registry
+    (registry, read_state)
 }
 
 /// Resolve the active tool-permission configuration.
@@ -360,7 +367,7 @@ pub(crate) async fn build_runtime(
             Arc::new(openai)
         }
     };
-    let mut tools = build_tools(config).await;
+    let (mut tools, read_state) = build_tools(config, None).await;
     let elicitation = recursive::mcp::new_elicitation_slot();
     tools = tools.with_elicitation_slot(elicitation.clone());
     register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation)).await;
@@ -503,6 +510,10 @@ pub(crate) async fn build_runtime(
     if let Some(mc) = microcompactor {
         builder = builder.microcompactor(mc);
     }
+    // Goal-334: file reinjector for post-compaction restoration of recently-read files.
+    if let Some(r) = recursive::build_file_reinjector_from_env(read_state.clone()) {
+        builder = builder.file_reinjector(r);
+    }
     if hook_timing {
         use recursive::hooks::HookRegistry;
         let mut hooks = HookRegistry::new();
@@ -516,4 +527,79 @@ pub(crate) async fn build_runtime(
         .with_plan_mode_tools(interactive)
         .build()
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            workspace: PathBuf::from("."),
+            api_base: "https://api.deepseek.com/v1".to_string(),
+            api_key: Some("sk-test".to_string()),
+            model: "deepseek-chat".to_string(),
+            provider_type: "openai".to_string(),
+            preset: None,
+            max_steps: 32,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
+            headless: true,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+            wall_timeout_secs: 0,
+        }
+    }
+
+    /// Goal-334: `build_tools` returns the shared `read_state` so `build_runtime`
+    /// can hand it to a `FileReinjector`. Pin two contracts:
+    ///   1. passing `None` creates a fresh state and the returned registry's
+    ///      `read_file_state()` points at the SAME arc (so the reinjector sees
+    ///      what Read just recorded);
+    ///   2. passing `Some(custom)` reuses that exact arc (no hidden copy).
+    #[tokio::test]
+    async fn build_tools_returns_shared_read_state_when_none() {
+        let cfg = test_config();
+        let (tools, read_state) = build_tools(&cfg, None).await;
+        let from_registry = tools
+            .read_file_state()
+            .expect("registry must expose the shared read_file_state");
+        // Same strong-counted arc → mutations through one are visible to the other.
+        assert!(
+            Arc::ptr_eq(&from_registry, &read_state),
+            "build_tools must share the SAME read_state arc between the registry and its return value"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_tools_reuses_supplied_read_state_when_some() {
+        let cfg = test_config();
+        let custom = Arc::new(Mutex::new(ReadFileState::new()));
+        let (_tools, read_state) = build_tools(&cfg, Some(custom.clone())).await;
+        assert!(
+            Arc::ptr_eq(&read_state, &custom),
+            "build_tools must reuse the caller-supplied read_state arc verbatim"
+        );
+    }
 }

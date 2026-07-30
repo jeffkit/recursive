@@ -70,7 +70,8 @@ pub use checkpoint_log::{
     read_log as read_checkpoint_log, truncate_to_turn as truncate_checkpoint_log,
     CheckpointLogWriter, CheckpointRecord, TouchedVia,
 };
-pub use compact::{Compactor, Microcompactor};
+pub use compact::reinject::build_file_reinjector_from_env;
+pub use compact::{Compactor, FileReinjector, Microcompactor};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};

@@ -83,6 +83,18 @@ impl ReadFileState {
     pub fn get(&self, path: &Path) -> Option<&ReadRecord> {
         self.records.get(path)
     }
+
+    /// Return up to `n` most-recently-recorded files, newest first, as
+    /// (path, content) pairs. Locks the mutex externally; this method takes
+    /// `&self` and reads `insertion_order`/`records` without mutating.
+    pub fn recent_files(&self, n: usize) -> Vec<(PathBuf, String)> {
+        self.insertion_order
+            .iter()
+            .rev()
+            .take(n)
+            .filter_map(|p| self.records.get(p).map(|r| (p.clone(), r.content.clone())))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

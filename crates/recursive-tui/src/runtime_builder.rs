@@ -312,6 +312,10 @@ pub fn build_runtime() -> TuiRuntime {
     );
     let prompt_segments = assembled.segments;
 
+    // Goal-334: extract the shared read_state BEFORE `tools` is moved into the
+    // builder, so we can construct a FileReinjector from it below.
+    let read_state = tools.read_file_state();
+
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
@@ -328,6 +332,12 @@ pub fn build_runtime() -> TuiRuntime {
     }
     if let Some(mc) = build_microcompactor() {
         builder = builder.microcompactor(mc);
+    }
+    // Goal-334: file reinjector for post-compaction restoration
+    if let Some(rs) = read_state {
+        if let Some(r) = recursive::build_file_reinjector_from_env(rs) {
+            builder = builder.file_reinjector(r);
+        }
     }
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
@@ -451,6 +461,10 @@ fn build_runtime_with_skill_tx(
     );
     let prompt_segments = assembled.segments;
 
+    // Goal-334: extract the shared read_state BEFORE `tools` is moved into the
+    // builder, so we can construct a FileReinjector from it below.
+    let read_state = tools.read_file_state();
+
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
@@ -467,6 +481,12 @@ fn build_runtime_with_skill_tx(
     }
     if let Some(mc) = build_microcompactor() {
         builder = builder.microcompactor(mc);
+    }
+    // Goal-334: file reinjector for post-compaction restoration
+    if let Some(rs) = read_state {
+        if let Some(r) = recursive::build_file_reinjector_from_env(rs) {
+            builder = builder.file_reinjector(r);
+        }
     }
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
@@ -945,6 +965,53 @@ type = "openai"
         assert!(
             names.contains(&"other-skill"),
             "expected other-skill (OS-native separator split) in {names:?}"
+        );
+    }
+
+    // ── Goal-334: file reinjector wiring in build_runtime ─────────────────
+    //
+    // The TUI's build_runtime extracts the shared read_state from the tool
+    // registry and constructs a FileReinjector from env. These tests pin the
+    // two load-bearing links of that wiring without spinning up a full
+    // TuiRuntime (which needs a live provider): (1) the standard tool set
+    // exposes a read_file_state the reinjector can share, and (2) the env
+    // helper honours the disabled sentinel so `RECURSIVE_REINJECT_FILES=0`
+    // yields no reinjector in TUI mode either.
+
+    #[test]
+    fn standard_tools_expose_read_file_state_for_reinjector() {
+        // The TUI wiring (`tools.read_file_state()` before the builder move)
+        // only attaches a reinjector when the registry actually carries a
+        // shared read state. Pin that build_standard_tools attaches one —
+        // if a future refactor stops sharing it, file reinjection silently
+        // becomes a no-op in TUI mode.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let tools = recursive::tools::build_standard_tools(std::path::Path::new("."), &[], 300);
+        let read_state = tools
+            .read_file_state()
+            .expect("standard tool set must expose a shared read_file_state");
+        // And the reinjector can be built from that state when enabled.
+        let _g = EnvGuard::set("RECURSIVE_REINJECT_FILES", "3");
+        let r = recursive::build_file_reinjector_from_env(read_state)
+            .expect("enabled env must yield a reinjector from the shared state");
+        assert_eq!(r.max_files, 3, "explicit count must propagate");
+    }
+
+    #[test]
+    fn reinjector_disabled_in_tui_when_env_zero() {
+        // `RECURSIVE_REINJECT_FILES=0` means opt-out everywhere; the TUI
+        // path must respect it too (build_file_reinjector_from_env → None).
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let tools = recursive::tools::build_standard_tools(std::path::Path::new("."), &[], 300);
+        let read_state = tools
+            .read_file_state()
+            .expect("standard tool set must expose a shared read_file_state");
+        let _g = EnvGuard::set("RECURSIVE_REINJECT_FILES", "0");
+        assert!(
+            recursive::build_file_reinjector_from_env(read_state).is_none(),
+            "RECURSIVE_REINJECT_FILES=0 must disable the reinjector in TUI mode"
         );
     }
 }

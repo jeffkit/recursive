@@ -211,6 +211,9 @@ pub struct AgentRuntime {
     /// buckets. `None` for runtimes that don't supply a structured
     /// prompt (tests, programmatic builders).
     prompt_segments: Option<crate::system_prompt::PromptSegments>,
+    /// Goal-334: optional file re-injector for post-compaction restoration
+    /// of recently-read file contents as System attachments.
+    file_reinjector: Option<crate::compact::FileReinjector>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -237,6 +240,7 @@ impl std::fmt::Debug for AgentRuntime {
                 &self.deferred_turn_finished.as_ref().map(|_| "<event>"),
             )
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
+            .field("file_reinjector", &self.file_reinjector.is_some())
             .finish()
     }
 }
@@ -457,6 +461,32 @@ impl AgentRuntime {
                             usage: None,
                         })
                         .await;
+                }
+                // Goal-334: re-inject recently-read files right after the summary,
+                // before the preserved tail. After compaction the transcript is
+                // `[summary, ...preserved]`; we capture the preserved slice, ask
+                // the reinjector for deduped attachments, then insert them at
+                // index 1 (immediately after the summary) so the order becomes
+                // `[summary, <file-atts>, ...preserved]`. Emit a MessageAppended
+                // per attachment so observers record them.
+                if let Some(r) = &self.file_reinjector {
+                    // Capture the preserved tail BEFORE we start inserting, so the
+                    // slice indices stay valid. Summary is at index 0; preserved
+                    // messages follow.
+                    let preserved: Vec<_> = self.transcript.iter().skip(1).cloned().collect();
+                    let atts = r.reinject(&preserved);
+                    // Insert attachments in order at index 1, shifting each
+                    // subsequent one forward so final order is
+                    // [summary, att0, att1, ..., preserved...].
+                    for (offset, att) in atts.into_iter().enumerate() {
+                        Arc::make_mut(&mut self.transcript).insert(1 + offset, att.clone());
+                        self.event_sink
+                            .emit(AgentEvent::MessageAppended {
+                                message: att,
+                                usage: None,
+                            })
+                            .await;
+                    }
                 }
             }
             Ok(None) => {
@@ -1268,6 +1298,9 @@ pub struct AgentRuntimeBuilder {
     /// Goal-328: structured prompt segments from `assemble_system_prompt`,
     /// forwarded to the kernel for the local `ContextBreakdown` estimator.
     prompt_segments: Option<crate::system_prompt::PromptSegments>,
+    /// Goal-334: optional file re-injector for post-compaction restoration
+    /// of recently-read file contents as System attachments.
+    file_reinjector: Option<crate::compact::FileReinjector>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -1282,6 +1315,7 @@ impl std::fmt::Debug for AgentRuntimeBuilder {
                 &self.saved_event_sink.as_ref().map(|_| "<EventSink>"),
             )
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
+            .field("file_reinjector", &self.file_reinjector.is_some())
             .finish()
     }
 }
@@ -1307,6 +1341,7 @@ impl AgentRuntimeBuilder {
             goal_eval_transcript_tail: 12,
             skills: Vec::new(),
             prompt_segments: None,
+            file_reinjector: None,
         }
     }
 
@@ -1455,6 +1490,13 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set an optional file re-injector for post-compaction restoration
+    /// of recently-read file contents as System attachments.
+    pub fn file_reinjector(mut self, r: crate::compact::FileReinjector) -> Self {
+        self.file_reinjector = Some(r);
+        self
+    }
+
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.
@@ -1536,6 +1578,7 @@ impl AgentRuntimeBuilder {
             session: SessionLifecycle::open(),
             goal_eval_transcript_tail: self.goal_eval_transcript_tail,
             prompt_segments: self.prompt_segments,
+            file_reinjector: self.file_reinjector,
         })
     }
 }

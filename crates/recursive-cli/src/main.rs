@@ -670,7 +670,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Tools => {
-            let tools = cli::builder::build_tools(&config).await;
+            let (tools, _) = cli::builder::build_tools(&config, None).await;
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
@@ -721,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
-            let tools = cli::builder::build_tools(&config).await;
+            let (tools, _) = cli::builder::build_tools(&config, None).await;
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
             let retry = RetryPolicy {
@@ -1886,7 +1886,7 @@ async fn run_loop(
 
     // Build tools with ScheduleWakeup registered; must happen before build_runtime
     // so the slot is shared between the tool and the runtime loop.
-    let mut tools = cli::builder::build_tools(&config).await;
+    let (mut tools, _) = cli::builder::build_tools(&config, None).await;
     let elicitation = recursive::mcp::new_elicitation_slot();
     tools = tools.with_elicitation_slot(elicitation.clone());
     cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation))
@@ -2530,7 +2530,7 @@ async fn repl(
 async fn run_mcp_server_stdio(config: Config, _mcp_config: Option<PathBuf>) -> anyhow::Result<()> {
     // Build the tool registry (local tools only — no MCP servers, since
     // we *are* the MCP server).
-    let tools = cli::builder::build_tools(&config).await;
+    let (tools, _) = cli::builder::build_tools(&config, None).await;
 
     // We don't need an LLM provider or agent for the stdio server mode.
     // The tools are called directly via dispatch_request.

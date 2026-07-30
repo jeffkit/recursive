@@ -12,8 +12,10 @@
 //!   is skipped entirely.
 
 pub mod micro;
+pub mod reinject;
 
 pub use micro::{Microcompactor, MICROCOMPACT_PLACEHOLDER};
+pub use reinject::FileReinjector;
 
 /// Stop attempting proactive compaction after this many consecutive
 /// failures. Emergency compaction (`compact_on_overflow`) is exempt —
