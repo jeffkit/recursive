@@ -320,8 +320,10 @@ impl AgentRuntime {
         // proportionally to the number of tool-use steps in the turn, causing
         // `should_compact` to fire prematurely on multi-step turns even when
         // the actual context usage is well below the threshold.
-        self.maybe_compact_cross_turn(turn_outcome.last_prompt_tokens)
-            .await?;
+        //
+        // Pass the full TokenUsage so cache_hit_tokens / cache_miss_tokens
+        // land on the CompactionBoundary event (g336).
+        self.maybe_compact_cross_turn(&turn_outcome.usage).await?;
 
         let outcome: RuntimeOutcome = turn_outcome.into();
 
@@ -382,12 +384,15 @@ impl AgentRuntime {
     /// on-disk jsonl. A `CompactionBoundary` event (g157) lets the reader skip
     /// pre-compaction messages on resume.
     ///
-    /// `last_prompt_tokens` is the actual prompt token count reported by the API
-    /// for the turn that just completed. When non-zero and
-    /// `compactor.threshold_prompt_tokens` is set, the token-based check takes
-    /// priority over the character estimate (more reliable for CJK content where
-    /// the 4-char/token assumption significantly underestimates token density).
-    async fn maybe_compact_cross_turn(&mut self, last_prompt_tokens: u32) -> Result<()> {
+    /// `last_usage` is the [`TokenUsage`] from the turn that just completed.
+    /// Its `prompt_tokens` field is the actual prompt token count reported by the
+    /// API — when non-zero and `compactor.threshold_prompt_tokens` is set, the
+    /// token-based check takes priority over the character estimate (more reliable
+    /// for CJK content where the 4-char/token assumption significantly
+    /// underestimates token density). The `cache_hit_tokens` /
+    /// `cache_miss_tokens` fields are forwarded to the emitted
+    /// `CompactionBoundary` event for cache-telemetry (g336).
+    pub async fn maybe_compact_cross_turn(&mut self, last_usage: &TokenUsage) -> Result<()> {
         // Goal 333: run microcompact before the LLM-summary check so that
         // count-based pruning of old tool results may drop the transcript
         // below the compaction threshold, skipping the expensive summary.
@@ -417,7 +422,7 @@ impl AgentRuntime {
         }
 
         let chars = Compactor::estimate_chars(&self.transcript);
-        if !compactor.should_compact(chars, last_prompt_tokens) {
+        if !compactor.should_compact(chars, last_usage.prompt_tokens) {
             return Ok(());
         }
         // Goal 345: only dispatch PreCompact when compaction will actually run,
@@ -452,6 +457,8 @@ impl AgentRuntime {
                         turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
                         compacted_count: removed,
                         summary_uuid: None,
+                        cache_hit_tokens: last_usage.cache_hit_tokens,
+                        cache_miss_tokens: last_usage.cache_miss_tokens,
                     })
                     .await;
                 if let Some(summary) = self.transcript.first().cloned() {
@@ -543,11 +550,14 @@ impl AgentRuntime {
             removed,
             summary_chars,
         });
+        // The turn failed before reporting usage, so cache metrics are 0.
         self.event_sink
             .emit(AgentEvent::CompactionBoundary {
                 turn: turn as u32,
                 compacted_count: removed,
                 summary_uuid: None,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
             })
             .await;
         if let Some(summary) = self.transcript.first().cloned() {
@@ -3290,7 +3300,9 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Call maybe_compact_cross_turn directly.
-        rt.maybe_compact_cross_turn(0).await.unwrap();
+        rt.maybe_compact_cross_turn(&TokenUsage::default())
+            .await
+            .unwrap();
 
         // Check for Microcompact event.
         let mut microcompact_fired = false;
@@ -3336,7 +3348,9 @@ mod tests {
 
         // Call maybe_compact_cross_turn — it has no microcompactor, so the
         // microcompact block is skipped.
-        rt.maybe_compact_cross_turn(0).await.unwrap();
+        rt.maybe_compact_cross_turn(&TokenUsage::default())
+            .await
+            .unwrap();
 
         let mut microcompact_fired = false;
         while let Ok(ev) = rx.try_recv() {

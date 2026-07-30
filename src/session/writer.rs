@@ -517,6 +517,7 @@ impl EventSink for SessionPersistenceSink {
                 turn,
                 compacted_count,
                 summary_uuid,
+                ..
             } => {
                 // g157: write a compact_boundary system entry so resume can
                 // skip the pre-compaction messages.

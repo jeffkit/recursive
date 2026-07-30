@@ -241,3 +241,107 @@ fn no_boundary_loads_all_messages() {
         "all 3 messages should load when no boundary is present"
     );
 }
+
+// ── Goal 336: cache telemetry on the CompactionBoundary event ─────────
+//
+// The cross-turn compaction path must forward the just-completed turn's
+// cache_hit_tokens / cache_miss_tokens onto the emitted CompactionBoundary
+// event, so the journal/TUI/HTTP sink can record the pre-compact cache state
+// (the data that decides whether goal 341's cache-preserving work pays off).
+// These call AgentRuntime::maybe_compact_cross_turn directly with a transcript
+// seeded past the 100-char threshold so compaction always fires.
+
+fn seed_runtime_for_boundary(
+    provider: Arc<MockProvider>,
+) -> (
+    AgentRuntime,
+    tokio::sync::mpsc::UnboundedReceiver<recursive::AgentEvent>,
+) {
+    let (sink, rx) = recursive::event::ChannelSink::new();
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .compactor(Compactor::new(100))
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    // 8 user/assistant pairs, 40 chars each → ~640 chars, well over the 100 threshold.
+    let msgs: Vec<Message> = (0..16)
+        .map(|i| {
+            if i % 2 == 0 {
+                Message::user("x".repeat(40))
+            } else {
+                Message::assistant("y".repeat(40))
+            }
+        })
+        .collect();
+    rt.set_transcript(msgs);
+    (rt, rx)
+}
+
+fn summary_completion() -> recursive::llm::Completion {
+    recursive::llm::Completion {
+        content: "summary".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+#[tokio::test]
+async fn compaction_boundary_emits_cache_metrics() {
+    let (mut rt, mut rx) =
+        seed_runtime_for_boundary(Arc::new(MockProvider::new(vec![summary_completion()])));
+    while rx.try_recv().is_ok() {}
+    rt.maybe_compact_cross_turn(&recursive::TokenUsage {
+        cache_hit_tokens: 30,
+        cache_miss_tokens: 70,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut found = false;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(
+            ev,
+            recursive::AgentEvent::CompactionBoundary {
+                cache_hit_tokens: 30,
+                cache_miss_tokens: 70,
+                ..
+            }
+        ) {
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "CompactionBoundary must carry the turn's cache_hit/miss_tokens"
+    );
+}
+
+#[tokio::test]
+async fn compaction_boundary_cache_zero_when_no_usage() {
+    let (mut rt, mut rx) =
+        seed_runtime_for_boundary(Arc::new(MockProvider::new(vec![summary_completion()])));
+    while rx.try_recv().is_ok() {}
+    rt.maybe_compact_cross_turn(&recursive::TokenUsage::default())
+        .await
+        .unwrap();
+    let mut found = false;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(
+            ev,
+            recursive::AgentEvent::CompactionBoundary {
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
+                ..
+            }
+        ) {
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "CompactionBoundary cache fields must be 0 when usage is default"
+    );
+}

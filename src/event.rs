@@ -181,10 +181,16 @@ pub enum AgentEvent {
     /// `turn` — the turn index when compaction occurred.
     /// `compacted_count` — how many messages were removed.
     /// `summary_uuid` — UUID of the compaction summary message that replaced them.
+    /// `cache_hit_tokens` — tokens served from the provider's prompt cache on
+    ///   the just-completed turn (g336). Zero when no usage was reported.
+    /// `cache_miss_tokens` — tokens that missed the prompt cache on the
+    ///   just-completed turn (g336). Zero when no usage was reported.
     CompactionBoundary {
         turn: u32,
         compacted_count: usize,
         summary_uuid: Option<String>,
+        cache_hit_tokens: u32,
+        cache_miss_tokens: u32,
     },
 
     /// Goal-167: emitted when the agent updates its task checklist via
@@ -645,6 +651,8 @@ mod tests {
                 turn: 5,
                 compacted_count: 10,
                 summary_uuid: Some("abc-123".into()),
+                cache_hit_tokens: 42,
+                cache_miss_tokens: 158,
             },
             AgentEvent::GoalSet {
                 condition: "all tests pass".into(),
