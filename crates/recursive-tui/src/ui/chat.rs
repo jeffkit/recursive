@@ -90,6 +90,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // syntax colours we must not fight with a hard-coded background.
         if let Some((s, e)) = app.selection {
             use ratatui::style::Modifier;
+            // Selection is stored as (anchor, cursor); normalise so the
+            // highlight spans the inclusive range in either drag direction.
+            let (s, e) = (s.min(e), s.max(e));
             let lo = s.min(window.len());
             let hi = (e + 1).min(window.len());
             for line in &mut window[lo..hi] {

@@ -278,7 +278,10 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
 /// a single button: `Down(Left)` starts a selection at the clicked row,
 /// `Drag(Left)` extends it (only when a selection is already active, so a
 /// stray drag from another button is ignored), and `Up(Left)` copies the
-/// selected rows to the clipboard and clears the highlight.
+/// selected rows to the clipboard and clears the highlight. The selection
+/// is stored as `(anchor, cursor)` — the press row stays fixed as the
+/// anchor while the pointer row moves — and every consumer normalises the
+/// pair with min/max so upward and downward drags behave identically.
 fn handle_mouse(app: &mut App, ev: MouseEvent) {
     match ev.kind {
         MouseEventKind::ScrollUp => {
@@ -293,15 +296,32 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
             // Begin a selection at the clicked visible row. The messages
             // panel is the top layout chunk, so the terminal row equals the
             // visible-window row index.
+            //
+            // The tuple is `(anchor, cursor)`:
+            //   - `anchor` is the row where the press happened and stays
+            //     fixed for the whole drag;
+            //   - `cursor` follows the pointer.
+            // Consumers normalise with min/max, so dragging downward
+            // (cursor > anchor) and upward (cursor < anchor) both select
+            // the same inclusive [min, max] range.
             app.selection = Some((ev.row as usize, ev.row as usize));
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            // Extend the selection to the dragged-to row. Only extends an
+            // Extend the selection to the dragged-to row: keep the anchor
+            // (first element) fixed, move only the cursor. Only extends an
             // existing selection; a drag without a prior Down (e.g. another
             // button held) is ignored.
-            if let Some((start, _)) = app.selection {
-                let end = ev.row as usize;
-                app.selection = Some((start.min(end), start.max(end)));
+            //
+            // The original Goal-349 code re-derived the anchor from the
+            // current range (`start.min(end)` on the stored pair), which
+            // worked for downward drags only: after the first upward drag
+            // the stored pair became (cursor, anchor), so the "anchor" read
+            // back was the previous cursor row and each further drag dropped
+            // the rows between the click point and the previous cursor
+            // position — the highlight collapsed to a single row that
+            // followed the pointer.
+            if let Some((anchor, _)) = app.selection {
+                app.selection = Some((anchor, ev.row as usize));
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -322,6 +342,9 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
 /// rendered width — the same rows the render path paints — so the copied
 /// text always matches the selection highlight.
 fn copy_visible_rows(app: &mut App, start: usize, end: usize) {
+    // `selection` is stored as (anchor, cursor), so after an upward drag
+    // cursor < anchor; normalise to the inclusive row range.
+    let (start, end) = (start.min(end), start.max(end));
     let rows = crate::ui::chat::visible_physical_rows(app, app.last_render_width);
     let lo = start.min(rows.len());
     let hi = (end + 1).min(rows.len());
@@ -456,6 +479,70 @@ mod tests {
     /// existing style already sets a background.
     fn row_has_reversed(screen: &Screen, y: u16) -> bool {
         (0..screen.width()).any(|x| screen.style(x, y).add_modifier.contains(Modifier::REVERSED))
+    }
+
+    #[test]
+    fn mouse_upward_drag_keeps_anchor_and_selects_full_range() {
+        // Regression for the upward-drag collapse: dragging from a bottom
+        // row up must keep the press row as the fixed anchor. The original
+        // Goal-349 code re-derived the anchor from the already-normalised
+        // range, so after the first upward drag the anchor became the
+        // previous cursor row and each further drag dropped the rows
+        // between the click point and the previous cursor position — the
+        // highlight collapsed to a single row following the pointer.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "m0\n\nm1\n\nm2\n\nm3\n\nm4".into(),
+        });
+        // The assistant block renders as rows 0..=4: "•  m0", "  m1", …
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 4),
+        );
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 2),
+        );
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 1),
+        );
+        // Stored as (anchor, cursor): the anchor stays at the press row.
+        assert_eq!(
+            h.app().selection,
+            Some((4, 1)),
+            "anchor row must stay at the press row (4), cursor at 1"
+        );
+
+        let screen = h.render();
+        for y in 1..=4 {
+            assert!(
+                row_has_reversed(&screen, y),
+                "row {y} should be REVERSED after upward drag\n{}",
+                screen.numbered()
+            );
+        }
+        assert!(
+            !row_has_reversed(&screen, 0),
+            "row 0 must not be reversed\n{}",
+            screen.numbered()
+        );
+
+        // Release copies the full anchor→cursor range, not just the last
+        // dragged row.
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 1),
+        );
+        assert!(
+            h.app().selection.is_none(),
+            "selection must clear after a copy on release"
+        );
+        assert_eq!(
+            h.app().last_copied.as_deref(),
+            Some("  m1\n  m2\n  m3\n  m4"),
+            "release after upward drag must copy rows 1..=4"
+        );
     }
 
     #[test]

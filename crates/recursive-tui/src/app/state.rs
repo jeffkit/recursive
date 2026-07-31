@@ -35,6 +35,7 @@ impl App {
             scroll_offset: 0,
             selection: None,
             last_copied: None,
+            copy_notice: None,
             // Matches the harness default terminal size; real values are
             // recorded by `ui::chat::render` before any copy path runs.
             last_render_width: 80,
@@ -144,6 +145,10 @@ impl App {
         if let Ok(mut cb) = arboard::Clipboard::new() {
             let _ = cb.set_text(text.clone());
         }
+        // Goal-349 follow-up: stamp the status-bar notice so a release-copy
+        // (which needs no extra key) gives the user visible feedback
+        // instead of silently succeeding.
+        self.copy_notice = Some((text.chars().count(), std::time::Instant::now()));
         self.last_copied = Some(text);
     }
 
@@ -635,6 +640,24 @@ mod tests {
             app.last_copied.as_deref(),
             Some("selected rows"),
             "copy_text must always populate last_copied"
+        );
+    }
+
+    // ── Goal-349 follow-up: copy notice char count ─────────────────────
+
+    #[test]
+    fn copy_text_records_char_count_for_notice() {
+        // The status-bar notice reports how many characters were copied;
+        // the count is the number of chars (not bytes), so multi-byte
+        // text counts per display character.
+        let mut app = App::new();
+        app.copy_text("héllo 你好".into());
+        assert_eq!(app.last_copied.as_deref(), Some("héllo 你好"));
+        // h-é-l-l-o + space + 你 + 好 = 8 chars (13 bytes).
+        assert_eq!(
+            app.copy_notice.map(|(n, _)| n),
+            Some(8),
+            "notice must count characters, not bytes"
         );
     }
 }
