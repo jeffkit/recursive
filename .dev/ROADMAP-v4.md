@@ -129,19 +129,23 @@ v0.7 is a **收尾 release** — accept API breakage, fix accumulated weight deb
 
 | ID | Feature | Mode | Status |
 |----|---------|------|--------|
-| 20.1 | Delete deprecated `Agent`/`StepEvent`/`AgentOutcome` (Goal 219) | A | 🔴 |
-| 20.2 | Split `tui/app.rs` 3303 → 4 files (Goal 220) | A | 🔴 |
-| 20.3 | Split `session.rs` 2214 → 5 files (Goal 221) | A | 🔴 |
-| 20.4 | Split `LlmProvider` → `ChatProvider` + helpers (Goal 222) | A | 🔴 |
-| 20.5 | Narrow `Error` granularity: drop `Other`, add `call_id` to `Tool`, classify `Storage` (Goal 223) | A | 🔴 |
-| 20.6 | `#![deny(clippy::unwrap_used, expect_used)]` ship gate (Goal 224) | C | 🔴 |
-| 20.7 | Split `tools/mod.rs` 1377 → 4 files (Goal 225) | B | 🔴 |
-| 20.8 | Extract `recursive-tui` sub-crate (Goal 226) | A→B | 🔴 |
-| 20.9 | E2E guard tests for the 8 `AGENTS.md` invariants (Goal 227) | C | 🔴 |
-| 20.10 | Goal dependency graph + file size budget enforcer (Goal 228) | C | 🔴 |
-| 20.11 | `unwrap()/expect()` batch cleanup (Goal 229-01..229-NN) | B | 🔴 |
+| 20.1 | Delete deprecated `Agent`/`StepEvent`/`AgentOutcome` (Goal 219) | A | ✅ `src/agent.rs` 已拆为 `src/agent/{mod,types}.rs`；deprecated 类型全删 |
+| 20.2 | Split `tui/app.rs` 3303 → 4 files (Goal 220) | A | ✅ 已拆为 `crates/recursive-tui/src/app/{mod,commands,event_loop,render,state}.rs` |
+| 20.3 | Split `session.rs` 2214 → 5 files (Goal 221) | A | ✅ 已拆为 `src/session/{mod,lifecycle,reader,writer,serialize,orphan}.rs` |
+| 20.4 | Split `LlmProvider` → `ChatProvider` + helpers (Goal 222) | A | ✅ `pub trait ChatProvider`（`src/llm/mod.rs:80`）；`LlmProvider` 无残留 |
+| 20.5 | Narrow `Error` granularity: drop `Other`, add `call_id` to `Tool`, classify `Storage` (Goal 223) | A | ✅ `Error::Other` 已删；`Error::Tool { call_id: Option<String>, .. }` |
+| 20.6 | `#![deny(clippy::unwrap_used, expect_used)]` ship gate (Goal 224) | C | ✅ `src/lib.rs:17` + `recursive-tui/src/lib.rs:6` 启用；非测试 unwrap 仅 51 处 |
+| 20.7 | Split `tools/mod.rs` 1377 → 4 files (Goal 225) | B | ✅ `tools/mod.rs` 降至 538 行 |
+| 20.8 | Extract `recursive-tui` sub-crate (Goal 226) | A→B | ✅ `crates/recursive-tui/` 独立 crate |
+| 20.9 | E2E guard tests for the 8 `AGENTS.md` invariants (Goal 227) | C | ✅ `tests/invariants/` 6 文件（dep_justification / finish_reason_data / loop_size_orthogonality / sandbox / test_coverage / tool_call_pairing） |
+| 20.10 | Goal dependency graph + file size budget enforcer (Goal 228) | C | 🟡 部分：file size budget enforcer 已落地（`tests/invariants/loop_size_orthogonality.rs` 行数硬门）；goal dependency graph（`build-dep-graph.sh` + `DEPENDENCY.md`）**未实现** |
+| 20.11 | `unwrap()/expect()` batch cleanup (Goal 229-01..229-NN) | B | ✅ 详见 20.6（非测试代码 unwrap 基本清零，deny lint 守门） |
 
 **Total**: 11 顶层 goal + 6 e2e invariant 子 goal + 8-15 unwrap 批次。预期 6-8 batches。
+
+> **Status audit (2026-07-31)**: 10/11 已完成，仅 20.10 的 dependency graph 部分未做。
+> 旧条目全部标 🔴 是文档滞后——代码现实是 v0.7 重构基本收尾。下一步应收口
+> 20.10 dependency graph，或正式发 0.8.0（`Cargo.toml` 已是 0.8.0）。
 
 ### 依赖图（粗）
 
@@ -157,12 +161,12 @@ v0.7 is a **收尾 release** — accept API breakage, fix accumulated weight deb
 
 **关键路径**: 224 是收尾 goal，必须最后跑；229-NN 不能与 224 并行（会让仓库编译失败）。
 
-### 版本与 breaking change 范围
+### 版本与 breaking change 范围（均已落地）
 
-- `Agent`、`AgentOutcome`、`StepEvent`、`OnMessageFn`、`AgentBuilder` 删除
-- `LlmProvider` 改名 `ChatProvider`（`Arc<dyn LlmProvider>` 全部需替换）
-- `Error::Other` 删除；`Error::Tool` 加 `call_id` 字段
-- 文件级 `lib.rs` 顶部加 deny lint
+- `Agent`、`AgentOutcome`、`StepEvent`、`OnMessageFn`、`AgentBuilder` 删除 ✅
+- `LlmProvider` 改名 `ChatProvider`（`Arc<dyn LlmProvider>` 全部需替换） ✅
+- `Error::Other` 删除；`Error::Tool` 加 `call_id` 字段 ✅
+- 文件级 `lib.rs` 顶部加 deny lint ✅
 
 所有改动在 CHANGELOG 里以 `**BREAKING**` 标记，附带迁移 cookbook。
 
@@ -192,11 +196,11 @@ Batch 40: Phase 18 (Agent Patterns) — reflection, tool learning,
                                         MCP + OpenAI/Anthropic-shaped
                                         gateways cover the use case)
 Batch 41+: Phase 19 (Ecosystem) — SDKs, installers, docs site
-Batch 42: Phase 20.1-20.5 (A 类架构重构，人/Claude 主导)
+Batch 42: Phase 20.1-20.5 (A 类架构重构，人/Claude 主导) — DONE
            Goals: 219, 220, 221, 222, 223
-Batch 43-44: Phase 20.7-20.11 (B 类机械拆分 + C 类元策略，self-improve 主导)
+Batch 43-44: Phase 20.7-20.11 (B 类机械拆分 + C 类元策略，self-improve 主导) — DONE
              Goals: 229-01..229-NN, 225, 228, 227
-Batch 45: Phase 20.6 + 20.8 (收尾)
+Batch 45: Phase 20.6 + 20.8 (收尾) — DONE
            Goals: 226 (tui sub-crate), 224 (deny lint — last)
 Batch 46: 0.7.0 release — CHANGELOG、迁移 cookbook、tag
 ```

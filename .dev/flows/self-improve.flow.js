@@ -770,9 +770,17 @@ async function main() {
   // 用 -p recursive-cli 显式构建执行器二进制及其依赖。
   await cp.step('preflight.build', () => {
     console.log('  [preflight.build] cargo build --release -p recursive-cli ...')
-    execFileSync('cargo', ['build', '--release', '-p', 'recursive-cli'], { cwd: repo, stdio: 'inherit' })
+    execFileSync('cargo', ['build', '--release', '-p recursive-cli'], { cwd: repo, stdio: 'inherit' })
     console.log('  [preflight.build] ✓ done')
   })
+
+  // ── 预检：baseline 本身必须绿 ──────────────────────────────────
+  // main HEAD 若是红的（之前某个无关 commit 留下的测试失败），worktree 里的
+  // gate.test 也会因同样的失败红灯，而 resume-fix 会把 agent 拖去修与当前 goal
+  // 无关的预存债务（2026-07-31 事故：runtime.rs 4044 行触发 invariant #1，Goal 349
+  // 的 SSH agent 被迫去做 runtime.rs 拆分）。这里在创建 worktree 前 fail-fast，
+  // 给出失败的测试名，让人先修 main。opt-out: RECURSIVE_BASELINE_TEST_GATE=0。
+  await cp.step('preflight.baseline-tests', () => assertBaselineTestsGreen(repo))
 
   // ── 创建隔离 worktree（agent 只在 worktree 内改动，main checkout 保持干净）─
   const worktreeDir = join(repo, '.worktrees', runId)
@@ -1848,6 +1856,57 @@ async function assertGatePrereqs(repoPath) {
       'Install it once (`cargo install cargo-mutants`) before running self-improve — ' +
       'otherwise the tui/agent/cli mutant gates exit 2 and waste resume-fix rounds ' +
       'trying (and usually failing) to install it inside the sandboxed worktree.'
+    )
+  }
+}
+
+/**
+ * Preflight: the baseline (main HEAD) itself must be green.
+ *
+ * Why this exists: without it, a red main (pre-existing test failure from an
+ * earlier, unrelated commit) makes `gate.test` fail inside the worktree for
+ * reasons the current goal did NOT cause. The resume-fix loop then drags the
+ * agent off-goal to fix the pre-existing debt (observed 2026-07-31: runtime.rs
+ * at 4044 lines tripped invariant #1's 3700 limit; the Goal 349 SSH agent was
+ * pulled into a runtime.rs refactor instead of its SSH scope). This preflight
+ * fails fast, BEFORE the worktree is created, with the failing test names so
+ * the human fixes main first.
+ *
+ * Runs `cargo test --quiet --workspace` on the main checkout (which is
+ * guaranteed clean by captureBaseline's requireClean). The release build from
+ * preflight.build is reused for the lib/bin artifacts, so this only pays the
+ * test-compile + run cost.
+ *
+ * Opt out with RECURSIVE_BASELINE_TEST_GATE=0 (e.g. when intentionally running
+ * on a known-red main to fix it as the goal itself).
+ */
+async function assertBaselineTestsGreen(repoPath) {
+  if (process.env.RECURSIVE_BASELINE_TEST_GATE === '0') {
+    console.log('  [baseline-tests] skipped (RECURSIVE_BASELINE_TEST_GATE=0)')
+    return
+  }
+  console.log('  [baseline-tests] cargo test --quiet --workspace on main HEAD ...')
+  try {
+    execFileSync('cargo', ['test', '--quiet', '--workspace'],
+      { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000 })
+    console.log('  [baseline-tests] ✓ baseline green')
+  } catch (e) {
+    // Pull the failing test names out of cargo's output so the error is
+    // actionable, not just "test failed". cargo prints failures under a
+    // `failures:` header.
+    const out = `${(e.stdout ?? '')}\n${(e.stderr ?? '')}`
+    const failures = out.split('\n')
+      .filter(l => /^test .* \.\.\. FAILED/.test(l.trim()))
+      .map(l => '  ' + l.trim().replace(' ... FAILED', ''))
+    const hint = failures.length
+      ? `Failing tests on main HEAD (fix these on main FIRST, this goal is not responsible):\n${failures.join('\n')}`
+      : 'cargo test failed on main HEAD (no individual test names parsed — see output).'
+    throw new Error(
+      `baseline-tests: main HEAD is RED — refusing to run the agent on a broken baseline.\n` +
+      `${hint}\n\n` +
+      `  The self-improve gate.test would fail for reasons your goal did not cause,\n` +
+      `  and resume-fix would drag the agent off-goal. Fix main first, then re-run.\n` +
+      `  (To bypass — e.g. when fixing main IS the goal — set RECURSIVE_BASELINE_TEST_GATE=0.)`
     )
   }
 }
