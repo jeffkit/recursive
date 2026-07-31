@@ -770,19 +770,7 @@ async function main() {
   // 用 -p recursive-cli 显式构建执行器二进制及其依赖。
   await cp.step('preflight.build', () => {
     console.log('  [preflight.build] cargo build --release -p recursive-cli ...')
-    // ZCODE-DIAG: dump env to find why cargo sees " recursive-cli"
-    const envDump = Object.entries(process.env)
-      .filter(([k]) => /CARGO|RUST|PATH/.test(k))
-      .map(([k, v]) => `${k}=${v}`)
-    writeFileSync('/tmp/flow-env-dump.txt', envDump.join('\n') + '\n---CWD---\n' + process.cwd() + '\n---REPO---\n' + repo + '\n')
-    console.log('  [preflight.build][DIAG] env dumped; PATH=' + (process.env.PATH || '').split(':').slice(0, 4).join('|') + '...')
-    // run cargo with stderr captured so we see the EXACT invocation cargo receives
-    try {
-      execFileSync('cargo', ['build', '--release', '-p', 'recursive-cli'], { cwd: repo, stdio: 'inherit' })
-    } catch (e) {
-      writeFileSync('/tmp/flow-build-err.txt', 'status=' + e.status + '\nsignal=' + e.signal + '\nstdout=' + JSON.stringify(e.stdout) + '\nstderr=' + JSON.stringify(e.stderr) + '\n')
-      throw e
-    }
+    execFileSync('cargo', ['build', '--release', '-p recursive-cli'], { cwd: repo, stdio: 'inherit' })
     console.log('  [preflight.build] ✓ done')
   })
 
