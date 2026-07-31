@@ -33,6 +33,12 @@ impl App {
             connected: false,
             offline_reason: None,
             scroll_offset: 0,
+            selection: None,
+            last_copied: None,
+            // Matches the harness default terminal size; real values are
+            // recorded by `ui::chat::render` before any copy path runs.
+            last_render_width: 80,
+            last_render_height: 24,
             screen: AppScreen::Chat,
             start_time: Instant::now(),
             usage: UsageStats::default(),
@@ -122,6 +128,23 @@ impl App {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+    }
+
+    /// Goal-349: write `text` to the system clipboard (best-effort) and
+    /// always record it in [`App::last_copied`].
+    ///
+    /// The clipboard call can fail in headless / CI environments (no
+    /// display server, sandboxed session); that must NOT abort the copy
+    /// or surface an error to the user — [`App::last_copied`] is the
+    /// source of truth for tests. Both the mouse-drag copy path
+    /// (`lib.rs::copy_visible_rows`) and the Ctrl+Y / Ctrl+Shift+Y yank
+    /// arms (`commands.rs`) route through this single helper so the
+    /// clipboard logic is not duplicated.
+    pub fn copy_text(&mut self, text: String) {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(text.clone());
+        }
+        self.last_copied = Some(text);
     }
 
     /// Push a System block onto the transcript and scroll to bottom.
@@ -594,5 +617,24 @@ mod tests {
         app.reset_transcript();
         // Loop state must be None — /clear stops the loop.
         assert!(app.loop_state.is_none(), "loop_state cleared by /clear");
+    }
+
+    // ── Goal-349: clipboard test mirror ────────────────────────────────
+
+    #[test]
+    fn clipboard_failure_falls_back_to_last_copied() {
+        // Documents the headless / CI behaviour: `arboard::Clipboard::new()`
+        // can fail when there is no display server, and the live clipboard
+        // is never assertable in a sandbox. `copy_text` must therefore
+        // always record the text in `last_copied` (the test mirror) so a
+        // clipboard failure never silently drops a copy. This assertion
+        // holds whether the clipboard call succeeds or fails.
+        let mut app = App::new();
+        app.copy_text("selected rows".into());
+        assert_eq!(
+            app.last_copied.as_deref(),
+            Some("selected rows"),
+            "copy_text must always populate last_copied"
+        );
     }
 }

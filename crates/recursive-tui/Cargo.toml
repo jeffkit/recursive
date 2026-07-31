@@ -25,6 +25,11 @@ tracing = "0.1"
 futures-util = "0.3"
 async-trait = "0.1"
 dirs = "5"
+# Goal-349: system clipboard access for the mouse-drag select & Ctrl(+Shift)+Y
+# yank copy paths. Cross-platform (macOS/Linux/Windows); a normal (non-optional)
+# dependency — clipboard is a core UX feature, not a feature-flag extra. The
+# Clipboard::new() call may fail headless; callers must treat it as best-effort.
+arboard = "3"
 
 [dev-dependencies]
 tempfile = "3"

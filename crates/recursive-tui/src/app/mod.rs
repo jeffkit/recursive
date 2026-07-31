@@ -59,6 +59,30 @@ pub struct App {
     /// `deepseek-v4-flash` model fallback while the agent can't actually run.
     pub offline_reason: Option<String>,
     pub scroll_offset: usize,
+    /// Goal-349: active text selection over the visible transcript window,
+    /// as `(start_row, end_row)` inclusive physical-row indices relative to
+    /// the *visible* window (0 = top visible row). `None` when nothing is
+    /// selected. Cleared whenever `scroll_offset` changes (see the scroll
+    /// arms in `handle_key` / `handle_mouse`) so the highlight never
+    /// desyncs from the rows it was drawn against.
+    pub selection: Option<(usize, usize)>,
+    /// Goal-349: text of the most recent successful copy (mouse-release or
+    /// yank). Primary purpose: a testable mirror of the clipboard. In
+    /// headless/CI environments `arboard::Clipboard::new()` can fail (no
+    /// display server / sandbox), so every copy path writes the same text
+    /// here as a fallback that unit tests assert on.
+    pub last_copied: Option<String>,
+    /// Goal-349: width (columns) of the messages panel at the last render,
+    /// recorded at the top of `ui::chat::render`. The mouse/keyboard copy
+    /// paths recompute the visible window via
+    /// [`crate::ui::chat::visible_physical_rows`] and need the same width
+    /// the paint path used, so the copied text always matches what was drawn.
+    pub last_render_width: u16,
+    /// Goal-349: height (rows) of the messages panel at the last render.
+    /// Companion to [`App::last_render_width`]:
+    /// [`crate::ui::chat::visible_physical_rows`] needs the panel height to
+    /// produce exactly the `window` slice the render path paints.
+    pub last_render_height: u16,
     pub screen: AppScreen,
     /// Tracks when the TUI session started. Used by `/status` to report uptime.
     pub start_time: Instant,

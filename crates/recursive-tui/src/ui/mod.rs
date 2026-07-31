@@ -24,6 +24,10 @@ pub mod transcript;
 pub use theme::{find_theme, Theme, DARK};
 
 /// Render the current screen onto `frame`.
-pub fn render(frame: &mut Frame, app: &App) {
+///
+/// Takes `&mut App` so `chat::render` can record the messages-panel size
+/// (`last_render_width` / `last_render_height`) that the Goal-349 copy
+/// paths need between renders.
+pub fn render(frame: &mut Frame, app: &mut App) {
     chat::render(frame, app);
 }

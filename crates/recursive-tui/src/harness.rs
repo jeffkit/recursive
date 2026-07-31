@@ -278,13 +278,17 @@ impl Harness {
     // ── observation ──────────────────────────────────────────────────
 
     /// Render the current app state to an owned [`Screen`] snapshot.
-    pub fn render(&self) -> Screen {
+    ///
+    /// Takes `&mut self` because the renderer records the messages-panel size
+    /// on `App` (`last_render_width` / `last_render_height`) for the Goal-349
+    /// copy paths.
+    pub fn render(&mut self) -> Screen {
         let backend = TestBackend::new(self.width, self.height);
         // TestBackend::new is infallible by construction; the only error
         // path is an io failure on draw, which TestBackend cannot raise.
         let mut terminal = terminal(backend);
         terminal
-            .draw(|f| ui::render(f, &self.app))
+            .draw(|f| ui::render(f, &mut self.app))
             .expect("test backend draw is infallible");
         let buf = terminal.backend().buffer().clone();
         Screen {
@@ -295,12 +299,12 @@ impl Harness {
     }
 
     /// Render and return [`Screen::text`].
-    pub fn screen_text(&self) -> String {
+    pub fn screen_text(&mut self) -> String {
         self.render().text()
     }
 
     /// Render and return [`Screen::numbered`].
-    pub fn screen_numbered(&self) -> String {
+    pub fn screen_numbered(&mut self) -> String {
         self.render().numbered()
     }
 }
@@ -340,7 +344,7 @@ mod tests {
 
     #[test]
     fn harness_renders_empty_app_without_panic() {
-        let h = Harness::new();
+        let mut h = Harness::new();
         let screen = h.render();
         // An empty app renders the splash; the screen is non-empty text.
         assert!(!screen.text().is_empty());
@@ -390,7 +394,7 @@ mod tests {
 
     #[test]
     fn numbered_includes_row_prefixes() {
-        let h = Harness::new();
+        let mut h = Harness::new();
         let numbered = h.screen_numbered();
         assert!(
             numbered.contains("0|"),

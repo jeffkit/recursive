@@ -204,18 +204,67 @@ impl App {
             // box, root cause was this ordering.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(3);
+                // Goal-349: selection is relative to the visible window;
+                // scrolling moves the window under the highlight.
+                self.selection = None;
                 None
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                // Goal-349: clear-on-scroll invariant.
+                self.selection = None;
                 None
             }
             KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(20);
+                // Goal-349: clear-on-scroll invariant.
+                self.selection = None;
                 None
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                // Goal-349: clear-on-scroll invariant.
+                self.selection = None;
+                None
+            }
+            // ── Goal-349: copy / yank (client-side only, no UserAction) ──
+            // Both arms must appear BEFORE the generic `KeyCode::Char(c)`
+            // catch-all below, or the modifier guards never get a chance to
+            // fire. crossterm encodes Shift on a letter key as the capital
+            // letter, so Ctrl+Shift+y arrives as `Char('Y') + CONTROL`.
+            //
+            // Ctrl+Y — yank the *last assistant message* whole to the
+            // clipboard. Fast path for "grab the whole answer" without
+            // needing the mouse. No-op when no assistant block exists yet.
+            KeyCode::Char('y')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if let Some(TranscriptBlock::Assistant { text, .. }) = self
+                    .blocks
+                    .iter()
+                    .rev()
+                    .find(|b| matches!(b, TranscriptBlock::Assistant { .. }))
+                {
+                    self.copy_text(text.clone());
+                }
+                None
+            }
+            // Ctrl+Shift+Y — yank the entire *visible window* (the rows
+            // currently painted in the messages panel) to the clipboard.
+            KeyCode::Char('Y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let rows = crate::ui::chat::visible_physical_rows(self, self.last_render_width);
+                let text = rows
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.copy_text(text);
                 None
             }
             KeyCode::Up if self.should_walk_history_up() => {
@@ -1552,6 +1601,7 @@ mod tests {
 
     use crate::app::{App, AppScreen, InputMode, ToolResultData, TranscriptBlock};
     use crate::events::{UiEvent, UserAction};
+    use crate::harness::Harness;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1880,6 +1930,156 @@ mod tests {
         assert!(!app.should_quit);
         assert!(app.blocks.iter().any(|b| matches!(b,
             TranscriptBlock::System { text } if text.contains("Press Ctrl+C again"))));
+    }
+
+    // ── Goal-349: yank + clear-on-scroll ───────────────────────────────
+
+    #[test]
+    fn scroll_clears_selection() {
+        // Pins the clear-on-scroll invariant for the keyboard path: the
+        // selection indices are relative to the visible window, so scrolling
+        // (Shift+↑) must clear the stale highlight.
+        let mut h = Harness::new();
+        h.app_mut().selection = Some((0, 0));
+        h.type_key(shift(KeyCode::Up));
+        assert_eq!(
+            h.app().selection,
+            None,
+            "Shift+Up scroll must clear the active selection"
+        );
+        assert_eq!(
+            h.app().scroll_offset,
+            3,
+            "scroll behaviour itself is unchanged"
+        );
+    }
+
+    #[test]
+    fn ctrl_y_copies_last_assistant_message() {
+        let mut h = Harness::new();
+        h.app_mut().blocks.push(TranscriptBlock::User {
+            text: "question".into(),
+        });
+        h.pump(UiEvent::AssistantMessage {
+            content: "the answer".into(),
+        });
+        h.ctrl('y');
+        assert_eq!(
+            h.app().last_copied.as_deref(),
+            Some("the answer"),
+            "Ctrl+Y should yank the last assistant message's raw text"
+        );
+    }
+
+    #[test]
+    fn ctrl_y_copies_most_recent_assistant_message_when_multiple() {
+        // Yank must target the LAST assistant block, not the first.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "first answer".into(),
+        });
+        h.pump(UiEvent::AssistantMessage {
+            content: "second answer".into(),
+        });
+        h.ctrl('y');
+        assert_eq!(
+            h.app().last_copied.as_deref(),
+            Some("second answer"),
+            "Ctrl+Y must yank the most recent assistant message"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_y_copies_visible_window() {
+        // Ctrl+Shift+Y arrives as Char('Y') + CONTROL (crossterm encodes
+        // Shift on a letter as the capital). It must land in the
+        // Ctrl+Shift+Y arm — NOT the plain Ctrl+Y arm — and copy the
+        // visible window, which is smaller than the whole transcript.
+        // Blank-line-separated content so each row renders as its own
+        // physical row (the markdown renderer joins single newlines).
+        let mut h = Harness::with_size(80, 24);
+        let long = (0..40)
+            .map(|i| format!("row {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        h.pump(UiEvent::AssistantMessage { content: long });
+        // Render once so `last_render_width/height` reflect the real panel;
+        // then the yank window matches what the user sees.
+        let _screen = h.render();
+        h.type_key(KeyEvent::new(
+            KeyCode::Char('Y'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let copied = h
+            .app()
+            .last_copied
+            .clone()
+            .expect("Ctrl+Shift+Y should copy the visible window");
+        assert!(
+            copied.contains("row 39"),
+            "visible window should include the newest row; got:\n{copied}"
+        );
+        assert!(
+            !copied.contains("row 00"),
+            "visible window must NOT include the transcript top (scrolled to bottom)\n{copied}"
+        );
+        let lines = copied.lines().count();
+        assert!(
+            (10..=30).contains(&lines),
+            "window must be smaller than the full transcript (41 rows); got {lines} rows:\n{copied}"
+        );
+    }
+
+    #[test]
+    fn ctrl_y_without_assistant_block_is_noop() {
+        let mut h = Harness::new();
+        // No blocks at all — nothing to yank, no panic.
+        h.ctrl('y');
+        assert_eq!(
+            h.app().last_copied,
+            None,
+            "no assistant block → Ctrl+Y must be a no-op"
+        );
+        // Only a User block — still no assistant text to yank.
+        h.app_mut().blocks.push(TranscriptBlock::User {
+            text: "question".into(),
+        });
+        h.ctrl('y');
+        assert_eq!(
+            h.app().last_copied,
+            None,
+            "User-only transcript → Ctrl+Y must be a no-op"
+        );
+    }
+
+    #[test]
+    fn plain_y_still_types_into_input() {
+        // The yank arms are guard-gated: an unmodified 'y' (or capital 'Y'
+        // from Shift+y without Ctrl) must fall through to the generic
+        // Char(c) arm and type into the input box.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "answer".into(),
+        });
+        h.type_char('y');
+        h.type_key(key(KeyCode::Char('Y')));
+        assert_eq!(h.app().input(), "yY");
+        assert_eq!(h.app().last_copied, None, "no copy for plain y / Y");
+    }
+
+    #[test]
+    fn ctrl_y_emits_no_user_action() {
+        // Copy is purely client-side: the yank arms must return None, so no
+        // UserAction is ever sent to the backend worker.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "answer".into(),
+        });
+        h.ctrl('y');
+        assert!(
+            h.drain_actions().is_empty(),
+            "Ctrl+Y must not emit a UserAction"
+        );
     }
 }
 

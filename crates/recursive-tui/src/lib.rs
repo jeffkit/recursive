@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, MouseEvent, MouseEventKind,
+    Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -173,7 +173,7 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     app.session_roots = backend.session_roots.clone();
 
     loop {
-        terminal.draw(|frame| ui::chat::render(frame, &app))?;
+        terminal.draw(|frame| ui::chat::render(frame, &mut app))?;
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
 
         tokio::select! {
@@ -219,17 +219,77 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
     Ok(())
 }
 
-/// Map trackpad / mouse wheel events onto the transcript scroll offset.
+/// Map trackpad / mouse wheel events onto the transcript scroll offset, and
+/// left-button press-drag-release onto text selection over the visible
+/// transcript window (Goal-349).
+///
+/// Scroll behaviour is unchanged from before (same ±3 rows per wheel tick)
+/// except for one side effect: any scroll clears the active selection, whose
+/// indices are relative to the visible window — scrolling moves the window
+/// under the highlight, so a stale selection would point at the wrong rows.
+///
+/// Selection relies on the `Down`→`Drag`→`Up` pairing crossterm delivers for
+/// a single button: `Down(Left)` starts a selection at the clicked row,
+/// `Drag(Left)` extends it (only when a selection is already active, so a
+/// stray drag from another button is ignored), and `Up(Left)` copies the
+/// selected rows to the clipboard and clears the highlight.
 fn handle_mouse(app: &mut App, ev: MouseEvent) {
     match ev.kind {
         MouseEventKind::ScrollUp => {
+            app.selection = None; // Goal-349: clear-on-scroll invariant
             app.scroll_offset = app.scroll_offset.saturating_add(3);
         }
         MouseEventKind::ScrollDown => {
+            app.selection = None; // Goal-349: clear-on-scroll invariant
             app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Begin a selection at the clicked visible row. The messages
+            // panel is the top layout chunk, so the terminal row equals the
+            // visible-window row index.
+            app.selection = Some((ev.row as usize, ev.row as usize));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Extend the selection to the dragged-to row. Only extends an
+            // existing selection; a drag without a prior Down (e.g. another
+            // button held) is ignored.
+            if let Some((start, _)) = app.selection {
+                let end = ev.row as usize;
+                app.selection = Some((start.min(end), start.max(end)));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Release: copy the selected rows' text and clear.
+            if let Some((start, end)) = app.selection {
+                copy_visible_rows(app, start, end);
+                app.selection = None;
+            }
         }
         _ => {}
     }
+}
+
+/// Goal-349: copy the inclusive range `[start, end]` of *visible* rows to
+/// the system clipboard and to `app.last_copied` (test mirror).
+///
+/// The rows come from [`crate::ui::chat::visible_physical_rows`] at the last
+/// rendered width — the same rows the render path paints — so the copied
+/// text always matches the selection highlight.
+fn copy_visible_rows(app: &mut App, start: usize, end: usize) {
+    let rows = crate::ui::chat::visible_physical_rows(app, app.last_render_width);
+    let lo = start.min(rows.len());
+    let hi = (end + 1).min(rows.len());
+    let text: String = rows[lo..hi]
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.copy_text(text);
 }
 
 #[cfg(test)]
@@ -326,6 +386,145 @@ mod tests {
         assert!(
             log.contains("debt-test-panic-marker-XYZ"),
             "expected panic marker in log; got: {log}"
+        );
+    }
+
+    // ── Goal-349: mouse-drag select & copy ──────────────────────────────
+
+    use crate::events::UiEvent;
+    use crate::harness::{Harness, Screen};
+    use ratatui::style::Modifier;
+
+    fn mouse_event(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// True when any cell on screen row `y` carries the REVERSED modifier —
+    /// the selection highlight the renderer paints. Asserting on the
+    /// specific modifier (not "any bg") is unambiguous even for rows whose
+    /// existing style already sets a background.
+    fn row_has_reversed(screen: &Screen, y: u16) -> bool {
+        (0..screen.width()).any(|x| screen.style(x, y).add_modifier.contains(Modifier::REVERSED))
+    }
+
+    #[test]
+    fn mouse_down_drag_selects_row_range() {
+        // Down at row 0 then Drag to row 2 must select the inclusive range
+        // (0, 2) and the renderer must reverse-highlight exactly those rows.
+        // (Blank-line-separated content — the markdown renderer joins
+        // single-newline paragraphs into one row.)
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "line one\n\nline two\n\nline three".into(),
+        });
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0),
+        );
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 2),
+        );
+        assert_eq!(h.app().selection, Some((0, 2)));
+
+        let screen = h.render();
+        for y in 0..=2 {
+            assert!(
+                row_has_reversed(&screen, y),
+                "row {y} should be REVERSED after drag-select\n{}",
+                screen.numbered()
+            );
+        }
+        // The trailing blank row (window row 3) must NOT be reversed —
+        // selection covers exactly the dragged content rows.
+        assert!(
+            !row_has_reversed(&screen, 3),
+            "blank row 3 must not be reversed\n{}",
+            screen.numbered()
+        );
+    }
+
+    #[test]
+    fn mouse_up_copies_selection_and_clears() {
+        // Down(0) → Drag(1) → Up(1): the selected visible rows' rendered
+        // text lands in `last_copied` (the clipboard mirror; the live
+        // clipboard is not assertable headless) and the selection clears.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "alpha\n\nbeta".into(),
+        });
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0),
+        );
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 1),
+        );
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 1),
+        );
+        assert_eq!(
+            h.app().last_copied.as_deref(),
+            Some("•  alpha\n  beta"),
+            "release must copy the selected visible rows (rendered text)"
+        );
+        assert!(
+            h.app().selection.is_none(),
+            "selection must clear after a copy on release"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_without_prior_down_is_ignored() {
+        // A stray Drag (e.g. another button held) must not start a selection
+        // on its own — only a Down → Drag → Up pairing selects.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "a\nb\nc".into(),
+        });
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 2),
+        );
+        assert_eq!(
+            h.app().selection,
+            None,
+            "Drag without a prior Down must not create a selection"
+        );
+        let screen = h.render();
+        assert!(
+            !row_has_reversed(&screen, 2),
+            "row 2 must not be highlighted without a Down first"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_clears_selection() {
+        // Pins the clear-on-scroll invariant for the mouse path: scrolling
+        // moves the window under the selection, so the highlight must not
+        // stay pointing at now-wrong rows.
+        let mut h = Harness::new();
+        h.pump(UiEvent::AssistantMessage {
+            content: "a\nb\nc\nd".into(),
+        });
+        handle_mouse(
+            h.app_mut(),
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0),
+        );
+        assert!(h.app().selection.is_some());
+        handle_mouse(h.app_mut(), mouse_event(MouseEventKind::ScrollUp, 0));
+        assert!(h.app().selection.is_none(), "scroll must clear selection");
+        assert_eq!(
+            h.app().scroll_offset,
+            3,
+            "scroll wheel behaviour itself is unchanged"
         );
     }
 }

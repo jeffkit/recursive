@@ -35,7 +35,7 @@ fn todo_panel_height(app: &App) -> u16 {
     }
 }
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let input_total = input::total_height(app);
     let todo_height = todo_panel_height(app);
     // Fix-E: show a 1-row approval banner when a plan is awaiting the
@@ -73,52 +73,33 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.blocks.is_empty() && !app.turn.running {
         render_empty_state(frame, messages_area, app);
     } else {
-        let mut lines: Vec<Line<'static>> =
-            transcript::render_blocks(&app.blocks, &app.usage, app.theme, messages_area.width);
+        // Goal-349: record the messages-panel size for the copy paths. The
+        // mouse / yank handlers recompute the visible window via
+        // `visible_physical_rows` and must use the same width + height this
+        // paint used, or the copied text would drift from the screen.
+        app.last_render_width = messages_area.width;
+        app.last_render_height = messages_area.height;
 
-        if app.turn.running {
-            let elapsed = app
-                .turn
-                .step_started_at
-                .map(|t| t.elapsed().as_secs_f64())
-                .unwrap_or(0.0);
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![Span::styled(
-                spinner::format_line(app.spinner_frame, app.turn.spinner_verb, elapsed),
-                Style::default().fg(Color::Yellow),
-            )]));
+        let mut window = visible_physical_rows(app, messages_area.width);
+
+        // Goal-349: reverse-highlight the selected row range. Selection is
+        // stored in visible-window coordinates, which exactly matches
+        // `window`'s indexing, so no coordinate translation is needed.
+        // Modifier::REVERSED inverts fg/bg regardless of the row's existing
+        // colours — important because assistant markdown rows carry per-span
+        // syntax colours we must not fight with a hard-coded background.
+        if let Some((s, e)) = app.selection {
+            use ratatui::style::Modifier;
+            let lo = s.min(window.len());
+            let hi = (e + 1).min(window.len());
+            for line in &mut window[lo..hi] {
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
+            }
         }
-        // Keep one blank row between the last content line and the status bar
-        // so the output doesn't visually collide with it.
-        lines.push(Line::raw(""));
 
-        // The messages panel no longer wraps in a bordered `Block`, so the
-        // area is the chunk itself — no border rows / columns to subtract.
-        let inner_width = messages_area.width;
-        let visible = messages_area.height as usize;
-
-        // Pre-wrap every logical line into physical rows at the exact panel
-        // width, then window those rows ourselves in `usize`. This replaces
-        // the previous `Paragraph::scroll` + estimated-row-count scheme, whose
-        // char-width row estimate drifted from ratatui's word-aware wrapping
-        // (producing inexact scroll positions and rows that could never be
-        // scrolled into view) and whose `as u16` scroll cast could overflow on
-        // very long transcripts. Exact windowing means both ends are always
-        // reachable.
-        let physical = transcript::wrap_lines_to_width(&lines, inner_width);
-        let total_rows = physical.len();
-        let max_scroll = total_rows.saturating_sub(visible);
-        // `scroll_offset` counts rows from the bottom. Capping it at
-        // `max_scroll` keeps `scroll_offset == 0` stuck to the bottom (newest
-        // content visible) while letting a large offset scroll all the way to
-        // the first row. The transcript is top-anchored, so a short
-        // conversation fills from the top with blank space below.
-        let capped = app.scroll_offset.min(max_scroll);
-        let start = max_scroll - capped;
-        let end = (start + visible).min(total_rows);
-        let window: Vec<Line<'static>> = physical[start..end].to_vec();
-
-        // Rows are already wrapped to `inner_width`, so render without
+        // Rows are already wrapped to the panel width, so render without
         // additional wrapping or scroll offset.
         let messages_widget = Paragraph::new(window);
         frame.render_widget(messages_widget, messages_area);
@@ -155,6 +136,55 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.modals.is_empty() {
         modal::render(frame, app);
     }
+}
+
+/// Goal-349: the flattened, width-wrapped physical rows currently visible in
+/// the messages panel — exactly the `window` slice [`render`] paints.
+///
+/// This is the single source of truth for the row-windowing math (render
+/// blocks → wrap to width → slice by `scroll_offset`). Both the render path
+/// (which restyles the rows when a selection is active) and the mouse /
+/// keyboard copy paths (which slice text out of the rows) call this, so the
+/// selection text can never diverge from what is painted.
+///
+/// `width` is the messages-panel width in columns. The visible height and
+/// scroll offset are read from [`App::last_render_height`] and
+/// [`App::scroll_offset`] so the function reproduces the exact window of the
+/// last render — the copy paths run between renders and must not re-derive
+/// the width themselves.
+pub fn visible_physical_rows(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> =
+        transcript::render_blocks(&app.blocks, &app.usage, app.theme, width);
+
+    if app.turn.running {
+        let elapsed = app
+            .turn
+            .step_started_at
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled(
+            spinner::format_line(app.spinner_frame, app.turn.spinner_verb, elapsed),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+    // Keep one blank row between the last content line and the status bar
+    // so the output doesn't visually collide with it.
+    lines.push(Line::raw(""));
+
+    let physical = transcript::wrap_lines_to_width(&lines, width);
+    let total_rows = physical.len();
+    let visible = app.last_render_height as usize;
+    let max_scroll = total_rows.saturating_sub(visible);
+    // `scroll_offset` counts rows from the bottom. Capping it at
+    // `max_scroll` keeps `scroll_offset == 0` stuck to the bottom (newest
+    // content visible) while letting a large offset scroll all the way to
+    // the first row. The transcript is top-anchored, so a short
+    // conversation fills from the top with blank space below.
+    let capped = app.scroll_offset.min(max_scroll);
+    let start = max_scroll - capped;
+    let end = (start + visible).min(total_rows);
+    physical[start..end].to_vec()
 }
 
 /// Render the full-screen startup splash shown while the transcript is
@@ -405,7 +435,7 @@ mod debt_tests {
     use ratatui::Terminal;
     use recursive::tools::todo::{TodoItem, TodoStatus};
 
-    fn draw(app: &App, w: u16, h: u16) -> Buffer {
+    fn draw(app: &mut App, w: u16, h: u16) -> Buffer {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).expect("TestBackend infallible");
         term.draw(|fr| render(fr, app)).expect("draw infallible");
@@ -475,7 +505,7 @@ mod debt_tests {
         let mut app = App::new();
         app.plan_awaiting_approval = true;
         app.plan_mode_request_pending = false;
-        let buf = draw(&app, 80, 24);
+        let buf = draw(&mut app, 80, 24);
         assert!(
             all_text(&buf).contains("Plan awaiting approval"),
             "expected plan approval banner text"
@@ -488,7 +518,7 @@ mod debt_tests {
         let mut app = App::new();
         app.plan_mode_request_pending = true;
         app.plan_awaiting_approval = false;
-        let buf = draw(&app, 80, 24);
+        let buf = draw(&mut app, 80, 24);
         assert!(
             all_text(&buf).contains("Plan mode request"),
             "expected plan mode request banner text"
@@ -501,8 +531,8 @@ mod debt_tests {
         // tall terminal the logo is padded down by (mh-9)/2 rows. mutant
         // `/`->`%` pads by (mh-9)%2 (0 or 1) -> logo near the top.
         // kills 196:45 `/`->`%`.
-        let app = App::new();
-        let buf = draw(&app, 80, 60);
+        let mut app = App::new();
+        let buf = draw(&mut app, 80, 60);
         let y = row_y_containing(&buf, "┬─┐").expect("logo row should be present");
         assert!(
             y >= 10,
@@ -519,7 +549,7 @@ mod debt_tests {
         let mut app = App::new();
         app.model_name = "deepseek-v4-flash".to_string();
         app.offline_reason = Some("No LLM provider configured.".to_string());
-        let buf = draw(&app, 100, 30);
+        let buf = draw(&mut app, 100, 30);
         let text = all_text(&buf);
         assert!(
             text.contains("Offline"),
@@ -550,7 +580,7 @@ mod debt_tests {
         let mut app = App::new();
         app.current_todos = vec![todo("Task one", TodoStatus::Pending, None)];
         app.turn.running = true;
-        let buf = draw(&app, 80, 24);
+        let buf = draw(&mut app, 80, 24);
         assert!(
             all_text(&buf).contains("Tasks"),
             "expected todo panel title 'Tasks'"
@@ -569,7 +599,7 @@ mod debt_tests {
             todo("p2", TodoStatus::Pending, None),
         ];
         app.turn.running = true;
-        let buf = draw(&app, 80, 24);
+        let buf = draw(&mut app, 80, 24);
         assert!(
             all_text(&buf).contains("1/3"),
             "expected '1/3' in todo title"
@@ -586,7 +616,7 @@ mod debt_tests {
         let mut app = App::new();
         app.current_todos = vec![todo("DoThing", TodoStatus::Pending, Some("DoingThing"))];
         app.turn.running = true;
-        let buf = draw(&app, 80, 24);
+        let buf = draw(&mut app, 80, 24);
         assert!(
             all_text(&buf).contains("DoThing"),
             "Pending item should show content 'DoThing'"
@@ -607,7 +637,7 @@ mod debt_tests {
             })
             .collect();
         app.scroll_offset = 10;
-        let _ = draw(&app, 80, 12);
+        let _ = draw(&mut app, 80, 12);
     }
 
     #[test]
@@ -618,10 +648,74 @@ mod debt_tests {
         let mut app = App::new();
         app.turn.running = true;
         app.modals = vec![Modal::Help];
-        let buf = draw(&app, 80, 24);
+        let buf = draw(&mut app, 80, 24);
         assert!(
             all_text(&buf).contains(" Help "),
             "expected the Help modal title to be rendered"
+        );
+    }
+
+    // ── Goal-349: visible_physical_rows == the painted window ──────────
+
+    #[test]
+    fn visible_physical_rows_matches_painted_window() {
+        // Pins the Goal-349 refactor: `visible_physical_rows` must return
+        // exactly the `window` slice `render` paints (same length, same
+        // rows in the same order), so selection/copy text can never diverge
+        // from the screen. The messages panel is the top layout chunk, so
+        // screen row y == window row y for y < window.len().
+        use crate::harness::Harness;
+        use crate::model::TranscriptBlock;
+
+        let mut h = Harness::new();
+        h.app_mut().blocks = (0..40)
+            .map(|i| TranscriptBlock::System {
+                text: format!("msg {i:02}"),
+            })
+            .collect();
+
+        // Scroll up a bit, render, then verify the helper reproduces the
+        // painted window row-for-row.
+        h.app_mut().scroll_offset = 30;
+        let screen = h.render();
+        let rows = visible_physical_rows(h.app(), screen.width());
+        assert!(!rows.is_empty(), "visible window must not be empty");
+        for (i, row) in rows.iter().enumerate() {
+            let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(
+                screen.line(i as u16),
+                text.trim_end(),
+                "visible_physical_rows row {i} must equal the painted row"
+            );
+        }
+
+        // Scrolling to the bottom must shift the window the same way the
+        // renderer paints it: same height, different visible content.
+        // (Compare the full joined text — individual "last rows" can both be
+        // blank separators depending on row parity.)
+        h.app_mut().scroll_offset = 0;
+        let screen2 = h.render();
+        let rows2 = visible_physical_rows(h.app(), screen2.width());
+        assert_eq!(
+            rows.len(),
+            rows2.len(),
+            "window height is stable across scroll positions"
+        );
+        let text_of = |rs: &[Line<'static>]| -> String {
+            rs.iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_ne!(
+            text_of(&rows),
+            text_of(&rows2),
+            "scrolling must change which rows are visible"
         );
     }
 }
