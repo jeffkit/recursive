@@ -1,109 +1,149 @@
-# AGENTS.md — Working contract for AI agents in this repo
+# AGENTS.md — Working contract for AI agents in the recursive repo
 
-> **Two files, two audiences — read both.**
-> - **This file** (`/AGENTS.md`) — short runtime contract Recursive
->   injects into its own system prompt at v0.7 (loaded by
->   `src/config.rs::load_project_context`). Says how to *operate* the
->   agent: patch format, stuck detection, tool-call pairing.
-> - **`.dev/AGENTS.md`** — the source-code invariants. Says how to
->   *modify* the agent: 8 invariants the kernel/run loop depends on,
->   the current `src/` layout, the quality gates. Read it before
->   editing `src/`.
+> 本文件是 recursive 仓库的**唯一导航契约**：既讲如何**操作** agent（patch 格式、stuck 检测、
+> 工具配对），也讲如何**修改** agent 源码（invariants、质量门、worktree、E2E 规则）。
+> （`CLAUDE.md` 为本文件的软链，Claude Code 入口。）
 
-You are operating in the **recursive-agent** workspace. This is the
-self-improving coding-agent project. The dev loop drives agents
-(MiniMax / DeepSeek / GLM) to land roadmap features via the Flowcast
-flow `.dev/flows/self-improve.flow.js` (launched by
-`.dev/scripts/launch-flow.sh`; see `.dev/flows/SELF_IMPROVE.md`). The
-legacy `.dev/scripts/self-improve.sh` is deprecated. Detailed contract is
-in `.dev/AGENTS.md` — read it before making changes.
+You are operating in the **recursive-agent** workspace — the self-improving
+Rust coding-agent project. `src/` is the product; `.dev/` is dev meta-tooling
+(goals, scripts, roadmap). The dev loop drives agents (MiniMax / DeepSeek /
+GLM) to land roadmap features via the Flowcast flow
+`.dev/flows/self-improve.flow.js` (launched by `.dev/scripts/launch-flow.sh`;
+see `.dev/flows/SELF_IMPROVE.md`). The legacy `.dev/scripts/self-improve.sh`
+is deprecated. **Source-code invariants live in `.dev/AGENTS.md` — read it
+before editing `src/`.**
 
-## What you should know up front
+## What you should know up front (操作契约)
 
-- **Patch discipline matters.** Prefer `apply_patch` over `write_file`
-  for edits to existing files. `write_file` is for new files. The
-  observation system tracks `apply_patch:write_file` ratio and uses
-  it to grade runs — high `write_file` count usually means
-  `apply_patch` kept failing and the agent gave up.
+- **Patch discipline.** Prefer `apply_patch` over `write_file` for edits to
+  existing files (`write_file` = new files only). The observation system
+  tracks the `apply_patch:write_file` ratio to grade runs.
+- **V4A patch format** is the only `apply_patch` accepts (some tolerance for
+  unified-diff anchors). Context lines must be **unique** — three identical
+  lines in a row get rejected with "ambiguous". Read `.dev/AGENTS.md` for traps.
+- **`cargo test` after every product change.** `cargo run | jq` is NOT a
+  substitute (build output pollutes stdout — lesson 14 in `.dev/AGENTS.md`).
+- **`cargo clippy --all-targets -- -D warnings` is enforced** — a lint rolls
+  back the entire product commit in the self-improve flow.
+- **`cargo fmt --all` before committing.**
 
-- **V4A patch format** is the only `apply_patch` accepts (with some
-  tolerance for unified-diff anchors). When in doubt, read
-  `.dev/AGENTS.md` for the exact rules and common traps. Notable:
-  context lines must be **unique**; if three lines in a row look
-  identical to git, your patch will get rejected with "ambiguous".
+## Before touching code (源码 invariants)
 
-- **Run `cargo test` after every product change.** `cargo run | jq`
-  is NOT a substitute (build output pollutes stdout — see lesson 14
-  in `.dev/AGENTS.md`). `cargo test` is the canonical verifier.
+Read `.dev/AGENTS.md` for the full list. Especially:
+- **#1** Agent loop stays small — don't branch inside `src/run_core.rs::RunCore::run_inner`.
+- **#3** Sandbox — all fs/shell tools go through `tools::resolve_within`.
+- **#5** No `unwrap()`/`expect()` in non-test code.
+- **#7** Finish reasons are data, not errors.
+- **#8** Tool-call ↔ tool-result pairing must be preserved.
 
-- **`cargo clippy --all-targets -- -D warnings` is enforced.** A
-  clippy lint will cause the self-improve flow to roll back the entire
-  product commit. Run clippy locally before declaring done.
+New capabilities belong in tools (`src/tools/`) or providers (`src/llm/`),
+**never** as a branch in `run_inner`. The legacy `src/agent.rs` was split into
+`src/agent/types.rs` / `src/kernel.rs` / `src/runtime.rs` during Goal 219.
 
-- **Lint-as-you-go.** Use `cargo fmt --all` before committing.
+## Mandatory quality gates (before declaring done)
 
-## What's available besides the standard tools
+```bash
+cargo test --workspace
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all
+```
 
-If you see these tools in the registry list, you can use them:
+All three must be clean. If touching `crates/recursive-tui/src/`, also run
+`.dev/scripts/tui-test-presence.sh` (hard gate) and `.dev/scripts/tui-mutants.sh`
+(advisory for manual edits; full policy in `.dev/skills/tui-acceptance.md`).
+The Flowcast self-improve flow enforces `tui-mutants` as a hard gate via
+`.flowcast/gates.json` — that flow-level enforcement is intentional and unaffected
+by the lighter manual-edit policy.
 
-- `apply_patch`, `read_file`, `write_file`, `list_dir`, `run_shell`
-  — standard editing primitives.
-- `search_files` (regex/case-insensitive supported) — fast in-tree
-  search.
-- `estimate_tokens` — budget planning before reading a large file.
-- `web_fetch` — HTTP GET with HTML text extraction. Use sparingly;
-  most goals don't need it.
-- `remember` / `recall` / `forget` — persistent memory across runs,
-  stored in `<workspace>/.recursive/memory/`. Use for facts you'll
-  need next batch (e.g. "g42 cost record was $2.17, 45 patches").
-- `load_skill` — discover and load detailed how-to skills from
-  `<workspace>/.recursive/skills/` and `~/.recursive/skills/`. If
-  the skill_index in your system prompt mentions a relevant skill,
-  load it before doing related work.
+## Code conventions & after-change journal
 
-If sub-agent is enabled (`RECURSIVE_SUBAGENT_ENABLED=1`):
+- Minimal, surgical edits; don't rewrite a whole file to fix one thing.
+- New tool → `src/tools/` + register in `src/tools/mod.rs`. New provider →
+  `src/llm/` implementing `ChatProvider`. New error variant → `src/error.rs`.
+- Tests → `#[cfg(test)] mod tests` in the same file.
+- After changes, write `.dev/journal/manual-<YYYYMMDD>-<short-tag>.md`
+  (Date / Goal / Files touched / Tests added / Notes) to keep observation
+  history coherent with self-improve runs.
 
-- `sub_agent` — dispatch focused research/scan tasks to a fresh
-  agent loop with restricted tools. Use for "summarize what AGENTS.md
-  says about X" without polluting the main transcript.
+## Available tools (besides standard editing)
 
-If checkpointing is enabled (default when `git` is on PATH):
+`apply_patch` / `read_file` / `write_file` / `list_dir` / `run_shell` /
+`search_files` (regex) / `estimate_tokens` / `web_fetch` (sparingly) /
+`remember`·`recall`·`forget` (memory in `<workspace>/.recursive/memory/`) /
+`load_skill` (from `<workspace>/.recursive/skills/` or `~/.recursive/skills/`).
 
-- `checkpoint_list` — list this session's per-turn workspace
-  snapshots, newest first. Each turn produces one entry whose id
-  you can pass to `checkpoint_diff`.
-- `checkpoint_diff` — show a unified diff between two checkpoints
-  in this session, or between a checkpoint and the current
-  workspace. Useful for "what did I change in turn N?" self-checks.
-
-You **cannot** create or restore checkpoints from inside the agent.
-Snapshots are taken automatically by the runtime around every turn,
-and rewinds happen out-of-band via
-`recursive sessions rewind <session-id> --to-turn N`. Treat the
-checkpoint chain as read-only telemetry about your own footprint.
+- **sub_agent** (if `RECURSIVE_SUBAGENT_ENABLED=1`): dispatch focused
+  research/scan to a fresh agent loop with restricted tools.
+- **checkpoint_list / checkpoint_diff** (if `git` on PATH): read-only per-turn
+  workspace snapshots. You **cannot** create/restore checkpoints — rewinds
+  happen out-of-band via `recursive sessions rewind <session-id> --to-turn N`.
 
 ## Don't surprise the orchestrator
 
-- Each self-improve cycle has a step budget (default 200, hard cap
-  200 single-pass × 2 with auto-resume = 400). Don't burn budget on
-  exploratory reads. Plan first, then execute.
+- Step budget: default 200 (hard cap 400 with auto-resume). Don't burn it on
+  exploratory reads — plan first.
+- **Stuck** detection trips on **three identical failing tool calls**. Change
+  something (re-read context, widen anchors) before retrying.
+- Termination reasons (`BudgetExceeded` / `TranscriptLimit` / `Stuck` /
+  `NoMoreToolCalls`) are **data, not errors** — transcript is always saved.
+- **Tool-call pairing** (invariant #8): each `Role::Tool` MUST stay immediately
+  after the `Role::Assistant` whose `tool_calls` lists its `id`. Orphans →
+  HTTP 400. Regression test: `compaction_keeps_tool_calls_paired_with_results`.
 
-- `Stuck` detection trips on **three identical failing tool calls**.
-  If you call `apply_patch` and it errors, change something
-  (re-read context, widen anchors) before retrying — don't paste
-  the same patch.
+## Worktree workflow
 
-- Termination reasons (`BudgetExceeded`, `TranscriptLimit`,
-  `Stuck`, `NoMoreToolCalls`) are **data, not errors**. Your
-  transcript is saved on all of them. Don't panic.
+All feature development happens in a dedicated worktree at
+`<project-root>/.worktrees/<name>/` (git-ignored). The main checkout (project
+root) is reserved for the `main` branch — stable, non-bare, for shared admin
+tasks (fetch, merge, housekeeping). This keeps the main checkout clean and
+makes parallel feature work safe. Check before working:
 
-- **Tool-call ↔ tool-result pairing.** If you write code that
-  rearranges the transcript (compaction, trimming, replay, session
-  resume), each `Role::Tool` message MUST stay immediately after the
-  `Role::Assistant` message whose `tool_calls` lists its `id`.
-  OpenAI/DeepSeek/Anthropic all reject orphans with HTTP 400. See
-  invariant #8 in `.dev/AGENTS.md` and the regression test
-  `compaction_keeps_tool_calls_paired_with_results`.
+```bash
+ls .dev/runs/ 2>/dev/null
+ls .worktrees/ 2>/dev/null
+```
+
+Don't edit files a live worktree run is working on.
+
+### Known self-improve failure modes (treat as experimental)
+
+1. **Auto-rollback can fail silently when the agent dies mid-fix** (auth/quota/
+   malformed response). Always check `git -C .worktrees/<name> status` after a
+   run — dirty tree means manual `git restore`.
+2. **Cross-PR landing during a run creates phantom deletions.** Before merging
+   an agent branch, rebase onto current `main`; `git log --oneline <branch>..main`
+   shows intervening commits.
+3. **`self-improve.sh` is deprecated — always use `parallel-self-improve.sh`**
+   (which takes `<provider> <goal-file>`, handles concurrency, isolates worktrees,
+   resumes on context loss).
+
+New failure modes should be added here, not silently worked around.
+
+## E2E testing rules (essentials — full detail in `e2e/` + `.dev/`)
+
+E2E tests run via `argusai -c e2e.yaml`. Hard-won rules:
+- **Confirm container binary first**: `docker exec recursive-e2e recursive --version`.
+  Tool names are **PascalCase** (`Read`/`Write`/`Bash`/`Glob`) — snake_case
+  assertions silently lie.
+- **Port registry**: every HTTP suite picks a unique port (9090=08-http-api,
+  9091=08b-rate-limit, 9092=18-goal-loop, 9093=19-interrupt, 9096=21-ts-sdk,
+  9097=39-auth, 9099=22-compaction). Shared ports → 401/ECONNREFUSED ghosts.
+- **Session isolation**: `RECURSIVE_SESSIONS_DIR` is a hard override ignoring
+  `RECURSIVE_HOME`. For `recursive-session:` assertions, `unset RECURSIVE_SESSIONS_DIR`,
+  use a unique `RECURSIVE_HOME`, then `find` the transcript and copy to a predictable
+  path. See `e2e/tests/00-smoke.yaml` and `11-session-resume.yaml` for canonical form.
+- **aimock fixtures**: use `turnIndex` + `hasToolResult`, not text matching.
+- **HTTP in container**: always `-H 'Content-Type: application/json'`;
+  `POST /sessions/:id/messages` field is **`content`** not `message`;
+  use `http://127.0.0.1:PORT` not `localhost` (Node 18 IPv6 issue).
+- **`recursive loop` produces no `transcript.jsonl`** — use `file:` assertions only.
+- **`argusAI save:` can't capture exec stdout** — pass state via temp files.
+
+## Skills available
+
+- `/recursive-loop` — act as loop orchestrator: read roadmap, pick goals, launch
+  the Flowcast self-improve flow, handle results. Use when the user wants
+  Recursive to self-improve rather than you directly editing code.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
@@ -117,8 +157,8 @@ This project is indexed by GitNexus as **Recursive** (12664 symbols, 31434 relat
 - **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
 - **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping.
+- When you need full context on a specific symbol, use `gitnexus_context({name: "symbolName"})`.
 
 ## Never Do
 
