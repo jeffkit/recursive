@@ -1,4 +1,4 @@
-# Goal 350 — Tool-name constants in policy/safety layers (kill hardcoded "Write"/"Edit"/"Bash" strings)
+# Goal 351 — Tool-name constants in policy/safety layers (kill hardcoded "Write"/"Edit"/"Bash" strings)
 
 **Roadmap**: Post-Phase — Architecture Quality (consistency)
 
