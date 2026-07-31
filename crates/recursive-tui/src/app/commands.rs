@@ -332,6 +332,9 @@ impl App {
         use std::time::Instant;
 
         let now = Instant::now();
+        // Read the previous ESC timestamp BEFORE overwriting it so we can
+        // detect a second press within the window.
+        let prev_esc = self.double_press.last_esc_at;
         self.double_press.last_esc_at = Some(now);
 
         // Step 1: non-empty buffer or non-Prompt mode → clear.
@@ -343,10 +346,27 @@ impl App {
             return None;
         }
 
-        // Step 2: in-flight turn → interrupt.
+        // Step 2: in-flight turn → double-press required to interrupt.
+        //
+        // A single ESC while a turn runs shows a hint but does NOT interrupt.
+        // The second ESC within the double-press window triggers the actual
+        // interrupt. This prevents spurious interrupts caused by fragmented
+        // mouse-escape sequences: the terminal can split `\x1b[<35;92;39M`
+        // (an SGR mouse-move event) at the byte boundary, causing crossterm
+        // to emit a standalone `KeyCode::Esc` before the rest arrives. A
+        // double-press requirement means a lone stray ESC is harmless.
         if self.turn.running {
-            self.push_system("Interrupting… (press Ctrl+C again to exit)");
-            return Some(UserAction::Interrupt);
+            let within_window = prev_esc
+                .map(|t| now.duration_since(t) <= double_press_window())
+                .unwrap_or(false);
+            if within_window {
+                // Confirmed second press — interrupt.
+                self.double_press.last_esc_at = None;
+                return Some(UserAction::Interrupt);
+            }
+            // First press — arm the hint.
+            self.push_system("Press ESC again to interrupt (or Ctrl+C)");
+            return None;
         }
 
         // Step 3: idle and empty — explicitly no-op (do **not** quit).
@@ -482,6 +502,16 @@ impl App {
         }
 
         for c in text.chars() {
+            // Normalize line endings: skip bare \r so that \r\n paste
+            // sources (Windows clipboard, some macOS apps) don't corrupt
+            // the buffer. The \n that follows a \r is inserted normally
+            // so the newline itself is preserved. Lone \r is also dropped
+            // rather than rendered as a carriage-return control character,
+            // which would cause the terminal cursor to jump to column 0
+            // and visually overwrite the beginning of the current line.
+            if c == '\r' {
+                continue;
+            }
             self.prompt.insert_char(c);
         }
     }
@@ -502,11 +532,31 @@ impl App {
 
         let action = match mode {
             InputMode::Prompt => {
-                self.blocks
-                    .push(TranscriptBlock::User { text: body.clone() });
-                self.scroll_to_bottom();
-                self.start_turn();
-                Some(UserAction::SendMessage(body))
+                // Goal-343 intentionally keeps paste in Prompt mode (no mode auto-detect on
+                // paste). Re-check here: if the buffer starts with '/' and the first token is
+                // a known slash command, dispatch it correctly rather than sending it verbatim
+                // to the LLM — so pasted commands like `/loop <goal>` work the same as typed.
+                // We do NOT early-return so that record_submission (history) still runs below.
+                let paste_cmd = body.strip_prefix('/').and_then(|rest| {
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    if !name.is_empty()
+                        && (self.commands.lookup(name).is_some()
+                            || self.commands.lookup_skill(name).is_some())
+                    {
+                        Some(rest.to_owned())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(rest) = paste_cmd {
+                    self.dispatch_slash_command(&rest)
+                } else {
+                    self.blocks
+                        .push(TranscriptBlock::User { text: body.clone() });
+                    self.scroll_to_bottom();
+                    self.start_turn();
+                    Some(UserAction::SendMessage(body))
+                }
             }
             InputMode::Bash => {
                 self.blocks.push(TranscriptBlock::User {
@@ -2081,6 +2131,63 @@ mod tests {
             "Ctrl+Y must not emit a UserAction"
         );
     }
+
+    // ── ESC double-press interrupt tests ─────────────────────────────────
+
+    /// ESC during a running turn shows a hint but does NOT interrupt on
+    /// the first press. A second press within the window does interrupt.
+    #[test]
+    fn esc_during_running_turn_requires_double_press_to_interrupt() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.turn.start();
+
+        // First ESC: should show hint, not interrupt.
+        let action = app.handle_key(key(KeyCode::Esc));
+        assert!(
+            action.is_none(),
+            "first ESC during running turn must not interrupt, got {action:?}"
+        );
+        assert!(
+            app.blocks.iter().any(|b| matches!(b,
+                TranscriptBlock::System { text } if text.contains("Press ESC again"))),
+            "first ESC must show the double-press hint"
+        );
+
+        // Second ESC immediately after: within the window → interrupt.
+        let action = app.handle_key(key(KeyCode::Esc));
+        assert!(
+            matches!(action, Some(UserAction::Interrupt)),
+            "second ESC within window must interrupt, got {action:?}"
+        );
+    }
+
+    /// ESC during idle (no turn running) never interrupts.
+    #[test]
+    fn esc_during_idle_turn_is_noop() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        let action = app.handle_key(key(KeyCode::Esc));
+        assert!(action.is_none(), "ESC while idle must be a no-op");
+        assert!(!app.should_quit);
+    }
+
+    /// ESC outside the double-press window does not interrupt even if
+    /// a prior ESC was recorded.
+    #[test]
+    fn esc_outside_window_during_turn_does_not_interrupt() {
+        use std::time::Instant;
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.turn.start();
+        // Backdate last_esc_at so the next press is "outside" the window.
+        app.double_press.last_esc_at = Some(Instant::now() - Duration::from_secs(60));
+        let action = app.handle_key(key(KeyCode::Esc));
+        assert!(
+            !matches!(action, Some(UserAction::Interrupt)),
+            "ESC outside window must not interrupt, got {action:?}"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2373,6 +2480,89 @@ mod prompt_input_tests {
         assert!(app.prompt.history_idx.is_none());
     }
 
+    // ── pasted slash command in Prompt mode (Goal-343 paste fix) ────
+    //
+    // Goal-343 intentionally skips mode auto-detection on paste so
+    // multi-line pastes don't accidentally flip modes. The side-effect is
+    // that pasting a known slash command (e.g. `/loop <goal>`) lands the
+    // full text in the Prompt-mode buffer. `submit_prompt` must catch this
+    // at submission time and dispatch it as a slash command.
+
+    #[test]
+    fn pasted_known_slash_command_in_prompt_mode_dispatches_as_command() {
+        // Simulate bracketed paste of "/clear" while mode stays Prompt.
+        let mut app = fresh_app();
+        // After paste, mode=Prompt, buffer="/clear".
+        app.handle_paste("/clear");
+        assert_eq!(
+            app.prompt.mode,
+            InputMode::Prompt,
+            "paste must not flip mode"
+        );
+        assert_eq!(app.prompt.buffer, "/clear");
+        // Pressing Enter must dispatch as slash command, not SendMessage.
+        let action = app.handle_key(k(KeyCode::Enter));
+        // /clear calls reset_transcript and returns StopLoop.
+        assert!(
+            matches!(action, Some(crate::events::UserAction::StopLoop)),
+            "pasted /clear should dispatch as StopLoop action, got {action:?}"
+        );
+        // Buffer is cleared after dispatch.
+        assert!(app.prompt.buffer.is_empty());
+    }
+
+    #[test]
+    fn pasted_loop_command_in_prompt_mode_dispatches_start_loop() {
+        // Simulate pasting "/loop watch the build" in Prompt mode.
+        let mut app = fresh_app();
+        app.handle_paste("/loop watch the build");
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        let action = app.handle_key(k(KeyCode::Enter));
+        assert!(
+            matches!(
+                &action,
+                Some(crate::events::UserAction::StartLoop { goal, .. })
+                    if goal == "watch the build"
+            ),
+            "pasted /loop should dispatch StartLoop with the goal, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn pasted_unknown_slash_text_in_prompt_mode_sends_as_message() {
+        // A pasted path like "/usr/local/bin/node" must NOT be treated
+        // as a slash command — "usr" is not a known command name.
+        let mut app = fresh_app();
+        app.handle_paste("/usr/local/bin/node");
+        assert_eq!(app.prompt.mode, InputMode::Prompt);
+        let action = app.handle_key(k(KeyCode::Enter));
+        assert!(
+            matches!(
+                &action,
+                Some(crate::events::UserAction::SendMessage(text))
+                    if text == "/usr/local/bin/node"
+            ),
+            "unknown /... should fall through to SendMessage, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn typed_slash_command_still_dispatches_via_command_mode() {
+        // The regular path (typing '/' → Command mode) is unchanged by
+        // the paste fix.  Ensure it still works.
+        let mut app = fresh_app();
+        let _ = app.handle_key(k(KeyCode::Char('/')));
+        assert_eq!(app.prompt.mode, InputMode::Command);
+        for c in "clear".chars() {
+            let _ = app.handle_key(k(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(k(KeyCode::Enter));
+        assert!(
+            matches!(action, Some(crate::events::UserAction::StopLoop)),
+            "typed /clear via Command mode should still dispatch correctly"
+        );
+    }
+
     // ── home / end on multi-line ────────────────────────────────────
 
     #[test]
@@ -2585,6 +2775,32 @@ mod paste_tests {
         app.handle_paste("XY");
         assert_eq!(app.prompt.buffer, "aXYb");
         assert_eq!(app.prompt.cursor, 3);
+    }
+
+    #[test]
+    fn paste_strips_carriage_returns_from_crlf() {
+        // \r\n (Windows / some macOS clipboard sources) must be normalised
+        // to \n.  A bare \r is treated as a carriage-return control character
+        // by the terminal emulator, which moves the cursor to column 0 and
+        // causes subsequent characters to visually overwrite the line start —
+        // the exact artifact the user sees as "character jumps to leftmost".
+        let mut app = fresh_app();
+        app.handle_paste("line1\r\nline2");
+        assert_eq!(
+            app.prompt.buffer, "line1\nline2",
+            "\\r must be stripped so only \\n remains"
+        );
+        assert_eq!(app.prompt.cursor, "line1\nline2".len());
+    }
+
+    #[test]
+    fn paste_strips_bare_carriage_return() {
+        // Lone \r (old-style Mac line ending) is also dropped rather than
+        // being passed through as a cursor-jumping control character.
+        let mut app = fresh_app();
+        app.handle_paste("abc\rdef");
+        assert_eq!(app.prompt.buffer, "abcdef");
+        assert_eq!(app.prompt.cursor, "abcdef".len());
     }
 }
 

@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -181,6 +181,52 @@ pub async fn run_with_backend(backend: Backend) -> io::Result<()> {
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            // Guard against fragmented SGR mouse sequences.
+                            //
+                            // The terminal can split `\x1b[<btn;col;rowM` at the
+                            // first byte, delivering `\x1b` as a standalone byte
+                            // before the rest. crossterm then emits `KeyCode::Esc`
+                            // for the `\x1b` and the remaining `[<btn;col;rowM`
+                            // arrives as individual key chars on the next poll.
+                            //
+                            // Detection: if ESC arrives and the very next pending
+                            // event (available with zero timeout) is `[`, we are
+                            // almost certainly seeing a fragmented sequence — real
+                            // ESC + `[` from a human typist would never arrive
+                            // that quickly. Discard both and let the rest of the
+                            // sequence be silently consumed in subsequent iterations
+                            // (the chars are harmless inserts; the double-press
+                            // guard in handle_esc prevents an interrupt).
+                            if key.code == KeyCode::Esc
+                                && event::poll(Duration::ZERO)?
+                            {
+                                if let Ok(Event::Key(nk)) = event::read() {
+                                    if nk.kind == KeyEventKind::Press
+                                        && nk.code == KeyCode::Char('[')
+                                    {
+                                        // Fragmented mouse sequence confirmed —
+                                        // drop the ESC and the `[`; the
+                                        // remaining sequence bytes will be read
+                                        // in the next iteration and inserted
+                                        // harmlessly into the buffer (or ignored
+                                        // when the user is not in a text-input
+                                        // context).
+                                        continue;
+                                    }
+                                    // Next event was something else — process ESC
+                                    // normally, then handle that event.
+                                    if let Some(action) = keymap::dispatch(&mut app, key) {
+                                        let _ = backend.action_tx.send(action);
+                                    }
+                                    if nk.kind == KeyEventKind::Press {
+                                        if let Some(action) = keymap::dispatch(&mut app, nk) {
+                                            let _ = backend.action_tx.send(action);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // read() failed — fall through to normal dispatch.
+                            }
                             if let Some(action) = keymap::dispatch(&mut app, key) {
                                 let _ = backend.action_tx.send(action);
                             }
