@@ -1,7 +1,7 @@
 ---
 type: Skill
 name: loop-supervise
-description: "Generic monitor+intervene playbook for the event-driven /loop. Use when the user wants to run a long-running command and watch it, intervening only when it needs a decision or fix it can't make itself. Project-agnostic; for Recursive's own self-improve flow, prefer the recursive-loop skill."
+description: "Monitor+intervene playbook for the event-driven /loop. Use when the user wants to run a long-running command and watch it, intervening only when it needs a decision or fix it can't make itself. Generic pattern first; includes a dedicated section for Recursive's own self-improve flow (.dev/flows/self-improve.flow.js) with the flow-specific launch args, event schema, and intervention rules (the recursive-loop skill is referenced where it exists, but this skill is self-contained for the flow too)."
 mode: trigger
 triggers: supervise, monitor, watch, 盯, 盯着, 盯住, 长跑, loop, 跑着, 看着
 ---
@@ -15,10 +15,12 @@ when it needs a decision or a fix the command can't make itself — and otherwis
 letting it run to a terminal outcome. This skill teaches the *pattern*; the
 command itself comes from the user's natural-language prompt.
 
-This is the generic, project-agnostic version. If the user is asking to run
-**Recursive's own self-improve flow** (`.dev/flows/self-improve.flow.js`), use
-the `recursive-loop` skill instead — it has the project-specific launch args,
-event schema, and intervention rules.
+This is the generic pattern. It also carries a **dedicated section below**
+("Recursive self-improve flow — flow-specific rules") for Recursive's own
+self-improve flow (`.dev/flows/self-improve.flow.js`): the launch args, event
+schema, and the flow-specific traps that the generic SOP doesn't cover. If
+the `recursive-loop` skill exists in this checkout it has the same info in
+more depth; either is fine to follow.
 
 ## Tools (use them; if one isn't in your eager tool list, `tool_search` for it by name)
 
@@ -97,6 +99,66 @@ event schema, and intervention rules.
 
 - Don't intervene on every hiccup — only on problems the command can't
   self-heal. Many long-running commands retry internally; let them.
+- **For gated commands** (a test/lint/build suite run in stages with an
+  `onFail` policy): learn the policy before judging. `onFail: resume-fix`
+  means a red gate is fed back to the worker as more work — the worker is
+  *already* fixing it, often by re-invoking the very gate script you see
+  "failing" in its transcript. That is the mechanism working, not the worker
+  flailing. Step in only when the fix-round budget is exhausted (watch the
+  `gate.<name>.fix-N` counter and the configured `MAX_FIX_ROUNDS`) or when
+  the failure is environmental and the worker structurally cannot fix it
+  (e.g. a missing service it can't install).
 - Keep interventions minimal and surgical.
 - In one or two lines per wake, note what you observed and what you did, so the
   user can follow along.
+
+## Recursive self-improve flow — flow-specific rules
+
+The generic SOP above covers launch → watch → intervene → stop. When the
+supervised command is **Recursive's own self-improve flow**
+(`.dev/scripts/launch-flow.sh` → `.dev/flows/self-improve.flow.js`), these
+extra rules apply. They are distilled from real supervised runs; the generic
+SOP alone will steer you into at least four avoidable traps.
+
+The flow runs inside a **tmux session**, is **resumable by `--run-id`**, and
+writes everything under `<repo>/.flowcast/runs/<run-id>/` (`state.json`,
+`run.log.jsonl`, `report.md`, `system-prompt.md`, `transcript.json`).
+Verdicts: `committed` (green + review passed → on `main`) ·
+`failed-preserved` (gate/review loop exhausted → worktree +
+`refs/preserve/<run-id>` kept, **not** rolled back) · `skip-commit` ·
+`panic-preserved`.
+
+**Flow-specific traps (do not learn these the hard way):**
+
+1. **Never pre-compile before launch.** The flow's `preflight.build` step
+   builds `recursive-cli` itself. If you run `cargo build --release` in
+   parallel, you contend on the `target/` directory lock and `preflight.build`
+   fails with a misleading error (`invalid character ' ' in package name:
+   ' recursive-cli'` — a corrupted lock state, not a real package-name bug).
+   Let the flow own the build. (Observed 2026-07-31.)
+
+2. **Each launch writes a NEW timestamped log file.** `launch-flow.sh`
+   generates `.flowcast/logs/flow-<TS>.log` afresh on every invocation, so
+   after a resume/re-launch the previous log path is stale. Derive the current
+   log from the run dir's `events.jsonl` mtime, or glob the newest
+   `.flowcast/logs/flow-*.log` — never assume the last run's path still
+   applies.
+
+3. **Resume requires `--goal-file` again.** `--run-id <id>` alone errors with
+   `缺少 --goal 或 --goal-file`. The run-id reuses the run *directory* for
+   outputs; it does **not** restore the goal text. Always pass both:
+   `launch-flow.sh --run-id <id> --goal-file .dev/goals/NN-*.md --provider ...`
+
+4. **Diagnose without polluting `main`.** The flow refuses a dirty `.dev/`
+   (`withSelfModGuard`), so any patch to `.dev/flows/*.js` must be committed
+   before it can run — and forgotten `wip(diag)` commits then sit on `main`
+   ahead of the real goal commit (observed: two throwaway diagnostic commits
+   polluted history). Prefer a **standalone reproducer in `/tmp`** (a CJS
+   `node -e` or `.js` file) over patching the flow script. If you must patch
+   the flow, commit → run → `git revert` (never `reset`; the goal commit sits
+   on top and revert keeps history honest).
+
+These four are flow-specific; the two cross-cutting rules — **probe liveness
+before declaring healthy** (SOP step 5) and **don't intervene on a gate the
+worker is already fixing** (Discipline, `onFail: resume-fix`) — are already
+covered above and apply to the flow too.
