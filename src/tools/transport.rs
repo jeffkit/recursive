@@ -100,6 +100,10 @@ pub struct SshTransport {
     connect_timeout: Duration,
     /// SSH command timeout
     command_timeout: Duration,
+    /// When `true`, skip strict host key verification for ephemeral / throwaway
+    /// hosts. MITM-unsafe: only for trusted networks or disposable sandboxes.
+    /// Default `false` (secure).
+    insecure_host_key_checking: bool,
 }
 
 impl SshTransport {
@@ -114,6 +118,7 @@ impl SshTransport {
             remote_workspace: remote_workspace.into(),
             connect_timeout: Duration::from_secs(10),
             command_timeout: Duration::from_secs(300),
+            insecure_host_key_checking: false,
         }
     }
 
@@ -132,6 +137,20 @@ impl SshTransport {
     /// Set the SSH command timeout.
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = timeout;
+        self
+    }
+
+    /// Opt in to skipping host-key verification (MITM-unsafe).
+    /// Emits a `tracing::warn!` so the choice is visible in logs.
+    ///
+    /// When enabled, commands are built with `StrictHostKeyChecking=accept-new`
+    /// (first-use trust): the remote host key is accepted on first connection
+    /// but later changes are still detected. This is strictly better than
+    /// `StrictHostKeyChecking=no` but is still unsafe against an active MITM
+    /// on the very first connection — only use it for trusted networks or
+    /// disposable sandboxes. Default is `false` (secure).
+    pub fn with_insecure_host_key_checking(mut self, on: bool) -> Self {
+        self.insecure_host_key_checking = on;
         self
     }
 
@@ -156,10 +175,19 @@ impl SshTransport {
 
         // Non-interactive options
         cmd.arg("-o").arg("BatchMode=yes");
-        cmd.arg("-o").arg("StrictHostKeyChecking=no");
-        cmd.arg("-o").arg("UserKnownHostsFile=/dev/null");
         cmd.arg("-o")
             .arg(format!("ConnectTimeout={}", self.connect_timeout.as_secs()));
+
+        // Host key verification is secure by default: use the user's
+        // known_hosts. Only an explicit opt-in relaxes it for ephemeral hosts.
+        if self.insecure_host_key_checking {
+            tracing::warn!(
+                host = %self.host,
+                "SshTransport: host key verification relaxed to StrictHostKeyChecking=accept-new \
+                 (MITM-unsafe — only for trusted networks or disposable sandboxes)"
+            );
+            cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        }
 
         // Optional identity file
         if let Some(ref key) = self.key_path {
@@ -701,8 +729,8 @@ mod tests {
         // Should have BatchMode=yes
         assert!(args.contains(&"-o".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
-        // Should have StrictHostKeyChecking=no
-        assert!(args.contains(&"StrictHostKeyChecking=no".to_string()));
+        // Default must NOT disable host key verification
+        assert!(!args.contains(&"StrictHostKeyChecking=no".to_string()));
     }
 
     #[test]
@@ -889,9 +917,10 @@ mod tests {
         assert!(args.contains(&"ConnectTimeout=15".to_string()));
     }
 
-    /// Test that the SSH command construction includes UserKnownHostsFile=/dev/null.
+    /// Test that the default SSH command does NOT discard known_hosts
+    /// verification (previously it appended UserKnownHostsFile=/dev/null).
     #[test]
-    fn ssh_build_command_known_hosts() {
+    fn ssh_build_command_known_hosts_secure_by_default() {
         let t = SshTransport::new("user@host", "/remote/workspace");
         let cmd = t.build_ssh_command("echo test");
         let args: Vec<String> = cmd
@@ -900,6 +929,51 @@ mod tests {
             .map(|s| s.to_string_lossy().to_string())
             .collect();
 
-        assert!(args.contains(&"UserKnownHostsFile=/dev/null".to_string()));
+        assert!(!args.contains(&"UserKnownHostsFile=/dev/null".to_string()));
+    }
+
+    /// The default SSH command must keep host key verification enabled.
+    #[test]
+    fn default_ssh_command_does_not_disable_host_key_checking() {
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let cmd = t.build_ssh_command("echo test");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(!args.contains(&"StrictHostKeyChecking=no".to_string()));
+        assert!(!args.contains(&"UserKnownHostsFile=/dev/null".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+    }
+
+    /// Opting in to insecure host key checking relaxes verification via
+    /// `StrictHostKeyChecking=accept-new` (first-use trust).
+    #[test]
+    fn insecure_opt_in_enables_host_key_checking_bypass() {
+        let t = SshTransport::new("user@host", "/remote/workspace")
+            .with_insecure_host_key_checking(true);
+        let cmd = t.build_ssh_command("echo test");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(!args.contains(&"StrictHostKeyChecking=no".to_string()));
+        assert!(!args.contains(&"UserKnownHostsFile=/dev/null".to_string()));
+    }
+
+    /// A fresh transport must default to secure host key checking.
+    #[test]
+    fn insecure_opt_in_defaults_to_false() {
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        assert!(!t.insecure_host_key_checking);
+        let t = t.with_insecure_host_key_checking(true);
+        assert!(t.insecure_host_key_checking);
+        let t = t.with_insecure_host_key_checking(false);
+        assert!(!t.insecure_host_key_checking);
     }
 }
