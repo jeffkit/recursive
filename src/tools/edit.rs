@@ -430,9 +430,22 @@ useful if you want to rename a variable for instance."
 
         let abs_path = resolve_within_any(&self.all_roots(), file_path, true)?;
 
-        // ── Partial-read guard ──────────────────────────────────────────
-        // Reject edits on files that have never been read, or were only read
-        // partially (via start_line/end_line), in this session.
+        // ── Read-state guard ────────────────────────────────────────────
+        // A file must have been Read at least once this session (full or
+        // partial) before it can be Edited — editing a file the model never
+        // laid eyes on is disallowed.
+        //
+        // Goal 347: a *partial* read (via start_line/end_line) is NO LONGER a
+        // rejection. Previously it forced the model to re-Read the complete
+        // file, which for large files (e.g. runtime.rs, ~3500 lines) blew up
+        // the context and trapped the agent in a partial-read → reject →
+        // full-read-too-big → partial-read loop. The Edit tool does not need
+        // the model to hold the whole file in context: it reads the current
+        // disk content itself at line 557 below and validates `old_string` is
+        // present and unique (the real safety gate). `old_string` is the
+        // model's proof it knows the exact bytes being replaced. (WriteFile,
+        // which has no `old_string` anchor and would clobber unseen content,
+        // KEEPS its partial-read reject — see fs.rs.)
         //
         // The lock is acquired briefly to extract the record, then dropped
         // before any `.await` to keep the future `Send`.
@@ -451,16 +464,6 @@ useful if you want to rename a variable for instance."
                             message: format!(
                                 "File `{file_path}` has not been read yet. \
                                  Read it first before editing."
-                            ),
-                        });
-                    }
-                    Some(record) if record.is_partial => {
-                        return Err(Error::Tool {
-                            name: "Edit".into(),
-                            call_id: None,
-                            message: format!(
-                                "File `{file_path}` was only partially read \
-                                 (line range). Read the complete file before editing."
                             ),
                         });
                     }
@@ -1350,7 +1353,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_rejected_when_partial_read() {
+    async fn edit_allowed_after_partial_read() {
+        // Goal 347: a partial read no longer blocks an Edit. Previously this
+        // asserted a "partially read" rejection; now the Edit falls through to
+        // the on-disk read + old_string match and succeeds.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("src.txt");
         std::fs::write(&path, "hello world\n").unwrap();
@@ -1362,7 +1368,7 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             get_file_mtime(&path),
         );
-        let err = EditTool::new(tmp.path())
+        let result = EditTool::new(tmp.path())
             .with_read_state(slot)
             .execute(serde_json::json!({
                 "file_path": "src.txt",
@@ -1370,12 +1376,13 @@ mod tests {
                 "new_string": "goodbye"
             }))
             .await
-            .unwrap_err();
-        let msg = format!("{err}");
+            .unwrap();
         assert!(
-            msg.contains("partially read"),
-            "expected 'partially read', got: {msg}"
+            result.contains("updated successfully"),
+            "partial read + valid old_string must now succeed, got: {result}"
         );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "goodbye world\n");
     }
 
     #[tokio::test]
@@ -1556,6 +1563,124 @@ mod tests {
         assert!(
             msg.contains("too large to edit"),
             "expected 'too large to edit', got: {msg}"
+        );
+    }
+
+    // ── Goal 347: partial read no longer blocks Edit ─────────────────────
+    //
+    // These share a read_state slot between ReadFile and EditTool so a ranged
+    // Read (is_partial=true) is recorded, then Edit is attempted. Before goal
+    // 347 the partial-read arm hard-rejected; now it falls through to the
+    // on-disk read + old_string match.
+
+    use crate::tools::ReadFile;
+    use std::sync::{Arc, Mutex};
+
+    /// Read a file with a line range (→ is_partial=true), then Edit a snippet
+    /// that exists and is unique → must succeed. Headline regression test:
+    //  would have failed before goal 347 (hard reject on partial read).
+    #[tokio::test]
+    async fn edit_succeeds_after_partial_read_when_old_string_found() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("e.txt");
+        std::fs::write(&path, "line1\nline2 target\nline3\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        // Partial read via line range.
+        ReadFile::new(tmp.path())
+            .with_read_state(slot.clone())
+            .execute(serde_json::json!({"path": "e.txt", "start_line": 1, "end_line": 2}))
+            .await
+            .unwrap();
+        // Edit a snippet that is present and unique on disk.
+        let result = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "e.txt",
+                "old_string": "line2 target",
+                "new_string": "line2 edited",
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("updated successfully"), "got: {result}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\nline2 edited\nline3\n");
+    }
+
+    /// Partial read, then Edit with an old_string NOT in the file → still
+    /// rejected with "not found". Proves the old_string validation is intact;
+    /// only the read guard was relaxed.
+    #[tokio::test]
+    async fn edit_after_partial_read_still_rejects_missing_old_string() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("e.txt"), "alpha\nbeta\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        ReadFile::new(tmp.path())
+            .with_read_state(slot.clone())
+            .execute(serde_json::json!({"path": "e.txt", "start_line": 1, "end_line": 1}))
+            .await
+            .unwrap();
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "e.txt",
+                "old_string": "not-in-file",
+                "new_string": "x",
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "expected not found, got: {msg}");
+    }
+
+    /// Partial read, file with duplicate lines, Edit without replace_all →
+    /// still rejected as ambiguous. Proves the uniqueness guard is intact.
+    #[tokio::test]
+    async fn edit_after_partial_read_still_rejects_ambiguous_old_string() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("e.txt"), "dup\ndup\ndup\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        ReadFile::new(tmp.path())
+            .with_read_state(slot.clone())
+            .execute(serde_json::json!({"path": "e.txt", "start_line": 1, "end_line": 2}))
+            .await
+            .unwrap();
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "e.txt",
+                "old_string": "dup",
+                "new_string": "uniq",
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("matches") || msg.contains("replace_all"),
+            "expected ambiguity rejection, got: {msg}"
+        );
+    }
+
+    /// No Read at all → still rejected with "has not been read yet".
+    /// Proves the None arm (never-read invariant) is unchanged.
+    #[tokio::test]
+    async fn edit_still_rejects_never_read_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("e.txt"), "hello\n").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        // NOTE: no ReadFile call — record is absent.
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "e.txt",
+                "old_string": "hello",
+                "new_string": "world",
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("has not been read yet"),
+            "expected never-read rejection, got: {msg}"
         );
     }
 }

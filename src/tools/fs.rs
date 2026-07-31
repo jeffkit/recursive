@@ -473,6 +473,13 @@ impl Tool for WriteFile {
                                 ),
                             });
                         }
+                        // Goal 347: Write KEEPS the partial-read reject, even
+                        // though Edit's was relaxed. Write is a whole-file
+                        // overwrite with no `old_string` anchor, so a partial
+                        // read means the model has not seen the bytes it is
+                        // about to clobber. Edit can verify `old_string`
+                        // against disk; Write cannot, so it must require a
+                        // full read.
                         Some(record) if record.is_partial => {
                             return Err(Error::Tool {
                                 name: "Write".into(),
