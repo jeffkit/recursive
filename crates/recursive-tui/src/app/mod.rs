@@ -59,12 +59,16 @@ pub struct App {
     /// `deepseek-v4-flash` model fallback while the agent can't actually run.
     pub offline_reason: Option<String>,
     pub scroll_offset: usize,
-    /// Goal-349: active text selection over the visible transcript window,
-    /// as `(start_row, end_row)` inclusive physical-row indices relative to
-    /// the *visible* window (0 = top visible row). `None` when nothing is
-    /// selected. Cleared whenever `scroll_offset` changes (see the scroll
-    /// arms in `handle_key` / `handle_mouse`) so the highlight never
-    /// desyncs from the rows it was drawn against.
+    /// Goal-349: active text selection over the visible transcript window.
+    /// Stored as `(anchor, cursor)` physical-row indices relative to the
+    /// *visible* window (0 = top visible row): the anchor is the row where
+    /// the mouse button was pressed and stays fixed for the whole drag,
+    /// while the cursor follows the pointer. Consumers normalise the pair
+    /// with min/max (see `handle_mouse` in `lib.rs`, the highlight in
+    /// `ui/chat.rs`), so upward and downward drags behave identically.
+    /// `None` when nothing is selected. Cleared whenever `scroll_offset`
+    /// changes (see the scroll arms in `handle_key` / `handle_mouse`) so
+    /// the highlight never desyncs from the rows it was drawn against.
     pub selection: Option<(usize, usize)>,
     /// Goal-349: text of the most recent successful copy (mouse-release or
     /// yank). Primary purpose: a testable mirror of the clipboard. In
@@ -72,6 +76,13 @@ pub struct App {
     /// display server / sandbox), so every copy path writes the same text
     /// here as a fallback that unit tests assert on.
     pub last_copied: Option<String>,
+    /// Goal-349 follow-up: transient status-bar notice reporting how many
+    /// characters the last copy (mouse-release or yank) put on the
+    /// clipboard, as `(char_count, copied_at)`. The release itself already
+    /// copies — no extra key is needed — and this notice is the only
+    /// feedback the user gets, so `ui::status` renders it for ~3 seconds
+    /// after the copy and then drops it by age-checking `copied_at`.
+    pub copy_notice: Option<(usize, std::time::Instant)>,
     /// Goal-349: width (columns) of the messages panel at the last render,
     /// recorded at the top of `ui::chat::render`. The mouse/keyboard copy
     /// paths recompute the visible window via

@@ -170,6 +170,24 @@ pub fn build_line(app: &App) -> Line<'static> {
         ));
     }
 
+    // [copy notice] — Goal-349 follow-up: transient feedback after a
+    // mouse-release or yank copy. Copying happens automatically on mouse
+    // release (no extra key); without this segment the user would have no
+    // idea the copy succeeded. Shown for ~3 seconds, then the segment
+    // drops off (the notice ages out naturally — nothing clears it).
+    if let Some((chars, at)) = app.copy_notice {
+        if at.elapsed() <= std::time::Duration::from_secs(3) {
+            spans.push(separator());
+            spans.push(Span::styled(
+                format!("copied {chars} chars"),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
     Line::from(spans)
 }
 
@@ -664,5 +682,44 @@ mod tests {
             text.contains("loop: turn 1/5"),
             "render wrote loop: {text:?}"
         );
+    }
+
+    // ── Goal-349 follow-up: transient copy notice ──────────────────────
+
+    #[test]
+    fn status_bar_shows_copy_notice_with_char_count() {
+        // Copying happens automatically on mouse release — no extra key —
+        // so the notice is the only feedback the user gets. "hello world"
+        // is 11 characters.
+        let mut app = App::new();
+        app.copy_text("hello world".to_string());
+        let text = line_text(&build_line(&app));
+        assert!(text.contains("copied 11 chars"), "got {text:?}");
+        // The notice must be a distinct segment, not merged into the
+        // workspace/model text.
+        assert!(text.contains('│'), "notice needs a separator: {text:?}");
+    }
+
+    #[test]
+    fn status_bar_hides_copy_notice_after_expiry() {
+        // The notice ages out ~3s after the copy; once expired it must not
+        // render. Drive the age by moving the stored Instant into the past.
+        let mut app = App::new();
+        app.copy_text("hello".to_string());
+        if let Some((_, at)) = &mut app.copy_notice {
+            *at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        }
+        let text = line_text(&build_line(&app));
+        assert!(
+            !text.contains("copied"),
+            "expired notice still shown: {text:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_no_copy_notice_before_any_copy() {
+        let app = App::new();
+        let text = line_text(&build_line(&app));
+        assert!(!text.contains("copied"), "no copy → no notice: {text:?}");
     }
 }
