@@ -41,6 +41,25 @@ pub use pricing::{
     RetryPolicy,
 };
 
+// ── Max-output-tokens default ────────────────────────────────────────────────
+
+/// Default per-response output token cap used when neither the
+/// `RECURSIVE_MAX_TOKENS` env var, the active provider preset's
+/// `ModelSpec.max_tokens`, nor the config-file `agent.max_tokens` is set.
+///
+/// Chosen to align with the escalation ceiling other coding agents use
+/// (e.g. Claude Code's `ESCALATED_MAX_TOKENS = 64_000`). 64K is generous
+/// for reasoning-heavy turns (the failure mode that motivated this: a
+/// 16_384 cap truncated a ~60K-char reasoning turn mid-plan, producing an
+/// empty tool-call message and `provider_stop:length`) yet still far below
+/// the real ceiling of modern providers (DeepSeek V4 = 384K, MiniMax M3
+/// ~1M context), so it neither truncates useful work nor over-reserves
+/// slot capacity.
+///
+/// Providers seed their struct default from this; `Config::from_env` uses
+/// it as the final fallback. Override per-run with `RECURSIVE_MAX_TOKENS`.
+pub const DEFAULT_MAX_TOKENS: u32 = 65_536;
+
 // ── Re-exports: provider implementations ─────────────────────────────────────
 
 #[cfg(feature = "anthropic")]

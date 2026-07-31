@@ -2941,6 +2941,7 @@ mod tests {
         let probed = vec![recursive::providers::ModelSpec {
             name: "my-local-model:latest".into(),
             context_window: 4096,
+            max_tokens: None,
             pricing: None,
         }];
         let _probe = pin_ollama_probe(Some(crate::ollama_probe::OllamaPickerModels::Local(probed)));

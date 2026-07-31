@@ -73,6 +73,7 @@ fn mock_config(workspace: PathBuf) -> Config {
         provider_type: "openai".into(),
         preset: None,
         max_steps: 32,
+        max_tokens: 65536,
         temperature: 0.0,
         system_prompt: "You are a test assistant.".into(),
         retry_max: 0,

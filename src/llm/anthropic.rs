@@ -61,7 +61,13 @@ impl AnthropicProvider {
             model: model.into(),
             client,
             temperature: 0.2,
-            max_tokens: 4096,
+            // Seed from the crate default (see openai.rs for the rationale:
+            // 4096 was far too small and truncated reasoning turns). The
+            // Anthropic Messages API requires `max_tokens` and enforces a
+            // model-specific ceiling, but 64K is within every current
+            // Claude model's limit and is overridden via `with_max_tokens`
+            // from `Config::from_env` (RECURSIVE_MAX_TOKENS) anyway.
+            max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
             max_search_rounds: 3,
         })

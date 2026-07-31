@@ -27,6 +27,20 @@ pub struct Config {
     /// Maximum agent loop iterations per turn/goal.
     /// `0` = unlimited (agent stops on `NoMoreToolCalls`, stuck, transcript limit, etc.).
     pub max_steps: usize,
+    /// Maximum tokens the model may generate per response. Mirrors the
+    /// `max_tokens` / `max_output_tokens` field of OpenAI-/Anthropic-style
+    /// providers. Resolved with three-tier precedence (see `from_env`):
+    ///   1. `RECURSIVE_MAX_TOKENS` env var (highest)
+    ///   2. provider `ModelSpec.max_tokens` / config-file `agent.max_tokens`
+    ///   3. [`crate::llm::DEFAULT_MAX_TOKENS`] (64K — see note below)
+    ///
+    /// Historical note: this used to be a hard-coded 16384 inside each
+    /// provider struct, with a stale comment claiming DeepSeek's ceiling was
+    /// "8192 for v3". DeepSeek V4 actually supports up to 384K output tokens
+    /// (flash == pro); 16384 was needlessly truncating reasoning-heavy turns
+    /// (`provider_stop:length` with empty content). 64K aligns with the
+    /// escalation ceiling other coding agents (Claude Code) use.
+    pub max_tokens: u32,
     pub temperature: f64,
     pub system_prompt: String,
     pub retry_max: usize,
@@ -123,6 +137,7 @@ impl std::fmt::Debug for Config {
             .field("provider_type", &self.provider_type)
             .field("preset", &self.preset)
             .field("max_steps", &self.max_steps)
+            .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("system_prompt", &self.system_prompt)
             .field("retry_max", &self.retry_max)
@@ -348,6 +363,28 @@ impl Config {
             .or_else(|| file_agent.and_then(|a| a.max_steps))
             .unwrap_or(0);
 
+        // Three-tier max_tokens resolution (env > provider/file config > default).
+        // 1) RECURSIVE_MAX_TOKENS env var wins outright.
+        // 2) Else the active provider preset's ModelSpec.max_tokens for the
+        //    configured model, falling back to the config file's agent.max_tokens.
+        // 3) Else the crate default (DEFAULT_MAX_TOKENS = 64K).
+        let max_tokens = std::env::var("RECURSIVE_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                // Look up the active model's spec in the resolved preset and
+                // read its optional max_tokens. Falls through to the file-level
+                // agent.max_tokens when the preset/model has none.
+                preset.as_ref().and_then(|p| {
+                    p.models
+                        .iter()
+                        .find(|m| m.name == model)
+                        .and_then(|m| m.max_tokens)
+                })
+            })
+            .or_else(|| file_agent.and_then(|a| a.max_tokens))
+            .unwrap_or(crate::llm::DEFAULT_MAX_TOKENS);
+
         let temperature = std::env::var("RECURSIVE_TEMPERATURE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -561,6 +598,7 @@ impl Config {
             provider_type,
             preset: preset.map(|p| p.id.clone()),
             max_steps,
+            max_tokens,
             temperature,
             system_prompt,
             retry_max,
@@ -852,6 +890,59 @@ mod tests {
     }
 
     #[test]
+    fn max_tokens_defaults_to_crate_default() {
+        // When no env var and no preset/file override, from_env must fall
+        // through to DEFAULT_MAX_TOKENS (64K) — the fix for the 16384 cap
+        // that truncated reasoning turns with provider_stop:length.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        unsafe {
+            std::env::remove_var("RECURSIVE_MAX_TOKENS");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.max_tokens,
+            crate::llm::DEFAULT_MAX_TOKENS,
+            "max_tokens should default to DEFAULT_MAX_TOKENS ({}), got {}",
+            crate::llm::DEFAULT_MAX_TOKENS,
+            config.max_tokens
+        );
+    }
+
+    #[test]
+    fn max_tokens_env_var_overrides_default() {
+        // RECURSIVE_MAX_TOKENS env var is the highest-priority source and
+        // must win over the crate default.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        unsafe {
+            std::env::set_var("RECURSIVE_MAX_TOKENS", "131072");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.max_tokens, 131_072);
+        unsafe {
+            std::env::remove_var("RECURSIVE_MAX_TOKENS");
+        }
+    }
+
+    #[test]
+    fn max_tokens_default_is_not_the_old_16384() {
+        // Regression guard: the old hard-coded 16384 must never silently
+        // come back. DEFAULT_MAX_TOKENS is intentionally much larger so
+        // reasoning-heavy turns aren't truncated mid-generation. We read the
+        // constant into a runtime value so clippy's `assertions_on_constants`
+        // lint doesn't fire on `assert!(CONST > ...)`.
+        let default = crate::llm::DEFAULT_MAX_TOKENS;
+        assert!(
+            default > 16_384,
+            "DEFAULT_MAX_TOKENS regressed to <= 16384 — reasoning turns will be truncated again"
+        );
+        assert_eq!(default, 65_536);
+    }
+
+    #[test]
     fn retry_defaults_match_old_policy() {
         // Ensure defaults match the hardcoded RetryPolicy::default()
         let config = Config {
@@ -862,6 +953,7 @@ mod tests {
             provider_type: "openai".into(),
             preset: None,
             max_steps: 32,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: String::new(),
             retry_max: 2,
@@ -1566,6 +1658,7 @@ preset = "totally-bogus-id"
             provider_type: "openai".into(),
             preset: None,
             max_steps: 32,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: String::new(),
             retry_max: 2,
@@ -1712,6 +1805,7 @@ api_key = "sk-from-file"
                 provider_type: "openai".into(),
                 preset: None,
                 max_steps: 0,
+                max_tokens: 65536,
                 temperature: 0.2,
                 system_prompt: String::new(),
                 retry_max: 2,
@@ -1761,6 +1855,7 @@ api_key = "sk-from-file"
             provider_type: "openai".into(),
             preset: None,
             max_steps: 0,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: String::new(),
             retry_max: 2,
@@ -1848,6 +1943,7 @@ api_key = "sk-from-file"
             provider_type: "openai".into(),
             preset: None,
             max_steps: 0,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: String::new(),
             retry_max: 2,

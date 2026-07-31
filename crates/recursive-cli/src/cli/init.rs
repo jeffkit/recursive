@@ -529,6 +529,7 @@ pub(crate) async fn run_init(
             snapshot.models.push(recursive::providers::ModelSpec {
                 name: model.clone(),
                 context_window: 0,
+                max_tokens: None,
                 pricing: None,
             });
         }
@@ -746,6 +747,7 @@ mod tests {
                 .map(|(name, ctx)| ModelSpec {
                     name: (*name).to_string(),
                     context_window: *ctx,
+                    max_tokens: None,
                     pricing: Some(ModelPricingSpec {
                         input_per_million: 0.0,
                         output_per_million: 0.0,

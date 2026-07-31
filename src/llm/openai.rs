@@ -75,15 +75,16 @@ impl OpenAiProvider {
             model: model.into(),
             client,
             temperature: 0.2,
-            // DeepSeek defaults to a per-response cap of 4096 tokens; any
-            // tool call whose `arguments` string holds more than that — e.g.
-            // a `write_file` with a multi-kilobyte `contents` field — gets
-            // truncated server-side and arrives as malformed JSON. 16384 is
-            // both within DeepSeek's hard ceiling (8192 for v3, 32K-64K for
-            // newer models) and big enough for whole-file writes. Callers
-            // can override with `with_max_tokens` if their provider supports
-            // more or needs less.
-            max_tokens: 16384,
+            // Per-response output token cap. Seed from the crate default
+            // (DEFAULT_MAX_TOKENS = 64K); callers override via
+            // `with_max_tokens`, which `Config::from_env` drives from
+            // `RECURSIVE_MAX_TOKENS` (env > provider ModelSpec.max_tokens
+            // > agent.max_tokens > this default). The historical 16384
+            // default + the comment below ("DeepSeek ceiling 8192 for v3")
+            // were stale: DeepSeek V4 supports up to 384K output tokens
+            // (flash == pro), and 16384 truncated reasoning-heavy turns
+            // mid-generation (`provider_stop:length` with empty content).
+            max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
             stream_tx: None,
             search_engine: Arc::new(KeywordSearchEngine::new()),

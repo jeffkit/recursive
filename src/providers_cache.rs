@@ -312,6 +312,7 @@ mod tests {
             models: vec![ModelSpec {
                 name: "test-model".to_string(),
                 context_window: 4096,
+                max_tokens: None,
                 pricing: Some(ModelPricingSpec {
                     input_per_million: 0.10,
                     output_per_million: 0.20,

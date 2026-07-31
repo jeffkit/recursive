@@ -702,12 +702,14 @@ async fn main() -> anyhow::Result<()> {
                     let anthropic =
                         AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                             .with_temperature(config.temperature)
+                            .with_max_tokens(config.max_tokens)
                             .with_retry_policy(anthropic_retry);
                     Arc::new(anthropic)
                 }
                 _ => {
                     let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                         .with_temperature(config.temperature)
+                        .with_max_tokens(config.max_tokens)
                         .with_retry_policy(retry);
                     Arc::new(openai)
                 }
@@ -740,12 +742,14 @@ async fn main() -> anyhow::Result<()> {
                         let anthropic =
                             AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                                 .with_temperature(config.temperature)
+                                .with_max_tokens(config.max_tokens)
                                 .with_retry_policy(anthropic_retry);
                         Arc::new(anthropic)
                     }
                     _ => {
                         let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                             .with_temperature(config.temperature)
+                            .with_max_tokens(config.max_tokens)
                             .with_retry_policy(retry);
                         Arc::new(openai)
                     }
@@ -1912,12 +1916,14 @@ async fn run_loop(
             };
             let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
+                .with_max_tokens(config.max_tokens)
                 .with_retry_policy(anthropic_retry);
             Arc::new(anthropic)
         }
         _ => {
             let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
+                .with_max_tokens(config.max_tokens)
                 .with_retry_policy(retry);
             Arc::new(openai)
         }
@@ -2758,6 +2764,7 @@ mod tests {
             provider_type: "openai".into(),
             preset: None,
             max_steps: 1,
+            max_tokens: 65536,
             temperature: 0.0,
             system_prompt: "test".into(),
             retry_max: 0,

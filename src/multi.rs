@@ -573,6 +573,7 @@ mod tests {
             provider_type: "openai".into(),
             preset: None,
             max_steps: 32,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: String::new(),
             retry_max: 2,

@@ -245,6 +245,7 @@ pub fn parse_tags(body: &[u8]) -> Vec<ModelSpec> {
                 })
                 .unwrap_or(DEFAULT_CONTEXT_WINDOW),
             name,
+            max_tokens: None,
             pricing: None,
         })
         .collect()
@@ -402,6 +403,7 @@ mod tests {
         OllamaPickerModels::Local(vec![ModelSpec {
             name: "cached-model:latest".into(),
             context_window: DEFAULT_CONTEXT_WINDOW,
+            max_tokens: None,
             pricing: None,
         }])
     }

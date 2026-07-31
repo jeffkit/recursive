@@ -19,6 +19,13 @@ pub struct ModelSpec {
     pub context_window: usize,
     /// Optional pricing. When present, used by `pricing_for()` instead of hard-coded values.
     pub pricing: Option<ModelPricingSpec>,
+    /// Optional per-model `max_tokens` (max output tokens per response).
+    /// When set, `Config::from_env` uses it as the second-tier default for
+    /// `RECURSIVE_MAX_TOKENS` (env var still wins). `None` = fall through to
+    /// the crate default. Optional so existing `providers.toml` entries and
+    /// `providers.d` overrides need not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -751,6 +758,7 @@ key_url = "https://custom.example.com/keys"
             models: vec![ModelSpec {
                 name: "wh-1".to_string(),
                 context_window: 8192,
+                max_tokens: None,
                 pricing: Some(ModelPricingSpec {
                     input_per_million: 0.10,
                     output_per_million: 0.20,

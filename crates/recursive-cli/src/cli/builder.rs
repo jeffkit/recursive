@@ -355,6 +355,7 @@ pub(crate) async fn build_runtime(
             };
             let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
+                .with_max_tokens(config.max_tokens)
                 .with_retry_policy(anthropic_retry)
                 .with_max_search_rounds(config.max_search_rounds);
             Arc::new(anthropic)
@@ -362,6 +363,7 @@ pub(crate) async fn build_runtime(
         _ => {
             let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
                 .with_temperature(config.temperature)
+                .with_max_tokens(config.max_tokens)
                 .with_retry_policy(retry)
                 .with_max_search_rounds(config.max_search_rounds);
             Arc::new(openai)
@@ -546,6 +548,7 @@ mod tests {
             provider_type: "openai".to_string(),
             preset: None,
             max_steps: 32,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: String::new(),
             retry_max: 2,

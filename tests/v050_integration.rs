@@ -35,6 +35,7 @@ mod v050_integration {
             provider_type: "openai".into(),
             preset: None,
             max_steps: 10,
+            max_tokens: 65536,
             temperature: 0.2,
             system_prompt: "You are a helpful assistant.".into(),
             retry_max: 0,

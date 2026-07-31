@@ -73,6 +73,11 @@ pub struct ProviderSection {
 #[derive(Debug, Deserialize)]
 pub struct AgentSection {
     pub max_steps: Option<usize>,
+    /// Optional `max_tokens` override (max output tokens per response).
+    /// Second-tier fallback for `RECURSIVE_MAX_TOKENS` (env var wins; the
+    /// active provider preset's ModelSpec.max_tokens is consulted first).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
     pub shell_timeout_secs: Option<u64>,
 }
