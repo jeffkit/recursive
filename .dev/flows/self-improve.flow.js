@@ -572,12 +572,36 @@ async function landPreserve(preserveRunId) {
     for (const g of gates) {
       await cp.step(`land.gate.${g.name}`, () => runGate(g, { resumeFix: null }))
     }
-    // 全绿 → cherry-pick 到 main
+    // 全绿 → 落地 preserve 的完整改动树到 main。
+    // 关键：不能 `cherry-pick <sha>`——sha 是 preserve 链顶最后一个 commit，当
+    // preserve worktree 在初次 preserve 后又被追加 commit（人工修正 / resume 产生
+    // 新 commit）时，cherry-pick 单个 sha 只带最后一个 commit 相对其父的增量，
+    // 丢掉同链更早的 commit（真实案例 g334：丢了 591 行核心实现，只剩 75 行测试）。
+    // 用 merge-base 求 sha 相对 main 的共同祖先，diff ancestor..sha 就是 preserve
+    // 上累积的全部改动（与 preserveScene 导出 preserved.diff 的 baseline..wtSha 思路
+    // 一致），apply 后压成单个干净 commit。不依赖 state 里存 baseline。
     const mainHead = git(['rev-parse', 'HEAD'], repo)
-    try { git(['cherry-pick', '--no-commit', sha], repo) } catch (err) {
-      try { git(['cherry-pick', '--abort'], repo) } catch { /* 未进入 cherry-pick */ }
-      throw new Error(`cherry-pick conflict landing ${sha.slice(0, 8)}: ${err.message}`)
+    const ancestor = git(['merge-base', mainHead, sha], repo)
+    if (ancestor === sha) {
+      throw new Error(`land-preserve: ${sha.slice(0, 8)} 已是 main 的祖先，无可落地改动`)
     }
+    const fullDiff = git(['diff', `${ancestor}..${sha}`], repo)
+    if (fullDiff.trim()) {
+      // git() 不支持 stdin，把 diff 写到 run 目录的临时文件再 apply（不污染 main 树）。
+      // 注意 git() 对 stdout 做了 .trim()，会剪掉 diff 末尾换行导致 `git apply` 报
+      // "corrupt patch"，这里补回末尾换行保证 patch 格式完整。
+      const diffFile = join(cp.dir, 'land.diff')
+      writeFileSync(diffFile, fullDiff.endsWith('\n') ? fullDiff : fullDiff + '\n')
+      try {
+        git(['apply', diffFile], repo)
+      } catch (err) {
+        // apply 失败可能让 main 工作树半应用——清理未提交改动，恢复到 mainHead。
+        try { git(['checkout', '--', '.'], repo) } catch { /* */ }
+        try { git(['clean', '-fd'], repo) } catch { /* */ }
+        throw new Error(`land-preserve apply 冲突 (${ancestor.slice(0, 8)}..${sha.slice(0, 8)}): ${err.message}`)
+      }
+    }
+    git(['add', '-A'], repo)
     git(['commit', '-m', `self-improve: ${goalSubject()} [land-preserve ${preserveRunId.slice(-6)}]`], repo)
     const landed = git(['rev-parse', '--short', 'HEAD'], repo)
     console.log(`[land-preserve] ✅ 已落地 ${landed}`)
