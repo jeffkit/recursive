@@ -119,6 +119,7 @@ pub fn render_block(block: &TranscriptBlock, th: &Theme, width: u16) -> Vec<Line
             text,
             streaming,
             duration_ms,
+            ..
         } => render_reasoning(text, *streaming, *duration_ms),
         TranscriptBlock::ToolCall {
             name,
@@ -828,6 +829,7 @@ mod tests {
                 text: "let me think about this\nmaybe this way".into(),
                 streaming: true,
                 duration_ms: None,
+                started: None,
             },
             &theme::DARK,
             0,
@@ -855,6 +857,7 @@ mod tests {
                 text: "done thinking".into(),
                 streaming: false,
                 duration_ms: Some(36_900),
+                started: None,
             },
             &theme::DARK,
             0,
@@ -877,6 +880,7 @@ mod tests {
                 text: String::new(),
                 streaming: false,
                 duration_ms: None,
+                started: None,
             },
             &theme::DARK,
             0,

@@ -474,6 +474,13 @@ impl App {
     /// block. Reasoning deltas arrive before the answer's text deltas,
     /// so the streaming Reasoning block is created first and naturally
     /// sits above the streaming Assistant block.
+    ///
+    /// Goal-352: when a *new* block is created we re-arm the spinner's
+    /// step timer (`turn.start_step()`) so the live `∴ Thinking…`
+    /// counter restarts from 0.0 at the start of each thought, and we
+    /// stamp the block's own `started` instant so its finalised
+    /// `duration_ms` is measured per-block instead of from the turn
+    /// start.
     fn append_streaming_reasoning(&mut self, chunk: &str) {
         if let Some(TranscriptBlock::Reasoning {
             text,
@@ -483,10 +490,15 @@ impl App {
         {
             text.push_str(chunk);
         } else {
+            // Goal-352: order start_step() and Instant::now() adjacent so
+            // the live spinner and the block's internal clock share
+            // essentially the same origin.
+            self.turn.start_step(); // Goal-352: live Thinking timer restarts per thought
             self.blocks.push(TranscriptBlock::Reasoning {
                 text: chunk.to_string(),
                 streaming: true,
                 duration_ms: None,
+                started: Some(std::time::Instant::now()), // Goal-352
             });
         }
     }
@@ -501,29 +513,43 @@ impl App {
     /// one before a trailing streaming Assistant block (keeping the
     /// visual order thinking → answer), or push it.
     ///
-    /// Stamps `duration_ms` from the turn start so the renderer can
-    /// switch the header from `∴ Thinking…` to `∴ Thought for Xs`.
+    /// Goal-352: stamps `duration_ms` from THIS block's own `started`
+    /// instant (not the turn start), so a turn with several thoughts
+    /// reports each thought's real elapsed time. The old code used
+    /// `self.turn.started_at`, which accumulated across every
+    /// thought+tool in the turn (second thought showed 20s after a
+    /// 10s first thought + gap).
     fn finalise_streaming_reasoning(&mut self, content: String) {
-        let duration_ms = self.turn.started_at.map(|t| t.elapsed().as_millis() as u64);
+        // Capture `now` once before the loop so the measured duration is
+        // not inflated by iteration.
+        let now = std::time::Instant::now();
         for block in self.blocks.iter_mut().rev() {
             if let TranscriptBlock::Reasoning {
                 text,
                 streaming,
-                duration_ms: dur,
+                duration_ms,
+                started,
             } = block
             {
                 if *streaming {
                     *text = content;
                     *streaming = false;
-                    *dur = duration_ms;
+                    // checked_duration_since: a monotonic-clock oddity
+                    // yields None (→ renders as `∴ Thought`) rather than a
+                    // panic (invariant #5 — no unwrap in product code).
+                    *duration_ms = started
+                        .and_then(|t| now.checked_duration_since(t).map(|d| d.as_millis() as u64));
                     return;
                 }
             }
         }
+        // Non-streaming path (no prior ReasoningPartial): no start instant
+        // was recorded, so duration is unknown → renders as `∴ Thought`.
         let block = TranscriptBlock::Reasoning {
             text: content,
             streaming: false,
-            duration_ms,
+            duration_ms: None,
+            started: None,
         };
         let insert_before_last = matches!(
             self.blocks.last(),
@@ -623,19 +649,26 @@ mod tests {
         app.handle_ui_event(UiEvent::ReasoningPartial {
             text: "Step two.".into(),
         });
-        // Mid-stream the reasoning block is live.
-        match app.blocks.last() {
+        // Mid-stream the reasoning block is live, with its own start
+        // instant already stamped (Goal-352).
+        let started_before = match app.blocks.last() {
             Some(TranscriptBlock::Reasoning {
                 text,
                 streaming,
                 duration_ms,
+                started,
             }) => {
                 assert_eq!(text, "Step one. Step two.");
                 assert!(*streaming);
                 assert!(duration_ms.is_none());
+                assert!(
+                    started.is_some(),
+                    "streaming reasoning should stamp its own start instant"
+                );
+                *started
             }
             other => panic!("expected streaming Reasoning, got {other:?}"),
-        }
+        };
         // Then the answer starts streaming.
         app.handle_ui_event(UiEvent::AssistantPartial {
             text: "The answer.".into(),
@@ -657,12 +690,17 @@ mod tests {
                 text,
                 streaming,
                 duration_ms,
+                started,
             } => {
                 assert_eq!(text, "Step one. Step two.");
                 assert!(!*streaming);
                 assert!(
                     duration_ms.is_some(),
                     "finalised reasoning should stamp duration_ms"
+                );
+                assert_eq!(
+                    *started, started_before,
+                    "finalise must not overwrite the block's started instant"
                 );
             }
             other => panic!("expected finalised Reasoning first, got {other:?}"),
@@ -707,6 +745,204 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── Goal-352: per-thought timing ─────────────────────────────────
+
+    #[test]
+    fn reasoning_block_stamps_started_on_creation() {
+        // The new `started` field must be stamped when a streaming
+        // Reasoning block is created, and finalise must compute
+        // `duration_ms` from it WITHOUT overwriting it.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "think".into(),
+        });
+        let started_before = match &app.blocks[0] {
+            TranscriptBlock::Reasoning { started, .. } => {
+                started.expect("streaming reasoning must stamp started on creation")
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        };
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "think".into(),
+        });
+        match &app.blocks[0] {
+            TranscriptBlock::Reasoning {
+                duration_ms,
+                started,
+                ..
+            } => {
+                assert!(
+                    duration_ms.is_some(),
+                    "finalise must stamp duration_ms from the block's started instant"
+                );
+                assert_eq!(
+                    *started,
+                    Some(started_before),
+                    "finalise must not overwrite the block's started instant"
+                );
+            }
+            other => panic!("expected finalised Reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_thought_duration_does_not_include_first() {
+        // Goal-352 headline regression (structural variant, no sleeps so
+        // it is CI-safe): a turn with two reasoning blocks separated by a
+        // tool call. With `turn.started_at` cleared entirely, every
+        // finalised block must still get `Some(duration_ms)` — proving
+        // the duration is measured from each block's OWN `started`
+        // instant, not the shared turn clock. Under the old code
+        // (`self.turn.started_at.map(...)`) a cleared turn clock produced
+        // `duration_ms = None`.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        // Precondition: no turn clock at all.
+        app.turn.started_at = None;
+        assert!(app.turn.started_at.is_none());
+
+        // First thought.
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "first".into(),
+        });
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "first".into(),
+        });
+
+        // Tool call between the two thoughts.
+        app.handle_ui_event(UiEvent::ToolCall {
+            id: "1".into(),
+            name: "Read".into(),
+            arguments: "{}".into(),
+        });
+
+        // Second thought.
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "second".into(),
+        });
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "second".into(),
+        });
+
+        let reasoning: Vec<(String, Option<u64>)> = app
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                TranscriptBlock::Reasoning {
+                    text, duration_ms, ..
+                } => Some((text.clone(), *duration_ms)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            reasoning.len(),
+            2,
+            "expected two Reasoning blocks, got {reasoning:?}"
+        );
+        for (text, duration_ms) in &reasoning {
+            assert!(
+                duration_ms.is_some(),
+                "block '{text}' must source duration from its own started \
+                 instant, not turn.started_at (which is None)"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual timing test (real sleeps); run with -- --ignored"]
+    fn second_thought_timing_is_independent_of_first() {
+        // Goal-352 real-timing variant: the second thought's displayed
+        // duration must be on the order of its own think time, NOT the
+        // cumulative turn time (first thought + tool gap + second
+        // thought). Kept #[ignore] because it sleeps on real time and
+        // asserts inequality rather than exact values.
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        // Simulate the real flow: a turn clock exists, but each thought
+        // must be timed from its own start.
+        app.turn.start();
+
+        // First thought: ~100ms.
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "first".into(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "first".into(),
+        });
+
+        // Tool call: ~60ms gap.
+        app.handle_ui_event(UiEvent::ToolCall {
+            id: "1".into(),
+            name: "Read".into(),
+            arguments: "{}".into(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        // Second thought: ~100ms.
+        app.handle_ui_event(UiEvent::ReasoningPartial {
+            text: "second".into(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.handle_ui_event(UiEvent::Reasoning {
+            content: "second".into(),
+        });
+
+        let durations: Vec<(String, u64)> = app
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                TranscriptBlock::Reasoning {
+                    text, duration_ms, ..
+                } => Some((text.clone(), duration_ms.expect("finalised duration"))),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            durations.len(),
+            2,
+            "expected two Reasoning blocks, got {durations:?}"
+        );
+        let d0 = durations[0].1;
+        let d1 = durations[1].1;
+        assert!(d0 < 1000, "first thought should be ~100ms, got {d0}ms");
+        // With the fix, d1 ≈ d0 (each thought is timed from its own
+        // start). With the old bug, d1 ≈ d0 + tool_gap + d1 (the second
+        // block inherited the whole-turn clock) → d1 ≥ 2 * d0.
+        assert!(
+            d1 < d0 * 2,
+            "second thought ({d1}ms) must not accumulate the first \
+             thought's time ({d0}ms)"
+        );
+    }
+
+    #[test]
+    fn resumed_reasoning_has_no_duration() {
+        // Guards the session-resume path (blocks_from_messages): resumed
+        // reasoning is reconstructed with no live timing (started: None,
+        // duration_ms: None) and must render as `∴ Thought` — never
+        // `∴ Thought for Xs` with an invented duration.
+        let block = TranscriptBlock::Reasoning {
+            text: "resumed thinking".into(),
+            streaming: false,
+            duration_ms: None,
+            started: None,
+        };
+        let lines = crate::ui::transcript::render_block(&block, &crate::ui::DARK, 0);
+        let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            header.contains("∴ Thought"),
+            "resumed reasoning should render as ∴ Thought, got {header:?}"
+        );
+        assert!(
+            !header.contains("Thought for"),
+            "resumed reasoning must not show a duration, got {header:?}"
+        );
     }
 
     #[test]

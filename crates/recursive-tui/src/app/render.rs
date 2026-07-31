@@ -44,6 +44,8 @@ pub fn blocks_from_messages(messages: &[recursive::message::Message]) -> Vec<Tra
                             text: reasoning.clone(),
                             streaming: false,
                             duration_ms: None,
+                            // Goal-352: resumed reasoning has no live timing
+                            started: None,
                         });
                     }
                 }

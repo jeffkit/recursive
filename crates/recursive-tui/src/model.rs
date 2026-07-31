@@ -92,8 +92,14 @@ pub enum TranscriptBlock {
         streaming: bool,
         /// Wall-clock duration of the thinking phase, stamped when the
         /// block is finalised. `None` while still streaming, or when
-        /// the turn start time is unavailable (e.g. session resume).
+        /// the block's start instant is unavailable (e.g. session resume,
+        /// where reasoning is reconstructed from history with no timing).
         duration_ms: Option<u64>,
+        /// Goal-352: when this reasoning block began streaming, so its
+        /// `duration_ms` can be measured per-block instead of from the
+        /// turn start. `None` only for reconstructed/resume blocks that
+        /// have no live timing; those render as `∴ Thought` (no duration).
+        started: Option<std::time::Instant>,
     },
     /// Tool call (paired with its result once available).
     ///
