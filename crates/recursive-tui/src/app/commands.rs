@@ -501,15 +501,20 @@ impl App {
             return;
         }
 
-        for c in text.chars() {
-            // Normalize line endings: skip bare \r so that \r\n paste
-            // sources (Windows clipboard, some macOS apps) don't corrupt
-            // the buffer. The \n that follows a \r is inserted normally
-            // so the newline itself is preserved. Lone \r is also dropped
-            // rather than rendered as a carriage-return control character,
-            // which would cause the terminal cursor to jump to column 0
-            // and visually overwrite the beginning of the current line.
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            // Normalize line endings to real \n line breaks. Terminals
+            // deliver pasted newlines as a bare \r in raw mode (the same
+            // byte Enter sends), so a lone \r must become \n — dropping it
+            // would eat the newline. \r\n (Windows/macOS clipboard sources)
+            // collapses to a single \n. Passing \r through verbatim would
+            // render as a terminal carriage return: the cursor jumps to
+            // column 0 and the following text sticks to the left border.
             if c == '\r' {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                self.prompt.insert_char('\n');
                 continue;
             }
             self.prompt.insert_char(c);
@@ -2780,10 +2785,7 @@ mod paste_tests {
     #[test]
     fn paste_strips_carriage_returns_from_crlf() {
         // \r\n (Windows / some macOS clipboard sources) must be normalised
-        // to \n.  A bare \r is treated as a carriage-return control character
-        // by the terminal emulator, which moves the cursor to column 0 and
-        // causes subsequent characters to visually overwrite the line start —
-        // the exact artifact the user sees as "character jumps to leftmost".
+        // to a single \n, not two newlines.
         let mut app = fresh_app();
         app.handle_paste("line1\r\nline2");
         assert_eq!(
@@ -2794,13 +2796,28 @@ mod paste_tests {
     }
 
     #[test]
-    fn paste_strips_bare_carriage_return() {
-        // Lone \r (old-style Mac line ending) is also dropped rather than
-        // being passed through as a cursor-jumping control character.
+    fn paste_converts_bare_carriage_return_to_newline() {
+        // Terminals deliver pasted newlines as a bare \r in raw mode
+        // (Enter also sends \r), so a lone \r must become a real \n line
+        // break — not be dropped, and not be passed through as a
+        // cursor-jumping control character.
         let mut app = fresh_app();
         app.handle_paste("abc\rdef");
-        assert_eq!(app.prompt.buffer, "abcdef");
-        assert_eq!(app.prompt.cursor, "abcdef".len());
+        assert_eq!(
+            app.prompt.buffer, "abc\ndef",
+            "bare \\r must be converted to a \\n line break"
+        );
+        assert_eq!(app.prompt.cursor, "abc\ndef".len());
+    }
+
+    #[test]
+    fn paste_converts_multiple_bare_carriage_returns() {
+        // A whole multi-line paste arrives as bare \r separators; every
+        // one must become \n so the buffer keeps all lines.
+        let mut app = fresh_app();
+        app.handle_paste("line1\rline2\rline3");
+        assert_eq!(app.prompt.buffer, "line1\nline2\nline3");
+        assert_eq!(app.prompt.cursor, "line1\nline2\nline3".len());
     }
 }
 
