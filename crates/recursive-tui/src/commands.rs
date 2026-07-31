@@ -1383,6 +1383,7 @@ pub fn build_theme_picker_lines(current: &str, selected: usize) -> Vec<Line<'sta
 mod tests {
     use super::*;
     use crate::app::{App, TranscriptBlock};
+    use crate::events::PartialDirection;
 
     /// Pin the ollama probe so picker tests don't depend on a live local
     /// Ollama. Returns a guard that clears the override on drop. Default

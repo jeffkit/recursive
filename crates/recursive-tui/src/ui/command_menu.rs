@@ -793,7 +793,9 @@ mod tests {
     #[test]
     fn up_down_moves_selection() {
         let mut app = fresh_command_app();
-        // "c" matches 3 entries: clear, compact, cost.
+        // "c" matches 5 entries after Goal 342 (clear, compact,
+        // compact-after-index, compact-before-index, cost) — the selection
+        // arithmetic below is count-independent.
         app.prompt.buffer = "c".into();
         app.prompt.cursor = 1;
 
@@ -1111,12 +1113,14 @@ mod tests {
 
     #[test]
     fn panel_height_command_mode_visible_three() {
-        // kills `+`->`*` in visible+2 (358): 3 builtin matches "c" -> n=3
+        // kills `+`->`*` in visible+2 (358): 3 builtin matches "com" -> n=3
         // -> visible 3 -> height 5; mutant `*`: 3*2=6; mutant `-`: 3-2=1.
+        // (Prefix "com" — not "c", which now matches 5 commands after
+        // Goal 342 added compact-before-index / compact-after-index.)
         let mut app = app_mode(InputMode::Command);
         app.commands = crate::commands::CommandRegistry::default_set();
-        app.prompt.buffer = "c".into();
-        assert_eq!(app.commands.search("c").len(), 3);
+        app.prompt.buffer = "com".into();
+        assert_eq!(app.commands.search("com").len(), 3);
         assert_eq!(panel_height(&app), 5);
     }
 
@@ -1384,12 +1388,14 @@ mod render_debt_tests {
     #[test]
     fn render_popup_highlights_selected_entry() {
         // kills `==`->`!=` in command_menu_selected (207): selected=0 ->
-        // row 0 (clear) Yellow bg; mutant highlights the other rows.
+        // row 0 (compact) Yellow bg; mutant highlights the other rows.
+        // Prefix "com" -> 3 entries (compact*, see Goal 342); "c" would
+        // match 5 and push the popup out of the expected rows.
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.prompt.mode = InputMode::Command;
         app.commands = crate::commands::CommandRegistry::default_set();
-        app.prompt.buffer = "c".into(); // clear / compact / cost (3)
+        app.prompt.buffer = "com".into(); // compact / compact-after-index / compact-before-index (3)
         app.command_menu_selected = Some(0);
         let buf = draw(80, 24, |f| render(f, Rect::new(0, 20, 80, 3), &app));
         // popup_h = 3+2 = 5; input.y=20 -> popup y=15; rows 16,17,18 = entries.
@@ -1451,12 +1457,14 @@ mod render_debt_tests {
     #[test]
     fn render_panel_command_mode_highlights_selected() {
         // kills `==`->`!=` in render_command_panel (422): selected=0 ->
-        // row 0 (clear) Yellow bg; mutant highlights the others.
+        // row 0 (compact) Yellow bg; mutant highlights the others.
+        // Prefix "com" -> 3 entries -> rows 21,22,23 (fit 24-tall buf).
+        // "c" would match 5 after Goal 342 and overflow the buffer.
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.prompt.mode = InputMode::Command;
         app.commands = crate::commands::CommandRegistry::default_set();
-        app.prompt.buffer = "c".into(); // 3 entries -> rows 21,22,23 (fit 24-tall buf)
+        app.prompt.buffer = "com".into(); // 3 entries -> rows 21,22,23 (fit 24-tall buf)
         app.command_menu_selected = Some(0);
         let buf = draw(80, 24, |f| render_panel(f, panel_area(), &app));
         assert!(row_has_bg(&buf, 21, 80, Color::Yellow));

@@ -447,6 +447,16 @@ useful if you want to rename a variable for instance."
         // which has no `old_string` anchor and would clobber unseen content,
         // KEEPS its partial-read reject — see fs.rs.)
         //
+        // Goal 348: partial reads also SKIP the staleness content-check below.
+        // That check compares the cached `record.content` against the full
+        // disk content, which is only meaningful when the cache holds the
+        // whole file (a full read). For a partial read the cached content is a
+        // view of a line range; comparing it to the full file would always
+        // differ and falsely reject every edit once ReadFile caches only the
+        // requested range. The `old_string` match below already guards against
+        // external modification on the partial path, so the staleness
+        // cached-content check is redundant there.
+        //
         // The lock is acquired briefly to extract the record, then dropped
         // before any `.await` to keep the future `Send`.
         if let Some(slot) = &self.read_state {
@@ -472,10 +482,19 @@ useful if you want to rename a variable for instance."
                         // the cached content for an async content-fallback check
                         // outside the lock.
                         let disk_mtime = get_file_mtime(&abs_path);
-                        if disk_mtime > record.timestamp {
+                        if disk_mtime > record.timestamp && !record.is_partial {
+                            // Full read: the cache holds the whole file, so the
+                            // content-equality check below is a meaningful
+                            // "nothing changed" signal. Partial reads skip it:
+                            // their cached content is a view of a line range,
+                            // not the whole file (a future ReadFile optimisation
+                            // may cache only the slice), so comparing it against
+                            // the full disk content would always differ. The
+                            // on-disk read + `old_string` match further down is
+                            // the safety net for partial reads.
                             Some((disk_mtime, record.content.clone()))
                         } else {
-                            None // mtime unchanged — no staleness concern
+                            None // mtime unchanged, or partial read — no staleness concern
                         }
                     }
                 }
@@ -625,8 +644,14 @@ the instance.\nString: {old_string}"
         // cached read, compare the content we just read (`content`) against
         // the cached content. This narrows the validate→write race window,
         // mirroring fake-cc's `call()`-level mtime re-check.
+        //
+        // Goal 348: like the pre-read guard, the content-equality comparison
+        // only applies to full reads (`!is_partial`). A partial read's cached
+        // content is a line-range view, not the whole file, so comparing it to
+        // the full disk content would always differ; the old_string match
+        // above is the safety net on that path.
         if let Some(slot) = &self.read_state {
-            let cached: Option<(u64, String)> = {
+            let cached: Option<(u64, bool, String)> = {
                 let state = slot.lock().map_err(|_| Error::Tool {
                     name: "Edit".into(),
                     call_id: None,
@@ -634,12 +659,12 @@ the instance.\nString: {old_string}"
                 })?;
                 state
                     .get(&abs_path)
-                    .map(|r| (r.timestamp, r.content.clone()))
+                    .map(|r| (r.timestamp, r.is_partial, r.content.clone()))
                 // guard dropped
             };
-            if let Some((cached_ts, cached_content)) = cached {
+            if let Some((cached_ts, is_partial, cached_content)) = cached {
                 let disk_mtime = get_file_mtime(&abs_path);
-                if disk_mtime > cached_ts && content != cached_content {
+                if disk_mtime > cached_ts && !is_partial && content != cached_content {
                     return Err(Error::Tool {
                         name: "Edit".into(),
                         call_id: None,
@@ -1681,6 +1706,128 @@ mod tests {
         assert!(
             msg.contains("has not been read yet"),
             "expected never-read rejection, got: {msg}"
+        );
+    }
+
+    // ── Goal 348: partial reads skip the staleness content-check ─────────
+    //
+    // Before this goal the staleness arm compared `record.content` (the cached
+    // file content) against the full disk content. That was only correct
+    // because ReadFile cached the WHOLE file even on a ranged read; if a
+    // future goal makes ReadFile cache only the requested slice, the equality
+    // check would compare full-file vs slice → always different → every
+    // partial-read edit falsely rejected. Partial reads now fall straight
+    // through to the on-disk read + old_string match, which is the real
+    // safety net. Full reads keep the content-equality staleness check.
+
+    /// Partial read + mtime advanced, but the disk content STILL contains the
+    /// old_string → edit succeeds. Headline test: proves partial reads no
+    /// longer hit the cached-content equality check. The cached content is a
+    /// line-range slice (as a future range-only ReadFile cache would hold),
+    /// which under the old coupling would never equal the full disk content.
+    #[tokio::test]
+    async fn edit_partial_read_skips_staleness_cache_check_when_mtime_advanced() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "line1\nline2 target\nline3\n").unwrap();
+        let slot = make_slot();
+        // Record a *partial* read whose cached content is only the line-range
+        // slice (simulating a future range-only ReadFile cache), timestamped
+        // BEFORE the external write below.
+        slot.lock().unwrap().record(
+            path.clone(),
+            true,
+            "line1\nline2 target\n".to_string(),
+            get_file_mtime(&path),
+        );
+        // Externally modify content (old_string still present) + bump mtime.
+        std::fs::write(&path, "line1\nline2 target\nline3 modified\n").unwrap();
+        bump_mtime_future(&path);
+        let result = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "line2 target",
+                "new_string": "line2 edited",
+            }))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("partial read with mtime advanced must NOT be rejected as stale, got: {e}")
+            });
+        assert!(result.contains("updated successfully"), "got: {result}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\nline2 edited\nline3 modified\n");
+    }
+
+    /// Full read + mtime advanced + content changed so old_string is gone →
+    /// Edit rejected with the staleness error (NOT "not found"). The staleness
+    /// check runs first (before the old_string match), and full reads keep the
+    /// cached-content equality check exactly as before Goal 348.
+    #[tokio::test]
+    async fn edit_full_read_still_runs_staleness_check_when_mtime_advanced() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let slot = make_slot();
+        // Full read.
+        slot.lock().unwrap().record(
+            path.clone(),
+            false,
+            std::fs::read_to_string(&path).unwrap(),
+            get_file_mtime(&path),
+        );
+        // Externally modify content (old_string GONE) + bump mtime.
+        std::fs::write(&path, "externally changed\n").unwrap();
+        bump_mtime_future(&path);
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye",
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("modified") && msg.contains("Read it again"),
+            "expected full-read staleness rejection, got: {msg}"
+        );
+    }
+
+    /// Partial read + mtime advanced + content changed so old_string is GONE
+    /// → Edit rejected with "not found" (NOT a blanket "modified since read").
+    /// Proves the old_string match is the safety net on the partial path when
+    /// the file really changed externally.
+    #[tokio::test]
+    async fn edit_partial_read_still_rejects_when_old_string_gone_after_external_change() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let slot = make_slot();
+        // Partial read, timestamped before the external write below.
+        slot.lock().unwrap().record(
+            path.clone(),
+            true,
+            "hello world\n".to_string(),
+            get_file_mtime(&path),
+        );
+        // Externally modify content (old_string GONE) + bump mtime.
+        std::fs::write(&path, "externally changed\n").unwrap();
+        bump_mtime_future(&path);
+        let err = EditTool::new(tmp.path())
+            .with_read_state(slot)
+            .execute(serde_json::json!({
+                "file_path": "src.txt",
+                "old_string": "hello",
+                "new_string": "goodbye",
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' rejection from old_string match, got: {msg}"
         );
     }
 }
