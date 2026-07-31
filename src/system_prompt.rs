@@ -206,9 +206,17 @@ mod tests {
 
         let out = assemble_system_prompt("BASE", tmp.path(), &[], false).into_full();
         assert!(out.starts_with("# Project context\n\n"), "{out}");
+        // AGENTS.md is authoritative; CLAUDE.md is ignored when both exist.
         assert!(out.contains("## AGENTS.md"), "{out}");
-        assert!(out.contains("## CLAUDE.md"), "{out}");
-        assert!(out.contains("agents-body") && out.contains("claude-body"));
+        assert!(out.contains("agents-body"));
+        assert!(
+            !out.contains("## CLAUDE.md"),
+            "CLAUDE.md must not load when AGENTS.md present: {out}"
+        );
+        assert!(
+            !out.contains("claude-body"),
+            "CLAUDE.md body must not leak: {out}"
+        );
         assert!(
             out.contains("\n\n---\n\nBASE"),
             "base after separator: {out}"
