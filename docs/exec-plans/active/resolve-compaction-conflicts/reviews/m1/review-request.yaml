@@ -1,0 +1,52 @@
+milestone: "M1: 合并 compaction 三方版本"
+requested_at: "2026-07-30 13:05 +0800"
+requestor: "implement-agent"
+
+scope:
+  changed_files:
+    - path: "src/run_core.rs"
+      change_type: modified
+      summary: "保留直接 Compactor 的 intra-turn 压缩、阈值与失败熔断实现。"
+    - path: "src/runtime.rs"
+      change_type: modified
+      summary: "在 emergency compaction 的 hook 派发前拒绝不可压缩 transcript，并添加 hook/provider no-op 回归测试。"
+    - path: "src/compact/runner.rs"
+      change_type: deleted
+      summary: "解决删除/保留冲突，移除与直接实现重复的旧 CompactionRunner。"
+
+  diff_stats:
+    files_changed: 3
+    insertions: 63
+    deletions: 0
+
+change_summary: |
+  三方冲突在一个旧 CompactionRunner 抽象与当前直接 Compactor 实现之间产生。
+  恢复选择当前工作目录实现；该实现此前已通过全 workspace、全 targets、全 features 的检查。
+  对抗审查 f1 的修复在 `compact_on_overflow` 派发 `PreCompact` 前调用
+  `would_compact`：系统消息是唯一 older slice 的 no-op 直接返回 `false`，不调用
+  provider，且不产生未配对的 lifecycle hook。新增 runtime 回归测试记录两种
+  compaction hook 并检查 MockProvider 调用记录。
+
+acceptance_criteria:
+  - "三个 compaction 冲突路径不再未合并。"
+  - "不回退 circuit-breaker、token-threshold 与 hook-balance 行为。"
+  - "emergency compaction no-op 不派发 PreCompact/PostCompact 且不调用 provider。"
+  - "fmt、test、clippy 与 build 全部通过。"
+
+verification_results:
+  lint: pass
+  typecheck: n/a
+  test: pass
+  build: pass
+
+e2e_verification:
+  applicable: false
+  framework: "n/a"
+  cases_written: []
+  run_result: skipped
+  run_id: "n/a"
+
+focus_areas:
+  - "f1：emergency compaction 的 would_compact preflight 是否早于 PreCompact"
+  - "system-only older slice 是否既无 hook 事件也无 provider 调用"
+  - "成功的 emergency compaction 是否保持原有 PostCompact、边界事件与重试语义"

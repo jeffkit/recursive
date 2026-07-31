@@ -1,0 +1,34 @@
+milestone: "M1: 合并 compaction 三方版本"
+reviewed_at: "2026-07-30 13:00 +0800"
+reviewer: "adversarial-reviewer"
+
+verdict: NEEDS_FIX
+
+findings:
+  - id: "f1"
+    severity: HIGH
+    category: boundary
+    description: "The emergency path dispatches PreCompact before determining whether compaction can run. For a configured compactor whose transcript is too short or has a degenerate older slice, apply_to_transcript returns Ok(None), compact_on_overflow returns false, and no PostCompact is sent. This violates the documented hook-pairing contract and leaves lifecycle hooks with unmatched start state precisely on an overflow recovery no-op."
+    suggestion: "Before dispatching PreCompact in compact_on_overflow, call compactor.would_compact(&self.transcript) and return Ok(false) when it is false. Add a regression test that records hook events and asserts that this no-op emits neither PreCompact nor PostCompact."
+    location: "src/runtime.rs:494"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: "Configure a compactor with keep_recent_n=8 and seed a nine-message transcript whose older slice is only a system message. Invoke compact_on_overflow with a hook recorder."
+    expected_behavior: "The method returns false without calling the provider and emits neither PreCompact nor PostCompact."
+    added_to_suite: false
+  - id: "at2"
+    type: unit
+    description: "Make the first kernel call return a context_length_exceeded error and make the emergency summary call fail with a distinct Error::Llm. Capture runtime events."
+    expected_behavior: "run returns the distinct compaction error without retrying the kernel and emits no CompactionBoundary or MessageAppended summary event."
+    added_to_suite: false
+  - id: "at3"
+    type: unit
+    description: "Force three consecutive cross-turn compaction provider failures at an exceeded token threshold, then run one additional threshold-exceeded turn with a provider response available."
+    expected_behavior: "Each of the first three failures emits CompactionSkipped::Error; the fourth emits CompactionSkipped::CircuitBreaker, does not call the provider, and preserves the failure counter."
+    added_to_suite: false
+
+summary: |
+  Emergency compaction can reject a transcript after emitting PreCompact, leaving its hook lifecycle unbalanced. The review also verified that the resolved index has no unmerged entries, src/compact/runner.rs is absent from HEAD, index, and worktree, and no CompactionRunner references remain in the searched source tree.

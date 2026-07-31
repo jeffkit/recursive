@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::agent::FinishReason;
 use crate::checkpoint::{CheckpointId, ShadowRepo};
 use crate::checkpoint_log::CheckpointLogWriter;
+use crate::compact::Compactor;
 use crate::error::Result;
 use crate::event::{AgentEvent, EventSink, NullSink};
 use crate::hooks::{HookEvent, HookRegistry};
@@ -36,7 +37,6 @@ use crate::tools::plan_mode::{
     EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanModeRequestGate, RequestPlanModeTool,
 };
 use crate::tools::{TodoItem, TodoWriteTool, ToolRegistry, TouchedFiles};
-use crate::Compactor;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Goal-168: GoalState / GoalStatus / GoalEvaluator
@@ -595,6 +595,11 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(false);
         };
+        // Keep the compaction lifecycle balanced: a rejected transcript must
+        // not emit PreCompact because it has no matching PostCompact event.
+        if !compactor.would_compact(&self.transcript) {
+            return Ok(false);
+        }
         let chars = Compactor::estimate_chars(&self.transcript);
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: chars,
@@ -3797,6 +3802,64 @@ mod tests {
         let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
         let ok = rt.compact_on_overflow().await.unwrap();
         assert!(!ok, "no compactor → must return false");
+    }
+
+    #[tokio::test]
+    async fn compact_on_overflow_rejects_degenerate_transcript_without_hook_events() {
+        struct CompactionHookRecorder(Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+        impl crate::hooks::Hook for CompactionHookRecorder {
+            fn on_event(&self, event: HookEvent) -> crate::hooks::HookAction {
+                match event {
+                    HookEvent::PreCompact { .. } => {
+                        self.0.lock().unwrap().push("PreCompact");
+                    }
+                    HookEvent::PostCompact { .. } => {
+                        self.0.lock().unwrap().push("PostCompact");
+                    }
+                    _ => {}
+                }
+                crate::hooks::HookAction::Continue
+            }
+        }
+
+        let llm = Arc::new(MockProvider::new(vec![]));
+        let hook_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hooks = HookRegistry::new();
+        hooks.register(Arc::new(CompactionHookRecorder(hook_events.clone())));
+        let mut rt = AgentRuntime::builder()
+            .llm(llm.clone())
+            .hooks(hooks)
+            .compactor(Compactor::new(usize::MAX).keep_recent_n(8))
+            .build()
+            .unwrap();
+
+        // The older slice contains only the system prompt, so it cannot be
+        // summarized. This is long enough to reach the compaction guard.
+        *Arc::make_mut(&mut rt.transcript) = vec![
+            Message::system("System prompt".to_string()),
+            Message::user("Add a feature".to_string()),
+            Message::assistant("Working on it".to_string()),
+            Message::user("Status?".to_string()),
+            Message::assistant("Almost done".to_string()),
+            Message::user("Run tests".to_string()),
+            Message::assistant("Tests pass".to_string()),
+            Message::user("Commit".to_string()),
+            Message::assistant("Done".to_string()),
+        ];
+
+        assert!(
+            !rt.compact_on_overflow().await.unwrap(),
+            "a degenerate transcript must reject emergency compaction"
+        );
+        assert!(
+            hook_events.lock().unwrap().is_empty(),
+            "a rejected compaction must emit neither PreCompact nor PostCompact"
+        );
+        assert!(
+            llm.calls().is_empty(),
+            "a rejected compaction must not call the provider"
+        );
     }
 
     /// Context-overflow error recovery integration test.

@@ -2611,6 +2611,8 @@ mod tests {
 
     // ========================================================================
     // run_inner integration tests
+    // ========================================================================
+    // Kills: `delete ! in RunCore<'a>::execute_tool_calls` at line 306.
     // These tests call run_inner() directly to kill mutants deep inside the
     // main agent loop that cannot be reached by unit tests of sub-functions.
     // ========================================================================
