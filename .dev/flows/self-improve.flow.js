@@ -146,7 +146,10 @@ async function recursive(prompt, opts = {}) {
 //
 // Two trigger modes:
 //   1. no-growth: transcript file hasn't grown for `idleMs` ms (after the
-//      run has had at least `idleMs` to start producing output)
+//      run has had at least `idleMs` to start producing output) AND the
+//      `recursive` worker has no living descendant processes (so a healthy
+//      long-running background job — e.g. tui-mutants compiling for 10 min
+//      — is NOT mistaken for a hang; g349 lesson)
 //   2. finish-marker-hang: transcript contains `[done after N steps] reason:`
 //      but the process hasn't exited within `graceMs`
 
@@ -172,9 +175,55 @@ export function findRecursivePid(transcriptOut) {
 }
 
 /**
+ * Count living descendant processes of `pid` (children, grandchildren, …).
+ * Used by the watchdog to tell "agent is genuinely hung" apart from
+ * "agent correctly spawned a long-running background job (e.g.
+ * `run_background` of `tui-mutants.sh` / `cargo build`, which can run
+ * 10+ minutes with zero transcript growth) and is waiting on it".
+ *
+ * Returns 0 when `pid` has no living descendants (either idle or gone).
+ * @param {number|null} pid
+ * @returns {number}
+ */
+export function countDescendants(pid) {
+  if (!pid || pid <= 0) return 0
+  // BFS over the process tree via `pgrep -P <pid>`. Cap the walk so a
+  // runaway fork loop can't hang the watchdog.
+  let count = 0
+  let frontier = [pid]
+  const seen = new Set([pid])
+  for (let depth = 0; depth < 8 && frontier.length; depth++) {
+    const next = []
+    for (const p of frontier) {
+      let children = []
+      try {
+        const r = spawnSync('pgrep', ['-P', String(p)], { encoding: 'utf8' })
+        if (r.status === 0) {
+          children = r.stdout.split('\n').map(s => s.trim()).filter(Boolean).map(Number)
+        }
+      } catch { /* pgrep missing or pid gone */ }
+      for (const c of children) {
+        if (!seen.has(c)) { seen.add(c); next.push(c); count++ }
+      }
+    }
+    frontier = next
+  }
+  return count
+}
+
+/**
  * Start a watchdog that monitors `transcriptOut` and fires `onTrigger` if:
- *   - the file hasn't grown for `idleMs` ms (no-growth), OR
+ *   - the file hasn't grown for `idleMs` ms (no-growth) AND the `recursive`
+ *     worker has no living descendant processes (i.e. it isn't running a
+ *     `run_background` job like a long gate compile), OR
  *   - a finish marker is seen but the process hasn't exited within `graceMs`.
+ *
+ * Background-job liveness: when the agent spawns a long-running background
+ * command (e.g. `.dev/scripts/tui-mutants.sh`, which compiles for 10+ min
+ * with zero transcript growth), the worker has living child processes.
+ * The watchdog counts those descendants and treats their presence as
+ * liveness, refreshing the idle clock so a healthy gate run is never
+ * mis-killed as `no-growth-hung` (g349 lesson).
  *
  * When triggered: SIGTERMs the `recursive` child by PID, then calls
  * `onTrigger(reason)`.  `stop()` clears the interval and idempotently
@@ -213,7 +262,19 @@ export function startRecursiveWatchdog({ transcriptOut, idleMs = 10 * 60 * 1000,
     }
     // only trip no-growth after the run has had at least idleMs to even start
     if (now - start >= idleMs && now - lastGrowthAt >= idleMs) {
-      reason.current = 'no-growth-hung'; fire(); return
+      // Before declaring a hang, check whether the agent is actually busy
+      // running a background job (run_background → shell → cargo/rustc/…).
+      // A long gate like tui-mutants.sh produces ZERO transcript growth for
+      // 10+ minutes while it compiles — that is healthy work, not a hang.
+      // Treat living descendant processes as liveness: refresh the idle
+      // clock and let it run. (g349 lesson: a successful run was killed
+      // mid-tui-mutants-gate by no-growth-hung.)
+      const pid = findRecursivePid(transcriptOut)
+      if (pid != null && countDescendants(pid) > 0) {
+        lastGrowthAt = now
+      } else {
+        reason.current = 'no-growth-hung'; fire(); return
+      }
     }
   }
 

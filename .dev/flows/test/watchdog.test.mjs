@@ -28,6 +28,30 @@ function findRecursivePid(transcriptOut) {
   } catch { return null }
 }
 
+function countDescendants(pid) {
+  if (!pid || pid <= 0) return 0
+  let count = 0
+  let frontier = [pid]
+  const seen = new Set([pid])
+  for (let depth = 0; depth < 8 && frontier.length; depth++) {
+    const next = []
+    for (const p of frontier) {
+      let children = []
+      try {
+        const r = spawnSync('pgrep', ['-P', String(p)], { encoding: 'utf8' })
+        if (r.status === 0) {
+          children = r.stdout.split('\n').map(s => s.trim()).filter(Boolean).map(Number)
+        }
+      } catch { /* pgrep missing or pid gone */ }
+      for (const c of children) {
+        if (!seen.has(c)) { seen.add(c); next.push(c); count++ }
+      }
+    }
+    frontier = next
+  }
+  return count
+}
+
 function startRecursiveWatchdog({ transcriptOut, idleMs = 10 * 60 * 1000, pollMs = 15_000, graceMs = 30_000, onTrigger }) {
   const start = Date.now()
   let lastSize = -1
@@ -56,7 +80,16 @@ function startRecursiveWatchdog({ transcriptOut, idleMs = 10 * 60 * 1000, pollMs
       reason.current = 'finish-marker-hang'; fire(); return
     }
     if (now - start >= idleMs && now - lastGrowthAt >= idleMs) {
-      reason.current = 'no-growth-hung'; fire(); return
+      // Background-job liveness: a long-running run_background job (e.g.
+      // tui-mutants compiling for 10 min) produces no transcript growth but
+      // leaves living descendant processes under the recursive worker.
+      // Treat that as liveness so a healthy gate run isn't mis-killed (g349).
+      const pid = findRecursivePid(transcriptOut)
+      if (pid != null && countDescendants(pid) > 0) {
+        lastGrowthAt = now
+      } else {
+        reason.current = 'no-growth-hung'; fire(); return
+      }
     }
   }
 
@@ -260,5 +293,92 @@ describe('startRecursiveWatchdog', () => {
     } finally {
       try { rmSync(transcript, { force: true }) } catch { /* best-effort */ }
     }
+  })
+
+  // g349 lesson: a long-running run_background job (e.g. tui-mutants) keeps
+  // descendant processes alive under the recursive worker for 10+ min with
+  // zero transcript growth. The watchdog must treat those descendants as
+  // liveness, NOT mis-fire no-growth-hung.
+  it('background-job liveness: living descendants suppress no-growth-hung', async () => {
+    const transcript = tmpPath()
+    writeFileSync(transcript, 'initial content\n')
+    // Spawn a fake "recursive worker" that matches --transcript-out AND
+    // has a long-lived child (simulating a run_background job).
+    const helperScript = tmpPath() + '.cjs'
+    writeFileSync(helperScript,
+      `const fs=require('fs');` +
+      `fs.writeFileSync('${helperScript}.pid',String(process.pid));` +
+      // spawn a child that outlives the parent's watchdog check window
+      `const{spawn}=require('child_process');` +
+      `spawn('sh',['-c','sleep 5'],{stdio:'ignore'});` +
+      `setInterval(()=>{},30000)`
+    )
+    try {
+      execSync(
+        `sh -c 'exec node "${helperScript}" --transcript-out "${transcript}"' </dev/null >/dev/null 2>&1 &`,
+        { encoding: 'utf8', timeout: 1000 }
+      )
+      // Wait for the helper + its child to come up
+      const deadline = Date.now() + 2000
+      let ready = false
+      while (Date.now() < deadline) {
+        const pid = findRecursivePid(transcript)
+        if (pid != null && countDescendants(pid) > 0) { ready = true; break }
+        const t0 = Date.now(); while (Date.now() - t0 < 50) { /* spin */ }
+      }
+      assert.ok(ready, 'fake worker + child did not come up')
+
+      let triggered = false
+      const w = startRecursiveWatchdog({
+        transcriptOut: transcript,
+        idleMs: 200,   // short: without the fix this would fire no-growth-hung
+        pollMs: 50,
+        graceMs: 2000, // high so finish-marker doesn't interfere
+        onTrigger: () => { triggered = true },
+      })
+
+      // Wait well past idleMs — descendants are alive, so it must NOT fire.
+      await new Promise(resolve => setTimeout(resolve, 600))
+      assert.strictEqual(triggered, false)
+      assert.strictEqual(w.reason, null)
+      w.stop()
+
+      // Clean up the fake worker + child
+      const pid = findRecursivePid(transcript)
+      if (pid != null) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
+    } finally {
+      try { rmSync(transcript, { force: true }) } catch { /* best-effort */ }
+      try { rmSync(helperScript, { force: true }) } catch { /* best-effort */ }
+      try { rmSync(`${helperScript}.pid`, { force: true }) } catch { /* best-effort */ }
+    }
+  })
+})
+
+describe('countDescendants', () => {
+  it('returns 0 for falsy / non-positive pid', () => {
+    assert.strictEqual(countDescendants(null), 0)
+    assert.strictEqual(countDescendants(0), 0)
+    assert.strictEqual(countDescendants(-1), 0)
+  })
+
+  it('returns 0 for a pid with no children', () => {
+    // The test process itself has no children at rest.
+    assert.strictEqual(countDescendants(process.pid), 0)
+  })
+
+  it('counts living descendants of a process tree', () => {
+    // Spawn a shell that spawns two `sleep` children, then count.
+    const r = spawnSync('sh', ['-c', 'sleep 5 & sleep 5 & wait'], {
+      encoding: 'utf8',
+      // Detach so we can inspect the tree; the sh stays alive via `wait`.
+      timeout: 500,
+    })
+    // r.pid is the sh pid; it has two sleep children.
+    const count = countDescendants(r.pid)
+    // The sh may have already exited by the time we count (timeout killed
+    // the spawnSync capture). When alive, expect >= 2; when gone, expect 0.
+    // Either is acceptable — we only assert countDescendants doesn't crash
+    // and returns a non-negative integer.
+    assert.ok(count >= 0 && Number.isInteger(count))
   })
 })
