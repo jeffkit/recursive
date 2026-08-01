@@ -28,6 +28,8 @@
 //! ```
 
 #![doc(html_root_url = "https://docs.rs/agui-client/0.1.0")]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub use agui_protocol::{Event, RunAgentInput};
 

@@ -159,6 +159,11 @@ fn render_messages(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_permission(f: &mut Frame, app: &App, area: Rect) {
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "caller guards with pending_permission.is_some()"
+    )]
     let prompt = app.pending_permission.as_ref().expect("prompt set");
     let lines = vec![
         Line::from(Span::styled(

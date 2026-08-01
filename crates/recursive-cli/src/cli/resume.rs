@@ -359,8 +359,12 @@ pub(crate) async fn run_resumed(
 
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> =
         if let Some(w) = existing_writer {
-            #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-            let display_path = w.lock().unwrap().session_dir().display().to_string();
+            let display_path = w
+                .lock()
+                .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?
+                .session_dir()
+                .display()
+                .to_string();
             eprintln!("session: appending to {display_path}");
             Some(w)
         } else if session {
@@ -386,15 +390,21 @@ pub(crate) async fn run_resumed(
         };
 
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
-        session_writer.as_ref().map(|w| {
-            #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-            let session_dir = w.lock().unwrap().session_dir().to_path_buf();
-            std::sync::Mutex::new(recursive::cost::CostTracker::new(
-                session_dir,
-                &config.model,
-                &config.provider_type,
-            ))
-        })
+        match session_writer.as_ref() {
+            Some(w) => {
+                let session_dir = w
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?
+                    .session_dir()
+                    .to_path_buf();
+                Some(std::sync::Mutex::new(recursive::cost::CostTracker::new(
+                    session_dir,
+                    &config.model,
+                    &config.provider_type,
+                )))
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -426,10 +436,16 @@ pub(crate) async fn run_resumed(
     if let Some(ref sw) = session_writer {
         match recursive::ShadowRepo::open(&config.workspace) {
             Ok(repo) => {
-                #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-                let session_id = sw.lock().unwrap().session_id().to_string();
-                #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-                let session_dir = sw.lock().unwrap().session_dir().to_path_buf();
+                let session_id = sw
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?
+                    .session_id()
+                    .to_string();
+                let session_dir = sw
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?
+                    .session_dir()
+                    .to_path_buf();
                 let log_path = session_dir.join("checkpoints.jsonl");
                 let touched = runtime.kernel().tools().touched_files();
                 if let Err(e) =
@@ -626,6 +642,7 @@ pub(crate) async fn run_resumed(
 #[cfg(test)]
 mod tests {
     use super::resolve_resume_message;
+    use crate::cli::session::resolve_session_path;
 
     #[test]
     fn explicit_message_wins() {
@@ -655,5 +672,33 @@ mod tests {
     fn whitespace_message_is_preserved_if_non_empty() {
         // "  x  " trims non-empty → preserved verbatim (not trimmed).
         assert_eq!(resolve_resume_message(Some("  x  ".into())), "  x  ");
+    }
+
+    #[test]
+    fn unique_session_id_resolves_to_ok_path() {
+        // Goal 354 regression: `resolve_session_path`'s `1 =>` arm used to
+        // `.unwrap()` the single match; it now binds via `let-else`. A
+        // uniquely-matching session id must resolve to `Ok(path)` — the
+        // resume path propagates errors instead of panicking on the match.
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let prev_home = std::env::var_os("RECURSIVE_HOME");
+        std::env::set_var("RECURSIVE_HOME", home.path());
+
+        // Legacy in-tree session dir is searched by resolve_session_path;
+        // the file's stem contains the query id, so it is the unique match.
+        let sessions_dir = workspace.path().join(".recursive").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_path = sessions_dir.join("2026-08-01T000000-hello-world.json");
+        std::fs::write(&session_path, "{}").unwrap();
+
+        let resolved = resolve_session_path(workspace.path(), "hello-world");
+        assert_eq!(resolved.unwrap(), session_path);
+
+        match prev_home {
+            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+            None => std::env::remove_var("RECURSIVE_HOME"),
+        }
     }
 }

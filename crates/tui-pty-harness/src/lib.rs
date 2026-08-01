@@ -23,6 +23,9 @@
 //! `stable_ms`, capped at `wait_ms` of wall clock. This keeps the harness
 //! deterministic on fast machines and non-flaky on slow CI.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -149,8 +152,13 @@ pub fn parse_keys(s: &str) -> Vec<u8> {
                 i += 1;
             }
         } else {
-            // UTF-8: push the whole char's bytes.
-            let ch = s[i..].chars().next().expect("non-empty char");
+            // UTF-8: push the whole char's bytes. `s[i..]` is guaranteed
+            // non-empty by the loop guard `i < bytes.len()`, so
+            // `chars().next()` is always `Some`; `let-else` satisfies the
+            // unwrap lint without panicking on the impossible empty case.
+            let Some(ch) = s[i..].chars().next() else {
+                break;
+            };
             let start = i;
             i += ch.len_utf8();
             out.extend_from_slice(&bytes[start..i]);
@@ -345,7 +353,7 @@ fn screen_text(parser: &VtParser) -> String {
 }
 
 /// Print a snapshot in the requested format. Used by the `tui-pty` CLI.
-pub fn print_snapshot(screen: &Screen, fmt: SnapFormat) {
+pub fn print_snapshot(screen: &Screen, fmt: SnapFormat) -> anyhow::Result<()> {
     match fmt {
         SnapFormat::Text => {
             let mut lines = screen.lines.clone();
@@ -370,9 +378,12 @@ pub fn print_snapshot(screen: &Screen, fmt: SnapFormat) {
                 "height": screen.rows,
                 "lines": lines,
             });
-            println!("{}", serde_json::to_string(&val).unwrap());
+            let rendered = serde_json::to_string(&val)
+                .map_err(|e| anyhow::anyhow!("snapshot json failed: {e}"))?;
+            println!("{rendered}");
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

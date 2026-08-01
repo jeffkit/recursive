@@ -166,7 +166,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         envs: &envs,
     };
     let screen = tui_pty_harness::spawn_and_snapshot(&spec)?;
-    print_snapshot(&screen, snap);
+    print_snapshot(&screen, snap)?;
     Ok(())
 }
 

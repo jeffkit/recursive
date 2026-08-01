@@ -125,7 +125,12 @@ pub(crate) fn resolve_session_path(workspace: &Path, session: &str) -> anyhow::R
             "Session not found: '{}'. Use 'recursive sessions list' to see available sessions.",
             session
         ),
-        1 => Ok(matches.into_iter().next().unwrap()),
+        1 => {
+            let Some(path) = matches.into_iter().next() else {
+                anyhow::bail!("internal error: session match vanished during resolution");
+            };
+            Ok(path)
+        }
         n => {
             eprintln!("Multiple sessions match '{}' ({}):", session, n);
             for m in &matches {

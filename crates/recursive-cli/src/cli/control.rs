@@ -101,9 +101,12 @@ impl ControlBridge {
             "input": input,
         });
         if let Some(id) = tool_use_id {
-            req.as_object_mut()
-                .expect("object")
-                .insert("tool_use_id".into(), json!(id));
+            // `req` is always a JSON object (built by `json!` above), so
+            // this insert is provably reachable; `if let` avoids panicking
+            // on the impossible non-object case.
+            if let Some(obj) = req.as_object_mut() {
+                obj.insert("tool_use_id".into(), json!(id));
+            }
         }
         self.ask_host(req).await
     }
@@ -718,12 +721,12 @@ fn control_read_file(session: &ControlSession, request: &Value) -> Result<Value,
     });
     if truncated {
         body.as_object_mut()
-            .expect("object")
+            .ok_or_else(|| "expected object body in control_read_file".to_string())?
             .insert("truncated".into(), json!(true));
     }
     if encoding == "base64" {
         body.as_object_mut()
-            .expect("object")
+            .ok_or_else(|| "expected object body in control_read_file".to_string())?
             .insert("encoding".into(), json!("base64"));
     }
     Ok(body)

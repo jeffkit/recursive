@@ -5,6 +5,9 @@
 //!   - `repl`:          interactive loop, one goal per line.
 //!   - `tools`:         print the registered tool specs as JSON.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod cli;
 
 #[cfg(feature = "otel")]
