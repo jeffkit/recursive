@@ -131,7 +131,19 @@ New failure modes should be added here, not silently worked around.
 
 ## E2E testing rules (essentials — full detail in `e2e/` + `.dev/`)
 
-E2E tests run via `argusai -c e2e.yaml`. Hard-won rules:
+E2E tests run via **one path only**: `.dev/scripts/e2e-run.sh <suite-id>`
+(MCP: mcp2cli → argusai-mcp). Replay and record differ only by `E2E_RECORD`:
+- **Replay (CI, no key):** `.dev/scripts/e2e-run.sh <suite-id>`.
+- **Record (new fixtures, needs real key):**
+  `E2E_RECORD=1 DEEPSEEK_API_KEY=... .dev/scripts/e2e-run.sh <suite-id>`,
+  then `cd e2e && ./scripts/promote.sh <suite-id>`.
+- The aimock container is owned by `e2e/plugins/src/index.ts` (NOT declared in
+  e2e.yaml `mocks`) — it starts aimock in record or replay mode on the argusai
+  network, so both modes work identically on this single path.
+- **Never** run `argusai -c e2e.yaml run` — the CLI 0.12.3 yaml-engine swallows
+  setup-step exec errors as "✓", yielding `Setup ✓ / case ✗ file missing`.
+  Full guide: `e2e/RECORD_REPLAY.md`.
+Hard-won rules:
 - **Confirm container binary first**: `docker exec recursive-e2e recursive --version`.
   Tool names are **PascalCase** (`Read`/`Write`/`Bash`/`Glob`) — snake_case
   assertions silently lie.
@@ -143,11 +155,6 @@ E2E tests run via `argusai -c e2e.yaml`. Hard-won rules:
   use a unique `RECURSIVE_HOME`, then `find` the transcript and copy to a predictable
   path. See `e2e/tests/00-smoke.yaml` and `11-session-resume.yaml` for canonical form.
 - **aimock fixtures**: use `turnIndex` + `hasToolResult`, not text matching.
-- **Recording workflow**: to capture a real model's behaviour as a regression
-  fixture, `E2E_RECORD=1 argusai -c e2e.yaml run -s <suite>` (needs a real
-  key in `e2e/.env`), then `./e2e/scripts/promote.sh <suite>` merges the
-  recording into `e2e/fixtures/<suite>.json`. Replay (default, no key) is the
-  CI path. Full guide: `e2e/RECORD_REPLAY.md`.
 - **HTTP in container**: always `-H 'Content-Type: application/json'`;
   `POST /sessions/:id/messages` field is **`content`** not `message`;
   use `http://127.0.0.1:PORT` not `localhost` (Node 18 IPv6 issue).

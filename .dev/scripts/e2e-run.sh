@@ -25,6 +25,21 @@
 # Usage:
 #   .dev/scripts/e2e-run.sh <suite-id> [--no-build]
 #
+# Single entry point for BOTH replay and record, via the MCP path
+# (mcp2cli → argusai-mcp). The e2e plugin is the sole owner of the aimock
+# container and starts it in record or replay mode based on E2E_RECORD:
+#
+#   Replay (CI, no key):   .dev/scripts/e2e-run.sh <suite-id>
+#   Record (new fixtures): E2E_RECORD=1 DEEPSEEK_API_KEY=... \
+#                            .dev/scripts/e2e-run.sh <suite-id>
+#   then: cd e2e && ./scripts/promote.sh <suite-id>
+#
+# The aimock container is NOT declared in e2e.yaml's `mocks` section — it
+# lives in e2e/plugins/src/index.ts, which mirrors argusai's network name
+# (argusai-<WORKTREE_ID>-network) and creates it if missing, so record mode
+# works identically on the MCP and legacy CLI paths. Full guide:
+# e2e/RECORD_REPLAY.md.
+#
 # Exit code: 0 iff the suite ran at least one case and every case passed.
 #
 # Prereqs: Docker, mcp2cli on PATH, argusai-mcp installed (npm i -g argusai-mcp).
@@ -43,6 +58,13 @@ if [[ -z "$SUITE" ]]; then
   echo "e.g.    $0 claude-json-stream" >&2
   exit 2
 fi
+
+# Namespace the Docker network per commit (argusai derives
+# `argusai-<WORKTREE_ID>-network` from isolation.namespace in e2e.yaml).
+# Setting it here makes the network name deterministic and clean; the
+# recursive-e2e / aimock container names are NOT affected (they come from
+# e2e.yaml service.container.name / the plugin).
+export WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo main)"
 
 # ---- resolve mcp2cli -------------------------------------------------------
 MCP2CLI=""
@@ -70,10 +92,10 @@ else
   echo "[e2e-run] argusai-mcp not found (npm i -g argusai-mcp)" >&2; exit 3
 fi
 
-# Single-worktree dev use: leave WORKTREE_ID unset so containers are named
-# `recursive-e2e` / `aimock` (matching the `container:` refs in suite YAMLs).
-unset WORKTREE_ID
-
+# Single-worktree dev use: containers are named `recursive-e2e` / `aimock`
+# (matching the `container:` refs in suite YAMLs); network is namespaced by
+# WORKTREE_ID above. E2E_RECORD / DEEPSEEK_API_KEY / DEEPSEEK_API_BASE flow
+# through to the plugin's record mode automatically (mcp2cli passes env).
 SESSION="e2e-run-$$"
 
 # _argus: invoke an argusai MCP tool; return non-zero on tool-level failure
@@ -92,6 +114,12 @@ _argus() {
 
 cleanup() {
   _argus argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+  # argus-clean only removes containers/networks it created itself (labeled
+  # argusai.managed). The plugin-owned aimock container carries no such label
+  # and the MCP path never invokes the plugin teardown hook, so a stale aimock
+  # would linger and — worse — silently replay old fixtures instead of
+  # recording on the next E2E_RECORD run. Remove it explicitly.
+  docker rm -f aimock >/dev/null 2>&1 || true
   "$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT

@@ -254,16 +254,17 @@ e2e/
    **E2E smoke is a hard gate by the self-improve flow** (restored after
    being silently skipped on g262): the flow runs the `e2e` project gate
    declared in `.flowcast/gates.json` →
-   `cd e2e && argusai -c e2e.yaml run -s smoke` (3 scenarios: basic
-   Write, basic Read, session-recording assertions).
+   `sh .dev/scripts/e2e-gate.sh` (MCP path: mcp2cli → argusai-mcp, runs the
+   `smoke` suite — 3 scenarios: basic Write, basic Read, session-recording
+   assertions).
    Replay mode — deterministic, no API key, ~700ms. If it fails the
    flow invokes a one-shot resume-fix replay asking you to fix
-   the regression. If the E2E prerequisites are missing (argusai not
-   on PATH, no `e2e/e2e.yaml`, or `e2e/plugins/dist/index.js` not
-   built) the gate is HARD-FAIL — the flow rolls back. argusai
+   the regression. If the E2E prerequisites are missing (argusai-mcp not
+   installed, no `e2e/e2e.yaml`, or `e2e/plugins/dist/index.js` not
+   built) the gate is HARD-FAIL — the flow rolls back. argusai-mcp
    is normally picked up via fnm's multishell path, but the gate
    has a fallback to the stable fnm install path
-   (`$FNM_DIR/node-versions/*/installation/bin/argusai`) for
+   (`$FNM_DIR/node-versions/*/installation/bin/argusai-mcp`) for
    non-interactive subprocesses. Only set `RECURSIVE_SMOKE_TEST=0`
    if Docker is genuinely unavailable in the run environment.
 

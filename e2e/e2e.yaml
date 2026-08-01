@@ -45,13 +45,11 @@ service:
       # Passed through for live integration tests (06, 23)
       DEEPSEEK_API_KEY: "{{env.DEEPSEEK_API_KEY}}"
 
-mocks:
-  aimock:
-    image: ghcr.io/copilotkit/aimock
-    port: 4010
-    volumes:
-      - "./fixtures:/fixtures"
-    args: "-f /fixtures -h 0.0.0.0"
+# NOTE: no `mocks:` section here by design. The aimock container (fixture
+# replay / record proxy) is owned by e2e/plugins/src/index.ts, which starts
+# it in replay or record mode (E2E_RECORD=1) on the argusai network. Declaring
+# aimock as an image mock here would make argus-setup clobber it with
+# replay-only args and cannot inject OPENAI_API_KEY, so recording would break.
 
 tests:
   suites:

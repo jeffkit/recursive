@@ -169,5 +169,9 @@ else
 fi
 
 _argus "$SESSION" argus-clean --project-path "$E2E_PROJECT" >/dev/null 2>&1 || true
+# argus-clean does not touch the plugin-owned aimock (no argusai.managed
+# label, plugin teardown not invoked on the MCP path); remove it so a stale
+# replay aimock can't silently swallow the next E2E_RECORD run (false green).
+docker rm -f aimock >/dev/null 2>&1 || true
 "$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
 exit "$RC"
