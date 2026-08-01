@@ -15,8 +15,13 @@
 // - Session resume/replay (loading from JSONL)
 // - Manual transcript trimming/splicing
 
-use recursive::llm::ToolCall;
+use recursive::compact::{FileReinjector, SkillReinjector};
+use recursive::llm::{Completion, MockProvider, ToolCall};
 use recursive::message::{Message, Role};
+use recursive::tools::ReadFileState;
+use recursive::{AgentRuntime, Compactor, TokenUsage};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -162,9 +167,6 @@ fn tool_with_mismatched_id_detected() {
 /// still satisfy the pairing invariant.
 #[tokio::test]
 async fn compaction_preserves_tool_call_pairing() {
-    use recursive::llm::{Completion, MockProvider};
-    use recursive::Compactor;
-
     // Build a transcript with tool calls before and after the split point.
     // keep_recent_n=3 will keep the last 3 messages verbatim.
     let transcript = vec![
@@ -343,4 +345,310 @@ fn consecutive_tool_results_share_same_assistant() {
 
     verify_tool_call_pairing(&transcript)
         .expect("consecutive tool results sharing same assistant must be valid");
+}
+
+// ── Cross-turn compaction + reinjection preserves pairing ──────────────────
+//
+// Invariant #8's highest-risk mutation path is the runtime's cross-turn
+// compaction reinjection (`maybe_compact_cross_turn`, src/runtime.rs:370).
+// After `Compactor::apply_to_transcript` drains the head and inserts a
+// summary at index 0 (src/runtime.rs:415-423), three reinjector blocks
+// re-insert `Role::System` attachment messages and compute their insertion
+// indices via string-prefix heuristics:
+//   Block A (file restore, src/runtime.rs:461-479): re-slices the preserved
+//     tail (`skip(1)`) and inserts at `1 + offset`.
+//   Block B (skill restore, src/runtime.rs:480-507): computes `insert_base`
+//     by counting `[post-compact file restore:` prefixes ("Approximate").
+//   Block C (plan/todo restore, src/runtime.rs:508-534): `insert_base` via
+//     `take_while` over the file/skill prefixes.
+// The reinjectors only emit System messages, so they cannot directly orphan
+// a Tool; the real risk is the preserved tail — if the re-slicing dropped or
+// duplicated a message, the tail's pairing breaks. These tests drive the REAL
+// runtime through the full path with a tool pair in the preserved tail and
+// assert the pairing invariant afterwards.
+
+/// A provider scripted with exactly one summary completion — enough for a
+/// single compaction pass (`maybe_compact_cross_turn` consumes one).
+fn summary_provider(content: &str) -> Arc<MockProvider> {
+    Arc::new(MockProvider::new(vec![Completion {
+        content: content.to_string(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+        reasoning_content: None,
+    }]))
+}
+
+/// Seed transcript with a complete tool pair (`c2`) at the tail and bulk
+/// padding up front so a 100-char compactor fires. With `keep_recent_n(2)`
+/// over 6 messages, `safe_split_point` retreats from index 4 (an
+/// Assistant-with-tool_calls) to index 3 (a User message), so the preserved
+/// tail is `[user, assistant c2, tool c2]` — the c2 pair survives the split
+/// wholesale and the pairing assertion is non-vacuous.
+fn transcript_with_tool_pair_in_tail() -> Vec<Message> {
+    vec![
+        Message::user("padding ".repeat(20)),
+        assistant_with_tool_call("c1", "read_file", "Reading file A."),
+        tool_result_msg("c1", "content of file A"),
+        Message::user("more padding ".repeat(20)),
+        assistant_with_tool_call("c2", "read_file", "Reading file B."),
+        tool_result_msg("c2", "content of file B"),
+    ]
+}
+
+/// An Assistant message that invokes the `Skill` tool with a `name` argument
+/// — the shape `SkillReinjector` scans for in `pre_compact`.
+fn skill_tool_call_msg(id: &str, skill_name: &str) -> Message {
+    Message::assistant_with_tool_calls(
+        format!("Loading skill {skill_name}."),
+        vec![ToolCall {
+            id: id.to_string(),
+            name: "Skill".to_string(),
+            arguments: serde_json::json!({ "name": skill_name }),
+        }],
+    )
+}
+
+/// Same as [`transcript_with_tool_pair_in_tail`], but with a `Skill` tool
+/// invocation in the older portion so `SkillReinjector::reinject(pre_compact)`
+/// finds a match while the preserved tail keeps the complete `c2` pair.
+fn transcript_with_skill_in_older_and_tool_pair_in_tail() -> Vec<Message> {
+    vec![
+        Message::user("padding ".repeat(20)),
+        skill_tool_call_msg("sk1", "my-skill"),
+        tool_result_msg("sk1", "skill body loaded"),
+        Message::user("more padding ".repeat(20)),
+        assistant_with_tool_call("c2", "read_file", "Reading file B."),
+        tool_result_msg("c2", "content of file B"),
+    ]
+}
+
+/// Assert the common post-compaction shape: compaction actually fired
+/// (guards against a silently-no-op test), the preserved tail still holds a
+/// Tool result (so the pairing check is not vacuous), and the whole
+/// transcript satisfies the pairing invariant.
+fn assert_compaction_fired_and_pairing_ok(rt: &AgentRuntime, context: &str) {
+    let transcript = rt.transcript();
+    assert_eq!(
+        transcript[0].role,
+        Role::System,
+        "{context}: transcript must start with the compaction summary"
+    );
+    assert!(
+        transcript[0].is_compaction_summary,
+        "{context}: first message must be flagged as a compaction summary"
+    );
+    assert!(
+        transcript.iter().any(|m| m.role == Role::Tool),
+        "{context}: preserved tail must retain a Tool result so the pairing check is non-vacuous"
+    );
+    verify_tool_call_pairing(transcript).expect(context);
+}
+
+/// Write a real skill to a tempdir and discover it (mirrors the
+/// `create_skill_on_disk` idiom in `src/compact/reinject.rs` tests — the
+/// reinjector reads the body from `skill.path` on disk). The returned
+/// `TempDir` must stay alive for the caller's test duration.
+fn skill_on_disk(name: &str, body: &str) -> (tempfile::TempDir, recursive::skills::Skill) {
+    let tmp = tempfile::tempdir().expect("tempdir for skill");
+    let skill_dir = tmp.path().join(name);
+    std::fs::create_dir(&skill_dir).expect("create skill dir");
+    let path = skill_dir.join("SKILL.md");
+    std::fs::write(
+        &path,
+        format!("---\nname: {name}\ndescription: {name} skill\n---\n\n{body}"),
+    )
+    .expect("write SKILL.md");
+    let discovered = recursive::skills::discover_skills(&[tmp.path().to_path_buf()]);
+    let skill = discovered.into_iter().next().expect("skill discovered");
+    (tmp, skill)
+}
+
+/// Seed the runtime's shared todo list through the real `TodoWrite` tool.
+/// The runtime keeps `todo_list` private, so the public seam is the kernel
+/// tool registry (the registered `TodoWriteTool` shares the same `Arc` the
+/// plan/todo reinjector reads).
+async fn seed_todos(rt: &AgentRuntime) {
+    let tool = rt
+        .kernel()
+        .tools()
+        .get("TodoWrite")
+        .expect("TodoWrite must be registered by AgentRuntimeBuilder::build");
+    tool.execute(serde_json::json!({
+        "todos": [
+            {"content": "Read files", "status": "completed"},
+            {"content": "Edit code", "status": "in_progress", "active_form": "Editing code..."},
+            {"content": "Run tests", "status": "pending"},
+        ]
+    }))
+    .await
+    .expect("todo write must succeed");
+}
+
+/// Cross-turn compaction with the FILE reinjector active must preserve
+/// tool-call ↔ tool-result pairing in the preserved tail. Drives Block A
+/// (src/runtime.rs:461-479): the re-slice of the preserved tail + insert of
+/// the `[post-compact file restore:` attachment at index 1.
+#[tokio::test]
+async fn cross_turn_compaction_with_file_reinjector_preserves_pairing() {
+    let provider = summary_provider("Summary of prior turns.");
+
+    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
+    {
+        let mut locked = read_state.lock().unwrap();
+        locked.record(
+            PathBuf::from("src/lib.rs"),
+            false,
+            "pub fn foo() {}".to_string(),
+            1000,
+        );
+    }
+
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .compactor(Compactor::new(100).keep_recent_n(2))
+        .file_reinjector(FileReinjector::new(read_state))
+        .build()
+        .expect("build runtime");
+
+    let msgs = transcript_with_tool_pair_in_tail();
+    verify_tool_call_pairing(&msgs).expect("seed transcript must satisfy pairing");
+    rt.set_transcript(msgs);
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .expect("cross-turn compaction must succeed");
+
+    assert_compaction_fired_and_pairing_ok(&rt, "file reinjector must preserve pairing");
+
+    let transcript = rt.transcript();
+    let file_idx = transcript
+        .iter()
+        .position(|m| m.content.starts_with("[post-compact file restore:"))
+        .expect("file restore attachment must be present");
+    assert!(
+        file_idx > 0 && file_idx < transcript.len() - 1,
+        "file restore must sit between the summary (index 0) and the preserved tail"
+    );
+    assert_eq!(
+        file_idx, 1,
+        "file restore must be the first attachment, immediately after the summary"
+    );
+    assert!(
+        transcript[file_idx].content.contains("pub fn foo() {}"),
+        "file restore must carry the re-injected file content"
+    );
+}
+
+/// Cross-turn compaction with the SKILL reinjector active must preserve
+/// pairing. Drives Block B (src/runtime.rs:480-507) and its "Approximate"
+/// `insert_base` heuristic most directly.
+#[tokio::test]
+async fn cross_turn_compaction_with_skill_reinjector_preserves_pairing() {
+    let provider = summary_provider("Summary of prior turns.");
+    let (_tmp, skill) = skill_on_disk("my-skill", "This skill teaches pairing.");
+
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .compactor(Compactor::new(100).keep_recent_n(2))
+        .skill_reinjector(SkillReinjector::new(vec![skill]))
+        .build()
+        .expect("build runtime");
+
+    let msgs = transcript_with_skill_in_older_and_tool_pair_in_tail();
+    verify_tool_call_pairing(&msgs).expect("seed transcript must satisfy pairing");
+    rt.set_transcript(msgs);
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .expect("cross-turn compaction must succeed");
+
+    assert_compaction_fired_and_pairing_ok(&rt, "skill reinjector must preserve pairing");
+
+    let transcript = rt.transcript();
+    let skill_idx = transcript
+        .iter()
+        .position(|m| m.content.starts_with("[post-compact skill restore:"))
+        .expect("skill restore attachment must be present");
+    assert!(skill_idx > 0, "skill restore must not replace the summary");
+    assert_eq!(
+        skill_idx, 1,
+        "skill restore must be the first attachment (no file reinjector installed)"
+    );
+    assert!(
+        transcript[skill_idx].content.contains("my-skill"),
+        "skill restore must name the invoked skill"
+    );
+}
+
+/// Cross-turn compaction with ALL three reinjectors active (file, skill,
+/// plan/todo) must preserve pairing and keep the attachment chain ordered
+/// `[file, skill, plan, todo]` — pinning both independent `insert_base`
+/// computations (src/runtime.rs:484 and :514).
+#[tokio::test]
+async fn cross_turn_compaction_with_all_reinjectors_preserves_pairing() {
+    let provider = summary_provider("Summary of prior turns.");
+
+    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
+    {
+        let mut locked = read_state.lock().unwrap();
+        locked.record(
+            PathBuf::from("src/lib.rs"),
+            false,
+            "pub fn foo() {}".to_string(),
+            1000,
+        );
+    }
+    let (_tmp, skill) = skill_on_disk("my-skill", "This skill teaches pairing.");
+
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .compactor(Compactor::new(100).keep_recent_n(2))
+        .file_reinjector(FileReinjector::new(read_state))
+        .skill_reinjector(SkillReinjector::new(vec![skill]))
+        .build()
+        .expect("build runtime");
+
+    // Activate plan + todo state so Block C (plan/todo restore) emits.
+    rt.plan_approval_gate()
+        .begin_approval("Step 1: explore\nStep 2: implement".to_string());
+    seed_todos(&rt).await;
+
+    let msgs = transcript_with_skill_in_older_and_tool_pair_in_tail();
+    verify_tool_call_pairing(&msgs).expect("seed transcript must satisfy pairing");
+    rt.set_transcript(msgs);
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .expect("cross-turn compaction must succeed");
+
+    assert_compaction_fired_and_pairing_ok(&rt, "all reinjectors must preserve pairing");
+
+    let transcript = rt.transcript();
+    let file_idx = transcript
+        .iter()
+        .position(|m| m.content.starts_with("[post-compact file restore:"))
+        .expect("file restore attachment must be present");
+    let skill_idx = transcript
+        .iter()
+        .position(|m| m.content.starts_with("[post-compact skill restore:"))
+        .expect("skill restore attachment must be present");
+    let plan_idx = transcript
+        .iter()
+        .position(|m| m.content.starts_with("[post-compact plan restore]"))
+        .expect("plan restore attachment must be present");
+    let todo_idx = transcript
+        .iter()
+        .position(|m| m.content.starts_with("[post-compact todo restore]"))
+        .expect("todo restore attachment must be present");
+
+    assert!(
+        file_idx < skill_idx && skill_idx < plan_idx && plan_idx < todo_idx,
+        "reinjector chain must order attachments [file, skill, plan, todo], \
+         got file={file_idx} skill={skill_idx} plan={plan_idx} todo={todo_idx}"
+    );
+    assert!(
+        todo_idx + 1 < transcript.len(),
+        "the preserved tail must follow the attachment chain"
+    );
 }
