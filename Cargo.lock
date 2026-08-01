@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-agent"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "agent-client-protocol-schema",
  "agui-client",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-tui"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "arboard",

@@ -1,8 +1,63 @@
 # Changelog
 
+## 0.8.1
+
+172 commits since 0.8.0. Highlights:
+
+### Features
+- **Agent Client Protocol (ACP)**: `recursive acp` server implementing
+  P0–P7 of ACP v1 — stdio JSON-RPC loop, session lifecycle, permission
+  bridge, editor fs + MCP multi-transport (new `recursive::acp` module).
+- **OTLP trace exporter**: feature-gated `otel` OpenTelemetry export in
+  the CLI (Goal 325).
+- **Sub-agents on by default**: backgroundable continued conversations,
+  coordinator briefing methodology, and a multi-sub-agent E2E regression
+  suite with aimock record/replay.
+- **Compaction upgrade**: circuit breaker, opt-in Microcompactor, and
+  post-compaction re-injection of the plan, todo list, recently-read
+  files, and invoked skills after cross-turn compaction.
+- **TUI select & copy**: selectable/copyable agent output (Goal 349);
+  `/compact-before` and `/compact-after` commands (Goal 342); context
+  gauge reads the effective provider catalog.
+- **Config**: `AGENTS.md` is authoritative, `CLAUDE.md` is fallback only.
+
+### Architecture & reliability
+- `#![deny(clippy::unwrap_used, expect_used)]` rolled out workspace-wide
+  across all 7 crates — the shipping `recursive` binary no longer carries
+  production `.unwrap()`/`.expect()` in session-resume / control paths
+  (Invariant #5, Goal 354).
+- `src/compact.rs` promoted to `src/compact/` module; unified compaction
+  threshold decision (Goal 330); CompactionRunner refactor with
+  boundary-preserving validation (Goal 341/347).
+- Recompaction-in-chain telemetry (Goal 338) and cache hit/miss metrics
+  on `CompactionBoundary` (Goal 336).
+- Edit staleness check decoupled from the full-content cache (Goal 348).
+
+### Bug Fixes
+- Mid-stream `Error::Cancelled` now persists the transcript (Invariant #7,
+  Goal 353).
+- Replaced unsound unmaintained `serde_yml 0.0.12` (RUSTSEC-2025-0068)
+  with `serde_yaml_ng` (Goal 355).
+- Cross-turn compaction sizes by `last_prompt_tokens`, not the accumulated
+  sum; degenerate emergency compaction without hook events is rejected.
+- TUI: pasted CR/CRLF normalized to real newlines; ESC double-press
+  interrupt; thinking duration no longer accumulates across thoughts
+  (Goal 352); `/clear` stops an active event-driven loop.
+- SshTransport host key verification hardened (Goal 349).
+
+### Dev & E2E
+- Flow watchdog detects hung `recursive` processes (Goal 346); in-flight
+  work preserved on flow kill (Goal 345).
+- E2E record/replay unified onto a single MCP path with self-healing
+  aimock mode.
+- Flowcast 0.6 executor migration; fail-fast quality-gate preflight;
+  `/loop` supervise shipped as a loadable skill with agent-controlled stop.
+
+Note: the `v0.8.1` git tag is pending — this section only prepares main.
+
 ## 0.8.0
 
-190 commits since 0.7.0. Highlights:
+192 commits since 0.7.0. Highlights:
 
 ### Features
 - **AG-UI interrupt/resume** (Pattern 2 HITL): pause agent runs for human
