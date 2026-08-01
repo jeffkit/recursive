@@ -1,0 +1,76 @@
+{
+  "_doc": "Background worker cross-turn continuation. Mirrors the real model behaviour captured in a live run: coordinator spawns a background worker (worker_id=cw) via `agent`, continues it with `send_message(worker_id=cw)`, the worker writes alpha.txt then beta.txt across two turns. Coordinator uses worker_id (not the dynamic task_id) to address the worker, so this fixture is deterministic. Match dims: coordinator requests keyed on the goal substring; worker requests keyed on the worker prompt substring — they never collide, so interleaving order does not matter.",
+  "_captured_from": "live deepseek-chat run; tool-call shapes adapted to use worker_id addressing",
+  "fixtures": [
+    {
+      "_comment": "C1: coordinator turn 0 (no assistant yet). Goal 'continue-marker'. Decides to spawn a background writer.",
+      "match": { "userMessage": "continue-marker", "turnIndex": 0 },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "agent",
+            "arguments": {
+              "mode": "single",
+              "background": true,
+              "manifest": {
+                "cw": {
+                  "system_prompt": "You are a file writer worker. Use the Write tool to create files with the exact contents specified. Be concise.",
+                  "allowed_tools": ["Write"]
+                }
+              },
+              "prompt": "write-alpha: write the file alpha.txt in the workspace root with contents exactly: aaa"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "W1: worker turn 1 (isolated transcript, turnIndex 0). Worker prompt 'write-alpha', no tool result. Calls Write.",
+      "match": { "userMessage": "write-alpha", "turnIndex": 0, "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          { "name": "Write", "arguments": { "path": "alpha.txt", "contents": "aaa" } }
+        ]
+      }
+    },
+    {
+      "_comment": "W1b: worker turn 1 close (turnIndex 1, has tool result). Final text so the first turn finishes.",
+      "match": { "userMessage": "write-alpha", "turnIndex": 1, "hasToolResult": true },
+      "response": { "content": "Wrote alpha.txt with contents aaa." }
+    },
+    {
+      "_comment": "C2: coordinator turn 1. Goal 'continue-marker' is the latest user msg again (agent tool returned task_id). Decides to continue the worker via send_message using the FIXED worker_id (not the dynamic task_id).",
+      "match": { "userMessage": "continue-marker", "turnIndex": 1 },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "send_message",
+            "arguments": {
+              "worker_id": "cw",
+              "message": "write-beta: write the file beta.txt in the workspace root with contents exactly: bbb"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "W2: worker turn 2 (continuation). send_message pushed 'write-beta...' as the latest user msg in the worker transcript. turnIndex 2 (two prior assistant replies from turn 1). Calls Write for beta.txt.",
+      "match": { "userMessage": "write-beta", "turnIndex": 2 },
+      "response": {
+        "toolCalls": [
+          { "name": "Write", "arguments": { "path": "beta.txt", "contents": "bbb" } }
+        ]
+      }
+    },
+    {
+      "_comment": "W2b: worker turn 2 close (turnIndex 3, has tool result). Final text so the second turn finishes.",
+      "match": { "userMessage": "write-beta", "turnIndex": 3, "hasToolResult": true },
+      "response": { "content": "Wrote beta.txt with contents bbb." }
+    },
+    {
+      "_comment": "C3: coordinator turn 2. Goal 'continue-marker', turnIndex 2. Final summary (both turns done).",
+      "match": { "userMessage": "continue-marker", "turnIndex": 2 },
+      "response": { "content": "Continuation complete: the background worker wrote alpha.txt then beta.txt across two turns via send_message." }
+    }
+  ]
+}

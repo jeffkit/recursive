@@ -212,3 +212,11 @@ tests:
     - name: "Claude-compatible JSON stream + control channel"
       id: claude-json-stream
       file: tests/40-claude-json-stream.yaml
+
+    - name: "Multi Sub-Agent Delegation (agent tool)"
+      id: multi-agent
+      file: tests/41-multi-agent.yaml
+
+    - name: "Sub-Agent Cross-Turn Continuation (background + send_message)"
+      id: multi-agent-continue
+      file: tests/42-multi-agent-continue.yaml

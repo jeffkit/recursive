@@ -1,0 +1,70 @@
+name: "Multi Sub-Agent Delegation"
+description: |
+  End-to-end: the parent agent delegates file-writing to a child worker via the
+  `agent` tool. Asserts (1) the `agent` tool was actually called, (2) the run
+  completed successfully, and (3) the child worker really wrote the file —
+  proving the delegation produced real work.
+sequential: true
+
+setup:
+  - name: "Prepare isolated workspace + RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-41
+        rm -rf /tmp/recursive-home-41
+        rm -rf /tmp/sessions-41
+        mkdir -p /workspace/test-41
+        mkdir -p /tmp/recursive-home-41
+        echo prepared
+
+  - name: "Run parent agent: delegate file-writing to a child worker"
+    exec:
+      container: recursive-e2e
+      # Sub-agent is enabled by default (recursive >= this change). We rely on
+      # the default here so this test also guards the default-on behaviour. If
+      # RECURSIVE_SUBAGENT_ENABLED is ever reset to opt-in, set it explicitly:
+      #   export RECURSIVE_SUBAGENT_ENABLED=1
+      command: |
+        unset RECURSIVE_SESSIONS_DIR
+        RECURSIVE_HOME=/tmp/recursive-home-41 \
+        recursive --workspace /workspace/test-41 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 20 \
+          run "delegate-marker: please delegate writing a note to a worker."
+        SESSION_DIR=$(find /tmp/recursive-home-41 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-41
+          cp -r "$SESSION_DIR/." /tmp/sessions-41/
+        fi
+
+cases:
+  - name: "Parent called the agent (sub-agent) tool"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-41
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      # The core assertion: the parent agent delegated via the `agent` tool.
+      hasToolCalls: ["agent"]
+      # A delegation produces at least: parent decision, agent tool result,
+      # and a final summary — so >= 3 messages.
+      minMessages: 3
+      finalized: true
+
+  - name: "Child worker actually wrote note.txt with the expected contents"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-41/note.txt
+      exists: true
+      contains: "hello-from-child"
+
+teardown:
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-41
+        rm -rf /tmp/recursive-home-41
+        rm -rf /tmp/sessions-41

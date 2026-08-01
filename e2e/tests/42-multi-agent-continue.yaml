@@ -1,0 +1,85 @@
+name: "Sub-Agent Cross-Turn Continuation (background + send_message)"
+description: |
+  End-to-end: the coordinator spawns a background worker via the `agent` tool
+  (mode:single, background:true), then continues the SAME worker with
+  `send_message` so it runs a second turn on its retained runtime. Asserts the
+  worker produced output in BOTH turns (two files), proving cross-turn
+  continuation works.
+
+  Fixture note: the coordinator and the background worker issue LLM requests
+  that interleave; aimock matches each request independently by content
+  (userMessage + turnIndex + hasToolResult), so arrival order does not matter.
+  The coordinator addresses the worker by its FIXED worker_id ("cw") rather
+  than the dynamic task_id, keeping the fixture deterministic. The fixture was
+  shaped from a real deepseek-chat run (same tool-call sequence) and verified
+  in replay.
+sequential: true
+
+setup:
+  - name: "Prepare isolated workspace + RECURSIVE_HOME"
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-42
+        rm -rf /tmp/recursive-home-42
+        rm -rf /tmp/sessions-42
+        mkdir -p /workspace/test-42
+        mkdir -p /tmp/recursive-home-42
+        echo prepared
+
+  - name: "Run coordinator: spawn background writer, then continue it"
+    exec:
+      container: recursive-e2e
+      # Sub-agent is on by default. background + send_message are both
+      # registered in the default build (not gated by coordinator-mode).
+      command: |
+        unset RECURSIVE_SESSIONS_DIR
+        RECURSIVE_HOME=/tmp/recursive-home-42 \
+        recursive --workspace /workspace/test-42 \
+          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --max-steps 30 \
+          run "continue-marker: spawn a background writer worker (worker_id=cw) that writes alpha.txt (contents aaa), then send_message to that same worker to write beta.txt (contents bbb) in a second turn."
+        # Give any lingering background task a moment to flush before the
+        # process exit tears down its runtime.
+        sleep 1
+        SESSION_DIR=$(find /tmp/recursive-home-42 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        if [ -n "$SESSION_DIR" ]; then
+          mkdir -p /tmp/sessions-42
+          cp -r "$SESSION_DIR/." /tmp/sessions-42/
+        fi
+
+cases:
+  - name: "Coordinator delegated AND continued the worker"
+    recursive-session:
+      container: recursive-e2e
+      input: /tmp/sessions-42
+      status: ["completed", "success"]
+      hasRoles: ["user", "assistant"]
+      # The core continuation assertion: both the spawn (agent) and the
+      # follow-up (send_message) tool calls appear in the transcript.
+      hasToolCalls: ["agent", "send_message"]
+      finalized: true
+
+  - name: "Worker first turn wrote alpha.txt"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-42/alpha.txt
+      exists: true
+      contains: "aaa"
+
+  - name: "Worker second turn (continuation) wrote beta.txt"
+    file:
+      container: recursive-e2e
+      path: /workspace/test-42/beta.txt
+      exists: true
+      contains: "bbb"
+
+teardown:
+  - name: "Clean workspace + RECURSIVE_HOME + session copy"
+    ignoreError: true
+    exec:
+      container: recursive-e2e
+      command: |
+        rm -rf /workspace/test-42
+        rm -rf /tmp/recursive-home-42
+        rm -rf /tmp/sessions-42

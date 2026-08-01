@@ -1,0 +1,47 @@
+{
+  "fixtures": [
+    {
+      "_comment": "1) Parent agent, first LLM call: goal contains 'delegate-marker', no tool result yet -> decide to delegate via the `agent` tool.",
+      "match": { "userMessage": "delegate-marker", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "agent",
+            "arguments": {
+              "mode": "single",
+              "manifest": {
+                "writer": {
+                  "system_prompt": "You write files exactly when asked. Be concise.",
+                  "allowed_tools": ["Write"]
+                }
+              },
+              "prompt": "child-marker: write a file named note.txt with the exact contents hello-from-child"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "2) Child worker, first LLM call: the latest user message is the worker prompt (contains 'child-marker'), no tool result yet -> call Write.",
+      "match": { "userMessage": "child-marker", "hasToolResult": false },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Write",
+            "arguments": { "path": "note.txt", "contents": "hello-from-child" }
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "3) Child worker, second LLM call: worker prompt still 'child-marker' (latest user msg), now has a tool result (Write done) -> produce final text.",
+      "match": { "userMessage": "child-marker", "hasToolResult": true },
+      "response": { "content": "Done. note.txt written with the requested contents." }
+    },
+    {
+      "_comment": "4) Parent agent, follow-up: goal 'delegate-marker' is the latest user msg again (after the agent tool result returns), has tool result -> summarize.",
+      "match": { "userMessage": "delegate-marker", "hasToolResult": true },
+      "response": { "content": "Delegation complete. The worker wrote note.txt." }
+    }
+  ]
+}

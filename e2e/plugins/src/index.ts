@@ -26,7 +26,10 @@ const plugin: PluginModule = {
 
   async setup() {
     const recordMode = process.env['E2E_RECORD'] === '1';
-    const realApiBase = process.env['DEEPSEEK_API_BASE'] ?? 'https://api.deepseek.com/v1';
+    // aimock's `--provider-openai` appends `/v1/chat/completions` itself, so
+    // strip a trailing `/v1` from the configured base to avoid `/v1/v1/`.
+    const rawBase = process.env['DEEPSEEK_API_BASE'] ?? 'https://api.deepseek.com/v1';
+    const realApiBase = rawBase.replace(/\/v1\/?$/, '');
     const apiKey = process.env['DEEPSEEK_API_KEY'] ?? '';
 
     // Auto-start aimock container, joining the correct Docker network.
@@ -64,15 +67,19 @@ const plugin: PluginModule = {
 
         let aimockCmd: string;
         if (recordMode && apiKey) {
-          // Record mode: proxy to real LLM, record responses to fixtures/recorded/
+          // Record mode: proxy to real LLM, record new fixtures. aimock's
+          // `--record` saves unmatched requests to the FIRST `-f` path, so we
+          // put the recorded/ dir first (writable) and the curated /fixtures
+          // second (existing fixtures still replay). Note: aimock has no
+          // `--record-path` flag — the first `-f` IS the record target.
           execSync(`mkdir -p "${recordedDir}"`);
           aimockCmd = `docker run -d --name aimock ${networkFlag} ` +
             `-v "${fixturesDir}:/fixtures" ` +
             `-e "OPENAI_API_KEY=${apiKey}" ` +
             `ghcr.io/copilotkit/aimock ` +
-            `--record --record-path /fixtures/recorded ` +
+            `--record ` +
             `--provider-openai ${realApiBase} ` +
-            `-f /fixtures -h 0.0.0.0`;
+            `-f /fixtures/recorded -f /fixtures -h 0.0.0.0`;
           console.log('[recursive-agent] aimock starting in RECORD mode (proxying to real LLM)');
         } else {
           // Replay mode: serve fixtures deterministically
