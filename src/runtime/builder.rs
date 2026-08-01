@@ -353,3 +353,89 @@ impl AgentRuntimeBuilder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::MockProvider;
+    use crate::message::Role;
+
+    fn mock_llm() -> Arc<dyn ChatProvider> {
+        Arc::new(MockProvider::new(vec![]))
+    }
+
+    #[test]
+    fn build_with_minimum_config_succeeds() {
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .build()
+            .expect("build() with just an LLM must succeed");
+
+        // Sane defaults pinned: max_steps 0 (unlimited), no compactor,
+        // streaming off, empty transcript, checkpoints disabled.
+        assert_eq!(rt.kernel.max_steps, 0);
+        assert_eq!(rt.kernel.max_transcript_chars, None);
+        assert!(rt.compactor.is_none());
+        assert!(rt.microcompactor.is_none());
+        assert!(!rt.streaming);
+        assert!(rt.transcript.is_empty());
+        assert!(!rt.checkpoints.enabled());
+        assert_eq!(rt.goal_eval_transcript_tail, 12);
+    }
+
+    #[test]
+    fn build_without_llm_errors() {
+        let result = AgentRuntimeBuilder::new().build();
+        let err = result.expect_err("build() without an LLM must fail");
+        assert!(
+            matches!(err, crate::error::Error::Config { .. }),
+            "expected Error::Config, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn builder_setters_round_trip() {
+        let compactor = Compactor::new(1000);
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .max_steps(7)
+            .max_transcript_chars(5000)
+            .compactor(compactor)
+            .streaming(true)
+            .stuck_window(4)
+            .seed_transcript(vec![
+                Message::user("seed user"),
+                Message::assistant("seed assistant"),
+            ])
+            .build()
+            .expect("build() with setters must succeed");
+
+        assert_eq!(rt.kernel.max_steps, 7);
+        assert_eq!(rt.kernel.max_transcript_chars, Some(5000));
+        assert!(rt.compactor.is_some());
+        assert!(rt.streaming);
+        assert_eq!(rt.kernel.stuck_window, 4);
+        // Seeded transcript appears verbatim (no system prompt set here).
+        assert_eq!(rt.transcript.len(), 2);
+        assert_eq!(rt.transcript[0].role, Role::User);
+        assert_eq!(rt.transcript[1].role, Role::Assistant);
+        assert_eq!(rt.transcript[0].content, "seed user");
+        assert_eq!(rt.transcript[1].content, "seed assistant");
+    }
+
+    #[test]
+    fn file_reinjector_and_skill_reinjector_wire_through() {
+        let read_state = Arc::new(std::sync::Mutex::new(crate::tools::fs::ReadFileState::new()));
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .file_reinjector(crate::compact::FileReinjector::new(read_state))
+            .skill_reinjector(crate::compact::SkillReinjector::new(vec![]))
+            .build()
+            .expect("build() with reinjectors must succeed");
+
+        assert!(rt.file_reinjector.is_some());
+        assert!(rt.skill_reinjector.is_some());
+        // Goal-340: build() always wires the plan/todo reinjector.
+        assert!(rt.plan_todo_reinjector.is_some());
+    }
+}

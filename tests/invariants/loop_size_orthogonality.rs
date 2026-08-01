@@ -121,6 +121,36 @@ fn run_inner_function_body_stays_small() {
     );
 }
 
+/// Production code (pre-`#[cfg(test)]`) in run_core.rs. The `run_inner`
+/// body guard above covers the function; this covers the sibling helpers
+/// (execute_tool_calls, dispatch_llm_step, etc.) that accumulate complexity
+/// off the main loop. Bump only with a journal entry justifying why
+/// extraction isn't possible.
+#[test]
+fn run_core_production_stays_small() {
+    let path = src_file("run_core.rs");
+    let content = std::fs::read_to_string(&path).expect("run_core.rs must exist");
+    let lines = production_line_count(&content);
+    assert!(
+        lines <= 1500,
+        "invariant #1 drift: run_core.rs production code is {lines} lines (limit: 1500). \
+         The run_inner body guard covers the function; this guards the sibling helpers. \
+         Extract new capabilities into tools/ rather than growing this file."
+    );
+}
+
+/// Count the production lines of a source file: the 1-based line number of
+/// the first `#[cfg(test)]` attribute, or the total line count when no test
+/// module exists (the whole file is production).
+fn production_line_count(content: &str) -> usize {
+    for (i, line) in content.lines().enumerate() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            return i + 1;
+        }
+    }
+    content.lines().count()
+}
+
 // ── Invariant #2: Orthogonality ────────────────────────────────────────────
 
 /// Tools must not import LLM internals beyond the `ToolSpec` shared type.

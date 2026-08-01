@@ -48,3 +48,58 @@ impl CheckpointState {
         self.shadow.is_some() && self.session_id.is_some()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn turn_index_starts_at_zero_and_increments() {
+        let state = CheckpointState::disabled();
+        assert_eq!(state.turn_index.load(Ordering::Relaxed), 0);
+
+        state.turn_index.fetch_add(1, Ordering::Relaxed);
+        state.turn_index.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(state.turn_index.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn disabled_state_has_no_checkpoint_subsystem() {
+        let state = CheckpointState::disabled();
+        assert!(!state.enabled());
+        assert!(state.shadow.is_none());
+        assert!(state.session_id.is_none());
+        assert!(state.writer.is_none());
+        assert!(state.touched_files.is_none());
+        assert!(state.log_path.is_none());
+    }
+
+    #[test]
+    fn touched_files_lifecycle() {
+        let state = CheckpointState::disabled();
+        assert!(state.touched_files.is_none());
+
+        // A checkpoint-enabled runtime owns a TouchedFiles observer shared
+        // with the tool registry; the add/read/clear cycle must not lose
+        // entries (pins accidental field-swaps in CheckpointState).
+        let touched = Arc::new(Mutex::new(TouchedFiles::new()));
+        let mut with_touched = CheckpointState::disabled();
+        with_touched.touched_files = Some(touched.clone());
+
+        {
+            let mut guard = touched.lock().unwrap();
+            guard.paths.insert("src/foo.rs".into());
+            guard.paths.insert("Cargo.toml".into());
+        }
+        {
+            let guard = touched.lock().unwrap();
+            assert_eq!(guard.paths_sorted(), vec!["Cargo.toml", "src/foo.rs"]);
+        }
+        {
+            let mut guard = touched.lock().unwrap();
+            guard.paths.clear();
+        }
+        assert!(touched.lock().unwrap().is_empty());
+    }
+}

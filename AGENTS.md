@@ -126,6 +126,13 @@ Don't edit files a live worktree run is working on.
 3. **`self-improve.sh` is deprecated — always use `parallel-self-improve.sh`**
    (which takes `<provider> <goal-file>`, handles concurrency, isolates worktrees,
    resumes on context loss).
+4. **An interrupted `e2e-gate.sh` run strands the argusai MCP session state.**
+   If the gate dies mid-flight (after `argus-init` succeeds, before `argus-clean`
+   runs), the next gate invocation fails instantly with `SESSION_EXISTS` (exit 5)
+   because `e2e/.argusai/history.db` is still marked "initialized" — plus a stale
+   `aimock` container. Remedy: `rm -rf e2e/.argusai && docker rm -f aimock`, then
+   re-run the gate. A completed gate run self-cleans (argus-clean + container
+   removal), so only interrupted runs strand this state.
 
 New failure modes should be added here, not silently worked around.
 
