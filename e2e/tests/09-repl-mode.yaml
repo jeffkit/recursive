@@ -30,7 +30,7 @@ setup:
         printf 'Write file repl-a.txt with content turn-a\n'
         | recursive --workspace /workspace/test-repl-single
         --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
+        --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         --max-steps 5
         repl
 
@@ -41,7 +41,7 @@ setup:
         printf 'Write file repl-a.txt with content turn-a\nWrite file repl-b.txt with content turn-b\n:q\n'
         | recursive --workspace /workspace/test-repl-multi
         --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
+        --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         --max-steps 5
         repl
 
@@ -62,7 +62,7 @@ cases:
         printf ':q\n'
         | recursive --workspace /workspace/test-repl-quit
         --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
+        --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         repl
     expect:
       exitCode: 0
@@ -93,7 +93,7 @@ cases:
         printf ':clear\n:q\n'
         | recursive --workspace /workspace/test-repl-clear
         --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
+        --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         repl 2>&1
     expect:
       exitCode: 0
@@ -108,7 +108,7 @@ cases:
         printf '\n\n:q\n'
         | recursive --workspace /workspace/test-repl-empty
         --api-base http://aimock:4010/v1
-        --api-key mock-key -m mock-chat
+        --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         repl
     expect:
       exitCode: 0

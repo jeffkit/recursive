@@ -32,7 +32,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-bg \
         recursive --workspace /workspace/test-bg \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 12 \
           run "Run background job 'sleep 0.5 && echo bg-ok > bg-result.txt', wait, then check its status with check_background. Write result to bg-check-result.txt."
         SESSION_DIR=$(find /tmp/rh-bg -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

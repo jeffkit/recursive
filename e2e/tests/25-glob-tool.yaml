@@ -31,7 +31,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-glob \
         recursive --workspace /workspace/test-glob \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 8 \
           run "Glob all .rs files in the workspace and save the list to glob-result.txt."
         SESSION_DIR=$(find /tmp/rh-glob -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

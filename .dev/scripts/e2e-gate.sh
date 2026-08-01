@@ -21,6 +21,15 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# ---- --accept <suite-id>：验收即录制，转发到 accept-fixture.sh -------------
+# 非门禁路径：跑真模型录制 → agent-judge 自验收 → PASS 才 promote → 回放验证。
+# 供「开发完成、提 PR 前」用真实会话生产 fixture，把人从验证环节退出，换成开发
+# agent 自己判。需 DEEPSEEK_API_KEY。完整流程见 e2e/RECORD_REPLAY.md「验收即录制」。
+if [[ "${1:-}" == "--accept" ]]; then
+  shift
+  exec "$REPO_ROOT/e2e/scripts/accept-fixture.sh" "$@"
+fi
+
 # ---- --check-prereqs：只查前置（Docker/mcp2cli/argusai-mcp/e2e.yaml），不跑套件
 # 供 flow 的 preflight.e2e-prereqs fail-fast 调用：在 agent 跑之前确认 e2e 门
 # 能跑，而不是等 agent 跑 35min 后在门里才挂。退出码：0=前置齐，3=缺前置。
@@ -102,6 +111,10 @@ cargo build -q 2>/dev/null || { echo "[e2e-gate] cargo build 失败" >&2; exit 4
 # ---- 跑 smoke --------------------------------------------------------------
 WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo main)"
 export WORKTREE_ID
+# smoke 门恒为回放；agent 容器的 RECURSIVE_API_KEY 用 mock-key（e2e.yaml 模板读取）。
+# 录制路径（accept-fixture.sh）自行设 E2E_RECORD_API_KEY 为真 key，不走本门。
+export E2E_RECORD_API_KEY="mock-key"
+export E2E_RECORD_MODEL="mock-chat"
 E2E_PROJECT="$(pwd)/e2e"
 SESSION="argusai-$WORKTREE_ID"
 

@@ -33,7 +33,7 @@ setup:
       command: |
         nohup recursive \
           --api-base http://aimock:4010/v1 \
-          --api-key mock-key -m mock-chat \
+          --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           http --addr 0.0.0.0:9095 \
           > /tmp/sdk-http.log 2>&1 &
         sleep 2

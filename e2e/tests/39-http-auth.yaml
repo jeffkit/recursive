@@ -27,7 +27,7 @@ setup:
         nohup sh -c 'RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
           recursive \
             --api-base http://aimock:4010/v1 \
-            --api-key mock-key -m mock-chat \
+            --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             http --addr 0.0.0.0:9097' \
           > /tmp/http-9097.log 2>&1 &
         for i in $(seq 1 20); do

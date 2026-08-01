@@ -29,7 +29,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-bash \
         recursive --workspace /workspace/test-bash \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 5 \
           run "Run a Bash command to create bash-output.txt with content 'bash-ok'."
         SESSION_DIR=$(find /tmp/rh-bash -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
@@ -45,7 +45,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-bash-cwd \
         recursive --workspace /workspace/test-bash-cwd \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 5 \
           run "Create file bash-cwd.txt inside the subdir folder using Bash with cwd=subdir."
         SESSION_DIR=$(find /tmp/rh-bash-cwd -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

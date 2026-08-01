@@ -27,7 +27,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-rewind \
         recursive --workspace /workspace/test-rewind \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 5 \
           run "Write rewind-probe.txt with content probe." 2>&1
         SESSION_PATH=$(find /tmp/rh-rewind -name ".meta.json" -printf "%h\n" 2>/dev/null | head -1)

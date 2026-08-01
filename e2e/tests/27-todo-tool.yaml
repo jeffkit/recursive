@@ -23,7 +23,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-todo \
         recursive --workspace /workspace/test-todo \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 10 \
           run "Create a 3-task todo list using TodoWrite (read, transform, write), then write todo-complete.txt with 'task-done', then mark all tasks completed."
         SESSION_DIR=$(find /tmp/rh-todo -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

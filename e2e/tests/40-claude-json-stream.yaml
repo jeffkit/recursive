@@ -44,7 +44,7 @@ setup:
       command: >
         printf ''
         | recursive --workspace /workspace/test-cj
-        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         --max-steps 5 --output-format stream-json
         run "Create greet.txt with content hi" > /workspace/cj-stream.jsonl 2>/workspace/cj-stream.err
         echo "stream exit=$? lines=$(wc -l < /workspace/cj-stream.jsonl)"
@@ -55,7 +55,7 @@ setup:
       command: >
         printf ''
         | recursive --workspace /workspace/test-cj
-        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         --max-steps 5 --output-format json
         run "Create greet.txt with content hi" > /workspace/cj-json.jsonl 2>/workspace/cj-json.err
         echo "json exit=$? lines=$(wc -l < /workspace/cj-json.jsonl)"
@@ -66,7 +66,7 @@ setup:
       command: |
         printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"What file did you just create? Answer briefly."}]}}' \
           | recursive --workspace /workspace/test-cj \
-            --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+            --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 8 --output-format stream-json --input-format stream-json \
             run "Create greet.txt with content hi" > /workspace/cj-multi.jsonl 2>/workspace/cj-multi.err
         echo "multi exit=$? lines=$(wc -l < /workspace/cj-multi.jsonl) turns=$(grep -o '"num_turns":[0-9]*' /workspace/cj-multi.jsonl)"
@@ -77,7 +77,7 @@ setup:
       command: >
         printf ''
         | recursive --workspace /workspace/test-cj
-        --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat
+        --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL"
         --max-steps 5 --output-format stream-json
         run "Tell me a joke about oysters" > /workspace/cj-err.jsonl 2>/workspace/cj-err.err
         echo "err exit=$? lines=$(wc -l < /workspace/cj-err.jsonl)"

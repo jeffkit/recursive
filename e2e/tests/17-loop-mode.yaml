@@ -1,21 +1,27 @@
-name: "Loop mode — schedule_wakeup triggers a second turn"
+name: "Loop mode — schedule_wakeup polls until a condition is met"
 description: |
-  Verify that when the agent calls schedule_wakeup during a loop run, the loop
-  actually reschedules and invokes the agent again. This is the multi-turn loop
-  scenario: turn 1 only schedules an immediate wakeup and ends; the wakeup
-  turn (turn 2) writes the output file and ends, so the loop exits cleanly.
+  Verify the event-driven loop semantics: the agent must keep the loop alive
+  with `schedule_wakeup` while waiting for an external condition, then act and
+  exit once the condition holds.
 
-  This complements 10-loop-mode (single-turn, no wakeup) by exercising the
-  actual wakeup/reschedule path AND asserting that both turns land in ONE
-  persisted session (transcript.jsonl) — the multi-turn-same-session property
-  of Goal 327. The session must be `completed` (loop exits 0) and contain both
-  the `schedule_wakeup` (turn 1) and `write_file` (turn 2) tool calls.
+  This is the realistic loop scenario (cf. the `loop-supervise` skill):
+  the agent is asked to watch for a `ready.flag` file that a background
+  process creates a few seconds in. Turn 1 finds the flag absent, so the agent
+  MUST `schedule_wakeup` to re-check (otherwise the loop exits and the task
+  fails). A later wakeup turn finds the flag present, writes `multi-loop.txt`,
+  and stops scheduling — so the loop exits cleanly.
 
-  Fixture authoring note (see e2e/fixtures/17-loop-mode.json): the schedule_wakeup
-  args MUST use the tool spec's names (delay_secs/reason/prompt). The legacy
-  seconds/message names silently default delay_secs to the tool's unwrap_or(60),
-  making the loop sleep 60s and trip argusai's setup-exec timeout — which is
-  what previously made this suite's session assertion look impossible.
+  This complements 10-loop-mode (single-turn, agent finishes immediately, no
+  wakeup) by exercising the actual poll/reschedule path AND asserting that all
+  turns land in ONE persisted session (transcript.jsonl) — the multi-turn-
+  same-session property of Goal 327. The session must be `completed` and
+  contain at least one `schedule_wakeup` and one `write_file` tool call.
+
+  Fixture note: this suite is driven by a REAL model recording (see
+  e2e/RECORD_REPLAY.md "验收即录制"). The hand-written fixture previously
+  assumed a "schedule then write" path that the real model never produces for
+  a one-shot goal; the goal is now a genuine poll-until-ready task so the real
+  model naturally calls schedule_wakeup.
 sequential: true
 
 setup:
@@ -27,16 +33,24 @@ setup:
         mkdir -p /workspace/test-multi-loop
         echo prepared
 
-  - name: "Run loop mode (act): multi-turn with schedule_wakeup + capture session"
+  - name: "Run loop mode (act): poll for ready.flag, then write + capture session"
     exec:
       container: recursive-e2e
       command: |
         unset RECURSIVE_SESSIONS_DIR
+        # Background timer: create ready.flag after ~8s. This is the external
+        # event the agent is waiting for. 8s comfortably covers turn-1 LLM
+        # latency + whatever delay_secs the model picks (1-10s) + turn-2 start.
+        # If the model picks a long delay, the flag is already there on the
+        # next wake; if short, it may re-schedule once more — both are valid.
+        ( sleep 8 && touch /workspace/test-multi-loop/ready.flag ) &
+        TIMER_PID=$!
         RECURSIVE_HOME=/tmp/rh-loop17 \
         recursive --workspace /workspace/test-multi-loop \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
-          --max-steps 8 \
-          loop "Write file multi-loop.txt with content wakeup-done"
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
+          --max-steps 12 \
+          loop "Watch for the file ready.flag in the workspace. On each turn, check if it exists. If it does NOT exist yet, call schedule_wakeup (delay_secs around 5) to check again shortly, then end the turn. When ready.flag exists, write multi-loop.txt with the exact content wakeup-done and do not schedule any further wakeup (the loop should end)."
+        kill $TIMER_PID 2>/dev/null || true
         SESSION_DIR=$(find /tmp/rh-loop17 -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-loop17
@@ -44,7 +58,7 @@ setup:
         fi
 
 cases:
-  - name: "multi-loop.txt produced after wakeup turn"
+  - name: "multi-loop.txt produced after the condition was met"
     file:
       container: recursive-e2e
       path: /workspace/test-multi-loop/multi-loop.txt
@@ -60,13 +74,16 @@ cases:
       output:
         contains: "wakeup-done"
 
-  - name: "loop persisted ONE multi-turn session with both turns' tool calls"
+  - name: "loop persisted ONE multi-turn session with poll + write tool calls"
     recursive-session:
       container: recursive-e2e
       input: /tmp/sessions-loop17
       status: ["completed", "success"]
       hasRoles: ["user", "assistant"]
-      hasToolCalls: ["schedule_wakeup", "write_file"]
+      # Tool names are PascalCase as registered (Write/Bash/Read), NOT the
+      # snake_case that older fixtures wrongly assumed. schedule_wakeup is the
+      # one snake_case tool here. See e2e/fixtures/README.md.
+      hasToolCalls: ["schedule_wakeup", "Write"]
       minMessages: 8
       finalized: true
 

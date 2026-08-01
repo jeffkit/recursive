@@ -27,7 +27,7 @@ setup:
         RECURSIVE_HOME=/tmp/rh-search \
           recursive --workspace /workspace/test-search \
             --api-base http://aimock:4010/v1 \
-            --api-key mock-key -m mock-chat \
+            --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 5 \
             run "Search for all files containing 'fn main' and tell me the count."
         SESSION_DIR=$(find /tmp/rh-search -name "transcript.jsonl" -exec dirname {} \; 2>/dev/null | head -1)

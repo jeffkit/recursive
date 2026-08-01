@@ -28,7 +28,7 @@ setup:
         RECURSIVE_RATE_LIMIT_RPM=60 \
         nohup recursive \
           --api-base http://aimock:4010/v1 \
-          --api-key mock-key -m mock-chat \
+          --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           http --addr 0.0.0.0:9091 \
           > /tmp/http-9091.log 2>&1 &
         sleep 2

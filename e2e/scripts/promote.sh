@@ -28,7 +28,9 @@ if [ ! -d "$RECORDED_DIR" ]; then
   exit 1
 fi
 
-RECORDED_FILES=($(ls "$RECORDED_DIR"/*.json 2>/dev/null || true))
+# aimock --record 把新 fixture 写到第一个 -f 路径下的 recorded/ 子目录
+# （/fixtures/recorded/recorded/*.json），所以用 find 递归而非 ls 顶层 glob。
+RECORDED_FILES=($(find "$RECORDED_DIR" -name '*.json' 2>/dev/null || true))
 
 if [ ${#RECORDED_FILES[@]} -eq 0 ]; then
   echo "error: No recorded fixture files found in $RECORDED_DIR/"
@@ -47,16 +49,24 @@ import json, glob, sys, os
 recorded_dir = '$RECORDED_DIR'
 all_fixtures = []
 
-for f in sorted(glob.glob(os.path.join(recorded_dir, '*.json'))):
+for f in sorted(glob.glob(os.path.join(recorded_dir, '**', '*.json'), recursive=True)):
     try:
         data = json.load(open(f))
         if isinstance(data, list):
-            all_fixtures.extend(data)
+            items = data
         elif isinstance(data, dict):
-            if 'fixtures' in data:
-                all_fixtures.extend(data['fixtures'])
-            else:
-                all_fixtures.append(data)
+            items = data.get('fixtures', [data])
+        else:
+            items = []
+        for fx in items:
+            # Strip match.model: recording uses the real model name (e.g.
+            # deepseek-chat) but replay uses mock-chat. Leaving model in the
+            # fixture would make aimock reject every replay request as a
+            # model mismatch. aimock matches on userMessage/turnIndex/
+            # hasToolResult — model is not a meaningful discriminator here.
+            if isinstance(fx, dict) and 'match' in fx and 'model' in fx['match']:
+                del fx['match']['model']
+            all_fixtures.append(fx)
     except json.JSONDecodeError as e:
         print(f'warning: skipping malformed file {f}: {e}', file=sys.stderr)
 
@@ -67,8 +77,10 @@ with open('$TARGET', 'w') as out:
 print(f'Promoted {len(all_fixtures)} fixture(s) to ${SUITE_ID}.json')
 "
 
-# Clean up recorded files
-rm -f "$RECORDED_DIR"/*.json
+# Clean up recorded files (recursive — aimock nests them under recorded/recorded/)
+find "$RECORDED_DIR" -name '*.json' -delete 2>/dev/null || true
+# Also remove now-empty nested dirs aimock created
+find "$RECORDED_DIR" -type d -empty -delete 2>/dev/null || true
 echo "Recorded fixtures cleaned up."
 echo ""
 echo "Next steps:"

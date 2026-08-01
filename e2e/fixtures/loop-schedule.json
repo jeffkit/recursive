@@ -1,0 +1,115 @@
+{
+  "fixtures": [
+    {
+      "match": {
+        "userMessage": "Watch for the file ready.flag in the workspace. On each turn, check if it exists. If it does NOT exist yet, call schedule_wakeup (delay_secs around 5) to check again shortly, then end the turn. When ready.flag exists, write multi-loop.txt with the exact content wakeup-done and do not schedule any further wakeup (the loop should end).",
+        "turnIndex": 0,
+        "hasToolResult": false
+      },
+      "response": {
+        "content": "I'll check for the ready.flag file.",
+        "toolCalls": [
+          {
+            "name": "Bash",
+            "arguments": "{\"command\": \"test -f ready.flag && echo \\\"EXISTS\\\" || echo \\\"MISSING\\\"\"}",
+            "id": "call_00_2fmV1GDNiQhl86wqmYr34202"
+          }
+        ]
+      },
+      "metadata": {
+        "systemHash": "95d13dc0",
+        "toolsHash": "d96fa71c"
+      }
+    },
+    {
+      "match": {
+        "userMessage": "Watch for the file ready.flag in the workspace. On each turn, check if it exists. If it does NOT exist yet, call schedule_wakeup (delay_secs around 5) to check again shortly, then end the turn. When ready.flag exists, write multi-loop.txt with the exact content wakeup-done and do not schedule any further wakeup (the loop should end).",
+        "turnIndex": 1,
+        "hasToolResult": true
+      },
+      "response": {
+        "content": "The file doesn't exist yet. I'll schedule a wakeup to check again.",
+        "toolCalls": [
+          {
+            "name": "schedule_wakeup",
+            "arguments": "{\"delay_secs\": 5, \"reason\": \"ready.flag not present yet; check again shortly\", \"prompt\": \"Check if ready.flag exists in the workspace. If not, schedule another wakeup in ~5s. If it exists, write multi-loop.txt with content \\\"wakeup-done\\\" and do not schedule further wakeups.\"}",
+            "id": "call_00_0Qik6pFIPRXWWTYXAYed7357"
+          }
+        ]
+      },
+      "metadata": {
+        "systemHash": "95d13dc0",
+        "toolsHash": "d96fa71c"
+      }
+    },
+    {
+      "match": {
+        "userMessage": "Watch for the file ready.flag in the workspace. On each turn, check if it exists. If it does NOT exist yet, call schedule_wakeup (delay_secs around 5) to check again shortly, then end the turn. When ready.flag exists, write multi-loop.txt with the exact content wakeup-done and do not schedule any further wakeup (the loop should end).",
+        "turnIndex": 2,
+        "hasToolResult": true
+      },
+      "response": {
+        "content": "Wakeup scheduled. Ending turn."
+      },
+      "metadata": {
+        "systemHash": "95d13dc0",
+        "toolsHash": "d96fa71c"
+      }
+    },
+    {
+      "match": {
+        "userMessage": "Check if ready.flag exists in the workspace. If not, schedule another wakeup in ~5s. If it exists, write multi-loop.txt with content \"wakeup-done\" and do not schedule further wakeups.",
+        "turnIndex": 3,
+        "hasToolResult": true
+      },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "Bash",
+            "arguments": "{\"command\": \"test -f ready.flag && echo \\\"EXISTS\\\" || echo \\\"MISSING\\\"\"}",
+            "id": "call_00_cYXxiBRgOV2THhIidTvL1540"
+          }
+        ]
+      },
+      "metadata": {
+        "systemHash": "95d13dc0",
+        "toolsHash": "d96fa71c"
+      }
+    },
+    {
+      "match": {
+        "userMessage": "Check if ready.flag exists in the workspace. If not, schedule another wakeup in ~5s. If it exists, write multi-loop.txt with content \"wakeup-done\" and do not schedule further wakeups.",
+        "turnIndex": 4,
+        "hasToolResult": true
+      },
+      "response": {
+        "content": "The file exists. Writing multi-loop.txt with the required content.",
+        "toolCalls": [
+          {
+            "name": "Write",
+            "arguments": "{\"path\": \"multi-loop.txt\", \"contents\": \"wakeup-done\\n\"}",
+            "id": "call_00_aS7QVUDZeU8mDI4J5fW84301"
+          }
+        ]
+      },
+      "metadata": {
+        "systemHash": "95d13dc0",
+        "toolsHash": "d96fa71c"
+      }
+    },
+    {
+      "match": {
+        "userMessage": "Check if ready.flag exists in the workspace. If not, schedule another wakeup in ~5s. If it exists, write multi-loop.txt with content \"wakeup-done\" and do not schedule further wakeups.",
+        "turnIndex": 5,
+        "hasToolResult": true
+      },
+      "response": {
+        "content": "Done. `ready.flag` was found, so I wrote `multi-loop.txt` with content `wakeup-done` and did not schedule any further wakeup. The loop ends here."
+      },
+      "metadata": {
+        "systemHash": "95d13dc0",
+        "toolsHash": "d96fa71c"
+      }
+    }
+  ]
+}

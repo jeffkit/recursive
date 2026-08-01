@@ -32,7 +32,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-episodic-pre \
         recursive --workspace /workspace/test-episodic \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 3 \
           run "Create hello.txt with content 'world'."
 
@@ -43,7 +43,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/rh-episodic \
         recursive --workspace /workspace/test-episodic \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 8 \
           run "episodic-search-task: call episodic_recall to search past sessions, then write episodic-result.txt."
         SESSION_DIR=$(find /tmp/rh-episodic -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

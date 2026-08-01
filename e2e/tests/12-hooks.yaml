@@ -23,7 +23,7 @@ setup:
         RECURSIVE_HOME=/tmp/rh-hooks \
           recursive --workspace /workspace/test-hooks \
             --api-base http://aimock:4010/v1 \
-            --api-key mock-key -m mock-chat \
+            --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 5 \
             --hook-timing \
             run "Write file hook-test.txt with content hook-ok"

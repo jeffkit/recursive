@@ -36,7 +36,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/recursive-home-42 \
         recursive --workspace /workspace/test-42 \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 30 \
           run "continue-marker: spawn a background writer worker (worker_id=cw) that writes alpha.txt (contents aaa), then send_message to that same worker to write beta.txt (contents bbb) in a second turn."
         # Give any lingering background task a moment to flush before the

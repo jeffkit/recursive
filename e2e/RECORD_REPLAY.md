@@ -88,6 +88,11 @@ fixture（`e2e/fixtures/<suite>.json`），reviewer 在 replay 模式下验证�
 
 ## 三步工作流
 
+> 这是录制的**手动**三步（写套件 → 录制 → promote）。如果想「录制 + agent 自验收 +
+> promote + 回放」一条命令搞定，跳到 [验收即录制](#验收即录制accept-on-verify) 章节，
+> 用 `.dev/scripts/e2e-gate.sh --accept <suite-id>`。下面的手动流程适合需要逐步控制
+> 或排查问题时用。
+
 ### 1. 写套件骨架
 
 在 `e2e/tests/<NN>-<name>.yaml` 写 argusai 套件：setup 跑 agent、cases 断言
@@ -156,11 +161,24 @@ fixture。详见 `e2e/fixtures/README.md` + aimock 官方文档
 agent 运行时生成的 ID（如 `task-<uuid>`）写不进 fixture。解法：用固定标识寻址。
 如 `send_message` 支持 `worker_id`（manifest 里固定的 key），而非动态 `task_id`。
 
-### 4. 录制时 aimock 用容器的 key 代理
+### 4. 录制时 aimock 转发请求里的 key 和 model（非容器环境变量）
 
-aimock `--record` 代理时用的是**容器环境**的 `OPENAI_API_KEY`，不是请求里的 key。
-录制插件把真 key 作为 `OPENAI_API_KEY` 传进 aimock 容器；被测 agent 发给 aimock
-的 key 用 `mock-key` 即可。
+⚠️ **本节 2026-08 实测订正**——旧描述（「aimock 用容器 `OPENAI_API_KEY` 代理」）
+对当前 aimock 版本是错的。
+
+aimock `--record` 代理到上游时，转发的是**请求里的 Authorization key 和 body 里的
+model**，不是 aimock 容器的 `OPENAI_API_KEY`。实测：用真 key 当 Authorization
+直 curl aimock → 代理成功；用 `mock-key` → 上游 401。同理，请求 body 里 `model:
+mock-chat` 会被原样转发给上游 → DeepSeek 回 400（不认识的 model 名）。
+
+**因此录制时被测 agent 必须发真 key + 真 model**，而不是 `mock-key` / `mock-chat`。
+回放时 aimock 不校验 key/model，`mock-key` / `mock-chat` 照常工作。
+
+实现：套件命令行的 `--api-key` / `-m` 已统一改成读环境变量
+`"$RECURSIVE_API_KEY"` / `"$RECURSIVE_MODEL"`（不再写死 mock-key/mock-chat）；
+`e2e.yaml` 把这两个变量声明为模板 `{{env.E2E_RECORD_API_KEY}}` /
+`{{env.E2E_RECORD_MODEL}}`。`e2e-run.sh` 按 `E2E_RECORD` 自动设值：录制时填真 key +
+真 model（`DEEPSEEK_MODEL`，默认 deepseek-chat），回放时填 mock-key + mock-chat。
 
 ### 5. `--provider-openai` 的 URL 不要带 `/v1`
 
@@ -186,12 +204,84 @@ aimock 容器要和 recursive-e2e 容器在同一 Docker 网络。worktree 隔�
   (userMessage, turnIndex, hasToolResult) 组合，易出错。优先录制；或基于真模型
   实跑的 transcript 手工构造（42 就是这样做的）。
 
+## 验收即录制（accept-on-verify）
+
+录制不是「额外动作」，而是**验收的副产品**。判据：**改动影响端到端 agent 产出 →
+验收本来就要跑真模型 → 把那次真实跑捕获成 fixture → 由开发 agent 自验符合预期
+才 promote → CI 无 key 回放。**「人」从验证环节退出，换成开发该功能的 agent 自己
+判（它最懂本次改动的意图）。
+
+### 工作流（一条命令）
+
+```bash
+# 开发完成、提 PR 前：
+export DEEPSEEK_API_KEY=sk-...
+.dev/scripts/e2e-gate.sh --accept <suite-id>
+# 或直接：e2e/scripts/accept-fixture.sh <suite-id>
+```
+
+`accept-fixture.sh` 自动跑 4 步：
+
+1. **录制**：`E2E_RECORD=1` 跑 argusai lifecycle，aimock 代理真模型，落
+   `e2e/fixtures/recorded/`。
+2. **验收**：录制跑完、容器销毁前 docker cp 出 session transcript，spawn 一个只读
+   recursive agent 当 judge，对照 `e2e/expectations/<suite-id>.md` 判
+   `{completed, score}`。要求 `completed=true && score>=阈值`（默认 4）。
+3. **promote**：验收通过才调 `promote.sh` 合并 recorded → `fixtures/<suite-id>.json`。
+   不通过则保留 `recorded/` 待人介入，**不污染回归 fixture**。
+4. **回放**：无 key 重跑 `e2e-run.sh <suite-id>`，确认新 fixture 回归绿。
+
+### expectation 文件
+
+`e2e/expectations/<suite-id>.md` 是套件的「预期行为」契约（goal / 预期行为 /
+anti-patterns / 验收阈值）。judge 据此判 PASS/FAIL。**没配 expectation 的套件退回
+判完整性**（工具调用是否合理、产出是否符合 goal）。首个范例：
+`e2e/expectations/loop-schedule.md`。
+
+### 该捕获 vs 该手写（判据）
+
+录制的前提是「环路里有真模型」。三类：
+
+- **该捕获**：agent 端到端跑的套件——验收跑真模型时顺手录。录到的真实行为比手写
+  桩更可信（手写是人脑假设的路径，真模型未必走；见下方 loop-schedule 实测）。
+- **必须手写**：① 环路里没有 LLM 的 case（直接走 MCP 调工具，如 `24-bash-tool`
+  的 C/D、`33-utility-tools` 的 B/C）——无真模型可捕获；② 需要确定性边界刺激的
+  套件（如 `22-compaction` 要精确撞 `RECURSIVE_COMPACT_THRESHOLD`）——真模型每次
+  给不同文本可能不触发。
+- **默认手写**：测运行时/协议而非 agent 行为的（cost/export/sdk），LLM 只是触发器。
+
+### ⚠️ 录制揭示的真实行为可能与手写 fixture 不符
+
+手写 fixture 是「人脑假设 agent 会这么走」，真模型未必。实测 loop-schedule：
+套件假设 agent「turn1 先 schedule_wakeup、turn2 再 write_file」（4-turn 结构），
+但真模型看到明确的「Write file」任务时，**turn1 直接 write_file 完成**，根本没调
+schedule_wakeup。这正是录制的价值——暴露手写 fixture 的假设偏差。遇到这种分歧时：
+若真模型行为合理 → 改套件 goal/case 适配真实行为后重录；若真模型行为是 bug →
+保留 expectation 作为期望，修 agent 后重录锁住。
+
+### 触发清单（什么改动触发对应套件的录制）
+
+当以下任一发生时，对应套件进录制流程（`e2e-gate.sh --accept <suite-id>`）：
+
+| 触发条件 | 套件 |
+|----------|------|
+| 改 `schedule_wakeup` 决策点 / loop 演进逻辑 | loop-schedule |
+| 改 TodoWrite todos schema 或教学文案 | todo |
+| 改 facts remember/recall 参数语义 | facts |
+| 改 skill 自动触发/匹配逻辑 | skill-lazy-load |
+| 给 Bash/Glob/Write 加新语义参数 | glob / bash-tool |
+| 把 41 从前台委派改成并发委派 | multi-agent |
+| 改 coordinator/worker 教学文案、worker 生命周期、send_message/task_* 语义 | multi-agent-continue |
+| 任何「修复 LLM 没按预期行动」的 bug | 对应行为套件 |
+
 ## 相关文件
 
 | 文件 | 说明 |
 |------|------|
 | `e2e/plugins/src/index.ts` | 录制插件（setup 启动 aimock） |
+| `e2e/scripts/accept-fixture.sh` | **验收即录制**：录制→judge→promote→回放 4 步封装 |
 | `e2e/scripts/promote.sh` | 录制产物合并脚本 |
+| `e2e/expectations/<suite-id>.md` | 套件预期行为契约（judge 判据） |
 | `e2e/fixtures/README.md` | aimock fixture 格式与多轮陷阱 |
 | `e2e/.env.example` | `E2E_RECORD` 等录制变量 |
 | `e2e/tests/41-multi-agent.yaml` | 前台委派回归套件（手写 fixture） |

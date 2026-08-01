@@ -21,8 +21,8 @@ setup:
         RECURSIVE_HOME=/tmp/rh-judge \
           recursive --workspace /workspace/test-judge \
             --api-base http://aimock:4010/v1 \
-            --api-key mock-key \
-            -m mock-chat \
+            --api-key "$RECURSIVE_API_KEY" \
+            -m "$RECURSIVE_MODEL" \
             --max-steps 15 \
             run "Create a Python script called greet.py that defines a function greet(name) returning 'Hello, {name}!', has a main block calling greet('World'), then create a README.md describing it."
         SESSION=$(find /tmp/rh-judge -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

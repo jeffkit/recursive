@@ -21,7 +21,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/recursive-home-02 \
         recursive --workspace /workspace/test-02 \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 10 \
           run "List the files in the workspace root using list_dir tool."
         SESSION_DIR=$(find /tmp/recursive-home-02 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

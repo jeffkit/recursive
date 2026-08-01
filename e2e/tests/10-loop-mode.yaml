@@ -27,7 +27,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/rh-loop \
         recursive --workspace /workspace/test-loop \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 5 \
           loop "Write file loop-result.txt with content loop-done"
         SESSION_DIR=$(find /tmp/rh-loop -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)

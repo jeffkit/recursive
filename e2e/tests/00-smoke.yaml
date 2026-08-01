@@ -31,7 +31,7 @@ setup:
         rm -rf /tmp/rh-smoke-01 /tmp/sessions-smoke-01
         RECURSIVE_HOME=/tmp/rh-smoke-01 \
           recursive --workspace /workspace/smoke-01 \
-            --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+            --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 5 \
             run "Create a file called smoke.txt with content 'ok'"
         SESSION=$(find /tmp/rh-smoke-01 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
@@ -49,7 +49,7 @@ setup:
         rm -rf /tmp/rh-smoke-02 /tmp/sessions-smoke-02
         RECURSIVE_HOME=/tmp/rh-smoke-02 \
           recursive --workspace /workspace/smoke-02 \
-            --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+            --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 5 \
             run "Read the file input.txt and tell me what it contains"
         SESSION=$(find /tmp/rh-smoke-02 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

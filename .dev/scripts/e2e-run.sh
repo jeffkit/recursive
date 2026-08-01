@@ -66,6 +66,19 @@ fi
 # e2e.yaml service.container.name / the plugin).
 export WORKTREE_ID="wt-$(git rev-parse --short HEAD 2>/dev/null || echo main)"
 
+# Record mode: the agent must send the REAL api key, because aimock --record
+# forwards the request's Authorization header to the upstream provider (it does
+# not substitute the container's OPENAI_API_KEY). Replay mode: aimock ignores
+# the key, so mock-key is fine. e2e.yaml reads this via {{env.E2E_RECORD_API_KEY}}.
+if [[ "${E2E_RECORD:-}" == "1" ]]; then
+  [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "[e2e-run] E2E_RECORD=1 但 DEEPSEEK_API_KEY 未设置" >&2; exit 3; }
+  export E2E_RECORD_API_KEY="$DEEPSEEK_API_KEY"
+  export E2E_RECORD_MODEL="${DEEPSEEK_MODEL:-deepseek-chat}"
+else
+  export E2E_RECORD_API_KEY="mock-key"
+  export E2E_RECORD_MODEL="mock-chat"
+fi
+
 # ---- resolve mcp2cli -------------------------------------------------------
 MCP2CLI=""
 for _c in "$HOME/.local/bin/mcp2cli" "/usr/local/bin/mcp2cli" "/opt/homebrew/bin/mcp2cli"; do

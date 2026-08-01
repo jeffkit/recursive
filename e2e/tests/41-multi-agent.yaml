@@ -29,7 +29,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR
         RECURSIVE_HOME=/tmp/recursive-home-41 \
         recursive --workspace /workspace/test-41 \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 20 \
           run "delegate-marker: please delegate writing a note to a worker."
         SESSION_DIR=$(find /tmp/recursive-home-41 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

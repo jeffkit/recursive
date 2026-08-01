@@ -29,7 +29,7 @@ setup:
         unset RECURSIVE_SESSIONS_DIR  # container-wide override would write the session outside RECURSIVE_HOME
         RECURSIVE_HOME=/tmp/recursive-home-facts \
         recursive --workspace /workspace/test-facts \
-          --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
+          --api-base http://aimock:4010/v1 --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
           --max-steps 10 \
           run "Store the fact 'The project uses Rust as its primary language' using remember tool with tags=['project','language']. Then recall using query 'primary language'. Write the recall result to facts-result.txt."
         SESSION_DIR=$(find /tmp/recursive-home-facts -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)

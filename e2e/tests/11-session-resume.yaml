@@ -33,7 +33,7 @@ setup:
         RECURSIVE_HOME=/tmp/rh-resume \
           recursive --workspace /workspace/test-resume \
             --api-base http://aimock:4010/v1 \
-            --api-key mock-key -m mock-chat \
+            --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 1 \
             run "Write file resume-step1.txt with content step1-done."
         echo exit=$?
@@ -63,7 +63,7 @@ setup:
         RECURSIVE_HOME=/tmp/rh-resume \
           recursive --workspace /workspace/test-resume \
             --api-base http://aimock:4010/v1 \
-            --api-key mock-key -m mock-chat \
+            --api-key "$RECURSIVE_API_KEY" -m "$RECURSIVE_MODEL" \
             --max-steps 5 \
             resume "$SESSION"
         # Copy the (now completed) session to a predictable assertions path.
