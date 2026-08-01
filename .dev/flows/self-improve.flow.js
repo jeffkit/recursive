@@ -770,7 +770,7 @@ async function main() {
   // 用 -p recursive-cli 显式构建执行器二进制及其依赖。
   await cp.step('preflight.build', () => {
     console.log('  [preflight.build] cargo build --release -p recursive-cli ...')
-    execFileSync('cargo', ['build', '--release', '-p recursive-cli'], { cwd: repo, stdio: 'inherit' })
+    execFileSync('cargo', ['build', '--release', '-p', 'recursive-cli'], { cwd: repo, stdio: 'inherit' })
     console.log('  [preflight.build] ✓ done')
   })
 
