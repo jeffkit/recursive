@@ -337,7 +337,8 @@ impl AnthropicProvider {
 
         // 决策 4b：把 SSE 循环改成 tokio::select!，让 cancel_token 能在两个 chunk 之间立刻
         // 触发。触发后 reqwest::Response 在函数返回时被 drop（HTTP 连接关闭），返回
-        // Err(Error::Cancelled)；run_core 已有逻辑翻成 FinishReason::Cancelled（Invariant #7）。
+        // Err(Error::Cancelled)；调用方（run_inner 的 dispatch_llm_step 调用点）会把这个
+        // 错误翻译成 FinishReason::Cancelled（Invariant #7）。
         loop {
             let chunk_result = if let Some(ct) = cancel_token.as_ref() {
                 tokio::select! {

@@ -529,7 +529,9 @@ impl AgentTool {
                 }
             }
             // Channel closed (no more send_message will arrive): mark complete.
-            state_for_task.mark_completed("worker finished".to_string()).await;
+            state_for_task
+                .mark_completed("worker finished".to_string())
+                .await;
         });
 
         // Attach the JoinHandle so `task_stop` can truly abort this task.
@@ -537,7 +539,6 @@ impl AgentTool {
 
         Ok(task_id)
     }
-
 
     // ------------------------------------------------------------------
     // Mode dispatchers
@@ -848,8 +849,7 @@ impl Tool for AgentTool {
                     "Workers have restricted tool sets and isolated transcripts."
                 ),
                 crate::multi::coordinator_system_prompt()
-            )
-            .into(),
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {

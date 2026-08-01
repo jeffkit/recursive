@@ -779,6 +779,37 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Goal 353 — translate a mid-stream [`Error::Cancelled`] from the
+    /// in-flight LLM call into a [`FinishReason::Cancelled`] outcome so the
+    /// caller persists the partial transcript (Invariant #7).
+    ///
+    /// `finished_steps` is `step` — NOT `step - 1` like [`check_shutdown`]:
+    /// the cancellation happened *during* the current step's LLM call, so the
+    /// step is in-progress, not pre-call. The caller passes the loop's `step`
+    /// verbatim; this helper deliberately does not compute it, keeping the
+    /// step-vs-step-1 distinction visible at the call site. The event and log
+    /// mirror [`check_shutdown`]'s so observers see Cancelled consistently.
+    fn make_cancelled_outcome(
+        self,
+        step: usize,
+        final_message: Option<String>,
+        total_usage: TokenUsage,
+        tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
+    ) -> RunInnerOutcome {
+        let finish = FinishReason::Cancelled;
+        self.emit(AgentEvent::TurnFinished {
+            reason: finish_reason_str(&finish),
+            steps: step,
+        });
+        tracing::info!(
+            target: "recursive::agent",
+            steps = step,
+            finish = ?finish,
+            "agent.run.cancelled_mid_stream"
+        );
+        self.make_outcome(finish, step, final_message, total_usage, tool_audits)
+    }
+
     /// Call the LLM once, delegating retry handling to the provider's
     /// internal `RetryPolicy`. Goal-288 removed the outer retry loop so
     /// there is exactly one retry layer.
@@ -1280,9 +1311,22 @@ impl<'a> RunCore<'a> {
             self.maybe_compact(step).await;
 
             // ---- LLM call (with retry) --------------------------------------------
-            let (completion, new_final_message) = self
-                .dispatch_llm_step(&specs, step, &mut total_usage)
-                .await?;
+            let (completion, new_final_message) =
+                match self.dispatch_llm_step(&specs, step, &mut total_usage).await {
+                    Ok(v) => v,
+                    Err(crate::error::Error::Cancelled) => {
+                        // Mid-stream cancellation: the stream was interrupted partway
+                        // through an LLM call. Route to FinishReason::Cancelled so the
+                        // partial transcript is persisted by the caller. Invariant #7.
+                        return Ok(self.make_cancelled_outcome(
+                            step,
+                            final_message,
+                            total_usage,
+                            tool_audits,
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
             if let Some(text) = new_final_message {
                 final_message = Some(text);
             }
@@ -2772,6 +2816,138 @@ mod tests {
             matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls),
             "expected NoMoreToolCalls, got {:?}",
             outcome.finish_reason,
+        );
+    }
+
+    /// Goal 353 — Invariant #7 (finish reasons are data, not errors).
+    ///
+    /// HEADLINE regression: a mid-stream cancellation (the provider returns
+    /// `Err(Error::Cancelled)` from the in-flight LLM call) must be translated
+    /// into a `FinishReason::Cancelled` *outcome* — NOT bubbled as `Err` — so
+    /// the caller (`runtime.rs`) persists the partial transcript, runs
+    /// `emit_turn_messages` + compaction, and lets the `SessionEnd` hook
+    /// suppression for cancellation fire. Before this fix the error rode `?`
+    /// out of `run_inner` and the transcript save was skipped.
+    #[tokio::test]
+    async fn cancelled_mid_stream_persists_transcript_and_finish_reason() {
+        use crate::agent::FinishReason;
+        use crate::event::AgentEvent;
+        use tokio::sync::mpsc;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // The error queue is consumed BEFORE scripted completions, so the
+        // first LLM call returns `Err(Error::Cancelled)` — simulating the
+        // provider aborting mid-stream when the shutdown token fires between
+        // SSE chunks (see `anthropic.rs` / `openai.rs` stream loops).
+        let provider = Arc::new(
+            crate::llm::MockProvider::new(vec![]).with_errors(vec![crate::error::Error::Cancelled]),
+        );
+        let messages = vec![Message::user("hello".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+        core.events = Some(tx);
+        // Provide a token but leave it UN-cancelled: check_shutdown must NOT
+        // fire — the Cancelled outcome has to come from the provider call.
+        core.shutdown_token = Some(tokio_util::sync::CancellationToken::new());
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "expected FinishReason::Cancelled, got {:?}",
+            outcome.finish_reason,
+        );
+        // The cancellation happened DURING the first step's LLM call (the
+        // loop's first iteration is step = 1), so the in-flight step is
+        // counted. This is deliberately `step`, not `step - 1` like
+        // check_shutdown — the call was in progress, not pre-call.
+        assert_eq!(
+            outcome.steps, 1,
+            "mid-stream cancel counts the in-flight step (not step - 1)",
+        );
+
+        // The seeded transcript must survive into the outcome.
+        assert_eq!(outcome.messages.len(), 1, "transcript must be preserved");
+        assert_eq!(
+            outcome.messages[0].role,
+            crate::message::Role::User,
+            "seeded user message must be in the outcome transcript",
+        );
+
+        let events: Vec<AgentEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnFinished { reason, steps }
+                    if reason.as_str() == "cancelled" && *steps == 1
+            )),
+            "TurnFinished(cancelled) must be emitted with the in-flight step; got: {events:?}",
+        );
+    }
+
+    /// Goal 353 — regression guard for the PRE-EXISTING path.
+    ///
+    /// When the shutdown token is ALREADY cancelled at loop top (before any
+    /// LLM call), `check_shutdown` handles it and reports `step - 1` (0 on the
+    /// first iteration). This pins that path so reviewers can see both arms
+    /// (between-steps vs mid-stream) are covered and deliberately distinct.
+    #[tokio::test]
+    async fn cancelled_between_steps_uses_check_shutdown_path() {
+        use crate::agent::FinishReason;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Empty provider: the LLM must NEVER be called — check_shutdown fires
+        // at loop top before the call, so a call here would fail loudly
+        // (MockProvider errors when its scripted queue is drained).
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]));
+        let messages = vec![Message::user("hello".to_string())];
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+        core.shutdown_token = Some(tokio_util::sync::CancellationToken::new());
+        // Cancel BEFORE run_inner: fires check_shutdown on step 1's loop top.
+        core.shutdown_token
+            .as_ref()
+            .expect("token just set")
+            .cancel();
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "expected FinishReason::Cancelled, got {:?}",
+            outcome.finish_reason,
+        );
+        assert_eq!(
+            outcome.steps, 0,
+            "between-steps cancel happens before any LLM call → 0 steps",
+        );
+    }
+
+    /// Goal 353 — negative guard.
+    ///
+    /// A NON-Cancelled error from the provider must still bubble out of
+    /// `run_inner` as `Err`. The new match only swallows `Cancelled`; any
+    /// other error keeps the original `?`-style propagation so genuine
+    /// failures are not silently converted into finished turns.
+    #[tokio::test]
+    async fn non_cancelled_error_still_bubbles() {
+        let hooks = crate::hooks::HookRegistry::new();
+        // Error::Llm is not retried by the run path (retry handling lives in
+        // the provider's own RetryPolicy, which MockProvider does not have),
+        // so it reaches run_inner's match and must fall through to the Err arm.
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]).with_errors(vec![
+            crate::error::Error::Llm {
+                provider: "mock".to_string(),
+                message: "injected non-cancelled error".to_string(),
+            },
+        ]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 1);
+
+        let err = match core.run_inner().await {
+            Ok(_) => panic!("run_inner must error for non-Cancelled provider errors"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::error::Error::Llm { .. }),
+            "expected Error::Llm, got {err:?}",
         );
     }
 

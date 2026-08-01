@@ -353,10 +353,7 @@ mod tests {
             assembled.segments.skills
         );
         assert!(
-            assembled
-                .segments
-                .subagents
-                .contains("Sub-agents enabled"),
+            assembled.segments.subagents.contains("Sub-agents enabled"),
             "subagents segment must contain the coordinator workflow heading when enabled"
         );
 

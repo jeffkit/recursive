@@ -495,7 +495,9 @@ mod tests {
 
         // Spawn a waiter that blocks until notified or times out (failure case).
         let wait_handle = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(2), notify.notified()).await.is_ok()
+            tokio::time::timeout(Duration::from_secs(2), notify.notified())
+                .await
+                .is_ok()
         });
 
         // Give the waiter a moment to register, then complete the task.

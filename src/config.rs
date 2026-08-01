@@ -2482,10 +2482,7 @@ api_key = "sk-from-file"
     /// Helper: build a Config from env with the two subagent vars set to given
     /// optional values, restoring them afterwards. Other env (MODEL/API_KEY)
     /// is fixed for a valid build.
-    fn config_with_subagent_env(
-        sub: Option<&str>,
-        team: Option<&str>,
-    ) -> Config {
+    fn config_with_subagent_env(sub: Option<&str>, team: Option<&str>) -> Config {
         let _env_lock = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);

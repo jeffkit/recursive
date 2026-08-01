@@ -76,8 +76,7 @@ impl Tool for TaskOutputTool {
             .unwrap_or(30_000);
 
         if block {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             // Event-driven wait: grab the task's completion Notify once, then
             // loop on `notified()` bounded by the remaining time until the
             // deadline. Each wake re-checks status; a completion that happens
