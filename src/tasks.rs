@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -92,6 +92,13 @@ pub struct TaskState {
     /// status.  Held in an Option so the registry can record the
     /// outcome even after the JoinHandle finishes.
     pub final_result: Mutex<Option<Result<String, String>>>,
+    /// Fired once when the task reaches any terminal state (Completed /
+    /// Failed / Stopped). Uses `notify_one()` so a completion that happens
+    /// while a waiter is mid-turn is not lost — the next `.notified()` poll
+    /// consumes the stored permit. Mirrors the `BackgroundJobManager` pattern
+    /// in `src/tools/run_background.rs`. Used by `task_output(block=true)`
+    /// to wait event-driven instead of busy-polling.
+    pub completed_notify: Arc<Notify>,
 }
 
 impl TaskState {
@@ -116,6 +123,7 @@ impl TaskState {
             output_rx: Mutex::new(Some(rx)),
             handle: Mutex::new(None),
             final_result: Mutex::new(None),
+            completed_notify: Arc::new(Notify::new()),
         };
         (state, id)
     }
@@ -174,6 +182,7 @@ impl TaskState {
         if let Some(handle) = h.as_ref() {
             handle.abort();
             *self.status.lock().await = TaskStatus::Stopped;
+            self.completed_notify.notify_one();
             true
         } else {
             false
@@ -184,12 +193,24 @@ impl TaskState {
     pub async fn mark_completed(&self, output: String) {
         *self.status.lock().await = TaskStatus::Completed;
         *self.final_result.lock().await = Some(Ok(output));
+        self.completed_notify.notify_one();
     }
 
     /// Mark the task as failed.
     pub async fn mark_failed(&self, err: String) {
         *self.status.lock().await = TaskStatus::Failed;
         *self.final_result.lock().await = Some(Err(err));
+        self.completed_notify.notify_one();
+    }
+
+    /// Return a clone of the completion-notify handle.
+    ///
+    /// Callers can `select!` on `completed_notify().notified()` to wake
+    /// when the task enters any terminal state (Completed / Failed /
+    /// Stopped), instead of polling `status()`. Mirrors
+    /// `BackgroundJobManager::completed_notify`.
+    pub fn completed_notify(&self) -> Arc<Notify> {
+        self.completed_notify.clone()
     }
 }
 
@@ -461,6 +482,48 @@ mod tests {
         assert_eq!(got.status().await, TaskStatus::Stopped);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn completed_notify_wakes_on_mark_completed() {
+        // A waiter that selects on notified() must wake when the task enters a
+        // terminal state. Mirrors BackgroundJobManager's completed_notify test.
+        let reg = TaskRegistry::new();
+        let (state, id) = TaskState::new("t", "", "");
+        let arc = reg.register(state).await;
+        let notify = arc.completed_notify();
+
+        // Spawn a waiter that blocks until notified or times out (failure case).
+        let wait_handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), notify.notified()).await.is_ok()
+        });
+
+        // Give the waiter a moment to register, then complete the task.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        arc.mark_completed("done".to_string()).await;
+
+        let woke = wait_handle.await.unwrap();
+        assert!(woke, "waiter should have been woken by notify_one()");
+        let got = reg.get(&id).await.unwrap();
+        assert_eq!(got.status().await, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn completed_notify_not_lost_when_fired_before_wait() {
+        // notify_one() stores a permit, so a completion that happens before
+        // the waiter calls notified() is not lost.
+        let reg = TaskRegistry::new();
+        let (state, _id) = TaskState::new("t", "", "");
+        let arc = reg.register(state).await;
+        let notify = arc.completed_notify();
+
+        // Fire completion first.
+        arc.mark_failed("boom".to_string()).await;
+        // Now wait — must return immediately due to the stored permit.
+        let woke = tokio::time::timeout(Duration::from_millis(100), notify.notified())
+            .await
+            .is_ok();
+        assert!(woke, "stored permit must wake a late waiter immediately");
     }
 
     #[tokio::test]

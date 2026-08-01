@@ -3,7 +3,14 @@
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
-use crate::tools::{AgentDefinitions, AgentTool, ToolRegistry};
+use crate::tasks::TaskRegistry;
+use crate::tools::{
+    AgentDefinitions, AgentTool, ListWorkersTool, SendMessageTool, ToolRegistry, WorkerRegistry,
+};
+#[cfg(feature = "coordinator-mode")]
+use crate::tools::{
+    TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool,
+};
 use crate::{ChatProvider, Config};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -420,24 +427,48 @@ impl AgentPool {
 ///
 /// The coordinator workflow:
 /// 1. Analyse the task and decide which specialists are needed
-/// 2. Call `team_add_role` for each specialist (custom system prompt + tools)
-/// 3. Call `spawn_workers_parallel` (or sequential `spawn_worker`) to dispatch tasks
+/// 2. Call the `agent` tool with a `manifest` describing each specialist
+///    (`system_prompt` + `allowed_tools`, or a `definition` referencing a built-in
+///    role from `.recursive/agents/*.md`)
+/// 3. Dispatch via the tool's `mode`: `single`, `parallel`, or `sequential`
 /// 4. Synthesise and return the combined results
 ///
-/// This prompt is injected in addition to any project-level context.
+/// This prompt is injected in addition to any project-level context. It only
+/// teaches tools that are actually registered on the coordinator's tool
+/// registry by [`register_subagent_if_enabled`].
 pub fn coordinator_system_prompt() -> &'static str {
     concat!(
         "You are a coordinator agent. Your job is to decompose complex tasks and delegate them ",
         "to specialist workers you design on the fly.\n\n",
+        "## Your tools\n\n",
+        "- **`agent`** — your primary tool. Spawns one or more specialist workers. Each worker ",
+        "  runs its own agent loop with a restricted tool set and an isolated transcript.\n",
+        "- **`send_message`** — push a follow-up message to a worker. For a background worker this ",
+        "drives a NEW turn on the same runtime, preserving its transcript/context (cross-turn ",
+        "continuation). Use `task_id` (returned by a background `agent` call) to address it.\n",
+        "- If present, **`task_list` / `task_output` / `task_stop`** let you inspect running tasks, ",
+        "drain their buffered output, or cancel them. (These are optional and may not be registered ",
+        "in every build; if a tool call is rejected as unknown, simply rely on `agent` and ",
+        "`send_message` instead.)\n\n",
         "## Your workflow\n\n",
         "1. **Analyse** — understand the task and identify the distinct subtasks and the expertise each requires.\n",
-        "2. **Design specialists** — for each distinct expertise, call `team_add_role` with:\n",
-        "   - A descriptive `name` (e.g. \"security-reviewer\", \"perf-analyst\")\n",
+        "2. **Design specialists** — for each distinct expertise, add an entry to the `agent` tool's ",
+        "`manifest`. Each entry is a worker_id → role mapping. A role is defined by:\n",
         "   - A focused `system_prompt` that defines the specialist's role, constraints, and output format\n",
-        "   - Appropriate `allowed_tools` (restrict read-only specialists to read/search tools)\n",
-        "3. **Dispatch** — use `spawn_workers_parallel` to run independent tasks concurrently, or\n",
-        "   sequential `spawn_worker` calls when one task's output feeds the next.\n",
-        "   Use `role_name` to route tasks to the custom roles you created.\n",
+        "   - Optional `allowed_tools` (omit or leave empty for the read-only set: ",
+        "Read, Grep, Glob, WebFetch, SearchFiles; list tool names to grant write tools)\n",
+        "   - Or a `definition` referencing a built-in role from `.recursive/agents/*.md` ",
+        "(e.g. `explore`, `plan`, `verification`, `general-purpose`)\n",
+        "3. **Dispatch** — set the `agent` tool's `mode`:\n",
+        "   - `single` — exactly one worker, runs to completion and returns its result.\n",
+        "   - `parallel` — all workers run concurrently. Use for independent read-only tasks ",
+        "(research, review).\n",
+        "   - `sequential` — workers run one after another. Use when one task's output feeds the next, ",
+        "or for write-heavy tasks that may touch the same files.\n",
+        "   - For a long-running task you want to continue later, set `background: true` with ",
+        "`mode: \"single\"`. The worker is spawned in the background and you get a `task_id` immediately ",
+        "(instead of waiting). Use `send_message(task_id=...)` to run follow-up turns on the same worker, ",
+        "and `task_output` / `task_stop` to inspect or cancel it.\n",
         "4. **Synthesise** — collect all worker results and write a final unified answer.\n\n",
         "## Rules\n\n",
         "- Design the *minimum* number of specialists the task requires — avoid over-decomposition.\n",
@@ -445,9 +476,9 @@ pub fn coordinator_system_prompt() -> &'static str {
         "- Write-heavy tasks (coding, patching) should run sequentially unless you are certain they touch different files.\n",
         "- After all workers finish, synthesise their outputs into a single coherent response rather than just concatenating them.\n\n",
         "## Writing worker prompts\n\n",
-        "**Workers cannot see this conversation.** Every `prompt` you pass to `spawn_worker` /\n",
-        "`spawn_workers_parallel`, and every `message` you send via `send_message`, must be\n",
-        "self-contained — it is the only context the worker has.\n\n",
+        "**Workers cannot see this conversation.** Every `prompt` you pass to the `agent` tool, ",
+        "and every `message` you send via `send_message`, must be self-contained — it is the only ",
+        "context the worker has.\n\n",
         "### Never delegate understanding\n\n",
         "When a worker reports research findings, **you** must understand them before directing\n",
         "follow-up work. Read the findings, identify the approach, then write a prompt that *proves*\n",
@@ -457,13 +488,18 @@ pub fn coordinator_system_prompt() -> &'static str {
         "hand off understanding to another worker.\n\n",
         "```\n",
         "// Bad — lazy delegation (workers can't see this conversation)\n",
-        "spawn_worker({ prompt: \"Based on your findings, fix the auth bug\" })\n",
-        "spawn_worker({ prompt: \"The worker found an issue in the auth module. Please fix it.\" })\n\n",
+        "agent({ mode: \"single\",\n",
+        "  manifest: { fixer: { system_prompt: \"You fix bugs.\" } },\n",
+        "  prompt: \"Based on your findings, fix the auth bug\" })\n",
+        "\n",
         "// Good — synthesised spec: file:line, root cause, exact change, done-criterion\n",
-        "spawn_worker({ role_name: \"coder\", prompt: \"Fix the null deref in src/auth/validate.rs:42.\n",
-        "  The `user` field on Session (src/auth/types.rs:15) is None when a session expires but the\n",
-        "  token stays cached. Add a None check before `user.id` access — if None, return 401 with\n",
-        "  'Session expired'. Run `cargo test -p auth` and report the result.\" })\n",
+        "agent({ mode: \"single\",\n",
+        "  manifest: { coder: { system_prompt: \"You implement tasks using the available tools.\",\n",
+        "                        allowed_tools: [\"Read\", \"Edit\", \"Bash\"] } },\n",
+        "  prompt: \"Fix the null deref in src/auth/validate.rs:42. The `user` field on Session\n",
+        "    (src/auth/types.rs:15) is None when a session expires but the token stays cached.\n",
+        "    Add a None check before `user.id` access — if None, return 401 with 'Session expired'.\n",
+        "    Run `cargo test -p auth` and report the result.\" })\n",
         "```\n\n",
         "### What every worker prompt must contain\n\n",
         "- **Target**: concrete `file:line` references and the exact change to make — not \"the auth\n",
@@ -476,17 +512,19 @@ pub fn coordinator_system_prompt() -> &'static str {
         "- **Purpose**: one line on why the task matters, so the worker can calibrate depth (\"this\n",
         "  informs a PR description — focus on user-facing changes\").\n\n",
         "### Continue vs spawn — decide by context overlap\n\n",
-        "After synthesising, choose `send_message` (continue an existing worker) vs `spawn_worker`\n",
-        "(fresh worker) by how much of the worker's loaded context overlaps the next task:\n\n",
+        "A background worker (`background: true`) stays alive across turns: `send_message(task_id=...)` ",
+        "runs a new turn on the same runtime, so the worker keeps its loaded files and prior findings. ",
+        "Choose between continuing an existing background worker and spawning a fresh one by how much of ",
+        "its loaded context overlaps the next task:\n\n",
         "| Situation | Mechanism | Why |\n",
         "|-----------|-----------|-----|\n",
-        "| Research explored exactly the files that now need editing | **Continue** (`send_message`) | Worker already has the files loaded AND now gets a clear plan |\n",
-        "| Research was broad but implementation is narrow | **Spawn fresh** (`spawn_worker`) | Focused context is cleaner than dragging along exploration noise |\n",
-        "| Correcting a failure or extending recent work | **Continue** | Worker has the error context and knows what it just tried |\n",
-        "| Verifying code a different worker just wrote | **Spawn fresh** | A verifier should see the code with fresh eyes, not carry the implementer's assumptions |\n",
+        "| Follow-up refines the background worker's current task | **Continue** (`send_message`) | Worker already has the files loaded AND now gets a clearer plan |\n",
+        "| Research was broad but the next task is narrow | **Spawn fresh** (`agent`) | Focused context is cleaner than dragging along exploration noise |\n",
+        "| Correcting a failure or extending recent work | **Continue** (`send_message`) | Worker has the error context and knows what it just tried |\n",
+        "| Verifying code a different worker just wrote | **Spawn fresh** (`agent`) | A verifier should see the code with fresh eyes, not carry the implementer's assumptions |\n",
         "| First attempt used the wrong approach entirely | **Spawn fresh** | Wrong-approach context pollutes the retry; clean slate avoids anchoring on the failed path |\n",
         "| Unrelated task | **Spawn fresh** | No useful context to reuse |\n\n",
-        "There is no universal default. High overlap → continue. Low overlap → spawn fresh.\n\n",
+        "There is no universal default. High overlap → continue with `send_message`. Low overlap → spawn fresh.\n\n",
         "### Verification — prove it works, don't confirm it exists\n\n",
         "When a worker (or you) claims a change is done, verification means **proving the code works**,\n",
         "not confirming that it exists. A verifier that rubber-stamps weak work undermines everything.\n",
@@ -497,13 +535,22 @@ pub fn coordinator_system_prompt() -> &'static str {
     )
 }
 
-/// Register the unified `Agent` (sub-agent / team coordination) tool on `tools`
-/// when `config.subagent_enabled` is true. This is the single, channel-agnostic
-/// hook called by every agent-loop entry point (CLI run / loop, HTTP API, TUI)
-/// after they build their base tool registry and resolve their provider, so
-/// the `Agent` tool and the coordinator prompt injected by
-/// [`crate::system_prompt::assemble_system_prompt`] stay in sync across all
-/// surfaces. Returns `tools` unchanged when sub-agent is disabled.
+/// Register the unified `Agent` (sub-agent / team coordination) tool — plus the
+/// coordinator-side coordination tools (`send_message`, `list_workers`,
+/// `task_create` / `task_get` / `task_list` / `task_output` / `task_stop` /
+/// `task_update`) — on `tools` when `config.subagent_enabled` is true.
+///
+/// This is the single, channel-agnostic hook called by every agent-loop entry
+/// point (CLI run / loop, HTTP API, TUI) after they build their base tool
+/// registry and resolve their provider, so the `Agent` tool and the coordinator
+/// prompt injected by [`crate::system_prompt::assemble_system_prompt`] stay in
+/// sync across all surfaces. Returns `tools` unchanged when sub-agent is
+/// disabled.
+///
+/// The coordination tools share a single `TaskRegistry` and `WorkerRegistry`
+/// with the `Agent` tool, so a coordinator can dispatch a worker via `agent`
+/// and then inspect / message / cancel it. Without this wiring the coordinator
+/// prompt would advertise tools it cannot actually call.
 pub fn register_subagent_if_enabled(
     tools: ToolRegistry,
     config: &Config,
@@ -516,6 +563,13 @@ pub fn register_subagent_if_enabled(
         tracing::warn!("Failed to load agent definitions: {e}");
         AgentDefinitions::default()
     });
+    // A single shared registry pair so the `agent` tool and the coordinator-side
+    // task/message tools observe the same workers.
+    let task_registry = Arc::new(TaskRegistry::new());
+    let worker_registry = WorkerRegistry::new();
+    let worker_table: crate::tools::agent::WorkerTable =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     let agent = AgentTool::new(
         &config.workspace,
         provider,
@@ -524,8 +578,47 @@ pub fn register_subagent_if_enabled(
         0,
         None,
     )
-    .with_definitions(defs);
-    tools.register(Arc::new(agent))
+    .with_definitions(defs)
+    .with_task_registry(task_registry.clone())
+    .with_registry(worker_registry.clone())
+    .with_workers(worker_table.clone());
+
+    // Register the `Agent` tool first, then the coordination tools that the
+    // coordinator prompt teaches alongside it. Each is built from the same
+    // shared registries. The task_* family is gated behind the
+    // `coordinator-mode` feature; when it is disabled only `agent` +
+    // `send_message` + `list_workers` are registered.
+    let tools = tools
+        .register(Arc::new(agent))
+        .register(Arc::new(SendMessageTool::new(
+            worker_registry.clone(),
+            task_registry.clone(),
+            worker_table.clone(),
+        )))
+        .register(Arc::new(ListWorkersTool::new(
+            worker_registry.clone(),
+            task_registry.clone(),
+        )));
+
+    #[cfg(feature = "coordinator-mode")]
+    {
+        tools
+            .register(Arc::new(TaskCreateTool::new(task_registry.clone())))
+            .register(Arc::new(TaskGetTool::new(task_registry.clone())))
+            .register(Arc::new(TaskListTool::new(task_registry.clone())))
+            .register(Arc::new(TaskOutputTool::new(task_registry.clone())))
+            .register(Arc::new(TaskStopTool::new(task_registry.clone())))
+            .register(Arc::new(TaskUpdateTool::new(task_registry.clone())))
+    }
+    #[cfg(not(feature = "coordinator-mode"))]
+    {
+        // Suppress unused warnings for the shared registries when the task_*
+        // tools are compiled out: send_message/list_workers above already
+        // consume `worker_registry`, and `task_registry` is still passed to
+        // the AgentTool via `with_task_registry` on the coordinator's behalf.
+        let _ = &task_registry;
+        tools
+    }
 }
 
 /// Default role set for common multi-agent patterns.
@@ -1131,8 +1224,8 @@ mod tests {
         );
         // Continue vs spawn decision table — both mechanisms must be named.
         assert!(
-            prompt.contains("send_message") && prompt.contains("spawn_worker"),
-            "coordinator prompt must cover both continue (send_message) and spawn (spawn_worker)"
+            prompt.contains("send_message") && prompt.contains("agent"),
+            "coordinator prompt must cover both continue (send_message) and spawn (agent)"
         );
         // Verification bar: prove it works, don't confirm it exists.
         assert!(

@@ -25,17 +25,16 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::agent::FinishReason;
 use crate::error::{Error, Result};
-use crate::kernel::{AgentKernel, TurnContext};
 use crate::llm::{ChatProvider, ToolSpec};
-use crate::message::Message;
 use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
-use crate::permissions::PermissionMode;
-use crate::tasks::TaskRegistry;
+use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
+use crate::tasks::{TaskId, TaskRegistry, TaskState};
 use crate::tools::agent_defs::AgentDefinitions;
 use crate::tools::edit::EditTool;
 use crate::tools::fs::{ReadFile, ReadFileState, WriteFile};
@@ -169,6 +168,28 @@ impl Tool for SharedMemoryWrite {
 // AgentTool — unified delegation
 // ---------------------------------------------------------------------------
 
+/// A long-lived handle to a background worker, enabling cross-turn
+/// continuation via `send_message`.
+///
+/// When a worker is spawned in the background, its `AgentRuntime` lives in a
+/// dedicated tokio task that drains an mpsc channel of incoming prompts. Each
+/// `send_message` to this worker pushes a prompt onto `tx`; the worker task
+/// runs it as a new turn on the same runtime (preserving transcript/context).
+/// `task_id` links this handle to the `TaskRegistry` entry so `task_get` /
+/// `task_output` / `task_stop` work uniformly.
+pub struct WorkerHandle {
+    /// Push a new turn prompt to the background worker. Returns Err if the
+    /// worker task has exited (channel closed).
+    pub tx: mpsc::UnboundedSender<String>,
+    /// The TaskRegistry id under which this worker is registered.
+    pub task_id: TaskId,
+}
+
+/// A process-wide table of live background workers keyed by worker_id.
+/// Shared between the `agent` tool (which inserts) and the `send_message`
+/// tool ( which looks up to continue a worker).
+pub type WorkerTable = Arc<RwLock<HashMap<String, Arc<WorkerHandle>>>>;
+
 /// The unified `agent` delegation tool.
 ///
 /// Spawns one or more specialist sub-agents (workers) according to a
@@ -184,6 +205,10 @@ pub struct AgentTool {
     pool: Option<Arc<RwLock<AgentPool>>>,
     task_registry: Arc<TaskRegistry>,
     definitions: Option<AgentDefinitions>,
+    /// Background worker continuation table (worker_id → handle). Populated
+    /// when a worker is spawned in the background; `send_message` reads here
+    /// to continue a worker across turns.
+    workers: WorkerTable,
 }
 
 impl AgentTool {
@@ -206,6 +231,7 @@ impl AgentTool {
             pool: None,
             task_registry: Arc::new(TaskRegistry::new()),
             definitions: None,
+            workers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -233,6 +259,14 @@ impl AgentTool {
     /// reference definitions by name via the `definition` field.
     pub fn with_definitions(mut self, defs: AgentDefinitions) -> Self {
         self.definitions = Some(defs);
+        self
+    }
+
+    /// Attach a shared background-worker continuation table. When set,
+    /// background workers register their continuation handle here so that
+    /// `send_message` can drive follow-up turns on the same runtime.
+    pub fn with_workers(mut self, workers: WorkerTable) -> Self {
+        self.workers = workers;
         self
     }
 
@@ -298,15 +332,19 @@ impl AgentTool {
     // Worker execution
     // ------------------------------------------------------------------
 
-    /// Run a single worker and return its final text.
-    async fn run_worker(
+    /// Build a fresh `AgentRuntime` for a worker with the manifest entry's
+    /// tool set and system prompt. The runtime retains transcript across
+    /// turns, which is what enables `send_message` to continue a background
+    /// worker: each follow-up prompt is a new turn on the same runtime.
+    ///
+    /// `worker_id` is used only for shared-memory tool namespacing.
+    async fn build_worker_runtime(
         &self,
         worker_id: &str,
         entry: &WorkerManifestEntry,
-        prompt: &str,
         max_steps: usize,
         child_depth: usize,
-    ) -> Result<String> {
+    ) -> Result<AgentRuntime> {
         // Resolve allowed tools
         let tool_names: Vec<String> = if entry.allowed_tools.is_empty() {
             Self::default_tool_names()
@@ -332,8 +370,11 @@ impl AgentTool {
         if let Some(pool) = &self.pool {
             child_agent = child_agent.with_pool(pool.clone());
         }
-        // Always propagate the task registry so all descendants share it.
-        child_agent = child_agent.with_task_registry(self.task_registry.clone());
+        // Always propagate the task registry and worker table so descendants
+        // share coordination state with the coordinator.
+        child_agent = child_agent
+            .with_task_registry(self.task_registry.clone())
+            .with_workers(self.workers.clone());
         sub_registry = sub_registry.register(Arc::new(child_agent));
 
         // Inject shared-memory tools if pool is available
@@ -350,6 +391,7 @@ impl AgentTool {
             sub_registry = sub_registry.register(Arc::new(SendMessageTool::new(
                 reg.clone(),
                 self.task_registry.clone(),
+                self.workers.clone(),
             )));
             sub_registry = sub_registry.register(Arc::new(ListWorkersTool::new(
                 reg.clone(),
@@ -366,50 +408,50 @@ impl AgentTool {
             }
         }
 
-        // Build and run the worker via AgentKernel
-        let kernel = AgentKernel::builder()
+        AgentRuntimeBuilder::new()
             .llm(self.provider.clone())
             .tools(sub_registry)
             .max_steps(max_steps)
+            .system_prompt(system_prompt)
             .build()
             .map_err(|e| Error::Tool {
                 name: "agent".into(),
                 call_id: None,
-                message: format!("failed to build worker '{}' kernel: {e}", worker_id),
-            })?;
+                message: format!("failed to build worker '{}' runtime: {e}", worker_id),
+            })
+    }
 
-        let ctx = TurnContext {
-            messages: Arc::new(vec![
-                Message::system(system_prompt),
-                Message::user(prompt.to_string()),
-            ]),
-            step_events_tx: None,
-            tool_specs: kernel.tools().specs(),
-            streaming: false,
-            permission_hook: self.permission_hook.clone(),
-            exploring_plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            permission_mode: PermissionMode::Default,
-            mailbox: None,
-            turn: 0,
-            prompt_segments: None,
-            wall_timeout_secs: 0,
-        };
-
-        let outcome = kernel.run(ctx).await.map_err(|e| Error::Tool {
+    /// Run a single worker synchronously and return its final text.
+    ///
+    /// The worker runs exactly one turn (the initial prompt) on a fresh
+    /// runtime; it is NOT registered for continuation. Use
+    /// [`spawn_background_worker`] for a long-lived, continuable worker.
+    async fn run_worker(
+        &self,
+        worker_id: &str,
+        entry: &WorkerManifestEntry,
+        prompt: &str,
+        max_steps: usize,
+        child_depth: usize,
+    ) -> Result<String> {
+        let mut runtime = self
+            .build_worker_runtime(worker_id, entry, max_steps, child_depth)
+            .await?;
+        let outcome = runtime.run(prompt).await.map_err(|e| Error::Tool {
             name: "agent".into(),
             call_id: None,
             message: format!("worker '{}' failed: {e}", worker_id),
         })?;
 
-        let finish_label = match &outcome.finish_reason {
-            FinishReason::NoMoreToolCalls => "NoMoreToolCalls",
-            FinishReason::BudgetExceeded => "BudgetExceeded",
+        let finish_label = match outcome.finish_reason {
+            FinishReason::NoMoreToolCalls => "NoMoreToolCalls".to_string(),
+            FinishReason::BudgetExceeded => "BudgetExceeded".to_string(),
             FinishReason::ProviderStop(r) => r,
-            FinishReason::Stuck { .. } => "Stuck",
-            FinishReason::TranscriptLimit { .. } => "TranscriptLimit",
-            FinishReason::Cancelled => "Cancelled",
-            FinishReason::PermissionDenialLimit => "PermissionDenialLimit",
-            FinishReason::WallClockExceeded { .. } => "WallClockExceeded",
+            FinishReason::Stuck { .. } => "Stuck".to_string(),
+            FinishReason::TranscriptLimit { .. } => "TranscriptLimit".to_string(),
+            FinishReason::Cancelled => "Cancelled".to_string(),
+            FinishReason::PermissionDenialLimit => "PermissionDenialLimit".to_string(),
+            FinishReason::WallClockExceeded { .. } => "WallClockExceeded".to_string(),
         };
 
         let final_text = outcome
@@ -420,6 +462,82 @@ impl AgentTool {
             "[worker '{worker_id}' finished: {finish_label}]\n{final_text}"
         ))
     }
+
+    /// Spawn a worker into a background tokio task that drains an mpsc channel
+    /// of turn prompts against a single long-lived `AgentRuntime`. Returns the
+    /// task id (registered in the shared `TaskRegistry`) immediately; the
+    /// coordinator can continue the worker via `send_message(task_id=...)` and
+    /// inspect/cancel it via `task_get` / `task_output` / `task_stop`.
+    ///
+    /// The runtime is retained across turns, so follow-up prompts continue
+    /// the same conversation (transcript + todo + goals preserved).
+    async fn spawn_background_worker(
+        &self,
+        worker_id: &str,
+        entry: &WorkerManifestEntry,
+        prompt: &str,
+        max_steps: usize,
+        child_depth: usize,
+    ) -> Result<TaskId> {
+        let runtime = self
+            .build_worker_runtime(worker_id, entry, max_steps, child_depth)
+            .await?;
+        let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+
+        // Register a TaskState so task_* tools can observe/cancel this worker.
+        let (state, task_id) =
+            TaskState::new(format!("worker '{worker_id}'"), String::new(), worker_id);
+        let state = self.task_registry.register(state).await;
+
+        // Continuation channel: the first prompt is enqueued by the spawner;
+        // each `send_message` push adds another turn.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let _ = tx.send(prompt.to_string());
+
+        // Record the continuation handle so `send_message` can reach this
+        // worker by worker_id.
+        let handle = Arc::new(WorkerHandle {
+            tx,
+            task_id: task_id.clone(),
+        });
+        self.workers
+            .write()
+            .await
+            .insert(worker_id.to_string(), handle.clone());
+
+        // Spawn the long-lived worker task.
+        let state_for_task = state.clone();
+        let join_handle = tokio::spawn(async move {
+            // Drain the channel: each message is a new turn on the same runtime.
+            while let Some(msg) = rx.recv().await {
+                let mut rt = runtime.lock().await;
+                match rt.run(&msg).await {
+                    Ok(outcome) => {
+                        let text = outcome
+                            .final_text
+                            .unwrap_or_else(|| "(no final message)".to_string());
+                        let _ = state_for_task
+                            .append_output(format!("--- turn ---\n{text}"))
+                            .await;
+                    }
+                    Err(e) => {
+                        state_for_task
+                            .mark_failed(format!("worker turn failed: {e}"))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            // Channel closed (no more send_message will arrive): mark complete.
+            state_for_task.mark_completed("worker finished".to_string()).await;
+        });
+
+        // Attach the JoinHandle so `task_stop` can truly abort this task.
+        state.set_handle(join_handle).await;
+
+        Ok(task_id)
+    }
+
 
     // ------------------------------------------------------------------
     // Mode dispatchers
@@ -488,6 +606,7 @@ impl AgentTool {
         let registry = self.registry.clone();
         let pool = self.pool.clone();
         let definitions = self.definitions.clone();
+        let workers = self.workers.clone();
 
         // Spawn each worker into a tokio task, collecting JoinHandles.
         let mut handles: Vec<tokio::task::JoinHandle<(String, Result<String>)>> = Vec::new();
@@ -502,6 +621,7 @@ impl AgentTool {
             let registry = registry.clone();
             let pool = pool.clone();
             let definitions = definitions.clone();
+            let workers = workers.clone();
 
             handles.push(tokio::spawn(async move {
                 let agent = AgentTool {
@@ -515,6 +635,7 @@ impl AgentTool {
                     pool: pool.clone(),
                     task_registry: Arc::new(crate::tasks::TaskRegistry::new()),
                     definitions,
+                    workers,
                 };
                 let result = agent
                     .run_worker(&worker_id, &entry, &prompt, max_steps, child_depth)
@@ -708,11 +829,25 @@ impl Tool for AgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "agent".into(),
-            description: concat!(
-                "Spawn one or more specialist sub-agents (workers) defined by a `manifest`. ",
-                "Use `mode: \"single\"` for one worker, `mode: \"parallel\"` for concurrent ",
-                "execution, or `mode: \"sequential\"` when each worker depends on the previous. ",
-                "Workers have restricted tool sets and isolated transcripts."
+            // The coordinator guidance (how/when to delegate, writing worker
+            // prompts, never delegating understanding, continue vs spawn,
+            // verification) is intentionally embedded in the tool description
+            // rather than the system prompt. This mirrors the fake-cc pattern:
+            // the model sees it only when the `agent` tool is registered (i.e.
+            // sub-agent is enabled), so disabling sub-agent removes both the
+            // tool and its token cost, and the base system prompt stays stable
+            // for users who never delegate.
+            description: format!(
+                "{}\n\n{}",
+                concat!(
+                    "Spawn one or more specialist sub-agents (workers) defined by a `manifest`. ",
+                    "Use `mode: \"single\"` for one worker, `mode: \"parallel\"` for concurrent ",
+                    "execution, or `mode: \"sequential\"` when each worker depends on the previous. ",
+                    "Set `background: true` (with `single`) to spawn a long-lived worker that ",
+                    "returns a `task_id` immediately and can be continued across turns. ",
+                    "Workers have restricted tool sets and isolated transcripts."
+                ),
+                crate::multi::coordinator_system_prompt()
             )
             .into(),
             parameters: json!({
@@ -751,6 +886,11 @@ impl Tool for AgentTool {
                         "type": "integer",
                         "description": "Maximum steps per worker (default 30, max 100).",
                         "default": 30
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "If true (and mode is 'single'), spawn the worker in the background and return its task_id immediately instead of waiting for it to finish. The worker runs on a long-lived runtime; use send_message(task_id=...) to run follow-up turns, and task_get/task_output/task_stop to inspect or cancel.",
+                        "default": false
                     }
                 },
                 "required": ["manifest", "prompt"]
@@ -789,6 +929,12 @@ impl Tool for AgentTool {
         // --- Resolve max_steps ---
         let max_steps = arguments["max_steps"].as_i64().unwrap_or(30).clamp(1, 100) as usize;
 
+        // --- Resolve background flag ---
+        let background = arguments
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // --- Parse manifest ---
         let manifest = self.parse_manifest(&arguments["manifest"])?;
 
@@ -802,7 +948,32 @@ impl Tool for AgentTool {
 
         let child_depth = self.current_depth + 1;
 
-        // --- Dispatch ---
+        // --- Background mode (single only): spawn and return task_id ---
+        if background && matches!(mode, AgentMode::Single) {
+            if manifest.len() != 1 {
+                return Err(Error::BadToolArgs {
+                    name: "agent".into(),
+                    message: format!(
+                        "background=true with mode 'single' requires exactly one manifest entry, got {}",
+                        manifest.len()
+                    ),
+                });
+            }
+            let (worker_id, entry) = manifest.iter().next().ok_or_else(|| Error::BadToolArgs {
+                name: "agent".into(),
+                message: "background=true requires one manifest entry".to_string(),
+            })?;
+            let task_id = self
+                .spawn_background_worker(worker_id, entry, prompt, max_steps, child_depth)
+                .await?;
+            return Ok(format!(
+                "Background worker '{worker_id}' spawned as task '{task_id}'. \
+                 Use send_message(task_id=\"{task_id}\", ...) to run follow-up turns, \
+                 task_get/task_output to inspect, or task_stop to cancel."
+            ));
+        }
+
+        // --- Dispatch (foreground) ---
         match mode {
             AgentMode::Single => {
                 self.execute_single(&manifest, prompt, max_steps, child_depth)
@@ -1160,5 +1331,135 @@ allowed_tools:
 
         assert!(result.contains("inspector"));
         assert!(result.contains("review done"));
+    }
+
+    #[tokio::test]
+    async fn background_worker_returns_task_id_and_runs() {
+        // background=true in single mode returns a task_id immediately and the
+        // worker runs in the background. The first turn's output should appear
+        // in the task's output buffer.
+        let provider = mock_provider(vec![Completion {
+            content: "first turn done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let task_registry = Arc::new(TaskRegistry::new());
+        let worker_table: WorkerTable = Arc::new(RwLock::new(HashMap::new()));
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_task_registry(task_registry.clone())
+            .with_workers(worker_table);
+
+        let result = agent
+            .execute(json!({
+                "mode": "single",
+                "background": true,
+                "manifest": {
+                    "w1": { "system_prompt": "You are a helper." }
+                },
+                "prompt": "do the first thing"
+            }))
+            .await
+            .unwrap();
+
+        // Should return a task_id, not a finished worker transcript.
+        assert!(result.contains("spawned as task"), "{result}");
+        assert!(result.contains("send_message"), "{result}");
+
+        // The task should be registered. Give the background task a moment to
+        // run its first turn, then drain output.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let tasks = task_registry.list().await;
+        assert_eq!(tasks.len(), 1, "exactly one task should be registered");
+        let _ = task_registry.drain_output(&tasks[0].id).await;
+        let output = tasks[0].output_snapshot().await;
+        let joined = output.join("\n");
+        assert!(joined.contains("first turn done"), "output was: {joined}");
+    }
+
+    #[tokio::test]
+    async fn send_message_continues_background_worker() {
+        // A background worker can be continued via send_message(task_id=...):
+        // the follow-up runs as a new turn on the same runtime, preserving
+        // transcript. We verify both turns' outputs appear.
+        let provider = mock_provider(vec![
+            Completion {
+                content: "turn one".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "turn two".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let task_registry = Arc::new(TaskRegistry::new());
+        let worker_registry = WorkerRegistry::new();
+        let worker_table: WorkerTable = Arc::new(RwLock::new(HashMap::new()));
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_task_registry(task_registry.clone())
+            .with_registry(worker_registry.clone())
+            .with_workers(worker_table.clone());
+
+        // Spawn the worker in the background.
+        let spawn_result = agent
+            .execute(json!({
+                "mode": "single",
+                "background": true,
+                "manifest": {
+                    "cw": { "system_prompt": "You are a helper." }
+                },
+                "prompt": "turn one please"
+            }))
+            .await
+            .unwrap();
+        let task_id = spawn_result
+            .split("task '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("task id in spawn result")
+            .to_string();
+
+        // Let turn one finish.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Send a follow-up via send_message — this drives a new turn.
+        let send_tool = SendMessageTool::new(
+            worker_registry.clone(),
+            task_registry.clone(),
+            worker_table.clone(),
+        );
+        let send_result = send_tool
+            .execute(json!({
+                "task_id": task_id,
+                "message": "now turn two"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            send_result.contains("new turn"),
+            "send_message should report a new turn: {send_result}"
+        );
+
+        // Let turn two finish, then drain the full output buffer.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let task = task_registry
+            .get(&TaskId(task_id.clone()))
+            .await
+            .expect("task still registered");
+        let _ = task_registry.drain_output(&task.id).await;
+        let joined = task.output_snapshot().await.join("\n");
+        assert!(joined.contains("turn one"), "missing turn one: {joined}");
+        assert!(joined.contains("turn two"), "missing turn two: {joined}");
     }
 }

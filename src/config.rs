@@ -87,10 +87,12 @@ pub struct Config {
     /// Read from `RECURSIVE_SUBAGENT_MAX_DEPTH` env var, defaults to 2.
     pub subagent_max_depth: usize,
     /// Whether the unified `Agent` tool (sub-agent / team coordination) is
-    /// registered and the coordinator workflow prompt is injected. Read from
-    /// `RECURSIVE_SUBAGENT_ENABLED` or `RECURSIVE_TEAM_ENABLED` (= "1"),
-    /// defaults to false. Honoured uniformly by every agent-loop channel
-    /// (CLI run / loop, HTTP API, TUI).
+    /// registered. Enabled by default. To disable, set
+    /// `RECURSIVE_SUBAGENT_ENABLED=0` (or its alias
+    /// `RECURSIVE_TEAM_ENABLED=0`). The coordinator guidance lives on the
+    /// `agent` tool's own description (not the system prompt), so disabling it
+    /// fully removes both the tool and its token cost. Honoured uniformly by
+    /// every agent-loop channel (CLI run / loop, HTTP API, TUI).
     pub subagent_enabled: bool,
     /// When `false` (default), API callers who request `"bypass"` permission
     /// mode are silently downgraded to `Default`. Set to `true` via
@@ -459,12 +461,17 @@ impl Config {
             })
             .unwrap_or(2);
 
-        let subagent_enabled = std::env::var("RECURSIVE_SUBAGENT_ENABLED")
-            .map(|s| s == "1")
-            .unwrap_or(false)
-            || std::env::var("RECURSIVE_TEAM_ENABLED")
-                .map(|s| s == "1")
-                .unwrap_or(false);
+        // Sub-agent (the `agent` tool + coordinator tools) is enabled by default.
+        // Either RECURSIVE_SUBAGENT_ENABLED or its legacy alias RECURSIVE_TEAM_ENABLED
+        // can be inspected; the FIRST one that is set wins. A value of "0" or
+        // "false" (case-insensitive) explicitly disables; anything else enables.
+        // When neither variable is set, sub-agent stays on.
+        let subagent_enabled = match std::env::var("RECURSIVE_SUBAGENT_ENABLED")
+            .or_else(|_| std::env::var("RECURSIVE_TEAM_ENABLED"))
+        {
+            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+            Err(_) => true,
+        };
 
         let allow_bypass_permissions = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS")
             .ok()
@@ -2467,36 +2474,46 @@ api_key = "sk-from-file"
         );
     }
 
-    // ── subagent_enabled OR-gate ─────────────────────────────────────────────
+    // ── subagent_enabled default-on semantics ───────────────────────────────
+    //
+    // Sub-agent is enabled by default. RECURSIVE_SUBAGENT_ENABLED (or its alias
+    // RECURSIVE_TEAM_ENABLED) can disable it with "0" / "false".
 
-    #[test]
-    fn subagent_enabled_via_team_env_alone() {
-        // Kills: `replace || with &&` at the SUBAGENT/TEAM OR-gate.
-        // With only RECURSIVE_TEAM_ENABLED=1 (SUBAGENT unset), the mutant
-        // `a && b` would leave subagent_enabled=false.
+    /// Helper: build a Config from env with the two subagent vars set to given
+    /// optional values, restoring them afterwards. Other env (MODEL/API_KEY)
+    /// is fixed for a valid build.
+    fn config_with_subagent_env(
+        sub: Option<&str>,
+        team: Option<&str>,
+    ) -> Config {
         let _env_lock = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
-        let orig_team = std::env::var("RECURSIVE_TEAM_ENABLED").ok();
         let orig_sub = std::env::var("RECURSIVE_SUBAGENT_ENABLED").ok();
+        let orig_team = std::env::var("RECURSIVE_TEAM_ENABLED").ok();
         let orig_model = std::env::var("RECURSIVE_MODEL").ok();
         let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
-        std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED");
-        std::env::set_var("RECURSIVE_TEAM_ENABLED", "1");
-        std::env::set_var("RECURSIVE_MODEL", "test-model");
-        std::env::set_var("RECURSIVE_API_KEY", "test-key");
-        let config = Config::from_env().expect("from_env");
-        assert!(
-            config.subagent_enabled,
-            "RECURSIVE_TEAM_ENABLED=1 alone must enable subagent"
-        );
-        match orig_team {
+
+        match sub {
+            Some(v) => std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", v),
+            None => std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED"),
+        }
+        match team {
             Some(v) => std::env::set_var("RECURSIVE_TEAM_ENABLED", v),
             None => std::env::remove_var("RECURSIVE_TEAM_ENABLED"),
         }
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        let config = Config::from_env().expect("from_env");
+
         match orig_sub {
             Some(v) => std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", v),
             None => std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED"),
+        }
+        match orig_team {
+            Some(v) => std::env::set_var("RECURSIVE_TEAM_ENABLED", v),
+            None => std::env::remove_var("RECURSIVE_TEAM_ENABLED"),
         }
         match orig_model {
             Some(v) => std::env::set_var("RECURSIVE_MODEL", v),
@@ -2506,44 +2523,53 @@ api_key = "sk-from-file"
             Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
             None => std::env::remove_var("RECURSIVE_API_KEY"),
         }
+        config
     }
 
     #[test]
-    fn subagent_enabled_via_subagent_env_alone() {
-        // Complementary pin: SUBAGENT=1 with TEAM unset must also enable.
-        // Kills: `replace == with !=` on the SUBAGENT "1" check.
-        let _env_lock = crate::test_util::env_lock();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
-        let orig_team = std::env::var("RECURSIVE_TEAM_ENABLED").ok();
-        let orig_sub = std::env::var("RECURSIVE_SUBAGENT_ENABLED").ok();
-        let orig_model = std::env::var("RECURSIVE_MODEL").ok();
-        let orig_key = std::env::var("RECURSIVE_API_KEY").ok();
-        std::env::remove_var("RECURSIVE_TEAM_ENABLED");
-        std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", "1");
-        std::env::set_var("RECURSIVE_MODEL", "test-model");
-        std::env::set_var("RECURSIVE_API_KEY", "test-key");
-        let config = Config::from_env().expect("from_env");
+    fn subagent_enabled_defaults_to_true_when_unset() {
+        // Default-on: neither var set → subagent_enabled == true.
+        // Kills: `Err(_) => false` mutant (someone reverting the default).
+        let config = config_with_subagent_env(None, None);
         assert!(
             config.subagent_enabled,
-            "RECURSIVE_SUBAGENT_ENABLED=1 alone must enable subagent"
+            "subagent must be enabled by default when neither env var is set"
         );
-        match orig_team {
-            Some(v) => std::env::set_var("RECURSIVE_TEAM_ENABLED", v),
-            None => std::env::remove_var("RECURSIVE_TEAM_ENABLED"),
-        }
-        match orig_sub {
-            Some(v) => std::env::set_var("RECURSIVE_SUBAGENT_ENABLED", v),
-            None => std::env::remove_var("RECURSIVE_SUBAGENT_ENABLED"),
-        }
-        match orig_model {
-            Some(v) => std::env::set_var("RECURSIVE_MODEL", v),
-            None => std::env::remove_var("RECURSIVE_MODEL"),
-        }
-        match orig_key {
-            Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
-            None => std::env::remove_var("RECURSIVE_API_KEY"),
-        }
+    }
+
+    #[test]
+    fn subagent_enabled_disabled_by_zero() {
+        // Explicit disable: =0 turns it off.
+        // Kills: `!(v == "0")` → `v == "0"` mutant.
+        let config = config_with_subagent_env(Some("0"), None);
+        assert!(
+            !config.subagent_enabled,
+            "RECURSIVE_SUBAGENT_ENABLED=0 must disable subagent"
+        );
+    }
+
+    #[test]
+    fn subagent_enabled_disabled_by_false_case_insensitive() {
+        // "false" (any case) also disables.
+        let config = config_with_subagent_env(Some("FALSE"), None);
+        assert!(!config.subagent_enabled, "FALSE must disable");
+    }
+
+    #[test]
+    fn subagent_enabled_explicit_one_keeps_enabled() {
+        // =1 still enables (redundant with default, but pins the truthy path).
+        let config = config_with_subagent_env(Some("1"), None);
+        assert!(config.subagent_enabled, "=1 must enable");
+    }
+
+    #[test]
+    fn subagent_team_alias_disables() {
+        // The legacy alias RECURSIVE_TEAM_ENABLED=0 also disables.
+        let config = config_with_subagent_env(None, Some("0"));
+        assert!(
+            !config.subagent_enabled,
+            "RECURSIVE_TEAM_ENABLED=0 (alias) must disable subagent"
+        );
     }
 
     #[test]

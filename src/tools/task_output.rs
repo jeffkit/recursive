@@ -76,8 +76,23 @@ impl Tool for TaskOutputTool {
             .unwrap_or(30_000);
 
         if block {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            // Event-driven wait: grab the task's completion Notify once, then
+            // loop on `notified()` bounded by the remaining time until the
+            // deadline. Each wake re-checks status; a completion that happens
+            // between checks is not lost because `notify_one()` stores a
+            // permit consumed by the next `notified()`.
+            let notify = {
+                let task = self
+                    .registry
+                    .get(&id)
+                    .await
+                    .ok_or_else(|| Error::NotFound(format!("task '{id}'")))?;
+                task.completed_notify()
+            };
             loop {
+                let now = std::time::Instant::now();
                 let s = self
                     .registry
                     .get(&id)
@@ -88,10 +103,13 @@ impl Tool for TaskOutputTool {
                 if s.is_terminal() {
                     break;
                 }
-                if std::time::Instant::now() >= deadline {
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Wait either for the completion signal or the remaining
+                // timeout budget, whichever comes first.
+                let _ = tokio::time::timeout(remaining, notify.notified()).await;
             }
         }
 

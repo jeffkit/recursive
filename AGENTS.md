@@ -72,8 +72,18 @@ by the lighter manual-edit policy.
 `remember`·`recall`·`forget` (memory in `<workspace>/.recursive/memory/`) /
 `load_skill` (from `<workspace>/.recursive/skills/` or `~/.recursive/skills/`).
 
-- **sub_agent** (if `RECURSIVE_SUBAGENT_ENABLED=1`): dispatch focused
-  research/scan to a fresh agent loop with restricted tools.
+- **agent** (if `RECURSIVE_SUBAGENT_ENABLED=1`): spawn one or more specialist
+  sub-agents via a `manifest` (each entry is a `system_prompt` + optional
+  `allowed_tools`, or a `definition` referencing a built-in role in
+  `.recursive/agents/*.md`: `general-purpose` / `explore` / `plan` /
+  `verification`). Modes: `single` / `parallel` / `sequential`. Set
+  `background: true` (with `single`) to spawn a long-lived worker that returns
+  a `task_id` immediately — continue it across turns with **send_message**
+  (preserves the worker's transcript), and inspect/cancel with
+  **task_output** / **task_stop**. Coordinator also gets **list_workers** and
+  (when built with `--features coordinator-mode`) **task_create / task_get /
+  task_list / task_output / task_stop / task_update**. Built-in roles ship
+  with the repo.
 - **checkpoint_list / checkpoint_diff** (if `git` on PATH): read-only per-turn
   workspace snapshots. You **cannot** create/restore checkpoints — rewinds
   happen out-of-band via `recursive sessions rewind <session-id> --to-turn N`.
@@ -133,6 +143,11 @@ E2E tests run via `argusai -c e2e.yaml`. Hard-won rules:
   use a unique `RECURSIVE_HOME`, then `find` the transcript and copy to a predictable
   path. See `e2e/tests/00-smoke.yaml` and `11-session-resume.yaml` for canonical form.
 - **aimock fixtures**: use `turnIndex` + `hasToolResult`, not text matching.
+- **Recording workflow**: to capture a real model's behaviour as a regression
+  fixture, `E2E_RECORD=1 argusai -c e2e.yaml run -s <suite>` (needs a real
+  key in `e2e/.env`), then `./e2e/scripts/promote.sh <suite>` merges the
+  recording into `e2e/fixtures/<suite>.json`. Replay (default, no key) is the
+  CI path. Full guide: `e2e/RECORD_REPLAY.md`.
 - **HTTP in container**: always `-H 'Content-Type: application/json'`;
   `POST /sessions/:id/messages` field is **`content`** not `message`;
   use `http://127.0.0.1:PORT` not `localhost` (Node 18 IPv6 issue).

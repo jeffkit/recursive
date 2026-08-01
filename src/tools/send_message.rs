@@ -119,13 +119,23 @@ impl WorkerRegistry {
 pub struct SendMessageTool {
     registry: WorkerRegistry,
     task_registry: Arc<TaskRegistry>,
+    /// Background worker continuation table. When a message targets a
+    /// task_id whose worker is registered here, the message is pushed onto
+    /// the worker's continuation channel, driving a new turn on its
+    /// long-lived runtime (cross-turn continuation).
+    workers: crate::tools::agent::WorkerTable,
 }
 
 impl SendMessageTool {
-    pub fn new(registry: WorkerRegistry, task_registry: Arc<TaskRegistry>) -> Self {
+    pub fn new(
+        registry: WorkerRegistry,
+        task_registry: Arc<TaskRegistry>,
+        workers: crate::tools::agent::WorkerTable,
+    ) -> Self {
         Self {
             registry,
             task_registry,
+            workers,
         }
     }
 }
@@ -183,21 +193,64 @@ impl Tool for SendMessageTool {
 
         // Prefer task_id (Phase D).
         if let Some(task_id_str) = arguments.get("task_id").and_then(|v| v.as_str()) {
+            let task_id = crate::tasks::TaskId(task_id_str.to_string());
             let task = self
                 .task_registry
-                .get(&crate::tasks::TaskId(task_id_str.to_string()))
+                .get(&task_id)
                 .await
                 .ok_or_else(|| Error::NotFound(format!("task '{task_id_str}'")))?;
             // Use the public output_tx so the worker (or a human reading
             // task_output) can see the message.
-            // `output_tx` is an mpsc::UnboundedSender<String>; send returns
-            // an Err if the receiver is gone.
             let _ = task.output_tx.send(message.clone());
+
+            // If this task is a background worker, drive a new turn by
+            // pushing the message onto the worker's continuation channel.
+            // The worker runtime is retained across turns, so this continues
+            // the same conversation (transcript preserved).
+            let workers = self.workers.read().await;
+            for handle in workers.values() {
+                if handle.task_id == task_id {
+                    match handle.tx.send(message.clone()) {
+                        Ok(()) => {
+                            return Ok(format!(
+                                "Message delivered to task '{task_id_str}'; worker will run it as a new turn."
+                            ));
+                        }
+                        Err(_) => {
+                            return Ok(format!(
+                                "Message queued for task '{task_id_str}', but the worker has exited and cannot continue."
+                            ));
+                        }
+                    }
+                }
+            }
             return Ok(format!("Message delivered to task '{task_id_str}'."));
         }
 
-        // Fall back to worker_id (legacy).
+        // Fall back to worker_id. For a background worker registered in the
+        // worker table, drive a new turn on its runtime (cross-turn
+        // continuation). Otherwise push to the legacy WorkerMailbox.
         if let Some(worker_id) = arguments.get("worker_id").and_then(|v| v.as_str()) {
+            // Background worker continuation: push to the mpsc channel so the
+            // long-lived worker runs this as a new turn on the same runtime.
+            let workers = self.workers.read().await;
+            if let Some(handle) = workers.get(worker_id) {
+                match handle.tx.send(message.clone()) {
+                    Ok(()) => {
+                        return Ok(format!(
+                            "Message delivered to worker '{worker_id}'; worker will run it as a new turn."
+                        ));
+                    }
+                    Err(_) => {
+                        return Ok(format!(
+                            "Message queued for worker '{worker_id}', but it has exited and cannot continue."
+                        ));
+                    }
+                }
+            }
+            drop(workers);
+
+            // Legacy in-memory mailbox path.
             match self.registry.get(worker_id).await {
                 Some(mailbox) => {
                     mailbox.push(message).await;
@@ -313,7 +366,7 @@ mod tests {
         use crate::tools::Tool;
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         assert!(
             !tool.is_readonly(),
             "SendMessageTool must not be ReadOnly: it pushes messages to worker mailboxes"
@@ -368,7 +421,7 @@ mod tests {
         let tr = Arc::new(TaskRegistry::new());
         let mailbox = reg.register("w1").await;
 
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         let result = tool
             .execute(json!({
                 "worker_id": "w1",
@@ -392,7 +445,7 @@ mod tests {
         let (state, id) = TaskState::new("t", "alpha", "r");
         tr.register(state).await;
 
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         let result = tool
             .execute(json!({
                 "task_id": id.to_string(),
@@ -408,7 +461,7 @@ mod tests {
     async fn send_message_unknown_task_errors() {
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         let res = tool
             .execute(json!({
                 "task_id": "task-bogus",
@@ -422,7 +475,7 @@ mod tests {
     async fn send_message_requires_one_of_ids() {
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         let res = tool.execute(json!({ "message": "hi" })).await;
         assert!(matches!(res, Err(Error::BadToolArgs { .. })));
     }
@@ -431,7 +484,7 @@ mod tests {
     async fn send_message_unknown_worker() {
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         let result = tool
             .execute(json!({"worker_id": "ghost", "message": "hi"}))
             .await
@@ -445,7 +498,7 @@ mod tests {
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
         reg.register("active-1").await;
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         let result = tool
             .execute(json!({"worker_id": "missing", "message": "hello"}))
             .await
@@ -485,7 +538,7 @@ mod tests {
         // kills `replace SendMessageTool::is_deferred -> bool with false`
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
-        let tool = SendMessageTool::new(reg, tr);
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
         assert!(
             tool.is_deferred(),
             "SendMessageTool must be deferred (depends on available workers)"

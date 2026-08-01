@@ -2,10 +2,12 @@
 **/*.rs.bk
 Cargo.lock.bak
 # Ignore per-workspace runtime state (memory, mcp cache, etc.) but
-# allow committing example/shipped skills. Parent dir must use /*
-# (not trailing /) so the negation below can re-include children.
+# allow committing example/shipped skills and built-in agent roles.
+# Parent dir must use /* (not trailing /) so the negation below can
+# re-include children.
 .recursive/*
 !.recursive/skills/
+!.recursive/agents/
 .env
 .envrc.local
 

@@ -136,7 +136,11 @@ async fn send_message_tool_delivers_to_registered_worker() {
     let reg = WorkerRegistry::new();
     let mailbox = reg.register("target-worker").await;
 
-    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
+    let tool = SendMessageTool::new(
+        reg,
+        Arc::new(TaskRegistry::new()),
+        <recursive::tools::agent::WorkerTable as Default>::default(),
+    );
     let result = tool
         .execute(json!({
             "worker_id": "target-worker",
@@ -154,7 +158,11 @@ async fn send_message_tool_unknown_worker_returns_helpful_error() {
     let reg = WorkerRegistry::new();
     reg.register("active-worker").await;
 
-    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
+    let tool = SendMessageTool::new(
+        reg,
+        Arc::new(TaskRegistry::new()),
+        <recursive::tools::agent::WorkerTable as Default>::default(),
+    );
     let result = tool
         .execute(json!({
             "worker_id": "nonexistent",
@@ -175,7 +183,11 @@ async fn send_message_tool_spec_has_required_fields() {
     // Phase D: only `message` is strictly required; `task_id` (preferred) and
     // `worker_id` (legacy fallback) are alternative routing parameters.
     let reg = WorkerRegistry::new();
-    let tool = SendMessageTool::new(reg, Arc::new(TaskRegistry::new()));
+    let tool = SendMessageTool::new(
+        reg,
+        Arc::new(TaskRegistry::new()),
+        <recursive::tools::agent::WorkerTable as Default>::default(),
+    );
     let spec = tool.spec();
 
     assert_eq!(spec.name, "send_message");

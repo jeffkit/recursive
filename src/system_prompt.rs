@@ -12,14 +12,13 @@
 //! 2. `base` — `default_system_prompt()` + 6 memory layers (already assembled
 //!    in `Config::from_env`) + any channel `append_system_prompt`
 //! 3. `# Available skills` — `skill_index()`
-//! 4. `## Coordinator workflow` + sub-agent usage note — only when
+//! 4. `## Sub-agents enabled` + sub-agent usage note — only when
 //!    `sub_agent_enabled` (the `Agent` tool is registered in parallel by
 //!    `multi::register_subagent_if_enabled`)
 
 use std::path::Path;
 
 use crate::config::prepend_project_context;
-use crate::multi::coordinator_system_prompt;
 use crate::skills::{skill_index, Skill};
 
 /// Owned, structured view of an assembled system prompt.
@@ -81,7 +80,7 @@ pub struct PromptSegments {
     pub system_prompt: String,
     /// `skill_index()` output (or `""` when no skills are loaded).
     pub skills: String,
-    /// `## Coordinator workflow` + sub-agent usage note (or `""` when
+    /// `## Sub-agents enabled` + sub-agent usage note (or `""` when
     /// `sub_agent_enabled` is false).
     pub subagents: String,
 }
@@ -120,14 +119,15 @@ pub fn assemble_system_prompt(
         system_prompt: base.to_string(),
         skills: skill_index(skills),
         subagents: if sub_agent_enabled {
-            format!(
-                "\n\n---\n\n## Coordinator workflow\n\n{}\n\n\
-                 When you need to do focused research or scan files without \
-                 polluting your main context, use the `sub_agent` tool. It spawns \
-                 a fresh agent with its own transcript and a restricted tool set \
-                 (read-only by default).",
-                coordinator_system_prompt()
-            )
+            // The full coordinator guidance (how/when to delegate, writing
+            // worker prompts, continuation, verification) lives on the `agent`
+            // tool's own description so it travels with the tool and doesn't
+            // bloat the base system prompt. Here we only plant a one-line
+            // pointer so the model knows delegation is available.
+            "\n\n---\n\n## Sub-agents enabled\n\n\
+             The `agent` tool is registered. See its description for how to \
+             delegate, continue, and verify worker output."
+                .to_string()
         } else {
             String::new()
         },
@@ -245,12 +245,15 @@ mod tests {
     fn subagent_suffix_appended_only_when_enabled() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let off = assemble_system_prompt("BASE", tmp.path(), &[], false).into_full();
-        assert!(!off.contains("Coordinator workflow"), "{off}");
-        assert!(!off.contains("sub_agent"), "{off}");
+        assert!(!off.contains("Sub-agents enabled"), "{off}");
+        assert!(
+            !off.contains("`agent` tool is registered"),
+            "sub-agent usage note must not appear when disabled: {off}"
+        );
 
         let on = assemble_system_prompt("BASE", tmp.path(), &[], true).into_full();
-        assert!(on.contains("## Coordinator workflow"), "{on}");
-        assert!(on.contains("`sub_agent` tool"), "{on}");
+        assert!(on.contains("## Sub-agents enabled"), "{on}");
+        assert!(on.contains("`agent` tool is registered"), "{on}");
     }
 
     #[test]
@@ -262,7 +265,7 @@ mod tests {
 
         let pc = out.find("# Project context").unwrap();
         let base = out.find("BASE").unwrap();
-        let coord = out.find("Coordinator workflow").unwrap();
+        let coord = out.find("Sub-agents enabled").unwrap();
         // Skill catalog is NOT in the static system prompt (ships as a
         // per-turn system-reminder), so it must be absent here.
         assert!(out.find("Available skills").is_none(), "{out}");
@@ -285,26 +288,24 @@ mod tests {
         std::fs::write(tmp.path().join("CLAUDE.md"), "CL").expect("write");
         let skills = vec![make_skill("xlsx", "Spreadsheets")];
 
-        // Reproduce the pre-goal-328 string the implementation used to
-        // return directly. The blocks are concatenated in the exact
-        // order documented in the module header:
+        // Reproduce the assembled string. The blocks are concatenated in the
+        // exact order documented in the module header:
         //   prepend_project_context(base, ws) +
         //   ("\n" + skill_index) when skills present +
-        //   ("\n\n---\n\n## Coordinator workflow\n\n" + coordinator_system_prompt()
-        //    + "\n\nWhen you need to do focused research …") when sub-agent enabled.
+        //   ("\n\n---\n\n## Sub-agents enabled\n\n...pointer...") when sub-agent enabled.
+        // Note: the full coordinator guidance lives on the `agent` tool
+        // description, NOT in the system prompt — so this segment is just a
+        // one-line pointer.
         let mut expected = crate::config::prepend_project_context("BASE", tmp.path());
         // Sanity: the catalog still ships via skill_reminder (not inlined).
         assert!(
             crate::skills::skill_reminder(&skills).contains("Available skills"),
             "skill_reminder must still produce the catalog"
         );
-        expected.push_str("\n\n---\n\n## Coordinator workflow\n\n");
-        expected.push_str(crate::multi::coordinator_system_prompt());
         expected.push_str(
-            "\n\nWhen you need to do focused research or scan files without \
-             polluting your main context, use the `sub_agent` tool. It spawns \
-             a fresh agent with its own transcript and a restricted tool set \
-             (read-only by default).",
+            "\n\n---\n\n## Sub-agents enabled\n\n\
+             The `agent` tool is registered. See its description for how to \
+             delegate, continue, and verify worker output.",
         );
 
         let assembled = assemble_system_prompt("BASE", tmp.path(), &skills, true).into_full();
@@ -355,7 +356,7 @@ mod tests {
             assembled
                 .segments
                 .subagents
-                .contains("Coordinator workflow"),
+                .contains("Sub-agents enabled"),
             "subagents segment must contain the coordinator workflow heading when enabled"
         );
 
@@ -393,7 +394,7 @@ mod tests {
             "full must NOT inline the skill catalog: {assembled}"
         );
         assert!(
-            assembled.full.contains("Coordinator workflow"),
+            assembled.full.contains("Sub-agents enabled"),
             "full must contain the sub-agent suffix after BASE"
         );
     }
@@ -449,12 +450,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let off = assemble_system_prompt("BASE", tmp.path(), &[], false);
         assert!(
-            !off.segments.subagents.contains("Coordinator workflow"),
+            !off.segments.subagents.contains("Sub-agents enabled"),
             "subagents segment must be empty when sub_agent_enabled=false"
         );
         let on = assemble_system_prompt("BASE", tmp.path(), &[], true);
         assert!(
-            on.segments.subagents.contains("Coordinator workflow"),
+            on.segments.subagents.contains("Sub-agents enabled"),
             "subagents segment must contain the coordinator workflow when enabled"
         );
     }

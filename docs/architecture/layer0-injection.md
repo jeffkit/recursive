@@ -36,17 +36,17 @@ to maximise prefix-cache hits.
 7. # Project context        ← AGENTS.md + CLAUDE.md at workspace root (≤ 16 KB each)
 8. # Available skills       ← skill_index() string
 9. ## Coordinator workflow  ← coordinator_system_prompt(), only when sub-agent enabled
-   + sub_agent usage note
+   + `agent` tool usage note
 ```
 
 `assemble_system_prompt(base, workspace, skills, sub_agent_enabled)` lays down
 7–9 on top of `base`. Project context is prepended (via
 `prepend_project_context`) so a user-supplied `--system-prompt` / HTTP
 `system_prompt` still gets the project context in front of it. The
-coordinator workflow + `sub_agent` note (9) appear only when
+coordinator workflow + `agent` tool note (9) appear only when
 `config.subagent_enabled` is true, in lockstep with the `Agent` tool
 registered by `multi::register_subagent_if_enabled` (also called by every
-channel) — so the prompt never advertises `sub_agent` to a surface that
+channel) — so the prompt never advertises the `agent` tool to a surface that
 lacks the tool.
 
 CLI `run` additionally appends goal-matched skill *bodies* after assembly
