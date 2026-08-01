@@ -1,7 +1,7 @@
 ---
 type: Skill
 name: self-improve-supervise
-description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Polling-driven (ZCode has no event-driven loop — unlike recursive's own loop-supervise/recursive-loop skills, which assume run_background/watch_file/schedule_wakeup)."
+description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Polling-driven (ZCode has no event-driven loop — unlike recursive's own loop-supervise/recursive-loop skills, which assume run_background/watch_file/schedule_wakeup)."
 mode: trigger
 triggers: self-improve, self improve, 自改, 跑一个goal, 跑一个 goal, 带跑, supervisor, 督战
 ---
@@ -70,20 +70,36 @@ SOP text that calls for them.
 
 ## SOP
 
-### 0. Decide placement & read the contract (before writing the goal)
+### 0a. Resolve the recursive root (`$RR`) — do this first, every session
 
-- This is a **sub-repo** change. All git operations target the `recursive`
-  sub-repo (`git -C recursive ...`), never the infra4agent monorepo root.
-- Read `<recursive>/AGENTS.md` + `<recursive>/.dev/AGENTS.md` for source
-  invariants (the kernel must stay small; no `unwrap()`; finish reasons are
-  data; etc.). A goal that violates an invariant will burn fix-rounds.
+This skill works whether ZCode's cwd is the **infra4agent monorepo root**
+(recursive lives under `recursive/`) or the **recursive repo itself** (`.`).
+Resolve `$RR` once and use it in every later command — never hardcode
+`recursive/` or `cd recursive`:
+
+```bash
+if   [ -f .dev/flows/self-improve.flow.js ];        then RR=.          # cwd IS recursive
+elif [ -f recursive/.dev/flows/self-improve.flow.js ]; then RR=recursive # cwd is monorepo root
+else echo "ERROR: run from the monorepo root or the recursive repo" >&2; exit 1; fi
+echo "recursive root -> $RR"
+```
+
+From here on, `$RR` is the recursive repo root: `$RR/.dev/...`,
+`$RR/.flowcast/...`, `git -C "$RR" ...`, `(cd "$RR" && .dev/scripts/...)`.
+All git targets the `recursive` sub-repo, never the infra4agent monorepo root.
+
+### 0b. Read the contract (before writing the goal)
+
+- Read `$RR/AGENTS.md` + `$RR/.dev/AGENTS.md` for source invariants (the
+  kernel must stay small; no `unwrap()`; finish reasons are data; etc.). A
+  goal that violates an invariant will burn fix-rounds.
 - Skim `mona.yaml` / `docs/ARCHITECTURE.md` at the monorepo root only if the
   goal crosses sub-repos (it usually shouldn't for a recursive self-improve).
 
 ### 1. Write the goal file
 
-- Next number = `max(ls .dev/goals/ | grep -oE '^[0-9]+') + 1`. Mirror the
-  format of a recent same-flavour goal (TUI goals look different from
+- Next number = `max(ls "$RR/.dev/goals/" | grep -oE '^[0-9]+') + 1`. Mirror
+  the format of a recent same-flavour goal (TUI goals look different from
   provider/tool goals — read one neighbour, e.g. `349-*` for TUI).
 - A good goal has: **Why** (root cause with file:line), **Scope** (do exactly
   this, no more — numbered steps with code), **Files NOT to touch**, **Tests**
@@ -97,18 +113,18 @@ SOP text that calls for them.
 ### 2. Commit the goal (clean tree is mandatory)
 
 ```bash
-git -C recursive add .dev/goals/NN-*.md
-git -C recursive commit -m "dev: add goal NN — <one line>"
+git -C "$RR" add .dev/goals/NN-*.md
+git -C "$RR" commit -m "dev: add goal NN — <one line>"
 ```
 
 `launch-flow.sh` **refuses to start if the worktree is dirty**
 (`withSelfModGuard`). The goal file must be committed first. Verify:
-`git -C recursive status --porcelain | wc -l` → must be `0`.
+`git -C "$RR" status --porcelain | wc -l` → must be `0`.
 
 ### 3. Launch (and capture the run-id)
 
 ```bash
-cd recursive
+cd "$RR"
 .dev/scripts/launch-flow.sh \
   --goal-file .dev/goals/NN-*.md \
   --provider deepseek \
@@ -167,11 +183,11 @@ applies.
 ### 5. Intervene only when it can't self-heal
 
 - **Crash** (process gone, no verdict) → read log tail, diagnose, apply the
-  **minimal** fix (PATH, dep, config), then **resume** with the same run-id:
-  `launch-flow.sh --run-id <id> --goal-file <path> --provider ...`. Note: a
-  resume **still requires `--goal-file`/`--goal`** — the run-id alone errors
-  `缺少 --goal 或 --goal-file`. (The run-id reuses the run *dir* for outputs;
-  it does not restore the goal text.)
+  **minimal** fix (PATH, dep, config), then **resume** from within `$RR`:
+  `.dev/scripts/launch-flow.sh --run-id <id> --goal-file <path> --provider ...`.
+  Note: a resume **still requires `--goal-file`/`--goal`** — the run-id alone
+  errors `缺少 --goal 或 --goal-file`. (The run-id reuses the run *dir* for
+  outputs; it does not restore the goal text.)
 - **Transient gate red that the agent is already fixing** (e.g. e2e
   `SESSION_EXISTS`) → **do nothing**. The resume-fix loop handles it. Only
   step in if `MAX_FIX_ROUNDS` is exhausted and it goes `failed-preserved`.
@@ -189,11 +205,13 @@ applies.
 ### 6. Reach verdict, verify, clean up
 
 When `status: completed`:
-- Read `report.md` for `verdict`. If `committed`, confirm it actually landed:
-  `git -C recursive merge-base --is-ancestor <commit> main && echo ON_MAIN`.
+- Read `$RR/.flowcast/runs/<run-id>/report.md` for `verdict`. If `committed`,
+  confirm it actually landed:
+  `git -C "$RR" merge-base --is-ancestor <commit> main && echo ON_MAIN`.
 - Verify the product independently: run the relevant test subset yourself
-  (e.g. `cargo test -p recursive-tui`), don't just trust the green gate.
-- Clean up: `git -C recursive worktree remove .worktrees/<run-id> --force`
+  (e.g. `cargo test --manifest-path "$RR/Cargo.toml" -p recursive-tui`), don't
+  just trust the green gate.
+- Clean up: `git -C "$RR" worktree remove .worktrees/<run-id> --force`
   (the flow usually does this, but confirm), `tmux kill-session` for any
   leftover, remove `/tmp` scratch files.
 - If you left any diagnostic commits on main, `git revert` them (don't reset —
@@ -221,22 +239,27 @@ When `status: completed`:
 ## Quick reference
 
 ```bash
-# launch
-cd recursive && .dev/scripts/launch-flow.sh --goal-file .dev/goals/NN-*.md --provider deepseek --hitl wecom
+# resolve recursive root first (RR=. if cwd IS recursive, RR=recursive if cwd is monorepo root)
+if   [ -f .dev/flows/self-improve.flow.js ];        then RR=.;
+elif [ -f recursive/.dev/flows/self-improve.flow.js ]; then RR=recursive; fi
+export RR
 
-# one tick (sleep + probe)
-sleep 180 && python3 -c "import json;d=json.load(open('.flowcast/runs/<RID>/state.json'));print(d['status'],d.get('currentStep'),d.get('verdict','-'),d.get('failedStep','-'));print([s['key'] for s in d['steps'] if s['status']=='done'])"
+# launch
+(cd "$RR" && .dev/scripts/launch-flow.sh --goal-file .dev/goals/NN-*.md --provider deepseek --hitl wecom)
+
+# one tick (sleep + probe) — paths under $RR
+sleep 180 && python3 -c "import json;d=json.load(open('$RR/.flowcast/runs/<RID>/state.json'));print(d['status'],d.get('currentStep'),d.get('verdict','-'),d.get('failedStep','-'));print([s['key'] for s in d['steps'] if s['status']=='done'])"
 
 # liveness
 tmux ls | grep recursive-flow; pgrep -fl self-improve.flow.js
 
-# resume after crash/intervention (goal-file REQUIRED)
-.dev/scripts/launch-flow.sh --run-id <RID> --goal-file .dev/goals/NN-*.md --provider deepseek --hitl wecom
+# resume after crash/intervention (goal-file REQUIRED) — run from within $RR
+(cd "$RR" && .dev/scripts/launch-flow.sh --run-id <RID> --goal-file .dev/goals/NN-*.md --provider deepseek --hitl wecom)
 
 # verify landing
-git -C recursive merge-base --is-ancestor <COMMIT> main && echo ON_MAIN
-cargo test -p recursive-tui   # or the relevant crate
+git -C "$RR" merge-base --is-ancestor <COMMIT> main && echo ON_MAIN
+cargo test --manifest-path "$RR/Cargo.toml" -p recursive-tui   # or the relevant crate
 
 # list historical runs
-node .dev/flows/self-improve.flow.js --list
+node "$RR/.dev/flows/self-improve.flow.js" --list
 ```
