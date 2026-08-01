@@ -71,7 +71,7 @@ pub struct AgentDefinition {
     pub allowed_tools: Vec<String>,
 }
 
-/// Used internally for the top-level YAML parsing so `serde_yml` can
+/// Used internally for the top-level YAML parsing so `serde_yaml_ng` can
 /// give us a flat `AgentDefinition` without requiring a nested key.
 #[derive(Debug, Clone, Deserialize)]
 struct AgentDefinitionRaw {
@@ -196,7 +196,7 @@ impl AgentDefinitions {
 
         let frontmatter = Self::extract_frontmatter(&raw, path)?;
         let def: AgentDefinitionRaw =
-            serde_yml::from_str(&frontmatter).map_err(|e| Error::Config {
+            serde_yaml_ng::from_str(&frontmatter).map_err(|e| Error::Config {
                 message: format!("Invalid YAML frontmatter in {}: {e}", path.display()),
             })?;
 
@@ -281,7 +281,7 @@ mod tests {
             "# Doc\n",
         );
         let front = AgentDefinitions::extract_frontmatter(raw, Path::new("test.md")).unwrap();
-        let def: AgentDefinitionRaw = serde_yml::from_str(&front).unwrap();
+        let def: AgentDefinitionRaw = serde_yaml_ng::from_str(&front).unwrap();
         assert_eq!(def.name, "reviewer");
         assert_eq!(def.system_prompt, "Line one.\nLine two.\n");
         assert_eq!(def.allowed_tools, vec!["Read", "Grep"]);
@@ -344,6 +344,35 @@ mod tests {
         assert!(msg.contains("no YAML frontmatter"), "got: {msg}");
     }
 
+    #[test]
+    fn parse_file_invalid_yaml_is_config_error() {
+        // Delimiters are well-formed, but the YAML body itself is invalid.
+        // This exercises the changed `serde_yaml_ng::from_str` error path in
+        // `parse_file` (the `map_err` wrapping into `Error::Config`).
+        let tmp = tempfile::tempdir().unwrap();
+        let md = tmp.path().join("bad.yaml.md");
+        std::fs::write(
+            &md,
+            "---\nname: helper\nsystem_prompt: [unclosed flow\n---\n",
+        )
+        .unwrap();
+
+        let err = AgentDefinitions::parse_file(&md).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Invalid YAML frontmatter"),
+            "expected wrapped config error, got: {msg}"
+        );
+        assert!(
+            msg.contains("bad.yaml.md"),
+            "error should name the offending file, got: {msg}"
+        );
+        match err {
+            Error::Config { .. } => {}
+            other => panic!("expected Error::Config, got: {other:?}"),
+        }
+    }
+
     // ------------------------------------------------------------------
     // load (directory walking)
     // ------------------------------------------------------------------
@@ -375,6 +404,32 @@ mod tests {
         let defs = AgentDefinitions::load(tmp.path()).unwrap();
         assert_eq!(defs.len(), 1);
         assert!(defs.get("helper").is_some());
+    }
+
+    #[test]
+    fn load_registry_reports_non_empty_and_iter_yields_definitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".recursive").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        std::fs::write(
+            agents_dir.join("helper.md"),
+            "---\nname: helper\nsystem_prompt: 'You help.'\n---\n",
+        )
+        .unwrap();
+
+        let defs = AgentDefinitions::load(tmp.path()).unwrap();
+        // Pins `is_empty()` returning false for a non-empty registry
+        // and `iter()` actually yielding the loaded definitions.
+        assert!(
+            !defs.is_empty(),
+            "registry with one agent must not be empty"
+        );
+        assert_eq!(defs.len(), 1);
+        let names: Vec<&String> = defs.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["helper"]);
+        let prompts: Vec<&String> = defs.iter().map(|(_, def)| &def.system_prompt).collect();
+        assert_eq!(prompts, vec!["You help."]);
     }
 
     #[test]
