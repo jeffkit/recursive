@@ -180,6 +180,15 @@ impl Tool for RunShell {
                 // the error path returns. `start_kill` is non-blocking
                 // and tolerant of the child having already exited.
                 let _ = child.start_kill();
+                let _ = child.wait().await;
+                // Drain the reader tasks before returning. They block on
+                // the stdout/stderr pipes until the kill closes them;
+                // awaiting them here prevents their JoinHandles from
+                // detaching with output still buffered. Order matters:
+                // kill (and reap) BEFORE awaiting the readers, or the
+                // pipes never close and the drain deadlocks.
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 return Err(Error::Tool {
                     name: "Bash".into(),
                     call_id: None,
@@ -357,6 +366,39 @@ mod tests {
             dead,
             "timed-out child PID {pid} still alive after 5s — orphan"
         );
+    }
+
+    // The timeout arm must kill the child and then AWAIT both reader
+    // tasks before returning, so their JoinHandles don't detach with
+    // buffered output. The observable contract: `execute` returns `Err`
+    // promptly — it must NOT hang until the child's sleep would have
+    // finished. `exec` makes the shell PID *become* the sleeper, so the
+    // kill closes the pipes and the drain completes immediately (a plain
+    // `sleep 30` would leave an orphaned descendant holding the pipes
+    // and the drain would block for the full sleep — a known limitation
+    // of best-effort cleanup on this path). If the drain were ordered
+    // before the kill (deadlock) or the kill were dropped (readers never
+    // see EOF), this test would hang for the full 30s.
+    #[tokio::test]
+    async fn shell_timeout_drains_reader_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let tool = RunShell::new(tmp.path()).with_timeout(Duration::from_millis(200));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.execute(json!({"command": "exec sleep 30"})),
+        )
+        .await;
+        let err = match result {
+            Ok(r) => r.expect_err("expected the timed-out command to fail"),
+            Err(_) => panic!("execute did not return within 5s — reader tasks not drained"),
+        };
+        match err {
+            Error::Tool { message, .. } => assert!(
+                message.contains("timed out"),
+                "expected a timeout error, got: {message}"
+            ),
+            other => panic!("expected Tool timeout error, got: {other}"),
+        }
     }
 
     #[tokio::test]

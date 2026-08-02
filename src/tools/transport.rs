@@ -228,6 +228,17 @@ impl SshTransport {
         let status = match tokio::time::timeout(self.command_timeout, wait).await {
             Ok(s) => s?,
             Err(_) => {
+                // Kill the child so the SSH connection drops and the reader
+                // tasks unblock (the remote command's pipes close when the
+                // ssh client dies); then drain them so their JoinHandles
+                // don't detach with buffered output. Order matters: the
+                // readers block on the pipes until the child is dead, so
+                // kill/wait BEFORE awaiting them. Best-effort cleanup on
+                // the error path — swallow secondary failures from it.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("SSH command timed out after {:?}", self.command_timeout),
@@ -393,6 +404,14 @@ impl ToolTransport for SshTransport {
         let status = match tokio::time::timeout(timeout, wait).await {
             Ok(s) => s?,
             Err(_) => {
+                // Same kill-then-drain cleanup as `ssh_exec`: the ssh
+                // client must die before the reader tasks can unblock,
+                // and awaiting them here prevents their JoinHandles from
+                // detaching with buffered output.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("SSH command timed out after {:?}", timeout),
@@ -676,6 +695,17 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
+
+    // TODO(goal-360): the SSH timeout arms in `ssh_exec` and `exec_shell`
+    // now kill the child and drain both reader tasks before returning,
+    // but that behavior can't be exercised end-to-end here without an SSH
+    // server in the test environment — spawning `ssh user@host` against a
+    // missing server fails fast with connection refused and never reaches
+    // the timeout branch. The kill-then-drain contract is pinned by
+    // `shell_timeout_drains_reader_tasks` in shell.rs (same spawn → two
+    // reader tasks → timeout(child.wait()) structure) and is
+    // grep-verifiable in this file: the timeout `Err(_)` arms contain
+    // `start_kill` and `stdout_task.await`.
 
     #[tokio::test]
     async fn local_transport_create_dir_all() {
