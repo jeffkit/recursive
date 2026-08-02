@@ -41,7 +41,7 @@ mkdir -p "$LOGS_DIR"
 # 启动，这些未提交的 goal 草稿不影响 flow 正确性（agent 在 worktree 沙箱里跑，
 # 不会动主 checkout 的 .dev/goals/）。已跟踪文件的修改（ M）和其他 untracked 仍拦。
 DIRTY=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null \
-  | grep -v '^?? .dev/goals/' \
+  | { grep -v '^?? .dev/goals/' || true; } \
   | wc -l | tr -d ' ')
 if [ "$DIRTY" != "0" ]; then
   echo "[launch-flow] ❌ 工作树不干净（$DIRTY 个未提交文件），withSelfModGuard 会拒绝启动。"
