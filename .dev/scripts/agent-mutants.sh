@@ -71,6 +71,9 @@ MUTATED_FILES=()
 
 cleanup_mutants() {
   local rc=$?
+  # NOTE: `$?` here is captured as the FIRST statement so a syntax-error / unexpected
+  # exit is faithfully re-emitted, not masked by the trap's own success.
+  # (mutants-gate-false-green bug: sh + <(...)-syntax-error produced exit 0.)
   if [[ ${#MUTATED_FILES[@]} -gt 0 ]]; then
     local dirty=()
     for f in "${MUTATED_FILES[@]}"; do
@@ -84,7 +87,7 @@ cleanup_mutants() {
       git checkout -- "${dirty[@]}" 2>/dev/null || true
     fi
   fi
-  exit $rc
+  exit "$rc"
 }
 trap cleanup_mutants EXIT
 
@@ -139,7 +142,12 @@ elif [[ "${1:-}" == "--list-files" ]]; then
   exit 0
 elif [[ "${1:-}" == "--all" ]]; then
   echo "Mutating the whole $CRATE crate (this can take a long time)…" >&2
-  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "src" -name '*.rs')
+  # Temp file instead of `< <(...)` (bash-only) — works under sh too.
+  # (mutants-gate bug: <(...)-syntax-error under sh silently exited 0.)
+  _tmp=$(mktemp)
+  find "src" -name '*.rs' > "$_tmp"
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < "$_tmp"
+  rm -f "$_tmp"
   assert_clean "${MUTATED_FILES[@]}"
   run_mutants --no-shuffle
   exit 0
@@ -147,7 +155,10 @@ elif [[ "${1:-}" == "--dir" ]]; then
   shift
   DIR="${1:?--dir requires a path}"
   echo "Mutating directory: $DIR" >&2
-  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "$DIR" -name '*.rs')
+  _tmp=$(mktemp)
+  find "$DIR" -name '*.rs' > "$_tmp"
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < "$_tmp"
+  rm -f "$_tmp"
   assert_clean "${MUTATED_FILES[@]}"
   run_mutants --no-shuffle --dir "$DIR"
   exit 0

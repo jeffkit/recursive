@@ -87,6 +87,13 @@ cd "$ROOT"
 # checkout` any that still carry it.
 MUTATED_FILES=()
 
+# Saved exit status. On a clean normal exit this is set by the last command
+# before the script ends; on a syntax error / unexpected exit, the EXIT trap
+# fires with `$?` reflecting the *trap function's own* success (0), NOT the
+# error that triggered it — which would mask real failures as `passed: true`.
+# Guard: capture `$?` as the FIRST statement in the trap, before any other
+# command can clobber it, and re-emit it faithfully. (mutants-gate-false-green
+# bug: sh-syntax-error + `exit $rc` reported exit 0.)
 cleanup_mutants() {
   local rc=$?
   if [[ ${#MUTATED_FILES[@]} -gt 0 ]]; then
@@ -102,7 +109,7 @@ cleanup_mutants() {
       git checkout -- "${dirty[@]}" 2>/dev/null || true
     fi
   fi
-  exit $rc
+  exit "$rc"
 }
 trap cleanup_mutants EXIT
 
@@ -162,7 +169,13 @@ elif [[ "${1:-}" == "--list-files" ]]; then
   exit 0
 elif [[ "${1:-}" == "--all" ]]; then
   echo "Mutating the whole $CRATE crate (this can take a while)…" >&2
-  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "crates/$CRATE/src" -name '*.rs')
+  # Collect into a temp file then read back into the array — this works under
+  # both bash and sh, unlike `< <(...)` process substitution (bash-only, which
+  # caused the mutants gate to silently fail under `sh`). (mutants-gate bug)
+  _tmp=$(mktemp)
+  find "crates/$CRATE/src" -name '*.rs' > "$_tmp"
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < "$_tmp"
+  rm -f "$_tmp"
   assert_clean "${MUTATED_FILES[@]}"
   run_mutants --no-shuffle
   exit 0
@@ -170,7 +183,10 @@ elif [[ "${1:-}" == "--dir" ]]; then
   shift
   DIR="${1:?--dir requires a path}"
   echo "Mutating directory: $DIR" >&2
-  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < <(find "$DIR" -name '*.rs')
+  _tmp=$(mktemp)
+  find "$DIR" -name '*.rs' > "$_tmp"
+  while IFS= read -r f; do MUTATED_FILES+=("$f"); done < "$_tmp"
+  rm -f "$_tmp"
   assert_clean "${MUTATED_FILES[@]}"
   run_mutants --no-shuffle --dir "$DIR"
   exit 0
