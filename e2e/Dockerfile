@@ -6,14 +6,18 @@
 # dir and compiles only the 3 workspace crates, so a src/ change costs
 # ~2-3 min instead of a full ~10 min rebuild.
 
-# ── Stage 1: planner — generate the dependency recipe (no source needed) ──
+# ── Stage 1: planner — generate the dependency recipe (NO source needed) ──
+# cargo chef prepare only reads manifests (Cargo.toml/Cargo.lock/.cargo/) — it
+# does NOT need src/. Omitting `COPY src` keeps this layer CACHED across src/
+# changes, so the downstream cooker layer (which COPYs recipe.json) also stays
+# CACHED. This is what makes worktree builds fast: the planner+cooker chain is
+# identical for any worktree of the same manifests.
 FROM rust:1.88-slim AS planner
 WORKDIR /app
 RUN cargo install cargo-chef --locked 2>&1 | tail -1
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY crates crates
-COPY src src
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 2: cooker — compile dependencies from the recipe (cached layer) ──
