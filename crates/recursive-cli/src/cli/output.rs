@@ -114,13 +114,54 @@ pub(crate) fn save_session(
 /// `Cancelled` is intentionally **not** an error: shutdown via SIGINT
 /// or SIGTERM is user-initiated, the saved transcript is intact, and
 /// the self-improve flow must NOT auto-resume something the user explicitly
-/// stopped. The fall-through `_ => Ok(())` covers it.
+/// stopped.
+///
+/// Every non-success, non-cancel finish reason is an error (exit 1) so a
+/// supervising script can distinguish "agent finished normally" from "agent
+/// got stuck / hit the wall-clock deadline / provider crashed".
 pub(crate) fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Result<()> {
     match finish {
+        // True success — model produced a final response without tool calls.
+        FinishReason::NoMoreToolCalls => Ok(()),
+        // User-initiated shutdown (SIGINT/SIGTERM); must not auto-resume.
+        FinishReason::Cancelled => Ok(()),
         FinishReason::BudgetExceeded => {
             anyhow::bail!("agent exceeded step budget ({steps})")
         }
-        _ => Ok(()),
+        FinishReason::WallClockExceeded { secs } => {
+            anyhow::bail!("agent exceeded wall-clock timeout ({secs}s)")
+        }
+        FinishReason::Stuck {
+            repeated_call,
+            repeats,
+        } => {
+            anyhow::bail!("agent stuck: repeated tool call '{repeated_call}' ({repeats}x)")
+        }
+        FinishReason::TranscriptLimit { chars, limit } => {
+            anyhow::bail!(
+                "transcript size {chars} exceeded hard limit {limit} and could not be reduced"
+            )
+        }
+        FinishReason::PermissionDenialLimit => {
+            anyhow::bail!("agent hit permission denial limit (loop of denied tool calls)")
+        }
+        FinishReason::ProviderStop(reason) => {
+            // `run_core` only constructs `ProviderStop` for reasons other than
+            // the normal stop signals ("stop"/"end_turn" map to
+            // `NoMoreToolCalls`); treat those plus a bare empty reason as
+            // success, and everything else (e.g. "rate_limited", "404",
+            // "context_length_exceeded") as a failure.
+            if reason == "stop" || reason == "end_turn" || reason.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!("provider stopped: {reason}")
+            }
+        }
+        // `FinishReason` is `#[non_exhaustive]`, so a wildcard arm is required
+        // from this crate. Treat unknown future variants conservatively as
+        // errors — a supervisor must never mistake an unrecognised terminal
+        // state for success.
+        _ => anyhow::bail!("agent finished with unknown reason: {finish}"),
     }
 }
 
@@ -444,5 +485,98 @@ mod tests {
             finish_to_session_status(&FinishReason::ProviderStop("boom".into())),
             SessionStatus::Crashed
         );
+    }
+
+    // --- exit_for_finish: the CLI exit-code contract ---
+
+    #[test]
+    fn exit_for_finish_success_returns_ok() {
+        assert!(exit_for_finish(&FinishReason::NoMoreToolCalls, 7).is_ok());
+    }
+
+    #[test]
+    fn exit_for_finish_cancelled_returns_ok() {
+        // Pins the intentional semantics: user-initiated shutdown must NOT
+        // propagate as a non-zero exit (which would trigger auto-resume).
+        assert!(exit_for_finish(&FinishReason::Cancelled, 3).is_ok());
+    }
+
+    #[test]
+    fn exit_for_finish_budget_exceeded_errors() {
+        let err = exit_for_finish(&FinishReason::BudgetExceeded, 42).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("step budget"), "unexpected: {msg}");
+        assert!(msg.contains("42"), "missing step count: {msg}");
+    }
+
+    #[test]
+    fn exit_for_finish_stuck_errors() {
+        let err = exit_for_finish(
+            &FinishReason::Stuck {
+                repeated_call: "Read".into(),
+                repeats: 3,
+            },
+            9,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stuck"), "unexpected: {msg}");
+        assert!(msg.contains("Read"), "missing tool name: {msg}");
+        assert!(msg.contains("3"), "missing repeat count: {msg}");
+    }
+
+    #[test]
+    fn exit_for_finish_wallclock_errors() {
+        let err = exit_for_finish(&FinishReason::WallClockExceeded { secs: 600 }, 5).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wall-clock"), "unexpected: {msg}");
+        assert!(msg.contains("600"), "missing timeout: {msg}");
+    }
+
+    #[test]
+    fn exit_for_finish_transcript_limit_errors() {
+        let err = exit_for_finish(
+            &FinishReason::TranscriptLimit {
+                chars: 100_000,
+                limit: 80_000,
+            },
+            4,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("transcript"), "unexpected: {msg}");
+        assert!(msg.contains("100000"), "missing size: {msg}");
+        assert!(msg.contains("80000"), "missing limit: {msg}");
+    }
+
+    #[test]
+    fn exit_for_finish_permission_denial_limit_errors() {
+        let err = exit_for_finish(&FinishReason::PermissionDenialLimit, 6).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("permission"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn exit_for_finish_provider_stop_stop_is_ok() {
+        assert!(exit_for_finish(&FinishReason::ProviderStop("stop".into()), 8).is_ok());
+    }
+
+    #[test]
+    fn exit_for_finish_provider_stop_end_turn_is_ok() {
+        assert!(exit_for_finish(&FinishReason::ProviderStop("end_turn".into()), 8).is_ok());
+    }
+
+    #[test]
+    fn exit_for_finish_provider_stop_empty_is_ok() {
+        assert!(exit_for_finish(&FinishReason::ProviderStop(String::new()), 8).is_ok());
+    }
+
+    #[test]
+    fn exit_for_finish_provider_stop_error_fails() {
+        let err =
+            exit_for_finish(&FinishReason::ProviderStop("rate_limited".into()), 2).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("provider stopped"), "unexpected: {msg}");
+        assert!(msg.contains("rate_limited"), "missing reason: {msg}");
     }
 }

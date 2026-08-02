@@ -2029,7 +2029,7 @@ async fn run_loop(
     );
 
     if let Some(last) = outcomes.last() {
-        let _ = cli::output::exit_for_finish(&last.finish_reason, last.steps);
+        return cli::output::exit_for_finish(&last.finish_reason, last.steps);
     }
 
     Ok(())
