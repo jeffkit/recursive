@@ -102,8 +102,14 @@ agui-protocol = { version = "0.1", path = "crates/agui-protocol", optional = tru
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 deadpool-redis = { version = "0.18", optional = true }
 uuid = { version = "1", features = ["v4", "v7"] }
-aws-sdk-s3 = { version = "1", optional = true }
-aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+# AWS SDK TLS: pin the modern rustls (aws-lc) connector and drop the legacy
+# hyper 0.14 / h2 0.3 / rustls 0.21 cluster from Cargo.lock. Note the trap:
+# aws-sdk-s3's `rustls` feature maps to aws-smithy-runtime/tls-rustls (the
+# LEGACY line), so we take default-features = false and re-enable every default
+# except `rustls`. aws-config's `rustls` feature is the modern line (maps to
+# default-https-client), so it is enabled alongside the defaults.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"], optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest", "rustls"], optional = true }
 bollard = { version = "0.18", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 chrono = { version = "0.4", features = ["serde"] }

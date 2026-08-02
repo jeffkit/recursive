@@ -55,3 +55,53 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --verbose
+
+  supply-chain:
+    name: supply-chain (cargo audit + machete)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # cargo install compiles from source (~1-2 min each); cache the binaries
+      # so repeat runs skip the compile. Mirrors the test job's actions/cache
+      # pattern (same action, different path — the cargo bin dir).
+      - name: Cache cargo-audit / cargo-machete binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-machete
+          key: ${{ runner.os }}-cargo-tools-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tools-
+
+      # RUSTFLAGS="-D warnings" is set workflow-wide for the product build; the
+      # installed tools aren't part of this workspace, so don't let their build
+      # warnings fail the install steps.
+      - name: Install cargo-audit
+        env:
+          RUSTFLAGS: ""
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: Install cargo-machete
+        env:
+          RUSTFLAGS: ""
+        run: |
+          if ! command -v cargo-machete >/dev/null 2>&1; then
+            cargo install cargo-machete --locked
+          fi
+
+      # Fails on any RUSTSEC advisory (default cargo audit behaviour).
+      - name: cargo audit (RUSTSEC advisories)
+        run: cargo audit
+
+      # Fails when unused dependencies are found (workspace is currently clean).
+      - name: cargo machete (unused dependencies)
+        run: cargo machete
