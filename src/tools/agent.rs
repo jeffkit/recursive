@@ -507,6 +507,15 @@ impl AgentTool {
 
         // Spawn the long-lived worker task.
         let state_for_task = state.clone();
+        // Clone the table + key so the task can deregister itself on EVERY
+        // exit path (failure return, channel-close completion). Without this
+        // the WorkerHandle — with its mpsc sender — lingers in the
+        // process-wide WorkerTable for the rest of the process: a slow memory
+        // + channel-buffer leak for long-running coordinator/HTTP/TUI
+        // processes (goal-370). A panicked task is NOT covered here (the
+        // panic unwinds past these lines); the two normal exits are.
+        let workers = self.workers.clone();
+        let worker_key = worker_id.to_string();
         let join_handle = tokio::spawn(async move {
             // Drain the channel: each message is a new turn on the same runtime.
             while let Some(msg) = rx.recv().await {
@@ -524,6 +533,7 @@ impl AgentTool {
                         state_for_task
                             .mark_failed(format!("worker turn failed: {e}"))
                             .await;
+                        let _ = workers.write().await.remove(&worker_key);
                         return;
                     }
                 }
@@ -532,6 +542,7 @@ impl AgentTool {
             state_for_task
                 .mark_completed("worker finished".to_string())
                 .await;
+            let _ = workers.write().await.remove(&worker_key);
         });
 
         // Attach the JoinHandle so `task_stop` can truly abort this task.
@@ -1461,5 +1472,82 @@ allowed_tools:
         let joined = task.output_snapshot().await.join("\n");
         assert!(joined.contains("turn one"), "missing turn one: {joined}");
         assert!(joined.contains("turn two"), "missing turn two: {joined}");
+    }
+
+    #[tokio::test]
+    async fn background_worker_deregisters_from_worker_table_on_exit() {
+        // goal-370: a background worker whose turn fails must remove its
+        // WorkerHandle (and its mpsc sender) from the process-wide
+        // WorkerTable when the task exits. Previously the mark_failed
+        // early-return path left the entry in the table forever — a slow
+        // memory + channel-buffer leak for long-running coordinator / HTTP /
+        // TUI processes. (This test exercises the failure exit path; the
+        // channel-close mark_completed path shares the same removal line.
+        // A *panicked* task is not covered — its cleanup is out of scope.)
+        let provider: Arc<dyn ChatProvider> =
+            Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
+                provider: "mock".into(),
+                message: "injected failure for deregistration test".into(),
+            }]));
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let task_registry = Arc::new(TaskRegistry::new());
+        let worker_table: WorkerTable = Arc::new(RwLock::new(HashMap::new()));
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_task_registry(task_registry.clone())
+            .with_workers(worker_table.clone());
+
+        // Spawn the worker in the background.
+        let spawn_result = agent
+            .execute(json!({
+                "mode": "single",
+                "background": true,
+                "manifest": {
+                    "w1": { "system_prompt": "You are a helper." }
+                },
+                "prompt": "do the thing"
+            }))
+            .await
+            .unwrap();
+        let task_id = spawn_result
+            .split("task '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("task id in spawn result")
+            .to_string();
+
+        // While the worker is alive its entry must be present.
+        assert!(
+            worker_table.read().await.contains_key("w1"),
+            "entry should exist while the worker is alive"
+        );
+
+        // The injected provider error makes the first turn fail, so the
+        // worker task takes the mark_failed early-return path and exits.
+        // Wait (bounded) for the entry to disappear — the property under
+        // test. On the old code this loop would time out because the entry
+        // was never removed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !worker_table.read().await.contains_key("w1") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("worker table entry for 'w1' was not removed after the worker exited");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Confirm the task actually failed (mark_failed path, not some other
+        // exit), so the removal above is attributable to the fix.
+        let task = task_registry
+            .get(&TaskId(task_id))
+            .await
+            .expect("task still registered");
+        let status = task.status().await;
+        assert!(
+            matches!(status, crate::tasks::TaskStatus::Failed),
+            "worker task should have failed, was {status:?}"
+        );
     }
 }
