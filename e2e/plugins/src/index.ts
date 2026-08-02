@@ -32,6 +32,15 @@ const plugin: PluginModule = {
     const realApiBase = rawBase.replace(/\/v1\/?$/, '');
     const apiKey = process.env['DEEPSEEK_API_KEY'] ?? '';
 
+    // Namespace-prefix the aimock container name so concurrent worktrees
+    // don't collide on `--name aimock` (which would cause them to rm -f each
+    // other's container). The bare `aimock` name stays resolvable via
+    // --network-alias, so RECURSIVE_API_BASE=http://aimock:4010 still works.
+    const worktreeId = process.env['WORKTREE_ID'];
+    const projectSlug = 'recursive-agent';
+    const namespace = worktreeId ?? projectSlug;
+    const aimockContainerName = `${namespace}-aimock`;
+
     // Auto-start aimock container, joining the correct Docker network.
     // If aimock is already running but on a different network (e.g. a stale
     // container from a previous worktree run), remove it and restart on the
@@ -49,8 +58,6 @@ const plugin: PluginModule = {
     // exactly like on the CLI path.
     try {
       const allNetworks = execSync('docker network ls --format "{{.Name}}"', { encoding: 'utf-8' }).trim().split('\n');
-      const worktreeId = process.env['WORKTREE_ID'];
-      const projectSlug = 'recursive-agent';
       const candidateNetworks = [
         worktreeId ? `argusai-${worktreeId}-network` : null,
         `argusai-${projectSlug}-network`,
@@ -74,31 +81,29 @@ const plugin: PluginModule = {
           console.log(`[recursive-agent] network ${targetNetwork} already exists`);
         }
       }
-      const networkFlag = `--network ${targetNetwork}`;
+      const networkFlag = `--network ${targetNetwork} --network-alias aimock`;
 
       // Desired aimock mode: record only when E2E_RECORD=1 AND a real key is
       // present (otherwise record mode would proxy with no key and 401).
       const wantRecord = recordMode && !!apiKey;
 
-      // Check if aimock is already running; if so, verify BOTH its network and
-      // its mode. A stale aimock from a previous run (argus-clean does NOT
-      // touch the plugin-owned container — plugin teardown is not invoked on
-      // the MCP path) would otherwise silently replay old fixtures while the
-      // user believes they are recording: a false green. Remove and restart if
-      // either property mismatches.
-      const running = execSync('docker ps --filter name=aimock --format "{{.Names}}"', { encoding: 'utf-8' }).trim();
+      // Check if THIS worktree's aimock is already running; if so, verify BOTH
+      // its network and its mode. A stale aimock from a previous run (argus-clean
+      // does NOT touch the plugin-owned container — plugin teardown is not
+      // invoked on the MCP path) would otherwise silently replay old fixtures
+      // while the user believes they are recording: a false green. Remove and
+      // restart if either property mismatches.
+      //
+      // NOTE: filter by exact name (`^${aimockContainerName}$`) so concurrent
+      // worktrees' aimock containers (with different namespace prefixes) are
+      // NOT matched — each worktree only manages its own aimock.
+      const running = execSync(`docker ps --filter "name=^/${aimockContainerName}$" --format "{{.Names}}"`, { encoding: 'utf-8' }).trim();
       let restart = false;
-      if (running.includes('aimock')) {
-        // NOTE: use `{{json ...}}` (no `$` template variables) — docker's
-        // `{{range $k, $v := ...}}` templates get their `$k`/`$v` expanded to
-        // empty by the shell inside execSync, producing a silent template
-        // parse error (exit 64) that the outer try/catch swallows. That made
-        // the stale-aimock check a no-op and record mode quietly replay old
-        // fixtures: the exact false-green this check exists to prevent.
+      if (running.includes(aimockContainerName)) {
         const aimockNetworks = Object.keys(
-          JSON.parse(execSync('docker inspect aimock --format "{{json .NetworkSettings.Networks}}"', { encoding: 'utf-8' }).trim())
+          JSON.parse(execSync(`docker inspect ${aimockContainerName} --format "{{json .NetworkSettings.Networks}}"`, { encoding: 'utf-8' }).trim())
         );
-        const aimockCmd = execSync('docker inspect aimock --format "{{.Config.Cmd}}"', { encoding: 'utf-8' }).trim();
+        const aimockCmd = execSync(`docker inspect ${aimockContainerName} --format "{{.Config.Cmd}}"`, { encoding: 'utf-8' }).trim();
         const isRecord = aimockCmd.includes('--record');
         if (!aimockNetworks.includes(targetNetwork)) {
           console.log(`[recursive-agent] aimock on wrong network (${aimockNetworks.join(', ')}); restarting on ${targetNetwork}`);
@@ -108,12 +113,12 @@ const plugin: PluginModule = {
           restart = true;
         }
         if (restart) {
-          execSync('docker rm -f aimock', { stdio: 'pipe' });
+          execSync(`docker rm -f ${aimockContainerName}`, { stdio: 'pipe' });
         }
       }
 
-      const stillRunning = execSync('docker ps --filter name=aimock --format "{{.Names}}"', { encoding: 'utf-8' }).trim();
-      if (!stillRunning.includes('aimock')) {
+      const stillRunning = execSync(`docker ps --filter "name=^/${aimockContainerName}$" --format "{{.Names}}"`, { encoding: 'utf-8' }).trim();
+      if (!stillRunning.includes(aimockContainerName)) {
         const fixturesDir = path.resolve(import.meta.dirname, '../../fixtures');
         const recordedDir = path.resolve(fixturesDir, 'recorded');
 
@@ -125,7 +130,7 @@ const plugin: PluginModule = {
           // second (existing fixtures still replay). Note: aimock has no
           // `--record-path` flag — the first `-f` IS the record target.
           execSync(`mkdir -p "${recordedDir}"`);
-          aimockCmd = `docker run -d --name aimock ${networkFlag} ` +
+          aimockCmd = `docker run -d --name ${aimockContainerName} ${networkFlag} ` +
             `-v "${fixturesDir}:/fixtures" ` +
             `-e "OPENAI_API_KEY=${apiKey}" ` +
             `ghcr.io/copilotkit/aimock ` +
@@ -135,7 +140,7 @@ const plugin: PluginModule = {
           console.log('[recursive-agent] aimock starting in RECORD mode (proxying to real LLM)');
         } else {
           // Replay mode: serve fixtures deterministically
-          aimockCmd = `docker run -d --name aimock ${networkFlag} ` +
+          aimockCmd = `docker run -d --name ${aimockContainerName} ${networkFlag} ` +
             `-v "${fixturesDir}:/fixtures" ` +
             `ghcr.io/copilotkit/aimock -f /fixtures -h 0.0.0.0`;
           console.log('[recursive-agent] aimock starting in REPLAY mode');
@@ -144,9 +149,9 @@ const plugin: PluginModule = {
         execSync(aimockCmd, { stdio: 'pipe' });
         // Wait for aimock to be ready
         await new Promise(resolve => setTimeout(resolve, 2000));
-        console.log('[recursive-agent] aimock container started');
+        console.log(`[recursive-agent] aimock container started (${aimockContainerName})`);
       } else {
-        console.log('[recursive-agent] aimock already running');
+        console.log(`[recursive-agent] aimock already running (${aimockContainerName})`);
       }
     } catch (e) {
       console.warn(`[recursive-agent] aimock auto-start failed: ${(e as Error).message}`);
@@ -160,10 +165,14 @@ const plugin: PluginModule = {
   },
 
   async teardown() {
-    // Stop aimock container
+    // Stop this worktree's aimock container (namespaced — doesn't touch
+    // other worktrees' aimock containers).
+    const worktreeId = process.env['WORKTREE_ID'];
+    const namespace = worktreeId ?? 'recursive-agent';
+    const aimockContainerName = `${namespace}-aimock`;
     try {
-      execSync('docker rm -f aimock', { stdio: 'pipe' });
-      console.log('[recursive-agent] aimock container stopped');
+      execSync(`docker rm -f ${aimockContainerName}`, { stdio: 'pipe' });
+      console.log(`[recursive-agent] aimock container stopped (${aimockContainerName})`);
     } catch { /* ignore if not running */ }
   },
 
