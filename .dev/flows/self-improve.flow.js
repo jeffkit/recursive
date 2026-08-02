@@ -273,7 +273,22 @@ export function startRecursiveWatchdog({ transcriptOut, idleMs = 10 * 60 * 1000,
       if (pid != null && countDescendants(pid) > 0) {
         lastGrowthAt = now
       } else {
-        reason.current = 'no-growth-hung'; fire(); return
+        // Winddown liveness: the agent is making synchronous finishing moves
+        // (writing a journal entry, running a final `cargo test`/`clippy` that
+        // returned green) with NO descendant processes. These produce zero
+        // transcript growth for a while but are normal completion, not a hang.
+        // Refresh the idle clock to give the run room to exit on its own.
+        // (g353 lesson: a green, complete run was killed during journal-write
+        // by no-growth-hung; the work survived only via supervisor rescue.)
+        const tail = (() => { try { return readFileSync(transcriptOut, 'utf8').slice(-8192) } catch { return '' } })()
+        const looksLikeWinddown =
+          /\[step \d+\] -> (write_file|Edit|apply_patch)[^\n]*journal/.test(tail) ||
+          /test result: ok|cargo (?:test|clippy)[^\n]*\bok\b|All gates green/i.test(tail.slice(-2048))
+        if (looksLikeWinddown) {
+          lastGrowthAt = now
+        } else {
+          reason.current = 'no-growth-hung'; fire(); return
+        }
       }
     }
   }
