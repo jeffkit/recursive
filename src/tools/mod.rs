@@ -59,6 +59,7 @@ pub mod team_delete;
 pub mod todo;
 pub mod tool_search;
 pub mod transport;
+pub(crate) mod url_guard;
 pub mod watch_file;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;

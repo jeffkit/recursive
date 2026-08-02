@@ -140,11 +140,31 @@ fn artifacts_to_text(artifacts: &[Artifact]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Tool that calls a remote A2A v1.0 agent and returns its text output.
-pub struct A2aCallTool;
+pub struct A2aCallTool {
+    /// Test-only escape hatch: when `true`, skip the SSRF URL guard so
+    /// mock-server tests can exercise the real network path against
+    /// 127.0.0.1. Production instances (via [`new`]) always guard.
+    ///
+    /// [`new`]: A2aCallTool::new
+    #[cfg(test)]
+    allow_private_urls: bool,
+}
 
 impl A2aCallTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            allow_private_urls: false,
+        }
+    }
+
+    /// Test-only constructor: skips the SSRF URL guard. Mock-server
+    /// integration tests bind to 127.0.0.1, which the guard rejects.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked() -> Self {
+        Self {
+            allow_private_urls: true,
+        }
     }
 
     /// Build a `reqwest::Client` with sane timeouts.
@@ -232,6 +252,19 @@ impl Tool for A2aCallTool {
                 name: "a2a_call".into(),
                 message: "missing required parameter: url".into(),
             })?;
+
+        // SSRF guard: reject private/internal/loopback targets before any
+        // socket opens. Test instances (`new_unchecked`) skip this so the
+        // protocol tests can reach 127.0.0.1 mock servers.
+        #[cfg(test)]
+        let validated_url = if self.allow_private_urls {
+            url.to_string()
+        } else {
+            crate::tools::url_guard::validate_url(url)?
+        };
+        #[cfg(not(test))]
+        let validated_url = crate::tools::url_guard::validate_url(url)?;
+
         let prompt = arguments["prompt"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
@@ -247,7 +280,7 @@ impl Tool for A2aCallTool {
         let use_async = arguments["async_mode"].as_bool().unwrap_or(false);
 
         // Normalise base URL — strip trailing slash.
-        let base = url.trim_end_matches('/');
+        let base = validated_url.trim_end_matches('/');
 
         let client = Self::build_client().map_err(|e| Error::Tool {
             name: "a2a_call".into(),
@@ -702,11 +735,31 @@ impl AgentCard {
 
 /// Tool that fetches and summarises a remote A2A Agent Card
 /// (`GET /.well-known/agent.json`).
-pub struct A2aCardTool;
+pub struct A2aCardTool {
+    /// Test-only escape hatch: when `true`, skip the SSRF URL guard so
+    /// mock-server tests can exercise the real network path against
+    /// 127.0.0.1. Production instances (via [`new`]) always guard.
+    ///
+    /// [`new`]: A2aCardTool::new
+    #[cfg(test)]
+    allow_private_urls: bool,
+}
 
 impl A2aCardTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            allow_private_urls: false,
+        }
+    }
+
+    /// Test-only constructor: skips the SSRF URL guard. Mock-server
+    /// integration tests bind to 127.0.0.1, which the guard rejects.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked() -> Self {
+        Self {
+            allow_private_urls: true,
+        }
     }
 }
 
@@ -759,9 +812,22 @@ impl Tool for A2aCardTool {
                 name: "a2a_card".into(),
                 message: "missing required parameter: url".into(),
             })?;
+
+        // SSRF guard: reject private/internal/loopback targets before any
+        // socket opens. Test instances (`new_unchecked`) skip this so the
+        // protocol tests can reach 127.0.0.1 mock servers.
+        #[cfg(test)]
+        let validated_url = if self.allow_private_urls {
+            url.to_string()
+        } else {
+            crate::tools::url_guard::validate_url(url)?
+        };
+        #[cfg(not(test))]
+        let validated_url = crate::tools::url_guard::validate_url(url)?;
+
         let authorization = arguments["authorization"].as_str();
 
-        let base = url.trim_end_matches('/');
+        let base = validated_url.trim_end_matches('/');
         let card_url = format!("{base}/.well-known/agent.json");
 
         let client = A2aCallTool::build_client().map_err(|e| Error::Tool {
@@ -812,11 +878,31 @@ impl Tool for A2aCardTool {
 /// Designed to be used together with `a2a_call` in `async_mode: true`, allowing
 /// the agent to submit a long-running task and check on it later, optionally
 /// combined with `schedule_wakeup` for periodic polling.
-pub struct A2aTaskCheckTool;
+pub struct A2aTaskCheckTool {
+    /// Test-only escape hatch: when `true`, skip the SSRF URL guard so
+    /// mock-server tests can exercise the real network path against
+    /// 127.0.0.1. Production instances (via [`new`]) always guard.
+    ///
+    /// [`new`]: A2aTaskCheckTool::new
+    #[cfg(test)]
+    allow_private_urls: bool,
+}
 
 impl A2aTaskCheckTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            allow_private_urls: false,
+        }
+    }
+
+    /// Test-only constructor: skips the SSRF URL guard. Mock-server
+    /// integration tests bind to 127.0.0.1, which the guard rejects.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked() -> Self {
+        Self {
+            allow_private_urls: true,
+        }
     }
 }
 
@@ -873,6 +959,19 @@ impl Tool for A2aTaskCheckTool {
                 name: "a2a_task_check".into(),
                 message: "missing required parameter: url".into(),
             })?;
+
+        // SSRF guard: reject private/internal/loopback targets before any
+        // socket opens. Test instances (`new_unchecked`) skip this so the
+        // protocol tests can reach 127.0.0.1 mock servers.
+        #[cfg(test)]
+        let validated_url = if self.allow_private_urls {
+            url.to_string()
+        } else {
+            crate::tools::url_guard::validate_url(url)?
+        };
+        #[cfg(not(test))]
+        let validated_url = crate::tools::url_guard::validate_url(url)?;
+
         let task_id = arguments["task_id"]
             .as_str()
             .ok_or_else(|| Error::BadToolArgs {
@@ -881,7 +980,7 @@ impl Tool for A2aTaskCheckTool {
             })?;
         let authorization = arguments["authorization"].as_str();
 
-        let base = url.trim_end_matches('/');
+        let base = validated_url.trim_end_matches('/');
         let task_url = format!("{base}/tasks/{task_id}");
 
         let client = A2aCallTool::build_client().map_err(|e| Error::Tool {
@@ -1026,9 +1125,11 @@ mod tests {
     #[test]
     fn missing_prompt_returns_bad_tool_args_error() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tool = A2aCallTool::new();
+        // `default()` == `new()`: SSRF guard active. The url is public, so the
+        // failure is the missing prompt (args validation), not the URL guard.
+        let tool = A2aCallTool::default();
         let err = rt
-            .block_on(tool.execute(json!({"url": "http://localhost"})))
+            .block_on(tool.execute(json!({"url": "https://example.com"})))
             .unwrap_err();
         assert!(matches!(err, Error::BadToolArgs { .. }));
     }
@@ -1036,7 +1137,9 @@ mod tests {
     #[test]
     fn missing_url_returns_bad_tool_args_error() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tool = A2aCallTool::new();
+        // `default()` == `new()`: SSRF guard active. No url arg at all — fails
+        // args validation before the guard even runs.
+        let tool = A2aCallTool::default();
         let err = rt
             .block_on(tool.execute(json!({"prompt": "hi"})))
             .unwrap_err();
@@ -1050,7 +1153,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1069,7 +1172,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1096,7 +1199,7 @@ mod tests {
 
         let addr = spawn_sequential_mock_server(vec![working_resp, completed_resp]);
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1116,7 +1219,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1137,7 +1240,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1206,7 +1309,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCardTool::new();
+        let tool = A2aCardTool::new_unchecked();
         let result = tool
             .execute(json!({"url": format!("http://{addr}")}))
             .await
@@ -1224,7 +1327,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCardTool::new();
+        let tool = A2aCardTool::new_unchecked();
         let result = tool
             .execute(json!({"url": format!("http://{addr}")}))
             .await
@@ -1278,7 +1381,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1301,7 +1404,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aCallTool::new();
+        let tool = A2aCallTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1324,7 +1427,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aTaskCheckTool::new();
+        let tool = A2aTaskCheckTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1344,7 +1447,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aTaskCheckTool::new();
+        let tool = A2aTaskCheckTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1364,7 +1467,7 @@ mod tests {
         let addr = spawn_mock_server(raw_resp);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let tool = A2aTaskCheckTool::new();
+        let tool = A2aTaskCheckTool::new_unchecked();
         let result = tool
             .execute(json!({
                 "url": format!("http://{addr}"),
@@ -1374,5 +1477,71 @@ mod tests {
             .unwrap();
 
         assert!(result.starts_with("ERROR: HTTP 404"), "got: {result}");
+    }
+
+    // ── Goal 371: SSRF guard on a2a tools ─────────────────────────────────
+
+    /// SSRF targets must be rejected at args-validation time (BadToolArgs),
+    /// BEFORE any socket opens. Uses `new()` so the guard is active.
+    #[tokio::test]
+    async fn a2a_call_rejects_ssrf_targets() {
+        let tool = A2aCallTool::new();
+        for bad_url in [
+            "http://127.0.0.1",
+            "http://169.254.169.254",
+            "http://10.0.0.1",
+            "http://[::1]",
+            "http://localhost",
+        ] {
+            let args = json!({"url": bad_url, "prompt": "hi"});
+            let res = tool.execute(args).await;
+            assert!(res.is_err(), "{bad_url} should be rejected");
+            match res.unwrap_err() {
+                Error::BadToolArgs { .. } => {}
+                other => panic!("expected BadToolArgs for {bad_url}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `a2a_card` GETs `{url}/.well-known/agent.json` — same attacker host.
+    #[tokio::test]
+    async fn a2a_card_rejects_ssrf_targets() {
+        let tool = A2aCardTool::new();
+        for bad_url in [
+            "http://127.0.0.1",
+            "http://169.254.169.254",
+            "http://10.0.0.1",
+            "http://[::1]",
+            "http://localhost",
+        ] {
+            let args = json!({"url": bad_url});
+            let res = tool.execute(args).await;
+            assert!(res.is_err(), "{bad_url} should be rejected");
+            match res.unwrap_err() {
+                Error::BadToolArgs { .. } => {}
+                other => panic!("expected BadToolArgs for {bad_url}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `a2a_task_check` polls `{url}/tasks/{id}` — same attacker host.
+    #[tokio::test]
+    async fn a2a_task_check_rejects_ssrf_targets() {
+        let tool = A2aTaskCheckTool::new();
+        for bad_url in [
+            "http://127.0.0.1",
+            "http://169.254.169.254",
+            "http://10.0.0.1",
+            "http://[::1]",
+            "http://localhost",
+        ] {
+            let args = json!({"url": bad_url, "task_id": "t1"});
+            let res = tool.execute(args).await;
+            assert!(res.is_err(), "{bad_url} should be rejected");
+            match res.unwrap_err() {
+                Error::BadToolArgs { .. } => {}
+                other => panic!("expected BadToolArgs for {bad_url}, got {other:?}"),
+            }
+        }
     }
 }
