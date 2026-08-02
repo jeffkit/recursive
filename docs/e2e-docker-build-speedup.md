@@ -3,6 +3,11 @@
 > 一篇关于如何把 self-improve flow 的 e2e gate 从"每次 25 分钟的 docker build 黑洞"
 > 优化到"src/ 改动 ~1 分钟、纯测试 goal 0.4 秒跳过"的实战记录。记录了试过的方案、
 > 失败的教训、以及背后的 Docker/BuildKit/Rust 编译原理。
+>
+> 📖 **想把这些经验用到其他项目？** 见通用指南
+> [docs/rust-docker-build-speedup.md](https://github.com/jeffkit/infra4agent/blob/main/docs/rust-docker-build-speedup.md)——
+> 去掉了 recursive 特有细节，提炼成任何 Rust + Docker + E2E 项目都能复用的模板、
+> 决策框架和诊断清单（含非 Rust 语言的等价方案）。
 
 **日期**：2026-08-02
 **背景**：recursive 项目的 self-improve flow 每跑一个改 `src/` 的 goal，e2e gate
