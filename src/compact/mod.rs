@@ -90,13 +90,16 @@ impl Compactor {
         self
     }
 
-    /// Estimate the prompt character count of a transcript.
+    /// Estimate the prompt byte count of a transcript.
     ///
-    /// This is a rough proxy for token count. The agent uses this to decide
-    /// whether compaction is needed before the next LLM call.
+    /// This is a rough proxy for token count (≈4 bytes/token for English;
+    /// over-counts CJK ~3× because CJK chars are 3 UTF-8 bytes each). The
+    /// agent uses this to decide whether compaction is needed before the
+    /// next LLM call. It is intentionally byte-based and kept in bytes —
+    /// the char/byte threshold calibration depends on it.
     /// Includes tool_calls arguments and reasoning_content which were previously
     /// omitted, causing the threshold to be systematically underestimated.
-    pub fn estimate_chars(transcript: &[Message]) -> usize {
+    pub fn estimate_bytes(transcript: &[Message]) -> usize {
         transcript
             .iter()
             .map(|m| {
@@ -112,14 +115,14 @@ impl Compactor {
 
     /// Decide whether compaction should run, preferring the token-based
     /// threshold (accurate, CJK-safe) when actual API `prompt_tokens` are
-    /// available, falling back to the char estimate.
+    /// available, falling back to the byte estimate.
     ///
     /// `last_prompt_tokens` of `0` means "no API reading yet" (first step,
-    /// or a provider that never reports usage) — the char estimate is used.
-    pub fn should_compact(&self, estimate_chars: usize, last_prompt_tokens: u32) -> bool {
+    /// or a provider that never reports usage) — the byte estimate is used.
+    pub fn should_compact(&self, estimate_bytes: usize, last_prompt_tokens: u32) -> bool {
         match (self.threshold_prompt_tokens, last_prompt_tokens) {
             (Some(token_threshold), actual) if actual > 0 => actual >= token_threshold,
-            _ => estimate_chars >= self.threshold_chars,
+            _ => estimate_bytes >= self.threshold_chars,
         }
     }
 
@@ -583,12 +586,12 @@ mod tests {
     }
 
     #[test]
-    fn estimate_chars_sums_content_lengths() {
+    fn estimate_bytes_sums_content_lengths() {
         let transcript = vec![
             Message::user("hello".to_string()),
             Message::assistant("world".to_string()),
         ];
-        assert_eq!(Compactor::estimate_chars(&transcript), 10);
+        assert_eq!(Compactor::estimate_bytes(&transcript), 10);
     }
 
     #[test]
@@ -980,11 +983,11 @@ mod tests {
     }
 
     // ========================================================================
-    // estimate_chars — tool_calls and reasoning_content coverage
+    // estimate_bytes — tool_calls and reasoning_content coverage
     // ========================================================================
 
     #[test]
-    fn estimate_chars_includes_tool_calls() {
+    fn estimate_bytes_includes_tool_calls() {
         use crate::llm::ToolCall;
         // An assistant message with one tool call.
         // name = "Read" (4 chars), arguments = "\"path\"" (6 chars), overhead = 32
@@ -998,26 +1001,26 @@ mod tests {
         let args_len = msg.tool_calls[0].arguments.to_string().len();
         let expected = 5 + (4 + args_len + 32);
         assert_eq!(
-            Compactor::estimate_chars(&[msg]),
+            Compactor::estimate_bytes(&[msg]),
             expected,
             "tool_calls contribution must be counted"
         );
     }
 
     #[test]
-    fn estimate_chars_includes_reasoning_content() {
+    fn estimate_bytes_includes_reasoning_content() {
         let mut msg = Message::assistant("hello".to_string());
         msg.reasoning_content = Some("some reasoning".to_string());
         // content=5, reasoning=14
         assert_eq!(
-            Compactor::estimate_chars(&[msg]),
+            Compactor::estimate_bytes(&[msg]),
             5 + 14,
             "reasoning_content must be counted"
         );
     }
 
     #[test]
-    fn estimate_chars_tool_calls_plus_reasoning_combined() {
+    fn estimate_bytes_tool_calls_plus_reasoning_combined() {
         use crate::llm::ToolCall;
         let tool_call = ToolCall {
             id: "c2".into(),
@@ -1029,7 +1032,7 @@ mod tests {
         let args_len = msg.tool_calls[0].arguments.to_string().len();
         // content=0, tool_call: name=5, args=..., +32; reasoning=6
         let expected = (5 + args_len + 32) + 6;
-        assert_eq!(Compactor::estimate_chars(&[msg]), expected);
+        assert_eq!(Compactor::estimate_bytes(&[msg]), expected);
     }
 
     // ========================================================================

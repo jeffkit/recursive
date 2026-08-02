@@ -396,8 +396,8 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        let chars = Compactor::estimate_chars(&self.transcript);
-        if !compactor.should_compact(chars, last_usage.prompt_tokens) {
+        let bytes = Compactor::estimate_bytes(&self.transcript);
+        if !compactor.should_compact(bytes, last_usage.prompt_tokens) {
             return Ok(());
         }
         // Goal 345: only dispatch PreCompact when compaction will actually run,
@@ -408,7 +408,7 @@ impl AgentRuntime {
             return Ok(());
         }
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
-            transcript_len: chars,
+            transcript_len: bytes,
         });
         // Snapshot pre-compact for file+skill reinjection (apply_to_transcript drains).
         let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
@@ -570,9 +570,9 @@ impl AgentRuntime {
         if !compactor.would_compact(&self.transcript) {
             return Ok(false);
         }
-        let chars = Compactor::estimate_chars(&self.transcript);
+        let bytes = Compactor::estimate_bytes(&self.transcript);
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
-            transcript_len: chars,
+            transcript_len: bytes,
         });
         let turn = self
             .checkpoints

@@ -88,18 +88,23 @@ impl ContextBreakdown {
     }
 }
 
-/// Estimate token count from a string using the chars/4 heuristic
-/// (ceiling). Used by both the `estimate_tokens` tool and the local
-/// `ContextBreakdown` so the two share the same arithmetic.
+/// Rough token estimate for budget/breakdown display. Uses a bytes/4
+/// heuristic (≈4 bytes/token for English; over-counts CJK ~3× because CJK
+/// chars are 3 UTF-8 bytes each). This is intentionally byte-based for
+/// speed (no char iteration) and is only an estimate — exact tokenization
+/// would require the provider's tokenizer. Do not use for billing.
 ///
-/// The estimator deliberately rounds up (ceil) so a 5-character string
-/// becomes 2 tokens, not 1; this matches the conservative budgeting the
-/// rest of the codebase applies when comparing local estimates against
-/// the provider's reported truth.
+/// Used by both the `estimate_tokens` tool and the local `ContextBreakdown`
+/// so the two share the same arithmetic.
+///
+/// The estimator deliberately rounds up (ceil) so a 5-byte string becomes
+/// 2 tokens, not 1; this matches the conservative budgeting the rest of
+/// the codebase applies when comparing local estimates against the
+/// provider's reported truth.
 pub fn estimate_tokens(text: &str) -> u32 {
-    let chars = text.len();
-    let tokens = (chars as f64 / 4.0).ceil() as u32;
-    // Defensive: if chars overflow the divisor (impossible for `str::len()`
+    let bytes = text.len();
+    let tokens = (bytes as f64 / 4.0).ceil() as u32;
+    // Defensive: if bytes overflow the divisor (impossible for `str::len()`
     // on a single allocation but possible in theory), the f64 rounding
     // path can yield 0. Force a 1-token floor for any non-empty input.
     if tokens == 0 && !text.is_empty() {
@@ -269,6 +274,23 @@ mod tests {
             content: content.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn estimate_tokens_is_byte_based_documents_cjk_overcount() {
+        // "hello world" = 11 bytes / 11 chars; "你好世界" = 12 bytes / 4 chars.
+        let ascii = "hello world";
+        let cjk = "你好世界";
+        // Pin the byte/char counts so the ratio below is self-documenting.
+        assert_eq!(ascii.len(), 11);
+        assert_eq!(ascii.chars().count(), 11);
+        assert_eq!(cjk.len(), 12);
+        assert_eq!(cjk.chars().count(), 4);
+        // Byte-based: ascii=11/4≈3, cjk=12/4=3 — same tokens despite cjk having 1/3 the chars.
+        assert_eq!(estimate_tokens(ascii), 3);
+        assert_eq!(estimate_tokens(cjk), 3);
+        assert_eq!(estimate_tokens(ascii), estimate_tokens(cjk));
+        // This equality IS the known over-count; the docstring explains it.
     }
 
     #[test]

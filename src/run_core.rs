@@ -50,15 +50,18 @@ pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit bud
 /// Minimum tool-result size (bytes) worth trimming; shorter results are kept verbatim.
 const MIN_TRIM_LENGTH: usize = 200;
 
-/// Goal-328: token estimate from a pre-computed char count.
+/// Goal-328: token estimate from a pre-computed byte count.
 ///
 /// Same arithmetic as [`crate::llm::estimate_tokens`] but takes a `usize`
-/// char-count directly so the conversation bucket can avoid re-iterating
+/// byte-count directly so the conversation bucket can avoid re-iterating
 /// the transcript just to read each message's `len()`. Matches the public
-/// helper's ceil semantics so a 5-char transcript chunk is 2 tokens, not 1.
-fn estimate_tokens_by_chars(chars: usize) -> u32 {
-    let tokens = (chars as f64 / 4.0).ceil() as u32;
-    if tokens == 0 && chars > 0 {
+/// helper's ceil semantics so a 5-byte transcript chunk is 2 tokens, not 1.
+/// Byte-based (like the public helper): over-counts CJK ~3× because CJK
+/// chars are 3 UTF-8 bytes each — intentional, and keeps the breakdown
+/// buckets in the same unit as `estimate_tokens`.
+fn estimate_tokens_by_bytes(bytes: usize) -> u32 {
+    let tokens = (bytes as f64 / 4.0).ceil() as u32;
+    if tokens == 0 && bytes > 0 {
         1
     } else {
         tokens
@@ -280,19 +283,19 @@ impl<'a> RunCore<'a> {
     /// reading from the just-completed LLM call; it backs the `overhead`
     /// bucket.
     fn compute_breakdown(&self, provider_total: u32) -> ContextBreakdown {
-        // Conversation bucket: chars/4 over the transcript body. We
+        // Conversation bucket: bytes/4 over the transcript body. We
         // intentionally re-tokenise every step (rather than caching) so
         // the bucket grows naturally with each new assistant / tool /
         // user message appended this run.
-        let mut conversation_chars: usize = 0;
+        let mut conversation_bytes: usize = 0;
         for msg in self.messages.iter() {
-            conversation_chars = conversation_chars.saturating_add(msg.content.len());
+            conversation_bytes = conversation_bytes.saturating_add(msg.content.len());
             if let Some(rc) = &msg.reasoning_content {
-                conversation_chars = conversation_chars.saturating_add(rc.len());
+                conversation_bytes = conversation_bytes.saturating_add(rc.len());
             }
         }
-        // `estimate_tokens` uses (chars as f64 / 4.0).ceil() as u32.
-        let conversation = estimate_tokens_by_chars(conversation_chars);
+        // `estimate_tokens` uses (bytes as f64 / 4.0).ceil() as u32.
+        let conversation = estimate_tokens_by_bytes(conversation_bytes);
 
         let local_sum = self
             .static_breakdown
@@ -961,8 +964,8 @@ impl<'a> RunCore<'a> {
             return;
         }
 
-        let chars = Compactor::estimate_chars(&self.messages);
-        if !compactor.should_compact(chars, self.last_prompt_tokens) {
+        let bytes = Compactor::estimate_bytes(&self.messages);
+        if !compactor.should_compact(bytes, self.last_prompt_tokens) {
             return;
         }
         // Goal 345: only dispatch PreCompact when compaction will actually run.
@@ -976,7 +979,7 @@ impl<'a> RunCore<'a> {
 
         // Only dispatch PreCompact when we're actually about to compact.
         self.hooks.dispatch(HookEvent::PreCompact {
-            transcript_len: chars,
+            transcript_len: bytes,
         });
 
         let kept_before = self.messages.len();
@@ -1894,8 +1897,8 @@ mod tests {
     #[test]
     fn maybe_trim_does_nothing_when_under_limit() {
         let hooks = crate::hooks::HookRegistry::new();
-        // Use a large tool result (> MIN_TRIM_LENGTH) but keep limit ABOVE total chars.
-        // This kills the `replace < with ==` mutant: with `==`, chars != limit means
+        // Use a large tool result (> MIN_TRIM_LENGTH) but keep limit ABOVE total bytes.
+        // This kills the `replace < with ==` mutant: with `==`, bytes != limit means
         // the early-return is skipped and the tool result would be incorrectly trimmed.
         let large_output = "x".repeat(MIN_TRIM_LENGTH + 10);
         let messages = vec![
@@ -1903,16 +1906,16 @@ mod tests {
             Message::tool_result("c1", &large_output),
         ];
         let orig_content = messages[1].content.clone();
-        let total_chars = "sys".len() + large_output.len();
+        let total_bytes = "sys".len() + large_output.len();
         let mut core = make_test_core(messages, &hooks);
 
-        // Set limit strictly ABOVE total chars (not equal), so trimming must not fire.
-        let limit = total_chars + 1;
+        // Set limit strictly ABOVE total bytes (not equal), so trimming must not fire.
+        let limit = total_bytes + 1;
         core.maybe_trim_transcript(limit, 0);
 
         assert_eq!(
             core.messages[1].content, orig_content,
-            "content must not be touched when total chars < limit"
+            "content must not be touched when total bytes < limit"
         );
     }
 
@@ -2265,8 +2268,8 @@ mod tests {
             Message::assistant("rep2".to_string()),
             Message::user("last".to_string()),
         ];
-        // Compute exact chars
-        let chars = crate::compact::Compactor::estimate_chars(&messages);
+        // Compute exact bytes
+        let bytes = crate::compact::Compactor::estimate_bytes(&messages);
         let provider = Arc::new(MockProvider::new(vec![Completion {
             content: "summary".to_string(),
             tool_calls: vec![],
@@ -2276,14 +2279,14 @@ mod tests {
         }]));
         let mut core = make_test_core(messages, &hooks);
         core.llm = provider;
-        // Set threshold = exact chars → `chars < threshold` is false → compaction fires
-        // With `< → <=`: `chars <= chars` is true → returns early → no compaction
-        core.compactor = Some(Compactor::new(chars).keep_recent_n(2));
+        // Set threshold = exact bytes → `bytes < threshold` is false → compaction fires
+        // With `< → <=`: `bytes <= bytes` is true → returns early → no compaction
+        core.compactor = Some(Compactor::new(bytes).keep_recent_n(2));
 
         core.maybe_compact(1).await;
         assert!(
             core.messages[0].is_compaction_summary,
-            "compaction must fire when chars == threshold (chars is NOT less than threshold)"
+            "compaction must fire when bytes == threshold (bytes is NOT less than threshold)"
         );
     }
 
@@ -2315,9 +2318,9 @@ mod tests {
         core.llm = provider;
         // Set high char threshold (would NOT fire on this transcript)
         // and low token threshold (WILL fire when last_prompt_tokens is set).
-        let chars = crate::compact::Compactor::estimate_chars(&core.messages);
+        let bytes = crate::compact::Compactor::estimate_bytes(&core.messages);
         core.compactor = Some(
-            Compactor::new(chars + 1000) // char threshold too high
+            Compactor::new(bytes + 1000) // char threshold too high
                 .threshold_prompt_tokens(500) // low token threshold
                 .keep_recent_n(2),
         );
