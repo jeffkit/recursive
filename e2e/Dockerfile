@@ -1,12 +1,40 @@
+# syntax=docker/dockerfile:1.4
+# Three-stage build using cargo-chef to cache dependency compilation.
+# The `cooker` stage compiles all 588 dependency crates from a recipe
+# (generated without source) — it only re-runs when Cargo.toml/Cargo.lock
+# change. The `builder` stage copies real source + the prebuilt target/
+# dir and compiles only the 3 workspace crates, so a src/ change costs
+# ~2-3 min instead of a full ~10 min rebuild.
+
+# ── Stage 1: planner — generate the dependency recipe (no source needed) ──
+FROM rust:1.88-slim AS planner
+WORKDIR /app
+RUN cargo install cargo-chef --locked 2>&1 | tail -1
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY crates crates
+COPY src src
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: cooker — compile dependencies from the recipe (cached layer) ──
+# This layer only rebuilds when recipe.json changes (i.e. Cargo.toml/lock).
+# Source changes do NOT invalidate it — that is the whole point.
+FROM rust:1.88-slim AS cooker
+WORKDIR /app
+RUN cargo install cargo-chef --locked 2>&1 | tail -1
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json 2>&1 | tail -5
+
+# ── Stage 3: builder — compile the actual project on top of cached deps ──
 FROM rust:1.88-slim AS builder
-
-WORKDIR /build
+WORKDIR /app
 COPY Cargo.toml Cargo.lock providers.toml ./
-COPY src/ src/
-COPY crates/ crates/
-
-# Build release binary. The `recursive` binary is the `recursive-cli` crate's
-# bin target (the root `recursive-agent` crate is a lib only, post split).
+COPY .cargo .cargo
+COPY crates crates
+COPY src src
+# Copy the prebuilt target/ from the cooker stage — cargo sees the
+# dependencies as already compiled and only builds the 3 workspace crates.
+COPY --from=cooker /app/target target
 RUN cargo build --release -p recursive-cli 2>&1 | tail -5
 
 FROM debian:bookworm-slim
@@ -20,7 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/recursive /usr/local/bin/recursive
+COPY --from=builder /app/target/release/recursive /usr/local/bin/recursive
 
 # Install Python SDK (for 20-python-sdk e2e test)
 COPY sdk/python /sdk/python
