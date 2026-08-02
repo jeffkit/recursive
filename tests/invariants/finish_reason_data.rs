@@ -1,10 +1,10 @@
 // Why this test exists:
 // .dev/AGENTS.md invariant #7: "Finish reasons are data, not errors.
-// `Agent::run` returns `Ok(AgentOutcome { finish: ... })` for every
+// `AgentRuntime::run` returns `Ok(RuntimeOutcome { finish_reason: ... })` for every
 // termination mode (NoMoreToolCalls, BudgetExceeded, Stuck, TranscriptLimit,
 // ProviderStop). Only honest-to-god failures (network, JSON, provider
 // transport, IO) become `Err`. The CLI decides binary exit code by inspecting
-// `outcome.finish` AFTER persisting the transcript — see
+// `outcome.finish_reason` AFTER persisting the transcript — see
 // `main.rs::exit_for_finish`. NEVER introduce a new `Error::XxxBudget` or
 // `Error::XxxLimit` variant that short-circuits the transcript save.
 // The self-improve flow's auto-resume step depends on the saved transcript
@@ -100,7 +100,7 @@ fn finish_reason_display_is_stable() {
 // ── No error variant maps to a finish reason ───────────────────────────────
 
 /// Invariant #7 explicitly forbids `Error::XxxBudget` or `Error::XxxLimit`
-/// variants. All termination modes must go through `Ok(AgentOutcome { finish })`.
+/// variants. All termination modes must go through `Ok(RuntimeOutcome { finish_reason })`.
 #[test]
 fn no_error_variant_corresponds_to_finish_reason() {
     // Load the error.rs source and check for forbidden patterns.

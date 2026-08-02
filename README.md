@@ -83,8 +83,9 @@ println!("{}", outcome.final_text.unwrap_or_default());
 ```
 
 Run it with no API key by swapping `OpenAiProvider` for the
-scriptable `MockProvider` — see `examples/basic.rs` and
-`examples/with_tools.rs`.
+scriptable `MockProvider` — see `examples/basic.rs` (requires the
+`test-utils` feature: `cargo run --example basic --features test-utils`)
+and `examples/with_tools.rs`.
 
 ## Design
 
@@ -167,7 +168,7 @@ Anything OpenAI-compatible works. Override via env vars (or CLI flags):
 | `RECURSIVE_API_BASE` | `https://api.openai.com/v1` | Chat-completions endpoint |
 | `RECURSIVE_API_KEY` | _(required)_ | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
-| `RECURSIVE_MAX_STEPS` | `32` | Loop budget |
+| `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Loop budget (0 = unlimited; set to N to cap at N steps) |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_WORKSPACE` | cwd | Root all fs/shell tools are sandboxed to |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a system prompt to load |
@@ -297,7 +298,7 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_API_KEY` | _(required)_ | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_PROVIDER_TYPE` | `openai` | Protocol: `openai` or `anthropic` |
-| `RECURSIVE_MAX_STEPS` | `32` | Max tool-call loop iterations per run |
+| `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Max tool-call loop iterations per run (0 = unlimited) |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a custom system-prompt file |
 | `RECURSIVE_WORKSPACE` | cwd | Filesystem sandbox root |

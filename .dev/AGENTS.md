@@ -120,12 +120,12 @@ e2e/
    journal entry. Prefer std + what's already in `Cargo.toml`.
    Automated test: `tests/invariants/dep_justification.rs` +
    `scripts/check-new-deps.sh`
-7. **Finish reasons are data, not errors.** `Agent::run` returns
-   `Ok(AgentOutcome { finish: ... })` for every termination mode
+7. **Finish reasons are data, not errors.** `AgentRuntime::run` returns
+   `Ok(RuntimeOutcome { finish_reason: ... })` for every termination mode
    (`NoMoreToolCalls`, `BudgetExceeded`, `Stuck`, `TranscriptLimit`,
    `ProviderStop`). Only honest-to-god failures (network, JSON,
    provider transport, IO) become `Err`. The CLI decides binary
-   exit code by inspecting `outcome.finish` AFTER persisting the
+   exit code by inspecting `outcome.finish_reason` AFTER persisting the
    transcript — see `main.rs::exit_for_finish`. **NEVER** introduce
    a new `Error::XxxBudget` or `Error::XxxLimit` variant that
    short-circuits the transcript save. The self-improve flow's auto-resume

@@ -4,7 +4,7 @@
 //!
 //! * [`Compactor`] — LLM-driven summarisation of older transcript messages
 //!   into a single system message. Disabled by default (threshold =
-//!   `usize::MAX`), enabled via `AgentBuilder::compactor(...)`.
+//!   `usize::MAX`), enabled via `AgentRuntimeBuilder::compactor(...)`.
 //!
 //! * [`Microcompactor`] — no-LLM proactive pruning of old tool results by
 //!   count. Runs before the LLM-driven compactor each step so the transcript

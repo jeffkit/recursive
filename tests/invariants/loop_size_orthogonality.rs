@@ -1,6 +1,6 @@
 // Why this test exists:
 // .dev/AGENTS.md invariant #1: "Agent loop stays small. New capabilities are
-// tools or providers, not branches inside `agent.rs::Agent::run`."
+// tools or providers, not branches inside `src/run_core.rs::RunCore::run_inner`."
 // .dev/AGENTS.md invariant #2: "Orthogonality. Tools must not depend on LLM
 // internals; providers must not depend on tools."
 //

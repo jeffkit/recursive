@@ -153,7 +153,7 @@ impl AgentRuntimeBuilder {
         self
     }
 
-    /// Set the maximum number of LLM calls per turn (optional, default 32).
+    /// Set the maximum number of LLM calls per turn (optional, default 0 (unlimited)).
     pub fn max_steps(mut self, n: usize) -> Self {
         self.kernel_builder = self.kernel_builder.max_steps(n);
         self
