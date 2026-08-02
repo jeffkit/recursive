@@ -139,6 +139,20 @@ Don't edit files a live worktree run is working on.
    even after the filesystem cleanup. If the first remedy isn't enough, kill the
    daemon too: `mcp2cli --session-stop argusai-$(git rev-parse --short HEAD)`
    (list live ones with `mcp2cli --session-list`), then re-run the gate.
+5. **Accumulated `argusai-wt-*-network` networks exhaust Docker's address pools.**
+   `argus-clean` removes containers but leaves the empty network behind, so every
+   completed e2e gate run leaks one bridge network. After enough runs
+   (`docker network ls --filter name=argusai` grows to ~25+), `docker network create`
+   fails with `all predefined address pools have been fully subnetted` and
+   `argusai-core`'s `ensureNetwork` **swallows** that error (`catch { // Network may
+   already exist }`) — so `argus-setup` reports `"created": true` but the subsequent
+   `docker run --network <name>` fails with `network ... not found`, and every smoke
+   case fails with `File ... does not exist` (setup exec steps ran against no
+   container). This looks like a code regression but isn't. Remedy:
+   `for n in $(docker network ls --filter name=argusai --format '{{.Name}}'); do docker network rm "$n"; done`
+   (only removes networks with no attached containers — safe for concurrent runs),
+   remove any stale `recursive-e2e` container (`docker rm -f recursive-e2e`), then
+   re-run the gate.
 
 New failure modes should be added here, not silently worked around.
 

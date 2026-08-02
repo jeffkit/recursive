@@ -34,6 +34,13 @@ impl WebFetch {
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .user_agent(format!("recursive-agent/{}", env!("CARGO_PKG_VERSION")))
+            // Do not follow redirects. `validate_url` (url_guard) checks only
+            // the *initial* URL, so reqwest's default policy (follow up to 10
+            // redirects) would let a public URL 302-redirect the fetch to a
+            // private/internal host — an SSRF bypass. Under `Policy::none()`, a
+            // 3xx comes back as a normal response and `fetch` surfaces it as an
+            // error instead of issuing a second request. (Goal 372)
+            .redirect(reqwest::redirect::Policy::none())
             // Construction carve-out: if TLS backend fails to initialize, the
             // process cannot perform HTTP requests at all. This is a fatal
             // startup condition equivalent to the providers.rs TOML parse
@@ -45,6 +52,89 @@ impl WebFetch {
         )]
         let client = client.expect("reqwest client build: TLS backend unavailable");
         Self { client }
+    }
+
+    /// Perform the HTTP GET against a URL that has already passed
+    /// [`validate_url`]. Kept separate from `execute` so tests can drive the
+    /// HTTP path against a loopback mock without tripping the SSRF guard on
+    /// the *initial* request (the guard itself is covered by
+    /// `validate_url_blocks_ssrf_targets`).
+    async fn fetch(&self, validated_url: &str, max_bytes: usize) -> Result<String> {
+        let response = self
+            .client
+            .get(validated_url)
+            .send()
+            .await
+            .map_err(|e| Error::Tool {
+                name: "WebFetch".into(),
+                call_id: None,
+                message: format!("request failed: {}", e),
+            })?;
+
+        let status = response.status();
+        // With `Policy::none()` a 3xx is a normal response, not an error — we
+        // must surface it ourselves. Following it would bypass the SSRF guard
+        // (the Location header can point at a private host).
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>");
+            return Err(Error::Tool {
+                name: "WebFetch".into(),
+                call_id: None,
+                message: format!(
+                    "WebFetch does not follow redirects; got HTTP {} (Location: {})",
+                    status.as_u16(),
+                    location
+                ),
+            });
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let excerpt = if body.len() > 200 {
+                format!("{}...", crate::truncate_str(&body, 200))
+            } else {
+                body
+            };
+            return Err(Error::Tool {
+                name: "WebFetch".into(),
+                call_id: None,
+                message: format!("HTTP {}: {}", status.as_u16(), excerpt),
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body = response.text().await.map_err(|e| Error::Tool {
+            name: "WebFetch".into(),
+            call_id: None,
+            message: format!("failed to read response body: {}", e),
+        })?;
+
+        let total_bytes = body.len();
+        let truncated = if total_bytes > max_bytes {
+            let truncated_body = crate::truncate_str(&body, max_bytes);
+            format!(
+                "{}\n\n[…truncated at {} bytes; total body was {} bytes]",
+                truncated_body, max_bytes, total_bytes
+            )
+        } else {
+            body
+        };
+
+        // Convert HTML to markdown if content type suggests HTML
+        if content_type.contains("text/html") {
+            return Ok(Self::html_to_markdown(&truncated));
+        }
+
+        Ok(truncated)
     }
 
     /// Simple HTML to markdown conversion - handles links, headings, basic tags.
@@ -246,62 +336,7 @@ impl Tool for WebFetch {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_MAX_BYTES);
 
-        let response = self
-            .client
-            .get(&validated_url)
-            .send()
-            .await
-            .map_err(|e| Error::Tool {
-                name: "WebFetch".into(),
-                call_id: None,
-                message: format!("request failed: {}", e),
-            })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let excerpt = if body.len() > 200 {
-                format!("{}...", crate::truncate_str(&body, 200))
-            } else {
-                body
-            };
-            return Err(Error::Tool {
-                name: "WebFetch".into(),
-                call_id: None,
-                message: format!("HTTP {}: {}", status.as_u16(), excerpt),
-            });
-        }
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let body = response.text().await.map_err(|e| Error::Tool {
-            name: "WebFetch".into(),
-            call_id: None,
-            message: format!("failed to read response body: {}", e),
-        })?;
-
-        let total_bytes = body.len();
-        let truncated = if total_bytes > max_bytes {
-            let truncated_body = crate::truncate_str(&body, max_bytes);
-            format!(
-                "{}\n\n[…truncated at {} bytes; total body was {} bytes]",
-                truncated_body, max_bytes, total_bytes
-            )
-        } else {
-            body
-        };
-
-        // Convert HTML to markdown if content type suggests HTML
-        if content_type.contains("text/html") {
-            return Ok(Self::html_to_markdown(&truncated));
-        }
-
-        Ok(truncated)
+        self.fetch(&validated_url, max_bytes).await
     }
 }
 
@@ -468,10 +503,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // SSRF protection blocks 127.0.0.1, so execute() never reaches the mock
-    // server and listener.accept() hangs forever. Test the truncation logic
-    // via reqwest::Client directly once WebFetch exposes an internal fetch fn.
-    #[ignore = "hangs: SSRF guard blocks 127.0.0.1 before HTTP request is made"]
     async fn test_c_body_exceeds_max_bytes() {
         // Spawn mock server returning large body
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -496,12 +527,15 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let tool = WebFetch::new();
-        let result = tool
-            .execute(json!({
-                "url": format!("http://{}/test", addr),
-                "max_bytes": 50
-            }))
-            .await;
+        // Drive `fetch` directly (not `execute`): validate_url would reject the
+        // 127.0.0.1 mock URL before any request is made. The SSRF guard on the
+        // initial URL is covered by `validate_url_blocks_ssrf_targets`.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/test"), 50),
+        )
+        .await
+        .expect("fetch should not hang");
 
         handle.join().ok();
 
@@ -515,9 +549,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // SSRF protection blocks 127.0.0.1, so execute() never reaches the mock
-    // server and listener.accept() hangs forever. Same fix needed as above.
-    #[ignore = "hangs: SSRF guard blocks 127.0.0.1 before HTTP request is made"]
     async fn web_fetch_tool_on_mock_server() {
         // Test the full tool with mock server
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -542,14 +573,75 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let tool = WebFetch::new();
-        let result = tool
-            .execute(json!({ "url": format!("http://{}/test", addr) }))
-            .await;
+        // Drive `fetch` directly (not `execute`): validate_url would reject the
+        // 127.0.0.1 mock URL before any request is made. The SSRF guard on the
+        // initial URL is covered by `validate_url_blocks_ssrf_targets`.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/test"), DEFAULT_MAX_BYTES),
+        )
+        .await
+        .expect("fetch should not hang");
 
         handle.join().ok();
 
         let output = result.expect("should succeed");
         assert!(output.contains("Plain text content"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_does_not_follow_redirect_to_private_ip() {
+        // Regression for the SSRF redirect bypass (Goal 372): a URL that 302s
+        // to a private host (AWS IMDS) must NOT be followed. The production
+        // client (WebFetch::new) is built with redirect(Policy::none()), so a
+        // 3xx is surfaced as an error instead of a second request to
+        // 169.254.169.254. We drive `fetch` directly so the SSRF guard on the
+        // *initial* 127.0.0.1 mock URL doesn't block the request before the
+        // redirect logic is reached; the guard itself is covered by
+        // `validate_url_blocks_ssrf_targets`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+
+            let response = "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            write!(stream, "{}", response).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Production tool: exercises the Policy::none() client built by new().
+        let tool = WebFetch::new();
+        // Timeout-guard the fetch so a regression (redirect followed to an
+        // unroutable/IMDS host) can't hang the suite.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/redirect"), DEFAULT_MAX_BYTES),
+        )
+        .await;
+
+        handle.join().ok();
+
+        let err_msg = match result {
+            Err(_elapsed) => panic!("fetch hung: redirect may have been followed"),
+            Ok(res) => match res {
+                Ok(body) => panic!("302 to a private IP must be an error, got body: {body}"),
+                Err(e) => e.to_string(),
+            },
+        };
+        // Must be the "does not follow redirects" 3xx error — NOT a successful
+        // body read from 169.254.169.254 and NOT a connection error to it.
+        assert!(
+            err_msg.contains("does not follow redirects"),
+            "unexpected error: {err_msg}"
+        );
+        assert!(err_msg.contains("302"));
+        assert!(err_msg.contains("169.254.169.254"));
     }
 
     #[tokio::test]
