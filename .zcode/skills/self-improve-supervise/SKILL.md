@@ -375,6 +375,62 @@ When `status: completed`:
     (`git fetch; git status -sb`) and note any pre-receive-hook quirks (an old
     issue doc in `.dev/issues/` may be stale; a clean push in 2026-08
     succeeded despite the doc claiming otherwise).
+19. **A gate that runs in ~100ms with "syntax error" in its output is NOT
+    passing — it's broken.** Every mutants gate in this codebase was silently
+    false-green for an unknown period: `gates.json` invoked bash-only scripts
+    (`< <(...)` process substitution) via `sh`, which aborts at parse time;
+    the `trap cleanup_mutants EXIT` then re-emitted `$?` captured *inside the
+    trap* (0 = trap's own success), masking the abort as `passed: true`. The
+    symptom — `gate.*-mutants` completing in ~100ms across every goal — was
+    visible in `run.log.jsonl` the whole time but read as "fast增量变异".
+    **Action:** when any gate shows suspiciously fast completion (<1s for
+    something that compiles), grep its `result.output` in `run.log.jsonl` for
+    `syntax error` / `command not found` / `unexpected token`. A real
+    cargo-mutants run takes minutes, not milliseconds. (Incident: cycle
+    2026-08-02, all goals 370-375; fixed in commit `17fb4da` — `sh`→`bash` in
+    gates.json + `< <(...)`→temp-file in the scripts + documented the `$rc`
+    capture trap.)
+20. **cargo-mutants contamination survives cherry-pick.** When you (or the
+    agent) run `cargo-mutants --in-place` in a worktree and the run is
+    interrupted (Ctrl-C, kill, watchdog), the mutated source lines carrying
+    `/* ~ changed by cargo-mutants ~ */` are NOT auto-restored. If you then
+    `git cherry-pick` or `git diff` from that worktree, the contamination
+    lands on main as a real code change. **Two real incidents this cycle:**
+    (a) supervisor's own verification run left `||`→`>` in `truncate_str`
+    (`src/lib.rs`); (b) the agent's self-check left `||`→`&&` in
+    `OldPermissionsConfig::From` (`src/permissions/mod.rs`) — the latter was
+    caught by `test_old_config_only_deny_produces_layer`, the former by a
+    manual `git diff` scan. **Action:** before ANY cherry-pick from a worktree
+    where cargo-mutants ran, `grep -rln "changed by cargo-mutants" src/
+    crates/` and `git checkout --` every hit. Never trust a worktree that has
+    a `mutants.out/` dir without scanning first.
+21. **Self-improve goals change the AGENT's source, not the dev scaffolding.**
+    The flow's `run.recursive` agent may only edit `src/`, `crates/*/src/`,
+    `Cargo.toml`, `tests/`, `e2e/` — i.e. things the shipped agent depends on.
+    `.dev/scripts/*.sh`, `.dev/flows/*.js`, `.flowcast/gates.json`, and the
+    skill files themselves are **supervisor/infrastructure** — editing them via
+    a self-improve goal is "the examinee rewriting the exam." If a cycle finds
+    a bug in the scaffolding (e.g. the mutants-gate false-green), the
+    supervisor fixes it with a direct commit, NOT a goal. When writing goals,
+    self-check the scope: if a proposed change touches `.dev/` or
+    `.flowcast/`, it's out of bounds — record it as a follow-up for the human
+    instead. (Incident: cycle 2026-08-02, a proposed "goal 376" to fix
+    `e2e-gate.sh` diff-scope was correctly rejected as out-of-scope after the
+    user flagged the boundary.)
+22. **Stop an agent that over-spends its budget self-checking.** Goal 373's
+    agent completed all code changes correctly, then spent 50+ minutes (and
+    ~120 steps) running a full 4994-mutant `cargo-mutants` self-check inside
+    `run.recursive`, polling with `sleep 280` (zero transcript growth →
+    watchdog-bait). It would have either hit the step cap
+    (`failed-preserved`) or been `no-growth-hung` killed — both wasted.
+    **Action:** when `run.recursive` runs >2× longer than同类 goals AND the
+    log shows the agent polling a long background job (`cargo mutants`,
+    `cargo test --all`, a big build) instead of editing, it has finished
+    writing and is over-verifying. Read the worktree diff: if the changes look
+    complete, stop the flow (`tmux kill-session` + `pkill`), cherry-pick the
+    worktree, and verify yourself. The gate phase exists to run the expensive
+    checks — the agent shouldn't duplicate them in `run.recursive`. (Incident:
+    goal 373, cycle 2026-08-02; rescued as `82d7ccb`.)
 
 ## Quick reference
 
@@ -401,8 +457,9 @@ git -C "$RR" merge-base --is-ancestor <COMMIT> main && echo ON_MAIN
 cargo test --manifest-path "$RR/Cargo.toml" -p recursive-tui   # or the relevant crate
 
 # background-poll to terminal (arm with run_in_background: true; get notified at verdict)
+# 60 iters × 90s = 90min ceiling — covers goals whose agent self-checks long (e.g. cargo-mutants)
 RID=selfimprove-XXXXXXXXX
-for i in $(seq 1 32); do
+for i in $(seq 1 60); do
   sleep 90
   pgrep -f self-improve.flow.js >/dev/null 2>&1 || { echo "node gone"; break; }
   read st v step <<< $(python3 -c "import json;d=json.load(open('$RR/.flowcast/runs/$RID/state.json'));print(d.get('status'),d.get('verdict') or '-',d.get('currentStep') or '-')")
@@ -413,12 +470,25 @@ done
 # rescue a failed-preserved run whose work is correct (watchdog mis-fire case)
 PRESERVE_COMMIT=$(git -C "$RR" log --format=%H refs/preserve/<RID> -1)
 git -C "$RR" cherry-pick "$PRESERVE_COMMIT"
+# CRITICAL (lesson 20): if the worktree ever ran cargo-mutants, contamination may
+# have landed with the cherry-pick. Scan + clean BEFORE running gates:
+grep -rln "changed by cargo-mutants" "$RR/src/" "$RR/crates/" 2>/dev/null | xargs -r git -C "$RR" checkout --
 # then independently re-run the 3 gates; if green, amend the message:
 git -C "$RR" commit --amend -m "feat(...): Goal NNN — <one line>"
 # if red: git -C "$RR" reset --hard ORIG_HEAD
 
 # verify the goal's headline test BY NAME (not just "test suite green")
 cargo test --manifest-path "$RR/Cargo.toml" <name-substring>   # e.g. cancelled_mid_stream
+
+# spot a silently-broken gate (lesson 19): ~100ms + "syntax error" in output = broken, not passing
+python3 -c "
+import json
+for line in open('$RR/.flowcast/runs/<RID>/run.log.jsonl'):
+    d=json.loads(line)
+    if d.get('event')=='done' and 'mutant' in d.get('key',''):
+        r=d.get('result',{}); out=str(r.get('output',''))[:80]
+        print(d['key'],'passed='+str(r.get('passed')),'dur='+str(d.get('durationMs'))+'ms',out)
+"
 
 # diagnose a phantom preflight.build error (invalid char in package name)
 grep -n "'-p [^']*'" "$RR/.dev/flows/self-improve.flow.js"   # a -p X with space INSIDE quotes = bug
