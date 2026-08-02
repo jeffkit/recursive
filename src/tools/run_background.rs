@@ -159,7 +159,14 @@ impl BackgroundJobManager {
 
     /// Remove stale jobs (older than TTL).
     fn cleanup(&mut self) {
-        let cutoff = Instant::now() - JOB_TTL;
+        // checked_sub: when the elapsed time since the Instant epoch is less than
+        // JOB_TTL (e.g. shortly after system boot), `now - TTL` would underflow and
+        // panic. In that case no job can possibly be older than the TTL, so keep them
+        // all (cutoff = now → `created_at > now` is false for every job, but that's
+        // fine — nothing is evicted, which is correct since nothing is stale).
+        let cutoff = Instant::now()
+            .checked_sub(JOB_TTL)
+            .unwrap_or_else(Instant::now);
         self.jobs.retain(|_, job| job.created_at > cutoff);
     }
 
@@ -1114,6 +1121,29 @@ mod tests {
         assert!(
             mgr.get_state(&fresh_id).is_some(),
             "fresh job must survive cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_panic_on_young_process() {
+        let mut mgr = BackgroundJobManager::new();
+        // Insert a freshly-created job (created_at = now). A job created in
+        // this process can never be older than JOB_TTL, so cleanup must keep
+        // it — and it must not panic even when `now - JOB_TTL` would underflow
+        // (the case where the Instant epoch is younger than the TTL, e.g.
+        // shortly after system boot).
+        let id = mgr.insert(Job {
+            state: JobState::Running,
+            created_at: Instant::now(),
+        });
+
+        // Must NOT panic even though `now - JOB_TTL` underflows on a young
+        // epoch.
+        mgr.cleanup();
+
+        assert!(
+            mgr.get_state(&id).is_some(),
+            "freshly-created job must survive cleanup"
         );
     }
 }
