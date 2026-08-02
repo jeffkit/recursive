@@ -138,15 +138,15 @@ pub struct ToolRegistry {
     pub(crate) policy: Option<policy_sandbox::PolicyConfig>,
     /// Goal-199: headless mode — interactive tools go through external hooks
     /// instead of waiting for terminal input.
-    pub headless: bool,
+    pub(crate) headless: bool,
     /// Goal-199: external hook runner for headless permission checks.
-    pub hook_runner: crate::hooks::ExternalHookRunner,
+    pub(crate) hook_runner: crate::hooks::ExternalHookRunner,
 
     /// Goal-200: optional auto classifier for `PermissionMode::Auto`.
     /// When `Some`, each tool call in Auto mode is classified by the
     /// LLM before execution. Wrapped in a `Mutex` (tokio) because `classify()`
     /// takes `&mut self` (it updates the denial tracker).
-    pub auto_classifier: Option<Arc<tokio::sync::Mutex<AutoClassifier>>>,
+    pub(crate) auto_classifier: Option<Arc<tokio::sync::Mutex<AutoClassifier>>>,
 }
 
 impl Default for ToolRegistry {

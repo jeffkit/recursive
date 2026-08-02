@@ -19,7 +19,7 @@
 
 pub mod acp;
 pub mod agent;
-pub mod atomic;
+pub(crate) mod atomic;
 pub mod checkpoint;
 pub mod checkpoint_log;
 pub mod compact;
@@ -53,11 +53,11 @@ pub mod runtime;
 pub mod runtime_goal;
 pub mod session;
 pub mod skills;
-pub mod skills_injector;
+pub(crate) mod skills_injector;
 pub mod storage;
 pub mod system_prompt;
 pub mod tasks;
-pub mod team;
+pub(crate) mod team;
 pub mod tool_set_provider;
 pub mod tools;
 pub mod transcript;
@@ -96,8 +96,8 @@ pub use mcp_server::{McpServerManager, McpServerRunner};
 pub use message::{Message, Role};
 pub use migrate::{migrate_workspace, MigrateReport};
 pub use multi::{
-    coordinator_system_prompt, register_subagent_if_enabled, AgentMessage, AgentPool, AgentRole,
-    MemoryEntry, MessageBus, MessageType, SharedMemory,
+    register_subagent_if_enabled, AgentMessage, AgentPool, AgentRole, MessageBus, MessageType,
+    SharedMemory,
 };
 pub use paths::{
     legacy_paths_in_workspace, user_data_dir, user_scratchpad_path, user_sessions_dir,
@@ -145,10 +145,10 @@ pub use tools::policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
 pub use tools::PermissionHook;
 pub use tools::{
     build_standard_tools, build_standard_tools_with_roots, new_shared_sandbox_roots, AccessTier,
-    AuditMeta, EnterPlanModeTool, ExitPlanModeTool, ExitStatus, PlanApprovalGate,
-    PlanApprovalResult, PlanModeRequestGate, PlanModeRequestResult, ReadFileState,
-    RequestPlanModeTool, SharedSandboxRoots, TodoItem, TodoStatus, TodoWriteTool, Tool,
-    ToolDispatch, ToolRegistry, ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
+    AuditMeta, EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanApprovalResult,
+    PlanModeRequestGate, PlanModeRequestResult, ReadFileState, RequestPlanModeTool,
+    SharedSandboxRoots, TodoItem, TodoStatus, TodoWriteTool, Tool, ToolDispatch, ToolRegistry,
+    ToolSideEffect, TouchedFiles, AUDIT_ERR_MAX_BYTES,
 };
 pub use transcript::{TranscriptFile, TranscriptMeta};
 

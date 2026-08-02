@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 /// safety check triggered the decision. Useful for debugging, audit
 /// logging, and user-facing error messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecisionReason {
     /// A rule from a specific source matched a pattern.
     Rule { source: RuleSource, pattern: String },
@@ -238,6 +239,7 @@ impl<'de> Deserialize<'de> for PermissionMode {
 ///
 /// Priority (highest first): Session > Project > User.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[non_exhaustive]
 pub enum RuleSource {
     /// Highest priority — set at runtime via API (Goal 196).
     Session,
@@ -584,6 +586,7 @@ pub type SharedPermissions = Arc<RwLock<LayeredPermissionsConfig>>;
 
 /// Behaviour to associate with a session-level permission rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuleBehavior {
     /// Explicitly allow the tool matching this pattern.
     Allow,
