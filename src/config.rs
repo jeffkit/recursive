@@ -359,39 +359,37 @@ impl Config {
                     .unwrap_or_else(|| "claude-sonnet-4-6".into())
             });
 
-        let max_steps = std::env::var("RECURSIVE_MAX_STEPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| file_agent.and_then(|a| a.max_steps))
-            .unwrap_or(0);
+        let max_steps = parse_env(
+            "RECURSIVE_MAX_STEPS",
+            file_agent.and_then(|a| a.max_steps).unwrap_or(0),
+        )?;
 
         // Three-tier max_tokens resolution (env > provider/file config > default).
         // 1) RECURSIVE_MAX_TOKENS env var wins outright.
         // 2) Else the active provider preset's ModelSpec.max_tokens for the
         //    configured model, falling back to the config file's agent.max_tokens.
         // 3) Else the crate default (DEFAULT_MAX_TOKENS = 64K).
-        let max_tokens = std::env::var("RECURSIVE_MAX_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                // Look up the active model's spec in the resolved preset and
-                // read its optional max_tokens. Falls through to the file-level
-                // agent.max_tokens when the preset/model has none.
-                preset.as_ref().and_then(|p| {
+        let max_tokens = parse_env(
+            "RECURSIVE_MAX_TOKENS",
+            // Env absent → fall back to the active model's spec in the
+            // resolved preset, then to the file-level agent.max_tokens, then
+            // to the crate default (DEFAULT_MAX_TOKENS = 64K).
+            preset
+                .as_ref()
+                .and_then(|p| {
                     p.models
                         .iter()
                         .find(|m| m.name == model)
                         .and_then(|m| m.max_tokens)
                 })
-            })
-            .or_else(|| file_agent.and_then(|a| a.max_tokens))
-            .unwrap_or(crate::llm::DEFAULT_MAX_TOKENS);
+                .or_else(|| file_agent.and_then(|a| a.max_tokens))
+                .unwrap_or(crate::llm::DEFAULT_MAX_TOKENS),
+        )?;
 
-        let temperature = std::env::var("RECURSIVE_TEMPERATURE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| file_agent.and_then(|a| a.temperature))
-            .unwrap_or(0.2);
+        let temperature = parse_env(
+            "RECURSIVE_TEMPERATURE",
+            file_agent.and_then(|a| a.temperature).unwrap_or(0.2),
+        )?;
 
         let system_prompt = match std::env::var("RECURSIVE_SYSTEM_PROMPT_FILE") {
             Ok(path) => std::fs::read_to_string(&path).map_err(|e| Error::Config {
@@ -417,49 +415,31 @@ impl Config {
             }
         }
 
-        let retry_max = std::env::var("RECURSIVE_RETRY_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
-        let retry_initial_backoff_secs = std::env::var("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let retry_max_backoff_secs = std::env::var("RECURSIVE_RETRY_MAX_BACKOFF_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
-        let shell_timeout_secs = std::env::var("RECURSIVE_SHELL_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| file_agent.and_then(|a| a.shell_timeout_secs))
-            .unwrap_or(300);
+        let retry_max = parse_env("RECURSIVE_RETRY_MAX", 3)?;
+        let retry_initial_backoff_secs = parse_env("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS", 1)?;
+        let retry_max_backoff_secs = parse_env("RECURSIVE_RETRY_MAX_BACKOFF_SECS", 8)?;
+        let shell_timeout_secs = parse_env(
+            "RECURSIVE_SHELL_TIMEOUT_SECS",
+            file_agent.and_then(|a| a.shell_timeout_secs).unwrap_or(300),
+        )?;
 
-        let wall_timeout_secs = std::env::var("RECURSIVE_WALL_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let wall_timeout_secs = parse_env("RECURSIVE_WALL_TIMEOUT_SECS", 0)?;
 
         let headless = std::env::var("RECURSIVE_HEADLESS")
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        let memory_summary_limit = std::env::var("RECURSIVE_MEMORY_SUMMARY_LIMIT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+        let memory_summary_limit = parse_env("RECURSIVE_MEMORY_SUMMARY_LIMIT", 5)?;
 
-        let subagent_max_depth = std::env::var("RECURSIVE_SUBAGENT_MAX_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                file_config
-                    .limits
-                    .as_ref()
-                    .and_then(|l| l.subagent_max_depth)
-            })
-            .unwrap_or(2);
+        let subagent_max_depth = parse_env(
+            "RECURSIVE_SUBAGENT_MAX_DEPTH",
+            file_config
+                .limits
+                .as_ref()
+                .and_then(|l| l.subagent_max_depth)
+                .unwrap_or(2),
+        )?;
 
         // Sub-agent (the `agent` tool + coordinator tools) is enabled by default.
         // Either RECURSIVE_SUBAGENT_ENABLED or its legacy alias RECURSIVE_TEAM_ENABLED
@@ -478,53 +458,53 @@ impl Config {
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        let max_search_rounds = std::env::var("RECURSIVE_MAX_SEARCH_ROUNDS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                file_config
-                    .limits
-                    .as_ref()
-                    .and_then(|l| l.max_search_rounds)
-            })
-            .unwrap_or(3);
+        let max_search_rounds = parse_env(
+            "RECURSIVE_MAX_SEARCH_ROUNDS",
+            file_config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_search_rounds)
+                .unwrap_or(3),
+        )?;
 
-        let stuck_window = std::env::var("RECURSIVE_STUCK_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| file_config.stuck.as_ref().and_then(|s| s.window))
-            .unwrap_or(10usize);
+        let stuck_window = parse_env(
+            "RECURSIVE_STUCK_WINDOW",
+            file_config
+                .stuck
+                .as_ref()
+                .and_then(|s| s.window)
+                .unwrap_or(10usize),
+        )?;
 
-        let stuck_error_rate = std::env::var("RECURSIVE_STUCK_ERROR_RATE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| file_config.stuck.as_ref().and_then(|s| s.error_rate))
-            .unwrap_or(0.8f64);
+        let stuck_error_rate = parse_env(
+            "RECURSIVE_STUCK_ERROR_RATE",
+            file_config
+                .stuck
+                .as_ref()
+                .and_then(|s| s.error_rate)
+                .unwrap_or(0.8f64),
+        )?;
 
-        let max_concurrent_runs = std::env::var("RECURSIVE_MAX_CONCURRENT_RUNS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                file_config
-                    .limits
-                    .as_ref()
-                    .and_then(|l| l.max_concurrent_runs)
-            })
-            .unwrap_or(8usize);
+        let max_concurrent_runs = parse_env(
+            "RECURSIVE_MAX_CONCURRENT_RUNS",
+            file_config
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_concurrent_runs)
+                .unwrap_or(8usize),
+        )?;
 
         // Goal-291: tail window for the goal-evaluator judge. Default 12,
         // matching the previous hard-coded `GOAL_EVAL_TRANSCRIPT_TAIL`
         // constant in src/runtime.rs.
-        let goal_eval_transcript_tail = std::env::var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                file_config
-                    .limits
-                    .as_ref()
-                    .and_then(|l| l.goal_eval_transcript_tail)
-            })
-            .unwrap_or(12usize);
+        let goal_eval_transcript_tail = parse_env(
+            "RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL",
+            file_config
+                .limits
+                .as_ref()
+                .and_then(|l| l.goal_eval_transcript_tail)
+                .unwrap_or(12usize),
+        )?;
 
         // Web search config: env var > file config > None
         let file_search = file_config.search.as_ref();
@@ -680,6 +660,32 @@ Set via --provider, RECURSIVE_PROVIDER_TYPE, or by using
             ));
         }
         Ok(())
+    }
+}
+
+/// Parse an env var into `T`, returning `default` when the var is absent.
+/// When the var is PRESENT but fails to parse, return a config error that names
+/// the var + value + expected type — instead of silently falling back to default.
+///
+/// Used by `from_env` for every numeric/float env knob. Absence is fine (the
+/// user didn't set it → use the default/file fallback); only present-but-bad
+/// input is an error, so a typo like `RECURSIVE_MAX_STEPS=1o0` surfaces at
+/// startup instead of silently becoming unlimited.
+fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, Error>
+where
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(v) => match v.parse::<T>() {
+            Ok(parsed) => Ok(parsed),
+            Err(e) => Err(Error::Config {
+                message: format!(
+                    "{name}={v:?} is not a valid value ({e}). Expected a {}.",
+                    std::any::type_name::<T>()
+                ),
+            }),
+        },
     }
 }
 
@@ -892,6 +898,116 @@ mod tests {
                 std::env::set_var("RECURSIVE_MAX_STEPS", v);
             } else {
                 std::env::remove_var("RECURSIVE_MAX_STEPS");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_env_absent_returns_default() {
+        // Absence is NOT an error: a user who never set the var must get the
+        // default (this is what from_env relies on for every numeric knob).
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let name = "RECURSIVE_TEST_PARSE_ENV_ABSENT";
+        let orig = std::env::var(name).ok();
+        unsafe {
+            std::env::remove_var(name);
+        }
+        let result = parse_env::<usize>(name, 42);
+        assert_eq!(
+            result.unwrap(),
+            42,
+            "absent env var must yield the default, not an error"
+        );
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_env_valid_returns_parsed() {
+        // A valid value must be parsed and returned (byte-identical to the
+        // old `.parse().ok().unwrap_or(default)` happy path).
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let name = "RECURSIVE_TEST_PARSE_ENV_VALID";
+        let orig = std::env::var(name).ok();
+        unsafe {
+            std::env::set_var(name, "100");
+        }
+        let result = parse_env::<usize>(name, 42);
+        assert_eq!(result.unwrap(), 100, "valid env var must be parsed");
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_env_invalid_returns_error_naming_var_and_value() {
+        // Present-but-unparseable must ERROR (the whole point of the goal),
+        // with a message that names the var and the bad value for diagnosis.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let name = "RECURSIVE_TEST_PARSE_ENV_INVALID";
+        let orig = std::env::var(name).ok();
+        unsafe {
+            std::env::set_var(name, "abc");
+        }
+        let err = parse_env::<usize>(name, 42).expect_err("unparseable value must error");
+        let msg = err.to_string();
+        assert!(msg.contains(name), "error must name the env var: {msg}");
+        assert!(
+            msg.contains("abc"),
+            "error must include the bad value: {msg}"
+        );
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_env_invalid_float_returns_error() {
+        // Float knobs (temperature, stuck_error_rate) must hit the same error
+        // path, not silently fall back to their default.
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let name = "RECURSIVE_TEST_PARSE_ENV_FLOAT";
+        let orig = std::env::var(name).ok();
+        unsafe {
+            std::env::set_var(name, "80%");
+        }
+        let err = parse_env::<f64>(name, 0.2).expect_err("unparseable f64 must error");
+        let msg = err.to_string();
+        assert!(msg.contains(name), "error must name the env var: {msg}");
+        assert!(
+            msg.contains("80%"),
+            "error must include the bad value: {msg}"
+        );
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
             }
         }
     }

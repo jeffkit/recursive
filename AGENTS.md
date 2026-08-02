@@ -133,6 +133,12 @@ Don't edit files a live worktree run is working on.
    `aimock` container. Remedy: `rm -rf e2e/.argusai && docker rm -f aimock`, then
    re-run the gate. A completed gate run self-cleans (argus-clean + container
    removal), so only interrupted runs strand this state.
+   **Update (goal-364):** the mcp2cli session daemon (`mcp2cli --session-start`
+   spawns it with `start_new_session=True`, so it **survives** the gate script
+   being killed) also holds the session in memory and reports `SESSION_EXISTS`
+   even after the filesystem cleanup. If the first remedy isn't enough, kill the
+   daemon too: `mcp2cli --session-stop argusai-$(git rev-parse --short HEAD)`
+   (list live ones with `mcp2cli --session-list`), then re-run the gate.
 
 New failure modes should be added here, not silently worked around.
 
