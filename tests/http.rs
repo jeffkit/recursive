@@ -240,6 +240,174 @@ mod http_tests {
         assert!(resp["error"].as_str().unwrap().contains("goal"));
     }
 
+    // --- Goal 361: Error → HTTP status-code mapping ---
+    //
+    // Drive POST /run with a MockProvider that returns a specific typed
+    // `recursive::error::Error` on the first LLM call, and assert the
+    // response carries the correct status code (previously every variant
+    // collapsed to 500).
+
+    #[tokio::test]
+    async fn run_returns_403_on_permission_denied() {
+        use recursive::error::Error;
+        use recursive::permissions::{DecisionReason, PermissionMode};
+
+        let provider =
+            Arc::new(
+                MockProvider::new(vec![]).with_errors(vec![Error::PermissionDenied {
+                    name: "Bash".into(),
+                    reason: DecisionReason::Mode(PermissionMode::DontAsk),
+                }]),
+            );
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "goal": "test" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("permission denied"),
+            "403 body should explain the denial, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_returns_429_with_retry_after_on_rate_limited() {
+        use recursive::error::Error;
+
+        let provider = Arc::new(
+            MockProvider::new(vec![]).with_errors(vec![Error::RateLimited {
+                provider: "mock".into(),
+                retry_after_ms: 1234,
+            }]),
+        );
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "goal": "test" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 429);
+        // The regression-prone part: the `Retry-After` header value, not
+        // just the status code. 1234ms floors to 1 whole second.
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("429 must carry a Retry-After header");
+        assert_eq!(retry_after, "1", "1234ms must floor to Retry-After: 1");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            resp["error"].as_str().unwrap().contains("rate limited"),
+            "429 body should explain the rate limit, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_returns_400_on_bad_tool_args() {
+        use recursive::error::Error;
+
+        let provider = Arc::new(
+            MockProvider::new(vec![]).with_errors(vec![Error::BadToolArgs {
+                name: "Read".into(),
+                message: "missing path".into(),
+            }]),
+        );
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "goal": "test" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 400);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("bad tool arguments"),
+            "400 body should explain the bad arguments, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_returns_500_on_internal_llm_error() {
+        use recursive::error::Error;
+
+        // Regression guard: a genuine provider failure (e.g. upstream 5xx)
+        // must stay 500 — the mapping must not accidentally 4xx real
+        // server-side failures.
+        let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
+            provider: "mock".into(),
+            message: "upstream 5xx".into(),
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "goal": "test" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 500);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            resp["error"].as_str().unwrap().contains("LLM error"),
+            "500 body should expose the LLM failure, got: {resp}"
+        );
+    }
+
     #[tokio::test]
     async fn run_response_has_expected_fields() {
         let provider = Arc::new(MockProvider::new(vec![Completion {

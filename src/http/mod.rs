@@ -431,6 +431,11 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    /// 403 Forbidden with a message.
+    pub(super) fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
+    }
+
     /// Attach a `Retry-After: <secs>` header to this error response.
     ///
     /// Goal-313: lets `session_clear_goal` preserve the `Retry-After: 5`

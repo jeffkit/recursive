@@ -54,6 +54,45 @@ fn record_run_failed(metrics: &super::Metrics) {
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Map a typed runtime [`crate::error::Error`] to the correct HTTP status code.
+///
+/// Goal 361: previously every run failure collapsed to 500, so a client could
+/// not distinguish "your input was bad" (400) from "you got rate limited"
+/// (429, retry after N seconds) from "we crashed" (500). This helper is the
+/// single place that translates a runtime error into the right [`ApiError`];
+/// both run-entry handlers call it after recording metrics.
+///
+/// Deliberately NOT mapped per-variant: `Io`/`Json`/`Mcp`/`Llm`/`Timeout`/
+/// `Tool` etc. are server-side failures — 500 is correct for them. Only
+/// client-correctable or retryable conditions get a 4xx/503.
+///
+/// `Cancelled` maps to 503 (Service Unavailable) rather than 500: 499 is a
+/// non-standard nginx code and axum/tower has no built-in constant for it,
+/// and this goal explicitly prefers 503 over 500 (a client retrying a cancel
+/// as 500 is the pre-existing bug; 503 at least signals "transient, ok to
+/// retry"). We do NOT return 200-with-body for a cancel because no other
+/// finish-reason in this API uses that convention — the run genuinely did
+/// not complete.
+fn map_run_error(e: &crate::error::Error) -> ApiError {
+    use crate::error::Error;
+    match e {
+        Error::Cancelled => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "agent run cancelled"),
+        Error::PermissionDenied { .. } | Error::PermissionDeniedLimit { .. } => {
+            ApiError::forbidden(e.to_string())
+        }
+        Error::RateLimited { retry_after_ms, .. } => {
+            // `with_retry_after` takes whole seconds; floor so a sub-second
+            // wait becomes `Retry-After: 0` (retry immediately) rather than
+            // over-promising.
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, e.to_string())
+                .with_retry_after((*retry_after_ms / 1000) as u32)
+        }
+        Error::BadToolArgs { .. } => ApiError::bad_request(e.to_string()),
+        // Everything else is genuinely internal: keep 500.
+        _ => ApiError::internal(e.to_string()),
+    }
+}
+
 // Thin wrapper around `build_openapi_spec` (schema covered elsewhere).
 #[cfg_attr(test, mutants::skip)]
 pub(super) async fn openapi_spec() -> Json<serde_json::Value> {
@@ -129,7 +168,7 @@ pub(super) async fn run_agent(
 
     let outcome = runtime.run(&body.goal).await.map_err(|e| {
         record_run_failed(&state.metrics);
-        ApiError::internal(format!("agent run failed: {e}"))
+        map_run_error(&e)
     })?;
 
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
@@ -946,7 +985,10 @@ pub(super) async fn send_session_message(
     runtime.set_event_sink(Arc::new(NullSink));
     let _ = forward_handle.await;
 
-    let outcome = run_result.map_err(|e| ApiError::internal(format!("agent run failed: {e}")))?;
+    let outcome = run_result.map_err(|e| {
+        record_run_failed(&state.metrics);
+        map_run_error(&e)
+    })?;
 
     // Update per-session token counters and global metrics.
     prompt_tokens_arc.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
