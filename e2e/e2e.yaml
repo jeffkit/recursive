@@ -15,7 +15,10 @@ service:
   build:
     dockerfile: Dockerfile
     context: ..
-    image: recursive:e2e
+    # Namespaced image tag so concurrent worktrees don't overwrite each other's
+    # built image. WORKTREE_ID is set by e2e-gate.sh (wt-<commit-short>).
+    # argusai config-loader substitutes {{env.XXX}} in ALL fields including image.
+    image: recursive:e2e-{{env.WORKTREE_ID}}
   container:
     name: recursive-e2e
     ports:
