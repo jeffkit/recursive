@@ -78,6 +78,29 @@ if [[ "$CHECK_PREREQS" == 1 ]]; then
   exit 0
 fi
 
+# ---- diff-scope 短路：改动未触及 e2e 关心路径就跳过昂贵的 docker build ------
+# e2e smoke 验证 agent 端到端行为（run_core/kernel/runtime/tools/llm/providers）。
+# 改动只触及 docs / tests / Cargo.toml 版本号 / .dev 配置时，不可能破坏 e2e 行为，
+# 直接绿灯——和 tui-mutants/agent-mutants/cli-mutants 的"未动 X 即跳过"同一思路。
+# opt-out: RECURSIVE_E2E_GATE_FORCE=1 强制跑（release 前全量验证用）。
+if [[ "${RECURSIVE_E2E_GATE_FORCE:-0}" != "1" ]]; then
+  CHANGED=$( {
+    git diff --name-only main...HEAD 2>/dev/null || true
+    git diff --name-only 2>/dev/null || true
+  } | sort -u || true )
+  # e2e 关心生产源码（lib + 各 crate 的 src/）+ e2e 套件本身；其余路径无关。
+  E2E_RELEVANT=$(echo "$CHANGED" | grep -E "^(src/|crates/[^/]+/src/|e2e/)" || true)
+  if [[ -z "$E2E_RELEVANT" ]]; then
+    echo "[e2e-gate] skip: 改动未触及 e2e 关心路径（src/、crates/*/src/、e2e/），跳过 docker build。"
+    if [[ -n "$CHANGED" ]]; then
+      echo "[e2e-gate] changed files:" >&2
+      echo "$CHANGED" | sed 's/^/  /' >&2
+    fi
+    echo "[e2e-gate] 强制跑: RECURSIVE_E2E_GATE_FORCE=1"
+    exit 0
+  fi
+fi
+
 # ---- 构建 e2e 插件（首次或 src 变动后）-------------------------------------
 if [[ -f "e2e/plugins/package.json" ]] && [[ ! -f "e2e/plugins/dist/index.js" || \
     "e2e/plugins/src" -nt "e2e/plugins/dist/index.js" ]]; then
