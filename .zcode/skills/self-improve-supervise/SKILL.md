@@ -288,8 +288,18 @@ When `status: completed`:
    skips it for docs/tests/`.dev/`-only changes (verified: a tests-only goal's
    `gate.e2e` ran in 435ms vs ~25min). So: **if you have a choice, batch the
    pure-test/docs goals** — they skip e2e and finish in minutes. When
-   monitoring an e2e-bearing goal, arm 4-5 min sleeps, not 90s — the docker
-   build is genuinely busy (colima CPU 40%+), not stuck.
+   monitoring an e2e-bearing goal, arm 2-3 min sleeps (not 90s, not 5 min) —
+   with cargo-chef caching (see below) the docker build is ~1min for src/
+   changes, ~10min only for the first build after a Dockerfile/Cargo.lock change.
+   **cargo-chef 3-stage Dockerfile** (`e2e/Dockerfile`) makes src/ changes
+   cheap: planner generates recipe.json (no src needed), cooker compiles all
+   588 deps from recipe.json (CACHED across worktrees because BuildKit layer
+   cache keys on file CONTENT hash, not context path), builder compiles only
+   the 3 workspace crates. So a src/ change costs **~1min docker build in ANY
+   worktree**, not ~12min. The first build after a Dockerfile change or
+   Cargo.lock change pays a ~10min cooker rebuild (one-time). Do NOT re-add
+   `COPY src` to the planner stage — it invalidates the cooker cache and
+   reverts worktree builds to ~12min each (hard-won lesson).
 10. **`failed-preserved` ≠ broken.** The watchdog (`no-growth-hung`) can
     mis-kill an agent that's writing its journal or running a final `cargo
     test` — synchronous moves with zero transcript growth and no child
