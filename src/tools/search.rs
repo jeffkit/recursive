@@ -13,6 +13,11 @@ use crate::llm::ToolSpec;
 const DEFAULT_MAX_RESULTS: usize = 50;
 const DEFAULT_MAX_LINE_LEN: usize = 240;
 
+/// Maximum file size Grep will read into memory. Larger files are skipped
+/// (silently, matching the binary-extension skip) to avoid OOM on logs /
+/// data dumps / bundled artifacts. 1 MiB covers virtually all source files.
+const MAX_GREP_FILE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct SearchFiles {
     pub root: PathBuf,
@@ -152,6 +157,7 @@ impl Tool for SearchFiles {
 
         let mut hits: Vec<String> = Vec::new();
         'outer: for entry in WalkDir::new(&scope)
+            .follow_links(false) // explicit: default, documents symlink-loop safety
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
@@ -169,6 +175,15 @@ impl Tool for SearchFiles {
                 })
                 .unwrap_or(false)
             {
+                continue;
+            }
+            // Skip files that would OOM if read wholesale. Source files are well
+            // under 1 MiB; anything larger is a log/data/artifact that grep
+            // shouldn't slurp. Silent skip, matching the binary-extension skip.
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            if meta.len() > MAX_GREP_FILE_BYTES {
                 continue;
             }
             let Ok(contents) = std::fs::read_to_string(path) else {
@@ -266,6 +281,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_files_larger_than_cap() {
+        let tmp = TempDir::new().unwrap();
+        // File larger than MAX_GREP_FILE_BYTES (1 MiB + 1) that WOULD match.
+        let big = format!("{}\nmatch\n", "a".repeat(MAX_GREP_FILE_BYTES as usize));
+        assert!(big.len() as u64 > MAX_GREP_FILE_BYTES);
+        write(&tmp, "big.log", &big);
+        // Small file that also matches.
+        write(&tmp, "small.txt", "match\n");
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "match"}))
+            .await
+            .unwrap();
+        assert!(out.contains("small.txt:1: match"));
+        assert!(!out.contains("big.log"));
     }
 
     #[tokio::test]
