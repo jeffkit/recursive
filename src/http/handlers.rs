@@ -1720,7 +1720,7 @@ pub(super) async fn agui_run(
             Err(_) => (None, None),
         };
 
-        match outcome {
+        match &outcome {
             Ok(o) => record_run_success(&metrics, o.steps, &o.total_usage),
             Err(_) => record_run_failed(&metrics),
         }
@@ -1834,11 +1834,31 @@ pub(super) async fn agui_run(
                 base: ag::BaseEvent::default(),
             }));
         } else {
+            // Report the run's real outcome. When runtime.run() returned
+            // Err (LLM failure, tool failure, provider down, ...), the
+            // RunFinished must carry an Error outcome so the client can
+            // distinguish a failed run from a successful one with no
+            // result — otherwise the failure is silently swallowed at
+            // the SSE boundary. `code` is reserved for a follow-up goal
+            // that maps Error::Cancelled / RateLimited / etc. to codes.
+            let (run_outcome, result_msg) = match &outcome {
+                Ok(o) => (
+                    ag::RunFinishedOutcome::Success,
+                    o.final_text.clone().map(serde_json::Value::String),
+                ),
+                Err(e) => (
+                    ag::RunFinishedOutcome::Error {
+                        message: e.to_string(),
+                        code: None,
+                    },
+                    None,
+                ),
+            };
             let _ = sse_tx.send(ag::Event::RunFinished(ag::RunFinished {
                 thread_id: drv_thread,
                 run_id: drv_run,
-                outcome: Some(ag::RunFinishedOutcome::Success),
-                result: None,
+                outcome: Some(run_outcome),
+                result: result_msg,
                 base: ag::BaseEvent::default(),
             }));
         }

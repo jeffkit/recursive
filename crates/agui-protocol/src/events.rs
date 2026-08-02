@@ -61,7 +61,20 @@ pub struct RunStarted {
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum RunFinishedOutcome {
     Success,
-    Interrupt { interrupts: Vec<Interrupt> },
+    Interrupt {
+        interrupts: Vec<Interrupt>,
+    },
+    /// The run failed before completing. `message` carries a human-readable
+    /// cause (the agent `Error` rendered via `Display`); `code` is an optional
+    /// short machine-readable token (e.g. "cancelled", "rate_limited",
+    /// "tool_error") the client MAY branch on. Today the driver sets only
+    /// `message` from `e.to_string()`; `code` is reserved for future
+    /// per-variant mapping.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
 }
 
 /// One open interrupt that the client must resolve.

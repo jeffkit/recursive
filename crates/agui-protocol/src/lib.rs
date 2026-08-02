@@ -279,6 +279,71 @@ mod tests {
     }
 
     #[test]
+    fn run_finished_outcome_error_round_trips() {
+        let ev = Event::RunFinished(RunFinished {
+            thread_id: "t".into(),
+            run_id: "r".into(),
+            outcome: Some(RunFinishedOutcome::Error {
+                message: "provider failed".into(),
+                code: Some("rate_limited".into()),
+            }),
+            result: None,
+            base: BaseEvent::default(),
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["outcome"]["type"], "error");
+        assert_eq!(v["outcome"]["message"], "provider failed");
+        assert_eq!(v["outcome"]["code"], "rate_limited");
+        let back: Event = serde_json::from_value(v).unwrap();
+        match back {
+            Event::RunFinished(rf) => {
+                assert_eq!(
+                    rf.outcome,
+                    Some(RunFinishedOutcome::Error {
+                        message: "provider failed".into(),
+                        code: Some("rate_limited".into()),
+                    })
+                );
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_finished_outcome_error_omits_none_code() {
+        let ev = Event::RunFinished(RunFinished {
+            thread_id: "t".into(),
+            run_id: "r".into(),
+            outcome: Some(RunFinishedOutcome::Error {
+                message: "provider failed".into(),
+                code: None,
+            }),
+            result: None,
+            base: BaseEvent::default(),
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["outcome"]["type"], "error");
+        assert_eq!(v["outcome"]["message"], "provider failed");
+        assert!(
+            v["outcome"].get("code").is_none(),
+            "None code must be omitted: {v}"
+        );
+        let back: Event = serde_json::from_value(v).unwrap();
+        match back {
+            Event::RunFinished(rf) => {
+                assert_eq!(
+                    rf.outcome,
+                    Some(RunFinishedOutcome::Error {
+                        message: "provider failed".into(),
+                        code: None,
+                    })
+                );
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn run_finished_with_legacy_result_still_parses() {
         let v = json!({"type":"RunFinished","threadId":"t","runId":"r","result":{"legacy":"data"}});
         let ev: Event = serde_json::from_value(v).unwrap();

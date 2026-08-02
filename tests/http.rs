@@ -2783,6 +2783,73 @@ mod http_tests {
         }
     }
 
+    /// Goal 359: when `runtime.run()` returns `Err` (LLM failure, provider
+    /// down, ...), the AG-UI RunFinished must carry an `Error` outcome —
+    /// NOT a silent `Success` with `result: None`. This test locks the
+    /// driver's else-branch fix: it configures a MockProvider whose first
+    /// `complete()` returns `Error::Llm`, drives the real /agui endpoint,
+    /// and asserts the terminal event reports the failure.
+    #[tokio::test]
+    async fn agui_runfinished_reports_error_when_run_fails() {
+        use recursive::error::Error;
+        let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
+            provider: "mock".into(),
+            message: "injected provider failure".into(),
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router(state);
+
+        let body = agui_request_body(
+            serde_json::json!([
+                {"id": "u1", "role": "user", "content": "say hello"}
+            ]),
+            serde_json::json!([]),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let events = collect_agui_events(response).await;
+        assert!(!events.is_empty(), "expected at least one AG-UI event");
+
+        // First event must still be RunStarted.
+        match &events[0] {
+            agui_protocol::Event::RunStarted(_) => {}
+            other => panic!("expected RunStarted first, got {other:?}"),
+        }
+
+        // Last event must be RunFinished carrying an Error outcome.
+        match events.last().unwrap() {
+            agui_protocol::Event::RunFinished(rf) => {
+                let outcome = rf
+                    .outcome
+                    .as_ref()
+                    .expect("RunFinished must carry an outcome");
+                match outcome {
+                    agui_protocol::RunFinishedOutcome::Error { message, code } => {
+                        assert!(
+                            message.contains("injected provider failure"),
+                            "message should surface the underlying error, got: {message}"
+                        );
+                        assert!(code.is_none(), "code is reserved for future mapping");
+                    }
+                    other => panic!("expected Error outcome, got {other:?}"),
+                }
+            }
+            other => panic!("expected RunFinished last, got {other:?}"),
+        }
+    }
+
     // ── Plan-mode HTTP endpoint tests ─────────────────────────────────────
 
     /// Helper: build a state that has one pre-inserted session whose gate has
